@@ -92,6 +92,10 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },
+  { method: 'GET', path: botPath('oncall-target'), upstream: '/api/bot-oncall-target', body: NO_BODY },
+  putBotConfig('oncall-target', { kind: 'json', maxBytes: 16 * 1024 }),
+  { method: 'POST', path: botPath('oncall-target/choices'), upstream: '/api/bot-oncall-target/choices', body: { kind: 'json', maxBytes: 1024 } },
+  { method: 'POST', path: botPath('oncall-target/check'), upstream: '/api/bot-oncall-target/check', body: NO_BODY },
   // steward：`{ steward: {...} | null }`（管家开关、管家群、提示词追加/替换）。
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
@@ -114,6 +118,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('env'),
   putBotConfig('env-policy'),
   putBotConfig('codex-auth-sync'),
+  // archive-codex：`{ archiveCodex: true | false | null }`（null = 继承全局 sessionCleanup.archiveCodex）。
+  putBotConfig('archive-codex'),
   // codex-config：独立 CODEX_HOME 的 config.toml 路径信息；resync 先备份再从宿主覆盖。
   { method: 'GET', path: botPath('codex-config'), upstream: '/api/bot-codex-config', body: NO_BODY },
   { method: 'POST', path: botPath('codex-config/resync'), upstream: '/api/bot-codex-config/resync', body: RAW },

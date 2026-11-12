@@ -40,6 +40,14 @@ export interface OverloadThresholds {
   /** Leave overload only when swap-used fraction <= this. Default 0.25. */
   exitSwapUsedFrac: number;
   /**
+   * Optional host-wide CPU utilization dimension (0..100). The alert path
+   * leaves this undefined (unchanged behaviour); the host-pressure reclaim
+   * path supplies it so a CPU-bound host trips even when load15 lags.
+   */
+  enterCpuPct?: number;
+  /** Leave only when host CPU <= this percent. Must be < enterCpuPct. */
+  exitCpuPct?: number;
+  /**
    * Minimum ms between two "entered" alerts. Even if the state machine leaves
    * and re-enters overload, suppress a fresh entered-alert within this window.
    * Default 15 min. The recovered-alert is never rate-limited (it ends noise).
@@ -201,10 +209,13 @@ export interface HostReading {
    */
   swapTotalBytes?: number;
   swapUsedBytes?: number;
+  /** Optional host-wide CPU utilization (0..100). Only consumers that opt
+   *  into the CPU dimension (host-pressure reclaim) supply it. */
+  cpuPct?: number;
 }
 
 /** Which dimension(s) tripped the enter threshold — used for the alert copy. */
-export type OverloadReason = 'load' | 'memory' | 'swap';
+export type OverloadReason = 'load' | 'memory' | 'swap' | 'cpu';
 
 export interface OverloadState {
   overloaded: boolean;
@@ -225,6 +236,7 @@ export interface OverloadAlertAction {
     cpuCount: number;
     memUsedFrac: number;
     swapUsedFrac: number | undefined;
+    cpuPct?: number;
   };
 }
 
@@ -256,6 +268,9 @@ function enterReasons(reading: HostReading, t: OverloadThresholds): OverloadReas
   if (memUsedFrac(reading) >= t.enterMemUsedFrac) reasons.push('memory');
   const swap = swapUsedFrac(reading);
   if (t.enterSwapUsedFrac > 0 && swap !== undefined && swap >= t.enterSwapUsedFrac) reasons.push('swap');
+  if (t.enterCpuPct !== undefined && reading.cpuPct !== undefined && reading.cpuPct >= t.enterCpuPct) {
+    reasons.push('cpu');
+  }
   return reasons;
 }
 
@@ -269,7 +284,11 @@ function fullyRecovered(reading: HostReading, t: OverloadThresholds): boolean {
   const memOk = memUsedFrac(reading) <= t.exitMemUsedFrac;
   const swap = swapUsedFrac(reading);
   const swapOk = t.enterSwapUsedFrac <= 0 || swap === undefined || swap <= t.exitSwapUsedFrac;
-  return loadOk && memOk && swapOk;
+  const cpuOk = t.enterCpuPct === undefined
+    || reading.cpuPct === undefined
+    || t.exitCpuPct === undefined
+    || reading.cpuPct <= t.exitCpuPct;
+  return loadOk && memOk && swapOk && cpuOk;
 }
 
 function metricsFor(reading: HostReading, t: OverloadThresholds): OverloadAlertAction['metrics'] {
@@ -279,6 +298,7 @@ function metricsFor(reading: HostReading, t: OverloadThresholds): OverloadAlertA
     cpuCount: t.cpuCount,
     memUsedFrac: memUsedFrac(reading),
     swapUsedFrac: swapUsedFrac(reading),
+    ...(reading.cpuPct !== undefined ? { cpuPct: reading.cpuPct } : {}),
   };
 }
 
@@ -337,6 +357,7 @@ const REASON_LABEL: Record<OverloadReason, string> = {
   load: 'CPU 负载',
   memory: '内存',
   swap: 'Swap',
+  cpu: '整机 CPU',
 };
 
 /** Build the Feishu text body for an alert action. Kept here so it's testable. */
@@ -403,6 +424,9 @@ export interface OverloadCardState {
   browsers?: OverloadCardBrowser[];
   /** bundleIds whose restart button has already been clicked (✓ done). */
   restartedBrowsers?: string[];
+  /** Sessions automatically parked by the host-pressure backstop during this
+   *  episode. Rendered as one extra line on the same edge card; never a new DM. */
+  autoSuspendedN?: number;
 }
 
 /** A per-browser restart button descriptor carried on the card. */
@@ -519,6 +543,12 @@ export function buildOverloadAlertCard(st: OverloadCardState, hostLabel?: string
     { tag: 'div', text: { tag: 'lark_md', content: `**触发维度：**${why}\n${stateMetricsLine(st)}` } },
     { tag: 'div', text: { tag: 'lark_md', content: `当前可降压：**僵尸会话 ${st.stopped} 个** · **闲置会话 ${st.idle} 个**` } },
   ];
+  if (st.autoSuspendedN !== undefined && st.autoSuspendedN > 0) {
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: `本 bot 已因整机过载自动挂起 **${st.autoSuspendedN}** 个闲置会话（下条消息冷恢复）` },
+    });
+  }
   if (memList) elements.push({ tag: 'div', text: { tag: 'lark_md', content: memList } });
   elements.push({ tag: 'hr' });
   elements.push(...actionRows);

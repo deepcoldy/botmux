@@ -27,6 +27,7 @@ import {
   isolatedDispatchOutputSinkAllowed,
   withIsolatedDispatchSinkFence,
 } from '../src/core/dispatch-output-sink.js';
+import { dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 function routeHandler(routeConstant: string): string {
@@ -121,6 +122,7 @@ function run(
     getDashboardAdminOpenIds: () => [],
     dispatchUserForTurn: async () => undefined,
     pickTurnReplyTarget: () => undefined, dispatchCallerFromReply,
+    dispatchOnlyToolsForTurn,
     fallbackTurnId, frozenReplyContextForTurn,
     config: { session: { dataDir: '/nonexistent' } },
     join, logger: { info: vi.fn(), warn: vi.fn() },

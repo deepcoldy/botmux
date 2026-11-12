@@ -9,6 +9,8 @@ import { ui } from '../src/dashboard/web/ui.js';
 
 const confirmMock = vi.hoisted(() => vi.fn(async (_options: { title: string; message: string }) => true));
 vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: confirmMock }));
+const toastMock = vi.hoisted(() => vi.fn());
+vi.mock('../src/dashboard/web/toast.js', () => ({ toast: toastMock }));
 
 const BOT = 'cli_listener';
 const OTHER_BOT = 'cli_other';
@@ -69,6 +71,9 @@ function mockApi(options: {
   chats?: Array<[string, string]>;
   members?: (url: string) => Promise<Response> | Response;
   put?: (request: Request) => Response | undefined;
+  // A daemon that drops a custom rule saved switched off with no prompt, yet
+  // still answers mode:'custom' (with no rule).
+  dropsBlankPausedRule?: boolean;
 } = {}) {
   const requests: Request[] = [];
   const chat = (chatId: string, name: string) => ({ chatId, name, memberBots: [
@@ -89,8 +94,13 @@ function mockApi(options: {
       const rejected = options.put?.(request);
       if (rejected) return rejected;
       const chatId = url.match(new RegExp(`^/api/group-message-listeners/${BOT}/(.+)$`))?.[1];
-      if (chatId) groupState.set(chatId, { mode: request.body.mode, listener: request.body.listener ?? null });
-      return response({ ok: true });
+      if (!chatId) return response({ ok: true });
+      // Like the daemon's route (pinned in dashboard-ipc.test.ts): inherit drops
+      // the group's entry, and the answer is what a re-read returns.
+      const { mode, listener } = request.body;
+      const dropsRule = mode === 'custom' && options.dropsBlankPausedRule && !listener.enabled && !listener.prompt.trim();
+      groupState.set(chatId, mode === 'inherit' || dropsRule ? { mode: 'inherit', listener: null } : { mode, listener: listener ?? null });
+      return response(dropsRule ? { ok: true, mode: 'custom', listener: null } : { ok: true, ...groupState.get(chatId) });
     }
     const chatList: Array<[string, string]> = options.chats
       ?? [[INHERIT, 'Inherit group'], [CUSTOM, 'Custom group']];
@@ -483,6 +493,60 @@ describe('effective state and confirmations', () => {
     await act(async () => { renderer.unmount(); });
   });
 
+});
+
+describe('a custom rule saved switched off with no prompt', () => {
+  beforeEach(() => { confirmMock.mockReset(); confirmMock.mockResolvedValue(true); toastMock.mockReset(); });
+  afterEach(() => vi.restoreAllMocks());
+
+  // With no global rule set up, a fresh custom draft starts switched off and empty.
+  const noGlobalRule = () => savedGlobal({ enabled: false, prompt: '' });
+  const status = (root: Instance, name = 'Inherit group') => text(byClass(groupItem(root, name), 'message-listener-group-status')[0]!);
+
+  it('stays custom and paused after the re-read and a reload', async () => {
+    const requests = mockApi({ global: noGlobalRule() });
+    let renderer = await renderPage();
+    await click(modeButton(renderer.root, 2));
+    await click(groupSave(renderer.root));
+    expect(puts(requests, `/api/group-message-listeners/${BOT}/${INHERIT}`)[0]?.body).toMatchObject({ mode: 'custom', listener: { enabled: false, prompt: '' } });
+    expect(editorOf(renderer.root, 'group').props.flash?.text).toBe('已保存');
+    expect(status(renderer.root)).toBe('自定义');
+    expect(text(byClass(groupItem(renderer.root, 'Inherit group'), 'message-listener-effective')[0]!)).toBe('未监听');
+    expect(text(byClass(renderer.root, 'message-listener-detail-head')[0]!)).toContain('规则未启用');
+
+    await act(async () => { renderer.unmount(); });
+    renderer = await renderPage();
+    expect(status(renderer.root)).toBe('自定义');
+    expect(toastMock).not.toHaveBeenCalled();
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('does not report a rule the daemon dropped as saved, and keeps the draft open', async () => {
+    mockApi({ global: noGlobalRule(), dropsBlankPausedRule: true });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(modeButton(root, 2));
+    await click(groupSave(root));
+    expect(toastMock).toHaveBeenCalledWith(expect.stringContaining('没有保留'), { kind: 'error' });
+    expect(status(root)).toBe('使用全局');
+    // Still an unsaved switch: the user can add a prompt or pick another mode.
+    expect(hasEditor(root, 'group')).toBe(true);
+    expect(editorOf(root, 'group').props.flash).toBeNull();
+    expect(byClass(groupItem(root, 'Inherit group'), 'message-listener-unsaved-tag')).toHaveLength(1);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('re-reads a group whose existing custom rule the daemon dropped, so it no longer shows as custom', async () => {
+    mockApi({ global: noGlobalRule(), dropsBlankPausedRule: true });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(groupItem(root, 'Custom group'));
+    act(() => editorOf(root, 'group').props.onPatch({ enabled: false, prompt: '' }));
+    await click(groupSave(root));
+    expect(toastMock).toHaveBeenCalledWith(expect.stringContaining('「Custom group」'), { kind: 'error' });
+    expect(status(root, 'Custom group')).toBe('使用全局');
+    await act(async () => { renderer.unmount(); });
+  });
 });
 
 describe('group list ordering', () => {

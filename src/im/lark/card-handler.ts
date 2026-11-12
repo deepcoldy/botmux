@@ -98,7 +98,7 @@ import { holdPurgeClickRollback } from '../../services/image-purge-recovery.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from '../../core/resume-result-message.js';
 import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
@@ -230,6 +230,9 @@ export interface CardActionData {
   event?: { event_id?: string };
   operator?: {
     open_id?: string;
+    /** Trusted callback identity; user_id requires contact:user.employee_id:readonly. */
+    user_id?: string;
+    tenant_key?: string;
     /** Lark-verified union_id, present on card v2 callbacks where the tenant
      *  enables `with_union_id`. Absent when Lark doesn't carry it; callers
      *  fall back to `resolveUserUnionId` via `resolveCardOperatorUnionId`. */
@@ -2140,7 +2143,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return handleAskCardAction(data, { larkAppId });
   }
 
-  if (value?.action === 'oncall_group_create' && larkAppId) {
+  if (typeof value?.action === 'string' && value.action.startsWith('oncall_group_form_') && larkAppId) {
+    const { handleOncallFormAction } = await import('./oncall-group.js');
+    return handleOncallFormAction(data, larkAppId);
+  }
+
+  if ((value?.action === 'oncall_group_create' || value?.action === 'oncall_group_forward' || value?.action === 'oncall_group_join') && larkAppId) {
     const { handleOncallGroupAction } = await import('./oncall-group.js');
     return handleOncallGroupAction(data, larkAppId);
   }
@@ -2160,7 +2168,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const extension = await handleFeedbackExtensionCard(data, larkAppId, config.session.dataDir);
     if (extension !== undefined) return extension;
     if (value?.action === 'feedback_custom_action') return { toast: { type: 'error', content: '动作不存在或已失效' } };
-    return handleSkillFeedbackCardAction(data, larkAppId, {
+    const result = await handleSkillFeedbackCardAction(data, larkAppId, {
       store: await getSkillFeedbackStore(config.session.dataDir),
       loadBaseCard: async (platformMessageId) => {
         const detail = await getMessageDetail(larkAppId, platformMessageId);
@@ -2174,6 +2182,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         }
       },
     });
+    const { reconcileOncallReplyCard } = await import('./oncall-group.js');
+    for (const key of ['card', 'deferredCard']) if (result?.[key]?.type === 'raw' && result[key].data && data.context?.open_message_id) {
+      result[key].data = reconcileOncallReplyCard(larkAppId, data.context.open_message_id, result[key].data);
+    }
+    return result;
   }
 
   if (
@@ -4010,11 +4023,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           // the adapter can only resume a precise cliSessionId and none was
           // persisted, the next spawn starts a FRESH session — say so instead
           // of claiming history is back.
-          const resumeMsg = result.recoveryPending
-            ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
-            : resumeStartsFresh(result.ds.session)
-              ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-              : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          const resumeMsg = resumeSuccessMessage(result, cliName, localeForBot(result.ds.larkAppId));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
           // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
           // cards are enabled. Card-off bots only withdraw the stale closed card

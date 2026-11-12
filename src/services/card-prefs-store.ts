@@ -81,7 +81,7 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
   replyCardActions: boolean;
-  /** Bot-level master switch for the native CoT (thinking process) message.
+  /** In-card activity in unified replies, native CoT in legacy replies.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
@@ -90,6 +90,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  Default TRUE (absent = show; only explicit false persists). Only takes
    *  effect with replyCardMode 'unified'; the value survives mode switches. */
   replyCardShowTools: boolean;
+  /** Native CoT alongside unified replies; default false, independent of cotEnabled. */
+  replyCardNativeCot: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -97,6 +99,9 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   senderTag: boolean;
   /** Hide email only in newly rendered sender tags. Default false. */
   senderTagHideEmail: boolean;
+  /** Keep development-host addresses out of Lark replies (BotConfig.hideLocalAddresses).
+   *  Default false; only an explicit true persists. */
+  hideLocalAddresses: boolean;
   /** When true, this bot's daemon watches host load/mem and DMs the owner on
    *  overload enter/recover edges. Machine-wide signal, so designate one bot;
    *  a shared episode lock de-dups if several have it on. Default false. */
@@ -118,6 +123,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   autoStartOnNewTopic: boolean;
   /** 群负责人（默认接待者）开关，默认关。 */
   chatManagerEnabled: boolean;
+  /** 共享回复模式下，群负责人免 @ 接的顶层消息也开话题，默认关。 */
+  chatManagerSharedTopic: boolean;
   /** 群秘书（/secretary）开关，默认关。 */
   groupSecretaryEnabled: boolean;
   autoStartExcludedChats: string[];
@@ -156,12 +163,14 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexBrowserAutoApproveOrigins: c.codexBrowser?.autoApproveOrigins === true,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
       replyCardShowTools: c.replyCardShowTools !== false,
+      replyCardNativeCot: c.replyCardNativeCot === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
       senderTagHideEmail: c.senderTagHideEmail === true,
+      hideLocalAddresses: c.hideLocalAddresses === true,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoInviteOwnerOnGroupAdd: c.autoInviteOwnerOnGroupAdd !== false,
@@ -170,6 +179,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
       chatManagerEnabled: c.chatManagerEnabled === true,
+      chatManagerSharedTopic: c.chatManagerSharedTopic === true,
       groupSecretaryEnabled: c.groupSecretaryEnabled === true,
       autoStartExcludedChats: c.autoStartExcludedChats ?? [],
       groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
@@ -196,12 +206,14 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexBrowserAutoApproveOrigins: false,
       thinkingCardToolResult: true,
       replyCardShowTools: true,
+      replyCardNativeCot: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       replyCardActions: false,
       cotEnabled: true,
       senderTag: true,
       senderTagHideEmail: false,
+      hideLocalAddresses: false,
       overloadAlert: false,
       botToBotSameDir: true,
       autoInviteOwnerOnGroupAdd: true,
@@ -210,6 +222,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
       chatManagerEnabled: false,
+      chatManagerSharedTopic: false,
       groupSecretaryEnabled: false,
       autoStartExcludedChats: [],
       groupJoinCommandEnabled: false,
@@ -333,6 +346,7 @@ async function updateBotCardPrefsInternal(
     }
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'replyCardShowTools', patch.replyCardShowTools);
+    apply(entry, 'replyCardNativeCot', patch.replyCardNativeCot);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
@@ -341,6 +355,7 @@ async function updateBotCardPrefsInternal(
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'senderTagHideEmail', patch.senderTagHideEmail);
+    apply(entry, 'hideLocalAddresses', patch.hideLocalAddresses);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     applyDefaultTrue(entry, 'autoInviteOwnerOnGroupAdd', patch.autoInviteOwnerOnGroupAdd);
@@ -349,6 +364,7 @@ async function updateBotCardPrefsInternal(
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     apply(entry, 'chatManagerEnabled', patch.chatManagerEnabled);
+    apply(entry, 'chatManagerSharedTopic', patch.chatManagerSharedTopic);
     apply(entry, 'groupSecretaryEnabled', patch.groupSecretaryEnabled);
     if (patch.autoStartExcludedChats !== undefined) {
       if (patch.autoStartExcludedChats.length) entry.autoStartExcludedChats = patch.autoStartExcludedChats;
@@ -378,12 +394,14 @@ async function updateBotCardPrefsInternal(
         codexBrowserAutoApproveOrigins: entry.codexBrowser?.autoApproveOrigins === true,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         replyCardShowTools: entry.replyCardShowTools !== false,
+        replyCardNativeCot: entry.replyCardNativeCot === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
         cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         senderTagHideEmail: entry.senderTagHideEmail === true,
+        hideLocalAddresses: entry.hideLocalAddresses === true,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd !== false,
@@ -392,6 +410,7 @@ async function updateBotCardPrefsInternal(
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
         chatManagerEnabled: entry.chatManagerEnabled === true,
+        chatManagerSharedTopic: entry.chatManagerSharedTopic === true,
         groupSecretaryEnabled: entry.groupSecretaryEnabled === true,
         autoStartExcludedChats: entry.autoStartExcludedChats ?? [],
         groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
@@ -457,6 +476,9 @@ async function updateBotCardPrefsInternal(
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
   }
+  if (patch.replyCardNativeCot !== undefined) {
+    bot.config.replyCardNativeCot = patch.replyCardNativeCot || undefined;
+  }
   if (patch.replyCardShowTools !== undefined) {
     // Default true: store false explicitly, clear (→ default show) when true.
     bot.config.replyCardShowTools = patch.replyCardShowTools === false ? false : undefined;
@@ -467,6 +489,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.senderTagHideEmail !== undefined) {
     bot.config.senderTagHideEmail = patch.senderTagHideEmail || undefined;
+  }
+  if (patch.hideLocalAddresses !== undefined) {
+    bot.config.hideLocalAddresses = patch.hideLocalAddresses || undefined;
   }
   if (patch.senderTag !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -498,6 +523,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.chatManagerEnabled !== undefined) {
     bot.config.chatManagerEnabled = patch.chatManagerEnabled || undefined;
+  }
+  if (patch.chatManagerSharedTopic !== undefined) {
+    bot.config.chatManagerSharedTopic = patch.chatManagerSharedTopic || undefined;
   }
   if (patch.groupSecretaryEnabled !== undefined) {
     bot.config.groupSecretaryEnabled = patch.groupSecretaryEnabled || undefined;
@@ -549,6 +577,7 @@ async function updateBotCardPrefsInternal(
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
     `senderTagHideEmail=${r.result.senderTagHideEmail} ` +
+    `hideLocalAddresses=${r.result.hideLocalAddresses} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +

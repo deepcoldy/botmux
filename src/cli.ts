@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { sendCompletionHintKey } from './services/send-completion-hint.js';
+import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -77,7 +79,7 @@ import {
 } from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { withBotSessionDirective } from './core/topic-session-continuity.js';
-import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants, dedupeParticipants } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
   enableAutostart,
@@ -170,6 +172,7 @@ import {
 import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
 import { createDispatchLaunchSourceCoordinator } from './core/dispatch-launch-source.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
+import { deferredSuspendNote, DRY_RUN_DEFER_NOTE } from './cli/suspend-output.js';
 import {
   computeSessionPickerLayout,
   type SessionPickerColumnKey,
@@ -191,7 +194,7 @@ import {
 import {
   FLEET_DAEMON_EXIT_WAIT_MS,
 } from './core/shutdown-budgets.js';
-import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, primaryCardBodyMissing, sendBodyRequiredMessage, sendFileAttachments, sendVideoAttachments, shouldSendAsPureFile, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
 import { assertCardPatchChat, buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
@@ -343,6 +346,7 @@ import {
   type ManagedOriginAttestationContext,
 } from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
+import { classifySendStdin, describeEmptySendStdin, readSendStdin, sendStdinPolicy } from './cli/send-stdin.js';
 import {
   collaborationHelp,
   formatBotInfoEntriesForCli,
@@ -5722,29 +5726,21 @@ async function cmdList(): Promise<void> {
   // would make a large session list quadratic and amplify socket timeouts.
   const probeSnapshot = buildBackingProbeSnapshot(active);
 
-  // Auto-prune unrecoverable sessions: process dead and no recoverable backing
-  // session (tmux/herdr/zellij/zmx).
-  // Split into two buckets so a never-activated daemon-command scratch (e.g. an
+  // Auto-prune only never-activated daemon-command scratches (e.g. an
   // unconfirmed /adopt that only posted a picker card, /help, an abandoned
-  // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
+  // /relay picker). Such a scratch never forked
   // a worker, so it has no cliId / lastCliInput / adoptedFrom — the same "was it
   // ever a real CLI session" markers isRelayableRealSession uses. Closing it is
   // fine, but the "进程已死且无 tmux session" notice wrongly implies a CLI ran
   // and crashed, which is exactly the confusing output users hit after /adopt.
-  const pruned: SessionData[] = [];
   const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
     if (isAdoptedSession(s)) {
-      const pid = adoptedCliPid(s);
-      if (pid && isProcessAlive(pid)) {
-        live.push(s);
-      } else if (pid) {
-        pruned.push(s);
-      } else {
-        const hasPid = !!(s.pid && isProcessAlive(s.pid));
-        hasPid ? live.push(s) : pruned.push(s);
-      }
+      // A sandbox can deny signal-zero probes of the external CLI with EPERM.
+      // Listing must not turn that lack of visibility into a permanent close
+      // of its live bridge. Retain even a stale/missing pid for explicit detach.
+      live.push(s);
       continue;
     }
 
@@ -5753,8 +5749,7 @@ async function cmdList(): Promise<void> {
     const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
     // Non-adopt sessions are only ever kept or pruned-as-scratch now: a real
     // managed session with a missing backing is dormant-recoverable, never
-    // auto-closed by this read command (see sessionListDisposition). Adopt
-    // zombies still reach the `pruned` bucket via the branch above.
+    // auto-closed by this read command (see sessionListDisposition).
     if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
@@ -5781,20 +5776,14 @@ async function cmdList(): Promise<void> {
     // Keep `list` read-only in primary mode. These rows come from the Pod-local
     // store, so even an apparently harmless scratch cleanup could close only
     // the local row while PostgreSQL keeps the canonical Session active.
-    live.push(...prunedScratch, ...pruned);
-    const skipped = prunedScratch.length + pruned.length;
+    live.push(...prunedScratch);
+    const skipped = prunedScratch.length;
     if (skipped > 0) {
       console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
     }
   } else {
     // Scratches: close silently — they were placeholders, not dead sessions.
     await closeNow(prunedScratch, 'scratch');
-    if (pruned.length > 0) {
-      const prunedCount = await closeNow(pruned, 'real');
-      if (prunedCount > 0) {
-        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
-      }
-    }
   }
 
   // Sort by creation time, newest first
@@ -6046,7 +6035,7 @@ async function cmdSuspend(): Promise<void> {
       }
       const predicted = predictSuspend(await lookupRow(s.sessionId, s.larkAppId));
       switch (predicted) {
-        case 'defer': console.log(`· 将排队（正在回复，完成后自动挂起）: ${label}`); deferred++; break;
+        case 'defer': console.log(`· 将排队，${DRY_RUN_DEFER_NOTE}: ${label}`); deferred++; break;
         case 'suspend': console.log(`· 将挂起: ${label}`); break;
         case 'no_worker': console.log(`· 将跳过（本就无存活 CLI）: ${label}`); skipped++; break;
         case 'refuse': console.log(`· 将拒绝（adopt / 不可挂起 backend）: ${label}`); failed++; break;
@@ -6080,7 +6069,7 @@ async function cmdSuspend(): Promise<void> {
       if (res.ok && body?.ok) {
         if (body.suspended) { console.log(`✓ 已挂起: ${label}`); suspended++; }
         else if (body.reason === 'deferred') {
-          console.log(`⏳ 已排队（正在回复，完成后自动挂起）: ${label}`);
+          console.log(`⏳ 已排队，${deferredSuspendNote(body)}: ${label}`);
           deferred++;
         }
         else { console.log(`· 本就无存活 CLI（目标态已达成）: ${label}`); skipped++; }
@@ -6253,10 +6242,27 @@ async function cmdMaintenance(args: string[]): Promise<void> {
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
+/** A final that left as its own message in this turn's conversation (for
+ * notifications, a quote, attachments…) closes the turn there, so a completed
+ * native-CoT reply card needs no answerless summary. Finals sent elsewhere (top
+ * level, another topic or chat) do not, and keep that summary. Persistence only:
+ * failure restores the summary card and never affects the delivered final. */
+async function noteTurnFinalOutsideReplyCard(
+  key: { larkAppId: string; sessionId: string; turnId: string; dispatchAttempt?: number },
+  chatId: string, offThread: boolean,
+): Promise<void> {
+  if (offThread) return;
+  try {
+    await new TurnReplyCardStore(resolveDataDir()).noteExternalFinal(key, chatId);
+  } catch (error) {
+    console.error(`botmux send: 未能标记本轮答复卡（最终答复已送达）：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6264,7 +6270,7 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret || route === 'chat-manager') {
+  if (!hostSecret || route === 'chat-manager' || route === 'project-workstream') {
     const claim = readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
@@ -6276,7 +6282,7 @@ async function postSessionCliIpc(
       if (claim.turnId) requestBody.originTurnId = claim.turnId;
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
     }
-    if (!claim && route === 'chat-manager' && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+    if (!claim && (route === 'chat-manager' || route === 'project-workstream') && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
       const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
       if (marker?.sessionId === sessionId && marker.capability) {
         requestBody.originCapability = marker.capability;
@@ -6912,6 +6918,14 @@ async function cmdProject(argv: string[]): Promise<void> {
                         [--milestone <里程碑>] [--next-milestone <下一节点>] [--clear-next-milestone]
   botmux project close [--milestone <完成说明>]
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
+  botmux project workstream inspect --root <om_root> --source-app <cli_app> --source-session <id>
+  botmux project workstream attach --root <om_root> --source-app <cli_app> --source-session <id>
+                                  --title <24字内标题> [--purpose <说明>] [--revision <n>] [--grant <id>]
+  botmux project workstream rename --root <om_root> --title <24字内标题>
+  botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
+  botmux project workstream status [--root <om_root>]
+  botmux project workstream grant
+  botmux project workstream notifications --mode ignore|notify
 
 说明:
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
@@ -6931,7 +6945,8 @@ async function cmdProject(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (session.chatType !== 'group' || session.scope !== 'chat') {
+  const sourceGrant = 'workstream' in parsed && parsed.workstream.action === 'grant';
+  if (session.chatType !== 'group' || (session.scope !== 'chat' && !sourceGrant)) {
     console.error('project 模式只能在普通群的 chat-scope 主控会话中使用。');
     process.exitCode = 1;
     return;
@@ -6946,9 +6961,17 @@ async function cmdProject(argv: string[]): Promise<void> {
   const response = await postSessionCliIpc(
     ipcPort,
     session.sessionId,
-    'project',
-    parsed.action as unknown as Record<string, unknown>,
+    'workstream' in parsed ? 'project-workstream' : 'project',
+    'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
   );
+  if ('workstream' in parsed) {
+    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; result?: unknown; grantId?: string };
+    if (!response.ok || !result.ok) {
+      console.error(`workstream 操作失败: ${result.error ?? response.status}`);
+      process.exitCode = 1;
+    } else console.log(JSON.stringify(result.result ?? result, null, 2));
+    return;
+  }
   const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; project?: Record<string, unknown> };
   if (!response.ok || !body.ok || !body.project) {
     console.error(`project 操作失败: ${body.error ?? `HTTP ${response.status}`}`);
@@ -7930,7 +7953,8 @@ const SEND_HELP_BODY = [
   '       --images <path>                 内联图片（可重复）',
   '       --image-mode <mode>             独立单图：fit_horizontal（默认）|medium|small|tiny',
   '                                      medium/small/tiny 等比占宽 1/2、1/3、1/4，完整显示不裁剪',
-  '       --files <path>                  附件（可重复）',
+  '       --files <path>                  附件（可重复）。只发一个文件且不 @ 人时可以不写正文；',
+  '                                      多个附件或带 @ 时需要正文（位置参数 / --content-file / stdin）',
   '       --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）',
   '       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）',
   '       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON',
@@ -7956,6 +7980,7 @@ const SEND_HELP_BODY = [
   '       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）',
   '       --no-mention                    明确声明本条不@任何人',
   '       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）',
+  '       --reply-to <message_id>         按当前会话已接收消息的位置回复（不改变 final 轮次）',
   '       --no-quote                      不引用，发独立消息（普通群）',
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
@@ -8123,6 +8148,7 @@ ${SEND_HELP_BODY}
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
+  ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
   ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
                                        否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
@@ -9564,6 +9590,18 @@ async function assertListenerCardDestination(session: SessionData, appId: string
   }
 }
 
+/** BOTMUX_CHAT_ID for the caller's own session, preferred over an old session
+ *  record whose chatType/chatId may predate a DM→group handoff (the worker
+ *  refreshes it for the current managed session). Never applied to an explicit
+ *  different sid. A virtual (headless/HTTP) value is skipped: it is a spawn-time
+ *  snapshot that cannot name a Feishu chat, and a session later bound to a real
+ *  chat keeps it in its env — only the record knows the bound chat. */
+function currentSessionEnvChatId(sid: string): string | undefined {
+  if (sid !== process.env.BOTMUX_SESSION_ID) return undefined;
+  const chatId = process.env.BOTMUX_CHAT_ID?.trim();
+  return chatId && !isHttpVirtualSession(chatId) ? chatId : undefined;
+}
+
 async function cmdTabs(rest: string[]): Promise<void> {
   const {
     CHAT_TABS_CLI_USAGE,
@@ -9589,12 +9627,7 @@ async function cmdTabs(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'tabs');
-  // The worker refreshes BOTMUX_CHAT_ID for the current managed session. Prefer
-  // that turn-bound value over an old session record whose chatType/chatId may
-  // predate a DM→group handoff. Never apply it to an explicit different sid.
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -9642,9 +9675,7 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'top-notice');
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux top-notice: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -10109,7 +10140,8 @@ import {
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
-import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery, prepareNativeOncallCard } from './im/lark/oncall-group.js';
+import { OncallGroupStore } from './services/oncall-group-store.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from './im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
@@ -10375,7 +10407,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--reply-to', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -10610,7 +10642,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
   // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
   // can only ever answer "no bots at all". Letting that stand would silently turn
   // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
-  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // it exists to catch — and resolveManagedOriginTransport() (which advertises
   // itself as tamper-resistant) delegates its verdict here.
   //
   // The worker already hands this bot its OWN config through the designed private
@@ -10666,35 +10698,98 @@ function currentTurnHasNoTransport(): boolean {
   return !!appId && currentBotIsApiOnly(appId);
 }
 
-/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
- *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
- *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+interface ManagedOriginTransportVerdict {
+  noTransport: boolean;
+  chatId: string | undefined;
+  /** A visible ancestor marker and BOTMUX_SESSION_ID name different sessions. */
+  sessionConflict?: { ancestorSessionId: string; envSessionId: string };
+}
+
+let managedOriginTransportVerdict: ManagedOriginTransportVerdict | undefined;
+
+/** Tamper-resistant managed-origin transport verdict, plus the chatId it was
+ *  judged from.
+ *
+ *  Checks the pid-marker ANCESTRY (process.ppid walk) before the general routing
+ *  resolver; a conflicting BOTMUX_SESSION_ID is refused. Then loads the record and
  *  judges transport from its chatId + its bot's apiOnly config. So `env -u
  *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
- *  managed no-transport identity. Returns false (not gated) when no managed
- *  origin resolves — a bare host-operator shell keeps full access. Total; on any
- *  resolution error falls back to the env-based check (never throws). */
-function managedOriginHasNoTransport(): boolean {
+ *  managed no-transport identity. Returns `noTransport: false` (not gated) when
+ *  no managed origin resolves — a bare host-operator shell keeps full access.
+ *  Total; on any resolution error falls back to the env-based check (never
+ *  throws).
+ *
+ *  The record is the routing truth, not the env: BOTMUX_CHAT_ID is a spawn-time
+ *  snapshot, so a session that was headless when its CLI was spawned and was
+ *  later bound/transferred to a real chat keeps that very process (the tmux
+ *  backend re-attaches to the surviving `bmx-<sessionId>` rather than
+ *  respawning), and its env never learns about the move. `chatId` is returned so
+ *  the refusal message can name the reason the same snapshot was judged from.
+ *
+ *  Judged once per process: the root-dispatch gate and the command's own early
+ *  gate ask the same question moments apart, and the record lookup loads every
+ *  bot's session store (hundreds of ms on a large fleet). */
+function resolveManagedOriginTransport(): ManagedOriginTransportVerdict {
+  managedOriginTransportVerdict ??= judgeManagedOriginTransport();
+  return managedOriginTransportVerdict;
+}
+
+function judgeManagedOriginTransport(): ManagedOriginTransportVerdict {
+  const envVerdict = (requireEnvSession: boolean) => ({
+    noTransport: (!requireEnvSession || !!process.env.BOTMUX_SESSION_ID)
+      && currentTurnHasNoTransport(),
+    chatId: process.env.BOTMUX_CHAT_ID,
+  });
   try {
-    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    const dataDir = resolveDataDir();
+    const envSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+    // The general routing resolver treats envSessionId as ground truth and
+    // skips conflicting markers. A transport gate must observe the ancestor
+    // before that filter, or a changed env could select another real session.
+    // Reject the conflict rather than routing through either identity; legacy
+    // markers without a birth stamp may be stale, not just a changed env.
+    const ancestor = findLiveAncestorSessionContext(dataDir);
+    if (ancestor?.sessionId && envSessionId && ancestor.sessionId !== envSessionId) {
+      return {
+        noTransport: true,
+        chatId: undefined,
+        sessionConflict: { ancestorSessionId: ancestor.sessionId, envSessionId },
+      };
+    }
+    const ctx = ancestor?.sessionId ? ancestor : resolveSessionContext(dataDir, envSessionId);
     if (!ctx?.sessionId) {
       // No managed origin at all (bare operator). Still honor an explicit env
       // signal if present (daemon-spawned turn whose marker was pruned), but a
       // truly bare shell has neither → not gated.
-      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+      return envVerdict(true);
     }
     const s = loadSessions().get(ctx.sessionId);
     if (!s) {
       // Marker resolved a session id but no record on disk (riff sandbox etc.) —
       // fall back to the env view for that same managed turn.
-      return currentTurnHasNoTransport();
+      return envVerdict(false);
     }
     const chatId = s.chatId ?? '';
-    if (isHttpVirtualSession(chatId)) return true;
-    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+    return {
+      noTransport: isHttpVirtualSession(chatId)
+        || (!!s.larkAppId && currentBotIsApiOnly(s.larkAppId)),
+      chatId,
+    };
   } catch {
-    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    return envVerdict(true);
   }
+}
+
+/** Refusal text for a marker/env session conflict. Naming both ids keeps the
+ *  real reason visible instead of the generic no-transport causes. */
+function managedOriginConflictMessage(
+  op: string,
+  conflict: NonNullable<ManagedOriginTransportVerdict['sessionConflict']>,
+): string {
+  return `botmux ${op} is unavailable: an ancestor process marker names session ` +
+    `${conflict.ancestorSessionId}, but BOTMUX_SESSION_ID names ${conflict.envSessionId}.\n` +
+    `Feishu read/write is refused rather than routed through either session. Run it\n` +
+    `from the session's own CLI without overriding BOTMUX_SESSION_ID.`;
 }
 
 /** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
@@ -10703,8 +10798,17 @@ function managedOriginHasNoTransport(): boolean {
  *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
  *  for type-flow clarity; execution never continues past the exit. */
 function assertTurnTransportOrExit(op: string): void {
-  if (!currentTurnHasNoTransport()) return;
-  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  // Judge with the SAME managed-origin verdict the root-dispatch gate applies to
+  // every Lark-facing command. Judging by the env alone permanently refused
+  // `send` (and every sibling verb) in a session that was spawned headless and
+  // later bound to a real chat — see resolveManagedOriginTransport.
+  const verdict = resolveManagedOriginTransport();
+  if (!verdict.noTransport) return;
+  if (verdict.sessionConflict) {
+    console.error(managedOriginConflictMessage(op, verdict.sessionConflict));
+    process.exit(2);
+  }
+  const chatId = verdict.chatId ?? '';
   const headless = chatId.startsWith('headless_');
   const why = headless
     ? 'this turn runs in a headless automation session (no Feishu chat)'
@@ -10763,7 +10867,11 @@ async function registerSelfFromCredFile(): Promise<void> {
   // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
   // no secret is still a no-op (nothing to register).
   if (!cred.larkAppSecret && cred.apiOnly !== true) return;
-  const { registerBot } = await import('./bot-registry.js');
+  const { registerBot, resolveHideLocalAddresses } = await import('./bot-registry.js');
+  // Read before registering: a host session can read bots.json (the live
+  // setting); only an isolated sandbox falls back to the worker's snapshot.
+  // The cred file outlives the sandboxed session that wrote it.
+  const hideLocalAddresses = resolveHideLocalAddresses(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -10779,6 +10887,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -10867,6 +10976,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
   const session: SessionData = {
@@ -10989,27 +11099,57 @@ async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
     return { kind: 'error', message: t('xpi.send.as_usage') };
   }
 
-  // Read stdin before session/ledger/marker resolution. This is the same read
-  // the command used to perform later, but doing it here keeps a rejected body
-  // from advancing a queued turn or copying an open socket into a transport.
-  // Trade-off: this read also precedes the workflow/transport/capability gates
-  // inside cmdSend, so a non-TTY stdin that never reaches EOF blocks before
-  // those gates can refuse. That fd shape is not reachable in production (the
-  // worker hands the CLI a TTY; remote-runner uses --content-file with
-  // stdio:'ignore'), and the queued-turn ordering win is worth it.
-  const stdinContent = await readStdin();
+  // Read stdin before session/ledger/marker resolution, so a rejected body can
+  // neither advance a queued turn nor copy an open socket into a transport.
+  // How long to wait depends on what fd 0 is (src/cli/send-stdin.ts): a
+  // terminal or /dev/null never carries a body, and an attachment send only
+  // takes a piped body that is already flowing. A caller can hand the CLI a
+  // pipe that never reaches EOF — Claude Code's Bash tool does for a command
+  // that contains a heredoc — and waiting on it wedged attachment-only sends.
+  // A body-only send (or an explicit lone '-') still waits for EOF, so
+  // `slow-producer | botmux send` keeps working; it also still precedes the
+  // workflow/transport/capability gates inside cmdSend.
+  const flags = plan.invocation.flags;
   const loneDash = plan.invocation.positionals.length === 1 && plan.invocation.positionals[0] === '-';
+  const { images, files, videos, videoCovers } = plan.attachments;
+  const hasAttachments = images.length + files.length + videos.length + videoCovers.length > 0;
+  const stdinShape = classifySendStdin();
+  const stdinRead = await readSendStdin(sendStdinPolicy(stdinShape, { explicitDash: loneDash, hasAttachments }));
+  const stdinContent = decodeStdinBytes(stdinRead.bytes);
   if (loneDash && !stdinContent.trim()) {
     return {
       kind: 'error',
       message: "botmux send: 位置参数 '-' 表示从 stdin 读正文，但 stdin 没有内容；多行正文请直接用 botmux send <<'EOF' … EOF。",
     };
   }
-  const hasAttachments = plan.attachments.images.length + plan.attachments.files.length
-    + plan.attachments.videos.length + plan.attachments.videoCovers.length > 0;
-  if (!loneDash && !stdinContent.trim() && !hasAttachments
-    && !Object.hasOwn(plan.invocation.flags, '--diff') && !asChoice) {
-    return { kind: 'error', message: 'botmux send: 正文为空（stdin 没有内容）。' };
+  if (!loneDash && !stdinContent.trim()) {
+    const emptyReason = describeEmptySendStdin(stdinShape, stdinRead.outcome);
+    if (!hasAttachments && !Object.hasOwn(flags, '--diff') && !asChoice) {
+      return {
+        kind: 'error',
+        message: `botmux send: 正文为空（${emptyReason}）。请把正文写成位置参数，或用 --content-file <文件>；多行正文用 botmux send <<'EOF' … EOF。`,
+      };
+    }
+    // Same shape test cmdSend applies to the final rendered body; failing here
+    // keeps the refusal ahead of any session or transport resolution. Voice,
+    // slash and --diff primaries are not the reply card and report their own
+    // body errors; --as synthesizes its body.
+    const replyCardPrimary = !asChoice && !Object.hasOwn(flags, '--diff')
+      && !Object.hasOwn(flags, '--voice') && !Object.hasOwn(flags, '--slash');
+    if (hasAttachments && replyCardPrimary && primaryCardBodyMissing({
+      hasBodyText: false,
+      imageCount: images.length,
+      fileCount: files.length,
+      videoCount: videos.length,
+      mentionCount: (flags['--mention']?.length ?? 0) + (Object.hasOwn(flags, '--mention-back') ? 1 : 0),
+    })) {
+      return { kind: 'error', message: sendBodyRequiredMessage(emptyReason) };
+    }
+    if (stdinRead.outcome === 'no-input') {
+      // The only case where a body could still have been on its way: say so,
+      // rather than drop a slow producer's text without a trace.
+      console.error(`botmux send: ${emptyReason}，按不带正文发送附件；正文由较慢的管道产生时请加 '-'。`);
+    }
   }
   return { kind: 'plan', plan: { ...plan, stdinContent } };
 }
@@ -11633,6 +11773,16 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Quote chain (chat scope): --quote <message_id> overrides the auto target,
   // --no-quote forces a plain (un-quoted) send.
   const explicitQuote = argValue(rest, '--quote');
+  if (flagPresentButValueMissing(rest, '--reply-to')
+    || rest.filter(token => token === '--reply-to' || token.startsWith('--reply-to=')).length > 1) {
+    console.error('botmux send: --reply-to 需要且只能指定一个消息编号');
+    process.exit(2);
+  }
+  const explicitReplyTo = argValue(rest, '--reply-to');
+  if (explicitReplyTo !== undefined && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined)) {
+    console.error('botmux send: --reply-to 不能与 --top-level / --chat-id / --into / --quote 混用');
+    process.exit(2);
+  }
   const managedQuoteError = managedVcQuoteError({
     managed: !!vcMeetingManagedSendOrigin,
     durableDelivery: !!vcMeetingDeliveryReplyOrigin,
@@ -11921,11 +12071,25 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
 
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
-  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const replyMarker = trustedRelayCtx && process.env.BOTMUX_REPLY_MESSAGE_ID
+    ? { sessionId: trustedRelayCtx.sessionId, turnId: trustedRelayCtx.turnId,
+        queuedTurns: [{ turnId: process.env.BOTMUX_REPLY_MESSAGE_ID, inputConsumed: true as const }] }
+    : liveMarkerCtx;
+  let replyMessageId = currentTurnId;
+  try {
+    replyMessageId = selectReplyMessageId(s, currentTurnId,
+      !sendTopLevel && !overrideChatId && !sendInto && explicitQuote === undefined
+        && !vcMeetingManagedSendOrigin && originSessionId === sid ? replyMarker : undefined,
+      explicitReplyTo);
+  } catch (error) {
+    console.error(`botmux send: ${error instanceof Error ? error.message : error}`);
+    process.exit(2);
+  }
+  const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
   const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.quoteTargetId
+    ?? s.turnReplyContexts?.[replyMessageId ?? '']?.quoteTargetId
     ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-    ?? (currentTurnId?.startsWith('om_') ? currentTurnId : undefined);
+    ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined);
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12021,7 +12185,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const frozenTurnDispatch = originSessionId === sid
     ? exactOriginDispatch
     : undefined;
-  const frozenTurnReplyTarget = frozenTurnDispatch?.replyTarget;
+  const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
+    ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
   if (exactOriginDispatch?.deliverySink === 'http_wait'
     || exactOriginDispatch?.deliverySink === 'http_async'
     || exactOriginDispatch?.deliverySink === 'suppressed') {
@@ -12471,7 +12637,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? turnReplyTarget?.senderOpenId
+    ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
     ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
     // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
     // borrowed as a legacy fallback when there is NO currentTurnId (true
@@ -12545,14 +12711,16 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
   }
   if (!customCard && preparedText !== undefined) expectedLinkRenderedContent = preparedText;
-  const fileOnlyPrimaryRequested = !customCard
-    && !expectedLinkRenderedContent.trim()
-    && !asChoice
-    && images.length === 0
-    && files.length === 1
-    && videoAttachments.length === 0
-    && mentionArgs.length === 0
-    && !mentionBack;
+  // Requested mentions, not resolved ones: a mention that resolves to nobody
+  // must not silently turn an addressed send into a bare media message.
+  const primaryShape = {
+    hasBodyText: !!expectedLinkRenderedContent.trim(),
+    imageCount: images.length,
+    fileCount: files.length,
+    videoCount: videoAttachments.length,
+    mentionCount: mentionArgs.length + (mentionBack ? 1 : 0),
+  };
+  const fileOnlyPrimaryRequested = !customCard && !asChoice && shouldSendAsPureFile(primaryShape);
   // A file-only final intentionally has no card body. Its attachment is the
   // user-visible primary content, so inspect it only when link validation or a
   // durable final-answer fingerprint needs the bytes. The bounded streaming
@@ -12606,6 +12774,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file "${TMPDIR:-/tmp}/msg.md" --images "${TMPDIR:-/tmp}/chart.png"\n  botmux send --videos "${TMPDIR:-/tmp}/replay.mp4" --video-covers "${TMPDIR:-/tmp}/cover.png" --no-mention "视频预览"');
     process.exit(1);
+  }
+  // Every body source converges here before any upload or provider write: an
+  // empty --content-file, a blank positional, a relay's prepared copy. (A
+  // stdin body was already refused in preflight with its stdin-specific
+  // reason.) The pure file / pure video shapes are the only media primaries;
+  // anything else would publish a reply card with nothing in its body.
+  if (!customCard && !asChoice && !asVoice && !isSlashSend && primaryCardBodyMissing(primaryShape)) {
+    console.error(sendBodyRequiredMessage(contentFile ? '--content-file 的内容为空' : '正文为空'));
+    process.exit(2);
   }
 
   // --attention guard: only valid replying into the current session with a text
@@ -12680,7 +12857,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           explicitQuote,
           noQuote,
           quoteTargetId: explicitQuote
-            ?? frozenTurnDispatch?.quoteTargetId
+            ?? (selectedReplyContext ? turnBoundQuoteTarget : frozenTurnDispatch?.quoteTargetId)
             ?? turnBoundQuoteTarget
             ?? (currentTurnId ? undefined : s.quoteTargetId),
           frozenReplyTarget: frozenTurnReplyTarget,
@@ -12762,6 +12939,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    // A retry after a lost reply-card mark completes it; a final already on
+    // the card is left alone by the store.
+    if (effectiveResponseKind === 'final' && currentTurnId) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+        overrideChatId ?? s.chatId, sendTopLevel || !!sendInto || !!overrideChatId);
+    }
     await removeScheduleSelfAfterFinal();
     if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
       advanceAncestorSessionTurn(
@@ -13382,9 +13565,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   feedbackPolicy = feedbackPolicyForScheduledSend({ policy: feedbackPolicy,
     requesterSubjectId: feedbackRequesterSubjectId,
     authenticatedTurnId: authoritativeOriginTurnCtx?.turnId, session: scheduledOrigin });
+  // Oncall is session-scoped even when the CLI's turn lease has retired.
+  // Reuse a proven existing turn for card indexing without changing send authority.
+  const oncallTurnId = currentTurnId ?? new OncallGroupStore(resolveDataDir()).latest(appId, sid)?.questionId;
+  const nativeOncallLink = effectiveResponseKind === 'final' && !asVoice && !sendTopLevel && !overrideChatId && !sendInto && !vcMeetingManagedSendOrigin
+    ? await prepareNativeOncallCard(appId, s.chatId, oncallTurnId ?? '', sid) : undefined;
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
-    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
+    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType, oncallTurnId ? { appId, sessionId: sid, questionId: oncallTurnId, phase: 'final', nativeLink: nativeOncallLink } : undefined);
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
   };
@@ -13428,6 +13616,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // VC turns carry their own single-target origin, so they skip this gate.
   if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
     const window = collectTurnWindowParticipants(s, currentTurnId);
+    const selectedWindow = selectedReplyContext ? collectTurnWindowParticipants(s, replyMessageId) : window;
+    window.participants = dedupeParticipants([...window.participants, ...selectedWindow.participants]);
+    window.incomplete ||= selectedWindow.incomplete;
     const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
     if (ambiguity.ambiguous) {
       console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
@@ -13438,9 +13629,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
-  if (mentionBack && replyTargetSenderOpenId
-      && !mentions.some(m => m.open_id === replyTargetSenderOpenId)) {
-    mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
+  const mentionReplySender = selectedReplyContext
+    ? turnReplyTarget?.senderOpenId ?? selectedReplyContext.replyTargetSenderOpenId
+    : replyTargetSenderOpenId;
+  if (mentionBack && mentionReplySender
+      && !mentions.some(m => m.open_id === mentionReplySender)) {
+    mentions.push({ open_id: mentionReplySender, name: '' });
   }
 
   const { sendMessage, replyMessage, urgentMessage, uploadImage: uploadLarkImage, uploadFile: uploadLarkFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
@@ -13739,7 +13933,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin
       ? undefined
       : explicitVcMeetingImOrigin?.larkMessageId
-        ?? frozenTurnDispatch?.quoteTargetId
+        ?? (selectedReplyContext ? turnBoundQuoteTarget : frozenTurnDispatch?.quoteTargetId)
         ?? turnBoundQuoteTarget
         ?? (currentTurnId ? undefined : s.quoteTargetId),
   });
@@ -13753,7 +13947,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // 上面或 `shouldDropAfterTheFactTopicQuote` 里短路，普通热路径不多付这次调用。
   // 探测失败一律保持 quote（既有默认行为），绝不因为不确定就改变所有正常回复的落点。
   const quotedTurnInThread = quoteTargetId
-    ? (s.turnReplyContexts?.[currentTurnId ?? '']?.inThread
+    ? (s.turnReplyContexts?.[replyMessageId ?? '']?.inThread
       ?? s.turnReplyContexts?.[quoteTargetId]?.inThread)
     : undefined;
   let effectiveQuoteTargetId = quoteTargetId;
@@ -14271,9 +14465,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
       // can't embed `<at>`), so it falls through to the card branch which renders
-      // the @ on the footer and sends the video as a follow-up attachment — same
-      // shape as an attachment-only `--files … --mention …` send, whose card body
-      // is likewise empty. See shouldSendAsPureVideo.
+      // the @ on the footer and sends the video as a follow-up attachment. That
+      // card needs a body: a mentioned media send without text or an image was
+      // already refused (primaryCardBodyMissing), never sent as an empty card.
+      // See shouldSendAsPureVideo.
       // No card/text primary here, so the FIRST media message must carry the
       // quote chain itself (dispatchPrimary applies the chat-scope quoteTargetId
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
@@ -14465,12 +14660,26 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
+        let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
                 ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
             : { kind: 'progress', text }, {
             beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+            beforeCreate: async () => {
+              const port = findDaemon(appId)?.ipcPort ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+              if (!port) throw new Error('Native thinking publication requires the live daemon');
+              const ready = await postSessionCliIpc(port, sid, 'reply-card-ready', {
+                expectedTurnId: currentTurnId, dispatchAttempt: originDispatchAttempt,
+              });
+              if (!ready.ok) throw new Error('Native thinking publication is not ready; answer send deferred');
+              // Only an explicit confirmation lets native thinking carry
+              // progress; an older daemon or failed display keeps the card.
+              const readiness = await ready.json().catch(() => undefined) as { nativeThinkingVisible?: unknown } | undefined;
+              await revalidateIsolatedOriginBeforeEffect();
+              return readiness?.nativeThinkingVisible === true;
+            },
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
@@ -14480,11 +14689,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
                 beginScheduledProviderEffect();
               }),
             isWithdrawn: error => error instanceof MessageWithdrawnError,
-            render: record => buildTurnReplyCard(record, {
+            render: record => attachOncallGroupButton(buildTurnReplyCard(record, {
               ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
               showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
               canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
-            }),
+            }), oncallGroupPolicy, s.chatId, s.chatType, { appId, sessionId: sid, questionId: record.turnId,
+              phase: record.finalCard ? 'final' : 'first', nativeLink: nativeOncallLink }),
             sendOverflow: async (fullText, uuid) => {
               const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
               writeFileSync(path, fullText, { mode: 0o600 });
@@ -14493,12 +14703,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
+            // Progress is expected here; asking for a final would push the
+            // model to lock the turn early with an interim note.
+            undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
+          }
           return delivered.messageId ?? '';
         });
         turnPrimaryReplayed ||= replyDelivery.replayed;
         unifiedReplyUsed = true;
         if (!replyDelivery.messageId) {
-          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+          console.error(undeliveredProgressHint);
           console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
           return;
         }
@@ -14536,6 +14751,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     if (turnPrimaryReplayed) {
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
+      // The first sender may have lost the reply-card mark; it is idempotent.
+      if (effectiveResponseKind === 'final' && currentTurnId) {
+        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+          targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
+      }
       await removeScheduleSelfAfterFinal();
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -14556,10 +14776,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       return;
     }
 
+    if (effectiveResponseKind === 'final' && messageId && currentTurnId && !unifiedReplyUsed) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+        targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
+    }
+
     if (oncallGroupCard && messageId) {
-      recordOncallGroupDelivery(resolveDataDir(), { appId, chatId: targetChatId, messageId,
-        questionId: currentTurnId ?? messageId,
-        answer: text, card: oncallGroupCard });
+      recordOncallGroupDelivery(resolveDataDir(), { appId, chatId: targetChatId, messageId, sessionId: sid, rootId: s.scope === 'chat' ? s.chatId : s.rootMessageId,
+        questionId: oncallTurnId ?? messageId,
+        answer: text, card: oncallGroupCard, nativeLink: nativeOncallLink, dispatchAttempt: originDispatchAttempt });
     }
 
     // Turn-completion bookkeeping is INDEPENDENT of the feedback card. A
@@ -14747,17 +14972,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
     // Sentinel guidance is surfaced HERE — in the send-success output the model
     // reads back — rather than only in the injected system prompt. A model only
-    // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
-    // cannot use the sentinel to end a turn where it did work but forgot to send
+    // gets completion guidance only after a final has actually been sent, so a
+    // progress receipt cannot invite it to end before delivering the answer
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
-    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
-      ? t('ai.send.after_success_unified', undefined, sendLocale)
-      : advancedNextTurnId
-        ? t('ai.send.after_success_steer_advanced', undefined, sendLocale)
-        : t('ai.send.after_success_hint', undefined, sendLocale));
+    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId), undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -15226,7 +15447,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 }
 
 async function cmdAuth(rest: string[]): Promise<void> {
-  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs } = await import('./cli/auth-request.js');
+  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthExitCode } = await import('./cli/auth-request.js');
   let parsed;
   try {
     parsed = parseAuthRequestArgs(rest);
@@ -15272,21 +15493,26 @@ async function cmdAuth(rest: string[]): Promise<void> {
         if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
         claim = read;
       }
-      const authBody = parsed.command === 'request'
-        ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
-        : { requestId: parsed.requestId };
+      const provider = parsed.command === 'request' ? parsed.provider : undefined;
+      const tenant = parsed.command === 'request' ? parsed.tenant : undefined;
+      const authBody = provider ? { provider, ...(tenant ? { tenant } : {}) }
+        : parsed.command === 'request'
+          ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
+          : { requestId: parsed.requestId };
+      // A provider request may start a device login and send a DM before it answers.
+      const requestTimeout = Math.min(provider ? 60_000 : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
           method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': toolBinding.accessKey },
-          body: JSON.stringify(authBody), signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+          body: JSON.stringify(authBody), signal: AbortSignal.timeout(requestTimeout),
         })
         : await postCurrentSessionDaemonRoute({
           path: `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`,
           sessionId: sid,
           larkAppId,
           ...(claim ? { originClaim: claim } : {}),
-          signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+          signal: AbortSignal.timeout(requestTimeout),
           body: {
             ...authBody,
             ...(claim ? {
@@ -15296,7 +15522,14 @@ async function cmdAuth(rest: string[]): Promise<void> {
             } : {}),
           },
         });
-      const body = await response.json() as { ok?: boolean; status?: string };
+      const body = await response.json() as { ok?: boolean; status?: string; message?: string; error?: string };
+      if (provider) {
+        if (parsed.command === 'request' && parsed.json) console.log(JSON.stringify(body));
+        else if (body.message) console.log(body.message);
+        else console.error(`botmux auth: ${body.error ?? `HTTP ${response.status}`}`);
+        process.exitCode = providerAuthExitCode(response.ok && body.ok === true, body.status);
+        return;
+      }
       if (parsed.command === 'wait' && response.ok && body.ok === true && body.status === 'pending') {
         await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(2_000, deadline - Date.now()))));
         continue;
@@ -17772,10 +18005,11 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   try {
     // Versioned admission prevents an old daemon silently dropping the
     // respondent restriction on a choice-only request. Never downgrade it.
-    const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
+    const endpoint = body.timeoutMs === 0 ? '/api/asks/no-deadline-v1'
+      : body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
       ? '/api/asks/form-v1' : '/api/asks';
-    // No client-side timeout — broker enforces `timeoutMs` and will respond
-    // with `kind:'timedOut'` so this fetch always settles.
+    // No client-side timeout — the broker owns finite expiry and explicit
+    // no-deadline asks wait for an answer or invalidation.
     res = await postAskIpc(daemon.ipcPort, endpoint, body);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
@@ -18001,18 +18235,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');
   };
   process.on('SIGINT', protectAskWait);
-  const reconnectDeadline = Date.now() + timeoutMs + 60_000;
   let result: import('./core/ask-types.js').AskResult;
   try {
-    while (true) {
-      try { result = await postAsk(body); break; }
-      catch (err) {
-        if (!(err as { retryable?: boolean }).retryable || Date.now() >= reconnectDeadline) throw err;
-        // The daemon owns the deadline and receipt. Reuse the same request;
-        // don't convert a transport failure into a human decision/timeout.
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+    const { waitForExplicitAskResult } = await import('./core/explicit-ask-continuation.js');
+    result = await waitForExplicitAskResult(body, postAsk);
   } catch (err) {
     process.removeListener('SIGINT', protectAskWait);
     console.error((err as Error).message);
@@ -19869,6 +20095,7 @@ if (__entrySubcommand) {
   // help dump instead of a session, and nothing reported an error.
   else if (__entrySubcommand === 'codex-app-runner') await import('./codex-app-runner.js');
   else if (__entrySubcommand === 'minimax-runner') await import('./minimax-runner.js');
+  else if (__entrySubcommand === 'antigravity-runner') await import('./antigravity-runner.js');
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
@@ -20942,10 +21169,9 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // ─── Central root-dispatch transport gate ──────────────────────────────────
 // A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
 // or a virtual/headless session) must not run ANY Lark-facing command. The managed
-// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
-// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
-// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
-// managed identity. We then load THAT session's record and gate on its chatId +
+// gate observes the pid-marker ancestry before env-based routing and refuses a
+// conflicting env session, so changing or removing BOTMUX_SESSION_ID cannot
+// discard a visible ancestor origin. We load that session's record and gate on its chatId +
 // its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
 // also can't flip the verdict. Covers every Feishu-facing verb by construction.
 // A BARE host-operator shell (no ancestry marker, no env session) resolves no
@@ -20956,13 +21182,16 @@ const LARK_FACING_COMMANDS = new Set([
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
-if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
-  console.error(
-    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
-    `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
-    `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
-    `through the current session result channel.`,
-  );
+const managedOriginVerdict = LARK_FACING_COMMANDS.has(command)
+  ? resolveManagedOriginTransport()
+  : undefined;
+if (managedOriginVerdict?.noTransport) {
+  console.error(managedOriginVerdict.sessionConflict
+    ? managedOriginConflictMessage(command, managedOriginVerdict.sessionConflict)
+    : `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+      `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
+      `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
+      `through the current session result channel.`);
   process.exit(2);
 }
 
@@ -20981,6 +21210,20 @@ switch (command) {
       process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
     } catch (error) {
       console.error(`__pty-smoke: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
+  case '__screenshot-smoke': {
+    try {
+      const output = process.argv[3];
+      if (!output) throw new Error('an output PNG path is required');
+      const { runScreenshotSmoke } = await import('./cli/screenshot-smoke.js');
+      const png = await runScreenshotSmoke();
+      writeFileSync(output, png);
+      process.stdout.write(`${JSON.stringify({ ok: true, bytes: png.length })}\n`);
+    } catch (error) {
+      console.error(`__screenshot-smoke: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
     }
     break;

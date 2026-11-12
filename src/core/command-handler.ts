@@ -18,13 +18,16 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { requestMeegoLogin } from '../services/meego-auth.js';
+import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
 import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
-import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
+import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
@@ -43,11 +46,11 @@ import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dis
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { ALL_CLI_IDS, cliAliasesSelecting, createCliAdapterSync, resolveCliName } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
@@ -57,7 +60,7 @@ import { logger } from '../utils/logger.js';
 import { isStoreFileUnavailableError } from '../utils/json-file.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
-import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -146,6 +149,7 @@ import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
+import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
@@ -163,7 +167,7 @@ import {
 import { isSessionGroup } from '../services/session-groups-store.js';
 import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
 import { dismissSessionGroup } from './dismiss-command.js';
-import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from './resume-result-message.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
@@ -238,6 +242,16 @@ function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backe
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
   if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(cliId)) return 'selected CLI cannot use codexRpcInput';
   return undefined;
+}
+
+function cliSelectionUsage(loc: Locale): string {
+  // An unrestricted bot: drops only the CLIs `/cli` refuses everywhere (riff).
+  const ids = ALL_CLI_IDS.filter(id => !cliSelectionSecurityError({}, id, 'default'));
+  const aliases = ids.flatMap(id => {
+    const names = cliAliasesSelecting(id);
+    return names.length ? [`${names.join(' / ')} → ${id}`] : [];
+  });
+  return t('cmd.cli.usage', { aliases: aliases.join('\n'), ids: ids.join(', ') }, loc);
 }
 
 /**
@@ -1666,9 +1680,14 @@ export async function handleCotCommand(
   }
 
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
-  // Master switch defaults ON — only an explicit false means disabled.
+  // /cot controls all enabled process destinations for the effective reply mode.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
+    try {
+      const cfg = getBot(larkAppId).config;
+      const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+      const unified = ds?.currentTurnId ? replyCardModeFor(ds) !== 'legacy' : cfg.replyCardMode === 'unified';
+      return cfg.cotEnabled !== false || (unified && cfg.replyCardNativeCot === true);
+    } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1700,6 +1719,7 @@ export async function handleCotCommand(
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid, beforeWrite) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid, beforeWrite }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
+        updateReplyCardNativeThinking(ds, update);
         return;
       }
       // Turn in flight with thinking already accumulated — render right away
@@ -1835,10 +1855,7 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   if (result.ok) {
     const cliName = sessionCliDisplayName(result.ds);
     const resultLoc = localeForBot(result.ds.larkAppId);
-    if (result.recoveryPending) return t('card.action.resume_started_remote', { cliName }, resultLoc);
-    return resumeStartsFresh(result.ds.session)
-      ? t('card.action.resume_success_fresh', { cliName }, resultLoc)
-      : t('card.action.resume_success', { cliName }, resultLoc);
+    return resumeSuccessMessage(result, cliName, resultLoc);
   }
   switch (result.error) {
     case 'not_closed': return t('card.action.resume_not_closed', undefined, loc);
@@ -2121,21 +2138,19 @@ export async function handleCommand(
           break;
         }
         const botCfg = getBot(ds.larkAppId).config;
-        const rawArgs = message.content.replace(/^\/cli\s*/i, '').trim();
-        const args = rawArgs.split(/\s+/u);
-        const requestedId = args[0];
-        let selectedCliId: CliId | undefined;
-        if (args.length === 1) {
-          try {
-            selectedCliId = createCliAdapterSync(requestedId as CliId).id as CliId;
-          } catch {
-            // Keep the normal invalid-CLI response below.
-          }
-        }
-        if (!selectedCliId) {
-          await sessionReply(rootId, 'Usage: /cli <cliId>\nUnknown or invalid CLI.');
+        const args = message.content.replace(/^\/cli\s*/i, '').trim().split(/\s+/u).filter(Boolean);
+        const requested = args.length === 1 ? resolveCliName(args[0]!) : undefined;
+        if (requested?.kind === 'ambiguous') {
+          const choices = requested.candidates.map(id => t('cmd.cli.choice', { cliId: id, name: getCliDisplayName(id) }, loc)).join(', ');
+          await sessionReply(rootId, t('cmd.cli.ambiguous', { input: args[0]!, choices }, loc));
           break;
         }
+        if (requested?.kind !== 'cli') {
+          const usage = cliSelectionUsage(loc);
+          await sessionReply(rootId, args.length === 1 ? `${t('cmd.cli.unknown', { input: args[0]! }, loc)}\n${usage}` : usage);
+          break;
+        }
+        const selectedCliId = requested.cliId;
         if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
@@ -2741,12 +2756,31 @@ export async function handleCommand(
           }
           // Run only after a clean explicit close, never on crash/restart/refusal.
           // The already-closed session and its receipt do not wait for OAuth/IM.
-          void tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId)
+          const closeTagging = pluginCommandGateway.replacesCloseTag(closed.current.larkAppId)
+            ? Promise.resolve({ status: 'skipped' as const })
+            : tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId);
+          void closeTagging
+            .catch(() => ({ status: 'failed' as const }))
             .then(async result => {
-              if (result.status === 'skipped') return;
-              await sessionReply(rootId, result.status === 'updated'
-                ? t('cmd.close.tag_updated', { name: result.name }, loc)
-                : t('cmd.close.tag_failed', undefined, loc));
+              if (result.status !== 'skipped') {
+                try {
+                  await sessionReply(rootId, result.status === 'updated'
+                    ? t('cmd.close.tag_updated', { name: result.name }, loc)
+                    : t('cmd.close.tag_failed', undefined, loc));
+                } catch (error) { logger.warn(`[${logTag}] close tag receipt failed: ${error}`); }
+              }
+              const outcomes = await pluginCommandGateway.afterClose({
+                larkAppId: closed.current.larkAppId, eventId: message.messageId, issuedAt: Number(message.createTime) || Date.now(),
+                command: '/close', args: '',
+                chat: { chatId: closed.current.chatId, chatType: closed.current.session.chatType ?? message.chatType ?? null, anchor: rootId },
+                sender: { openId: message.senderId ?? null, unionId: message.senderUnionId ?? null },
+                privileges: { canTalk: true, canOperate: canOperate(closed.current.larkAppId, closed.current.chatId, message.senderId, message.senderUnionId) },
+                locale: loc,
+              });
+              for (const outcome of outcomes) {
+                if (!outcome.ok) await sessionReply(rootId, '会话已关闭，但插件后续操作未确认，请检查群分类。');
+                else if (outcome.reply?.kind === 'text') await sessionReply(rootId, outcome.reply.text);
+              }
             }).catch(err => logger.warn(`[${logTag}] close tag notification failed: ${err}`));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
@@ -4479,12 +4513,14 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         // Any reply carrying an authorization link reaches only the sender: a
         // group member opening someone else's link would authorize as THEMSELVES.
+        const loginChatId = ds?.chatId ?? message.chatId;
         const authLinkReply = (text: string, privateCommand = '/login') => deliverAuthLink({
           privateChat: (ds?.chatType ?? message.chatType) === 'p2p',
           openId: isUsableOpenId(loginOpenId) ? loginOpenId : undefined,
           text,
           replyInPlace: content => sessionReply(rootId, content),
           sendDirect: (openId, content) => sendUserMessage(botCfg2.larkAppId, openId, content),
+          ...(loginChatId ? { sendEphemeral: (openId: string, card: string) => sendEphemeralCard(botCfg2.larkAppId, loginChatId, openId, card) } : {}),
           locale: loc,
           privateCommand,
         });
@@ -4524,6 +4560,39 @@ export async function handleCommand(
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // `/login meego [dcar]` — the person's Meego login, kept once per person
+        // for every session of this bot. Independent of where ByteCloud
+        // credentials come from: the platform does not issue Meego logins.
+        // meegle keeps one login per tenant, so a dcar user names the tenant
+        // here the way `bytedcli meego login --tenant dcar` does.
+        const meegoArgs = subCmd.split(/\s+/);
+        if (meegoArgs[0] === 'meego') {
+          const tenantArg = meegoArgs.slice(1).join(' ').replace(/^--tenant(?:=|\s+)/, '').toLowerCase();
+          if (tenantArg && !MEEGO_TENANTS.includes(tenantArg as MeegoTenant)) {
+            await sessionReply(rootId, t('cmd.login.meego_tenant_invalid', { tenants: MEEGO_TENANTS.join(' / ') }, loc));
+            break;
+          }
+          const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
+          if (!bytedcliGoverned) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+            break;
+          }
+          if (!isUsableOpenId(loginOpenId)) {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+            break;
+          }
+          const login = await requestMeegoLogin(loginOpenId, tenant);
+          if (login.state === 'link') {
+            await authLinkReply([
+              t('auth_link.meego_title', undefined, loc), login.authUrl, '', t('auth_link.meego_footer', undefined, loc),
+            ].join('\n'), meegoLoginCommand(tenant));
+          } else {
+            await sessionReply(rootId, login.state === 'ready'
+              ? t('cmd.login.meego_ready', undefined, loc)
+              : t('provider_auth.unavailable', { provider: 'Meego', detail: login.detail }, loc));
+          }
+          break;
+        }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {
@@ -7270,6 +7339,9 @@ export async function startCodexAppThreadSession(
     current.session.title = `Codex App: ${title}`;
     current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'adopt';
+    markProjectImportPending(current.session);
     if (existingAppServerEndpoint) {
       // Do not reuse a possibly frozen runner/wrapper from the temporary
       // BotMux shell this topic started with. The next fork freezes the current
@@ -7291,6 +7363,7 @@ export async function startCodexAppThreadSession(
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
+    noteProjectAssociationChanged(current.session);
     return { status: 'switched' as const, anchor: sessionAnchorId(current) };
   });
   if (switched.status === 'gone') {
@@ -7406,12 +7479,25 @@ export async function startAdoptSession(
     current.session.serviceTier = 'inherit';
     current.adoptedFrom = adoptedFromForTarget(target);
     current.session.adoptedFrom = { ...current.adoptedFrom };
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'adopt';
+    markProjectImportPending(current.session);
     sessionStore.updateSession(current.session);
-    forkAdoptWorker(current);
+    const admission = forkAdoptWorker(current);
+    if (admission !== 'accepted') {
+      current.session.projectImportPending = false;
+      sessionStore.updateSession(current.session);
+      return { status: 'rejected' as const, anchor: sessionAnchorId(current) };
+    }
+    noteProjectAssociationChanged(current.session);
     return { status: 'adopted' as const, anchor: sessionAnchorId(current) };
   });
   if (adopted.status === 'gone') {
     await replyNoSession((content) => sessionReply(sessionAnchorId(ds), content), loc);
+    return;
+  }
+  if (adopted.status === 'rejected') {
+    await sessionReply(adopted.anchor, '外部会话未成功接入，请检查接入限制后重试。');
     return;
   }
   if (adopted.status === 'pending') {
@@ -7510,11 +7596,15 @@ export async function startResumeImportSession(
     current.session.workingDir = target.cwd;
     current.session.cliSessionId = target.cliSessionId;
     current.session.title = target.title || `Import: ${project}`;
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'resume_import';
+    markProjectImportPending(current.session);
     // Resume sandbox decision is left to forkWorker (resume=true → not
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
+    noteProjectAssociationChanged(current.session);
     return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
   });
   if (resumed.status === 'gone') {

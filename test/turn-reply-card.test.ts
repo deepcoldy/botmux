@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import MarkdownIt from 'markdown-it';
-import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
+import { TurnReplyCardStore, type ReplyCardAsk, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
@@ -14,6 +14,7 @@ import { cardMarkdownImageReferences, FEISHU_IMG_KEY } from '../src/im/lark/card
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
+import { projectGroupContextCard } from '../src/im/lark/group-context-card.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -29,6 +30,26 @@ it('reads the unified card tool visibility from bot config, defaulting to visibl
   ]));
   expect(replyCardPresentation(configs[0], 'oc_any').showTools).toBe(false);
   expect(replyCardPresentation(configs[1], 'oc_any').showTools).toBe(true);
+});
+
+it('keeps the initial answer compact while preserving stop and the final answer renderer', () => {
+  const record: TurnReplyCardRecord = { ...key, ...input, version: 1, phase: 'working', createdAtMs: 1,
+    nativeCot: true, progress: [], tools: [], usage: { context: null, tokens: null } };
+  const initial = JSON.parse(buildTurnReplyCard(record, presentation));
+  expect(initial.body.elements.some((e: any) => ['botmux_turn_status', 'botmux_turn_usage'].includes(e.element_id))).toBe(false);
+  const controls = initial.body.elements.find((e: any) => e.element_id === 'botmux_reply_actions');
+  const stop = controls.columns.flatMap((c: any) => c.elements).find((e: any) => e.tag === 'button');
+  expect(stop).toMatchObject({ size: 'small', behaviors: [{ type: 'callback', value: { action: 'stop_turn', reply_card_turn_id: key.turnId } }] });
+  for (const canStop of [true, false]) {
+    const raw = buildTurnReplyCard(record, { ...presentation, canStop });
+    const card = JSON.parse(raw);
+    const blankRows = card.body.elements.filter((element: any) => element.tag === 'markdown'
+      && !String(element.content ?? '').replace(/<[^>]*>|\u2063/g, '').trim());
+    expect(blankRows).toEqual([]);
+    expect(projectGroupContextCard(raw)).toEqual({ kind: 'runtime' });
+  }
+  const final = JSON.parse(buildTurnReplyCard({ ...record, phase: 'completed', finalCard: finalEvent().card, finalText: '完整答复' }, presentation));
+  expect(extractCardContent(JSON.stringify(final))).toContain('完整答复');
 });
 
 describe('one reply card per turn', () => {
@@ -49,6 +70,180 @@ describe('one reply card per turn', () => {
     await store.prepare(key, input);
   });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  // Native thinking that the barrier confirmed live carries passive progress.
+  // 'legacy' = an older daemon/CLI barrier that resolves without a visibility answer.
+  const nativeTurn = async (turnId: string, liveThinking: boolean | 'legacy' = true) => {
+    const nativeKey = { ...key, turnId };
+    await store.prepare(nativeKey, { ...input, nativeCot: true });
+    io.beforeCreate = vi.fn(async () => liveThinking === 'legacy' ? undefined : liveThinking);
+    return nativeKey;
+  };
+  const nativeAsk = (askId: string) => ({ ask: {
+    askId, nonce: 'nonce', larkAppId: key.larkAppId, sessionId: key.sessionId,
+    chatId: input.chatId, rootMessageId: input.rootId, createdAt: 1, deadlineAt: 60001, settled: false,
+    questions: [{ prompt: 'Continue?', options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], multiSelect: false }],
+  } }) as ReplyCardAsk;
+
+  it('keeps native CoT progress off the answer surface and publishes one final after reopening', async () => {
+    const nativeKey = await nativeTurn('om_native_quiet');
+    for (const event of [{ kind: 'start' as const }, { kind: 'progress' as const, text: 'I will check the evidence.' },
+      { kind: 'tools' as const, tools: [{ id: 'tool', name: 'Read', subject: 'evidence' }] }]) {
+      expect((await store.update(nativeKey, event, io)).delivered).toBe(false);
+    }
+    expect(io.send).not.toHaveBeenCalled();
+    expect(store.read(nativeKey)).toMatchObject({ progress: ['I will check the evidence.'], nativeCotReady: true, nativeCotVisible: true });
+    const reopened = new TurnReplyCardStore(dir);
+    await reopened.update(nativeKey, finalEvent('Verified answer'), io);
+    await reopened.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(io.beforeCreate).toHaveBeenCalledTimes(1);
+    expect(reopened.read(nativeKey)).toMatchObject({ finalDelivered: true, phase: 'completed', finalText: 'Verified answer' });
+  });
+
+  it.each([false, 'legacy'] as const)('keeps the answer card as the progress surface when native thinking is not live (barrier=%s)', async live => {
+    const nativeKey = await nativeTurn(`om_native_fallback_${live}`, live);
+    expect((await store.update(nativeKey, { kind: 'start' }, io)).delivered).toBe(true);
+    await store.update(nativeKey, { kind: 'progress', text: 'Still running the suite' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(io.patch).toHaveBeenCalledTimes(1);
+    expect(store.read(nativeKey)).toMatchObject({ nativeCotReady: true, messageId: expect.any(String) });
+    expect(store.read(nativeKey)?.nativeCotVisible).toBeUndefined();
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Still running the suite');
+    // The barrier ran once; later updates do not reopen native thinking.
+    expect(io.beforeCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not create a completed progress card when a final was sent separately for notifications', async () => {
+    const nativeKey = await nativeTurn('om_native_external_final');
+    await store.update(nativeKey, { kind: 'progress', text: 'Intermediate status' }, io);
+    expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(true);
+    await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
+    await new TurnReplyCardStore(dir).update(nativeKey, { kind: 'refresh' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+    expect(store.read(nativeKey)).toMatchObject({ phase: 'completed', progress: ['Intermediate status'], externalFinal: true });
+  });
+
+  it('closes a native CoT turn that ended without any final with one completion card', async () => {
+    const nativeKey = await nativeTurn('om_native_no_final');
+    await store.update(nativeKey, { kind: 'progress', text: 'The answer only reached a progress send' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+    // A final for another chat is not this conversation's closing message.
+    expect(await store.noteExternalFinal(nativeKey, 'oc_elsewhere')).toBe(false);
+    expect((await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io)).delivered).toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('The answer only reached a progress send');
+    expect(store.read(nativeKey)?.externalFinal).toBeUndefined();
+  });
+
+  it('does not mark an answer that is already on the card as external', async () => {
+    const nativeKey = await nativeTurn('om_native_card_final');
+    await store.update(nativeKey, finalEvent('On the card'), io);
+    expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(false);
+    expect(await store.noteExternalFinal({ ...key, turnId: 'om_unprepared' }, input.chatId)).toBe(false);
+    expect(store.read(nativeKey)?.externalFinal).toBeUndefined();
+  });
+
+  it.each(['failed', 'cancelled', 'ambiguous'] as const)('publishes a native CoT %s outcome without requiring a final answer', async phase => {
+    const nativeKey = await nativeTurn(`om_native_${phase}`);
+    await store.update(nativeKey, { kind: 'progress', text: 'Intermediate status' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+    await store.update(nativeKey, { kind: 'terminal', phase }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(store.read(nativeKey)?.phase).toBe(phase);
+  });
+
+  it('still publishes an actionable question before a native CoT final answer', async () => {
+    const nativeKey = await nativeTurn('om_native_ask');
+    await store.update(nativeKey, { kind: 'ask', entry: nativeAsk('native_question') }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(store.read(nativeKey)?.lastCard).toContain('Continue?');
+  });
+
+  it.each([false, true])('keeps updating and settling a native CoT card that is already visible (external final=%s)', async external => {
+    const nativeKey = await nativeTurn(`om_native_existing_${external}`);
+    const entry = nativeAsk(`native_existing_${external}`);
+    expect((await store.update(nativeKey, { kind: 'start' }, io)).delivered).toBe(false);
+    await store.update(nativeKey, { kind: 'ask', entry }, io);
+    await store.update(nativeKey, { kind: 'ask', entry: { ...entry, result: {
+      kind: 'answered', answers: [['yes']], by: 'ou_user', comment: null, timedOut: false,
+    } as ReplyCardAsk['result'] } }, io);
+    const patches = vi.mocked(io.patch).mock.calls.length;
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Continuing after the answer' }, io)).delivered).toBe(true);
+    expect(io.patch).toHaveBeenCalledTimes(patches + 1);
+    const working = store.read(nativeKey)!.lastCard!;
+    expect(extractCardContent(working)).toContain('Continuing after the answer');
+    expect(working).toContain('stop_turn');
+    if (external) expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(true);
+    await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(io.patch).toHaveBeenCalledTimes(patches + 2);
+    const settled = store.read(nativeKey)!.lastCard!;
+    expect(settled).not.toContain('stop_turn');
+    expect(extractCardContent(settled)).toContain('Continuing after the answer');
+  });
+
+  it('hands progress back to the card once native thinking retires before the turn ends', async () => {
+    const nativeKey = await nativeTurn('om_native_retired');
+    let live = true;
+    const daemon = { ...io, nativeThinkingLive: () => live };
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Shown in native thinking' }, daemon)).delivered).toBe(false);
+    expect(store.read(nativeKey)?.nativeCotVisible).toBe(true);
+    // A newer turn's display replaced this one (or it failed, was switched off, or a restart lost it).
+    live = false;
+    // A CLI sender cannot see daemon display state; it relies on the persisted hand-back.
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Before the daemon notices' }, io)).delivered).toBe(false);
+    expect((await store.update(nativeKey, { kind: 'tools', tools: [{ id: 't', name: 'Bash', subject: 'npm test' }] }, daemon)).delivered).toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(store.read(nativeKey)?.nativeCotVisible).toBeUndefined();
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Before the daemon notices');
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Now on the card' }, io)).delivered).toBe(true);
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Now on the card');
+    // The hand-back is final for this turn even if the daemon's view changes again.
+    live = true;
+    await store.update(nativeKey, { kind: 'progress', text: 'Still on the card' }, daemon);
+    expect(store.read(nativeKey)?.nativeCotVisible).toBeUndefined();
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not hand back at the turn end, so a separately sent final still adds no summary card', async () => {
+    const nativeKey = await nativeTurn('om_native_end_handback');
+    let live = true;
+    const daemon = { ...io, nativeThinkingLive: () => live };
+    await store.update(nativeKey, { kind: 'progress', text: 'Intermediate status' }, daemon);
+    expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(true);
+    // The display failed, was lost to a restart, or aged out just before the terminal.
+    live = false;
+    expect((await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, daemon)).delivered).toBe(false);
+    expect(io.send).not.toHaveBeenCalled();
+    expect(store.read(nativeKey)).toMatchObject({ phase: 'completed', nativeCotVisible: true, externalFinal: true });
+  });
+
+  it('replays an unknown first native CoT POST after reopening even once nothing is actionable', async () => {
+    const nativeKey = await nativeTurn('om_native_unknown_post');
+    const entry = nativeAsk('native_unknown');
+    vi.mocked(io.send).mockRejectedValueOnce(new Error('POST result unknown'));
+    await expect(store.update(nativeKey, { kind: 'ask', entry }, io)).rejects.toThrow('POST result unknown');
+    const pending = store.read(nativeKey)!.pendingCreate!.content;
+    expect(pending).toContain('Continue?');
+    const reopened = new TurnReplyCardStore(dir);
+    await reopened.update(nativeKey, { kind: 'ask', entry: { ...entry, result: {
+      kind: 'answered', answers: [['yes']], by: 'ou_user', comment: null, timedOut: false,
+    } as ReplyCardAsk['result'] } }, io);
+    expect(io.send).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(io.send).mock.calls[1]).toEqual([pending, vi.mocked(io.send).mock.calls[0][1]]);
+    expect(reopened.read(nativeKey)).toMatchObject({ messageId: vi.mocked(io.send).mock.calls[0][1] });
+    expect(reopened.read(nativeKey)?.pendingCreate).toBeUndefined();
+  });
+
+  it('shows native CoT progress on the card when the process is explicitly requested', async () => {
+    const nativeKey = await nativeTurn('om_native_forced');
+    await store.update(nativeKey, { kind: 'progress', text: 'Hidden by default' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Shown on request' }, { ...io, forceVisible: true })).delivered).toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Shown on request');
+  });
 
   it.each(['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const)(
     'replays an unacknowledged %s PATCH without changing terminal facts or creating a card', async phase => {
@@ -71,6 +266,71 @@ describe('one reply card per turn', () => {
       expect(io.patch).toHaveBeenCalledTimes(patches);
     },
   );
+
+  it('retires duplicate notices atomically and retries an unacknowledged PATCH on the same card', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    const retirement = { kind: 'display_retired' as const, notice: 'Transcript unavailable' };
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('PATCH unavailable'));
+    await expect(store.update(key, retirement, io)).rejects.toThrow('PATCH unavailable');
+    expect(store.read(key)).toMatchObject({ phase: 'ambiguous', progress: [retirement.notice], publishPending: true });
+    await Promise.all([store.update(key, retirement, io), store.update(key, retirement, io)]);
+    expect(store.read(key)?.progress).toEqual([retirement.notice]);
+    expect(store.read(key)?.pendingPatch).toBeUndefined();
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(cards.size).toBe(1);
+  });
+
+  it('keeps an already-published final answer when a late missing-transcript notice arrives', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, finalEvent('Actual answer'), io);
+    await store.update(key, { kind: 'terminal', phase: 'ambiguous', notice: 'Transcript unavailable' }, io);
+    expect(store.read(key)?.progress).toEqual([]);
+    expect(store.read(key)?.finalText).toBe('Actual answer');
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect([...cards.values()][0]).not.toContain('Transcript unavailable');
+  });
+
+  it.each([false, true])('completes an acknowledged answer through display retirement (final ACK was lost=%s)', async lost => {
+    await store.update(key, { kind: 'start' }, io);
+    if (lost) vi.mocked(io.patch).mockRejectedValueOnce(new Error('ACK lost'));
+    const final = store.update(key, finalEvent('Actual answer'), io);
+    if (lost) await expect(final).rejects.toThrow('ACK lost'); else await final;
+    await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
+    expect(JSON.parse([...cards.values()][0]).body.elements.find((e: any) => e.element_id === 'botmux_turn_status')?.content).toContain('已完成');
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains display-only retirement across recovery and accepts the late final on the same card', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    await store.update(key, finalEvent('Late answer'), io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
+    expect(store.read(key)?.disconnected).not.toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('normalizes display retirement when recovery acknowledges the previously uncertain final PATCH', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('ACK lost'));
+    await expect(store.update(key, finalEvent('Actual answer'), io)).rejects.toThrow('ACK lost');
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('ACK lost'));
+    await expect(store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io)).rejects.toThrow('ACK lost');
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['failed', 'cancelled', 'superseded', 'ambiguous'] as const)('preserves a real %s terminal after final publication and display retirement', async phase => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase }, io);
+    await store.update(key, finalEvent('Partial answer'), io);
+    await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
+    expect(store.read(key)?.phase).toBe(phase);
+    expect(store.read(key)?.displayRetired).not.toBe(true);
+  });
 
   it('replays the same PATCH after its remote acceptance was not acknowledged', async () => {
     await store.update(key, { kind: 'start' }, io);

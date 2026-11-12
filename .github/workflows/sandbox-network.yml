@@ -46,8 +46,9 @@ jobs:
           bun-version: 1.4.4
       - name: Install kernel test tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap nftables slirp4netns iproute2
+          # Fail partial index updates rather than silently using stale indexes.
+          node scripts/ci-net-retry.mjs sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o APT::Update::Error-Mode=any update
+          node scripts/ci-net-retry.mjs sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y bubblewrap nftables slirp4netns iproute2
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi

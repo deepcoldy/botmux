@@ -1,4 +1,5 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
+import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
 
 export const CURRENT_EXECUTION_SCHEMA = 'botmux.current-execution.v1' as const;
@@ -123,10 +124,44 @@ export function isCurrentExecutionIdentityDocument(value: unknown): value is Cur
       'identityTurnId', 'env'].includes(key));
 }
 
+/** Which step of the identity fetch refused. Daemon-sent values first (wire
+ *  protocol of `/api/current-execution-identity`), then the ones this client
+ *  determines itself. Anything else a newer daemon sends maps to `unspecified`. */
+export const IDENTITY_REFUSAL_REASONS = [
+  // daemon: before the caller's lineage is proven
+  'invalid_request', 'peer_unresolved', 'lineage_unproven',
+  // daemon: caller proven, the session's identity model is not `proven`
+  'identity_decision_missing', 'identity_decision_conflict', 'identity_model_single',
+  // daemon: caller proven, no identity material for the turn (HTTP 404)
+  'identity_material_unavailable',
+  // client side
+  'invalid_invocation', 'daemon_unreachable', 'daemon_timeout', 'response_mismatch', 'unspecified',
+] as const;
+export type IdentityRefusalReason = typeof IDENTITY_REFUSAL_REASONS[number];
+
+/** A refused identity fetch. `message` stays the stable error code
+ *  (`current_execution_unverified`, `identity_material_unavailable`,
+ *  `current_execution_route_unavailable`); `reason` names the failing step. */
+export class CurrentExecutionIdentityError extends Error {
+  constructor(readonly code: string, readonly reason: IdentityRefusalReason, options?: { cause?: unknown }) {
+    super(code, options);
+    this.name = 'CurrentExecutionIdentityError';
+  }
+}
+
+function refusalReason(body: unknown): IdentityRefusalReason {
+  const reason = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>).reason : undefined;
+  return typeof reason === 'string' && (IDENTITY_REFUSAL_REASONS as readonly string[]).includes(reason)
+    ? reason as IdentityRefusalReason : 'unspecified';
+}
+
 /** Fetch the identity env BODY for the tool, proven by loopback process
- *  lineage. Distinct failures:
+ *  lineage. Distinct failures (CurrentExecutionIdentityError):
  *  - current_execution_route_unavailable: bad local arguments
- *  - current_execution_unverified: caller is not the current execution (403)
+ *  - current_execution_unverified: refused (403) or unreachable; `reason` says
+ *    whether the caller's lineage, the session's identity model, the daemon
+ *    connection or the response failed
  *  - identity_material_unavailable: lineage proven, but no identity is
  *    published for this turn/tool (GC, daemon restart, not prepared)
  */
@@ -140,7 +175,7 @@ export async function resolveCurrentExecutionIdentity(options: {
   if (!Number.isSafeInteger(options.ipcPort) || options.ipcPort <= 0 || options.ipcPort > 65535
     || !identifier(options.sessionId) || !identifier(options.larkAppId)
     || !identityTool(options.tool)) {
-    throw new Error('current_execution_route_unavailable');
+    throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   let response: Response;
   try {
@@ -148,25 +183,33 @@ export async function resolveCurrentExecutionIdentity(options: {
     // authority: the destination still attests the actual socket process.
     const ipcPort = options.fetchImpl ? options.ipcPort
       : parseDaemonIpcPort(findOnlineDaemon(options.larkAppId)?.ipcPort) ?? options.ipcPort;
+    // The route may wait on a platform grant still in flight (or re-ask for
+    // one) before answering; giving up sooner would refuse the tool call while
+    // the credentials are on their way.
     response = await (options.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool }),
-        redirect: 'error', signal: AbortSignal.timeout(20_000),
+        redirect: 'error', signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
       },
     );
   } catch (error) {
     // Network reachability failures are indistinguishable here from a refused
     // connection; fail closed. A loopback-isolated sandbox is rendered into
     // the single model upstream and never reaches this code.
-    throw new Error('current_execution_unverified', { cause: error });
+    const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+    throw new CurrentExecutionIdentityError('current_execution_unverified',
+      timedOut ? 'daemon_timeout' : 'daemon_unreachable', { cause: error });
   }
   const body: unknown = await response.json().catch(() => null);
-  if (response.status === 404) throw new Error('identity_material_unavailable');
-  if (!response.ok || !isCurrentExecutionIdentityDocument(body)
+  if (response.status === 404) {
+    throw new CurrentExecutionIdentityError('identity_material_unavailable', 'identity_material_unavailable');
+  }
+  if (!response.ok) throw new CurrentExecutionIdentityError('current_execution_unverified', refusalReason(body));
+  if (!isCurrentExecutionIdentityDocument(body)
     || body.sessionId !== options.sessionId || body.larkAppId !== options.larkAppId
     || body.tool !== options.tool) {
-    throw new Error('current_execution_unverified');
+    throw new CurrentExecutionIdentityError('current_execution_unverified', 'response_mismatch');
   }
   return body;
 }

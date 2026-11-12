@@ -130,8 +130,8 @@ describe('expandMergeForward: resources', () => {
     const { extraResources } = await expandMergeForward('app_test', 'om_root', parsed);
 
     expect(extraResources).toEqual([
-      { type: 'image', key: 'img_xyz', name: 'img_xyz.jpg' },
-      { type: 'file', key: 'file_abc', name: 'report.pdf' },
+      { type: 'image', key: 'img_xyz', name: 'img_xyz.jpg', fallbackMessageIds: ['om_img'] },
+      { type: 'file', key: 'file_abc', name: 'report.pdf', fallbackMessageIds: ['om_file'] },
     ]);
     // Image and file counters are independent (matches formatAttachmentsHint's
     // per-type numbering — `<image n="1">` + `<file n="1">`).

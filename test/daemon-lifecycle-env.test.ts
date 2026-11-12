@@ -10,6 +10,13 @@ it('reloads final-output handoff and clears a removed switch on managed restart'
     .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '' });
 });
 
+it('reloads edited Oncall connection settings instead of inheriting an old session snapshot', () => {
+  const resolved = resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', ONCALL_GROUP_ENDPOINT: 'https://old.example.test/chat/', ONCALL_EMAIL_DOMAIN: 'old.example.test' },
+    'ONCALL_GROUP_ENDPOINT=https://new.example.test/chat/\nONCALL_EMAIL_DOMAIN=new.example.test');
+  expect(resolved).toMatchObject({ ONCALL_GROUP_ENDPOINT: 'https://new.example.test/chat/', ONCALL_EMAIL_DOMAIN: 'new.example.test' });
+  expect(resolveDaemonEnv({ ...resolved, BOTMUX_SESSION_ID: 'session-1' }, '')).toMatchObject({ ONCALL_GROUP_ENDPOINT: '', ONCALL_EMAIL_DOMAIN: '' });
+});
+
 /**
  * Every key resolves to '' unless a source sets it, except the terminal and
  * dashboard bind hosts whose historical defaults land in resolveDaemonEnv. Built from

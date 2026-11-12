@@ -16,6 +16,27 @@ export interface ContractSessionRef { appId: string; sessionId: string }
 export interface WorkerRef { workerId: string; generation: number }
 export interface RuntimeRef { runtimeId: string; epoch: number }
 export interface ExecutionRef { executionId: string; turnId: string; dispatchAttempt?: number }
+/** A planned internal continuation, not permission to replay the original input. */
+export interface RuntimeExecutionContinuation {
+  reason: 'traex-auto-model';
+  execution: ExecutionRef;
+  from: RuntimeRef;
+  nativeSessionId: string;
+}
+export interface RuntimeExecutionContinuationResult {
+  execution: ExecutionRef;
+  status: 'approved' | 'rejected';
+}
+export interface RuntimeExecutionContinuationFailure {
+  bindingId: string;
+  continuation: RuntimeExecutionContinuation;
+  notice?: string;
+}
+/** Local PTY-family backends whose process_start identity a continuation can
+ * prove. Remote backends run off-box; zmx launches the CLI itself rather than
+ * botmux, so neither can supply the required physical process proof. The host
+ * gate and the Worker rotation gate must use this same set. */
+export const TRAEX_CONTINUATION_BACKENDS = ['pty', 'tmux', 'zellij', 'herdr'] as const;
 export interface RuntimeIdentity {
   backend: string;
   physicalId: string;
@@ -70,7 +91,7 @@ export interface SessionContract {
   activeOperationId?: string;
 }
 export type ExecutionAdmissionState = Pick<ExecutionContract, 'ref' | 'runtime' | 'phase'>;
-export interface SessionContractBootstrap { version: 2; session: ContractSessionRef; worker: WorkerRef; executions?: ExecutionAdmissionState[] }
+export interface SessionContractBootstrap { version: 2; session: ContractSessionRef; worker: WorkerRef; executions?: ExecutionAdmissionState[]; executionContinuations?: true; executionContinuationFailures?: true }
 export interface SessionCommandContext { version: 2; runtime?: RuntimeRef; execution?: ExecutionRef; operationId?: string }
 export interface ContractScope {
   runtime?: RuntimeRef;
@@ -99,6 +120,7 @@ export type ContractEvent =
   | { type: 'runtime_lost'; runtime: RuntimeRef; confirmed: boolean; reason?: string }
   | { type: 'execution_admitted'; execution: ExecutionContract }
   | { type: 'execution_phase'; execution: ExecutionRef; runtime: RuntimeRef; phase: Exclude<ExecutionPhase, 'succeeded' | 'failed' | 'cancelled'> }
+  | { type: 'execution_continued'; execution: ExecutionRef; from: RuntimeRef; runtime: RuntimeRef }
   | { type: 'execution_terminal'; execution: ExecutionRef; runtime: RuntimeRef; status: 'succeeded' | 'failed' | 'cancelled' | 'reconciling'; evidence: string; errorCode?: string }
   | { type: 'execution_output'; execution: ExecutionRef; output: NonNullable<ExecutionContract['output']>; delivery?: ExecutionContract['deliveries'][number] }
   | { type: 'control_requested'; operation: ControlOperation }
@@ -189,6 +211,16 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
     case 'execution_admitted':
       if (state.execution) return finish(sameExecution(state.execution.ref, event.execution.ref) ? 'duplicate' : 'conflict');
       state.execution = event.execution; return finish('applied');
+    case 'execution_continued':
+      if (!sameExecution(state.execution?.ref, event.execution) || !sameRuntime(state.execution?.runtime, event.from)
+        || !sameRuntime(state.runtime?.ref, event.runtime) || !sameRuntime(session.activeRuntime, event.runtime)
+        || session.lifecycle !== 'active' || session.activeOperationId || state.execution?.cancelRequested
+        || state.execution?.terminal || !['submitting', 'accepted', 'running'].includes(state.execution?.phase ?? '')
+        || sameRuntime(event.from, event.runtime)) return finish('stale');
+      // This logical request was already accepted by the old CLI. Do not
+      // make its original bytes runnable again on a fresh worker bootstrap.
+      state.execution!.runtime = event.runtime; state.execution!.phase = 'accepted'; state.execution!.revision++;
+      return finish('applied');
     case 'execution_phase':
       if (!sameExecution(state.execution?.ref, event.execution) || !sameRuntime(state.execution?.runtime, event.runtime)) return finish('stale');
       if (state.execution!.terminal) return finish('duplicate');

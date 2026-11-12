@@ -38,7 +38,7 @@ botmux has two kinds of "session group". This page covers both:
 ### Group name and avatar
 
 - **With a name**: your name is used and never changed afterwards.
-- **Without a name** (just `/g`): the group starts with the placeholder "New session MM/DD HH:mm". After your first substantive message in it, the bot summarizes a title of up to 12 characters and renames the group.
+- **Without a name** (just `/g`): the group starts with the placeholder "New session MM/DD HH:mm". After your first substantive message in it, the bot summarizes a title of up to 20 characters and renames the group.
 - **Avatar**: by default, the botmux logo on a gradient background (one of ten palettes, fixed per group). Add `--avatar name` for a text avatar showing the group name, or `--avatar off` to keep Lark's default.
 
 ![Group-name text avatar example](/img/group-name-avatar.png)
@@ -178,12 +178,12 @@ Or in that bot's `bots.json`:
 ```json
 {
   "sessionGroup": {
-    "naming": { "mode": "session-title", "maxLen": 12 }
+    "naming": { "mode": "session-title", "maxLen": 20 }
   }
 }
 ```
 
-`mode` is `ai-summary` / `session-title` / `truncate`; `maxLen` is the maximum title length (default 12).
+`mode` is `ai-summary` / `session-title` / `truncate`; `maxLen` is the maximum title length (default 20).
 
 Notes:
 

@@ -280,7 +280,19 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
   }
   const oncall = (elements[feedbackIndex] as any).columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
   // Lark's message read API omits behaviors, so restore the callback definition.
-  if (oncall) { (updated[0] as any).columns.push(buildOncallGroupColumn()); updated[0].flex_mode = 'flow'; }
+  if (oncall) {
+    const restored = structuredClone(oncall);
+    if (restored.elements?.[0]?.text?.content === buildOncallGroupColumn().elements[0].text.content
+      && !restored.elements[0].behaviors?.length) restored.elements[0].behaviors = buildOncallGroupColumn().elements[0].behaviors;
+    (updated[0] as any).columns.push(restored); updated[0].flex_mode = 'flow';
+  }
+  const standalone = elements.find((element: any) => element.element_id !== 'botmux_feedback'
+    && element.columns?.some((column: any) => column.element_id === 'botmux_oncall_group_column')) as any;
+  const standaloneColumn = standalone?.columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
+  if (standaloneColumn && !standaloneColumn.elements?.some((element: any) => element.behaviors?.length)
+    && standaloneColumn.elements?.[0]?.text?.content === buildOncallGroupColumn().elements[0].text.content) {
+    standaloneColumn.elements[0].behaviors = buildOncallGroupColumn().elements[0].behaviors;
+  }
   elements.splice(feedbackIndex, end - feedbackIndex, ...updated);
   card.body.elements = elements;
   return card;

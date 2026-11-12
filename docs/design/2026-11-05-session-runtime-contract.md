@@ -16,10 +16,19 @@ or persistent lineage evidence. Opaque identities are not reused across boots.
 Busy Traex reattachment can obtain the native ID before the first binding from
 a fresh, unambiguous user rollout held by the actual CLI PID. A configured resume
 ID is not evidence; lookup rechecks process birth and backend/scope ownership.
+A re-attached Claude-family CLI may be mid-turn and write nothing until that turn
+ends, so its first binding takes the native ID from the process's own pid-state
+record (the source a write's session ID comes from) when the record names that
+PID with that process birth and agrees with every session file the process holds
+open; otherwise the binding stays incomplete, as before.
 If an earlier incomplete observation already became selected, a new binding can
 recover only a unique unresolved runtime with the same complete fresh identity.
 The interval must contain no proven identity transition or unfinished execution;
 confirmed bindings and stopped/retired runtimes are never reassigned or revived.
+When the selected incomplete runtime itself still has unfinished work, the
+complete identity of that same live process completes it instead: the older
+runtime stays out of reach, and the re-attached worker is not refused a binding
+(which would leave it, and that work, with no runtime).
 
 The host persists a runtime reservation before granting `mayStart`. A worker
 awaits that receipt before starting its CLI. Once the backend exists, it reports

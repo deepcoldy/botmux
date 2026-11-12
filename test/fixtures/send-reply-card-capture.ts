@@ -274,6 +274,19 @@ if (process.env.BOTMUX_TEST_DEFERRED_TOPIC_DAEMON === '1') {
     });
   });
 }
+if (process.env.BOTMUX_TEST_NATIVE_COT_BARRIER) {
+  __setLoopbackTransportForTests(async (url) => {
+    const path = new URL(url).pathname;
+    if (!path.endsWith('/reply-card-ready')) throw new Error(`Unexpected native CoT test route: ${path}`);
+    console.log('CAPTURE_NATIVE_READY');
+    // ready = live native thinking; ready-hidden = display failed/switched off;
+    // ready-legacy = an older daemon that answers without visibility.
+    const barrier = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER ?? '';
+    const ok = barrier.startsWith('ready');
+    const body = barrier === 'ready-legacy' || !ok ? { ok } : { ok, nativeThinkingVisible: barrier === 'ready' };
+    return new Response(JSON.stringify(body), { status: ok ? 200 : 409 });
+  });
+}
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.
 globalThis.fetch = async () => { throw new Error('Unexpected test fetch'); };
 process.argv = [process.execPath, './src/cli.ts', ...process.argv.slice(2)];

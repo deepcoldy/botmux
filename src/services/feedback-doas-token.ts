@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
@@ -18,6 +19,52 @@ export interface TokenSource {
   refresh(rejectedGeneration: number): Promise<DynamicToken>;
 }
 export type PostgresCredential = string | TokenSource;
+
+function credentialCacheDeadline(token: string, now: number): number {
+  let deadline = now + 60000;
+  let expiresAt: number | undefined;
+  const segments = token.split('.');
+  if (segments.length === 3) {
+    try {
+      const payload = JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf8'));
+      const expiry = payload.expireTime ?? payload.exp;
+      if (typeof expiry === 'number' && Number.isFinite(expiry) && expiry > 0) {
+        expiresAt = expiry * 1000;
+      }
+    } catch {}
+  }
+  if (expiresAt !== undefined) {
+    if (expiresAt <= now) throw new Error('feedback_doas_token_expired');
+    deadline = Math.min(deadline, expiresAt - 30000);
+  }
+  return deadline;
+}
+
+async function readCachedCredential(path: string, generation: number, tokenHash?: string): Promise<DynamicToken | undefined> {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.size > 131072 || (info.mode & 0o077) !== 0
+      || (process.getuid && info.uid !== process.getuid())) throw new Error('feedback_doas_cache_unsafe');
+    const value = JSON.parse(await handle.readFile('utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('feedback_doas_state_invalid');
+    if (value.generation !== generation || value.tokenHash !== tokenHash) return undefined;
+    if (typeof value.token !== 'string' || !value.token || value.token.length > 65536 || /[\s\0]/.test(value.token)
+      || !Number.isFinite(value.validUntil) || value.validUntil > Date.now() + 60000
+      || createHash('sha256').update(value.token).digest('hex') !== tokenHash) {
+      throw new Error('feedback_doas_state_invalid');
+    }
+    if (value.validUntil <= Date.now()) return undefined;
+    if (credentialCacheDeadline(value.token, Date.now()) <= Date.now()) return undefined;
+    return { value: value.token, generation };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('feedback_doas_cache_unsafe');
+    if (error instanceof SyntaxError) throw new Error('feedback_doas_state_invalid');
+    throw error;
+  } finally { await handle?.close(); }
+}
 
 async function privateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
@@ -58,6 +105,7 @@ export function createDoasTokenSource(dataDir: string, config: DoasTokenConfig, 
   const directory = join(dataDir, 'feedback-doas', key);
   let pending: Promise<DynamicToken> | undefined;
   let cached: DynamicToken | undefined;
+  let cachedUntil = 0;
   const load = async (rejected?: number): Promise<DynamicToken> => {
     const canonical = await realpath(dataDir);
     const parent = join(canonical, 'feedback-doas');
@@ -68,6 +116,7 @@ export function createDoasTokenSource(dataDir: string, config: DoasTokenConfig, 
     await privateDirectory(join(root, 'identity'));
     return withFileLock(join(root, 'refresh'), async () => {
       const generationPath = join(root, 'generation.json');
+      const credentialPath = join(root, 'credential.json');
       let generation = 0, unusable = false;
       let rejectedHash: string | undefined;
       let tokenHash: string | undefined;
@@ -83,24 +132,39 @@ export function createDoasTokenSource(dataDir: string, config: DoasTokenConfig, 
         tokenHash = value.tokenHash;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('feedback_doas_state_invalid');
+        if (cached) throw new Error('feedback_doas_state_invalid');
       }
       if (rejected !== undefined && generation <= rejected && !unusable) {
         rejectedHash = tokenHash ?? (cached ? createHash('sha256').update(cached.value).digest('hex') : rejectedHash);
         cached = undefined;
+        cachedUntil = 0;
         generation += 1;
         unusable = true;
         await atomicWriteFile(generationPath, JSON.stringify({ generation, unusable, rejectedHash }), { mode: 0o600, durable: true, followTargetSymlink: false });
+        await unlink(credentialPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
         await execute(executable, ['--identity-dir', join(root, 'identity'), 'clean'], root);
-      } else if (cached?.generation === generation && !unusable) return cached;
+      } else if (!unusable) {
+        if (cached?.generation === generation && cachedUntil > Date.now()) return cached;
+        const shared = await readCachedCredential(credentialPath, generation, tokenHash);
+        if (shared) {
+          cached = shared;
+          cachedUntil = 0;
+          return shared;
+        }
+      }
       const stdout = await execute(executable, ['--type', 'gdpr', '-p', config.psm, '--print-env', '-e', config.environment, '--no-interaction', '--identity-dir', join(root, 'identity')], root);
       const token = stdout.trim();
       if (!token || token.length > 65536 || /[\s\0]/.test(token)) throw new Error('feedback_doas_output_invalid');
       if (rejectedHash === createHash('sha256').update(token).digest('hex')) throw new Error('feedback_doas_refresh_failed');
       const nextHash = createHash('sha256').update(token).digest('hex');
+      const validUntil = credentialCacheDeadline(token, Date.now());
       if (tokenHash && nextHash !== tokenHash && !unusable) generation += 1;
       tokenHash = nextHash;
       await atomicWriteFile(generationPath, JSON.stringify({ generation, unusable: false, rejectedHash, tokenHash }), { mode: 0o600, durable: true, followTargetSymlink: false });
+      await atomicWriteFile(credentialPath, JSON.stringify({ generation, tokenHash, token, validUntil }),
+        { mode: 0o600, durable: true, followTargetSymlink: false });
       cached = { value: token, generation };
+      cachedUntil = validUntil;
       return cached;
     }, { maxWaitMs: 35000 });
   };

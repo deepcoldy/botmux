@@ -129,11 +129,48 @@ export function traexRestoredComposerReady(
       && startupRows.some(row => /^[ \t]*permissions:[ \t]+\S/.test(row))
     ))
     && !startupRows.some(row => /(?:model|directory):[ \t]*loading\b/i.test(row));
-  if (!repositoryNotice && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
+  // TraeX 0.214.1 cold start draws the empty composer with a bare shortcut
+  // hint before the model/context footer resolves (measured: the model list
+  // fetch can take tens of seconds, leaving this frame on screen past the
+  // first-prompt hard timeout). Accept it only when the single footer row
+  // consists solely of native hint tokens. Recorded blocking pages (folder
+  // trust, migration, hooks review, sign-in, session lock) replace the
+  // composer and fail the empty-composer hint check above; anything rendered
+  // above an intact composer is covered by the worker's startup-blocker
+  // probes and its flush-time re-checks, not by this predicate.
+  // Startup diagnostics (e.g. an unparsable SKILL.md) are collected in the
+  // bottom warning indicator, right-aligned on the hint row. A wide pane shows
+  // `⚠ N warning(s) · f2 to view`; narrow panes degrade it to `⚠ N · f2` and
+  // then bare `⚠ N` (measured thresholds: 52 / 25 / 15 cols). It is a notice,
+  // not an input owner, so a hint row carrying any of these shapes is still
+  // the native composer footer. Below ~25 cols the hint tokens themselves are
+  // dropped and the warning indicator becomes the whole footer row.
+  const warningIndicator = '⚠[ \\t]+\\d+(?:[ \\t]+warnings?[ \\t]+·[ \\t]+f2[ \\t]+to[ \\t]+view|[ \\t]+·[ \\t]+f2)?';
+  const warningSuffix = `(?:[ \\t]+${warningIndicator})?`;
+  const hintOnlyRow = new RegExp(`^[ \\t]*(?:\\? for shortcuts|← for agents)(?:[ \\t]+·[ \\t]+(?:\\? for shortcuts|← for agents))*${warningSuffix}[ \\t]*$`);
+  const warningOnlyRow = new RegExp(`^[ \\t]*${warningIndicator}[ \\t]*$`);
+  const warningOnlyFooter = warningOnlyRow.test(footer[footer.length - 1]!);
+  const shortcutOnlyFooter = footer.length === 1 && (hintOnlyRow.test(footer[0]!) || warningOnlyFooter);
+  // A working directory wider than the pane truncates the model/context row
+  // with a U+2026 ellipsis before the Context cell can render. Such a row
+  // still contains the native ` · ` cell separator and ends on the
+  // truncation marker, which ordinary notifications never do. The bottom
+  // pane only emits native status cells (toasts render above the composer),
+  // so this arm deliberately trusts the footer-region geometry; revisit it if
+  // a future build moves notification content below the composer.
+  const truncatedStatusRow = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
+  if (!repositoryNotice && !shortcutOnlyFooter
+    && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
+    && !truncatedStatusRow.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
   if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
-  if (footer.length === 2 && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
+  // approval_policy=never and custom permission profiles (e.g. a managed
+  // qdh-topic profile) omit the standard permission label, so the second
+  // footer row is a bare hint row; on a narrow pane the hint tokens are
+  // dropped entirely and only the width-degraded warning indicator remains.
+  if (footer.length === 2 && !hintOnlyRow.test(footer[1]!) && !warningOnlyRow.test(footer[1]!)
+    && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat
   // a transcript sentence mentioning login as an active input owner.

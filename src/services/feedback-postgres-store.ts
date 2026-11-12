@@ -7,6 +7,7 @@ import type { RecordTurnDeliveryInput, RecordTurnTerminalInput, TurnCompletionEv
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination } from './feedback-outbox.js';
 import { validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
+import { feedbackDeliveryContext } from './feedback-extension-store.js';
 
 type Input<Method extends keyof FeedbackStore> = Parameters<FeedbackStore[Method]>[0];
 type Output<Method extends keyof FeedbackStore> = Awaited<ReturnType<FeedbackStore[Method]>>;
@@ -43,7 +44,7 @@ function cardTemplate(value: Record<string, unknown> | undefined): Record<string
 }
 
 class PostgresFeedbackStore implements FeedbackStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, private readonly dataDir?: string) {}
   async close(): Promise<void> { await this.pool.end(); }
   private async transaction<Result>(operation: (client: PoolClient) => Promise<Result>, ordered = true): Promise<Result> {
     const client = await this.pool.connect();
@@ -115,6 +116,7 @@ class PostgresFeedbackStore implements FeedbackStore {
     return row ? this.delivery(this.pool, row) : undefined;
   }
   async recordTurnDelivery(input: RecordTurnDeliveryInput): Promise<Output<'recordTurnDelivery'>> {
+    input = { ...input, context: feedbackDeliveryContext(this.dataDir, input) };
     return this.transaction(async client => {
       await this.lock(client, JSON.stringify(['turn', input.botAppId, input.sessionId, input.turnId, input.dispatchAttempt ?? 0]));
       await this.lock(client, JSON.stringify(['message', input.platform, input.platformAppId, input.platformMessageId]));
@@ -291,11 +293,17 @@ class PostgresFeedbackStore implements FeedbackStore {
   }
   async claimFeedbackOutbox(input: Input<'claimFeedbackOutbox'>): Promise<Output<'claimFeedbackOutbox'>> {
     return this.transaction(async client => {
-      const result = await client.query(`WITH picked AS (SELECT outbox_id FROM feedback_outbox WHERE status='pending' AND next_attempt_at<=$1 ORDER BY next_attempt_at,outbox_id LIMIT $2 FOR UPDATE SKIP LOCKED), updated AS (UPDATE feedback_outbox SET status='inflight',attempts=attempts+1,claimed_at=$1,claim_token=$3 WHERE outbox_id IN(SELECT outbox_id FROM picked) RETURNING *) SELECT updated.*,e.payload_json FROM updated JOIN feedback_events e USING(event_id)`, [input.now, Math.max(1, Math.min(input.limit, 100)), input.claimToken]);
+      const result = await client.query(`WITH picked AS (SELECT outbox_id FROM feedback_outbox WHERE status='pending' AND next_attempt_at<=$1 ORDER BY next_attempt_at,outbox_id LIMIT $2 FOR UPDATE SKIP LOCKED), updated AS (UPDATE feedback_outbox SET status='inflight',attempts=attempts+1,claimed_at=$1,claim_token=$3,last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_claimed_before_request' END WHERE outbox_id IN(SELECT outbox_id FROM picked) RETURNING *) SELECT updated.*,e.payload_json FROM updated JOIN feedback_events e USING(event_id)`, [input.now, Math.max(1, Math.min(input.limit, 100)), input.claimToken]);
       return result.rows.map(row => this.outbox(row));
     });
   }
   async tryClaimFeedbackOutbox(input: Input<'claimFeedbackOutbox'>): Promise<Output<'tryClaimFeedbackOutbox'>> { return { done: true, rows: await this.claimFeedbackOutbox(input) }; }
+  async startFeedbackOutboxRequest(outboxId: string, claimToken: string): Promise<boolean> {
+    return (await this.pool.query("UPDATE feedback_outbox SET last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_request_started' END WHERE outbox_id=$1 AND status='inflight' AND claim_token=$2", [outboxId, claimToken])).rowCount === 1;
+  }
+  async tryStartFeedbackOutboxRequest(outboxId: string, claimToken: string): Promise<Output<'tryStartFeedbackOutboxRequest'>> {
+    return { done: true, changed: await this.startFeedbackOutboxRequest(outboxId, claimToken) };
+  }
   async settleFeedbackOutboxDelivered(outboxId: string, claimToken: string, status: number, time: string): Promise<boolean> {
     return (await this.pool.query("UPDATE feedback_outbox SET status='delivered',last_http_status=$1,delivered_at=$2,claim_token=NULL,claimed_at=NULL WHERE outbox_id=$3 AND status='inflight' AND claim_token=$4", [status, time, outboxId, claimToken])).rowCount === 1;
   }
@@ -305,17 +313,17 @@ class PostgresFeedbackStore implements FeedbackStore {
   }
   async tryRescheduleFeedbackOutbox(...args: Parameters<FeedbackStore['rescheduleFeedbackOutbox']>): Promise<Output<'tryRescheduleFeedbackOutbox'>> { return { done: true, changed: await this.rescheduleFeedbackOutbox(...args) }; }
   async resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): Promise<number> {
-    return (await this.pool.query("UPDATE feedback_outbox SET status='pending',last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_outcome_unknown:' || COALESCE(claim_token,outbox_id) END,claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=$1", [now - staleAfterMs])).rowCount ?? 0;
+    return (await this.pool.query("UPDATE feedback_outbox SET status='pending',last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error WHEN last_error='webhook_claimed_before_request' THEN 'webhook_stopped_before_request' ELSE 'webhook_outcome_unknown:' || COALESCE(claim_token,outbox_id) END,claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=$1", [now - staleAfterMs])).rowCount ?? 0;
   }
   async tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): Promise<Output<'tryResetExpiredFeedbackOutboxClaims'>> { return { done: true, changed: await this.resetExpiredFeedbackOutboxClaims(now, staleAfterMs) }; }
 }
 
-export async function openPostgresFeedbackStore(target: PostgresTarget, password: PostgresCredential, instanceId: string, ca?: string, provision = false): Promise<FeedbackStore> {
+export async function openPostgresFeedbackStore(target: PostgresTarget, password: PostgresCredential, instanceId: string, ca?: string, provision = false, dataDir?: string): Promise<FeedbackStore> {
   const pool = feedbackPostgresPool(target, password, ca);
   try {
     const client = await pool.connect();
     try { await ensurePostgresFeedbackSchema(client, target.schema, instanceId, undefined, provision); } finally { client.release(); }
-    return new PostgresFeedbackStore(pool);
+    return new PostgresFeedbackStore(pool, dataDir);
   } catch (error) {
     await pool.end();
     throw error;

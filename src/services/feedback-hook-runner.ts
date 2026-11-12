@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import type { FeedbackHookRegistration } from './feedback-extension-types.js';
 import { normalizeFeedbackHook } from './feedback-hook-config.js';
+import type { FeedbackContext } from './feedback-context.js';
 
 export interface HookEvent {
   schemaVersion: 1;
@@ -11,6 +12,7 @@ export interface HookEvent {
   bot: { appId: string };
   scope: { chatId: string; topicId?: unknown; sourceMessageId?: unknown; subjectId?: unknown };
   action: { id: string } | null;
+  context?: FeedbackContext | null;
   [key: string]: unknown;
 }
 export interface HookResult {

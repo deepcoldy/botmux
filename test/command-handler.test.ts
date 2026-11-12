@@ -138,6 +138,12 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   pendingBytedcliChallenge: vi.fn(() => null),
 }));
 
+// The Meego login runs the CLI too.
+vi.mock('../src/services/meego-auth.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/meego-auth.js')>(),
+  requestMeegoLogin: vi.fn(async () => ({ state: 'link' as const, authUrl: 'https://meego.example/device?code=M1' })),
+}));
+
 // lark-cli per-person HOME auth likewise shells out; script the verdicts.
 // Platform credential source: controls whether this "machine" is bound.
 vi.mock('../src/platform/credential-grant-client.js', () => ({
@@ -436,7 +442,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   recordTurnExplicitMention: vi.fn(),
-  forkAdoptWorker: vi.fn(),
+  forkAdoptWorker: vi.fn().mockReturnValue('accepted'),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   requestSessionRestart: vi.fn((_ds: any, observer: any) => {
@@ -715,6 +721,8 @@ vi.mock('../src/services/cot-mode-store.js', () => ({
 
 vi.mock('../src/im/lark/cot-message.js', () => ({
   handleCotThinkingUpdate: vi.fn(() => true),
+  prepareCotMessageBeforeReply: vi.fn(async () => {}),
+  hasCotMessageForTurn: vi.fn(() => true),
 }));
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
@@ -732,9 +740,11 @@ import {
   writeRoleProfileEntry,
 } from '../src/services/role-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
+import { ALL_CLI_IDS, cliAliasesSelecting } from '../src/adapters/cli/registry.js';
 import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import { withBotTurnMutation } from '../src/core/bot-turn-mutation-gate.js';
+import { setProjectAssociationConsumer } from '../src/core/project-session-association-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
@@ -751,7 +761,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { resetSessionCodexModelSelection } from '../src/core/worker-pool.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
@@ -1066,16 +1076,87 @@ describe('/cli session selection', () => {
     expect(ds.session.cliLaunchSnapshot).toEqual(snapshot);
   });
 
-  it('rejects bare /cli and unknown cli ids', async () => {
+  it('answers bare /cli, extra tokens and unknown names with every selectable CLI and its aliases', async () => {
     const ds = makeDaemonSession({
       hasHistory: false,
       session: makeSession({ cliId: undefined }),
     });
     const deps = makeDeps(ds);
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli'), deps, LARK_APP_ID);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli claude code'), deps, LARK_APP_ID);
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli does-not-exist'), deps, LARK_APP_ID);
     expect(ds.session.cliLaunchSnapshot).toBeUndefined();
-    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, 'Usage: /cli <cliId>\nUnknown or invalid CLI.', undefined, LARK_APP_ID, 'msg_001');
+    const replies = vi.mocked(deps.sessionReply).mock.calls.map(call => call[1]);
+    expect(replies).toHaveLength(3);
+    expect(replies[2]).toContain('does-not-exist');
+    for (const reply of replies) {
+      const lines = reply.split('\n');
+      for (const id of ALL_CLI_IDS) {
+        // riff is refused by /cli on every bot, so it is not offered.
+        if (id === 'riff') expect(reply).not.toContain(id);
+        else expect(reply).toContain(id);
+        for (const alias of cliAliasesSelecting(id)) {
+          expect(lines.some(line => line.includes(alias) && line.includes(id)), `${alias} listed with ${id}`).toBe(true);
+        }
+      }
+      // Names that pick nothing on their own are not offered: `codex` is Codex's
+      // own id rather than Codex App's alias, and `trae` is shared by coco and traex.
+      const words = reply.split(/[^a-z0-9-]+/i);
+      expect(words).not.toContain('trae');
+      expect(words.filter(word => word === 'codex-app')).toHaveLength(1);
+    }
+  });
+
+  it.each([
+    ['cc', 'claude-code'],
+    ['CC', 'claude-code'],
+    ['claude', 'claude-code'],
+    ['omp', 'oh-my-pi'],
+    ['Agy', 'antigravity'],
+    // codex is also the program codex-app runs; the exact cliId wins.
+    ['codex', 'codex'],
+  ] as const)('selects %s as %s', async (input, cliId) => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage(`/cli ${input}`), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toEqual(expect.objectContaining({ state: 'pending', entryId: cliId, cliId }));
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, expect.stringContaining(cliId), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('lists the candidates of an alias shared by several CLIs and keeps the current selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
+    const selected = ds.session.cliLaunchSnapshot;
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli Trae'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBe(selected);
+    expect(selected?.cliId).toBe('hermes');
+    const reply = vi.mocked(deps.sessionReply).mock.lastCall?.[1] ?? '';
+    expect(reply).toContain('/cli traex');
+    expect(reply).toContain('/cli coco');
+  });
+
+  it('applies the operator check to a CLI picked by alias', async () => {
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli cc'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
   });
 
   it('rejects riff because it requires bot-level backend configuration', async () => {
@@ -2186,6 +2267,11 @@ describe('handleCommand', () => {
     vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
     vi.mocked(deleteMessage).mockResolvedValue(true);
     vi.mocked(sendMessage).mockResolvedValue('card-msg-id');
+    // Auth-link delivery: a test that queues a DM / private-card failure with
+    // mockRejectedValueOnce and never reaches it would hand that failure to a
+    // later test; mockReset drops the queue, then the default comes back.
+    vi.mocked(sendUserMessage).mockReset().mockResolvedValue('private-msg-id');
+    vi.mocked(sendEphemeralCard).mockReset().mockResolvedValue('eph_picker_msg_id');
     vi.mocked(replyMessage).mockResolvedValue('picker-card-msg-id');
     vi.mocked(getChatModeStrict).mockResolvedValue('topic');
     vi.mocked(getMessageThreadId).mockResolvedValue('omt_child');
@@ -2195,6 +2281,7 @@ describe('handleCommand', () => {
     vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
     vi.mocked(sessionStore.listSessions).mockReturnValue([]);
     vi.mocked(resumeSession).mockReset();
+    vi.mocked(forkAdoptWorker).mockReset().mockReturnValue('accepted');
   });
 
   describe('/fork source protection', () => {
@@ -7798,13 +7885,106 @@ describe('handleCommand', () => {
         expect(replies(deps).join('\n')).not.toContain('https://');
       });
 
-      it('DM fails: tells the sender to message the bot privately, never posts the link', async () => {
+      it('DM fails: the link goes in a card only the sender sees, never into the group', async () => {
+        const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+        vi.mocked(sendEphemeralCard).mockClear();
         vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+        const ds = makeDaemonSession({ chatType: 'group' });
+        const deps = makeDeps(ds);
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+        expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+        const [, chatId, openId, card] = vi.mocked(sendEphemeralCard).mock.calls[0];
+        expect(chatId).toBe(ds.chatId);
+        expect(openId).toBe('ou_sender');
+        expect(card).toContain('https://open.feishu.cn/auth/v1/test');
+        const text = replies(deps).join('\n');
+        expect(text).toBe(t('auth_link.sent_ephemeral', undefined, 'zh'));
+        expect(text).not.toContain('https://');
+      });
+
+      it('DM and the sender-only card both fail: says where to get it, never posts the link', async () => {
+        const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+        vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+        vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('18053 chat can not be thread'));
         const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
         const text = replies(deps).join('\n');
         expect(text).toBe(t('auth_link.dm_failed', { command: '/login bytedcli' }, 'zh'));
         expect(text).not.toContain('https://');
+      });
+
+      describe('/login meego', () => {
+        let restore: (() => void) | undefined;
+        beforeEach(async () => {
+          const previous = vi.mocked(getBot).getMockImplementation()!;
+          vi.mocked(getBot).mockImplementation(((id?: string) => {
+            const bot = previous(id as any) as any;
+            return { ...bot, config: { ...bot.config, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } };
+          }) as any);
+          restore = () => vi.mocked(getBot).mockImplementation(previous);
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          vi.mocked(requestMeegoLogin).mockClear();
+        });
+        afterEach(() => restore?.());
+
+        it('DMs the Meego link to the sender, for that person\'s shared login', async () => {
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
+          expect(requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender', undefined);
+          const [, openId, dmText] = vi.mocked(sendUserMessage).mock.calls[0]!;
+          expect(openId).toBe('ou_sender');
+          expect(dmText).toContain('https://meego.example/device?code=M1');
+          expect(replies(deps)).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
+        });
+
+        it.each(['/login meego dcar', '/login meego DCAR', '/login meego --tenant dcar', '/login meego --tenant=dcar'])(
+          '%s logs in to the dcar tenant, and the fallback names it', async (text) => {
+            const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+            const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+            vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+            vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('18053'));
+            const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+            await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+            expect(requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender', 'dcar');
+            expect(replies(deps)).toEqual([t('auth_link.dm_failed', { command: '/login meego dcar' }, 'zh')]);
+          });
+
+        it('a tenant bytedcli does not have: says which ones exist, starts nothing', async () => {
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego boe'), deps, LARK_APP_ID);
+          expect(requestMeegoLogin).not.toHaveBeenCalled();
+          expect(sendUserMessage).not.toHaveBeenCalled();
+          expect(replies(deps)).toEqual([t('cmd.login.meego_tenant_invalid', { tenants: 'dcar' }, 'zh')]);
+        });
+
+        it('DM and card both fail: points to /login meego elsewhere, never the link', async () => {
+          const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+          vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+          vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('18053'));
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
+          expect(replies(deps)).toEqual([t('auth_link.dm_failed', { command: '/login meego' }, 'zh')]);
+        });
+
+        it('already logged in: says so and sends nothing', async () => {
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'ready' });
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
+          expect(sendUserMessage).not.toHaveBeenCalled();
+          expect(replies(deps)).toEqual([t('cmd.login.meego_ready', undefined, 'zh')]);
+        });
+
+        it('bot does not run bytedcli as the person: explains the configuration, starts nothing', async () => {
+          restore?.();
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
+          expect(requestMeegoLogin).not.toHaveBeenCalled();
+          expect(replies(deps)).toEqual([t('cmd.login.bytedcli_configure', undefined, 'zh')]);
+        });
       });
 
       it('no session yet in a p2p chat: replies inline', async () => {
@@ -8406,6 +8586,38 @@ describe('handleCommand', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as string;
       expect(reply).toContain('Vendor Codex');
+    });
+
+    it('does not announce a successful association or retain an import notification after adopt admission is rejected', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const association = vi.fn();
+      setProjectAssociationConsumer(association);
+      vi.mocked(forkAdoptWorker).mockImplementationOnce(current => {
+        // Model an import eligible for notification before the final worker
+        // admission rejects it; the caller must clear that pending marker.
+        current.session.projectImportPending = true;
+        return 'rejected';
+      });
+      const target = {
+        source: 'tmux' as const, tmuxTarget: 'rejected-pane:0.0',
+        cliPid: 4242, cliId: 'claude-code' as const, cwd: '/repo',
+        paneCols: 80, paneRows: 24,
+      };
+      try {
+        await startAdoptSession(target, ds, deps, LARK_APP_ID);
+        expect(forkAdoptWorker).toHaveBeenCalledWith(ds);
+        expect(association).not.toHaveBeenCalled();
+        expect(ds.session.projectImportPending).toBe(false);
+        expect(sessionStore.updateSession).toHaveBeenLastCalledWith(ds.session);
+        expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0]![1];
+        // The success response identifies the adopted pane. Refusal must not
+        // present that success receipt to the user.
+        expect(reply).not.toContain(target.tmuxTarget);
+      } finally {
+        setProjectAssociationConsumer(undefined);
+      }
     });
 
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {
@@ -10992,6 +11204,16 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(setCotMode).not.toHaveBeenCalled();
   });
 
+  it('/cot status sees enabled unified native CoT even with in-card activity off', async () => {
+    botWith({ cotEnabled: false, replyCardNativeCot: true, replyCardMode: 'unified' });
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    const nativeStatus = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1];
+    botWith({ cotEnabled: true, replyCardMode: 'unified' });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1]).toBe(nativeStatus);
+  });
+
   it('/cot show without a live session replies no_active_session', async () => {
     const deps = makeDeps();
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
@@ -11025,7 +11247,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
   });
 
-  it('/cot show unified mid-turn does not restore hidden results to disk', async () => {
+  it.each([false, true])('/cot show unified with native=%s preserves hidden results on disk', async native => {
     const fs = await import('node:fs');
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const { tmpdir } = await vi.importActual<typeof import('node:os')>('node:os');
@@ -11043,7 +11265,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     const previousDir = config.session.dataDir;
     config.session.dataDir = dir;
     try {
-      botWith({ cotEnabled: true, thinkingCardToolResult: false, replyCardMode: 'unified', usageDisplay: 'off' });
+      botWith({ cotEnabled: true, replyCardNativeCot: native, thinkingCardToolResult: false, replyCardMode: 'unified', usageDisplay: 'off' });
       const ds = makeDaemonSession();
       ds.currentTurnId = 'om_cot_hidden';
       ds.lastThinkingUpdate = { turnId: ds.currentTurnId, entries: [
@@ -11060,6 +11282,8 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
       expect(disk()?.tools[0]).not.toHaveProperty('result');
       await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
       expect(ds.cotForced).toBe(true);
+      if (native) expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: ds.currentTurnId }), 'unified', expect.any(Function));
+      else expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
       expect(disk()?.tools).toHaveLength(1);
       expect(disk()?.tools[0]).not.toHaveProperty('result');
     } finally {

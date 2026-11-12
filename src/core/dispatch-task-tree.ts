@@ -117,6 +117,11 @@ function nodeState(entry: Record<string, unknown>, child: TaskTreeSessionRow | u
   const reported = currentReport(entry)?.status;
   if (reported === 'completed') return 'done';
   if (reported === 'failed') return 'failed';
+  // Imported tasks keep business status, but a detached association must not
+  // be displayed as a currently running CLI merely from an old receipt.
+  const attachment = entry.projectAttachment as { state?: string } | undefined;
+  if (attachment?.state === 'closed') return 'closed';
+  if (attachment && attachment.state !== 'active') return 'waiting';
   // Closed without reporting an outcome: someone may have stopped it halfway.
   if (child?.status === 'closed') return 'closed';
   if (reported === 'blocked') return 'waiting';

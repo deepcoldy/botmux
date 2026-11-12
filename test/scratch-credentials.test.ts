@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
-import { BACKGROUND_JOBS_HOME_ROOT } from '../src/services/bytedcli-home.js';
+import { BACKGROUND_JOBS_HOME_ROOT, MEEGO_HOME_ROOT } from '../src/services/bytedcli-home.js';
 
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'scratch-cred-')); });
@@ -126,7 +126,7 @@ describe('enumerateScratchSecretPaths', () => {
     // at most the HOST's own lark-cli keystores (a real secret it must never
     // un-mask), no file from the absent fake homes.
     const fixedDirs = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity'].map(d => join(data(), d));
-    fixedDirs.push(BACKGROUND_JOBS_HOME_ROOT);
+    fixedDirs.push(BACKGROUND_JOBS_HOME_ROOT, MEEGO_HOME_ROOT);
     const got = enumerateScratchSecretPaths({ botmuxHomes: [home(), join(root, 'nope')], dataDirs: [data()] }).denyPaths;
     // The detached-job host root is sealed even though it lives outside the
     // fake botmux home and no job directory exists yet.
@@ -145,6 +145,8 @@ describe('enumerateScratchSecretPaths', () => {
     const customData = join(root, 'core-only', 'cli_x', 'data');
     const got = enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [customData] }).denyPaths;
     expect(got).toContain(BACKGROUND_JOBS_HOME_ROOT);
+    // Same for every person's shared Meego login.
+    expect(got).toContain(MEEGO_HOME_ROOT);
   });
 
   it('masks the per-person secret dirs even when the data dir itself does not exist yet', () => {

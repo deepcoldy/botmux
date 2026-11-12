@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackSurface, defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage } from '../src/services/feedback-refresh.js';
+import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
 
 const dispose: Array<() => void> = [];
 afterEach(() => {
@@ -72,6 +73,198 @@ async function fixture() {
 }
 
 describe('feedback extension host callback', () => {
+  it('takes action context from the frozen surface, never the callback or a later question', async () => {
+    const data = await fixture();
+    const binding = data.extensions.surface('app', 'surface')!;
+    const context = { kind: 'classification', category: 42 };
+    data.extensions.bindSurface('app', 'native-surface', { ...binding, context });
+    data.extensions.bindSubject('app', 'session', 'later-turn', {
+      sourceMessageId: 'other-question', answerKind: 'substantive', context: { category: 99 },
+    });
+    const callback = data.callback('feedback_custom_action', { action_id: 'help' });
+    callback.context.open_message_id = 'native-surface';
+    (callback.action.value as any).context = { category: 999 };
+    await handleFeedbackExtensionCard(callback, 'app', data.directory);
+    const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
+    expect((data.extensions.job(jobId)?.payload.event as any).context).toEqual(context);
+    await handleFeedbackExtensionCard(callback, 'app', data.directory);
+    expect((data.extensions.job(jobId)?.payload.event as any).context).toEqual(context);
+  });
+  it('keeps native action context null for a historical card without a binding', async () => {
+    const data = await fixture();
+    await handleFeedbackExtensionCard(data.callback('feedback_custom_action', { action_id: 'help' }), 'app', data.directory);
+    const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
+    expect((data.extensions.job(jobId)?.payload.event as any).context).toBeNull();
+  });
+  it('blocks a surface prepared before its counting scope changes at the transport boundary', async () => {
+    const data = await fixture();
+    const initial = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, initial.version, {
+      ...initial, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'subject' }, rules: [] } },
+    }, 'admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('topic');
+    let sent = 0;
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      sent++;
+      return 'first-surface';
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(sent).toBe(1);
+    data.extensions.bindSubject('app', 'session', 'second', { sourceMessageId: 'followup-question', answerKind: 'substantive' });
+    data.source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'second', platform: 'lark',
+      platformAppId: 'app', platformMessageId: 'second-answer', chatId: 'chat', topicRootId: 'question',
+      content: 'second answer', status: 'delivered', cardMode: 'feedback', policy: data.policy });
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'second', status: 'completed' });
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      const current = await readFeedbackExtensionConfig(data.directory);
+      await saveFeedbackExtensionConfig(data.directory, current.version, {
+        ...current, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'topic' }, rules: [] } },
+      }, 'admin');
+      await args[7].beforeWrite();
+      sent++;
+      return 'stale-surface';
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(sent).toBe(1);
+    expect(data.extensions.jobsForApp('app').find(job => job.payload.answerMessageId === 'second-answer')?.status).toBe('blocked');
+  });
+  it('settles unknown instead of blocked when the scope changes between gateway retries', async () => {
+    const data = await fixture();
+    const initial = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, initial.version, {
+      ...initial, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'subject' }, rules: [] } },
+    }, 'admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('topic');
+    let sent = 0;
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      sent++;
+      return 'first-surface';
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(sent).toBe(1);
+    data.extensions.bindSubject('app', 'session', 'second', { sourceMessageId: 'followup-question', answerKind: 'substantive' });
+    data.source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'second', platform: 'lark',
+      platformAppId: 'app', platformMessageId: 'second-answer', chatId: 'chat', topicRootId: 'question',
+      content: 'second answer', status: 'delivered', cardMode: 'feedback', policy: data.policy });
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'second', status: 'completed' });
+    let retryError: unknown;
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      const current = await readFeedbackExtensionConfig(data.directory);
+      await saveFeedbackExtensionConfig(data.directory, current.version, {
+        ...current, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'topic' }, rules: [] } },
+      }, 'admin');
+      try { await args[7].beforeWrite(); }
+      catch (error) { retryError = error; throw error; }
+      throw new Error('gateway retry exhausted');
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(sent).toBe(1);
+    expect((retryError as Error).message).toBe('feedback_presentation_scope_changed_during_retry');
+    const job = data.extensions.jobsForApp('app').find(item => item.payload.answerMessageId === 'second-answer')!;
+    expect(job.status).toBe('unknown');
+    expect(job.result).toMatchObject({ reason: 'surface_delivery_unknown' });
+    expect(data.extensions.reconcileSurfaceReceipt(job.id, 'late-surface', 'tester', 'verified in chat')).toBe(true);
+    expect(data.extensions.surface('app', 'late-surface')?.answerMessageId).toBe('second-answer');
+  });
+  it('keeps topic-scoped cards working in an ordinary group whose topic root is the chat itself', async () => {
+    const data = await fixture();
+    const initial = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, initial.version, {
+      ...initial, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'topic' }, rules: [] } },
+    }, 'admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.extensions.bindSubject('app', 'session', 'ordinary', { sourceMessageId: 'ordinary-question', answerKind: 'substantive' });
+    data.source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'ordinary', platform: 'lark',
+      platformAppId: 'app', platformMessageId: 'ordinary-answer', chatId: 'chat', topicRootId: 'chat',
+      content: 'ordinary answer', status: 'delivered', cardMode: 'feedback', policy: data.policy });
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'ordinary', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('group');
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      return 'ordinary-surface';
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    const job = data.extensions.jobsForApp('app').find(item => item.payload.answerMessageId === 'ordinary-answer')!;
+    expect(job.status).toBe('succeeded');
+    expect(job.payload.roundScope).toBe('subject');
+    expect(data.extensions.surface('app', 'ordinary-surface')?.subjectId).toBe('ordinary-question');
+  });
+  it('does not query more old answers after a slow read exhausts the refresh budget', async () => {
+    const data = await fixture();
+    for (const messageId of ['old-first', 'old-second']) {
+      data.extensions.bindSurface('app', messageId, data.extensions.surface('app', 'surface')!);
+      data.extensions.dirtySurface('app', messageId, {});
+    }
+    const clock = vi.spyOn(Date, 'now');
+    let now = Date.now();
+    clock.mockImplementation(() => now);
+    const original = data.source.findDeliveryById.bind(data.source);
+    const reads = vi.spyOn(data.source, 'findDeliveryById').mockImplementation(deliveryId => {
+      now += 3000;
+      return original(deliveryId);
+    });
+    try {
+      await tickFeedbackExtensions(data.directory, 'app');
+      expect(reads).toHaveBeenCalledTimes(1);
+      expect(data.extensions.dirtySurfaces('app').some(item => item.messageId === 'old-second')).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+  it('sends through the production SQLite selector while an old card network patch is pending', async () => {
+    const data = await fixture();
+    const current = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, current.version, {
+      ...current, presentations: { app: { default: { enabled: true, rounds: [1], mode: 'separate' }, rules: [] } },
+    }, 'test-admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.extensions.dirtySurface('app', 'surface', {});
+    let release!: () => void;
+    const { store } = await getFeedbackStorage(data.directory);
+    mock.source = store;
+    mock.update.mockImplementation(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    const background = tickFeedbackExtensions(data.directory, 'app', 'background');
+    const deadline = Date.now() + 5000;
+    while (!release) {
+      if (Date.now() > deadline) throw new Error('background patch did not start');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const next = await store.recordTurnDelivery({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn',
+      platform: 'lark', platformAppId: 'app', platformMessageId: 'new-answer', chatId: 'chat', topicRootId: 'new-question',
+      content: 'new answer', cardMode: 'feedback', status: 'delivered', policy: data.policy });
+    await store.recordTurnTerminal({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('topic');
+    mock.reply.mockResolvedValue('new-surface');
+    try {
+      await tickFeedbackExtensions(data.directory, 'app', 'surface');
+      expect(data.extensions.surface('app', 'new-surface')?.deliveryId).toBe(next.deliveryId);
+    } finally { release(); await background; await closeFeedbackStorage(data.directory); }
+  });
+  it('leaves old-card refresh and inline cleanup to the background lane', async () => {
+    const data = await fixture();
+    data.extensions.dirtySurface('app', 'surface', { result: 'old' });
+    (data.extensions as any).database.prepare('INSERT OR IGNORE INTO inline_cleanup VALUES(?,?)').run('app', 'old-answer');
+    await tickFeedbackExtensions(data.directory, 'app', 'surface');
+    expect(mock.detail).not.toHaveBeenCalled();
+    expect(mock.update).not.toHaveBeenCalled();
+    expect(data.extensions.dirtySurfaces('app').map(item => item.messageId)).toContain('surface');
+    expect(data.extensions.inlineCleanups('app')).toContain('old-answer');
+  });
   it('keeps a newer revision queued until a timed-out old patch actually finishes', async () => {
     const data = await fixture();
     vi.useFakeTimers();

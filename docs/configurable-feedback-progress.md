@@ -14,12 +14,52 @@
 
 ## 本次基础变更
 
+### 原生业务上下文
+
+首轮正式回答前可调用`botmux feedback bind --file binding.json`，在既有
+`sourceMessageId`、`answerKind`之外提供可选`context`普通JSON对象。
+宿主核验当前应用、session、turn及原题所在话题后持久绑定，返回`contextBound=true`。
+最大8192 UTF-8字节、8层；拒绝非法JSON值，重复相同内容幂等，不允许变更已有绑定。
+业务数据不授予目标群、动作、工具或人员权限。
+
+答复delivery首次落盘时，在原有delivery context中保存宿主核验的`feedbackSubjectBinding`
+快照；当时没有绑定则显式保存null。SQLite和PostgreSQL运行入口均使用该快照，
+surface与feedback.revised订阅的context只取该快照，不读取后来新增的subject绑定。
+问题归属与答复类型仍按该回合的绑定判定，与旧版一致：同一回合在答复落盘后才绑定时，
+归属与类型照常生效，但context不进入该答复（为null），因此需要context时须在答复前绑定。
+从未绑定过的部署不会因此新建扩展库。
+反馈surface保留该答复的context快照，原生动作事件及feedback.revised订阅携带
+`context`，由宿主读取而不接受按钮回调的自报context。旧卡缺失时为null，保留历史快照，
+不从新问题猜测或补写。`contextRef`保持原null契约，不假定引用解析能力。
+框架不解释分类字段，不调用模型；业务可在首轮分类后写入context，在点击时直接消费。
+需要首轮类别但缺上下文的业务应明确停止，不能假装分类已保存。
+同一问题动作的重复点击、不同反馈卡及暂停恢复保留首次接受的事件、操作者和context；
+脚本定义相同的重新授权只刷新Hook版本，不替换业务事件或增加执行。
+
 - `feedbackPresentation` 提供 bot 默认、群规则和具体问题规则。
 - 具体问题覆盖群规则；数组整体替换；同 selector 或 id 重复时报错。
 - `rounds` 必须是升序、无重复的正整数；未配置默认关闭。
+- `roundScope` 可选为 `subject` 或 `topic`，省略时保留按原问题计数。`topic` 按应用、群和原生话题统计正式回答，配合 `rounds: [1]` 仅显示首次正式回答的反馈卡；同话题后续来源消息不重新计为首轮。普通群没有原生话题时仍按问题计数，不变成整个群只显示一次。
+- `answerReference` 插槽可省略；保留该插槽但不配置 `content` 时显示原有轮次和答复链接。配置 `content` 可使用固定文本及 `{round}`、`{answerUrl}` 两个变量；空白内容不渲染引用区。引用文本最长4000字符，沿用模板的mention与图片限制，未知变量被拒绝，不执行表达式。
 - 现有反馈按钮定义不复制到展示配置，后续 renderer 必须使用原 delivery 的反馈策略。
 - 配置写入和重载共用规范化；直接写入无效展示规则也会拒绝。
 - 宿主 Hook 注册类型和校验器约束命令参数、工作目录、作用域及秘密引用，已接入注册 UI 和执行器。
+
+引用文本示例：
+
+```json
+{ "slot": "answerReference", "content": "第 {round} 次回答：[查看原答复]({answerUrl})" }
+```
+
+纯文字使用 `{ "slot": "answerReference", "content": "欢迎对本次回答给出反馈" }`；隐藏引用则从 `elements` 中省略该插槽。默认模板不变，`feedbackButtons`、`feedbackDetails` 与 `status` 仍为必需插槽；配置动作时仍须有 `actionButtons`。
+
+使用Dashboard现有“展示规则 JSON”“自定义模板 JSON”保存或预览即可配置。模板快照在反馈和Hook状态更新后保持引用文本，不把文本配置变成新的回调或脚本能力。群/问题覆盖策略为每个回答选择计数范围，配置生效时间与已有回执保持原来的历史不重放规则。
+
+排队卡片保存其计算轮次的有效范围。发送认领与真实transport写入前都复验当前范围；配置从subject切到topic或反向切换时，旧范围准备的卡片被阻止，不拿旧round套用新规则。未完成回答只阻止同一计数范围的后续回答，不阻止另一个独立问题。配置与发送回执未知时仍不自动重发。
+
+一次reconcile批次按应用/群/话题读取回答与问题绑定快照，单次遍历按subject分组；已保存的surface job或本批已准备的job不重复渲染或查询答复链接。链接缓存仅在该批内按群/答复消息ID复用，不跨批缓存平台权限或状态。
+
+relayed答复没有宿主提供的sourceMessageId绑定时，问题身份仍回退到topicRootId；同话题这些答复属于同一计数范围，不能从CLI文本猜测独立问题。需要独立subject时必须使用宿主核验并保存的绑定；`roundScope: "topic"` 明确按整个原生话题计数。默认回退、未完成回答顺序与历史回执不变。
 
 ## 本轮阻断修复
 

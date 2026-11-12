@@ -1,3 +1,5 @@
+import { attachOncallGroupButton, prepareNativeOncallCard, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { OncallGroupStore } from '../services/oncall-group-store.js';
 import { join } from 'node:path';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -5,9 +7,11 @@ import { config } from '../config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
+import { cotMessageCarriesTurn, handleCotThinkingUpdate, finalizeCotMessage, hasCotMessageForTurn, prepareCotMessageBeforeReply } from '../im/lark/cot-message.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
+import { controllerForSession } from './session-controller.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot, t as tr } from '../i18n/index.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
@@ -86,12 +90,60 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   if (mode !== 'legacy') {
     const record = new TurnReplyCardStore(config.session.dataDir).prepareSync(replyCardKey(ds, turnId), {
       mode, chatId: ds.chatId, rootId: sessionAnchorId(ds),
+      nativeCot: cfg.replyCardNativeCot === true && (ds.cotForced === true || !cfg.noCotChats?.includes(ds.chatId)),
     });
     mode = record.mode;
   }
   snapshot.set(turnId, mode);
   if (snapshot.size > 512) snapshot.delete(snapshot.keys().next().value!);
   return mode;
+}
+
+/** Admission fixes the channel order. Enabling native CoT after an answer is
+ * already visible applies next turn, instead of inserting thinking below it. */
+function nativeThinkingOwner(ds: DaemonSession, owns?: () => boolean): () => boolean {
+  const session = ds.session;
+  const worker = ds.worker;
+  const generation = ds.workerGeneration;
+  const controller = controllerForSession(ds);
+  const currentRuntime = () => controller?.currentRuntime() ?? session.sessionRuntimeContract?.session.activeRuntime;
+  const runtime = currentRuntime();
+  return () => ds.session === session && ds.worker === worker && ds.workerGeneration === generation
+    && session.status !== 'closed'
+    && currentRuntime()?.runtimeId === runtime?.runtimeId
+    && currentRuntime()?.epoch === runtime?.epoch
+    && owns?.() !== false;
+}
+
+export function updateReplyCardNativeThinking(ds: DaemonSession, msg: ToolsUpdate, owns?: () => boolean): void {
+  const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt))
+    ?? new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId));
+  // After native thinking handed this turn back to the answer card, keep it
+  // there: re-enabling the channel mid-turn must not show the same progress
+  // twice. `/cot show` explicitly asks for both.
+  const handedBack = record?.nativeCotHandedBack === true && !ds.cotForced;
+  if (record?.nativeCot && !handedBack && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, msg))) {
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', ...msg }, record.mode, nativeThinkingOwner(ds, owns));
+  }
+}
+
+export function replyCardDispatchAttempt(ds: DaemonSession, turnId: string): number | undefined {
+  if (ds.managedTurnOrigin?.turnId === turnId) return ds.managedTurnOrigin.dispatchAttempt;
+  if (ds.turnDispatchAttemptHighWater?.turnId === turnId) return ds.turnDispatchAttemptHighWater.dispatchAttempt;
+  if (ds.session.readonlyTaskContinuation?.currentTurnId === turnId) return ds.session.readonlyTaskContinuation.currentDispatchAttempt;
+  return ds.lastThinkingUpdate?.turnId === turnId ? ds.lastThinkingUpdate.dispatchAttempt : undefined;
+}
+
+/** Resolves whether the native thinking display is live for this turn. Only a
+ * live display may take over passive progress from the answer card. */
+export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<boolean> {
+  const store = new TurnReplyCardStore(config.session.dataDir);
+  const record = store.read(replyCardKey(ds, turnId, dispatchAttempt)) ?? store.read(replyCardKey(ds, turnId));
+  const binding = { turnId, dispatchAttempt: dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) };
+  if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, binding))) {
+    return prepareCotMessageBeforeReply(ds, binding, nativeThinkingOwner(ds, owns));
+  }
+  return false;
 }
 
 /**
@@ -146,9 +198,21 @@ export async function updateTurnReplyCard(
     }
   };
   beforeEffect();
-  if (event.kind === 'terminal' && !event.disconnected) invalidateReplyCardAsks(key, 'Turn finished');
-  await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds) });
+  if (event.kind === 'display_retired' || (event.kind === 'terminal' && !event.disconnected)) invalidateReplyCardAsks(key, 'Turn finished');
+  await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds),
+    nativeCot: store.read(replyCardKey(ds, turnId))?.nativeCot });
   const cfg = getBot(ds.larkAppId).config;
+  const oncallEnabled = ds.chatType !== 'p2p' && ((cfg.oncallGroup?.enabled === true && cfg.oncallGroup.chatIds.includes(ds.chatId))
+    || new OncallGroupStore(config.session.dataDir).getRequest({ appId: ds.larkAppId, sessionId: session.sessionId,
+      chatId: ds.chatId, messageId: '', questionId: turnId, answer: '' })?.status === 'succeeded');
+  const oncallTurn = oncallEnabled ? new OncallGroupStore(config.session.dataDir).registerTurn(ds.larkAppId, session.sessionId, turnId, { chatId: ds.chatId, rootId: anchor }) : undefined;
+  const nativeOncallLink = oncallEnabled ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, turnId, session.sessionId) : undefined;
+  const indexOncall = (messageId: string, body: string) => {
+    if (!oncallEnabled || !messageId) return;
+    recordOncallGroupDelivery(config.session.dataDir, { appId: ds.larkAppId, chatId: ds.chatId, messageId,
+      sessionId: session.sessionId, rootId: sessionAnchorId(ds), questionId: turnId, turnNumber: oncallTurn, dispatchAttempt: key.dispatchAttempt,
+      answer: event.kind === 'final' ? event.text : '', card: JSON.parse(body), nativeLink: nativeOncallLink });
+  };
   const groupContextAuthorOrigin = event.kind === 'final' ? readGroupContextAuthorOrigin({
     appId: ds.larkAppId, chatId: ds.chatId, sessionId: session.sessionId, turnId,
     nativeSessionId: session.cliSessionId, cliId: session.cliLaunchSnapshot?.cliId ?? session.cliId ?? cfg.cliId,
@@ -168,10 +232,12 @@ export async function updateTurnReplyCard(
   const transport = {
     usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
+    beforeCreate: () => prepareReplyCardNativeThinking(ds, turnId, options.dispatchAttempt, options.owns),
+    nativeThinkingLive: () => cotMessageCarriesTurn(ds, { turnId, dispatchAttempt: options.dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) }),
     send: async (body, uuid) => {
       body = prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
-      if (messageId) acknowledged.set(messageId, 'primary');
+      if (messageId) { acknowledged.set(messageId, 'primary'); indexOncall(messageId, body); }
       if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
         message_id: messageId, chat_id: ds.chatId, root_id: sessionAnchorId(ds), msg_type: 'interactive', body: { content: body },
       }, groupContextAuthorOrigin);
@@ -182,18 +248,22 @@ export async function updateTurnReplyCard(
       await patchReplyCardWithAuditRedaction(ds.larkAppId, card, `${event.kind} turn=${turnId.substring(0, 8)}`,
         body => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, body, sessionAnchorId(ds),
           groupContextAuthorOrigin, beforeEffect));
-      acknowledged.set(messageId, 'primary');
+      acknowledged.set(messageId, 'primary'); indexOncall(messageId, card);
     },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
       const cfg = getBot(ds.larkAppId).config;
       const presentation = replyCardPresentation(cfg, ds.chatId);
-      return prepareLocalAddressContent(buildTurnReplyCard(record, {
+      const raw = buildTurnReplyCard(record, {
         ...presentation, locale: localeForBot(ds.larkAppId), workingDir: ds.workingDir,
         showProcess: options.forceVisible || ds.cotForced || presentation.showProcess,
         showLiveUsage: normalizeUsageDisplay(cfg) === 'streaming',
         canStop: presentation.canStop && ds.initConfig?.codexRpcInput !== true,
+      });
+      return prepareLocalAddressContent(attachOncallGroupButton(raw, cfg.oncallGroup, ds.chatId, ds.chatType, {
+        appId: ds.larkAppId, sessionId: session.sessionId, questionId: turnId,
+        phase: record.finalCard || replyCardIsTerminal(record) ? 'final' : 'first', nativeLink: nativeOncallLink, messageId: record.messageId,
       }), 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
     },
     sendOverflow: async (text: string, uuid: string) => {
@@ -214,7 +284,11 @@ export async function updateTurnReplyCard(
   } satisfies import('../services/turn-reply-card.js').TurnReplyCardTransport;
   for (let attempt = 0; ; attempt++) {
     try {
-      const delivered = await store.update(key, event, transport);
+      // A model card already accepted for this turn keeps its own link fields
+      // when the card is rendered again, even if the bot turned
+      // hideLocalAddresses on since; otherwise the turn could never settle.
+      const delivered = await replayVettedBody([store.read(key)?.finalCard, event.kind === 'final' ? event.card : undefined],
+        'interactive', () => store.update(key, event, transport));
       const complete = event.kind === 'final' && event.source === 'bridge'
         && delivered.record.finalSource === 'bridge' && delivered.record.finalText === event.text
         && delivered.record.finalDelivered && !!delivered.messageId
@@ -248,6 +322,35 @@ type ToolsUpdate = { turnId: string; dispatchAttempt?: number; entries: import('
 type PendingTools = { msg: ToolsUpdate; send: ReplyCardSender; owns: () => boolean; timer?: ReturnType<typeof setTimeout> };
 const pendingTools = new WeakMap<DaemonSession, Map<string, PendingTools>>();
 const toolFlushes = new WeakMap<DaemonSession, Map<string, Promise<void>>>();
+// Sessions owning queued/in-flight tool flushes. WeakMaps are not enumerable, so
+// without this registry test teardown cannot reach timers queued by an earlier
+// test case whose ds local variable is already out of scope.
+const trackedToolSessions = new Set<DaemonSession>();
+
+function untrackToolSessionIfIdle(ds: DaemonSession): void {
+  if (!pendingTools.get(ds)?.size && !toolFlushes.get(ds)?.size) trackedToolSessions.delete(ds);
+}
+
+/** Test-only: cancel every queued tools flush and await in-flight ones.
+ *  After this resolves, no reply-card timer or flush can write into a data dir
+ *  that the test is about to remove or that belongs to the next test. */
+export async function __testOnlyDrainTurnReplyTools(): Promise<void> {
+  // Loop to a fixed point: awaiting an in-flight flush could in principle run
+  // handlers that queue again, so one pass must not claim the contract early.
+  while (trackedToolSessions.size) {
+    for (const ds of [...trackedToolSessions]) {
+      const pending = pendingTools.get(ds);
+      if (pending) {
+        for (const next of pending.values()) {
+          if (next.timer) clearTimeout(next.timer);
+        }
+        pending.clear();
+      }
+      await Promise.allSettled([...(toolFlushes.get(ds)?.values() ?? [])]);
+      trackedToolSessions.delete(ds);
+    }
+  }
+}
 
 export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: ReplyCardSender, owns: () => boolean): void {
   let pending = pendingTools.get(ds);
@@ -262,6 +365,7 @@ export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: R
   }
   const next: PendingTools = { msg, send, owns };
   pending.set(key, next);
+  trackedToolSessions.add(ds);
   next.timer = setTimeout(() => {
     void flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
       logger.warn(`[reply-card] tool update failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -278,7 +382,10 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   if (inflight) await inflight.catch(() => undefined);
   const pending = pendingTools.get(ds);
   const next = pending?.get(key);
-  if (!next) return;
+  if (!next) {
+    untrackToolSessionIfIdle(ds);
+    return;
+  }
   clearTimeout(next.timer);
   pending!.delete(key);
   const cfg = getBot(ds.larkAppId).config;
@@ -290,7 +397,34 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   let running = toolFlushes.get(ds);
   if (!running) { running = new Map(); toolFlushes.set(ds, running); }
   running.set(key, work);
-  try { await work; } finally { if (running.get(key) === work) running.delete(key); }
+  try { await work; } finally {
+    if (running.get(key) === work) running.delete(key);
+    untrackToolSessionIfIdle(ds);
+  }
+}
+
+/** UI retirement never asserts native task failure or changes task settlement. */
+export async function retireReplyCardDisplay(
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message: string },
+  send: ReplyCardSender, owns: () => boolean,
+): Promise<boolean> {
+  if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
+    finalizeCotMessage(ds, msg.turnId, 'ambiguous', msg.dispatchAttempt);
+    return false;
+  }
+  try {
+    if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
+    await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+      // A failed cosmetic PATCH must not prevent persisting the terminal notice.
+      logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
+    });
+    const retired = await updateTurnReplyCard(ds, msg.turnId, { kind: 'display_retired', notice: msg.message }, send,
+      { dispatchAttempt: msg.dispatchAttempt, owns });
+    return retired !== undefined;
+  } finally {
+    const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
+    finalizeCotMessage(ds, msg.turnId, record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous', msg.dispatchAttempt);
+  }
 }
 
 /** A confirmed merged input retires the old display, not the native task.
@@ -339,7 +473,8 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
   };
   // The record keeps the agent's raw text; a re-render is model output entering again.
   const localContext = localAddressContextForBot(record.larkAppId, workingDir);
-  await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
+  // The accepted model card keeps its link fields on re-render (see updateTurnReplyCard).
+  await replayVettedBody([record.finalCard], 'interactive', () => store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
     beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
     // The persisted pendingPatch was vetted before this restart.
@@ -362,7 +497,7 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
     }), 'interactive', localContext),
-  });
+  }));
 }
 
 /** Like the CoT orphan sweep: recover only this bot's previously visible cards. */

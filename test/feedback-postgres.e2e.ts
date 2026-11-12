@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,6 +13,7 @@ import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { openPostgresFeedbackStore } from '../src/services/feedback-postgres-store.js';
 import { openPostgresFeedbackAnalytics } from '../src/services/feedback-postgres-analytics.js';
+import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 import type { PostgresTarget, FeedbackStore } from '../src/services/feedback-storage-types.js';
 
 const connectionString = process.env.BOTMUX_TEST_POSTGRES_URL;
@@ -184,6 +186,30 @@ describe('PostgreSQL feedback integration', () => {
     expect(await store.listFeedbackRevisions(delivery.deliveryId, 'user')).toEqual([]);
     expect(await store.listFeedbackEvents()).toEqual([]);
   });
+  it('freezes the host-verified subject binding into a delivery without creating the extension database', async () => {
+    const { target, password, instanceId } = await fixture();
+    const dataDir = await mkdtemp(join(tmpdir(), 'feedback-pg-binding-'));
+    try {
+      const store = await openPostgresFeedbackStore(target, password, instanceId, undefined, false, dataDir);
+      stores.push(store);
+      const record = (turnId: string, platformMessageId: string) => store.recordTurnDelivery({
+        botAppId: 'app', sessionId: 'session', turnId, platform: 'lark', platformAppId: 'app', platformMessageId,
+        content: 'answer', cardMode: 'card', status: 'delivered', context: { teamId: 'team' },
+      });
+      expect((await record('first', 'om_first')).context).toEqual({ teamId: 'team', feedbackSubjectBinding: null });
+      expect(existsSync(join(dataDir, 'feedback-extensions.sqlite'))).toBe(false);
+      const extensions = await FeedbackExtensionStore.open(dataDir);
+      try {
+        extensions.bindSubject('app', 'session', 'second', {
+          sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+        });
+      } finally { extensions.close(); }
+      await record('second', 'om_second');
+      expect((await store.findDeliveryByPlatformMessage('lark', 'app', 'om_second'))?.context).toEqual({
+        teamId: 'team', feedbackSubjectBinding: { sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 } },
+      });
+    } finally { await rm(dataDir, { recursive: true, force: true }); }
+  });
   it('deduplicates concurrent responses and feedback, preserves revisions and statistics', async () => {
     const { target, password, instanceId, store } = await fixture();
     const other = await openPostgresFeedbackStore(target, password, instanceId);
@@ -218,7 +244,16 @@ describe('PostgreSQL feedback integration', () => {
     expect(await store.listTurnCompletionEvents()).toHaveLength(1);
     const rows = await store.claimFeedbackOutbox({ now: Date.now() + 1000, limit: 10, claimToken: 'first' });
     expect(rows).toHaveLength(1);
+    await store.resetExpiredFeedbackOutboxClaims(Date.now() + 2000, 0);
+    expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+    await store.claimFeedbackOutbox({ now: Date.now() + 3000, limit: 10, claimToken: 'second' });
+    expect(await store.startFeedbackOutboxRequest(rows[0].outboxId, 'wrong')).toBe(false);
+    expect(await store.startFeedbackOutboxRequest(rows[0].outboxId, 'second')).toBe(true);
+    await store.resetExpiredFeedbackOutboxClaims(Date.now() + 4000, 0);
+    expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_outcome_unknown:second' }]);
+    await store.claimFeedbackOutbox({ now: Date.now() + 5000, limit: 10, claimToken: 'first' });
     expect(await store.settleFeedbackOutboxDelivered(rows[0].outboxId, 'wrong', 200, new Date().toISOString())).toBe(false);
     expect(await store.settleFeedbackOutboxDelivered(rows[0].outboxId, 'first', 200, new Date().toISOString())).toBe(true);
+    expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'delivered', lastError: 'webhook_outcome_unknown:second' }]);
   });
 });

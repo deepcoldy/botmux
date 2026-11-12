@@ -372,6 +372,21 @@ describe('bot-config store', () => {
     expect(effectiveReplyDelivery('app_default', cliId)).toBe('transcript');
   });
 
+  it.each(['grok-4.7', 'grok-4.7-build-fast'])('toggles zero injection without dropping %s xhigh', async model => {
+    const { registry, store } = await loaded({ cliId: 'grok', model, reasoningEffort: 'xhigh', replyDelivery: 'send', backendType: 'tmux' });
+    const zero = store.findConfigField('promptInjection')!;
+    expect(await store.applyConfigField('app_default', zero, 'none')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none', replyDelivery: 'send' });
+    expect(registry.getBot('app_default').config).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'grok')).toBe('transcript');
+
+    expect(await store.applyConfigField('app_default', zero, 'default')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'default' });
+    expect(effectiveReplyDelivery('app_default', 'grok')).toBe('send');
+  });
+
   it.each(['codex', 'traex'])('supports zero injection with local %s RPC input', async (cliId) => {
     const { store } = await loaded({ cliId, codexRpcInput: true });
     expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
@@ -874,6 +889,26 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().model).toBeUndefined();
     expect(registry.getBot('app_default').config.model).toBeUndefined();
+  });
+
+  it('archiveCodex preserves both overrides across reload and unset restores inheritance', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('archiveCodex')!;
+    expect(spec.effect).toBe('immediate');
+    for (const enabled of [true, false]) {
+      expect((await store.applyConfigField('app_default', spec, enabled)).ok).toBe(true);
+      expect(readConfig().archiveCodex).toBe(enabled);
+      expect(registry.getBot('app_default').config.archiveCodex).toBe(enabled);
+      const [reloaded] = registry.parseBotConfigsFromText(readFileSync(configPath, 'utf8'));
+      expect(reloaded.archiveCodex).toBe(enabled);
+    }
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('archiveCodex');
+    expect(registry.getBot('app_default').config.archiveCodex).toBeUndefined();
+    const snapshot = store.getConfigSnapshot('app_default');
+    expect(snapshot.ok && snapshot.rows.find(field => field.key === 'archiveCodex')?.value).toBe('inherit');
+    const [invalid] = registry.parseBotConfigsFromText(JSON.stringify([{ ...readConfig(), archiveCodex: 'false' }]));
+    expect(invalid.archiveCodex).toBeUndefined();
   });
 
   it('displayName round-trips, fires the refresher hook, and clears on null', async () => {
@@ -2628,6 +2663,29 @@ describe('bot-config store', () => {
     const r = await store.applyConfigField('app_missing', spec, 'x');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+
+  it('persists idleSpinSuspend without dropping other bot fields', async () => {
+    const { registry, store } = await loaded({ workingDir: '/tmp/keep-me', maxLiveWorkers: 12 });
+    const spec = store.findConfigField('idleSpinSuspend')!;
+    const coerced = store.coerceConfigValue(spec, JSON.stringify({ cpuPercent: 30, cliIds: ['traex'] }));
+    expect(coerced.ok).toBe(true);
+    const r = await store.applyConfigField('app_default', spec, (coerced as any).value);
+    expect(r.ok).toBe(true);
+    const persisted = readConfig();
+    expect(persisted.idleSpinSuspend).toMatchObject({ cpuPercent: 30, cliIds: ['traex'] });
+    expect(persisted.workingDir).toBe('/tmp/keep-me');
+    expect(persisted.maxLiveWorkers).toBe(12);
+    expect(registry.getBot('app_default').config.idleSpinSuspend).toMatchObject({ cpuPercent: 30 });
+  });
+
+  it('rejects an out-of-range idleSpinSuspend without writing', async () => {
+    const { store } = await loaded({ maxLiveWorkers: 12 });
+    const spec = store.findConfigField('idleSpinSuspend')!;
+    const coerced = store.coerceConfigValue(spec, JSON.stringify({ cpuPercent: 0 }));
+    expect(coerced.ok).toBe(false);
+    expect(readConfig().idleSpinSuspend).toBeUndefined();
+    expect(readConfig().maxLiveWorkers).toBe(12);
   });
 });
 

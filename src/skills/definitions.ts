@@ -363,7 +363,7 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 
 **话题不可用时遵循机器人配置**：默认保持原有发送和兜底行为。返回 \`TOPIC_SEND_BLOCKED\` 时停止发送，不得改用其他位置绕过；返回 \`TOPIC_SEND_CHECK_FAILED\` 表示查询失败，不代表话题已失效，可以重试原话题查询。
 
-**发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）就代表消息**已经送达**用户——即使你的终端里看不到任何回执，也不用再发一遍。发完 \`botmux send\` 后，本轮「终端没有可见文本、直接安静结束」是正常且预期的。如果之后看到类似「你上一条回复没有可见输出，请继续并产出用户可见回复」这样的提示，那是底层 CLI（Claude Code 等）的误判——**不要重发**，只有当 \`botmux send\` 自己报错（非零退出或打印「发送失败」）时才需要重试。
+**发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）代表本条消息已送达，不要重复发送。**消息送达不等于任务完成**：只发了确认或阶段进度时，progress / auxiliary 的成功回执不能代替最终交付。需要回复的请求，须先用 \`--response-kind final\` 交付完整结果或具体阻碍并核验成功，才可无终端正文地结束；完整答复已经用普通发送发出的，不要再补发 final 或总结，直接让最终回复只输出 \`BOTMUX_NOTHING_TO_SEND\`。不是发给你的消息保持静默。最终答复已送达时，不因“无可见输出”提示重发；发送结果未知先核对，明确未送达才重试。
 
 **格式自动处理**：普通回复统一用飞书卡片（schema 2.0）发送；单句纯文本仍保持轻量正文，Markdown 标题和表格转换为独立组件，代码块由富文本组件原生渲染。**该用 md 就用 md**——结构化内容不要手撸成纯文本或 ASCII 表格。
 
@@ -575,6 +575,8 @@ EOF
 \`\`\`bash
 botmux send --files "$TMPDIR/report.pdf" "报告已生成，请查收附件。"
 \`\`\`
+
+只发一个文件且不 @ 人时可以不写正文，文件本身就是这条消息；多个附件或带 @ 时会先发一张正文卡片，必须给正文（位置参数、\`--content-file\` 或 heredoc），否则直接拒发、什么都不发。
 
 ### 带视频预览
 
@@ -820,9 +822,10 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--schedule-remove-self\` | 仅 scheduled turn + 标准 final；投递成功并落账后删除当前精确任务 |
 | \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
-| \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
+| \`--mention-back\` | @ 回本次回复目标消息的发送者（open_id 自动从会话取，保留多参与者歧义检查）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
-| \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
+| \`--quote <message_id>\` | 引用指定消息（普通群）。默认跟随最近已注入消息的位置；需要回复较早消息时用 --reply-to |
+| \`--reply-to <message_id>\` | 按当前会话已接收消息的位置回复；不改变 final 归属。不能与显式 --quote / --top-level / --chat-id / --into 混用 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
 | \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
@@ -1502,7 +1505,9 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 不使用 \`--questions-file\` 时 \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
 - \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
-- 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+- 省略 \`--timeout\` 仍默认 300 秒；正数范围为 10–3600 秒。只有显式 \`botmux ask buttons --timeout 0\` 表示无截止时间，直到真人回答或宿主正式关闭/撤销
+- \`--timeout 0\` 要求 CLI 和 daemon 同时支持，使用版本化入口；旧 daemon 会明确拒绝，不自动降级成有限超时。此选项不改变 hook 或权限确认的有限超时策略
+- 无期限不代表永久批准：答题人、原请求身份、nonce、首个有效答案、当前方案版本与授权范围仍须校验。连接丢失后复用同一 requestId 和原卡片，不能用超时或重复提问代替人工决定
 
 ## @ 点名（--mention）
 

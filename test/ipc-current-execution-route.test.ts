@@ -260,6 +260,63 @@ describe('POST /api/current-execution', () => {
     }
   });
 
+  it('a requester who authorizes mid-turn gets the grant on a later fetch of the same turn (#3312)', async () => {
+    const { publishTurnCliIdentity, __resetTransientRefusalsForTest, NOT_AUTHORIZED_RETRY_INTERVAL_MS } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const policy = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty', triggerUserAuth: policy,
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-not-authorized-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let authorized = false;
+    let calls = 0;
+    __resetTransientRefusalsForTest();
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: async () => {
+        calls++;
+        return authorized
+          ? { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'jwt-after-authorizing' } } }
+          : { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' };
+      },
+    });
+    const fetchIdentity = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { env: string }).env;
+    };
+    try {
+      await publishTurnCliIdentity({
+        botConfig: { larkAppId: 'cli_execution', larkAppSecret: 's', brand: 'feishu', triggerUserAuth: policy } as any,
+        sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      // The turn starts refused, and its next call right away is not a new platform request.
+      expect(await fetchIdentity()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      expect(calls).toBe(1);
+      // They authorize on the platform; once the spacing has passed, the same turn picks the grant up.
+      authorized = true;
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + NOT_AUTHORIZED_RETRY_INTERVAL_MS + 1_000);
+      expect(await fetchIdentity()).toContain("BYTEDCLI_USER_CLOUD_JWT='jwt-after-authorizing'");
+      expect(calls).toBe(2);
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('re-reads the live bot policy after the platform answers: a mid-flight switch to local is not written', async () => {
     const { publishTurnCliIdentity, __resetTransientRefusalsForTest } = await import('../src/core/turn-cli-identity.js');
     const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
@@ -332,7 +389,103 @@ describe('POST /api/current-execution', () => {
       body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
     });
     expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ error: 'current_execution_unverified' });
+    expect(await response.json()).toMatchObject({ error: 'current_execution_unverified', reason: 'identity_decision_conflict' });
+  });
+
+  it.each([
+    ['no identity decision ever reached the daemon', (ds: any) => { delete ds.reportedIdentityModel; }, 'identity_decision_missing'],
+    ['the worker reported the single model', (ds: any) => { ds.reportedIdentityModel.model = 'single'; }, 'identity_model_single'],
+    ['the caller is not in the live turn', (ds: any) => { ds.localProcessAttestation.cliProcStart = 'stale'; }, 'lineage_unproven'],
+    // An unproven caller learns only that it is not proven, never the model.
+    ['an unproven caller asks about a session that has no decision', (ds: any) => {
+      ds.localProcessAttestation.cliProcStart = 'stale'; delete ds.reportedIdentityModel; }, 'lineage_unproven'],
+    ['an unproven caller asks about a single-model session', (ds: any) => {
+      ds.localProcessAttestation.cliProcStart = 'stale'; ds.reportedIdentityModel.model = 'single'; }, 'lineage_unproven'],
+  ])('names the refused step when %s', async (_label, mutate, reason) => {
+    const ds = session(); mutate(ds);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ schema: 'botmux.current-execution-identity.v1', status: 'blocked',
+      error: 'current_execution_unverified', reason });
+  });
+
+  it('logs each kind of refusal once a minute per live session, and nothing a caller chose', async () => {
+    const { logger } = await import('../src/utils/logger.js');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const ds = session(); delete ds.reportedIdentityModel;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const refuse = async (sessionId: string) => (await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, tool: 'bytedcli' }),
+    })).status;
+    const refusals = () => warn.mock.calls.map(([line]) => String(line)).filter(line => line.includes('refused bytedcli identity'));
+    // Clear of any refusal another case in this file logged (the limiter is daemon-wide state).
+    const start = Date.now() + 3_600_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    for (let i = 0; i < 3; i++) expect(await refuse('s-execution')).toBe(403);
+    expect(refusals()).toEqual([expect.stringMatching(/for s-execut: identity_decision_missing$/)]);
+    // Sessions the daemon does not know share one key, and their ids never reach the log.
+    for (let i = 0; i < 5; i++) expect(await refuse(`forged-${i}\nFORGED LOG LINE`)).toBe(403);
+    expect(refusals()).toHaveLength(2);
+    expect(refusals()[1]).toMatch(/for an unknown session: lineage_unproven/);
+    expect(refusals().join('\n')).not.toContain('FORGED');
+    // The live session's own limit was not reset by them; it reopens after a minute.
+    expect(await refuse('s-execution')).toBe(403);
+    expect(refusals()).toHaveLength(2);
+    clock.mockReturnValue(start + 61_000);
+    expect(await refuse('s-execution')).toBe(403);
+    expect(refusals()).toHaveLength(3);
+  });
+
+  it.skipIf(process.platform !== 'linux')('the wrapper runner tells a proven caller which step refused, and prints no identity', async () => {
+    const ds = session(); delete ds.reportedIdentityModel;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-refusal-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    writeSessionIdentity(dataDir, 's-execution', {
+      tool: 'bytedcli', cloudJwt: 'jwt-must-not-leak', turnId: 'trigger-current', openId: 'ou-original',
+    }, 'proven');
+    const run = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawnTsScript('src/cli-identity-runner.ts', [
+        '--data-dir', dataDir, '--session-id', 's-execution', '--app-id', 'cli_execution',
+        '--ipc-port', String(ipc!.port), '--tool', 'bytedcli',
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      child.stdout!.on('data', data => { stdout += data; }); child.stderr!.on('data', data => { stderr += data; });
+      child.once('error', reject); child.once('close', code => resolve({ code, stdout, stderr }));
+    });
+    try {
+      const result = await run();
+      expect(result.code).toBe(77);
+      expect(result.stdout).toBe('');
+      const lines = result.stderr.trim().split('\n');
+      expect(lines[0]).toBe('botmux: current_execution_unverified [reason=identity_decision_missing]');
+      // A cause and a next step follow, naming the tool; never the identity.
+      expect(lines).toHaveLength(3);
+      expect(lines[1]).toContain('bytedcli');
+      expect(result.stderr).not.toContain('jwt-must-not-leak');
+      // Once the decision is known, the same caller is served its identity.
+      ds.reportedIdentityModel = session().reportedIdentityModel;
+      const served = await run();
+      expect(served.code, served.stderr).toBe(0);
+      expect(served.stdout).toBe(recallProvenIdentityContent(dataDir, 's-execution', 'trigger-current', 'bytedcli'));
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
   it('does not let a valid host HMAC bypass current process attestation', async () => {

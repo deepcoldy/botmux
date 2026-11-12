@@ -74,6 +74,7 @@ import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
+import { traexHistoryInputMatches, traexSkillInputAliases } from './traex-skill-input.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
@@ -1052,7 +1053,9 @@ export function drainTraexRollout(
         const text = item.content.flatMap((block: any) => block?.type === 'input_text'
           && typeof block.text === 'string' ? [block.text] : []).join('');
         if (text && claimUserTurn(sourceTurnId)) {
-          events.push({ ...base, kind: 'user', text, sourceTurnId });
+          const inputTextAliases = traexSkillInputAliases(text, item.content);
+          events.push({ ...base, kind: 'user', text, sourceTurnId,
+            ...(inputTextAliases ? { inputTextAliases } : {}) });
           if (!probe) {
             // Forward the no-turn-id pending bucket to this turn, mirroring the
             // legacy user_message / item_completed user edges. Do NOT delete any
@@ -1081,6 +1084,7 @@ export function drainTraexRollout(
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
       const userText = payload.message;
+      const inputTextAliases = traexSkillInputAliases(userText);
       if (!sourceTurnId) {
         if (takeExpectedTraexUserMirror(pendingUserMirrors, 'legacy', userText, base.timestampMs)) continue;
       }
@@ -1092,6 +1096,7 @@ export function drainTraexRollout(
           ...base,
           kind: 'user',
           text: userText,
+          ...(inputTextAliases ? { inputTextAliases } : {}),
           ...(sourceTurnId ? { sourceTurnId } : {}),
           ...(preserveCollecting ? { preserveCollecting: true } : {}),
         });
@@ -1112,6 +1117,7 @@ export function drainTraexRollout(
       && payload.type === 'item_completed') {
       const userText = itemCompletedUserText(payload.item);
       if (userText) {
+        const inputTextAliases = traexSkillInputAliases(userText, payload.item.content);
         const sourceMessageId = typeof payload.item.id === 'string' && payload.item.id
           ? payload.item.id : undefined;
         const itemClaim = claimTraexUserItem(seenUserItems, sourceTurnId, sourceMessageId);
@@ -1130,6 +1136,7 @@ export function drainTraexRollout(
           if (legacyIndex !== undefined) {
             events[legacyIndex] = {
               ...events[legacyIndex],
+              ...(inputTextAliases ? { inputTextAliases } : {}),
               ...(sourceTurnId ? { sourceTurnId } : {}),
               ...(sourceMessageId ? { sourceMessageId } : {}),
             };
@@ -1144,6 +1151,7 @@ export function drainTraexRollout(
               ...base,
               kind: 'user',
               text: userText,
+              ...(inputTextAliases ? { inputTextAliases } : {}),
               ...(sourceTurnId ? { sourceTurnId } : {}),
               ...(sourceMessageId ? { sourceMessageId } : {}),
               ...(preserveCollecting ? { preserveCollecting: true } : {}),
@@ -1356,10 +1364,6 @@ export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
   return readLatestRolloutRuntime(path, TRAEX_RUNTIME_SCAN_MAX_BYTES);
 }
 
-function normaliseInputText(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
-
 // -- history.jsonl submit-confirmation (submit-time truth) ------------------
 //
 // TRAE writes ~/.trae/cli/history.jsonl at SUBMIT time — one JSON line
@@ -1391,7 +1395,8 @@ function readTraexHistorySid(parsed: unknown): string | undefined {
 }
 
 /** Scan the byte delta appended to history.jsonl since `fromByte` for a line
- *  whose decoded `text` exactly matches `expectedText` (newline-normalised).
+ *  whose decoded `text` matches `expectedText` after newline normalization
+ *  or TRAE's native skill-link expansion. Skill arguments still match in full.
  *  Never parses a non-newline-terminated tail, so a half-written line can't
  *  manufacture a false match — a later poll sees the completed entry. */
 export function traexHistoryMatchDelta(
@@ -1411,13 +1416,12 @@ export function traexHistoryMatchDelta(
   const delta = buf.toString('utf8');
   // Drop a trailing partial line (no newline yet) — it may still be mid-write.
   const lines = delta.endsWith('\n') ? delta.split('\n') : delta.split('\n').slice(0, -1);
-  const expected = normaliseInputText(expectedText);
   for (const line of lines) {
     if (line.length === 0) continue;
     let parsed: any;
     try { parsed = JSON.parse(line); } catch { continue; }
     if (typeof parsed?.text !== 'string') continue;
-    if (normaliseInputText(parsed.text) !== expected) continue;
+    if (!traexHistoryInputMatches(parsed.text, expectedText)) continue;
     const cliSessionId = readTraexHistorySid(parsed);
     // Skip a same-text line owned by a DIFFERENT pane (shared-TRAE_HOME
     // collision). Keep scanning — the owned line may be later in this delta

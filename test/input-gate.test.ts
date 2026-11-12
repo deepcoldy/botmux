@@ -112,6 +112,12 @@ describe('shouldReleaseFirstPromptTimeout', () => {
       hardTimeoutMs: 90_000,
     })).toBe(true);
   });
+
+  it('releases at the soft timeout when the backend screen already shows a ready input box', () => {
+    const deferred = { deferFirstPromptTimeoutUntilReady: true, hasReadyPattern: true, elapsedMs: 15_000, hardTimeoutMs: 90_000 };
+    expect(shouldReleaseFirstPromptTimeout({ ...deferred, inputBoxReady: true })).toBe(true);
+    expect(shouldReleaseFirstPromptTimeout({ ...deferred, inputBoxReady: false })).toBe(false);
+  });
 });
 
 describe('shouldWaitForPostSessionStartPromptEvidence', () => {
@@ -404,5 +410,26 @@ describe('decideFirstWriteLiveness', () => {
   it('keeps the legacy behavior when there is nothing to check', () => {
     expect(decideFirstWriteLiveness({ ...base, readyPattern: undefined, viewport: '' }).write).toBe(true);
     expect(decideFirstWriteLiveness({ ...base, viewport: undefined }).write).toBe(true);
+  });
+
+  describe("with the adapter's own input-box verdict", () => {
+    // Codex 0.166 paints `›` before its footer; its writeInput refuses that box.
+    const codex = { ...base, readyPattern: /[›»](?!\s*\d+\.)|\d+% left/, viewport: '› Ask Codex to do anything' };
+
+    it('holds the first write while the box is not ready even though the prompt marker is visible', () => {
+      expect(decideFirstWriteLiveness({ ...codex, inputBoxReady: false }))
+        .toEqual({ write: false, reason: 'input-box-not-ready' });
+      expect(decideFirstWriteLiveness({ ...codex, inputBoxReady: false, readySignal: true }).write).toBe(false);
+    });
+
+    it('keeps the first message queued past the hard cap instead of forcing it into a refused write', () => {
+      expect(decideFirstWriteLiveness({ ...codex, inputBoxReady: false, hardCapReached: true }))
+        .toEqual({ write: false, reason: 'input-box-not-ready' });
+    });
+
+    it('writes as soon as the box is ready, even before the stream showed a prompt', () => {
+      expect(decideFirstWriteLiveness({ ...codex, viewport: undefined, inputBoxReady: true }))
+        .toEqual({ write: true, reason: 'input-box-ready' });
+    });
   });
 });

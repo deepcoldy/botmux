@@ -149,6 +149,13 @@ setInterval(() => {
       writeFileSync(request, value);
       await waitFor(() => existsSync(receipt) && readFileSync(receipt, 'utf8') === value, logs);
     };
+    // Phase 1 is worker start-up, which stretches with runner load (bun first
+    // compiles src/worker.ts, then init spawns the PTY CLI): under bun-test's
+    // four-way fan-out a busy runner can spend the whole shared 8s window
+    // before the fake CLI even exists, failing with empty logs (#3371). Wait
+    // for its pid file under a load-tolerant budget first; only the file
+    // handshake then uses the fixed window, so slow start-up cannot eat it.
+    await waitFor(() => existsSync(pidDir) && readdirSync(pidDir).length > 0, logs, 25_000);
     await writeReceipt('started');
     const cliPid = Number(readdirSync(pidDir)[0]);
     expect(Number.isSafeInteger(cliPid) && cliPid > 1).toBe(true);
@@ -172,7 +179,8 @@ setInterval(() => {
       await waitFor(() => !processAlive(cliPid)
         && (child.exitCode !== null || child.signalCode !== null), logs);
     }
-  }, 20_000);
+    // The 25s start-up budget above is load-tolerant; give the whole case room.
+  }, 60_000);
 });
 
 describe('ordinary IM during real worker init', () => {
@@ -644,7 +652,10 @@ if (process.argv.includes('app-server')) {
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     children.add(child);
-    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
 
@@ -672,11 +683,26 @@ if (process.argv.includes('app-server')) {
       turnId: 'om_followup_order',
     } satisfies DaemonToWorker);
 
+    // The race window is init's resume-title baseline read: once spawnCli
+    // returns, init awaits Codex thread metadata with a fixed 7s timeout
+    // (src/worker.ts, captureCodexResumeTitleBaseline; BOTMUX_TIME_SCALE does
+    // not scale it), and the fake app-server above never answers, so all of it
+    // elapses. Budget the phases separately: under one shared 14s deadline, a
+    // busy CI runner that needed 5.4s just to spawn the CLI left the fixed 7s
+    // running past the deadline (#3353).
+    const titleBaselineReadMs = 7_000;
+    // 1. Start-up, which stretches with machine load: the CLI reaches its
+    //    prompt, normally inside the window while the follow-up is queued.
+    await waitFor(() => messages.some(message => message.type === 'prompt_ready'), logs, 25_000);
+    // 2. The window: `ready` is sent only once init has put the initial
+    //    prompt at the queue head.
+    await waitFor(() => messages.some(message => message.type === 'ready'), logs, titleBaselineReadMs + 8_000);
+    // 3. Both inputs reach the CLI.
     await waitFor(() => {
       if (!existsSync(inputLog)) return false;
       const input = readFileSync(inputLog, 'utf8');
       return input.includes('INITIAL_ORDER_MARKER') && input.includes('FOLLOWUP_ORDER_MARKER');
-    }, logs, 14_000);
+    }, logs, 15_000);
 
     const input = readFileSync(inputLog, 'utf8');
     expect(input.indexOf('INITIAL_ORDER_MARKER')).toBeLessThan(input.indexOf('FOLLOWUP_ORDER_MARKER'));
@@ -684,7 +710,7 @@ if (process.argv.includes('app-server')) {
       type: 'turn_input_rejected',
       turnId: 'om_followup_order',
     }));
-  }, 20_000);
+  }, 60_000);
 
   it('acknowledges an OpenCode argv activation token without a dispatch attempt', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-opencode-argv-activation-'));

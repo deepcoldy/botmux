@@ -86,6 +86,17 @@ Then DM the bot, or run `botmux dashboard` to create a group and start chatting.
 
 More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Final answer feedback](docs/feedback-capability-current-implementation.md) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent (showcase)](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
 
+## Central Platform (open source, self-hosted)
+
+botmux on a single machine needs no central service. Once you have several machines, want to reach them from outside their network, or want to use them with a team, you can deploy the open-source **[Botmux Platform](https://github.com/botmux-ai/botmux-platform)** (MIT). You sign in with Lark, and the botmux on every machine shows up in one website:
+
+- **Open from anywhere**: each machine dials out to the platform over a tunnel, so no inbound ports are needed; open any machine's Dashboard and web terminal from the website, with Lark single sign-on.
+- **Machine overview**: online status, daemon version, one-click upgrade, and co-managers per machine.
+- **Team collaboration**: teams with Lark collaboration groups and an Issue board, plus finding bots on teammates' machines to bring into a group.
+- **Personal credential vault**: authorize Lark once on the platform, and it issues short-lived credentials to your bound machines so bots can call lark-cli as you.
+
+To connect a machine, click 「绑定新机器」 (Bind new machine) on the platform website and run the `botmux bind <credential>` command it gives you in that machine's terminal. Deployment is covered in the [platform repository](https://github.com/botmux-ai/botmux-platform), connecting and usage in the [Central Platform docs](https://deepcoldy.github.io/botmux/en/platform); there's also a [3-minute explainer video](https://github.com/user-attachments/assets/52136d9e-841e-4e52-a297-8dcad561c7dc) (in Chinese).
+
 ## Per-Bot Zero Prompt Injection
 
 Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bots). Bypasses all botmux system prompts, per-turn reminders, identity envelopes, roles, and skill directory injections, while automatically collecting final replies from CLI transcripts.
@@ -103,7 +114,7 @@ Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (proce
 
 `claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) · `doubao` ([Doubao CLI setup and usage](docs/doubao.en.md)) …
 
-- **Session-level CLI Selection**: Select a registered CLI for an upcoming session with `/cli <cliId>`.
+- **Session-level CLI Selection**: Select a registered CLI for an upcoming session with `/cli <cliId>`; program names and short aliases work too (`/cli cc`, `/cli omp`).
 - **Codex Multi-Account & Instances**: Configure multiple login homes and distribution strategies via [Session-level Codex Instances](docs/codex-instances.md).
 - **Compatible Distributions**: Codex-compatible and Kimi-compatible distributions can declare independent identities via `cliRuntime`, see [Codex-compatible Distributions](https://deepcoldy.github.io/botmux/en/adapters#codex-compatible-distributions).
 - **Shared Memory (Optional)**: Enable cross-agent persistent memory with [OpenViking Shared Memory](examples/openviking-memory/README.md).

@@ -301,6 +301,14 @@ afterAll(async () => {
   rmSync(config.session.dataDir, { recursive: true, force: true });
 });
 
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
+
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
@@ -1099,15 +1107,20 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       status: 'completed', durationMs: 2300, completedAtMs: Date.now() });
     const expectedAnswer = source === 'explicit' ? '显式完整答复' : '同卡完整答复';
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const replyStore = new TurnReplyCardStore(config.session.dataDir);
+    const replyKey = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId };
     await vi.waitFor(() => {
+      expect(replyStore.read(replyKey)).toMatchObject({ phase: 'completed', finalDelivered: true });
       expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
       expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_managed_reply'))
         .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
+      // The bridge final settles after an explicit answer already completed the card; the next case reuses this turn key.
+      expect(ds.lastBridgeEmittedUuid).toBe(`${ds.session.sessionId}:managed-final`);
     }, { timeout: 5000 });
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
-    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-    const record = new TurnReplyCardStore(config.session.dataDir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
+    const record = replyStore.read(replyKey);
     if (source === 'bridge') expect(record?.tools[0]?.subject).toBe('README.md');
     expect(record?.finalDelivered).toBe(true);
     expect(record?.finalSource).toBe(source);
@@ -3926,6 +3939,36 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('file');
     expect(cardJson).not.toContain(missing);
     expect(cardJson).not.toContain('[file](');
+  });
+
+  it('forwards host paths and local links as written for a bot that has not turned on hideLocalAddresses', async () => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    try {
+      const ds = makeDs();
+      ds.workingDir = '/custom/project';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, {
+        ...finalOutputMsg(),
+        content: '排查证据在 /opt/app/logs/error.log 和 /custom/project/src/main.ts:12，见 [说明](/home/alice/notes.md)，服务 http://localhost:3000/health',
+      }, 'tag', 0);
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      const cardJson = sessionReply.mock.calls[0][1] as string;
+      for (const kept of ['/opt/app/logs/error.log', '/custom/project/src/main.ts:12', '[说明](/home/alice/notes.md)', 'http://localhost:3000/health']) {
+        expect(cardJson).toContain(kept);
+      }
+      expect(cardJson).not.toContain('内部文件');
+    } finally {
+      restore();
+    }
   });
 
   it('removes an inaccessible home-shaped relative link from non-isolated bridge output', async () => {

@@ -1,3 +1,4 @@
+import { renderInboundMessageLocation, type InboundMessageLocation } from './reply-message.js';
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { isLeadOnlySession } from './lead-only.js';
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
@@ -56,6 +57,7 @@ import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { hideLocalAddressesFor } from '../im/lark/local-address-switch.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
@@ -710,7 +712,8 @@ export async function downloadResources(larkAppId: string, messageId: string, re
       // Whose token backs the user-token fallback: the person who sent the
       // attachment. They can see what they just posted, and the download is
       // attributed to them rather than to whoever happens to be logged in.
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId,
+        res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : undefined);
       const attachment: LarkAttachment = { type: res.type, path: savePath, name: res.name, resourceKey: res.key };
       // Sniffing is best-effort: a successfully downloaded attachment must remain available.
       try {
@@ -1477,7 +1480,7 @@ function buildNewTopicBlocks(
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind });
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1829,7 +1832,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'messageLocation' | 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1838,6 +1841,7 @@ type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' |
 /** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
  *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
 type FollowUpOpts = {
+  messageLocation?: InboundMessageLocation;
   promptInjection?: PromptInjection;
   attachments?: LarkAttachment[];
   mentions?: LarkMention[];
@@ -1909,7 +1913,7 @@ function buildFollowUpBlocks(
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
   const formattingBlock = opts?.cliId !== 'mira' && !noTransport
-    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale)}</botmux_formatting>`
+    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale, hideLocalAddressesFor(opts?.larkAppId))}</botmux_formatting>`
     : '';
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -1963,6 +1967,8 @@ function buildFollowUpBlocks(
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
   if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
+  const messageLocation = renderInboundMessageLocation(opts?.messageLocation);
+  if (messageLocation && !bare) blocks.push({ key: 'messageLocation', text: messageLocation });
 
   // bare（transcript + solo）：裸文本 + `[附件]`/`[@提及]` 行，附件/提及已折进正文，
   // 下面的 sender / senderNote / attachments / mentions 块一并跳过；substitute 保留。
@@ -2021,7 +2027,7 @@ export function buildFollowUpContent(
   ) {
     const formattingGuidance = sessionIsNoTransport(opts.larkAppId, opts.chatId) || opts.cliId === 'mira'
       ? undefined
-      : feishuReplyPresentationGuidance(opts.locale);
+      : feishuReplyPresentationGuidance(opts.locale, hideLocalAddressesFor(opts.larkAppId));
     return buildServiceUserPrompt(
       [opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'),
       formattingGuidance,
@@ -2223,7 +2229,9 @@ export function buildFollowUpCliInput(
   const hookTurnId = opts?.turnId;
   if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
-    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['formatting', 'reminder', 'whiteboard', 'sender', 'mentions']);
+    // messageLocation 是宿主元数据，与 sender 同类：hook 模式下进 envelope，
+    // 输入框与 transcript 仍只有用户正文。
+    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['formatting', 'reminder', 'whiteboard', 'sender', 'mentions', 'messageLocation']);
     const ptyText = blocks
       .filter((b) => !ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
@@ -2253,7 +2261,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const formattingBlock = sessionIsNoTransport(opts.larkAppId, opts.chatId)
     ? ''
-    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale)}</botmux_formatting>`;
+    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale, hideLocalAddressesFor(opts.larkAppId))}</botmux_formatting>`;
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),

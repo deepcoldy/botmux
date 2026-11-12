@@ -50,8 +50,11 @@ import * as sandboxStore from '../src/services/sandbox-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
 import * as botRegistry from '../src/bot-registry.js';
+import { sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 import * as costCalculator from '../src/core/cost-calculator.js';
 import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied, markMessageListenerRunPreviewCompleted, markMessageListenerRunPreviewRunning } from '../src/services/message-listener-run-preview-store.js';
+import { findMessageListenerForChat } from '../src/services/message-listener.js';
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
@@ -3493,6 +3496,51 @@ describe('PUT /api/bot-card-prefs — senderTag (<sender> 注入开关)', () => 
   });
 });
 
+describe('PUT /api/bot-card-prefs — hideLocalAddresses (飞书回复隐藏开发机地址)', () => {
+  it('defaults off, persists only an explicit true and applies it to the next reply', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-local-address-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-local-address-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const evidence = '日志在 /opt/app/logs/error.log';
+    const put = (base: string, value: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hideLocalAddresses: value }),
+    });
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ hideLocalAddresses: false });
+      expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(appId))).toBe(evidence);
+
+      const on = await put(base, true);
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, hideLocalAddresses: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ hideLocalAddresses: true });
+      expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(appId))).not.toContain('/opt/app/logs');
+
+      // A non-boolean is not coerced into a value.
+      expect((await put(base, 'yes')).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ hideLocalAddresses: true });
+
+      const off = await put(base, false);
+      expect(await off.json()).toMatchObject({ ok: true, hideLocalAddresses: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('hideLocalAddresses');
+      expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(appId))).toBe(evidence);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — senderTagHideEmail (<sender> 注入开关)', () => {
   it('defaults off and persists hiding independently of the master switch', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sender-tag-'));
@@ -3866,6 +3914,109 @@ describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence 
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('PUT /api/group-message-listeners/:chatId — the answer is what the group now runs', () => {
+  const appId = 'test-group-listener-app';
+  const chatId = 'oc_group_listener_chat';
+  const ownRule = { mode: 'custom', listener: { enabled: true, prompt: '本群规则' } };
+
+  async function withDaemon(entry: Record<string, unknown>, run: (base: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-group-listener-'));
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = join(dir, 'bots.json');
+      writeFileSync(process.env.BOTS_CONFIG, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude', ...entry }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const put = (base: string, body: unknown) => fetch(`${base}/api/group-message-listeners/${chatId}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  it('keeps a custom rule saved switched off with no prompt, so the group stays off the global rule', async () => {
+    await withDaemon({
+      globalMessageListener: { enabled: true, prompt: '全局规则' },
+      groupMessageListenerOverrides: { [chatId]: ownRule },
+    }, async base => {
+      const res = await put(base, { mode: 'custom', listener: { enabled: false, prompt: '', contentPolicy: { includeKeywords: ['告警'] } } });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, mode: 'custom', listener: { enabled: false, prompt: '', contentPolicy: { includeKeywords: ['告警'] } } });
+      expect(await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json()).toMatchObject({ mode: 'custom', listener: { enabled: false, prompt: '' } });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+      expect(findMessageListenerForChat(getBot(appId), 'oc_inheriting_chat')?.prompt).toBe('全局规则');
+
+      // A restart reads the same paused rule back from bots.json.
+      __testOnly_resetBotRegistry();
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      expect(getBot(appId).config.groupMessageListenerOverrides?.[chatId]).toMatchObject({ mode: 'custom', listener: { enabled: false, prompt: '' } });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
+  });
+
+  it('counts a paused custom rule as configured on GET /api/groups, apart from the active flag', async () => {
+    await withDaemon({
+      groupMessageListenerOverrides: { [chatId]: { mode: 'custom', listener: { enabled: false, prompt: '暂停的规则' } } },
+    }, async base => {
+      const spy = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
+        { chatId, name: 'paused' },
+        { chatId: 'oc_group_listener_plain', name: 'plain' },
+      ]);
+      try {
+        const body = await (await fetch(`${base}/api/groups`)).json();
+        expect(body.chats.map((chat: any) => [chat.chatId, chat.hasMessageListener, chat.hasMessageListenerConfig])).toEqual([
+          [chatId, false, true],
+          ['oc_group_listener_plain', false, false],
+        ]);
+      } finally { spy.mockRestore(); }
+    });
+  });
+
+  it.each([
+    ['custom, on', { mode: 'custom', listener: { enabled: true, prompt: '新规则' } }],
+    ['custom, off with a prompt', { mode: 'custom', listener: { enabled: false, prompt: '新规则' } }],
+    ['custom, off with no prompt', { mode: 'custom', listener: { enabled: false, prompt: '' } }],
+    ['disabled', { mode: 'disabled' }],
+    ['inherit', { mode: 'inherit' }],
+  ])('answers "%s" with what a re-read returns', async (_name, body) => {
+    await withDaemon({ groupMessageListenerOverrides: { [chatId]: ownRule } }, async base => {
+      const answer = await (await put(base, body)).json();
+      const reread = await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json();
+      expect(answer).toMatchObject({ ok: true, mode: reread.mode });
+      if (reread.mode === 'custom') expect(answer.listener).toEqual(reread.listener);
+    });
+  });
+
+  // What a group-page save leaves in bots.json: the rule plus its legacy shadow,
+  // which a restart loads into memory for the poller and the no-override fallback.
+  const savedFromGroupPage = { groupMessageListenerOverrides: { [chatId]: ownRule }, messageListeners: { [chatId]: ownRule.listener } };
+
+  it('leaves the legacy DELETE route clearing the rule, for the running daemon too', async () => {
+    await withDaemon(savedFromGroupPage, async base => {
+      expect((await fetch(`${base}/api/message-listeners/${chatId}`, { method: 'DELETE' })).status).toBe(200);
+      expect(await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json()).toMatchObject({ mode: 'inherit', listener: null });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
+  });
+
+  it('pauses the rule for the running daemon too, so a later legacy clear cannot bring it back', async () => {
+    await withDaemon(savedFromGroupPage, async base => {
+      expect((await put(base, { mode: 'custom', listener: { enabled: false, prompt: '' } })).status).toBe(200);
+      // The poller reads this row; a stale enabled copy keeps the paused group polled.
+      expect(getBot(appId).config.messageListeners?.[chatId]).toMatchObject({ enabled: false, prompt: '' });
+      expect((await fetch(`${base}/api/message-listeners/${chatId}`, { method: 'DELETE' })).status).toBe(200);
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
   });
 });
 
@@ -11160,6 +11311,7 @@ describe('GET /api/groups (Phase B)', () => {
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
+      hasMessageListenerConfig: false,
       observedBotNames: [],
       pinStreamingCardMasterEnabled: false,
       pinStreamingCardChatEnabled: true,
@@ -11203,6 +11355,7 @@ describe('GET /api/groups (Phase B)', () => {
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
+        hasMessageListenerConfig: false,
         observedBotNames: [],
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
@@ -11252,6 +11405,7 @@ describe('GET /api/groups (Phase B)', () => {
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
+        hasMessageListenerConfig: false,
         observedBotNames: [],
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: false,
@@ -11291,6 +11445,7 @@ describe('GET /api/groups (Phase B)', () => {
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
+        hasMessageListenerConfig: false,
         observedBotNames: [],
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
@@ -11343,6 +11498,7 @@ describe('GET /api/groups (Phase B)', () => {
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
+          hasMessageListenerConfig: false,
           observedBotNames: [],
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
@@ -11362,6 +11518,7 @@ describe('GET /api/groups (Phase B)', () => {
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
+          hasMessageListenerConfig: false,
           observedBotNames: [],
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: false,
@@ -11381,6 +11538,7 @@ describe('GET /api/groups (Phase B)', () => {
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
+          hasMessageListenerConfig: false,
           observedBotNames: [],
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
@@ -13187,6 +13345,22 @@ describe('PUT /api/bot-card-prefs — unified card tool visibility', () => {
         body: JSON.stringify({ replyCardShowTools: 'false' }),
       });
       expect(badType.status).toBe(400);
+
+      for (const enabled of [true, false]) {
+        const saved = await fetch(url, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ replyCardNativeCot: enabled }),
+        });
+        expect(saved.status).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, replyCardNativeCot: enabled });
+        expect(getBot(appId).config.replyCardNativeCot === true).toBe(enabled);
+        expect(loadBotConfigs()[0].replyCardNativeCot === true).toBe(enabled);
+      }
+      const invalidNative = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardNativeCot: 'true' }),
+      });
+      expect(invalidNative.status).toBe(400);
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -13283,5 +13457,42 @@ describe('GET /api/sessions/:sessionId/reply-render-snapshot', () => {
       findSpy.mockReturnValue(undefined);
       expect((await fetch(base)).status).toBe(404);
     } finally { findSpy.mockRestore(); renderSpy.mockRestore(); }
+  });
+});
+
+
+describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
+  it('requires host/session authority and rechecks the exact attempt after the native publication wait', async () => {
+    const cards = await import('../src/core/turn-reply-card.js');
+    const appId = 'cli_native_order';
+    const ds = { larkAppId: appId, currentTurnId: 'om_order',
+      managedTurnOrigin: { turnId: 'om_order', dispatchAttempt: 1, capability: 'fixture-capability' },
+      session: { sessionId: 'native-order', status: 'active' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    let release!: (visible: boolean) => void;
+    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockImplementation(() => new Promise<boolean>(resolve => { release = resolve; }));
+    try {
+      setLarkAppId(appId); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/native-order/reply-card-ready';
+      const body = JSON.stringify({ expectedTurnId: 'om_order', dispatchAttempt: 1 });
+      expect((await requestJson(handle.port, path, { method: 'POST', body })).status).toBe(403);
+      const query = () => requestJson(handle!.port, path, { method: 'POST', body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' } });
+      const pending = query();
+      await vi.waitFor(() => expect(prepareSpy).toHaveBeenCalledOnce());
+      ds.managedTurnOrigin.dispatchAttempt = 2;
+      release(true);
+      expect((await pending).status).toBe(409);
+      ds.managedTurnOrigin.dispatchAttempt = 1;
+      // The CLI may hand passive progress to native thinking only when it is live.
+      for (const visible of [true, false]) {
+        prepareSpy.mockResolvedValue(visible);
+        const ready = await query();
+        expect(ready.status).toBe(200);
+        expect(ready.json).toEqual({ ok: true, nativeThinkingVisible: visible });
+      }
+      expect(prepareSpy).toHaveBeenLastCalledWith(ds, 'om_order', 1);
+    } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });
 });

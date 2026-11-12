@@ -803,6 +803,26 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
   return [...out];
 }
 
+/** The conversation a live Claude process itself declares, for its runtime
+ *  identity: its own pid-state record (the source a write's session id comes
+ *  from), held to the stricter standard an identity needs. The record must name
+ *  this pid and carry a start time equal to the live process's, so a recycled
+ *  pid's leftover never counts; a platform where that cannot be checked gets
+ *  nothing. Any session file the process holds open must be that same
+ *  conversation: a pre-2.1.305 record keeps its spawn-time id across `/clear`,
+ *  and an answer that disagrees with what the process has open is no answer. */
+export function readClaudeLiveSessionId(pid: number, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
+  if (!parsed || typeof parsed !== 'object' || parsed.pid !== pid) return undefined;
+  if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return undefined;
+  const live = readProcStarttime(pid);
+  if (typeof parsed.procStart !== 'string' || live === null || parsed.procStart !== live) return undefined;
+  const open = findOpenClaudeSessionIds(pid, dataDir);
+  if (open.some(sid => sid !== parsed.sessionId)) return undefined;
+  return parsed.sessionId;
+}
+
 /** Fingerprint search that fans out from the pinned project dir to every
  *  sibling under `~/.claude/projects/`. Used as the writeInput fallback
  *  when the pinned `claudeJsonlPath` doesn't contain the submit marker —
@@ -1216,7 +1236,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1347,7 +1367,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, cliId: 'claude-code' }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
       return args;
     },
 

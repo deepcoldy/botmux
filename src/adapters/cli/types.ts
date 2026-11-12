@@ -272,6 +272,9 @@ export interface CliAdapter {
     /** Lead-only chat manager session (claude-code only; ignored by other CLIs): block
      *  file/web/agent tools, mount the dedicated lead-only guard plugin dir, append the lead-only prompt. */
     leadOnly?: boolean;
+    /** BotConfig.hideLocalAddresses when the worker was forked: adapters that
+     *  build the Botmux system prompt add the full local-address rule. */
+    hideLocalAddresses?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
@@ -310,6 +313,8 @@ export interface CliAdapter {
      *  Missing or "unknown" means "not probed": adapters must then behave as if the
      *  flag is unsupported (keep the old argv) rather than guess. */
     cliVersion?: string;
+    /** True when attaching to an existing process; its version may differ from the installation. */
+    reattach?: boolean;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
@@ -741,6 +746,16 @@ export interface CliAdapter {
    * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
    * This only releases startup type-ahead; it never proves an idle/turn boundary. */
   readonly startupReadyFromHistory?: (history: string) => boolean;
+  /** Positive evidence, judged on the backend's own cells and cursor, that the
+   * input box is empty and accepts a write now: the verdict the adapter's
+   * writeInput enforces. When defined and the backend reports its input state,
+   * a fresh spawn's first write waits for it instead of readyPattern, and the
+   * first-prompt soft timeout releases on it. */
+  readonly inputBoxReady?: (state: { viewport: string; cursor: { x: number; y: number } }) => boolean;
+  /** The pre-write input-box check writeInput starts with, run on a spawn's
+   * opening input before it leaves the worker's queue: a refusal (the reason)
+   * keeps it queued until inputBoxReady holds again instead of failing it. */
+  readonly settleInputBox?: (pty: PtyHandle) => Promise<string | undefined>;
 
   /**
    * Longer PTY-silence window used ONLY before this CLI process's FIRST idle
@@ -880,6 +895,44 @@ export interface CliAdapter {
    *  `working`/`blocked`; startup readiness stays on the screen heuristics, as
    *  with program status off. Later reports are authoritative as usual. */
   readonly programStatusStartupIdleUntrusted?: boolean;
+
+  /** Lowest CLI release whose OSC 7501 reports were verified for this adapter.
+   *  The worker parses reports only for a spawn whose probed version
+   *  (`SpawnContext.cliVersion`) is at least this. An older, unknown or
+   *  unparsable version, an adopted pane (its process version is not the
+   *  probed install) and an RPC viewer keep the screen heuristics, exactly as
+   *  without OSC 7501. Undefined = no version gate. */
+  readonly programStatusMinVersion?: string;
+
+  /** OSC 7501 reports describe this CLI's input cycles, not its composer:
+   *  - before the first botmux write cycle (`IdleDetector.reset({ inputCycle })`)
+   *    every report is ignored and startup readiness stays on the adapter's
+   *    screen gates (only the latest root report is remembered, see
+   *    `IdleDetector.lastProgramStatusReport`);
+   *  - after each write cycle the screen decides idle until the CLI reports
+   *    busy (`working` / `blocked`); terminal reports in between are ignored;
+   *  - from that busy report on the reports are authoritative as usual.
+   *  A cycle re-armed while a busy report is held keeps authority. For CLIs
+   *  that acknowledge a retained `done` with `idle` on the first keystroke,
+   *  report nothing for commands that start no work (`/status`, `/clear`),
+   *  and whose startup reports do not track composer readiness. Do not
+   *  combine with `programStatusSubmitAwaitsBusy`. */
+  readonly programStatusFollowsInputCycle?: boolean;
+
+  /** While OSC 7501 reports `blocked` (an approval dialog owns the input),
+   *  queued input is not typed ahead into the running turn: Enter would pick
+   *  the dialog's default answer. It goes in after the turn's terminal report,
+   *  like any input queued while not type-ahead capable. A `kind=question`
+   *  block is not held: the next message is its answer. */
+  readonly programStatusBlockedHoldsInput?: boolean;
+
+  /** The transcript's own turn terminal (`assistant_final`, fed through
+   *  `IdleDetector.fireIdle`) ends the turn even while OSC 7501 still holds
+   *  `working`; authority is dropped and the screen decides until the next
+   *  report. `blocked` still vetoes it. For CLIs whose `working` also covers
+   *  work beyond the botmux turn (Codex keeps active goals and pending
+   *  follow-ups `working`) and that have an exact transcript terminal. */
+  readonly programStatusYieldsToTranscriptTerminal?: boolean;
 
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,

@@ -77,22 +77,14 @@ describe('prompt fragment catalog', () => {
     expect(validateFragmentOverride(line.key, '群里有 {count} 个：{names}')).toBeUndefined();
   });
 
-  it('protects {tools}/{host} on the credential-identity fragments', () => {
-    // The governed-tool list and git host are runtime values: an override that
-    // drops either token would silently render a credential block that names no
-    // tool (or no host), recreating the over-broad promise this catalog tracks.
-    expect(
-      validateFragmentOverride('ai.credentials.acting_identity', '本会话已启用按发起人身份注入。'),
-    ).toMatch(/tools/);
-    expect(
-      validateFragmentOverride('ai.credentials.acting_identity', '已为 {tools} 启用。'),
-    ).toBeUndefined();
-    expect(
-      validateFragmentOverride('ai.credentials.git_identity', 'git 鉴权使用本轮身份。'),
-    ).toMatch(/host/);
-    expect(
-      validateFragmentOverride('ai.credentials.git_identity', 'git 对 {host} 使用本轮身份。'),
-    ).toBeUndefined();
+  it('lists exactly the credential lines the block can render', () => {
+    expect(PROMPT_FRAGMENTS.filter((f) => f.block === 'credentials').map((f) => f.key)).toEqual([
+      'ai.credentials.never_read_others',
+      'ai.credentials.never_forward',
+      'ai.credentials.on_auth_failure',
+      'ai.credentials.on_auth_link',
+      'ai.credentials.on_missing_scope',
+    ]);
   });
 
   it('fragmentStages lists primary + extra stages without duplicates', () => {
@@ -110,6 +102,8 @@ describe('prompt fragment catalog', () => {
       'ai.whiteboard.block_read',
       'ai.whiteboard.hint_send_shell',
       'ai.send.after_success_unified',
+      'ai.send.after_success_progress',
+      'ai.send.after_success_auxiliary',
     ];
     for (const key of migratedKeys) {
       expect(PROMPT_FRAGMENTS.some((f: PromptFragmentSpec) => f.key === key), key).toBe(true);
@@ -126,7 +120,8 @@ describe('prompt fragment catalog matches what each stage reads', () => {
     );
     setPromptOverrideResolver((key) => (followup.has(key) ? `<<${key}>>` : undefined));
     for (const loc of SUPPORTED_LOCALES) {
-      const lines = feishuReplyPresentationGuidance(loc).split('\n');
+      // With the bot's hideLocalAddresses switch on, every line that can appear.
+      const lines = feishuReplyPresentationGuidance(loc, true).split('\n');
       expect(lines.length).toBeGreaterThan(1);
       for (const line of lines) expect(line, `[${loc}]`).toMatch(/^<<ai\.[\w.]+>>$/);
     }

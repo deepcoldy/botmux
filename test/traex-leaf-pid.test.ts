@@ -147,3 +147,63 @@ describe('worker currentTraexObservedPid', () => {
     expect(load(3, false)()).toBe(3);
   });
 });
+
+describe('worker TRAE rollout discovery', () => {
+  function harness(overrides: Record<string, any> = {}) {
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'traex', adoptMode: false }, backend: {},
+      lastSpawnEffectiveResume: false,
+      structuredBridgeIs: (id: string) => id === 'traex',
+      codexBridgeRolloutPath: undefined, traexBridgePidProbeLastMs: 0,
+      TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS: 2000,
+      currentTraexObservedPid: vi.fn(() => 10),
+      traexSessionIdFromRolloutPath: () => 'native_current',
+      findTraexRolloutByPid: vi.fn(), persistCliSessionId: vi.fn(),
+      log: vi.fn(),
+      codexBridgeAttach: vi.fn(), codexBridgePendingSessionId: undefined,
+      codexBridgeNotifyCliSessionId: vi.fn(), ...overrides,
+    };
+    return { scope, poll: loadWorkerFunction<() => void>('maybeFollowTraexSessionRotationViaPid', scope) };
+  }
+
+  it('attaches the lazily opened first rollout of a spawned CLI without a submit session id', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      const { scope, poll } = harness();
+      poll();
+      expect(scope.persistCliSessionId).not.toHaveBeenCalled();
+      scope.findTraexRolloutByPid.mockReturnValue({ path: '/owned.jsonl', cliSessionId: 'native_owned' });
+      vi.advanceTimersByTime(2000);
+      poll();
+      expect(scope.findTraexRolloutByPid).toHaveBeenLastCalledWith(10, undefined);
+      expect(scope.persistCliSessionId).toHaveBeenCalledExactlyOnceWith('native_owned');
+      expect(scope.codexBridgeNotifyCliSessionId).toHaveBeenCalledExactlyOnceWith('native_owned');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps its existing binding until a different owned rollout appears', () => {
+    const { scope, poll } = harness({ codexBridgeRolloutPath: '/current.jsonl' });
+    scope.findTraexRolloutByPid.mockReturnValue({ path: '/current.jsonl', cliSessionId: 'native_current' });
+    poll();
+    expect(scope.findTraexRolloutByPid).toHaveBeenCalledWith(10, 'native_current');
+    expect(scope.codexBridgeNotifyCliSessionId).not.toHaveBeenCalled();
+  });
+
+  it('binds a resumed CLI through its owned rollout and the history-safe baseline', () => {
+    const { scope, poll } = harness({ lastSpawnEffectiveResume: true });
+    scope.findTraexRolloutByPid.mockReturnValue({ path: '/owned.jsonl', cliSessionId: 'native_owned' });
+    poll();
+    expect(scope.codexBridgeAttach).toHaveBeenCalledExactlyOnceWith('/owned.jsonl', 'baseline-existing');
+    expect(scope.codexBridgeNotifyCliSessionId).not.toHaveBeenCalled();
+  });
+
+  it.each(['no-pid', 'other-cli'] as const)('does not discover from an unowned process (%s)', reason => {
+    const { scope, poll } = harness(reason === 'no-pid'
+      ? { currentTraexObservedPid: () => undefined }
+      : { structuredBridgeIs: () => false });
+    poll();
+    expect(scope.findTraexRolloutByPid).not.toHaveBeenCalled();
+    expect(scope.codexBridgeNotifyCliSessionId).not.toHaveBeenCalled();
+  });
+});

@@ -8,11 +8,19 @@ import {
   reduceSessionContract, reusableRuntimeIdentity, sameRuntime, sameWorker, sameExecution, samePhysicalRuntimeIdentity, canSupersedeControlOperation,
   type ContractSessionRef, type SessionContract, type RuntimeContract, type RuntimeIdentity, type RuntimeRef,
   type ExecutionContract, type ExecutionRef, type ControlOperation, type ControlKind, type ContractEvent,
-  type ContractTransition, type ContractTransitionInput, type WorkerRef,
+  type ContractTransition, type ContractTransitionInput, type WorkerRef, type RuntimeExecutionContinuation, type RuntimeExecutionContinuationResult,
+  type RuntimeExecutionContinuationFailure,
 } from './session-contract.js';
 
 export class SessionContractConflict extends Error {
   constructor(readonly currentRevision: number) { super('session_contract_revision_conflict'); }
+}
+interface PlannedExecutionContinuation extends RuntimeExecutionContinuation {
+  target: RuntimeRef;
+  executionRuntime: RuntimeRef;
+  worker: WorkerRef;
+  status: 'planned' | 'approved' | 'rejected';
+  consumed?: true;
 }
 export interface SessionContractSnapshot {
   version: 2;
@@ -26,7 +34,7 @@ function sessionKey(ref: ContractSessionRef): string {
 }
 function eventExecution(event: ContractEvent): ExecutionRef | undefined {
   if (event.type === 'execution_admitted') return event.execution.ref;
-  if (event.type === 'execution_phase' || event.type === 'execution_terminal' || event.type === 'execution_output') return event.execution;
+  if (event.type === 'execution_phase' || event.type === 'execution_continued' || event.type === 'execution_terminal' || event.type === 'execution_output') return event.execution;
   if (event.type === 'control_requested') return event.operation.targetExecution;
   return undefined;
 }
@@ -247,6 +255,24 @@ export class SessionContractStore {
   private saveEntity(ref: ContractSessionRef, kind: string, id: string, phase: string, value: unknown): void {
     this.db.prepare('INSERT INTO entities(session_key,kind,id,phase,value) VALUES(?,?,?,?,?) ON CONFLICT(session_key,kind,id) DO UPDATE SET phase=excluded.phase,value=excluded.value').run(sessionKey(ref), kind, id, phase, JSON.stringify(value));
   }
+  /** Continuation decisions are checkpointed authority, not an auxiliary
+   * cache. Advance the version in the same transaction as the entity write. */
+  private saveExecutionContinuation(ref: ContractSessionRef, bindingId: string, value: PlannedExecutionContinuation): void {
+    this.saveVersionedEntity(ref, 'execution_continuation', bindingId, value.status, value);
+  }
+  private saveVersionedEntity(ref: ContractSessionRef, kind: string, id: string, phase: string, value: unknown): void {
+    this.transaction(() => {
+      const previous = this.entity<unknown>(ref, kind, id);
+      if (JSON.stringify(previous) === JSON.stringify(value)) return;
+      const state = this.read(ref); if (!state) throw new Error('contract_session_missing');
+      this.saveEntity(ref, kind, id, phase, value);
+      const updated = { ...state, revision: state.revision + 1 };
+      const changed = this.db.prepare('UPDATE contracts SET revision=?,value=? WHERE session_key=? AND revision=?')
+        .run(updated.revision, JSON.stringify(updated), sessionKey(ref), state.revision);
+      if (Number(changed.changes) !== 1) throw new SessionContractConflict(state.revision);
+      this.projectSession(ref, updated);
+    });
+  }
   private projectSession(ref: ContractSessionRef, state: SessionContract): void {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
     const hit = this.db.prepare('SELECT row FROM sessions WHERE session_id=?').get(ref.sessionId) as { row: string } | undefined;
@@ -310,6 +336,7 @@ export class SessionContractStore {
       const older = (kind: string, keep: number, phases: string[]) => this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=? AND phase IN (${phases.map(() => '?').join(',')}) AND rowid NOT IN (SELECT rowid FROM entities WHERE session_key=? AND kind=? ORDER BY rowid DESC LIMIT ?)`)
         .run(key, kind, ...phases, key, kind, keep);
       older('execution', retention.executions, ['succeeded', 'failed', 'cancelled']);
+      older('continuation_failure_delivery', retention.executions, ['delivered']);
       older('operation', retention.operations, ['confirmed', 'failed_before_effect', 'rejected']);
       this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind='execution_observer'
         AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.session_key=entities.session_key AND x.kind='execution'
@@ -333,6 +360,152 @@ export class SessionContractStore {
       this.db.prepare('INSERT INTO observation_watermarks VALUES(?,?,?,?) ON CONFLICT(session_key,producer,runtime_id) DO UPDATE SET sequence=excluded.sequence').run(sessionKey(ref), producer, runtime.runtimeId, sequence);
       return true;
     });
+  }
+  /** Freeze the one ordinary execution before its replacement is bound. A
+   * runtime reservation alone never authorizes another execution submission. */
+  planExecutionContinuation(ref: ContractSessionRef, bindingId: string, target: RuntimeRef,
+    worker: WorkerRef, request: RuntimeExecutionContinuation): void {
+    this.transaction(() => {
+      const prior = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+      if (prior) {
+        if (!sameWorker(prior.worker, worker) || !sameRuntime(prior.target, target)
+          || !sameRuntime(prior.from, request.from) || !sameExecution(prior.execution, request.execution)
+          || prior.nativeSessionId !== request.nativeSessionId) throw new Error('execution_continuation_conflict');
+        return;
+      }
+      const state = this.read(ref);
+      const source = request.from && this.runtime(ref, request.from.runtimeId);
+      const proposed = this.runtime(ref, target.runtimeId);
+      const execution = request.execution && this.execution(ref, request.execution.executionId);
+      const belongsHere = (value: ExecutionContract): boolean => sameRuntime(value.runtime, request.from)
+        || (!!value.runtime && this.continuedExecution(ref, value.runtime, worker, value.ref));
+      const running = this.executions(ref).filter(value => belongsHere(value)
+        && !terminalPhase(value.phase) && value.phase !== 'queued');
+      if (request.reason !== 'traex-auto-model' || !request.nativeSessionId
+        || request.execution?.dispatchAttempt !== undefined
+        || !state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
+        || !sameRuntime(state.activeRuntime, request.from) || !source || !sameWorker(source.worker, worker)
+        || source.identity?.proof !== 'process_start' || source.identity.nativeSessionId !== request.nativeSessionId
+        || !proposed || !sameRuntime(proposed.ref, target) || proposed.phase !== 'starting'
+        || !sameWorker(proposed.worker, worker) || target.epoch <= source.ref.epoch
+        || !execution || !sameExecution(execution.ref, request.execution) || !execution.runtime || !belongsHere(execution)
+        || !['submitting', 'accepted', 'running'].includes(execution.phase) || execution.cancelRequested || execution.terminal
+        || running.length !== 1 || !sameExecution(running[0]!.ref, request.execution)) {
+        throw new Error('execution_continuation_unproven');
+      }
+      this.saveExecutionContinuation(ref, bindingId, {
+        ...structuredClone(request), target, executionRuntime: execution.runtime, worker, status: 'planned',
+      } satisfies PlannedExecutionContinuation);
+    });
+  }
+  /** Commit only after the new process proves the exact native conversation.
+   * Its old execution identity is retained, but old-runtime events cannot
+   * mutate the newly bound attempt. Retries never reset an approved attempt. */
+  commitExecutionContinuation(ref: ContractSessionRef, bindingId: string, worker: WorkerRef): void {
+    this.transaction(() => {
+      const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+      if (!plan || plan.status !== 'planned') return;
+      const state = this.read(ref);
+      const target = this.binding(ref, bindingId);
+      const source = this.runtime(ref, plan.from.runtimeId);
+      const execution = this.execution(ref, plan.execution.executionId);
+      const reject = (): void => this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'rejected' });
+      if (!state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
+        || !sameWorker(plan.worker, worker) || !target || !sameRuntime(target.ref, plan.target)
+        || !sameRuntime(state.activeRuntime, target.ref) || !sameWorker(target.worker, worker)
+        || !['starting', 'ready'].includes(target.phase) || !source || !sameWorker(source.worker, worker)
+        || !execution || !sameExecution(execution.ref, plan.execution) || !sameRuntime(execution.runtime, plan.executionRuntime)
+        || !['submitting', 'accepted', 'running'].includes(execution.phase) || execution.cancelRequested || execution.terminal) { reject(); return; }
+      // PID/native identity may be learned after the first registration. Keep
+      // the intent and the worker's pending input until that proof arrives.
+      if (!target.identity || target.identity.proof === 'opaque' || !target.identity.nativeSessionId) return;
+      if (target.identity.proof !== 'process_start' || target.identity.backend !== source.identity?.backend
+        || target.identity.physicalId === source.identity?.physicalId
+        || target.identity.nativeSessionId !== plan.nativeSessionId) { reject(); return; }
+      const result = this.applyInside(ref, { type: 'execution_continued', execution: execution.ref,
+        from: plan.executionRuntime, runtime: target.ref }, `continuation:${bindingId}`);
+      if (result.decision !== 'applied') { reject(); return; }
+      this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'approved' });
+    });
+  }
+  /** A launcher/native-id enrichment keeps the physical CLI. Preserve an
+   * unconsumed permit without granting it to a different native conversation. */
+  inheritExecutionContinuation(ref: ContractSessionRef, fromBindingId: string, bindingId: string, worker: WorkerRef): void {
+    const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', fromBindingId);
+    const target = this.binding(ref, bindingId);
+    if (!plan || plan.status === 'rejected' || !target || !sameWorker(plan.worker, worker)
+      || this.entity(ref, 'execution_continuation', bindingId)) return;
+    const execution = this.execution(ref, plan.execution.executionId);
+    if (plan.status === 'approved' && (plan.consumed || execution?.phase !== 'accepted')) return;
+    const rejected = target.identity?.nativeSessionId !== plan.nativeSessionId || !!execution?.terminal || !!execution?.cancelRequested;
+    this.saveExecutionContinuation(ref, bindingId, {
+      ...plan, ...(plan.status === 'planned' ? { target: target.ref } : {}), status: rejected ? 'rejected' : plan.status,
+    });
+  }
+  rejectExecutionContinuation(ref: ContractSessionRef, bindingId: string): void {
+    this.transaction(() => {
+      const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+      const execution = plan && this.execution(ref, plan.execution.executionId);
+      if (!plan || plan.status === 'rejected' || (plan.status === 'approved' && execution?.phase !== 'accepted' && !execution?.terminal)) return;
+      this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'rejected' });
+    });
+  }
+  consumeExecutionContinuation(ref: ContractSessionRef, worker: WorkerRef, execution: ExecutionRef, runtime: RuntimeRef): void {
+    this.transaction(() => {
+      const rows = this.db.prepare("SELECT id,value FROM entities WHERE session_key=? AND kind='execution_continuation' AND phase='approved' AND json_extract(value,'$.execution.executionId')=?")
+        .all(sessionKey(ref), execution.executionId) as Array<{ id: string; value: string }>;
+      for (const row of rows) {
+        const plan = JSON.parse(row.value) as PlannedExecutionContinuation;
+        if (plan.consumed || !sameWorker(plan.worker, worker) || !sameExecution(plan.execution, execution)
+          || !sameRuntime(plan.target, runtime)) continue;
+        this.saveExecutionContinuation(ref, row.id, { ...plan, consumed: true });
+      }
+    });
+  }
+  executionContinuationFailureRuntime(ref: ContractSessionRef, worker: WorkerRef,
+    failure: RuntimeExecutionContinuationFailure, origin: RuntimeRef, errorCode: string): RuntimeRef | undefined {
+    const request = failure?.continuation;
+    if (typeof failure?.bindingId !== 'string' || !failure.bindingId || request?.reason !== 'traex-auto-model'
+      || !request.execution?.executionId || request.execution.dispatchAttempt !== undefined || !request.from?.runtimeId) return;
+    const state = this.read(ref);
+    const source = this.runtime(ref, request.from.runtimeId);
+    const execution = this.execution(ref, request.execution.executionId);
+    if (!sameWorker(state?.worker, worker) || !source || !sameWorker(source.worker, worker)
+      || !sameRuntime(source.ref, request.from) || source.identity?.proof !== 'process_start'
+      || !request.nativeSessionId || source.identity.nativeSessionId !== request.nativeSessionId
+      || !execution?.runtime || !sameExecution(execution.ref, request.execution)
+      || !this.authorizedProducer(ref, origin, worker)
+      || (execution.terminal && (execution.phase !== 'failed' || execution.terminal.errorCode !== errorCode))) return;
+    const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', failure.bindingId);
+    if (plan) {
+      if (plan.consumed || !this.bindingProducer(ref, failure.bindingId, worker) || !sameWorker(plan.worker, worker)
+        || !sameRuntime(plan.from, request.from) || !sameExecution(plan.execution, request.execution)
+        || plan.nativeSessionId !== request.nativeSessionId || !sameRuntime(origin, plan.executionRuntime)) return;
+      if (!sameRuntime(execution.runtime, plan.executionRuntime)
+        && (!sameRuntime(execution.runtime, plan.target)
+          || (!execution.terminal && (plan.status !== 'approved' || execution.phase !== 'accepted')))) return;
+    } else if (this.binding(ref, failure.bindingId) || !sameRuntime(execution.runtime, origin)
+      || (!sameRuntime(origin, request.from) && !this.continuedExecution(ref, origin, worker, execution.ref))) return;
+    return execution.runtime;
+  }
+  continuationFailureDelivered(ref: ContractSessionRef, execution: ExecutionRef, errorCode: string): boolean {
+    const receipt = this.entity<{ execution: ExecutionRef; errorCode: string }>(ref, 'continuation_failure_delivery', execution.executionId);
+    return !!receipt && sameExecution(receipt.execution, execution) && receipt.errorCode === errorCode;
+  }
+  confirmContinuationFailureDelivery(ref: ContractSessionRef, execution: ExecutionRef, errorCode: string): void {
+    const current = this.execution(ref, execution.executionId);
+    if (!sameExecution(current?.ref, execution) || current?.terminal?.status !== 'failed' || current.terminal.errorCode !== errorCode) {
+      throw new Error('execution_continuation_failure_unproven');
+    }
+    this.saveVersionedEntity(ref, 'continuation_failure_delivery', execution.executionId, 'delivered', { execution, errorCode });
+  }
+  executionContinuation(ref: ContractSessionRef, bindingId: string): RuntimeExecutionContinuationResult | undefined {
+    const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+    if (!plan || plan.status === 'planned') return;
+    const execution = this.execution(ref, plan.execution.executionId);
+    const rejected = !execution || !!execution.terminal || execution.cancelRequested
+      || ['reconciling', 'blocked', 'waiting_input'].includes(execution.phase);
+    return { execution: plan.execution, status: rejected ? 'rejected' : plan.status };
   }
   reserveRuntime(ref: ContractSessionRef, worker: WorkerRef, bindingId?: string): RuntimeRef {
     return this.transaction(() => {
@@ -370,10 +543,15 @@ export class SessionContractStore {
         const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as RuntimeContract);
         const executions = this.executions(ref);
         if (executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref))) {
-          throw new Error('runtime_recovery_has_active_execution');
+          // Work still open on the selected bare observation keeps the older
+          // runtime out of reach. The complete identity is that same live
+          // process, so it completes the selected runtime: refusing the binding
+          // would leave a re-attached worker, and that work, with no runtime.
+          if (['retiring', 'stopped'].includes(previous.phase)) throw new Error('runtime_recovery_has_active_execution');
+          reuse = previous;
         }
         const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
-        const candidates = history.filter(runtime => runtime.phase === 'unresolved'
+        const candidates = reuse ? [] : history.filter(runtime => runtime.phase === 'unresolved'
           && runtime.ref.epoch < previous.ref.epoch && reusableRuntimeIdentity(runtime.identity, identity));
         if (candidates.length === 1) {
           const candidate = candidates[0];
@@ -463,6 +641,33 @@ export class SessionContractStore {
       'execution_observer', JSON.stringify([worker.workerId, worker.generation, execution.executionId]));
     return !!value && sameWorker(value.worker, worker) && sameExecution(value.execution, execution)
       && sameRuntime(value.runtime, runtime) && sameRuntime(this.execution(ref, execution.executionId)?.runtime, runtime);
+  }
+  /** The live CLI of `from` became `to` without restarting. Attempts already
+   * bound to `from` keep running in that process and stay on their runtime. */
+  continueRuntime(ref: ContractSessionRef, from: RuntimeRef, to: RuntimeRef, worker: WorkerRef): void {
+    this.saveEntity(ref, 'runtime_continuation', from.runtimeId, 'active', { from, to, worker });
+  }
+  /** Runtimes the live CLI of `from` became through `worker`'s in-process continuations, in order. */
+  continuedRuntimes(ref: ContractSessionRef, from: RuntimeRef, worker: WorkerRef): RuntimeRef[] {
+    const chain: RuntimeRef[] = [];
+    let current = from;
+    for (let hops = 0; hops < 16; hops++) {
+      const link = this.entity<{ from: RuntimeRef; to: RuntimeRef; worker: WorkerRef }>(ref, 'runtime_continuation', current.runtimeId);
+      if (!link || !sameRuntime(link.from, current) || !sameWorker(link.worker, worker)) break;
+      chain.push(link.to); current = link.to;
+    }
+    return chain;
+  }
+  /** `from` is `to`, or became it through `worker`'s in-process continuations. */
+  runtimeContinues(ref: ContractSessionRef, from: RuntimeRef, to: RuntimeRef, worker: WorkerRef): boolean {
+    return sameRuntime(from, to) || this.continuedRuntimes(ref, from, worker).some(runtime => sameRuntime(runtime, to));
+  }
+  /** An attempt bound to a runtime its own worker continued into the active one. */
+  continuedExecution(ref: ContractSessionRef, runtime: RuntimeRef, worker: WorkerRef, execution?: ExecutionRef): boolean {
+    const active = this.read(ref)?.activeRuntime;
+    const attempt = execution ? this.execution(ref, execution.executionId) : undefined;
+    if (!active || !attempt || !sameExecution(attempt.ref, execution) || !sameRuntime(attempt.runtime, runtime)) return false;
+    return !sameRuntime(runtime, active) && this.runtimeContinues(ref, runtime, active, worker);
   }
   admitExecution(ref: ContractSessionRef, turnId: string, dispatchAttempt?: number, admissionId?: string): ExecutionContract {
     return this.transaction(() => {

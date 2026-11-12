@@ -54,7 +54,7 @@ import type { Session } from '../types.js';
 // Generous: one-shot CLIs pay cold-start + API latency (codex regularly
 // exceeds 15s); the rename is async so a slow title costs nothing visible.
 const TITLE_TIMEOUT_MS = 45_000;
-export const DEFAULT_TITLE_MAX_LEN = 12;
+export const DEFAULT_TITLE_MAX_LEN = 20;
 export const MAX_SESSION_GROUP_TITLE_ROUNDS = 3;
 
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by

@@ -118,6 +118,8 @@ import { buildExternalEventApplicationContext, buildExternalEventCodexAppContext
 import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale, t } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText, feishuReplyPresentationGuidance } from '../src/adapters/cli/shared-hints.js';
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { rmSync } from 'node:fs';
 import { writeManagerClaim } from '../src/services/chat-manager-state.js';
@@ -492,15 +494,40 @@ describe('botmux routing prose XML boundaries', () => {
 });
 
 describe('local-address rule placement', () => {
+  // The rules ride only for a bot that turned on BotConfig.hideLocalAddresses.
   it.each(['zh', 'en'] as const)('states the full rule once per session and a one-line reminder per turn (%s)', locale => {
-    const rule = t('ai.routing.no_local_addresses', undefined, locale);
-    const reminder = t('ai.followup.no_local_addresses', undefined, locale);
-    expect(buildBotmuxSystemPromptText({ locale })).toContain(rule);
-    expect(buildBotmuxShellHints(locale).join('\n')).toContain(rule);
-    const followUp = buildFollowUpContent('hello', 'sid-rule', { locale });
-    expect(followUp).toContain(reminder);
-    expect(followUp).not.toContain(rule);
-    expect(reminder.length * 2).toBeLessThan(rule.length);
+    const restore = setHideLocalAddressesResolver(app => app === 'app_hides');
+    try {
+      const rule = t('ai.routing.no_local_addresses', undefined, locale);
+      const reminder = t('ai.followup.no_local_addresses', undefined, locale);
+      expect(buildBotmuxSystemPromptText({ locale, hideLocalAddresses: true, cliId: 'claude-code' })).toContain(rule);
+      const opening = buildNewTopicPrompt('hello', 'sid-rule', 'codex', undefined, undefined, undefined, undefined, undefined,
+        undefined, locale, undefined, { larkAppId: 'app_hides' });
+      expect(opening).toContain(escapeXmlTagLikeTokens(rule));
+      const followUp = buildFollowUpContent('hello', 'sid-rule', { locale, larkAppId: 'app_hides' });
+      expect(followUp).toContain(reminder);
+      expect(followUp).not.toContain(rule);
+      expect(reminder.length * 2).toBeLessThan(rule.length);
+    } finally { restore(); }
+  });
+
+  it.each(['zh', 'en'] as const)('injects neither rule for a bot that has not turned it on (%s)', locale => {
+    const restore = setHideLocalAddressesResolver(app => app === 'app_hides');
+    try {
+      const rule = t('ai.routing.no_local_addresses', undefined, locale);
+      const reminder = t('ai.followup.no_local_addresses', undefined, locale);
+      expect(buildBotmuxSystemPromptText({ locale, hideLocalAddresses: undefined, cliId: 'claude-code' })).not.toContain(rule);
+      expect(buildBotmuxShellHints(locale).join('\n')).not.toContain(escapeXmlTagLikeTokens(rule));
+      const opening = buildNewTopicPrompt('hello', 'sid-rule', 'codex', undefined, undefined, undefined, undefined, undefined,
+        undefined, locale, undefined, { larkAppId: 'app_default' });
+      expect(opening).not.toContain(escapeXmlTagLikeTokens(rule));
+      for (const larkAppId of ['app_default', undefined]) {
+        const followUp = buildFollowUpContent('hello', 'sid-rule', { locale, larkAppId });
+        expect(followUp).toContain(t('ai.followup.feishu_safe_emphasis', undefined, locale));
+        expect(followUp).not.toContain(reminder);
+      }
+      expect(feishuReplyPresentationGuidance(locale)).toBe(t('ai.followup.feishu_safe_emphasis', undefined, locale));
+    } finally { restore(); }
   });
 });
 
@@ -578,9 +605,9 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
     // Complex send guidance is discoverable once in the opening catalog; keep
     // every follow-up reminder intentionally tiny. By default (experimental
-    // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
-    // baseline — no anti-resend clause appended.
-    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    // anti-resend toggle OFF) it carries the final-delivery requirement without
+    // the additional unknown-send reconciliation clause.
+    expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder', undefined, 'zh')}</botmux_reminder>`);
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
@@ -590,9 +617,8 @@ describe('buildFollowUpContent', () => {
     (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
     try {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
-      // ON variant must inherit #554's sentinel semantics AND add anti-resend.
-      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
-      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+      // ON variant keeps permitted silence and qualifies no-resend by final delivery.
+      expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder_no_resend', undefined, 'zh')}</botmux_reminder>`);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
     }
@@ -604,10 +630,10 @@ describe('buildFollowUpContent', () => {
     // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
     // (bridge-forwarded finals can't carry an @mention), so Hermes now shares
     // the standard path. With the anti-resend toggle OFF (default) that is
-    // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
+    // the same final-delivery and permitted-silence contract as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder', undefined, 'zh')}</botmux_reminder>`);
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
   });
@@ -619,8 +645,7 @@ describe('buildFollowUpContent', () => {
     (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
     try {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
-      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
-      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+      expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder_no_resend', undefined, 'zh')}</botmux_reminder>`);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
     }
@@ -1336,15 +1361,15 @@ describe('builder locale fallback when the caller omits locale', () => {
     setDefaultLocale('zh');
     setBotLookup(enBot);
     const content = buildFollowUpContent('hello', SID, { cliId: 'codex', larkAppId: 'en-app' });
-    expect(content).toContain('<botmux_reminder>Respond to messages addressed to you');
-    expect(content).not.toContain('发给你的消息');
+    expect(content).toContain('<botmux_reminder>Before ending a request requiring a reply');
+    expect(content).not.toContain('需要回复的请求');
   });
 
   it('buildFollowUpCliInput applies the same fallback (live-worker reply entry)', () => {
     setDefaultLocale('zh');
     setBotLookup(enBot);
     const out = buildFollowUpCliInput('hello', SID, { cliId: 'codex', larkAppId: 'en-app' });
-    expect(out.content).toContain('Respond to messages addressed to you');
+    expect(out.content).toContain('Before ending a request requiring a reply');
   });
 
   it('opening entry also falls back: whiteboard block for an en bot is English', () => {
@@ -1365,7 +1390,7 @@ describe('builder locale fallback when the caller omits locale', () => {
     setDefaultLocale('zh');
     setBotLookup(undefined);
     const content = buildFollowUpContent('hello', SID, { cliId: 'codex', larkAppId: 'ghost-app' });
-    expect(content).toContain('发给你的消息');
+    expect(content).toContain('需要回复的请求');
   });
 
   it('still lets an explicit locale override the bot config', () => {
@@ -1374,7 +1399,7 @@ describe('builder locale fallback when the caller omits locale', () => {
     const content = buildFollowUpContent('hello', SID, {
       cliId: 'codex', larkAppId: 'zh-app', locale: 'en',
     });
-    expect(content).toContain('Respond to messages addressed to you');
+    expect(content).toContain('Before ending a request requiring a reply');
   });
 });
 

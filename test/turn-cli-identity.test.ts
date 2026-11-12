@@ -608,6 +608,8 @@ describe('target daemon consumes signed message authority', () => {
       scheduleAuthorityStore: undefined as any,
       // noteTurnReceived's reaction bookkeeping: a card-on session stops there.
       streamingCardDisabledFor: () => false,
+      // This harness isolates identity; Oncall acceptance has no configured source.
+      registerOncallTurn: () => {},
     };
     const handlers = new Function('scope', 'with (scope) { ' + code
       + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity, handleIdentityDecisionFlip, noteTurnReceived }; }')(scopeValues);
@@ -1107,5 +1109,31 @@ describe('publishTurnCliIdentity — tools are prepared concurrently', () => {
     ]);
     expect(identityBody('lark-cli', 'turn-iso')).toContain('/isolated/alice');
     expect(identityBody('bytedcli', 'turn-iso')).toContain('[reason=provider_unavailable]');
+  });
+});
+
+describe('awaitTurnIdentityPublication — waits out a whole platform grant', () => {
+  // A tool call that arrives while the turn's identity is still being fetched
+  // waits for it. A wait shorter than the grant budget refused the call while
+  // the credentials were still on their way.
+  it('returns once a publication that took the whole grant budget has landed, not before', async () => {
+    const { awaitTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
+    const { TOTAL_BUDGET_MS } = await import('../src/platform/credential-grant-budget.js');
+    vi.useFakeTimers();
+    try {
+      let landed = false;
+      void trackTurnIdentityPublication(dir, SESSION, new Promise<void>(resolve => setTimeout(() => {
+        landed = true; resolve();
+      }, TOTAL_BUDGET_MS)));
+      let returned = false;
+      const waiting = awaitTurnIdentityPublication(dir, SESSION).then(() => { returned = true; });
+      await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS - 1);
+      expect(returned).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await waiting;
+      expect(landed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

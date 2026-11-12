@@ -11,7 +11,7 @@
 //   - 确定性失败第一次就红：lockfile 与 package.json 不符、依赖解析失败、包/版本/文件不存在、
 //     无权限、完整性校验失败，见 DETERMINISTIC。输出里同时带网络特征也不重试。
 //   - 两边都不像的失败同样不重试：宁可红一次让人看，也不把真错误重试掉。
-//   - DNS 只认 EAI_AGAIN（解析器临时失败）；ENOTFOUND / curl (6) 也可能是主机名写错，不重试。
+//   - DNS 只认 EAI_AGAIN / apt Temporary failure resolving（解析器临时失败）；ENOTFOUND / curl (6) 也可能是主机名写错，不重试。
 //
 // 子进程 stdout/stderr 原样转发，退出码原样传出（被信号杀掉按 128+信号值；起不来按 127）。
 import { spawn } from 'node:child_process';
@@ -45,6 +45,8 @@ export const TRANSIENT = Object.freeze([
   // Node 系（npm / pnpm / electron）套接字层
   /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ESOCKETTIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|EPIPE|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT)\b/,
   /\bsocket hang up\b/,
+  // apt 的临时 DNS 失败；不包含一般 Could not resolve。
+  /\bTemporary failure resolving\s+['"]/,
 ]);
 
 export const DETERMINISTIC = Object.freeze([
@@ -61,6 +63,10 @@ export const DETERMINISTIC = Object.freeze([
   /\bERR_PNPM_FETCH_40[134]\b/,
   /\bResponse code 40[134]\b/, // electron postinstall
   /\breturned error: 40[134]\b/, // curl
+  // apt：不能把缺包、签名或权限错误混同为临时 DNS 失败。
+  /\b(?:Unable to locate package|has no installation candidate|Hash Sum mismatch|NO_PUBKEY|EXPKEYSIG|BADSIG)\b/,
+  /(?:is not signed|does not have a Release file|signatures couldn't be verified|Permission denied)/i,
+  /\b40[134]\s+(?:Unauthorized|Forbidden|Not Found)\b/,
   // 完整性校验失败
   /\bcode EINTEGRITY\b/, // npm
   /\bERR_PNPM_TARBALL_INTEGRITY\b/,

@@ -417,7 +417,11 @@ it(`never injects picker keys into a composer draft that starts with the menu ro
 it.skipIf(!tmuxAvailable)('protects a composer draft whose guidance text precedes the menu rows (tmux)',
   () => runScenario({ backendType: 'tmux', fake: { paint: 'stream', banner: 'skeleton', picker: 'none', history: false, draft: 'guided' } }, async ctx => {
     await ctx.waitFor(() => ctx.events().includes('started'));
-    await ctx.waitFor(() => ctx.logs.join('').includes('Codex has an existing draft') || committed(ctx, 'om_test'));
+    // Whichever check meets the draft first, the held write keeps re-checking
+    // the box and must keep finding the draft.
+    await ctx.waitFor(() => /Codex input box is not ready yet|Holding opening input|Codex has an existing draft/.test(ctx.logs.join(''))
+      || committed(ctx, 'om_test'));
+    await new Promise(r => setTimeout(r, 6_000));
     expect(ctx.composerInput(), ctx.detail()).toBe('');
     expect(committed(ctx, 'om_test'), ctx.detail()).toBe(false);
     expect(ctx.logs.join(''), ctx.detail()).not.toContain('Codex model-migration picker');

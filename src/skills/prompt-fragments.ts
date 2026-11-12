@@ -150,7 +150,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '飞书回复：用户可访问的地址',
-    gateLabel: '完整规则，每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
+    gateLabel: '仅 bot 配置开启「隐藏开发机地址」时注入（默认关）；完整规则每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
   },
   {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
@@ -241,16 +241,6 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   // <botmux_credentials> — trigger-user-auth sessions only
   {
-    key: 'ai.credentials.acting_identity', block: 'credentials', stage: 'new',
-    kind: 'placeholder', placeholders: ['tools'],
-    label: '凭证：当前授权身份说明', gateLabel: '仅该 bot 开启 trigger-user CLI 鉴权时注入',
-  },
-  {
-    key: 'ai.credentials.git_identity', block: 'credentials', stage: 'new',
-    kind: 'placeholder', placeholders: ['host'],
-    label: '凭证：git 鉴权身份说明', gateLabel: '仅当 bytedcli 在 tools 内且配置了 gitHost 时注入',
-  },
-  {
     key: 'ai.credentials.never_read_others', block: 'credentials', stage: 'new', kind: 'editable',
     label: '凭证：不得读取他人登录态', gateLabel: '仅 trigger-user 鉴权会话',
   },
@@ -260,19 +250,15 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
-  },
-  {
-    key: 'ai.credentials.on_bytedcli_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：ByteCloud 鉴权失败处理流程', gateLabel: '仅当 bytedcli 在 triggerUserAuth.tools 内时注入',
+    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
   {
     key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：stderr 已附授权链接时', gateLabel: '仅 trigger-user 鉴权会话',
+    label: '凭证：stderr 已附授权链接时', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
   {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
+    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
 
   // ───────── cross-listed: 会话开始 + 每条新消息 (new + followup) ──────────
@@ -392,7 +378,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.followup.no_local_addresses', block: 'followup', stage: 'followup', kind: 'editable',
     label: '飞书回复：用户可访问的地址（每轮一句）',
-    gateLabel: '随每轮飞书格式提示；完整规则在会话开始阶段',
+    gateLabel: '仅 bot 配置开启「隐藏开发机地址」时随每轮飞书格式提示（默认关）；完整规则在会话开始阶段',
   },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
@@ -421,12 +407,20 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   {
     key: 'ai.send.after_success_hint', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: 'send 成功后的常规回显',
+    label: '最终答复发送成功回显',
+  },
+  {
+    key: 'ai.send.after_success_progress', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '进度发送成功回显（未标记 final）',
+  },
+  {
+    key: 'ai.send.after_success_auxiliary', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '补充消息发送成功回显',
   },
   {
     key: 'ai.send.after_success_unified', block: 'send_feedback', stage: 'send', kind: 'editable',
     label: '统一回复卡片：进度已更新回显',
-    gateLabel: '仅本轮发送走统一回复卡片、且未标记 --response-kind final 时',
+    gateLabel: '仅本轮发送走统一回复卡片、且发送类型为 progress 时',
   },
 ];
 
