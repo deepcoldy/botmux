@@ -9590,6 +9590,18 @@ async function assertListenerCardDestination(session: SessionData, appId: string
   }
 }
 
+/** BOTMUX_CHAT_ID for the caller's own session, preferred over an old session
+ *  record whose chatType/chatId may predate a DM→group handoff (the worker
+ *  refreshes it for the current managed session). Never applied to an explicit
+ *  different sid. A virtual (headless/HTTP) value is skipped: it is a spawn-time
+ *  snapshot that cannot name a Feishu chat, and a session later bound to a real
+ *  chat keeps it in its env — only the record knows the bound chat. */
+function currentSessionEnvChatId(sid: string): string | undefined {
+  if (sid !== process.env.BOTMUX_SESSION_ID) return undefined;
+  const chatId = process.env.BOTMUX_CHAT_ID?.trim();
+  return chatId && !isHttpVirtualSession(chatId) ? chatId : undefined;
+}
+
 async function cmdTabs(rest: string[]): Promise<void> {
   const {
     CHAT_TABS_CLI_USAGE,
@@ -9615,12 +9627,7 @@ async function cmdTabs(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'tabs');
-  // The worker refreshes BOTMUX_CHAT_ID for the current managed session. Prefer
-  // that turn-bound value over an old session record whose chatType/chatId may
-  // predate a DM→group handoff. Never apply it to an explicit different sid.
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -9668,9 +9675,7 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'top-notice');
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux top-notice: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -10637,7 +10642,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
   // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
   // can only ever answer "no bots at all". Letting that stand would silently turn
   // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
-  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // it exists to catch — and resolveManagedOriginTransport() (which advertises
   // itself as tamper-resistant) delegates its verdict here.
   //
   // The worker already hands this bot its OWN config through the designed private
@@ -10693,35 +10698,98 @@ function currentTurnHasNoTransport(): boolean {
   return !!appId && currentBotIsApiOnly(appId);
 }
 
-/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
- *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
- *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+interface ManagedOriginTransportVerdict {
+  noTransport: boolean;
+  chatId: string | undefined;
+  /** A visible ancestor marker and BOTMUX_SESSION_ID name different sessions. */
+  sessionConflict?: { ancestorSessionId: string; envSessionId: string };
+}
+
+let managedOriginTransportVerdict: ManagedOriginTransportVerdict | undefined;
+
+/** Tamper-resistant managed-origin transport verdict, plus the chatId it was
+ *  judged from.
+ *
+ *  Checks the pid-marker ANCESTRY (process.ppid walk) before the general routing
+ *  resolver; a conflicting BOTMUX_SESSION_ID is refused. Then loads the record and
  *  judges transport from its chatId + its bot's apiOnly config. So `env -u
  *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
- *  managed no-transport identity. Returns false (not gated) when no managed
- *  origin resolves — a bare host-operator shell keeps full access. Total; on any
- *  resolution error falls back to the env-based check (never throws). */
-function managedOriginHasNoTransport(): boolean {
+ *  managed no-transport identity. Returns `noTransport: false` (not gated) when
+ *  no managed origin resolves — a bare host-operator shell keeps full access.
+ *  Total; on any resolution error falls back to the env-based check (never
+ *  throws).
+ *
+ *  The record is the routing truth, not the env: BOTMUX_CHAT_ID is a spawn-time
+ *  snapshot, so a session that was headless when its CLI was spawned and was
+ *  later bound/transferred to a real chat keeps that very process (the tmux
+ *  backend re-attaches to the surviving `bmx-<sessionId>` rather than
+ *  respawning), and its env never learns about the move. `chatId` is returned so
+ *  the refusal message can name the reason the same snapshot was judged from.
+ *
+ *  Judged once per process: the root-dispatch gate and the command's own early
+ *  gate ask the same question moments apart, and the record lookup loads every
+ *  bot's session store (hundreds of ms on a large fleet). */
+function resolveManagedOriginTransport(): ManagedOriginTransportVerdict {
+  managedOriginTransportVerdict ??= judgeManagedOriginTransport();
+  return managedOriginTransportVerdict;
+}
+
+function judgeManagedOriginTransport(): ManagedOriginTransportVerdict {
+  const envVerdict = (requireEnvSession: boolean) => ({
+    noTransport: (!requireEnvSession || !!process.env.BOTMUX_SESSION_ID)
+      && currentTurnHasNoTransport(),
+    chatId: process.env.BOTMUX_CHAT_ID,
+  });
   try {
-    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    const dataDir = resolveDataDir();
+    const envSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+    // The general routing resolver treats envSessionId as ground truth and
+    // skips conflicting markers. A transport gate must observe the ancestor
+    // before that filter, or a changed env could select another real session.
+    // Reject the conflict rather than routing through either identity; legacy
+    // markers without a birth stamp may be stale, not just a changed env.
+    const ancestor = findLiveAncestorSessionContext(dataDir);
+    if (ancestor?.sessionId && envSessionId && ancestor.sessionId !== envSessionId) {
+      return {
+        noTransport: true,
+        chatId: undefined,
+        sessionConflict: { ancestorSessionId: ancestor.sessionId, envSessionId },
+      };
+    }
+    const ctx = ancestor?.sessionId ? ancestor : resolveSessionContext(dataDir, envSessionId);
     if (!ctx?.sessionId) {
       // No managed origin at all (bare operator). Still honor an explicit env
       // signal if present (daemon-spawned turn whose marker was pruned), but a
       // truly bare shell has neither → not gated.
-      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+      return envVerdict(true);
     }
     const s = loadSessions().get(ctx.sessionId);
     if (!s) {
       // Marker resolved a session id but no record on disk (riff sandbox etc.) —
       // fall back to the env view for that same managed turn.
-      return currentTurnHasNoTransport();
+      return envVerdict(false);
     }
     const chatId = s.chatId ?? '';
-    if (isHttpVirtualSession(chatId)) return true;
-    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+    return {
+      noTransport: isHttpVirtualSession(chatId)
+        || (!!s.larkAppId && currentBotIsApiOnly(s.larkAppId)),
+      chatId,
+    };
   } catch {
-    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    return envVerdict(true);
   }
+}
+
+/** Refusal text for a marker/env session conflict. Naming both ids keeps the
+ *  real reason visible instead of the generic no-transport causes. */
+function managedOriginConflictMessage(
+  op: string,
+  conflict: NonNullable<ManagedOriginTransportVerdict['sessionConflict']>,
+): string {
+  return `botmux ${op} is unavailable: an ancestor process marker names session ` +
+    `${conflict.ancestorSessionId}, but BOTMUX_SESSION_ID names ${conflict.envSessionId}.\n` +
+    `Feishu read/write is refused rather than routed through either session. Run it\n` +
+    `from the session's own CLI without overriding BOTMUX_SESSION_ID.`;
 }
 
 /** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
@@ -10730,8 +10798,17 @@ function managedOriginHasNoTransport(): boolean {
  *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
  *  for type-flow clarity; execution never continues past the exit. */
 function assertTurnTransportOrExit(op: string): void {
-  if (!currentTurnHasNoTransport()) return;
-  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  // Judge with the SAME managed-origin verdict the root-dispatch gate applies to
+  // every Lark-facing command. Judging by the env alone permanently refused
+  // `send` (and every sibling verb) in a session that was spawned headless and
+  // later bound to a real chat — see resolveManagedOriginTransport.
+  const verdict = resolveManagedOriginTransport();
+  if (!verdict.noTransport) return;
+  if (verdict.sessionConflict) {
+    console.error(managedOriginConflictMessage(op, verdict.sessionConflict));
+    process.exit(2);
+  }
+  const chatId = verdict.chatId ?? '';
   const headless = chatId.startsWith('headless_');
   const why = headless
     ? 'this turn runs in a headless automation session (no Feishu chat)'
@@ -21092,10 +21169,9 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // ─── Central root-dispatch transport gate ──────────────────────────────────
 // A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
 // or a virtual/headless session) must not run ANY Lark-facing command. The managed
-// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
-// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
-// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
-// managed identity. We then load THAT session's record and gate on its chatId +
+// gate observes the pid-marker ancestry before env-based routing and refuses a
+// conflicting env session, so changing or removing BOTMUX_SESSION_ID cannot
+// discard a visible ancestor origin. We load that session's record and gate on its chatId +
 // its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
 // also can't flip the verdict. Covers every Feishu-facing verb by construction.
 // A BARE host-operator shell (no ancestry marker, no env session) resolves no
@@ -21106,13 +21182,16 @@ const LARK_FACING_COMMANDS = new Set([
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
-if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
-  console.error(
-    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
-    `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
-    `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
-    `through the current session result channel.`,
-  );
+const managedOriginVerdict = LARK_FACING_COMMANDS.has(command)
+  ? resolveManagedOriginTransport()
+  : undefined;
+if (managedOriginVerdict?.noTransport) {
+  console.error(managedOriginVerdict.sessionConflict
+    ? managedOriginConflictMessage(command, managedOriginVerdict.sessionConflict)
+    : `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+      `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
+      `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
+      `through the current session result channel.`);
   process.exit(2);
 }
 
