@@ -12,6 +12,7 @@
  *
  * usePlanOnlyBwrap() puts a private directory first on PATH for the enclosing
  * describe, holding:
+ *   - network helpers that answer capability probes but refuse execution;
  *   - `bwrap`: a stand-in that answers `--version` / `--help` (advertising the
  *     options sandboxNetworkLaunch() checks for) and refuses to run anything;
  *   - `sudo` and every package manager ensureSandboxDeps() tries: exit 1 at
@@ -58,6 +59,18 @@ export function usePlanOnlyBwrap(): void {
       'exit 1',
       '',
     ].join('\n'));
+    // Network launch plans discover these tools even though no namespace or
+    // network process is started. Keep this boundary independent of host packages.
+    for (const [name, help] of Object.entries({
+      slirp4netns: '--disable-host-loopback --disable-dns',
+      unshare: '--kill-child --mount-proc', nft: '', ip: '',
+    })) {
+      writeScript(join(dir, name), [
+        `[ "$1" = "--help" ] && { printf '%s\\n' '${help}'; exit 0; }`,
+        `printf '${name} %s\\n' "$*" >> '${log}'`,
+        'exit 1', '',
+      ].join('\n'));
+    }
     for (const name of INSTALLERS) {
       writeScript(join(dir, name), `printf '${name} %s\\n' "$*" >> '${log}'\nexit 1\n`);
     }

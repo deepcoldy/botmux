@@ -6605,6 +6605,11 @@ function recoverTraexQuotaTurn(turn: CodexPendingTurn): boolean {
   const nativeSessionId = lastInitConfig.cliSessionId;
   const target = backend;
   traexQuotaPending = token;
+  // An exact native terminal settles the ambiguous write before attempting
+  // recovery. Otherwise the switch rejects the still-quarantined generation
+  // and only the later fallback emission releases it, losing the recovery.
+  // Register pending recovery first so the release cannot admit queued input.
+  releaseInputDeliveryQuarantineForStructuredTerminal(turn.turnId, turn.dispatchAttempt);
   if (capacityRecovery) {
     // Invalidate older capacity proposals and persist the refusal before IO.
     controller.recordUnavailableModel(turn.turnId);

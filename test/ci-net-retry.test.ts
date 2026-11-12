@@ -10,7 +10,9 @@ const SCRIPT = join(ROOT, 'scripts/ci-net-retry.mjs');
 
 // 样本是真实输出：两条来自 #3193 的 CI 现场日志，其余是 bun 1.4.4 / npm 11 / pnpm 9.5.0 /
 // electron install.js / curl 对着本地故障注入 registry（504、断开连接、404）时的报错原文。
+const APT_DNS = "E: Failed to fetch mirror+file:/etc/apt/apt-mirrors.txt/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb Temporary failure resolving 'azure.archive.ubuntu.com'";
 const TRANSIENT: Record<string, string> = {
+  'apt 临时 DNS 失败（#3348 CI 原始日志）': APT_DNS,
   'electron postinstall 504（#3193 现场一）':
     'bun install v1.4.3 (c6da4a4d3)\nHTTPError: Response code 504 (Gateway Time-out)\n    at Request._onResponseBase (/home/runner/work/botmux/botmux/node_modules/got/dist/source/core/index.js:913:31)\nerror: postinstall script from "electron" exited with 1',
   'setup-bun 下载 504（#3193 现场二）': 'Unexpected HTTP response: 504\nWaiting 18 seconds before trying again\n##[error]Error: Unexpected HTTP response: 504',
@@ -82,6 +84,38 @@ function harness(results: Attempt[]) {
 const GATEWAY_504 = { code: 1, output: TRANSIENT['bun tarball 504'] };
 
 describe('runWithRetry', () => {
+  it.each([true, false])('apt 临时解析失败有界重试，恢复=%s', async (recovers) => {
+    const failed = { code: 100, output: APT_DNS };
+    const h = harness(recovers ? [failed, { code: 0, output: '' }] : [failed]);
+    const args = ['apt-get', '-o', 'APT::Update::Error-Mode=any', 'update'];
+    await expect(runWithRetry('sudo', args, h.deps)).resolves.toBe(recovers ? 0 : 100);
+    expect(h.calls).toEqual(Array.from({ length: recovers ? 2 : 5 }, () => ['sudo', ...args]));
+    expect(h.sleeps).toEqual(recovers ? [10_000] : [...RETRY_DELAYS_MS]);
+  });
+
+  it.each([
+    'E: Unable to locate package missing',
+    "E: Package missing has no installation candidate",
+    'E: Hash Sum mismatch',
+    'NO_PUBKEY 1234567890ABCDEF',
+    'EXPKEYSIG 1234567890ABCDEF',
+    'BADSIG 1234567890ABCDEF',
+    "E: The repository is not signed",
+    "E: The repository does not have a Release file",
+    "W: The following signatures couldn't be verified",
+    'E: Could not open lock file (13: Permission denied)',
+    'E: Failed to fetch https://example.invalid/pkg 403 Forbidden',
+    'E: Failed to fetch https://example.invalid/pkg 404 Not Found',
+    'E: Failed to fetch https://example.invalid/pkg 401 Unauthorized',
+  ])('apt 确定性错误优先于同时出现的 DNS 失败：%s', async (error) => {
+    const output = `${APT_DNS}\n${error}`;
+    expect(classifyFailure(output).kind).toBe('deterministic');
+    const h = harness([{ code: 100, output }, { code: 0, output: '' }]);
+    await expect(runWithRetry('sudo', ['apt-get', 'update'], h.deps)).resolves.toBe(100);
+    expect(h.calls).toHaveLength(1);
+    expect(h.sleeps).toEqual([]);
+  });
+
   it('次数与间隔写死：最多 5 次，间隔 10s/20s/40s/80s', () => {
     expect(RETRY_DELAYS_MS).toEqual([10_000, 20_000, 40_000, 80_000]);
     expect(Object.isFrozen(RETRY_DELAYS_MS)).toBe(true);

@@ -1,3 +1,4 @@
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -39,6 +40,7 @@ function fixture() {
   let resolve!: (value: any) => void;
   const query = new Promise<any>(done => { resolve = done; });
   const scope: Record<string, any> = {
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
     traexAutoModelController: pool, traexAutoModelRuntimeEligible: () => true,
     activeTurnAuthority: authority, inflightInputs: tracker, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
     lastInitConfig: { cliId: 'traex', cliSessionId: 'native', model: models[0] }, backend: {},
@@ -63,6 +65,7 @@ function fixture() {
     scope[name] = loadWorkerFunction(name, scope);
   }
   const turn = { turnId: 'turn', sourceTurnId: 'native-turn', terminalStatus: 'failed', terminalErrorCode: TRAEX_MODEL_ACCESS_ERROR_CODE };
+  scope.releaseInputDeliveryQuarantineForStructuredTerminal = loadWorkerFunction('releaseInputDeliveryQuarantineForStructuredTerminal', scope);
   const recover = loadWorkerFunction<(turn: any) => boolean>('recoverTraexQuotaTurn', scope);
   const fresh = () => store.getSessionFresh(session.sessionId)!;
   return { pool, scope, turn, recover, resolve, fresh };

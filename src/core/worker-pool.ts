@@ -896,7 +896,7 @@ import { isBotMentionEntry, knownBotOpenIdsFromCrossRef, type BotMentionEntry } 
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
-import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
+import { isStructuredBridgeAdoptCli, isStructuredBridgeLifecycleBlockingCli } from '../services/structured-bridge-clis.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../services/bots-info-cache.js';
@@ -22507,9 +22507,19 @@ function setupWorkerHandlers(
           }
         }
         if (!outcomeExcluded && !nonLarkFailureHandled && !ordinaryHttpTerminal) {
+          let delivered = false;
           void recordTurnOutcome(ds, msg, {
             recoveryHandled,
+            onClassified: outcome => { delivered = outcome === 'delivered'; },
             isFinalDelivered: () => isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId)),
+          }).then(async () => {
+            if (!usesOutcomeBasedTurnReactions(ds)) return;
+            await finishTurnReactions(ds, {
+              turnId: msg.turnId,
+              delivered,
+              owns: () => ds.worker === worker && ds.workerGeneration === workerGeneration
+                && ds.session.status === 'active',
+            });
           }).catch((err: unknown) => {
             logger.warn(`[${t}] turn outcome: ${err instanceof Error ? err.message : String(err)}`);
           });
@@ -24146,33 +24156,34 @@ function shouldDropMismatchedHermesFinalOutput(
   return true;
 }
 
-/**
- * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
- * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
- * acceptance point (`noteTurnReceived`); the screen_update handler calls this
- * only on working|analyzing → idle|limited (not cold-start starting→idle), to
- * flip every pending ✋ on this session to ✅ DONE and clear the list. When
- * silentTurnReactions is enabled after a ✋ has already landed, we only remove
- * that received reaction and do not add DONE. Binding the start to the message
- * (not a status edge) means type-ahead / busy-batched messages each get their
- * own reaction and all settle together here.
- *
- * Every Feishu call is best-effort — a failure only means a missing emoji, so it
- * must never throw into the status pipeline (callers invoke as `void`).
- */
-async function finishTurnReactions(ds: DaemonSession): Promise<void> {
-  const list = ds.pendingAckReactions;
-  if (!list || list.length === 0) return;
-  // Detach the batch first so a second idle edge can't double-flip it.
-  ds.pendingAckReactions = [];
-  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
-  // reactions only ever exist for a real inbound user message (the ✋ is placed
-  // when that message arrives — transcript deliveries have no inbound message to
-  // react to), so a non-empty list here always belongs to a plain user turn and
-  // must settle to ✅ like any session. No VC special-case.
+/** Screen-only CLIs retain their legacy idle signal. For drivers with an
+ * authoritative terminal, a quiet screen is not evidence of answer delivery.
+ * Adopt/workflow/meeting lanes retain their existing dedicated UI contracts. */
+function usesOutcomeBasedTurnReactions(ds: DaemonSession): boolean {
+  return isStructuredBridgeLifecycleBlockingCli(sessionCliId(ds, getBot(ds.larkAppId).config))
+    && !isSharedAdoptSession(ds) && !ds.session.workflowNode && !ds.session.vcMeetingReceiver;
+}
+
+/** Settle only the acknowledged messages belonging to the proven terminal.
+ * no_output/interrupted removes the received reaction without claiming success.
+ * Legacy screen-only sessions still settle their busy batch on the idle edge.
+ * This is presentation only: it never replays input or holds an execution lock. */
+async function finishTurnReactions(
+  ds: DaemonSession,
+  terminal?: { turnId: string; delivered: boolean; owns: () => boolean },
+): Promise<void> {
+  if (usesOutcomeBasedTurnReactions(ds) && !terminal) return;
+  if (terminal && !terminal.owns()) return;
+  const pending = ds.pendingAckReactions;
+  if (!pending?.length) return;
+  const belongs = (ack: NonNullable<DaemonSession['pendingAckReactions']>[number]) =>
+    !terminal || (ack.turnId ?? ack.messageId) === terminal.turnId;
+  const list = pending.filter(belongs);
+  ds.pendingAckReactions = pending.filter(ack => !belongs(ack));
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
   for (const ack of list) {
+    if (terminal && !terminal.owns()) return;
     if (ack.reactionId) {
       try {
         await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
@@ -24180,7 +24191,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
         logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
       }
     }
-    if (silent) continue;
+    if (silent || (terminal && (!terminal.delivered || !terminal.owns()))) continue;
     try {
       await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
     } catch (err: any) {

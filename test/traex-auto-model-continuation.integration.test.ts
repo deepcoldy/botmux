@@ -277,13 +277,14 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(f.messages.filter(message => message.type === 'active_runtime' && message.traexAutoModelRuntime?.modelAccessRecovery?.blockedModels.length === 2).length).toBeGreaterThan(0);
   }, 45_000);
 
-  it('model access restrictions also skip confirmed quota failures during the same capacity search', async () => {
+  it.each([0, 400])('model access restrictions also skip confirmed quota failures during the same capacity search (receipt delay %sms)', async receiptDelayMs => {
     const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
       undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity',
         modelErrors: { backup: { codex_error_info: 'usage_limit_exceeded', message: 'Usage quota exhausted' } },
-      });
+      }, receiptDelayMs ? { submission: 1, ms: receiptDelayMs } : undefined);
     f.child.send({ type: 'message', content: 'mixed access and quota task', turnId: 'om_access_quota' } satisfies DaemonToWorker);
     await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access_quota' && message.status === 'completed'), 'mixed failure recovery complete');
+    if (receiptDelayMs) expect(f.logs.join('')).toContain('after unconfirmed submit turn=om_access_quota');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
     expect(rows(f.submissions).filter(row => row.text.startsWith('mixed access and quota task'))).toHaveLength(1);
     expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access_quota')).toHaveLength(1);

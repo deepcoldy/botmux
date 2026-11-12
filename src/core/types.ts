@@ -510,7 +510,7 @@ export interface DaemonSession {
    *  batched messages each get their own reaction). Every pending ✋ here is
    *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
    *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
-  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
+  pendingAckReactions?: Array<{ messageId: string; reactionId?: string; turnId?: string }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
