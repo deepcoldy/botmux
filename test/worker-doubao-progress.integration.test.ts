@@ -93,17 +93,19 @@ describe.skipIf(process.platform === 'win32')('Doubao worker execution progress'
         ? JSON.stringify({ role: 'assistant', content: 'Old answer' }) + '\n' + oldTool.slice(0, split) : '');
       if (resumed) writeFileSync(join(systemDir, 'assignment.md'), '## [2026-01-01T00:00:00Z] 需求\nOld prompt\n');
       const completeFlag = join(root, 'complete');
+      const readyPaint = join(root, 'paint-ready');
       const inputFile = join(root, 'input');
       const fakeCli = join(root, 'fake-doubao');
       writeFileSync(fakeCli, `#!/usr/bin/env node
 const fs = require('node:fs');
 let busy = false;
+let paintedReady = false;
 const ready = () => process.stdout.write('\\x1b[2J\\x1b[HAsk Doubao to do anything\\nEnter send · Ctrl+J newline\\n');
-ready();
 process.stdin.on('data', data => { busy = true; fs.appendFileSync(${JSON.stringify(inputFile)}, data); });
 setInterval(() => {
   if (fs.existsSync(${JSON.stringify(completeFlag)})) { busy = false; ready(); }
   else if (busy) process.stdout.write('\\x1b[48;1H\\x1b[KResponding… (1s • esc to interrupt)');
+  else if (!paintedReady && fs.existsSync(${JSON.stringify(readyPaint)})) { paintedReady = true; ready(); }
 }, 100);
 `, { mode: 0o755 });
       const messages: WorkerToDaemon[] = [];
@@ -149,6 +151,12 @@ setInterval(() => {
         larkAppId: 'app_doubao', larkAppSecret: 'test-only', turnId: 'om_doubao_turn', apiOnly: true,
       } satisfies DaemonToWorker;
       child!.send(init);
+      // A fast Linux CLI can paint before tmux pipe-pane subscribes. Wait for
+      // the real worker to install its observers before the fixture's one-shot
+      // ready frame; prompt detection and the literal submit still run normally.
+      await waitUntil(() => messages.some(msg => msg.type === 'ready'), logs);
+      expect(logs.some(line => line.includes('Writing to PTY (flush)'))).toBe(false);
+      writeFileSync(readyPaint, 'paint');
       await waitUntil(() => logs.some(line => line.includes('Writing to PTY (flush)')), logs);
       writeFileSync(join(systemDir, 'assignment.md'), `## [${new Date().toISOString()}] 需求\n${prompt}\n`, { flag: 'a' });
       if (resumed) appendFileSync(trajectory, oldTool.slice(split) + '\n');
