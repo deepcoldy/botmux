@@ -18,6 +18,8 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
  *                                  messages in any card mode
  *   • writableTerminalLinkInCard — embed a directly-usable writable terminal
  *                                  link in the streaming card body
+ *   • goalStatusCard            — Codex / TRAE native-goal status card
+ *                                  (opt-in, default off)
  *   • privateCard               — `/card` sends a private ephemeral snapshot
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
@@ -77,6 +79,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   codexBrowser: boolean;
   codexBrowserAutoApproveOrigins: boolean;
   writableTerminalLinkInCard: boolean;
+  /** Codex / TRAE native-goal status card. Default false; only true persists. */
+  goalStatusCard: boolean;
   privateCard: boolean;
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
@@ -165,6 +169,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       replyCardShowTools: c.replyCardShowTools !== false,
       replyCardNativeCot: c.replyCardNativeCot === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
+      goalStatusCard: c.goalStatusCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
       cotEnabled: c.cotEnabled !== false,
@@ -208,6 +213,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       replyCardShowTools: true,
       replyCardNativeCot: false,
       writableTerminalLinkInCard: false,
+      goalStatusCard: false,
       privateCard: false,
       replyCardActions: false,
       cotEnabled: true,
@@ -348,6 +354,7 @@ async function updateBotCardPrefsInternal(
     applyDefaultTrue(entry, 'replyCardShowTools', patch.replyCardShowTools);
     apply(entry, 'replyCardNativeCot', patch.replyCardNativeCot);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
+    apply(entry, 'goalStatusCard', patch.goalStatusCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
     // [legacy-thinkingCard] 显式拨开关时清旧名（懒迁移）；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
@@ -396,6 +403,7 @@ async function updateBotCardPrefsInternal(
         replyCardShowTools: entry.replyCardShowTools !== false,
         replyCardNativeCot: entry.replyCardNativeCot === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
+        goalStatusCard: entry.goalStatusCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
         cotEnabled: normalizeCotEnabled(entry),
@@ -466,6 +474,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
+  }
+  if (patch.goalStatusCard !== undefined) {
+    bot.config.goalStatusCard = patch.goalStatusCard || undefined;
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
@@ -572,7 +583,7 @@ async function updateBotCardPrefsInternal(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `codexBrowser=${r.result.codexBrowser} ` +
-    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
+    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} goalStatusCard=${r.result.goalStatusCard} privateCard=${r.result.privateCard} ` +
     `cotEnabled=${r.result.cotEnabled} ` +
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +

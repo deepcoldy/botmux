@@ -45,6 +45,7 @@ import {
   type Dirent,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { nativeGoalFromEvent, type NativeGoalState } from './native-goal-state.js';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { isTraexQuotaError, TRAEX_QUOTA_ERROR_CODE } from './traex-quota.js';
 import { isTraexModelAccessError, TRAEX_MODEL_ACCESS_ERROR_CODE } from './traex-model-access.js';
@@ -971,6 +972,7 @@ export function drainTraexRollout(
   const sourceSessionId = traexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  let latestGoal: NativeGoalState | null | undefined;
   const seenUserTurns = new Set<string>();
   const freshUserItems = (): TraexSeenUserItems => ({ messages: new Map(), turnCounts: new Map() });
   const seenUserItems = probe ? freshUserItems()
@@ -1020,6 +1022,8 @@ export function drainTraexRollout(
     latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
     if (!payload || typeof payload !== 'object') continue;
+    const goal = nativeGoalFromEvent(obj, sourceSessionId);
+    if (goal !== undefined) latestGoal = goal;
     const base = {
       uuid: `${path}:${lineStart}${displayIndex !== undefined ? `:display:${displayIndex}` : ''}`,
       timestampMs: eventTimestampMs(obj.timestamp),
@@ -1345,6 +1349,7 @@ export function drainTraexRollout(
     pendingTail,
     ...(latestModel ? { latestModel } : {}),
     ...(latestReasoningEffort ? { latestReasoningEffort } : {}),
+    ...(latestGoal !== undefined ? { latestGoal } : {}),
   };
 }
 

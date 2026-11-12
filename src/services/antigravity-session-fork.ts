@@ -21,6 +21,15 @@ export class AntigravitySessionLog {
     mkdirSync(dirname(this.path), { recursive: true });
   }
 
+  /** True once `agy --log-file` has created and written to this native log. */
+  hasLogFile(): boolean {
+    try {
+      return statSync(this.path).size > 0;
+    } catch {
+      return false;
+    }
+  }
+
   read(): Readonly<typeof this.state> {
     try {
       const stat = statSync(this.path);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution, sameRuntime, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity, type ExecutionRef,
@@ -2061,6 +2062,12 @@ function observeContractNativeSession(nativeSessionId: string): void {
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
+  if (msg.type === 'goal_update') {
+    const binding = workerSessionEventScope.contextBinding();
+    const context = workerSessionEventScope.envelope(binding ? { bindingId: binding.bindingId, runtime: binding.runtime } : undefined);
+    delete context.scope.execution;
+    return { ...msg, sessionContract: context };
+  }
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
@@ -12434,6 +12441,53 @@ function currentHermesBridgeDbPath(): string {
   return hermesBridgeDbPath ?? resolveHermesStateDbPath();
 }
 
+let nativeGoalSourcePath: string | undefined;
+let nativeGoalSignature: string | undefined;
+let nativeGoalPendingSignature: string | undefined;
+let nativeGoalTimer: ReturnType<typeof setInterval> | undefined;
+let nativeGoalReadAt = 0;
+let nativeGoalGeneration = -1;
+let nativeGoalPhysicalId: string | undefined;
+let nativeGoalOrigin: { key: string; goalId?: string; turnId?: string; dispatchAttempt?: number } | undefined;
+function publishNativeGoal(goal: import('./services/native-goal-state.js').NativeGoalState | null): void {
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && (!binding?.runtime || binding.physicalId !== nativeGoalPhysicalId)) return;
+  const signature = createHash('sha256').update(JSON.stringify({ goal, generation: cliSpawnGeneration,
+    bindingId: binding?.bindingId, runtime: binding?.runtime })).digest('hex');
+  if (signature === nativeGoalSignature) return;
+  if (goal) {
+    const key = createHash('sha256').update(`${goal.createdAt}\0${goal.objective}`).digest('hex');
+    if (!nativeGoalOrigin || nativeGoalOrigin.key !== key || goal.goalId && nativeGoalOrigin.goalId && goal.goalId !== nativeGoalOrigin.goalId) {
+      nativeGoalOrigin = { key, goalId: goal.goalId, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
+    } else if (!nativeGoalOrigin.goalId && goal.goalId) nativeGoalOrigin.goalId = goal.goalId;
+  }
+  nativeGoalPendingSignature = signature;
+  const publish = () => send({ type: 'goal_update', goal, signature,
+    turnId: nativeGoalOrigin ? nativeGoalOrigin.turnId : currentBotmuxTurnId,
+    dispatchAttempt: nativeGoalOrigin ? nativeGoalOrigin.dispatchAttempt : currentBotmuxDispatchAttempt });
+  if (binding && workerSessionEventScope) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
+/** Opt-in per bot (goalStatusCard), fixed for this worker process. */
+function nativeGoalCardEnabled(): boolean {
+  return lastInitConfig?.goalStatusCard === true && (structuredBridgeIs('traex') || structuredBridgeIs('codex'));
+}
+function observeNativeGoal(): void {
+  if (!nativeGoalCardEnabled() || nativeGoalGeneration !== cliSpawnGeneration) {
+    nativeGoalSourcePath = undefined;
+    if (nativeGoalTimer) clearInterval(nativeGoalTimer);
+    nativeGoalTimer = undefined;
+    return;
+  }
+  const path = nativeGoalSourcePath;
+  if (!path || !backend || cliRestartInProgress) return;
+  if (Date.now() - nativeGoalReadAt < 2000) return;
+  nativeGoalReadAt = Date.now();
+  const nativeId = structuredBridgeIs('traex') ? traexSessionIdFromRolloutPath(path) : codexGenerationSessionIdFromRolloutPath(path);
+  const goal = nativeId ? readNativeGoalForRollout(path, nativeId) : undefined;
+  if (goal === undefined) return;
+  publishNativeGoal(goal);
+}
 function structuredBridgeIngestPath(
   path: string,
   offset: number,
@@ -12460,6 +12514,25 @@ function structuredBridgeIngestPath(
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
+    if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && nativeGoalCardEnabled()) {
+      nativeGoalSourcePath = path;
+      nativeGoalGeneration = cliSpawnGeneration;
+      nativeGoalSignature = undefined;
+      nativeGoalPendingSignature = undefined;
+      nativeGoalPhysicalId = workerSessionEventScope?.currentBinding()?.physicalId;
+      nativeGoalReadAt = 0;
+      const nativeId = structuredBridgeIs('traex') ? traexSessionIdFromRolloutPath(path) : codexGenerationSessionIdFromRolloutPath(path);
+      const currentGoal = nativeId ? readNativeGoalForRollout(path, nativeId) : undefined;
+      if (currentGoal !== undefined) result.latestGoal = currentGoal;
+      else if (result.latestGoal === undefined) result.latestGoal = readLatestNativeGoal(path, nativeId);
+      if (nativeGoalTimer) clearInterval(nativeGoalTimer);
+      nativeGoalTimer = setInterval(observeNativeGoal, 2000);
+      nativeGoalTimer.unref?.();
+    }
+    if (result.latestGoal !== undefined && nativeGoalCardEnabled()) {
+      publishNativeGoal(result.latestGoal);
+    }
+    if (nativeGoalSourcePath === path) observeNativeGoal();
     if (structuredBridgeIs('codex')) {
       // Codex resume can copy the whole conversation into a new generation
       // file; content-addressed ids let the queue dedup copied history across
@@ -12585,10 +12658,10 @@ function codexBridgeStartTimer(): void {
         // the pid fallback here recovers a probe that lost the race.
         //
         // Resolve while UNBOUND or while a lazy-created conversation is still
-        // pending — the latter also covers a /new rotation: the notify path
-        // stored the new id while its brain file did not exist yet, and the
-        // retired conversation's path is still bound. Gating only on
-        // !codexBridgeRolloutPath would leave the new file unattached forever.
+        // pending — the latter also covers a /new rotation or misbind
+        // correction: the notify path stored the new id while its brain file
+        // did not exist yet, and the previous path is still bound. Gating only
+        // on !codexBridgeRolloutPath would leave the new file unattached forever.
         if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
           const action = decideAntigravityTickerAction({
             boundPath: codexBridgeRolloutPath,
@@ -12596,27 +12669,34 @@ function codexBridgeStartTimer(): void {
             resolveBySid: sid => resolveFileBridgePath('antigravity', { sessionId: sid }),
             resolveByPid: () => {
               const pid = currentAntigravityObservedPid();
-              const activeId = cliAdapter?.resolveActiveSessionId?.({ cliPid: pid });
-              // /fork retains the parent's fd. An active child with a lazy
-              // brain file must wait for that file, never bind the parent.
-              if (activeId) return resolveFileBridgePath('antigravity', { sessionId: activeId });
+              // Honor cliAdapter.resolveActiveSessionId when present: on a
+              // fresh launch it withholds transient startup ListConversations
+              // DB fds until --log-file records `Streaming conversation`, and
+              // after /fork it disambiguates child vs retained parent DB fds.
+              if (cliAdapter?.resolveActiveSessionId) {
+                const activeId = cliAdapter.resolveActiveSessionId({ cliPid: pid, cliCwd: lastInitConfig?.workingDir });
+                return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
+              }
               return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
             },
           });
           if (action.kind === 'rotate') {
-            // A new conversation resolved while the retired one is bound
+            // A new conversation resolved while the previous one was bound
             // (either the pending SID authoritatively, or the pid's open
-            // conversation switched): release the retired conversation's held
-            // final, then bind the new one fresh so its live turn is ingested
-            // from byte 0 (never as history).
+            // conversation switched): flush the retired conversation's held
+            // final only when an earlier turn belongs to it, then bind the new
+            // one fresh so its live turn is ingested from byte 0.
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
-            try {
-              codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-              emitReadyCodexTurns();
-            } catch (err: any) {
-              log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+            if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+              try {
+                codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+                emitReadyCodexTurns();
+              } catch (err: any) {
+                log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+              }
             }
+            log(`Antigravity bridge late-rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
             codexBridgeDetachFile();
             codexBridgeAttach(action.path, 'fresh-empty');
           } else if (action.kind === 'bind-initial') {
@@ -13192,13 +13272,11 @@ function armAntigravityCotForTurn(): void {
   if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
-  let cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: backend?.getChildPid?.() ?? undefined, cliCwd: lastInitConfig.workingDir })
-    ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
-  if (!cid) {
-    const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
-    const effectivePid = pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
-    cid = effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined;
-  }
+  const effectivePid = currentAntigravityObservedPid();
+  const discoveredCid = cliAdapter?.resolveActiveSessionId
+    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
+    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
+  const cid = discoveredCid ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
   if (!cid) return;
   persistCliSessionId(cid);
   ensureAntigravityCotReader(cid);
@@ -13748,7 +13826,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         codexBridgeStartTimer();
       }
     }
-    return;
+    if (!structuredBridgeIs('antigravity')) return;
   }
   if (structuredBridgeIs('mtr')) {
     const source = findMtrSessionById(cliSessionId);
@@ -13786,9 +13864,11 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   }
   if (structuredBridgeIs('antigravity')) {
     // cliSessionId is agy's conversation UUID, which names the brain
-    // transcript directory. writeInput reports the id on EVERY submit (it is
-    // also how `/new` surfaces the freshly-minted conversation in the same
-    // process), so this is both the first-attach and the rotation path.
+    // transcript directory. writeInput and the native --log-file observer
+    // report the id on every submit/stream switch, and `codexBridgeRolloutPath`
+    // above falls through for Antigravity so this handles both initial attach
+    // and in-binding rotation/rebind (e.g. `/new`, `/fork`, or correcting an
+    // early misbound transcript).
     const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
     // Compared by conversation, not path: a compact-log bind resolves to the
     // full log here once agy has created it, and that is NOT a /new. The
@@ -13800,27 +13880,29 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     if (action.kind !== 'wait-pending') {
       if (action.kind === 'rotate') {
-        // Conversation rotated (/new): drain the retired transcript so a
-        // trailing final is not stranded, then rebind. The new conversation's
-        // existing bytes are THIS session's live turn, never history →
-        // fresh-empty regardless of the spawn resume flag.
-        try {
-          // Flush the retired conversation's held candidate: the new
-          // conversation starting proves the old loop ended.
-          codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-          emitReadyCodexTurns();
-        } catch (err: any) {
-          log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
+        // Conversation rotated (/new) or corrected from an early misbind:
+        // drain the retired transcript only when an earlier turn actually
+        // belongs to it, then rebind fresh-empty so the current conversation's
+        // existing bytes are ingested from byte 0.
+        if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+          try {
+            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+            emitReadyCodexTurns();
+          } catch (err: any) {
+            log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
+          }
         }
+        log(`Antigravity bridge rebound ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
         codexBridgeDetachFile();
         codexBridgeAttach(action.path, 'fresh-empty');
       } else {
         codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
       }
       codexBridgePendingSessionId = undefined;
+      codexBridgeIngest();
     } else {
       // The brain file is created lazily after submit — keep id pending and
-      // let the 1s ticker late-attach (pid probe covers a lost race).
+      // let the 1s ticker late-attach or rotate once the file appears.
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
     }
@@ -14014,6 +14096,18 @@ function codexBridgeIngest(opts: {
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  // While a newly reported Antigravity conversation is still waiting for its
+  // lazily-created brain file (`codexBridgePendingSessionId`), do not let
+  // fs.watch or steady-state ticks ingest new unstarted turns from the
+  // superseded/misbound transcript.
+  if (
+    structuredBridgeIs('antigravity')
+    && !opts.flushAntigravityTrailingFinal
+    && codexBridgePendingSessionId
+    && !(codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1)
+  ) {
+    return;
+  }
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
     flushAntigravityTrailingFinal: opts.flushAntigravityTrailingFinal,
@@ -20808,8 +20902,9 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
     if (currentPid && currentPid !== pid) return;
 
     const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
-    const cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: realPid })
-      ?? findAntigravityConversationIdByPid(realPid);
+    const cid = cliAdapter?.resolveActiveSessionId
+      ? cliAdapter.resolveActiveSessionId({ cliPid: realPid, cliCwd: lastInitConfig?.workingDir })
+      : findAntigravityConversationIdByPid(realPid);
     if (cid) {
       if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
         log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
@@ -36533,6 +36628,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       send({ type: 'prompt_cache_keepalive_result', injected: true });
       log('Prompt-cache keep-alive queued');
       void flushPendingInjections();
+      break;
+    }
+
+    case 'goal_update_ack': {
+      if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
       break;
     }
 

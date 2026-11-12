@@ -5937,12 +5937,22 @@ dialog.onboarding-dialog::backdrop {
   line-height: 1.4;
 }
 
-#g-drawer .g-card-section-config {
+#g-drawer .g-card-section-config,
+#g-drawer .g-card-completed-display {
   display: grid;
   gap: 6px;
+  min-width: 0;
   color: var(--muted);
   font-size: var(--fs-12);
   font-weight: var(--fw-s);
+}
+
+#g-drawer .g-card-completed-display select {
+  width: 100%;
+  min-height: var(--button-height);
+  margin: 0;
+  border-color: var(--border-strong);
+  background: var(--surface);
 }
 
 #g-drawer .g-card-section-grid {

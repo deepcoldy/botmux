@@ -2337,6 +2337,14 @@ export interface BotConfig {
    */
   writableTerminalLinkInCard?: boolean;
   /**
+   * Opt-in (default off): when a Codex / TRAE session sets a native goal, post
+   * one goal status card in the conversation and update it in place (status,
+   * animation, CLI-counted elapsed time). Off means no card, no refresh timer
+   * and no goal-store polling in the worker. The worker side is read when a
+   * worker process starts; the daemon side is read live.
+   */
+  goalStatusCard?: boolean;
+  /**
    * When true, `/card` sends a **private** static snapshot card via the ephemeral
    * API, visible only to the bot's `allowedUsers` (owner / co-owners), instead of
    * the group-visible live streaming card. Talk-only grants (globalGrants /
@@ -4569,6 +4577,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
+      goalStatusCard: entry.goalStatusCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

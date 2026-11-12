@@ -53,12 +53,14 @@ export interface GroupChat {
 
 export type ProjectProgressCardTemplateId = 'status-dashboard' | 'compact-list';
 export type ProjectProgressCardSectionId = 'goal' | 'blockers' | 'workstreams' | 'milestones';
+export type ProjectProgressCardCompletedDisplay = 'all' | 'collapsed' | 'recent';
 
 export interface ProjectProgressCardConfig {
   schemaVersion: 1;
   templateId: ProjectProgressCardTemplateId;
   sections: ProjectProgressCardSectionId[];
   milestonesExpanded: boolean;
+  completedDisplay?: ProjectProgressCardCompletedDisplay;
 }
 
 export function defaultProjectProgressCardConfig(): ProjectProgressCardConfig {
