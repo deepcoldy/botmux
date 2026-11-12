@@ -4454,7 +4454,8 @@ export async function noteTurnReceived(
       await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
     }
   }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId,
+    ...(_turnId && _turnId !== triggerMessageId ? { turnId: _turnId } : {}) });
 }
 
 /**
