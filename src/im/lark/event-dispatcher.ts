@@ -77,6 +77,14 @@ import {
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import {
+  acquireReverifySlot,
+  contentHasMentionPlaceholder,
+  mentionPlaceholdersSettled,
+  mentionReverifyEnabled,
+  parseReverifyDelaysMs,
+  releaseReverifySlot,
+} from './mention-reverify.js';
 import { ingestGroupContextEvent, ingestGroupContextRecall, isGroupContextEnabled } from '../../services/group-context-ingest.js';
 import { hasTriggeredMessage, markMessageTriggered, _resetCacheForTest as _resetTriggeredMessagesForTest } from '../../services/triggered-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
@@ -6490,6 +6498,9 @@ export function createLarkEventDispatcherRuntime(
             });
             if (!autoTopic) {
               logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
+              // mention 晚落定补偿（测试版）：正文带 @ 占位符却被 @ 闸忽略时，
+              // 延迟权威回读重判再决定是否补派发——见 mention-reverify.ts 头注。
+              scheduleMentionReverify({ larkAppId, messageId, chatId, message, source: 'receive-ignore' });
               return;
             }
             logger.info(`[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工 msg=${messageId.substring(0, 12)}`);
@@ -6786,6 +6797,15 @@ export function createLarkEventDispatcherRuntime(
       await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
       if (!isBotMentioned(larkAppId, data.message, undefined)) {
         logger.debug(`[message-updated:${larkAppId}] edited message does not mention us, ignoring msg=${messageId.substring(0, 12)}`);
+        // 单次回读同样可能赶在 mention 落定之前（「两路都漏」的窗口）：排期有界
+        // 补偿，覆盖编辑救援路径的读回竞态。见 mention-reverify.ts 头注。
+        scheduleMentionReverify({
+          larkAppId,
+          messageId,
+          chatId: typeof data.message?.chat_id === 'string' ? data.message.chat_id : undefined,
+          message: data.message,
+          source: 'edit-unresolved',
+        });
         return;
       }
 
@@ -6827,6 +6847,174 @@ export function createLarkEventDispatcherRuntime(
       logger.error(`Error handling message updated event: ${err}`);
       if (primary) throw err;
     }
+  }
+
+  /**
+   * mention 晚落定补偿（测试版；纯逻辑与登记表见 mention-reverify.ts 头注）。
+   *
+   * 触发条件：一条人类群消息带 @ 占位符（contentHasMentionPlaceholder），却在
+   * receive 路径的 pre-admission @ 闸被忽略（快照 mentions[] 还没落定），或在
+   * 编辑补 @ 救援路径的单次权威回读里仍无本 bot mention（回读赶在落定之前）。
+   *
+   * 行为：按有界延迟序列（默认 2.5s/7s/16s，env 可调）用 im.message.get 权威
+   * 回读重判；落定为 @ 本 bot 且从未触发过任务 → 走与编辑补 @ **完全相同**的
+   * processMessageEvent 复入链路补派发——权限/@ 闸、mention 策略、路由、会话
+   * 派发全部照常重跑。幂等不新增持久化：triggered-store + pendingMessageTriggers
+   * 照旧把关；seen-store 的 claim 不会重复发生（补偿不走 WS 投递层）。
+   * 落定为「@ 的是别人」→ 静默放弃（正常让路）；回读一直无 mention / 失败 →
+   * 按次重试，耗尽后 WARN（这是本缺陷此前完全不可见的观测面）。
+   * 快照里的 @ 已经全部落定（即 @ 的是别人）时不排期：占位符落定后仍留在正文里，
+   * 否则群里每条 @ 别人的消息都会让每个没被 @ 的 bot 白白回读一次。
+   */
+  let mentionReverifyDelays: number[] | undefined;
+  let mentionReverifyCapacityWarned = false;
+  const mentionReverifyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function scheduleMentionReverify(input: {
+    larkAppId: string;
+    messageId: string;
+    chatId: string | undefined;
+    message: any;
+    source: 'receive-ignore' | 'edit-unresolved';
+  }): void {
+    const { larkAppId, messageId, chatId, message, source } = input;
+    try {
+      if (!mentionReverifyEnabled()) return;
+      // durable-primary 模式下补偿必须走 primary 入站（canonical admission / 所有权
+      // 检查 / 持久输出都在那条链上）。本测试版不支持，直接关闭，绝不绕过
+      // primary 派发（独立复核 P1）。默认部署未启用 primary，不受影响。
+      if (runtimeOptions.enqueuePrimary) return;
+      if (!messageId || !chatId) return;
+      if (message?.chat_type === 'p2p') return;
+      if (!contentHasMentionPlaceholder(message)) return;
+      // 快照里的 @ 已全部落定且没有本 bot（调用方已判定未 @ 我们）= @ 的是别人，
+      // 回读只会得出同一结论，不排期。只有仍有未落定的 @ 才值得回读。
+      if (mentionSettledElsewhere(larkAppId, message)) return;
+      if (isMessageTriggerClaimed(larkAppId, messageId)) return;
+      const key = messageTriggerKey(larkAppId, messageId);
+      if (mentionReverifyTimers.has(key)) return;
+      const slot = acquireReverifySlot(key);
+      if (slot !== 'ok') {
+        if (slot === 'capacity-full' && !mentionReverifyCapacityWarned) {
+          mentionReverifyCapacityWarned = true;
+          logger.warn(`[mention-reverify:${larkAppId}] pending 容量已满，跳过补偿 msg=${messageId.substring(0, 12)}`);
+        }
+        return;
+      }
+      mentionReverifyDelays ??= parseReverifyDelaysMs(process.env.BOTMUX_MENTION_REVERIFY_DELAYS_MS);
+      const delays = mentionReverifyDelays;
+      const chatIdForLog = chatId;
+      const attempt = (idx: number): void => {
+        const wait = idx === 0 ? delays[0] : delays[idx] - delays[idx - 1];
+        const timer = setTimeout(() => {
+          mentionReverifyTimers.delete(key);
+          void (async () => {
+            const outcome = await runMentionReverifyReadback({ larkAppId, messageId, chatId: chatIdForLog, source });
+            if (outcome !== 'retry') {
+              releaseReverifySlot(key);
+              return;
+            }
+            if (idx + 1 < delays.length) {
+              // 整条重试梯持续占用同一个 pending 名额：容量统计与 busy 保护
+              // 都覆盖到序列终结为止（独立复核 P2）。
+              attempt(idx + 1);
+              return;
+            }
+            logger.warn(
+              `[mention-reverify:${larkAppId}] @ 占位符存在但 ${delays.length} 次权威回读仍未见本 bot mention，放弃 ` +
+              `chat=${chatIdForLog.substring(0, 12)} msg=${messageId.substring(0, 12)} source=${source}`,
+            );
+            releaseReverifySlot(key);
+          })().catch(err => {
+            logger.warn(
+              `[mention-reverify:${larkAppId}] 补偿执行异常 msg=${messageId.substring(0, 12)}: `
+              + `${err instanceof Error ? err.message : err}`,
+            );
+            releaseReverifySlot(key);
+          });
+        }, wait);
+        timer.unref?.();
+        mentionReverifyTimers.set(key, timer);
+      };
+      attempt(0);
+      logger.debug(
+        `[mention-reverify:${larkAppId}] 已排期补偿 chat=${chatId.substring(0, 12)} ` +
+        `msg=${messageId.substring(0, 12)} source=${source}`,
+      );
+    } catch (err) {
+      logger.warn(
+        `[mention-reverify:${larkAppId}] 排期失败 msg=${String(messageId).substring(0, 12)}: `
+        + `${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
+  /** 调用方已确认没 @ 本 bot 时，能否断定「@ 都已落定且指向别人」。本 bot open_id
+   * 还没探明时无从排除自己，按未落定处理（继续排期 / 重试，回读前会再探一次）。 */
+  function mentionSettledElsewhere(larkAppId: string, message: any): boolean {
+    return !!getBot(larkAppId).botOpenId && mentionPlaceholdersSettled(message);
+  }
+
+  async function runMentionReverifyReadback(input: {
+    larkAppId: string;
+    messageId: string;
+    chatId: string;
+    source: string;
+  }): Promise<'dispatched' | 'claimed' | 'elsewhere' | 'retry'> {
+    const { larkAppId, messageId, chatId, source } = input;
+    let readback: any;
+    try {
+      readback = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
+    } catch (err) {
+      logger.debug(
+        `[mention-reverify:${larkAppId}] 回读失败（稍后重试） msg=${messageId.substring(0, 12)}: `
+        + `${err instanceof Error ? err.message : err}`,
+      );
+      return 'retry';
+    }
+    const current = readback?.items?.[0] ?? readback?.message;
+    if (!current) {
+      logger.debug(`[mention-reverify:${larkAppId}] 回读无消息（稍后重试） msg=${messageId.substring(0, 12)}`);
+      return 'retry';
+    }
+    // 与编辑补 @ 同构的 REST → receive 形态归一化；群上下文在原消息入站时已采集，
+    // 标记已处理避免复入链路重复采集。
+    const data = larkReceiveEventFromHistoryMessage(current, current.chat_id ?? chatId);
+    if (typeof current.body?.content === 'string') {
+      data.message.content = unwrapEditedTextContent(current.body.content);
+    }
+    data.__groupContextHandled = true;
+    await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+    if (!isBotMentioned(larkAppId, data.message, undefined)) {
+      if (mentionSettledElsewhere(larkAppId, data.message)) {
+        logger.debug(
+          `[mention-reverify:${larkAppId}] @ 已落定且不含本 bot（指向他人、@ 已删或消息已撤回），放弃 ` +
+          `msg=${messageId.substring(0, 12)}`,
+        );
+        return 'elsewhere';
+      }
+      return 'retry';
+    }
+    if (isMessageTriggerClaimed(larkAppId, messageId)) return 'claimed';
+    logger.info(
+      `[mention-reverify:${larkAppId}] mention 晚落定，补派发 chat=${chatId.substring(0, 12)} ` +
+      `msg=${messageId.substring(0, 12)} source=${source}`,
+    );
+    // 与编辑补 @ 同款的两步派发前修正（独立复核 P2）：REST 条目不带 chat_type
+    //（归一化默认 'group'），派发前补判 p2p，保证私聊走对权限/路由分支；REST 行
+    // 只有 open_id，补 union_id 供团队/授权闸（canTalk）使用，否则仅靠团队身份
+    // 授权的发送者会被误判无权限。
+    if (data.message.chat_type !== 'p2p' && data.message.chat_id) {
+      const mode = await getChatMode(larkAppId, data.message.chat_id);
+      if (mode === 'p2p') data.message.chat_type = 'p2p';
+    }
+    const senderOpenId = data.sender?.sender_id?.open_id;
+    if (senderOpenId) {
+      const unionId = await resolveUnionIdFromOpenId(larkAppId, senderOpenId);
+      if (unionId) data.sender.sender_id.union_id = unionId;
+    }
+    await processMessageEvent(data);
+    return 'dispatched';
   }
 
   interface PrimaryRecoveryState {

@@ -2148,7 +2148,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return handleOncallFormAction(data, larkAppId);
   }
 
-  if ((value?.action === 'oncall_group_create' || value?.action === 'oncall_group_forward') && larkAppId) {
+  if ((value?.action === 'oncall_group_create' || value?.action === 'oncall_group_forward' || value?.action === 'oncall_group_join') && larkAppId) {
     const { handleOncallGroupAction } = await import('./oncall-group.js');
     return handleOncallGroupAction(data, larkAppId);
   }

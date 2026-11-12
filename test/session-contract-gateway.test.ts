@@ -44,6 +44,66 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  // The worker's input-queue report describes the worker's own queue: a
+  // callback started under a runtime that was re-bound in process since then
+  // still reports the live queue, and it is reported only when it changes.
+  // A semantic rebind moves the live CLI to a new runtime while a turn runs;
+  // that turn keeps reporting under the runtime it was submitted on.
+  it('takes a working frame of the turn running across an in-process rebind as the live runtime\'s, but not one from a respawned CLI', () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_running_turn');
+    expect(s.controller.ingest({ type: 'turn_execution_started', turnId: 'om_running_turn', sessionContract: s.context(1, { runtime: s.runtime, execution }) }, s.worker))
+      .toMatchObject({ kind: 'current' });
+    const rebound = s.controller.reserveBinding('binding-rebound', s.worker);
+    s.controller.bindRuntime('binding-rebound', s.worker,
+      { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native1', proof: 'process_start' }, undefined, 'binding-old');
+    expect(s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(2, { runtime: rebound }) }, s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.store.runtime(s.ref, rebound.runtimeId)?.promptReady).toBe(true);
+
+    const frame = (sequence: number) => ({ type: 'screen_update', status: 'working', content: '', turnId: 'om_running_turn',
+      sessionContract: s.context(sequence, { runtime: s.runtime, execution }) });
+    expect(s.controller.ingest(frame(3), s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.store.runtime(s.ref, rebound.runtimeId)?.promptReady).toBe(false);
+    // The turn's own prompt edge, still under the runtime it was submitted on.
+    expect(s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(5, { runtime: s.runtime, execution }) }, s.worker))
+      .toMatchObject({ kind: 'current' });
+    expect(s.store.runtime(s.ref, rebound.runtimeId)?.promptReady).toBe(true);
+    // Frames of one CLI are ordered as one stream, whichever binding they carry:
+    // an older frame arriving late does not undo a newer prompt edge.
+    expect(s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(7, { runtime: rebound }) }, s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest(frame(6), s.worker)).toMatchObject({ kind: 'reject', reason: 'stale_observation_sequence' });
+    expect(s.store.runtime(s.ref, rebound.runtimeId)?.promptReady).toBe(true);
+
+    // A new physical CLI is not a continuation of the old one (the gateway
+    // refuses the old runtime's frames once it is no longer continued).
+    const respawned = s.controller.reserveBinding('binding-respawned', s.worker);
+    s.controller.bindRuntime('binding-respawned', s.worker, { backend: 'tmux', physicalId: '333:start3', proof: 'process_start' });
+    expect(s.controller.currentRuntime()).toEqual(respawned);
+    expect(s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(8, { runtime: respawned }) }, s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest(frame(9), s.worker)).toMatchObject({ kind: 'reject' });
+    expect(s.store.runtime(s.ref, respawned.runtimeId)?.promptReady).toBe(true);
+  });
+  it('admits the current worker\'s input-queue report whichever binding its callback was started under', () => {
+    const s = fixture();
+    const workerScope = new WorkerSessionEventScope(s.ref, s.worker);
+    const spawned = workerScope.beginRuntime(); workerScope.assign(spawned.bindingId, s.runtime);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: workerScope });
+    // The runtime moves to the real CLI behind the launcher.
+    const rebound = s.controller.reserveBinding('binding-rebound', s.worker);
+    s.controller.bindRuntime('binding-rebound', s.worker,
+      { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native1', proof: 'process_start' }, undefined, 'binding-old');
+    expect(s.controller.currentRuntime()).toEqual(rebound);
+    // An observation that still carries the replaced runtime is refused.
+    const screen = workerScope.run(spawned, () => metadata({ type: 'screen_update', status: 'idle', content: '' }));
+    expect(s.controller.ingest(screen, s.worker)).toMatchObject({ kind: 'reject' });
+
+    const report = workerScope.run(spawned, () => metadata({ type: 'cli_input_backlog', pending: false }));
+    expect(report.sessionContract.scope.runtime).toBeUndefined();
+    expect(s.controller.ingest(report, s.worker)).toMatchObject({ kind: 'worker' });
+    // Still only from this worker.
+    const forged = { ...report, sessionContract: { ...report.sessionContract, producer: { workerId: 'retired-worker', generation: 0 } } };
+    expect(s.controller.ingest(forged, s.worker)).toMatchObject({ kind: 'reject' });
+  });
   it.each([
     { turnId: undefined, retry: false },
     { turnId: 'om_initial_capture', retry: false },
