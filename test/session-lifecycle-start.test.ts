@@ -280,6 +280,9 @@ import {
   suspendWorker,
   currentGatewayCallerOpenId,
   __testOnly_setSuspendBackingVerifier,
+  __testOnly_resetTurnTerminalReportingClis,
+  manualSuspendWaits,
+  queueManualSuspend,
 } from '../src/core/worker-pool.js';
 import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
@@ -10492,5 +10495,90 @@ describe('settledTurnTerminals on worker init', () => {
     } as any;
     expect(forkWorker(matching, 'hello', 'om_same_turn')).toBe(true);
     expect(initOf()?.settledTurnTerminals).toBeUndefined();
+  });
+});
+
+// `botmux suspend` while a re-forked worker starts on the message that woke
+// the session: the previous worker crashed while idle, so that idle is still
+// on the session. The opening input of a CLI that takes it on its command line
+// is committed without ever being queued, so no backlog report precedes the
+// commit. The suspend must wait for the new CLI's own idle, not cut the turn
+// off right at the commit on the old idle.
+describe('a suspend queued while a re-forked worker takes its opening input', () => {
+  const ticks = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+  it('waits for the new CLI to go idle after its first turn, not the previous worker\'s idle', async () => {
+    __testOnly_resetTurnTerminalReportingClis();
+    const ds = makeDs();
+    expect(forkWorker(ds, 'first', 'om_first')).toBe(true);
+    const first = forkMock.mock.results.at(-1)!.value;
+    first.emit('message', { type: 'worker_ipc_ready' });
+    first.emit('message', { type: 'turn_input_received', turnId: 'om_first' });
+    first.emit('message', { type: 'turn_input_committed', turnId: 'om_first' });
+    first.emit('message', { type: 'ready', port: 0, token: 'tok' });
+    first.emit('message', { type: 'prompt_ready' });
+    first.emit('message', { type: 'screen_update', status: 'idle', content: '' });
+    await ticks();
+    first.emit('exit', 1, null);
+    await ticks();
+    expect(ds.lastScreenStatus).toBe('idle');
+
+    expect(forkWorker(ds, 'wake me', 'om_wake')).toBe(true);
+    const next = forkMock.mock.results.at(-1)!.value;
+    next.emit('message', { type: 'worker_ipc_ready' });
+    const waits = manualSuspendWaits(ds);
+    expect(waits.waitingFor).toEqual(['input']);
+    queueManualSuspend(ds, waits);
+    next.emit('message', { type: 'turn_input_received', turnId: 'om_wake' });
+    next.emit('message', { type: 'ready', port: 0, token: 'tok2' });
+    next.emit('message', { type: 'turn_input_committed', turnId: 'om_wake' });
+    await ticks();
+    expect(ds.worker).toBe(next);
+
+    next.emit('message', { type: 'screen_update', status: 'working', content: '' });
+    await ticks();
+    expect(ds.worker).toBe(next);
+    next.emit('message', { type: 'prompt_ready' });
+    next.emit('message', { type: 'screen_update', status: 'idle', content: '' });
+    await ticks();
+    expect(ds.worker).toBeNull();
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  // A follow-up the new worker refuses before it has reported a screen status
+  // of its own: its CLI may already show a prompt, but the status on the
+  // session is still the previous worker's idle, so the claim is not
+  // re-checked against it.
+  it('keeps the claim when a follow-up fails before the new worker has reported its screen', async () => {
+    __testOnly_resetTurnTerminalReportingClis();
+    const ds = makeDs();
+    expect(forkWorker(ds, 'first', 'om_first')).toBe(true);
+    const first = forkMock.mock.results.at(-1)!.value;
+    first.emit('message', { type: 'worker_ipc_ready' });
+    first.emit('message', { type: 'turn_input_committed', turnId: 'om_first' });
+    first.emit('message', { type: 'ready', port: 0, token: 'tok' });
+    first.emit('message', { type: 'prompt_ready' });
+    first.emit('message', { type: 'screen_update', status: 'idle', content: '' });
+    await ticks();
+    first.emit('exit', 1, null);
+    await ticks();
+
+    expect(forkWorker(ds, 'wake me', 'om_wake')).toBe(true);
+    const next = forkMock.mock.results.at(-1)!.value;
+    next.emit('message', { type: 'worker_ipc_ready' });
+    next.emit('message', { type: 'ready', port: 0, token: 'tok2' });
+    next.emit('message', { type: 'turn_input_committed', turnId: 'om_wake' });
+    next.emit('message', { type: 'prompt_ready' });
+    await ticks();
+    expect(ds.cliReady).toBe(true);
+    expect(sendWorkerInput(ds, 'one more thing', 'om_more')).toBe(true);
+    queueManualSuspend(ds, manualSuspendWaits(ds));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      next.emit('message', { type: 'turn_input_rejected', turnId: 'om_more', reason: 'busy', rejectedBeforeAdmission: true });
+      await ticks();
+    }
+    expect(next.send.mock.calls.filter(([message]: [any]) => message?.type === 'message' && message.turnId === 'om_more')).toHaveLength(2);
+    expect(ds.worker).toBe(next);
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
   });
 });

@@ -2064,9 +2064,22 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
   if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
-  // Queue observations span turns, including admissions not yet bound to the
-  // runtime. An unaccepted input must not invalidate its own backlog report.
-  if (msg.type === 'cli_input_backlog') delete context.scope.execution;
+  // Queue observations belong to this worker process, not to a turn or a
+  // runtime: they span turns (including admissions not yet bound to the
+  // runtime) and runtimes too. Whatever callback publishes one, it reports the
+  // queue as it is now, so it must not carry the binding that callback was
+  // started under: once the runtime is re-bound (the relay resolved the real
+  // CLI behind its launcher, then the native session id arrived), a report
+  // from the write that began before it would be dropped as a stale runtime's
+  // event. A backlog is reported only when it changes, so the daemon would keep
+  // the previous report — "the CLI has not taken its input" — for good. The
+  // producer is still this worker; the gateway admits it as a worker event.
+  if (msg.type === 'cli_input_backlog') {
+    delete context.scope.execution;
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
