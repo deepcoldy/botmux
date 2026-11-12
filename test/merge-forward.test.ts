@@ -18,6 +18,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 import { expandMergeForward } from '../src/im/lark/merge-forward.js';
+import { createImgNumberer } from '../src/im/lark/message-parser.js';
 import type { LarkMessage } from '../src/types.js';
 
 function fakeParsed(messageId = 'om_root'): LarkMessage {
@@ -113,6 +114,34 @@ describe('expandMergeForward: nested merge_forward', () => {
 
 describe('expandMergeForward: resources', () => {
   beforeEach(() => getMessageDetailMock.mockReset());
+
+  it.each([false, true])('preserves attachment numbering and typed keys (preexisting=%s)', async preexisting => {
+    const numberer = createImgNumberer();
+    if (preexisting) numberer.assign('image:shared');
+    getMessageDetailMock.mockResolvedValueOnce({
+      items: [
+        ...['om_first', 'om_second'].map(message_id => ({ message_id, upper_message_id: 'om_root',
+          msg_type: 'image', body: { content: JSON.stringify({ image_key: 'shared' }) } })),
+        { message_id: 'om_file', upper_message_id: 'om_root', msg_type: 'file',
+          body: { content: JSON.stringify({ file_key: 'shared', file_name: 'report.pdf' }) } },
+        { message_id: 'om_next', upper_message_id: 'om_root', msg_type: 'image',
+          body: { content: JSON.stringify({ image_key: 'next' }) } },
+      ],
+    });
+
+    const parsed = fakeParsed();
+    const { extraResources } = await expandMergeForward('app_test', 'om_root', parsed, numberer);
+
+    expect(extraResources).toEqual([
+      ...(preexisting ? [] : [{ type: 'image', key: 'shared', name: 'shared.jpg',
+        fallbackMessageIds: ['om_first', 'om_second'] }]),
+      { type: 'file', key: 'shared', name: 'report.pdf', fallbackMessageIds: ['om_file'] },
+      { type: 'image', key: 'next', name: 'next.jpg', fallbackMessageIds: ['om_next'] },
+    ]);
+    expect(parsed.content.match(/\[图片 1\]/g)).toHaveLength(2);
+    expect(parsed.content.match(/\[图片 2\]/g)).toHaveLength(1);
+    expect(parsed.content).toContain('[文件 1: report.pdf]');
+  });
 
   it('collects image/file resources from sub-messages', async () => {
     getMessageDetailMock.mockResolvedValueOnce({

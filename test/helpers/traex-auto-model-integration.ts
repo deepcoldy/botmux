@@ -20,6 +20,7 @@ import { SessionController } from '../../src/core/session-controller.js';
 import { SessionContractStore } from '../../src/services/session-contract-store.js';
 import { sameWorker } from '../../src/services/session-contract.js';
 import { loadWorkerPoolClosure } from './worker-pool-function-harness.js';
+import { retireWorkerIpc } from './worker-ipc-teardown.js';
 import type { DaemonSession } from '../../src/core/types.js';
 import { messages as zhMessages } from '../../src/i18n/zh.js';
 const interruptedTurn = { turnOpen: true, tasks: [] };
@@ -55,6 +56,9 @@ export const contractEvents: Promise<unknown>[] = [];
 export function useTraexAutoModelIntegrationCleanup(): void {
   afterEach(async () => {
     for (const child of children.splice(0)) {
+      // Host replies to messages the worker sent just before the kill may
+      // still be in flight (contractEvents are awaited below).
+      retireWorkerIpc(child);
       if (child.exitCode === null && child.signalCode === null) {
         const stopped = new Promise(resolveExit => child.once('exit', resolveExit));
         child.kill('SIGKILL');

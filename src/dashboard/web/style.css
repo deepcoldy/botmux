@@ -2652,13 +2652,15 @@ button.primary {
 }
 
 /* 休眠会话不上看板时的一行提示，放在看板下方。 */
-.sessions-dormant-hint {
+.sessions-dormant-hint,
+.sessions-history-pagination {
   margin: 10px 2px 0;
   color: var(--muted);
   font-size: 12px;
 }
 
-.sessions-dormant-hint button {
+.sessions-dormant-hint button,
+.sessions-history-pagination button {
   margin-left: 6px;
   padding: 0;
   border: 0;
@@ -2668,8 +2670,14 @@ button.primary {
   cursor: pointer;
 }
 
-.sessions-dormant-hint button:hover {
+.sessions-dormant-hint button:hover,
+.sessions-history-pagination button:hover:not(:disabled) {
   text-decoration: underline;
+}
+
+.sessions-history-pagination button:disabled {
+  color: var(--muted);
+  cursor: default;
 }
 
 .kanban-card {

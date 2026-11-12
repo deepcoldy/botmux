@@ -4,6 +4,12 @@ export const SESSION_EVENT_PROTOCOL_VERSION = 2 as const;
 /** New worker boots always negotiate this contract. Legacy output recovery is
  * independent of executor admission; it cannot disable the state authority. */
 export function sessionContractsEnabled(): boolean { return true; }
+/** The host computes historical execution observer grants only for a persistent
+ * Codex tmux CLI. The worker may wait for such a grant only under the same
+ * predicate; every other CLI/backend keeps the ordinary admission path. */
+export function executionObserverSupported(cliId: unknown, backend: unknown): boolean {
+  return cliId === 'codex' && backend === 'tmux';
+}
 export function contractTerminalStatus(status: unknown, errorCode: unknown): 'succeeded' | 'failed' | 'cancelled' | 'reconciling' {
   if (typeof errorCode === 'string' && (errorCode === 'rpc_turn_aborted'
     || errorCode === 'codex_turn_aborted' || errorCode.startsWith('codex_turn_aborted_')

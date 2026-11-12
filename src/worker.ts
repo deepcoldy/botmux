@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { contractTerminalStatus, sameExecution, sameRuntime, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity, type ExecutionRef,
+import { contractTerminalStatus, executionObserverSupported, sameExecution, sameRuntime, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity, type ExecutionRef,
   type RuntimeExecutionContinuation, type RuntimeExecutionContinuationFailure } from './services/session-contract.js';
+import { RestoredObserverGrantWait } from './services/restored-observer-grant-wait.js';
 import {
   awaitRuntimeReservation,
   RUNTIME_RESERVATION_DEADLINE_MS,
@@ -14638,8 +14639,32 @@ function drainReliableTerminalBeforeInterrupt(): void {
   }
 }
 
+/** Restored structured turns waiting for the host's historical observer grant. */
+const restoredObserverGrantWait = new RestoredObserverGrantWait();
+
 function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
-  const ready = settledQuotaTurns ?? codexBridgeQueue.drainEmittable().filter(turn => !recoverTraexQuotaTurn(turn));
+  let ready = settledQuotaTurns ?? codexBridgeQueue.drainEmittable().filter(turn => !recoverTraexQuotaTurn(turn));
+  if (workerSessionEventScope) {
+    const scope = workerSessionEventScope;
+    // A stale journal can contain an already-settled predecessor that cannot
+    // receive an observer grant. Retire only that proven, unowned attempt;
+    // owned output retries and unresolved executions keep their delivery path.
+    ready = ready.filter(turn => scope.provesExecutionEvent(turn.turnId, turn.dispatchAttempt)
+      || !scope.isExecutionSettled(turn.turnId, turn.dispatchAttempt));
+    // Restored transcript terminals can precede the host's observer grant.
+    // Keep them queued only while that grant can still arrive; the FIFO queue
+    // holds every successor behind them. Afterwards an ungranted turn returns
+    // to ordinary admission, which refuses its cross-runtime terminal.
+    const unproven = ready.filter(turn => !scope.provesExecutionEvent(turn.turnId, turn.dispatchAttempt));
+    if (unproven.length > 0) {
+      if (restoredObserverGrantWait.hold(scope.currentBinding()?.bindingId,
+        executionObserverSupported(lastInitConfig?.cliId, effectiveBackendType), () => codexBridgeDrainAndMaybeEmit())) {
+        codexBridgeQueue.restoreDrained(ready);
+        return;
+      }
+      log(`Restored structured turn(s) ${unproven.map(turn => turn.turnId.substring(0, 8)).join(',')} have no observer grant; returning them to ordinary admission`);
+    }
+  }
   if (!universalOutputHandoff) { checkpointCodexAdoptRecovery(); checkpointStructuredBridgeRecovery(); }
   if (ready.length === 0) return;
   if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
@@ -29042,17 +29067,15 @@ async function spawnCliBody(
   if (cliPid) observeAntigravityCliSessionId(cliPid);
   observeZcodeCliSessionId();
 
-  // File sandbox / Linux credential-only bwrap launches `bwrap --unshare-pid --
-  // traex`; Forge x TraeX launches `forge run --agent traex`. In both shapes the
-  // pane leaf (getChildPid) is a launcher, not the process that holds the TRAE
-  // rollout fd, so the ownership gate cannot admit the id until backend.cliPid is
-  // rewired to the real traex descendant. Bounded retry (not one-shot): the
-  // launcher may not have forked traex yet at spawn. Reuses
-  // scheduleWrapperRealCliPid's stale-backend guard so a mid-retry worker restart
-  // can't rewire the new session.
+  // Any managed TRAE command may be a persistent launcher (including an
+  // ordinary Node wrapper supplied through cliPathOverride), not the process
+  // holding the rollout fd. Discover within this spawn's process tree, just as
+  // for Codex below, rather than limiting ownership resolution to bwrap/Forge.
+  // Native TRAE roots are kept by the resolver and retry's direct-leaf guard:
+  // descending them could otherwise bind a deeper TRAE subagent.
   const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;
   lastSpawnOuterBwrapActive = outerBwrapActive;
-  const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
+  const traexLauncherActive = cfg.cliId === 'traex';
   lastSpawnTraexLauncherActive = traexLauncherActive;
   // A standard npm-installed Codex starts as a Node launcher which then forks
   // the native `codex` binary.  Treat every managed Codex spawn as potentially
@@ -29077,7 +29100,14 @@ async function spawnCliBody(
     const generation = cliSpawnGeneration;
     scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
-      getChildPid: () => backend?.getChildPid?.(),
+      // The captured spawn root, not backend.getChildPid() (same reasoning as
+      // the Codex resolver below): Herdr/ZMX alias that accessor to the mutable
+      // cliPid, which a launch-payload binding (owned scope / relay) has
+      // already moved off this root before the first tick. The same-pid arm
+      // would then end discovery for good, stranding a launcher whose TRAE
+      // leaf forks later. Backend identity still fences a replaced runtime;
+      // the generation fences a restart that keeps the same backend object.
+      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
       applyRealPid: (realPid) => {
         if (generation !== cliSpawnGeneration) {
           log(`TRAE launcher: ignoring stale leaf pid ${realPid} from spawn ${generation} (current ${cliSpawnGeneration})`);
@@ -29164,6 +29194,12 @@ async function spawnCliBody(
         : ownershipPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    if (cfg.cliId === 'traex' && wiredPid !== ownershipPid) {
+      // Publish the synchronous ownership correction together with the
+      // binding: bridgeCliPid and the attestation must not keep naming the
+      // launcher until the retry's first tick.
+      applyResolvedCliPid(wiredPid, 'TRAE ownership', ownershipPid);
+    }
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
     if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(cliPid);
   }
@@ -29177,8 +29213,12 @@ async function spawnCliBody(
   // output) until the pid appears, then write the marker + wire claude-family pid.
   if (!cliPid) {
     let attempts = 0;
+    const latePidBackend = backend;
+    const latePidGeneration = cliSpawnGeneration;
     const resolveCliPidLate = () => {
       if (!backend) return;
+      if (cfg.cliId === 'traex'
+        && (backend !== latePidBackend || cliSpawnGeneration !== latePidGeneration)) return;
       const pid = backend.getChildPid?.();
       if (pid) {
         publishLocalProcessAttestation(pid);
@@ -29201,6 +29241,9 @@ async function spawnCliBody(
               : ownershipPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          if (cfg.cliId === 'traex' && wiredPid !== ownershipPid) {
+            applyResolvedCliPid(wiredPid, 'TRAE ownership', ownershipPid);
+          }
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
           if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }
@@ -35248,6 +35291,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
         if (!closeUnderWay) armRetiredRuntimeExit(msg.bindingId);
       } else if (continuation) void flushPending();
+      // The host decided which restored executions this binding may observe;
+      // release the ones it did not grant instead of waiting for the deadline.
+      const observerDecided = msg.observerDecision === true && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)
+        && restoredObserverGrantWait.decide(msg.bindingId);
+      if (msg.mayExecute && (msg.observedExecutions?.length || observerDecided)) codexBridgeDrainAndMaybeEmit();
       break;
     }
 
