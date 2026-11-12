@@ -119,6 +119,7 @@ export async function renewExpiringBytedcliIdentities(
         ...(jwts.regionalCloudJwts || entry.identity.regionalCloudJwts
           ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, ...jwts.regionalCloudJwts } }
           : {}),
+        ...(entry.identity.regionalCloudJwtSource ? { regionalCloudJwtSource: entry.identity.regionalCloudJwtSource } : {}),
         turnId: entry.identity.turnId,
         ...(entry.identity.openId ? { openId: entry.identity.openId } : {}),
       };

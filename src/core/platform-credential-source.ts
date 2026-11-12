@@ -17,6 +17,9 @@ import {
   requestCredentialGrant,
   platformCredentialsUrl,
   describeCredentialGrantFailure,
+  BYTEDCLI_REGIONAL_GRANT_VARIABLES,
+  type BytedcliGrantRegion,
+  type CredentialGrant,
   type CredentialGrantResult,
   type CredentialGrantRequest,
 } from '../platform/credential-grant-client.js';
@@ -24,7 +27,7 @@ import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
-import type { LarkCliIdentity, BytedCliIdentity } from './cli-identity.js';
+import type { LarkCliIdentity, BytedCliIdentity, BytedcliRegion } from './cli-identity.js';
 
 export type PlatformIdentityResolution =
   | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number }
@@ -178,6 +181,15 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
   return null;
 }
 
+/** The `region` claim of a ByteCloud JWT (read, not verified). */
+function jwtRegionClaim(jwt: string): unknown {
+  try {
+    return JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'))?.region;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Grant variables → identity. The client already enforces the per-tool
  * allow-list, but the identity file is the last stop before a wrapper execs a
@@ -185,8 +197,15 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
  *
  * Note `LARKSUITE_CLI_APP_ID` is the PLATFORM's Feishu app (the issuer of the
  * user token), deliberately not this bot's app id — the two differ by design.
+ *
+ * Regional ByteCloud JWTs come in the same grant as the default one — same
+ * request, same union_id — so they are this turn's sender's as much as it is.
+ * Each must claim the partition it is filed under, as the local mint requires:
+ * one for another partition would only move the failure, so it is dropped and
+ * that partition's calls are refused like any other missing region.
  */
-function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity | null {
+function toIdentity(tool: TriggerUserAuthTool, grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions'>): LarkCliIdentity | BytedCliIdentity | null {
+  const { variables } = grant;
   const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
   if (tool === 'lark-cli') {
     const appId = variables.LARKSUITE_CLI_APP_ID;
@@ -197,7 +216,22 @@ function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>
   const cloudJwt = variables.BYTEDCLI_USER_CLOUD_JWT;
   if (!nonEmpty(cloudJwt)) return null;
   const codeJwt = variables.BYTEDCLI_USER_CODE_JWT;
-  return { tool, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
+  const regionalCloudJwts: Partial<Record<BytedcliRegion, string>> = {};
+  let regionalIssued = false;
+  for (const [region, key] of Object.entries(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as Array<[BytedcliGrantRegion, string]>) {
+    const jwt = variables[key];
+    if (!nonEmpty(jwt)) continue;
+    regionalIssued = true;
+    if (jwtRegionClaim(jwt) === region) regionalCloudJwts[region] = jwt;
+    else logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
+  }
+  return {
+    tool,
+    cloudJwt,
+    ...(nonEmpty(codeJwt) ? { codeJwt } : {}),
+    ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
+    regionalCloudJwtSource: grant.cloudJwtRegions || regionalIssued ? 'platform' : 'platform-legacy',
+  };
 }
 
 /** The platform page a refused person should open (null when unbound). */
@@ -230,7 +264,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
   }, { binding });
 
   if (result.ok) {
-    const identity = toIdentity(args.tool, result.value.variables);
+    const identity = toIdentity(args.tool, result.value);
     if (!identity) {
       logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
       return { state: 'unavailable', detail: 'malformed grant' };

@@ -37,6 +37,13 @@ export interface CredentialGrant {
   variables: Record<string, string>;
   /** Epoch ms after which the variables must not be used. */
   expiresAt: number;
+  /**
+   * bytedcli only: the partitions the platform says it tried to mint (its
+   * answer to {@link CLOUD_JWT_REGIONS_FIELD}). Absent when the platform did not
+   * answer it — one that predates regional tokens — so a region missing from
+   * {@link variables} can be told apart from one the platform could not mint.
+   */
+  cloudJwtRegions?: BytedcliGrantRegion[];
 }
 
 export type CredentialGrantFailure =
@@ -66,6 +73,27 @@ export interface CredentialGrantClientOptions {
   http?: { post: typeof postJson };
 }
 
+/**
+ * ByteCloud JWTs are partition-scoped: the default (cn) one is refused by the
+ * overseas partitions. A bytedcli grant asks for one per partition by naming
+ * them in the request ({@link CLOUD_JWT_REGIONS_FIELD}), and the platform
+ * returns each one it minted under these variable names.
+ *
+ * Asked for, not just accepted: a daemon from before these names rejects the
+ * WHOLE grant when it sees a variable outside its allow-list, so a platform
+ * may only send them to a daemon whose request named the regions.
+ */
+export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
+  i18n: 'BYTEDCLI_USER_CLOUD_JWT_I18N',
+  i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD',
+  tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
+} as const;
+export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
+const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];
+/** Request field naming the partitions a bytedcli grant should cover, and the
+ *  response field in which the platform says which ones it tried. */
+export const CLOUD_JWT_REGIONS_FIELD = 'cloudJwtRegions';
+
 /** Env keys a grant may carry, per tool. Anything else is rejected: the
  *  platform must not be able to inject arbitrary environment into a session. */
 export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readonly string[]; optional: readonly string[] }> = {
@@ -75,7 +103,7 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
   },
   bytedcli: {
     required: ['BYTEDCLI_USER_CLOUD_JWT'],
-    optional: ['BYTEDCLI_USER_CODE_JWT'],
+    optional: ['BYTEDCLI_USER_CODE_JWT', ...Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES)],
   },
 };
 
@@ -239,6 +267,9 @@ async function requestCredentialGrantInner(
     sessionId: req.sessionId,
     ...(req.turnId ? { turnId: req.turnId } : {}),
     machineId: binding.machineId,
+    // A platform that predates regional tokens ignores the field (it reads
+    // only the fields it knows) and answers with the default token alone.
+    ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: BYTEDCLI_GRANT_REGIONS } : {}),
   };
   const totalBudget = opts.totalBudgetMs ?? TOTAL_BUDGET_MS;
   const deadline = Date.now() + totalBudget;
@@ -285,7 +316,18 @@ async function requestCredentialGrantInner(
   const expiresAt = Math.min(rawExpiresAt, now + MAX_GRANT_TTL_MS);
   const variables = pickVariables(req.tool, rec.variables);
   if (typeof variables === 'string') return { ok: false, reason: 'invalid_response', error: variables };
-  return { ok: true, value: { tool: req.tool, unionId: req.unionId, variables, expiresAt } };
+  const cloudJwtRegions = req.tool === 'bytedcli' ? pickRegions(rec[CLOUD_JWT_REGIONS_FIELD]) : undefined;
+  return {
+    ok: true,
+    value: { tool: req.tool, unionId: req.unionId, variables, expiresAt, ...(cloudJwtRegions ? { cloudJwtRegions } : {}) },
+  };
+}
+
+/** The platform's list of partitions it tried. It only words the refusal for a
+ *  missing region, so an unreadable list is dropped, never fatal to the grant. */
+function pickRegions(raw: unknown): BytedcliGrantRegion[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return BYTEDCLI_GRANT_REGIONS.filter(region => raw.includes(region));
 }
 
 /** One-line, secret-free description for logs. */
