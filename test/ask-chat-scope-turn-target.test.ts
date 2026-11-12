@@ -19,6 +19,10 @@ import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
+import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
+import * as sessionControllers from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 // 执行 daemon.ts 里真实的 handleAskRequest，配真实 broker / 显式 ask 回执 / 飞书发卡器，
 // 只把飞书发送接口换成记录器：断言卡片实际发到哪、文字答复能否结算。
@@ -69,7 +73,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     rmSync(dir, { recursive: true, force: true });
   });
 
-  function post(ds: Ds, body: Record<string, unknown>) {
+  function post(ds: Ds, body: Record<string, unknown>, dependencies: Record<string, unknown> = {}) {
     const responses: Array<{ status: number; payload: any }> = [];
     const handler = productionConst('src/daemon.ts', 'handleAskRequest', {
       readJsonBody: async () => body,
@@ -97,10 +101,63 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       frozenReplyContextForTurn,
       activeSessions: new Map([['k', ds]]),
       logger: { info: () => {}, warn: () => {}, debug: () => {} },
+      ...dependencies,
     });
     const done: Promise<void> = handler({}, { destroyed: false, once: () => {}, off: () => {} });
     return { done, responses };
   }
+
+  it.each(['none', 'document lookup', 'before registration', 'waiting for answer'])(
+    'routes a native question with no legacy thread mirror; replaces runtime during %s', async replace => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      const { worker } = controller.bindWorker(1);
+      const bind = (binding: string, physicalId: string) => {
+        controller.reserveBinding(binding, worker);
+        return controller.bindRuntime(binding, worker, { backend: 'tmux', physicalId,
+          proof: 'process_start', nativeSessionId: 'thread-current' });
+      };
+      bind('current', '10:100');
+      const deliveryChecks: boolean[] = [];
+      const { done, responses } = post(ds, askBody(TURN, {
+        originKind: 'native-user-input-async', requestId: 'question-item',
+        asyncUserInput: { threadId: 'thread-current', nativeTurnId: 'native-turn', itemId: 'question-item' },
+      }), {
+        isCodexAppCliId: (id: string) => id === 'codex-app', captureCodexAsyncAskOrigin,
+        asyncAskAudience: () => ({ kind: 'human', answererOpenId: 'ou_user' }),
+        localeForBot: () => 'zh', tr: (key: string) => key, notifyAsyncAsk: vi.fn(),
+        resolveDocumentAskDelivery: async () => {
+          if (replace === 'document lookup') bind('replacement', '11:101');
+          return undefined;
+        },
+        verifiedAskMention: async () => {
+          if (replace === 'before registration') bind('replacement', '11:101');
+          return undefined;
+        },
+        deliverCodexAsyncAnswer: async (_identity: unknown, _questions: unknown, _result: unknown, deps: { isCurrent(): boolean }) => {
+          deliveryChecks.push(deps.isCurrent()); return deps.isCurrent();
+        },
+      });
+      if (replace === 'document lookup' || replace === 'before registration') {
+        await done;
+        expect(sent).toHaveLength(0);
+        expect(responses.at(-1)).toMatchObject({ status: 409 });
+        return;
+      }
+      await vi.waitFor(() => expect(sent).toEqual([{ via: 'send', target: CHAT }]));
+      expect(ds.session.cliSessionId).toBeUndefined();
+      if (replace === 'waiting for answer') bind('replacement', '11:101');
+      const [pending] = listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT });
+      expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
+      await done;
+      expect(deliveryChecks).toEqual([replace === 'none']);
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
 
   /** 等卡片发出，再用 chat-scope 折叠路径的锚点（chatId）以文字作答。 */
   async function cardThenTextAnswer(ds: Ds, body: Record<string, unknown>) {

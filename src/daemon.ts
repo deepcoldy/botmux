@@ -3,6 +3,7 @@ import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { registerSessionContractPrimary } from './core/session-contract-primary.js';
 import { controllerForSession } from './core/session-controller.js';
+import { captureCodexAsyncAskOrigin } from './core/codex-async-ask-origin.js';
 import { sessionContractStore } from './services/session-contract-store.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
@@ -10941,6 +10942,13 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const documentSource = typeof body.originTurnId === 'string'
     ? askSession?.session.docCommentTargets?.[body.originTurnId] : undefined;
   const asyncDocumentTarget = documentSource ? { ...documentSource } : undefined;
+  const asyncInput = boundAsk.asyncUserInput;
+  const asyncAskOriginIsCurrent = asyncInput && askSession
+    && isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
+      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
+    ? captureCodexAsyncAskOrigin(askSession, asyncInput.threadId) : undefined;
+  const isAsyncAskCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
+    && asyncAskOriginIsCurrent?.() === true;
   let documentDelivery: Awaited<ReturnType<typeof resolveDocumentAskDelivery>>;
   const askGeneration = askSession && captureRoutingGeneration(askSession);
   const askWorker = askSession?.worker;
@@ -10963,9 +10971,6 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
     });
   }
-  const asyncInput = boundAsk.asyncUserInput;
-  const asyncWorker = askSession?.worker;
-  const asyncGeneration = askSession?.session.workerGeneration;
   const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
   const audience = asyncInput && askSession
     ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
@@ -10974,10 +10979,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const asyncCaller = audience?.kind === 'human' ? audience.answererOpenId : undefined;
   const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
     ? body.originTurnId : askSession?.session.rootMessageId;
-  if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed
-    || !isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
-      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
-    || askSession.session.cliSessionId !== asyncInput.threadId)) {
+  if (asyncInput && !isAsyncAskCurrent()) {
+    logger.warn(`[ask:${boundAsk.sessionId.slice(0, 8)}] Async question rejected: native thread origin unavailable`);
     if (askSession && audience?.kind !== 'silent') await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
       tr('card.ask.async_unavailable', undefined, localeForBot(askSession.larkAppId)));
     return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
@@ -11035,6 +11038,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     isPeerBot: openId => isKnownPeerBot(config.session.dataDir, boundAsk.larkAppId, openId),
     isHuman: openId => isHumanOpenId(boundAsk.larkAppId, openId),
   });
+  if (asyncInput && !isAsyncAskCurrent()) {
+    return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+  }
   if (requestedMention && !mentionedOpenId) {
     logger.warn(`[ask:${boundAsk.sessionId.slice(0, 8)}] --mention ${requestedMention.slice(0, 12)} is not a human of this app; card sent without the mention`);
   }
@@ -11065,10 +11071,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
-    const isCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
-      && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
-      && askSession.session.workerGeneration === asyncGeneration
-      && askSession.session.cliSessionId === asyncInput.threadId;
+    const isCurrent = isAsyncAskCurrent;
     const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
       isCurrent,
       deliver: async (text, by) => {
