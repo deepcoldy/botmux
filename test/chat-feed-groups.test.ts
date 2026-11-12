@@ -51,6 +51,43 @@ describe('chat feed-group replacement', () => {
     expect(request.mock.calls).toHaveLength(2);
   });
 
+  it('continues cleanup when the exact chat is already absent from a group', async () => {
+    const client = api([{ group_id: 'absent', name: 'Other' }, { group_id: 'present', name: 'pending' }]);
+    client.request.mockImplementation(async (path, body) => {
+      if (body === undefined) return { groups: [{ group_id: 'absent', name: 'Other' }, { group_id: 'present', name: 'pending' }] };
+      if (path.includes('/absent/')) return { failed_items: [{ error_code: 230005, error_message: 'item not in feed group', item: { feed_id: 'oc_current', feed_type: 'chat' } }] };
+      return {};
+    });
+    await expect(replaceChatFeedGroups(client, 'oc_current', null)).resolves.toBeUndefined();
+    expect(client.request.mock.calls.at(-1)?.[0]).toBe('/open-apis/im/v1/groups/present/batch_remove_item');
+  });
+
+  it.each([
+    { error_code: 230004, item: { feed_id: 'oc_current', feed_type: 'chat' } },
+    { error_code: 230005, item: { feed_id: 'oc_other', feed_type: 'chat' } },
+    { error_code: 230005, item: { feed_id: 'oc_current', feed_type: 'doc' } },
+    { error_code: 230005 },
+    null,
+  ])('rejects removal failures that do not prove the requested chat is absent: %j', async (failure) => {
+    const client = api([{ group_id: 'old', name: 'pending' }]);
+    client.request.mockImplementation(async (_path, body) => body === undefined
+      ? { groups: [{ group_id: 'old', name: 'pending' }] }
+      : { failed_items: [failure] });
+    await expect(replaceChatFeedGroups(client, 'oc_current', null)).rejects.toThrow('feed_group_item_failed');
+  });
+
+  it('rejects absence errors on additions and mixed removal failures', async () => {
+    const client = api([{ group_id: 'target', name: 'p0' }]);
+    client.request.mockImplementation(async (_path, body) => body === undefined
+      ? { groups: [{ group_id: 'target', name: 'p0' }] }
+      : { failed_items: [{ error_code: 230005, item: { feed_id: 'oc_current', feed_type: 'chat' } }] });
+    await expect(replaceChatFeedGroups(client, 'oc_current', 'p0')).rejects.toThrow('feed_group_item_failed');
+    client.request.mockImplementation(async (_path, body) => body === undefined
+      ? { groups: [{ group_id: 'old', name: 'pending' }] }
+      : { failed_items: [{ error_code: 230005, item: { feed_id: 'oc_current', feed_type: 'chat' } }, { error_code: 999 }] });
+    await expect(replaceChatFeedGroups(client, 'oc_current', null)).rejects.toThrow('feed_group_item_failed');
+  });
+
   it('reports removal errors so callers cannot claim that all prior labels were cleared', async () => {
     const request = vi.fn(async (path: string, body?: unknown): Promise<Record<string, unknown>> => {
       if (body === undefined) return { groups: [{ group_id: 'old', name: 'pending' }] };

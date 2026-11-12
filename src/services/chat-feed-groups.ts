@@ -39,6 +39,19 @@ async function groups(api: ChatFeedGroupApi): Promise<FeedGroup[]> {
   throw new Error('incomplete_feed_group_directory');
 }
 
+/** Accept removal's already-absent result only for the exact requested chat. */
+function assertItemResult(data: Record<string, unknown>, chatId: string, removing = false): void {
+  if (!Array.isArray(data.failed_items) || data.failed_items.length === 0) return;
+  const alreadyAbsent = removing && data.failed_items.every((failure: unknown) => {
+    if (!failure || typeof failure !== 'object') return false;
+    const entry = failure as Record<string, unknown>;
+    if (entry.error_code !== 230005 || !entry.item || typeof entry.item !== 'object') return false;
+    const item = entry.item as Record<string, unknown>;
+    return item.feed_id === chatId && item.feed_type === 'chat';
+  });
+  if (!alreadyAbsent) throw new Error('feed_group_item_failed');
+}
+
 /** Add the target first, then remove this chat from every other manageable label. */
 export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: string, label: string | null): Promise<void> {
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(chatId) || (label !== null && !LABELS.has(label))) throw new Error('invalid_chat_label');
@@ -51,9 +64,9 @@ export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: strin
     target = created.group_id;
   }
   const item = { items: [{ feed_id: chatId, feed_type: 'chat' }] };
-  if (target) await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(target)}/batch_add_item`, item);
+  if (target) assertItemResult(await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(target)}/batch_add_item`, item), chatId);
   for (const group of directory) {
-    if (group.id !== target) await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(group.id)}/batch_remove_item`, item);
+    if (group.id !== target) assertItemResult(await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(group.id)}/batch_remove_item`, item), chatId, true);
   }
 }
 
@@ -87,7 +100,6 @@ export async function setChatFeedGroup(appId: string, chatId: string, actorOpenI
           const data = envelope.data ?? {};
           if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid_feed_group_response');
           const record = data as Record<string, unknown>;
-          if (Array.isArray(record.failed_items) && record.failed_items.length) throw new Error('feed_group_item_failed');
           return record;
         },
       }, chatId, label);
