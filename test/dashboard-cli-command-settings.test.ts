@@ -70,8 +70,13 @@ describe('command tag input', () => {
     await editor.close();
   });
   it('removes a tag using its button and the last tag using Backspace', async () => {
-    const editor = await tagEditor('/goal /export');
+    const editor = await tagEditor('/goal /export /review');
     await act(async () => editor.renderer.root.findByProps({ 'data-remove-command': '/goal' }).props.onClick());
+    expect(editor.tags()).toEqual(['/export', '/review']);
+    // Backspace edits a non-empty draft; it must not consume a tag.
+    await editor.type('/x'); await editor.key('Backspace');
+    expect(editor.tags()).toEqual(['/export', '/review']);
+    await editor.type(''); await editor.key('Backspace');
     expect(editor.tags()).toEqual(['/export']);
     await editor.key('Backspace');
     expect(editor.tags()).toEqual([]);

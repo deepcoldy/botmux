@@ -106,8 +106,6 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 ## 支持的 CLI / Agent
 
-在 Dashboard「Bot 配置 → Slash 命令权限」中查看当前 CLI 的默认透传命令，并配置额外的命令名，例如 `/goal /export`。之后在会话里发送完整命令和参数，botmux 按名单将其直接交给 CLI 的原生命令解析器。CLI 必须提供原生命令输入通道；具体命令和子命令以 CLI 版本为准。Claude Code、Codex、Seed、Relay、TRAE CLI 默认启用 `/goal`，在新话题发送 `/goal <目标与完成条件>` 可以冷启动会话。
-
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
 `claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) · `doubao` ([Doubao CLI 安装与使用](docs/doubao.md)) …

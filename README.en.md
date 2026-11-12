@@ -110,8 +110,6 @@ Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bo
 
 ## Supported CLIs & Agents
 
-In Dashboard → Bot Config → Slash command permissions, view the current CLI's default passthrough commands and configure extra command names, such as `/goal /export`. Send the full command and arguments in the conversation; botmux routes matching commands directly to the CLI's native parser. The CLI must provide a native command input channel, and available commands depend on its version. Claude Code, Codex, Seed, Relay, and TRAE CLI enable `/goal` by default; `/goal <objective and completion criteria>` in a new topic can start a session.
-
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents:
 
 `claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) · `doubao` ([Doubao CLI setup and usage](docs/doubao.en.md)) …
