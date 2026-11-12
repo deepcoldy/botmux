@@ -111,16 +111,28 @@ export function publishReplyPolicyChanged(chatId?: string): void {
  * wins when present; otherwise an opted-in signed chat default, then the
  * per-bot `regularGroupMentionMode` default.
  */
+export function resolveGroupMentionModeForConfig(
+  cfg: {
+    chatMentionModes?: Record<string, GroupMentionMode>;
+    signedChatDefaults?: boolean;
+    regularGroupMentionMode?: GroupMentionMode;
+  } | undefined,
+  larkAppId: string,
+  chatId?: string,
+): GroupMentionMode {
+  if (!cfg) return 'always';
+  const perChat = chatId ? cfg.chatMentionModes?.[chatId] : undefined;
+  if (perChat === 'always' || perChat === 'topic' || perChat === 'never' || perChat === 'ambient') {
+    return perChat;
+  }
+  if (cfg.signedChatDefaults === true && signedChatMentionDefault(larkAppId, chatId)) return 'ambient';
+  const m = cfg.regularGroupMentionMode;
+  return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
+}
+
 export function resolveGroupMentionMode(larkAppId: string, chatId?: string): GroupMentionMode {
   try {
-    const cfg = getBot(larkAppId).config;
-    const perChat = chatId ? cfg.chatMentionModes?.[chatId] : undefined;
-    if (perChat === 'always' || perChat === 'topic' || perChat === 'never' || perChat === 'ambient') {
-      return perChat;
-    }
-    if (cfg.signedChatDefaults === true && signedChatMentionDefault(larkAppId, chatId)) return 'ambient';
-    const m = cfg.regularGroupMentionMode;
-    return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
+    return resolveGroupMentionModeForConfig(getBot(larkAppId).config, larkAppId, chatId);
   } catch {
     return 'always';
   }

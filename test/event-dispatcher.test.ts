@@ -16271,3 +16271,283 @@ describe('im.message.receive_v1 — mention late-resolution reverify', () => {
     }
   });
 });
+
+describe('migrated topic un-@ human reply routing', () => {
+  const COORD_APP_ID = 'cli_project_coord';
+  const MIGRATED_APP_ID = 'cli_migrated_worker';
+  const AMBIENT_WORKER_APP_ID = 'cli_ambient_worker';
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    _resetSeenMessagesForTest();
+    _resetTriggeredMessagesForTest();
+    _resetReverifyForTest();
+    mockFindOncallChat.mockReturnValue(undefined);
+  });
+
+  it('routes un-@ human reply in migrated topic to coordinator when migrated bot has mentionMode=always, while migrated bot and ambient worker yield', async () => {
+    const chatId = 'chat-imported-always';
+    const rootId = 'om_imported_root_always';
+    const threadId = 'omt_imported_thread_always';
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
+    mockGetCachedChatModeStrict.mockReturnValue('group');
+
+    const botStates = new Map<string, any>([
+      [COORD_APP_ID, {
+        config: {
+          larkAppId: COORD_APP_ID, larkAppSecret: 's', cliId: 'codex',
+          allowedUsers: [USER_OPEN_ID],
+          regularGroupReplyMode: 'shared',
+          regularGroupMentionMode: 'topic',
+          chatManagerEnabled: true,
+        },
+        botOpenId: 'ou_coord_bot',
+        resolvedAllowedUsers: [USER_OPEN_ID],
+        resolvedBlockedUsers: [],
+      }],
+      [MIGRATED_APP_ID, {
+        config: {
+          larkAppId: MIGRATED_APP_ID, larkAppSecret: 's', cliId: 'claude-code',
+          allowedUsers: [USER_OPEN_ID],
+          regularGroupReplyMode: 'new-topic',
+          regularGroupMentionMode: 'always',
+        },
+        botOpenId: 'ou_migrated_bot',
+        resolvedAllowedUsers: [USER_OPEN_ID],
+        resolvedBlockedUsers: [],
+      }],
+      [AMBIENT_WORKER_APP_ID, {
+        config: {
+          larkAppId: AMBIENT_WORKER_APP_ID, larkAppSecret: 's', cliId: 'codex',
+          allowedUsers: [USER_OPEN_ID],
+          regularGroupReplyMode: 'new-topic',
+          regularGroupMentionMode: 'ambient',
+        },
+        botOpenId: 'ou_ambient_bot',
+        resolvedAllowedUsers: [USER_OPEN_ID],
+        resolvedBlockedUsers: [],
+      }],
+    ]);
+    mockGetBot.mockImplementation((id: string) => botStates.get(id));
+    mockGetAllBots.mockImplementation(() => [...botStates.values()]);
+
+    const capturedByApp = new Map<string, Record<string, (data: any) => Promise<any>>>();
+
+    const handoffFor = (appId: string) => appId === MIGRATED_APP_ID ? null : ({
+      sourceLarkAppId: MIGRATED_APP_ID,
+      sourceAnswersWithoutMention: false,
+      hasProjectCoordinator: true,
+      isProjectCoordinator: appId === COORD_APP_ID,
+    });
+
+    const coordHandlers = {
+      ...makeHandlers(),
+      isSessionOwner: vi.fn((anchor: string, appId: string) => appId === COORD_APP_ID && anchor === chatId),
+      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+        (r === rootId && c === chatId) ? handoffFor(appId) : null,
+    };
+    startLarkEventDispatcher(COORD_APP_ID, 'secret', coordHandlers);
+    capturedByApp.set(COORD_APP_ID, { ...capturedHandlers } as any);
+
+    const migratedHandlers = {
+      ...makeHandlers(),
+      isSessionOwner: vi.fn((anchor: string, appId: string) => appId === MIGRATED_APP_ID && anchor === rootId),
+      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+        (r === rootId && c === chatId) ? handoffFor(appId) : null,
+    };
+    startLarkEventDispatcher(MIGRATED_APP_ID, 'secret', migratedHandlers);
+    capturedByApp.set(MIGRATED_APP_ID, { ...capturedHandlers } as any);
+
+    const ambientHandlers = {
+      ...makeHandlers(),
+      isSessionOwner: vi.fn(() => false),
+      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+        (r === rootId && c === chatId) ? handoffFor(appId) : null,
+    };
+    startLarkEventDispatcher(AMBIENT_WORKER_APP_ID, 'secret', ambientHandlers);
+    capturedByApp.set(AMBIENT_WORKER_APP_ID, { ...capturedHandlers } as any);
+
+    const inbound = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '接着看看这个问题怎么处理' }),
+      messageId: 'om_unat_msg_1',
+      chatId,
+      chatType: 'group',
+      rootId,
+      threadId,
+      mentions: [],
+    });
+
+    await Promise.all([
+      capturedByApp.get(COORD_APP_ID)!['im.message.receive_v1'](inbound),
+      capturedByApp.get(MIGRATED_APP_ID)!['im.message.receive_v1'](inbound),
+      capturedByApp.get(AMBIENT_WORKER_APP_ID)!['im.message.receive_v1'](inbound),
+    ]);
+    await flushEventWork();
+
+    // Coordinator folds into its chat-scope session and replies inside the migrated topic!
+    expect(coordHandlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(coordHandlers.handleThreadReply.mock.calls[0]![1]).toMatchObject({
+      larkAppId: COORD_APP_ID,
+      chatId,
+      scope: 'chat',
+      anchor: chatId,
+      replyRootId: rootId,
+    });
+    // Neither the migrated bot (mentionMode=always) nor the ambient worker bot chimes in!
+    expect(migratedHandlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(migratedHandlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(ambientHandlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(ambientHandlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes un-@ human reply in migrated topic to the migrated bot when it has免@ enabled (topic/ambient/never), while coordinator yields even with a prior replyThreadAlias', async () => {
+    const chatId = 'chat-imported-topicmode';
+    const rootId = 'om_imported_root_topicmode';
+    const threadId = 'omt_imported_thread_topicmode';
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
+    mockGetCachedChatModeStrict.mockReturnValue('group');
+
+    const botStates = new Map<string, any>([
+      [COORD_APP_ID, {
+        config: {
+          larkAppId: COORD_APP_ID, larkAppSecret: 's', cliId: 'codex',
+          allowedUsers: [USER_OPEN_ID],
+          regularGroupReplyMode: 'shared',
+          regularGroupMentionMode: 'ambient',
+          chatManagerEnabled: true,
+        },
+        botOpenId: 'ou_coord_bot',
+        resolvedAllowedUsers: [USER_OPEN_ID],
+        resolvedBlockedUsers: [],
+      }],
+      [MIGRATED_APP_ID, {
+        config: {
+          larkAppId: MIGRATED_APP_ID, larkAppSecret: 's', cliId: 'claude-code',
+          allowedUsers: [USER_OPEN_ID],
+          regularGroupReplyMode: 'new-topic',
+          regularGroupMentionMode: 'topic',
+        },
+        botOpenId: 'ou_migrated_bot',
+        resolvedAllowedUsers: [USER_OPEN_ID],
+        resolvedBlockedUsers: [],
+      }],
+    ]);
+    mockGetBot.mockImplementation((id: string) => botStates.get(id));
+    mockGetAllBots.mockImplementation(() => [...botStates.values()]);
+
+    const capturedByApp = new Map<string, Record<string, (data: any) => Promise<any>>>();
+
+    const coordHandlers = {
+      ...makeHandlers(),
+      isSessionOwner: vi.fn((anchor: string, appId: string) => appId === COORD_APP_ID && anchor === chatId),
+      resolveReplyThreadAlias: vi.fn(() => ({ chatId, sessionId: 'coord-session', anchor: chatId })),
+      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+        (r === rootId && c === chatId && appId !== MIGRATED_APP_ID)
+          ? { sourceLarkAppId: MIGRATED_APP_ID, sourceAnswersWithoutMention: true, hasProjectCoordinator: true, isProjectCoordinator: true }
+          : null,
+    };
+    startLarkEventDispatcher(COORD_APP_ID, 'secret', coordHandlers);
+    capturedByApp.set(COORD_APP_ID, { ...capturedHandlers } as any);
+
+    const migratedHandlers = {
+      ...makeHandlers(),
+      isSessionOwner: vi.fn((anchor: string, appId: string) => appId === MIGRATED_APP_ID && anchor === rootId),
+      resolveImportedTopicMentionlessHandoff: () => null,
+    };
+    startLarkEventDispatcher(MIGRATED_APP_ID, 'secret', migratedHandlers);
+    capturedByApp.set(MIGRATED_APP_ID, { ...capturedHandlers } as any);
+
+    const inbound = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '继续按刚才的方案改' }),
+      messageId: 'om_unat_msg_2',
+      chatId,
+      chatType: 'group',
+      rootId,
+      threadId,
+      mentions: [],
+    });
+
+    await Promise.all([
+      capturedByApp.get(COORD_APP_ID)!['im.message.receive_v1'](inbound),
+      capturedByApp.get(MIGRATED_APP_ID)!['im.message.receive_v1'](inbound),
+    ]);
+    await flushEventWork();
+
+    // Migrated bot handles its own thread-scope session!
+    expect(migratedHandlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(migratedHandlers.handleThreadReply.mock.calls[0]![1]).toMatchObject({
+      larkAppId: MIGRATED_APP_ID,
+      chatId,
+      scope: 'thread',
+      anchor: rootId,
+    });
+    // Coordinator yields completely (no double-reply even with ambient + prior alias)!
+    expect(coordHandlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(coordHandlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('keeps executor dispatch subtopics (projectImportSource undefined) unchanged on un-@ chatter and keeps top-level un-@ routed to group manager', async () => {
+    const chatId = 'chat-executor-subtopic';
+    const rootId = 'om_executor_dispatch_root';
+    const threadId = 'omt_executor_dispatch_thread';
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
+    mockGetCachedChatModeStrict.mockReturnValue('group');
+    mockIsChatManager.mockResolvedValue(true);
+
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'shared',
+      regularGroupMentionMode: 'topic',
+      chatManagerEnabled: true,
+    });
+    const coordHandlers = {
+      ...makeHandlers(),
+      isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+      resolveImportedTopicMentionlessHandoff: () => null,
+    };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', coordHandlers);
+
+    // 1) Un-@ inside an executor dispatch subtopic (not an imported session) -> manager does NOT barge in.
+    const subtopicInbound = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '旁人随口一句不@' }),
+      messageId: 'om_unat_exec_1',
+      chatId,
+      chatType: 'group',
+      rootId,
+      threadId,
+      mentions: [],
+    });
+    await capturedHandlers['im.message.receive_v1'](subtopicInbound);
+    await flushEventWork();
+    expect(coordHandlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(coordHandlers.handleNewTopic).not.toHaveBeenCalled();
+
+    // 2) Un-@ at top level -> group manager still handles it normally!
+    const topLevelInbound = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '主控帮我看个新问题' }),
+      messageId: 'om_unat_top_1',
+      chatId,
+      chatType: 'group',
+      mentions: [],
+    });
+    await capturedHandlers['im.message.receive_v1'](topLevelInbound);
+    await flushEventWork();
+    expect(coordHandlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(coordHandlers.handleThreadReply.mock.calls[0]![1]).toMatchObject({
+      larkAppId: MY_APP_ID,
+      chatId,
+      scope: 'chat',
+      anchor: chatId,
+    });
+  });
+});

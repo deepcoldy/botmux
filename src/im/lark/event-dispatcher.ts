@@ -4048,6 +4048,26 @@ export interface EventHandlers {
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
+  /** Inspect an active imported (`/relay` / `/adopt` / `/fork` / `bind`) thread-scope
+   *  session anchored at `rootId` in `chatId` when owned by another bot (`sourceLarkAppId !== larkAppId`).
+   *  When `sourceAnswersWithoutMention` is false, the group's project coordinator /
+   *  chat manager automatically picks up un-@ human replies in that topic; when true,
+   *  other bots yield so only the owning bot replies. */
+  resolveImportedTopicMentionlessHandoff?: (
+    rootId: string,
+    chatId: string,
+    larkAppId: string,
+  ) => {
+    sourceLarkAppId: string;
+    sourceAnswersWithoutMention: boolean;
+    hasProjectCoordinator: boolean;
+    isProjectCoordinator: boolean;
+  } | null | Promise<{
+    sourceLarkAppId: string;
+    sourceAnswersWithoutMention: boolean;
+    hasProjectCoordinator: boolean;
+    isProjectCoordinator: boolean;
+  } | null>;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
   /** True when this chat's chat-scope session already answered `rootId` as a FLAT
@@ -6170,8 +6190,53 @@ export function createLarkEventDispatcherRuntime(
       // that @mentions another specific member (person/bot) is a redirect to
       // someone else → back off, don't fold it in (mentionsAnotherMember).
       // 'never' stays unconditional by design.
+      let yieldToImportedTopicHandler = false;
+      let importedTopicCoordinatorFolded = false;
+      if (isAllowed
+          && !explicitlyMentionedThisBot
+          && !messageListener
+          && !substituteTrigger
+          && routing.scope === 'thread'
+          && message.root_id
+          && message.thread_id
+          && chatType === 'group'
+          && !mentionsAnotherMember(larkAppId, message)) {
+        const handoff = await handlers.resolveImportedTopicMentionlessHandoff?.(message.root_id, chatId, larkAppId) ?? null;
+        if (handoff) {
+          if (handoff.sourceAnswersWithoutMention) {
+            // The migrated topic's owning bot has免@ enabled (`topic`/`ambient`/`never`)
+            // and will handle this message itself; never chime in from coordinator/other bots.
+            yieldToImportedTopicHandler = true;
+          } else {
+            const actsAsGroupCoordinator = handoff.hasProjectCoordinator
+              ? handoff.isProjectCoordinator
+              : (getBot(larkAppId).config.chatManagerEnabled === true && await isChatManager(larkAppId, chatId));
+            const regMode = resolveRegularGroupMode(larkAppId, chatId);
+            if (actsAsGroupCoordinator && (handoff.isProjectCoordinator || (regMode !== 'new-topic' && regMode !== 'chat-topic'))) {
+              const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+              if (freshMode === 'group') {
+                routing.scope = 'chat';
+                routing.anchor = chatId;
+                replyRootId = message.root_id;
+                importedTopicCoordinatorFolded = true;
+                logger.info(
+                  `[project-import-routing] un-@ reply in imported topic root=${message.root_id.substring(0, 12)} `
+                  + `(owner=${handoff.sourceLarkAppId}, mentionMode=always) routed to coordinator=${larkAppId} chat=${chatId.substring(0, 12)}`,
+                );
+              }
+            } else {
+              // Another bot owns this imported topic and this bot is not the group coordinator;
+              // yield so ambient/never worker bots cannot hijack the imported topic.
+              yieldToImportedTopicHandler = true;
+            }
+          }
+        }
+      }
+
       const mentionModeForAlias = resolveGroupMentionMode(larkAppId, chatId);
       if (!explicitlyMentionedThisBot
+          && !yieldToImportedTopicHandler
+          && !importedTopicCoordinatorFolded
           && mentionModeForAlias !== 'always'
           && !((mentionModeForAlias === 'topic' || mentionModeForAlias === 'ambient') && mentionsAnotherMember(larkAppId, message))
           && routing.scope === 'thread' && message.root_id && message.thread_id && chatType === 'group') {
@@ -6239,26 +6304,28 @@ export function createLarkEventDispatcherRuntime(
 
       let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
 
-      const ownsThreadSessionBeforeFold = routing.scope === 'thread'
-        ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
-        : false;
-      const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
-        larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
-        answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
-      });
-      if (foldedReplyRootId) {
-        replyRootId = foldedReplyRootId;
-        ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
-      } else {
-        const seedReplyRootId = await maybeApplySharedTopicSeed({
-          larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
-          // 群监听命中的消息归属监听自己的会话路由（独立 thread/per_message 或 chat + autoClose），
-          // 负责人 seed 不得把它并进群级会话；监听支路不传负责人回调即可保持原路由。
-          chatManagerAddressed: messageListener ? undefined : chatManagerAddressed,
+      if (!importedTopicCoordinatorFolded && !yieldToImportedTopicHandler) {
+        const ownsThreadSessionBeforeFold = routing.scope === 'thread'
+          ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
+          : false;
+        const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
+          larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
+          answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
         });
-        if (seedReplyRootId) {
-          replyRootId = seedReplyRootId;
+        if (foldedReplyRootId) {
+          replyRootId = foldedReplyRootId;
           ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+        } else {
+          const seedReplyRootId = await maybeApplySharedTopicSeed({
+            larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+            // 群监听命中的消息归属监听自己的会话路由（独立 thread/per_message 或 chat + autoClose），
+            // 负责人 seed 不得把它并进群级会话；监听支路不传负责人回调即可保持原路由。
+            chatManagerAddressed: messageListener ? undefined : chatManagerAddressed,
+          });
+          if (seedReplyRootId) {
+            replyRootId = seedReplyRootId;
+            ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+          }
         }
       }
 
@@ -6333,7 +6400,7 @@ export function createLarkEventDispatcherRuntime(
       // stays in the buffer and flushes on its original timer. Paired seeds
       // only arise under never/ambient modes, where a legitimate merge always
       // requires isAllowed anyway.
-      if (senderOpenId && isAllowed && message.root_id && !isControlCommand) {
+      if (!yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
         await waitForSeedRoutingGate(message.root_id);
         const pairingInput = {
           larkAppId,
@@ -6499,6 +6566,13 @@ export function createLarkEventDispatcherRuntime(
         // revalidateSolo 重查过人数——「刚拉新 bot、缓存仍是陈旧 {1,1}」会查出多 bot
         // 而不放行；重查后仍是 1人1bot,说明被 @ 的人不在群里（飞书允许 @ 群外的人）,
         // 唯一能接话的就是本 bot,照常放行。
+        if (yieldToImportedTopicHandler && !builtinMentionlessCommand) {
+          logger.debug(
+            `[project-import-routing:${larkAppId}] yielding un-@ reply in imported topic ` +
+            `root=${String(message.root_id).substring(0, 12)} msg=${messageId.substring(0, 12)}`,
+          );
+          return;
+        }
         const relax = (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
           || !!messageListener
