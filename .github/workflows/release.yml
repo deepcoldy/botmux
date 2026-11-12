@@ -155,7 +155,9 @@ jobs:
   #
   # The ancestry guard no longer refuses a tag just because master moved after
   # it was pushed: a tag on an older master commit is admitted as long as it
-  # contains the published baseline (see the guard's comment below).
+  # contains the published baseline (see the guard's comment below). Here it
+  # only refuses early; the verdict the release is held to is re-taken in
+  # `publish-gate`, after signing approval and before the first npm publish.
   preflight:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -164,15 +166,11 @@ jobs:
     outputs:
       tag: ${{ steps.dist_tag.outputs.tag }}
       prerelease: ${{ steps.dist_tag.outputs.prerelease }}
-      # The facts the ancestry guard below actually admitted this release on: the
-      # origin/master SHA it read, which rule admitted it, and (for the
-      # published-baseline rule) the baseline commits it required. `release`
-      # re-checks THESE values rather than re-reading master / npm / tags, so a
-      # commit landing on master or a dist-tag moving mid-run cannot flip the
-      # verdict after the platform subpackages are already on npm (issue #1150).
+      # What the early admission below was taken on. publish-gate's re-admission uses
+      # them for one thing only: a tag preflight admitted as a child of master's tip
+      # stays admissible while master moves on during the signing wait.
       master_sha: ${{ steps.master_ancestry.outputs.master_sha }}
       ancestry_mode: ${{ steps.master_ancestry.outputs.ancestry_mode }}
-      baseline_shas: ${{ steps.master_ancestry.outputs.baseline_shas }}
     steps:
       - uses: actions/checkout@v6
         # fetch-depth: 0 —— 正式版发版闸要在 master、被打 tag 的 commit 和已发布版本的 tag 之间
@@ -258,9 +256,11 @@ jobs:
         #   ② 被打 tag 的 commit 在 origin/master 的 first-parent 链上（tip、tip~1、tip~2……，
         #      可以不是 tip；用 merge commit 合进来的分支内部提交不算），并且包含「已发布基线」：
         #      npm latest 版本对应 tag 的 commit，加上版本号介于 npm latest 与本版之间的每个正式版
-        #      tag 的 commit。
-        # 拿不到基线（npm view 失败、latest 不是规范的 X.Y.Z、对应 tag 不存在）时只剩 ①，
-        # fail-closed。判定只看 commit 图、tag 和已发布版本，不看墙钟时间。
+        #      （只有 tag 的、已发到 npm 的都算）对应 tag 的 commit。npm 上已发布过版本号高于本版的
+        #      正式版时 ② 不成立。
+        # 拿不到基线（npm view 失败、latest 不是规范的 X.Y.Z、已发布过更高的正式版、基线里某个
+        # 版本的 tag 不存在）时只剩 ①，fail-closed。① 不读 npm：tip 包含了所有从 master 发出去的
+        # 版本。判定只看 commit 图、tag 和已发布版本，不看墙钟时间。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
         #
         # 为什么从「必须包含最新 master」放宽到 ②：旧规则下打完 tag 后 master 只要再进一个
@@ -292,10 +292,19 @@ jobs:
         # 的人工审批，可能几个小时，这期间 npm latest 还是上一版。若只看 npm latest，在更旧的
         # master 提交上打的下一个正式版也能过，两次都批准后版本号更大的那个反而缺前一版的
         # 改动。版本号高于本版的 tag 已被先决条件拒掉，所以基线覆盖了所有已发布和在途的正式版。
+        # 再加上 npm 的已发布版本列表，是因为 latest 可以被 npm-dist-tag.yml 回滚、正式版 tag 可以被持有
+        # 规则集绕过权限的人删掉，那时 latest 和 tag 都看不出用户已经拿到过更新的版本，npm 自己的
+        # 版本列表还记着。
         # 版本号不倒退由上一步「Guard against downgrading npm latest」负责，这里管的是内容不倒退。
         #
-        # 判定用到的事实（master SHA、放行方式、基线 commit）固定成 step 输出，release job 只按
-        # 这些固定值复核，见那边的 TOCTOU 说明（issue #1150）。
+        # 这一步判三次，各管一段时间：
+        #   - 这里（preflight）：打完 tag 立刻判，不放行就不必编译、不必等签名审批。
+        #   - publish-gate：签名审批之后、任何包发布之前，按当时的 master、tag 和 npm 重判一次，
+        #     并把判定用到的事实（master SHA、放行方式、基线 commit）固定成输出。审批可能等好几天，
+        #     这期间可能有更低的版本发布、tag 被删或重建、latest 被回滚；只用这里的判定，审批后可能
+        #     发出一个比已发布版本少东西的版本。
+        #   - release：平台子包已经发出去之后，只按 publish-gate 固定的值复核，不再读会移动的 ref，
+        #     见那边的 TOCTOU 说明（issue #1150）。
         id: master_ancestry
         if: steps.dist_tag.outputs.tag == 'latest'
         env:
@@ -327,20 +336,33 @@ jobs:
   # packaging/notarization remains asynchronous; only the two CLI executables
   # are a prerequisite for npm and the GitHub Release.
   #
-  # NOTE ON `needs` vs `if` (do not "tidy" this): this job intentionally has NO
-  # `if:`. GitHub applies the implicit "all needs succeeded" gate only to jobs
-  # WITHOUT a condition; adding any `if:` here would make this job run even when
-  # `bun-binaries` or `binary-subpackages` FAILED or was skipped, silently
-  # defeating the entire ordering guarantee above (that is exactly why
-  # `attach-desktop-assets` has to spell out `needs.*.result == 'success'`). The
-  # tag-push-only restriction is inherited through `preflight`, which carries
-  # `if: github.event_name == 'push'`. If you ever add an `if:` here you MUST
-  # also re-assert `needs.<each>.result == 'success'` for every entry in `needs`.
-  # `binary-subpackages` below is the deliberate counterpart: it needs an `if:`
-  # to admit a skipped signing job on prereleases, so it explicitly re-asserts
-  # success for every other prerequisite and for stable signing.
+  # NOTE ON `needs` vs `if` (do not "tidy" this): without an `if:` a job gets the
+  # implicit `success()` check, and that check fails when ANY job upstream of it
+  # was skipped, transitively (GitHub docs: "a failure or skip applies to all
+  # jobs in the dependency chain from the point of failure or skip onwards"). On a
+  # prerelease `sign-darwin-binaries` is skipped by design and sits upstream of
+  # this job, so an implicit gate would skip the main package after the platform
+  # subpackages were already published. Hence an explicit `if:` that starts with
+  # `!cancelled()` (a status function, so it opts out of the implicit check) and
+  # then re-asserts `result == 'success'` for EVERY entry in `needs` — drop one and
+  # this job runs after that prerequisite failed. `!cancelled()`, not `always()`:
+  # on Cancel GitHub re-evaluates `if:` and keeps running whatever still evaluates
+  # true, so `always()` would publish the main package after the run was
+  # cancelled. A run cancelled half-way through the publishes is finished with
+  # "Re-run failed jobs" (the subpackages guard keeps the pinned verdict once part
+  # of the version is on npm). Stable signing is enforced through
+  # `binary-subpackages` and `publish-gate`, which both require it on stable.
   release:
-    needs: [preflight, bun-binaries, bun-binaries-musl, binary-subpackages]
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.preflight.result == 'success' &&
+        needs.publish-gate.result == 'success' &&
+        needs.bun-binaries.result == 'success' &&
+        needs.bun-binaries-musl.result == 'success' &&
+        needs.binary-subpackages.result == 'success'
+      }}
+    needs: [preflight, publish-gate, bun-binaries, bun-binaries-musl, binary-subpackages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -437,8 +459,9 @@ jobs:
           fi
 
       - name: Guard — stable release must come from master
-        # 复核 preflight 的「Guard — stable release must come from master」放行时用到的同一组事实。
-        # 规则、为什么放宽、怎么挡住 v2.47.0 那类事故，都写在 preflight 那一步的注释里。
+        # 复核 publish-gate 里同名步骤放行时用到的同一组事实（那是签名审批之后、任何包发布之前
+        # 的最后一次判定）。规则、为什么放宽、怎么挡住 v2.47.0 那类事故，都写在 preflight 那一步
+        # 的注释里。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
         if: steps.dist_tag.outputs.tag == 'latest'
         env:
@@ -459,18 +482,19 @@ jobs:
           # hash differently and publish-npm-if-missing.mjs correctly refuses to
           # overwrite a published version with different content. 3.18.10 was burned.
           #
-          # So this job re-checks the facts preflight PINNED — which rule admitted the
-          # release, the master SHA it read, and the baseline commits it required —
+          # So this job re-checks the facts `publish-gate` PINNED — which rule admitted
+          # the release, the master SHA it read, and the baseline commits it required —
           # never whatever master, npm `latest` or the tags say now. The published
           # baseline is just as mobile as master: the subpackages published moments
           # ago, or a concurrent release, can move npm `latest`. The guard keeps its
           # meaning — the tag must satisfy what was true when this release was
-          # ADMITTED — while the verdict stays immutable for the rest of the run. A
-          # commit landing mid-release belongs to the next release, not to a burned
-          # version number.
-          PINNED_MODE: ${{ needs.preflight.outputs.ancestry_mode }}
-          PINNED_MASTER: ${{ needs.preflight.outputs.master_sha }}
-          PINNED_BASELINE: ${{ needs.preflight.outputs.baseline_shas }}
+          # ADMITTED, right before the first publish — while the verdict stays
+          # immutable for the rest of the run. A commit landing mid-release belongs to
+          # the next release, not to a burned version number.
+          PINNED_MODE: ${{ needs.publish-gate.outputs.ancestry_mode }}
+          PINNED_MASTER: ${{ needs.publish-gate.outputs.master_sha }}
+          PINNED_BASELINE: ${{ needs.publish-gate.outputs.baseline_shas }}
+          PINNED_ANCHOR: ${{ needs.publish-gate.outputs.anchor_sha }}
         run: node .github/scripts/release-master-guard.mjs verify
 
       - run: bun run build
@@ -1034,6 +1058,97 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  publish-gate:
+    # The verdict a stable release is held to: the "stable release must come from
+    # master" guard, taken again right before the first irreversible publish.
+    #
+    # WHY AGAIN, AND WHY HERE: preflight judges the tag the moment it is pushed,
+    # but a stable release then waits for the Developer ID signing approval in
+    # `sign-darwin-binaries`, which can take days (cancel-stale-release-approvals
+    # exempts stable runs). Over that wait the facts can change: a lower version
+    # can be published, a stable tag can be deleted and re-created, `latest` can
+    # be rolled back. Measured with real repos and the real guard: a v1.2.0 run
+    # admitted at preflight on an older master commit, then a hotfix v1.1.0
+    # published after v1.2.0's tag was deleted, then v1.2.0 re-created on the same
+    # commit — approving the original run published 1.2.0 without the hotfix,
+    # because every later check only re-read preflight's pins. Re-admitting here,
+    # after approval, refuses it (npm latest 1.1.0 is not contained).
+    #
+    # This is still before ANY package reaches npm, so a refusal here costs a
+    # tag name, never a version number (contrast issue #1150). `release`, which
+    # runs after the platform subpackages are public, only re-checks the facts
+    # this job pinned. As its own job (not a step at the top of the publishing
+    # job), its outputs survive "Re-run failed jobs": a publish that failed
+    # half-way is retried against the same verdict instead of being re-judged.
+    #
+    # KNOWN LIMIT (accepted): once any package of this version is on npm, a resume
+    # keeps that verdict — re-judging could only refuse half a release and burn the
+    # version. So if someone with the tag-ruleset bypass deletes this tag after a
+    # partial publish, ships a LOWER hotfix, re-creates the tag on the same commit
+    # and resumes this run, the resumed release does not contain the hotfix. The
+    # same was true before this gate existed (the release job only ever re-checked
+    # pinned facts and the version number). The guard's refusal text and CLAUDE.md
+    # say: never delete the tag of a version that has any package on npm; ship the
+    # fix as a higher version.
+    #
+    # It needs every job `binary-subpackages` needs, so it is the last thing before
+    # the first publish: if anything between them fails (a musl leg, say), "Re-run
+    # failed jobs" re-runs this job too instead of reusing a days-old verdict.
+    # `binary-subpackages` additionally re-takes the admission itself when nothing
+    # of the version is on npm yet, which covers a failure inside that job before
+    # its first publish.
+    #
+    # Prereleases skip signing, so this job runs for them too (with every step
+    # skipped) and succeeds; the jobs after it check its result explicitly.
+    if: >-
+      ${{
+        !cancelled() &&
+        github.event_name == 'push' &&
+        needs.preflight.result == 'success' &&
+        needs.bun-binaries.result == 'success' &&
+        needs.bun-binaries-musl.result == 'success' &&
+        (
+          needs.preflight.outputs.tag != 'latest' ||
+          needs.sign-darwin-binaries.result == 'success'
+        )
+      }}
+    needs: [preflight, bun-binaries, bun-binaries-musl, sign-darwin-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      # The facts this verdict was taken on: the origin/master SHA it read, which
+      # rule admitted the release, and (for the published-baseline rule) the
+      # baseline commits it required. `release` re-checks THESE values rather than
+      # re-reading master / npm / tags (issue #1150).
+      master_sha: ${{ steps.master_ancestry.outputs.master_sha }}
+      ancestry_mode: ${{ steps.master_ancestry.outputs.ancestry_mode }}
+      baseline_shas: ${{ steps.master_ancestry.outputs.baseline_shas }}
+      anchor_sha: ${{ steps.master_ancestry.outputs.anchor_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        if: needs.preflight.outputs.tag == 'latest'
+        # Same commit preflight judged: for a tag push, checkout fetches the tag and
+        # refuses if it no longer points at github.sha.
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        if: needs.preflight.outputs.tag == 'latest'
+        with:
+          node-version: 22
+
+      - name: Guard — stable release must come from master
+        # 和 preflight 同名步骤跑的是同一套判定；规则与理由见那一步的注释。这一次的结论和固定值
+        # 才是本次发版要遵守的。
+        id: master_ancestry
+        if: needs.preflight.outputs.tag == 'latest'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PREFLIGHT_MODE: ${{ needs.preflight.outputs.ancestry_mode }}
+          PREFLIGHT_MASTER: ${{ needs.preflight.outputs.master_sha }}
+        run: node .github/scripts/release-master-guard.mjs admit
+
   sign-darwin-binaries:
     # Stable CLI releases need a stable code identity, not merely a structurally
     # valid ad-hoc signature. macOS TCC records an ad-hoc executable by cdhash;
@@ -1100,8 +1215,9 @@ jobs:
     # closed unless both darwin binaries were Developer ID signed first.
     if: >-
       ${{
-        always() &&
+        !cancelled() &&
         needs.preflight.result == 'success' &&
+        needs.publish-gate.result == 'success' &&
         needs.bun-binaries.result == 'success' &&
         needs.bun-binaries-musl.result == 'success' &&
         (
@@ -1109,7 +1225,7 @@ jobs:
           needs.sign-darwin-binaries.result == 'success'
         )
       }}
-    needs: [preflight, bun-binaries, bun-binaries-musl, sign-darwin-binaries]
+    needs: [preflight, publish-gate, bun-binaries, bun-binaries-musl, sign-darwin-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1119,8 +1235,15 @@ jobs:
       id-token: write
     env:
       RELEASE_TAG: ${{ github.ref_name }}
+      # The one list of platform subpackages: the guard below probes npm for these, the publish
+      # loop publishes these.
+      SUBPACKAGE_PLATFORMS: linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64
     steps:
       - uses: actions/checkout@v6
+        # fetch-depth: 0 —— 下面的发版闸要判祖先关系。默认的浅克隆只有 tag 那一个提交，「包含」全都判成否，
+        # 所有不在当前 master tip 上的 tag 都会被拒（守门脚本在浅克隆里会直接报错说明）。
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
@@ -1139,6 +1262,19 @@ jobs:
           merge-multiple: true
           path: dist-bin
 
+      - name: Guard — stable release must come from master
+        # 本 job 第一次 npm publish 之前的最后一道。「Re-run failed jobs」在 publish-gate 成功、本 job
+        # 在发包前失败时只重跑本 job，那时 publish-gate 的判定可能已经是几天前的。所以：本版本的子包
+        # 一个都还没发 → 按此刻的事实重判（规则同 preflight 那一步）；已经发了一部分 → 是中断后的
+        # 续发，沿用 publish-gate 固定的判定（此时重判可能拒掉半个版本、烧掉版本号，issue #1150）；
+        # 查不清楚 npm 上有没有 → fail-closed。release job 仍只复核 publish-gate 固定的值。
+        if: needs.preflight.outputs.tag == 'latest'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PREFLIGHT_MODE: ${{ needs.preflight.outputs.ancestry_mode }}
+          PREFLIGHT_MASTER: ${{ needs.preflight.outputs.master_sha }}
+        run: node .github/scripts/release-master-guard.mjs recheck
+
       - name: Stage each binary into its subpackage and publish
         # The binary must land as the file named exactly `botmux` (that is the
         # sole entry in each subpackage's `files` allowlist) and must be
@@ -1152,7 +1288,7 @@ jobs:
         # one carry the tag's version.
         run: |
           VERSION="${RELEASE_TAG#v}"
-          for plat in linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64; do
+          for plat in $SUBPACKAGE_PLATFORMS; do
             src="dist-bin/botmux-${plat}"
             dir="packages/binary-${plat}"
             if [ ! -f "$src" ]; then echo "missing compiled binary $src"; exit 1; fi
@@ -1174,15 +1310,17 @@ jobs:
     # which derives them from `uname -s`/`uname -m`). Renaming these would
     # silently break the curl installer.
     #
-    # Must spell out `needs.*.result == 'success'` because it carries an `if:` —
-    # GitHub drops the implicit all-needs-succeeded gate for conditional jobs
-    # (same reason `attach-desktop-assets` does it).
+    # Starts with `!cancelled()` and spells out `needs.*.result == 'success'`: without a
+    # status function GitHub applies an implicit `success()` that also fails when any
+    # job further upstream was skipped (on a prerelease, `sign-darwin-binaries` is),
+    # so this job would be skipped after a good release. Same for
+    # `publish-github-release` and `attach-desktop-assets`.
     #
     # NOT a gate on npm: if this fails, npm + the subpackages are already live and
     # the binaries can be re-attached by hand. The npm channel already carries the
     # same binaries inside the platform subpackages, so a missing Release asset
     # only affects the curl/install.sh path.
-    if: github.event_name == 'push' && needs.bun-binaries.result == 'success' && needs.bun-binaries-musl.result == 'success' && needs.release.result == 'success'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.bun-binaries.result == 'success' && needs.bun-binaries-musl.result == 'success' && needs.release.result == 'success' }}
     needs: [bun-binaries, bun-binaries-musl, release]
     runs-on: ubuntu-latest
     permissions:
@@ -1233,7 +1371,7 @@ jobs:
     # binaries inside the platform subpackages, so this is never a total outage.
     #
     # `--draft=false` is idempotent: publishing an already-public release is a no-op.
-    if: github.event_name == 'push' && needs.attach-bun-binaries.result == 'success'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.attach-bun-binaries.result == 'success' }}
     needs: [attach-bun-binaries]
     runs-on: ubuntu-latest
     permissions:
@@ -1292,7 +1430,7 @@ jobs:
     # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
     # macOS (fresh artifact, so the 7-day retention is irrelevant) and
     # `refresh-desktop-assets` --clobber-attaches to the existing Release.
-    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success' }}
     needs: [desktop, release]
     runs-on: ubuntu-latest
     permissions:
