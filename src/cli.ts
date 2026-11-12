@@ -18000,7 +18000,15 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       process.exit(2);
     }
     const { readFileSync } = await import('node:fs');
-    const body = JSON.parse(readFileSync(controlFile, 'utf8')) as Record<string, unknown>;
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(controlFile, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('control file must be a JSON object');
+      body = parsed as Record<string, unknown>;
+    } catch (error) {
+      console.error(`botmux ask control: cannot read --control-file: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
     if (typeof body.larkAppId !== 'string') {
       console.error('botmux ask control: larkAppId required');
       process.exit(2);
@@ -18010,11 +18018,20 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       console.error('botmux ask control: daemon unavailable');
       process.exit(3);
     }
-    const response = await fetchDaemonIpc(daemon.ipcPort, `/api/asks/managed/${action}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15_000),
-    }, loadDaemonIpcSecret());
-    const result = await response.json();
+    // A lost or timed-out response leaves the outcome unknown: report it and
+    // let the caller inspect the original operation instead of retrying blind.
+    let response: Response;
+    let result: unknown;
+    try {
+      response = await fetchDaemonIpc(daemon.ipcPort, `/api/asks/managed/${action}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      }, loadDaemonIpcSecret());
+      result = await response.json();
+    } catch (error) {
+      console.error(`botmux ask control: outcome unknown, inspect before retrying: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(3);
+    }
     await writeAndFlush(process.stdout, JSON.stringify(result) + '\n');
     if (!response.ok) process.exit(3);
     return;

@@ -37,6 +37,16 @@ export interface ManagedAskSession {
   terminalExecutionKeys?: ReadonlyArray<string>;
 }
 
+/** Decision status of a receipt. `retired` is reported only once the
+ * invalidated settlement is durable; a persisted intent whose broker write has
+ * not landed yet is `retiring` — the card can still be answered and an answer
+ * still wins. */
+export function managedAskDecisionStatus(receipt: ExplicitAskReceipt): 'answered' | 'retired' | 'invalidated' | 'retiring' | 'waiting' {
+  if (receipt.result?.kind === 'answered') return 'answered';
+  if (receipt.result) return receipt.retirement && receipt.result.kind === 'invalidated' ? 'retired' : 'invalidated';
+  return receipt.retirement ? 'retiring' : 'waiting';
+}
+
 export function managedAskOriginKey(origin: ExplicitAskControl['origin']): string {
   return JSON.stringify([origin.workerGeneration, origin.turnId, origin.dispatchAttempt ?? null]);
 }
@@ -82,23 +92,26 @@ export function createManagedAskControl(deps: {
   }
   function inspect(request: ExplicitAskControl) {
     const receipt = validate(request);
-    return result(request, receipt, receipt.result?.kind === 'answered' ? 'answered'
-      : receipt.retirement ? 'retired' : receipt.result ? 'invalidated' : 'waiting');
+    return result(request, receipt, managedAskDecisionStatus(receipt));
   }
   function describe(request: ExplicitAskControl) {
     bound(request);
     if (!deps.describe) throw new Error('managed Ask discovery unavailable');
     const receipt = deps.describe(request);
-    return result(request, receipt, receipt.result?.kind === 'answered' ? 'answered'
-      : receipt.retirement ? 'retired' : receipt.result ? 'invalidated' : 'waiting');
+    return result(request, receipt, managedAskDecisionStatus(receipt));
   }
+  /** Retiring only makes the original decision unanswerable; it touches no
+   * worker, runtime or backing. It therefore needs the exact receipt binding
+   * and origin (validate), not live ownership of the original generation —
+   * that would make every Ask that outlived a daemon restart, a refork or a
+   * Dashboard lock permanently unretirable. Release keeps the ownership gate. */
   async function retire(request: ExplicitAskRetirement) {
     const receipt = validate(request);
     if (receipt.result?.kind === 'answered') return result(request, receipt, 'answered');
-    const session = deps.session(request.sessionId)!;
-    if (!managedAskExecutionOwned(request, session)) return result(request, receipt, 'conflict');
     const retired = deps.retire(request);
-    return result(request, retired, retired.result?.kind === 'answered' ? 'answered' : 'draining');
+    return result(request, retired, retired.result?.kind === 'answered' ? 'answered'
+      : retired.result?.kind === 'invalidated' && retired.retirement?.operationId === request.operationId
+        ? 'draining' : managedAskDecisionStatus(retired));
   }
   async function release(request: ExplicitAskRetirement) {
     const receipt = validate(request);

@@ -44,8 +44,8 @@ import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
-import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
-import { createManagedAskControl, managedAskExecutionOwned, parseManagedAskControl } from './core/managed-ask-control.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
+import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
 import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -10736,10 +10736,7 @@ const explicitAskContinuation = createExplicitAskContinuation({
   hasHandoff: hasExplicitAskHandoff,
   invalidate: invalidateExplicitAsk,
   retire: retireExplicitAsk,
-  canRetire: receipt => !!receipt.origin && managedAskExecutionOwned({
-    larkAppId: receipt.input.larkAppId, sessionId: receipt.input.sessionId, requestId: receipt.input.requestId,
-    chatId: receipt.input.chatId, rootMessageId: receipt.input.rootMessageId, origin: receipt.origin,
-  }, managedAskSession(receipt.input.sessionId)),
+  canRetire: receipt => explicitAskRetirementBound(receipt, findActiveBySessionId(receipt.input.sessionId)),
   snapshot: explicitAskSnapshot,
   shouldInvalidate: receipt => sessionsRestored
     && !explicitAskSessionBound(receipt.input, findActiveBySessionId(receipt.input.sessionId)),

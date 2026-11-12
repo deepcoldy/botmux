@@ -3,7 +3,8 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, waitForExplicitAskResult } from '../src/core/explicit-ask-continuation.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, waitForExplicitAskResult, type ExplicitAskReceipt } from '../src/core/explicit-ask-continuation.js';
+import { createManagedAskControl, managedAskOriginKey } from '../src/core/managed-ask-control.js';
 import { registerHostAsk, setCardDispatcher, setAskPersistStore, setCanTalkChecker,
   restorePersistedAsks, tryResolveAsk, getAskSnapshot, releaseExplicitAskHandoff, invalidateExplicitAsk,
   setExplicitAskSessionChecker, submitAskFromDesktop, retireExplicitAsk, explicitAskSnapshot, _resetForTest } from '../src/core/ask-broker.js';
@@ -31,6 +32,23 @@ function setup() {
   return { deps, manager: createExplicitAskContinuation(deps), register, dispatch, onError,
     tick: () => { clock += 6000; }, advance: (ms: number) => { clock += ms; },
     setResumable: (value: boolean) => { resumable = value; } };
+}
+/** Real broker + durable store; `restart` drops broker memory and restores from disk. */
+function brokerFixture(dir: string) {
+  const store = createAskPersistStore(join(dir, 'broker'));
+  let failStrict = false;
+  let card: PendingAsk | undefined;
+  const wire = () => {
+    setAskPersistStore({ ...store, put: (value, options) => {
+      if (failStrict && options?.strict) throw new Error('retirement write failed');
+      store.put(value, options);
+    } });
+    setCanTalkChecker(() => true);
+    setCardDispatcher({ send: async ask => { card = ask; return { messageId: 'card' }; } });
+  };
+  wire();
+  return { store, card: () => card!, failStrict: (value: boolean) => { failStrict = value; },
+    restart: () => { _resetForTest(); wire(); restorePersistedAsks(Date.now(), 'app'); } };
 }
 describe('explicit Ask durable continuation', () => {
   it('recovers the first answer after strict retirement failure and a lost original caller', async () => {
@@ -71,28 +89,168 @@ describe('explicit Ask durable continuation', () => {
     expect(restored.inspect(request).result).toEqual(answer);
   });
 
-  it('keeps interrupted retirement pending when live authority no longer owns the original execution', async () => {
+  it('falls back to ordinary no-deadline invalidation when an interrupted retirement is no longer bound', async () => {
     const fixture = setup();
-    let owns = true;
-    let result: AskResult | undefined;
     const waitingInput = { ...input, timeoutMs: 0 };
     const origin = { turnId: 'turn', workerGeneration: 3, dispatchAttempt: 1 };
     const first = createExplicitAskContinuation({ ...fixture.deps, register: () => new Promise(() => {}),
-      canRetire: () => owns, retire: () => { throw new Error('interrupted'); } });
+      retire: () => { throw new Error('interrupted'); } });
     void first.wait(waitingInput, origin);
     const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
       chatId: 'chat', rootMessageId: null, origin, operationId: 'operation', reason: 'ended' };
     expect(() => first.retire(request)).toThrow('interrupted');
-    owns = false;
-    const restored = createExplicitAskContinuation({ ...fixture.deps, canRetire: () => owns,
-      retire: () => { result = { kind: 'invalidated', reason: 'ended', by: null, selected: null, comment: null, timedOut: false }; return result; } });
+    const closed: AskResult = { kind: 'invalidated', reason: 'explicit Ask session closed or binding changed',
+      by: null, selected: null, comment: null, timedOut: false };
+    const invalidate = vi.fn();
+    const restored = createExplicitAskContinuation({ ...fixture.deps, canRetire: () => false, canResume: () => false,
+      shouldInvalidate: () => true, invalidate, register: async () => closed,
+      retire: () => { throw new Error('an unbound retirement must not settle through retire'); } });
     expect(() => restored.retire(request)).toThrow('authority');
     await restored.sweep();
-    expect(result).toBeUndefined();
-    expect(restored.inspect(request).result).toBeUndefined();
-    owns = true;
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(restored.inspect(request).result).toEqual(closed));
+    expect(restored.inspect(request).retirement?.operationId).toBe('operation');
+    fixture.advance(10_000);
     await restored.sweep();
-    expect(restored.inspect(request).result?.kind).toBe('invalidated');
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('finishes an interrupted retirement after a restart replaced the worker generation, releasing the broker handoff', async () => {
+    const fixture = setup();
+    const broker = brokerFixture(fixture.deps.dir);
+    const waitingInput = { ...input, timeoutMs: 0 };
+    const origin = { turnId: 'turn', workerGeneration: 3 };
+    let session: Parameters<typeof explicitAskRetirementBound>[1] & Record<string, unknown> = {
+      larkAppId: 'app', chatId: 'chat', session: { scope: 'chat', rootMessageId: 'oc_chat' },
+      workerGeneration: 3, worker: {}, managedTurnOrigin: { turnId: 'turn' }, replyExecutionTerminals: new Map() };
+    const canRetire = (receipt: ExplicitAskReceipt) => explicitAskRetirementBound(receipt, session);
+    const continuation = () => createExplicitAskContinuation({ ...fixture.deps, register: registerHostAsk, canRetire,
+      retire: retireExplicitAsk, snapshot: explicitAskSnapshot, releaseHandoff: releaseExplicitAskHandoff });
+    void continuation().wait(waitingInput, origin);
+    await vi.waitFor(() => expect(broker.card()).toBeDefined());
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'retire', reason: 'MR closed' };
+    broker.failStrict(true);
+    expect(() => continuation().retire(request)).toThrow('retirement write failed');
+    broker.failStrict(false);
+    broker.restart();
+    // Restore builds a fresh session: the worker is re-forked under the next
+    // generation, with no managed turn origin and an empty terminal table; a
+    // Dashboard lock does not matter for retiring the decision either.
+    session = { larkAppId: 'app', chatId: 'chat', session: { scope: 'chat', rootMessageId: 'oc_chat', locked: true },
+      workerGeneration: 4, worker: {} };
+    const restored = continuation();
+    await restored.sweep();
+    expect(restored.inspect(request)).toMatchObject({ retirement: { operationId: 'retire' },
+      result: { kind: 'invalidated', reason: 'MR closed' } });
+    expect(tryResolveAsk({ askId: broker.card().askId, nonce: broker.card().nonce, selected: 'yes', by: 'human' })).toBe('already_settled');
+    expect(broker.store.list()).toHaveLength(0);
+    fixture.advance(10_000);
+    await restored.sweep();
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('retiring a restored Ask before any claimant re-attached also releases its broker handoff', async () => {
+    const fixture = setup();
+    const broker = brokerFixture(fixture.deps.dir);
+    const waitingInput = { ...input, timeoutMs: 0 };
+    const origin = { turnId: 'turn', workerGeneration: 3 };
+    const continuation = () => createExplicitAskContinuation({ ...fixture.deps, register: registerHostAsk, canResume: () => false,
+      retire: retireExplicitAsk, snapshot: explicitAskSnapshot, releaseHandoff: releaseExplicitAskHandoff });
+    void continuation().wait(waitingInput, origin);
+    await vi.waitFor(() => expect(broker.card()).toBeDefined());
+    broker.restart();
+    const restored = continuation();
+    await restored.sweep();
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'retire', reason: 'MR closed' };
+    expect(restored.retire(request)).toMatchObject({ retirement: { operationId: 'retire' }, result: { kind: 'invalidated' } });
+    expect(broker.store.list()).toHaveLength(0);
+    expect(tryResolveAsk({ askId: broker.card().askId, nonce: broker.card().nonce, selected: 'yes', by: 'human' })).toBe('already_settled');
+  });
+
+  it('reports retiring, not retired, after a failed strict retirement, and a later answer still wins', async () => {
+    const fixture = setup();
+    const broker = brokerFixture(fixture.deps.dir);
+    const origin = { turnId: 'turn', workerGeneration: 3 };
+    const manager = createExplicitAskContinuation({ ...fixture.deps, register: registerHostAsk,
+      retire: retireExplicitAsk, snapshot: explicitAskSnapshot, releaseHandoff: releaseExplicitAskHandoff });
+    const control = createManagedAskControl({ appId: 'app', inspect: manager.inspect, describe: manager.describe,
+      retire: manager.retire, snapshot: receipt => explicitAskSnapshot(receipt.input),
+      session: () => ({ larkAppId: 'app', chatId: 'chat', rootMessageId: null, workerGeneration: 3, workerAlive: true,
+        turnId: 'turn', safeToSuspend: false, resourceOwned: true }),
+      suspend: async () => false });
+    const waiting = manager.wait({ ...input, timeoutMs: 0 }, origin);
+    await vi.waitFor(() => expect(broker.card()).toBeDefined());
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'retire', reason: 'MR closed' };
+    broker.failStrict(true);
+    await expect(control.retire(request)).rejects.toThrow('retirement write failed');
+    broker.failStrict(false);
+    expect(control.inspect(request)).toMatchObject({ status: 'retiring', operationId: 'retire' });
+    expect(control.describe(request)).toMatchObject({ status: 'retiring' });
+    expect(tryResolveAsk({ askId: broker.card().askId, nonce: broker.card().nonce, selected: 'yes', by: 'human' })).toBe('accepted');
+    await expect(waiting).resolves.toEqual(answer);
+    expect(control.inspect(request)).toMatchObject({ status: 'answered', result: answer });
+    await expect(control.retire(request)).resolves.toMatchObject({ status: 'answered' });
+  });
+
+  it('records a retirement on a decision another path already invalidated so the same operation can release', async () => {
+    const fixture = setup();
+    const broker = brokerFixture(fixture.deps.dir);
+    const origin = { turnId: 'turn', workerGeneration: 3 };
+    const manager = createExplicitAskContinuation({ ...fixture.deps, register: registerHostAsk,
+      retire: retireExplicitAsk, snapshot: explicitAskSnapshot, releaseHandoff: releaseExplicitAskHandoff });
+    let alive = true;
+    let suspends = 0;
+    const control = createManagedAskControl({ appId: 'app', inspect: manager.inspect, describe: manager.describe,
+      retire: manager.retire, snapshot: receipt => explicitAskSnapshot(receipt.input),
+      session: () => ({ larkAppId: 'app', chatId: 'chat', rootMessageId: null, workerGeneration: 3, workerAlive: alive,
+        safeToSuspend: true, resourceOwned: true, suspensionConfirmed: !alive,
+        terminalExecutionKeys: [managedAskOriginKey(origin)] }),
+      suspend: async () => { suspends++; alive = false; return true; } });
+    const waitingInput = { ...input, timeoutMs: 0 };
+    const waiting = manager.wait(waitingInput, origin);
+    await vi.waitFor(() => expect(broker.card()).toBeDefined());
+    invalidateExplicitAsk(waitingInput, 'binding changed');
+    await expect(waiting).resolves.toMatchObject({ kind: 'invalidated', reason: 'binding changed' });
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'retire', reason: 'MR closed' };
+    await expect(control.retire(request)).resolves.toMatchObject({ status: 'draining', operationId: 'retire',
+      result: { kind: 'invalidated', reason: 'binding changed' } });
+    await expect(control.retire(request)).resolves.toMatchObject({ status: 'draining', operationId: 'retire' });
+    await expect(control.retire({ ...request, operationId: 'another' })).rejects.toThrow('conflict');
+    await expect(control.release(request)).resolves.toMatchObject({ status: 'suspended' });
+    await expect(control.release(request)).resolves.toMatchObject({ status: 'suspended' });
+    expect(suspends).toBe(1);
+  });
+
+  it('durably takes over an answer that beat an interrupted retirement even while retirement authority is unavailable', async () => {
+    const fixture = setup();
+    const broker = brokerFixture(fixture.deps.dir);
+    const waitingInput = { ...input, timeoutMs: 0 };
+    const origin = { turnId: 'turn', workerGeneration: 3 };
+    const manager = createExplicitAskContinuation({ ...fixture.deps, snapshot: explicitAskSnapshot, retire: retireExplicitAsk,
+      releaseHandoff: releaseExplicitAskHandoff,
+      register: async value => { await registerHostAsk(value); throw new Error('caller lost'); } });
+    const waiting = manager.wait(waitingInput, origin);
+    await vi.waitFor(() => expect(broker.card()).toBeDefined());
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'retire', reason: 'MR closed' };
+    broker.failStrict(true);
+    expect(() => manager.retire(request)).toThrow('retirement write failed');
+    broker.failStrict(false);
+    expect(tryResolveAsk({ askId: broker.card().askId, nonce: broker.card().nonce, selected: 'yes', by: 'human' })).toBe('accepted');
+    await expect(waiting).rejects.toThrow('caller lost');
+    broker.restart();
+    // Sessions are not restored yet: neither retirement nor ordinary recovery may act.
+    const restored = createExplicitAskContinuation({ ...fixture.deps, canRetire: () => false, canResume: () => false,
+      register: registerHostAsk, retire: retireExplicitAsk, snapshot: explicitAskSnapshot, releaseHandoff: releaseExplicitAskHandoff });
+    await restored.sweep();
+    expect(broker.store.list()).toHaveLength(0);
+    broker.restart();
+    expect(restored.inspect(request).result).toEqual(answer);
+    expect(fixture.dispatch).not.toHaveBeenCalled();
   });
   it('describes a registered invocation for host discovery without granting mutation authority', async () => {
     const fixture = setup();

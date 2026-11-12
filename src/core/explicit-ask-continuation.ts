@@ -137,21 +137,29 @@ export function createExplicitAskContinuation(deps: {
     return receipt;
   }
   function retire(control: ExplicitAskRetirement): ExplicitAskReceipt {
-    let receipt = inspect(control);
-    if (receipt.retirement && (receipt.retirement.operationId !== control.operationId
-      || receipt.retirement.reason !== control.reason)) throw new Error('explicit Ask retirement conflict');
-    if (receipt.result) return receipt;
+    const current = inspect(control);
+    if (current.retirement && (current.retirement.operationId !== control.operationId
+      || current.retirement.reason !== control.reason)) throw new Error('explicit Ask retirement conflict');
+    if (current.result?.kind === 'answered') return current;
     if (!deps.retire) throw new Error('explicit Ask retirement unsupported');
-    if (!deps.canRetire?.(receipt)) throw new Error('explicit Ask retirement authority conflict');
-    const key = keyFor(receipt.input);
-    receipt = { ...receipt, retirement: receipt.retirement ?? {
-      operationId: control.operationId, reason: control.reason, requestedAt: now(),
-    } };
-    write(key, receipt);
-    const result = deps.retire(receipt.input, control.reason);
-    if (!result) throw new Error('explicit Ask handoff unavailable');
-    const latest = read(key)!;
-    if (!latest.result) write(key, { ...latest, result, settledAt: now() });
+    if (!deps.canRetire?.(current)) throw new Error('explicit Ask retirement authority conflict');
+    const key = keyFor(current.input);
+    const stored = read(key)!;
+    // A decision another path already invalidated (session rebound, handoff
+    // missing) is void either way: record this operation so the same
+    // retirement can release, without a second broker settlement.
+    if (!stored.retirement) {
+      write(key, { ...stored, retirement: { operationId: control.operationId, reason: control.reason, requestedAt: now() } });
+    }
+    if (!stored.result) {
+      const result = deps.retire(stored.input, control.reason);
+      if (!result) throw new Error('explicit Ask handoff unavailable');
+      const latest = read(key)!;
+      if (!latest.result) write(key, { ...latest, result, settledAt: now() });
+      // The receipt now durably owns the terminal result; drop the broker's
+      // host_explicit handoff exactly like a settled wait() does.
+      deps.releaseHandoff?.(stored.input);
+    }
     return inspect(control);
   }
   /** presentation 只影响首次发卡位置和点名；重连保持原始回执与冻结卡片授权。 */
@@ -213,12 +221,20 @@ export function createExplicitAskContinuation(deps: {
               const winner = deps.snapshot?.(receipt.input)?.result;
               if (winner?.kind === 'answered') {
                 write(key, { ...receipt, result: winner, settledAt: now() });
+                deps.releaseHandoff?.(receipt.input);
                 continue;
               }
-              if (!deps.canRetire?.(receipt)) continue;
-              const result = deps.retire(receipt.input, receipt.retirement.reason);
-              if (result) write(key, { ...receipt, result, settledAt: now() });
-              continue;
+              if (deps.canRetire?.(receipt)) {
+                const result = deps.retire(receipt.input, receipt.retirement.reason);
+                if (result) {
+                  write(key, { ...receipt, result, settledAt: now() });
+                  deps.releaseHandoff?.(receipt.input);
+                }
+                continue;
+              }
+              // No longer bound (session closed or rebound): an unfinished
+              // retirement must not keep the card live forever. Fall through
+              // to the ordinary no-deadline invalidation below.
             }
             if (receipt.input.timeoutMs === 0 && deps.shouldInvalidate?.(receipt) && deps.invalidate) {
               deps.invalidate(receipt.input, 'explicit Ask session closed or binding changed');
@@ -260,6 +276,18 @@ export function explicitAskSessionBound(
 ): boolean {
   return !!session && session.larkAppId === ask.larkAppId && session.chatId === ask.chatId
     && (session.session.scope === 'chat' ? null : session.session.rootMessageId) === ask.rootMessageId;
+}
+
+/** Retirement authority (live control and the durable sweep alike): the
+ * receipt carries a daemon-observed origin and its exact routing binding is
+ * still the live session's. Worker generation and execution ownership are
+ * deliberately not required — retiring only invalidates the decision, and a
+ * daemon restart or refork always replaces both. */
+export function explicitAskRetirementBound(
+  receipt: ExplicitAskReceipt,
+  session: Parameters<typeof explicitAskSessionBound>[1],
+): boolean {
+  return !!receipt.origin && explicitAskSessionBound(receipt.input, session);
 }
 
 /** The daemon must compare against its live worker authority, not CLI stdout. */
