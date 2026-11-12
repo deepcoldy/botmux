@@ -284,6 +284,77 @@ describe('streaming card authority across same-worker runtime continuations and 
     });
   });
 
+  it('retains a turn-less ready card (no execution scope) when the same worker continues its runtime mid-POST', async () => {
+    // A worker spawned without an opening prompt reports ready with no turnId,
+    // so the admitted event carries only a runtime scope. A ready with a turnId
+    // gets an execution attached on admission and exercises a different branch.
+    const controller = controllerForSession(ds, true)!;
+    closeStores.push(() => controller.store.close());
+    ds.initConfig = { sessionContract: controller.bindWorker(1) } as any;
+    const worker = createFakeWorker();
+    ds.worker = worker as any;
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    setupWorkerHandlers(ds, worker as any, undefined, 1);
+    const workerRef = controller.store.read(controller.ref)!.worker!;
+    const r1 = controller.reserveBinding('b1-turnless', workerRef);
+    controller.bindRuntime('b1-turnless', workerRef, {
+      backend: 'tmux',
+      physicalId: '100:turnlessLauncher',
+      proof: 'process_start',
+    });
+
+    let resolvePost!: (value: { code: number; data: { message_id: string } }) => void;
+    let postInFlight = false;
+    mocks.reply.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          postInFlight = true;
+          resolvePost = resolve;
+        }),
+    );
+
+    const readyPromise = worker.listeners('message')[0]({
+      type: 'ready',
+      port: 9999,
+      token: 'fixture',
+      sessionContract: {
+        version: 2,
+        session: controller.ref,
+        producer: workerRef,
+        bindingId: 'b1-turnless',
+        eventId: `${workerRef.workerId}:1`,
+        sequence: 1,
+        scope: { runtime: r1 },
+      },
+    });
+
+    await vi.waitFor(() => expect(postInFlight).toBe(true));
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+
+    controller.reserveBinding('b2-turnless-leaf', workerRef);
+    const bound2 = controller.bindRuntime(
+      'b2-turnless-leaf',
+      workerRef,
+      {
+        backend: 'tmux',
+        physicalId: '200:turnlessLeaf',
+        nativeSessionId: 'conv-turnless',
+        proof: 'process_start',
+      },
+      undefined,
+      'b1-turnless',
+    );
+    expect(controller.currentRuntime()).toEqual(bound2.ref);
+
+    resolvePost({ code: 0, data: { message_id: 'om_card_turnless' } });
+    await readyPromise;
+
+    expect(mocks.delete).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_card_turnless');
+    expect(ds.session.streamCardId).toBe('om_card_turnless');
+  });
+
   it('retains the initial ready streaming card even when the opening turn already bound to the continued runtime before ready POST resolves', async () => {
     const controller = controllerForSession(ds, true)!;
     closeStores.push(() => controller.store.close());
