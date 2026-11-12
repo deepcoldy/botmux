@@ -429,3 +429,303 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
     expect(ensureAntigravityCotReader).not.toHaveBeenCalled();
   });
 });
+
+// A pid above Linux's pid_max: the real /proc scan behind it can never match a
+// live process, so only the injected probes below decide what a "pid lookup" sees.
+const AGY_PID = 2_147_483_000;
+const STARTUP_LOG_LINE = 'I1112 12:10:53.869907 192 server.go:3092] ListConversations: cache miss for 62 conversations\n';
+const streamingLine = (cid: string) => `I1112 12:11:00.848983 2322 conversation_manager.go:1044] Streaming conversation ${cid}\n`;
+
+describe('Antigravity bridge ticker and spawn observer honor the adapter session authority', () => {
+  let root: string;
+  let previousHome: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'bmx-agy-ticker-'));
+    previousHome = process.env.HOME;
+    process.env.HOME = root;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Fresh-launch adapter whose native log is in agy's startup window: written,
+   *  but no `Streaming conversation` yet (real agy 1.5.4 opens a sibling DB
+   *  for ~25ms in exactly this window). */
+  async function startupAdapter() {
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    const args = adapter.buildArgs({ sessionId: 'b3f0c0de-0000-4000-8000-000000000001', resume: false, reattach: false });
+    const logPath = args[args.indexOf('--log-file') + 1]!;
+    writeFileSync(logPath, STARTUP_LOG_LINE);
+    return { adapter, logPath };
+  }
+
+  /** The real worker bridge functions (notify, attach, detach, ingest and the
+   *  1s ticker) against real transcript files and a real attribution queue.
+   *  Only the clock source, the pid probe and the native-log authority are
+   *  injected. */
+  function bridgeHarness(cliAdapter: Record<string, any>, pidProbePath?: () => string | undefined) {
+    const brainDir = join(root, '.gemini', 'antigravity-cli', 'brain');
+    const makeTranscript = (cid: string): string => {
+      const dir = join(brainDir, cid, '.system_generated', 'logs');
+      mkdirSync(dir, { recursive: true });
+      const fullPath = join(dir, 'transcript_full.jsonl');
+      writeFileSync(fullPath, '');
+      return fullPath;
+    };
+    const emittedFinals: Array<{ turnId: string; text: string }> = [];
+    const pidLookups: number[] = [];
+    const queue = new CodexBridgeQueue(() => Date.now());
+    let tickCallback: (() => void) | undefined;
+    const scope: Record<string, any> = {
+      codexBridgeTimer: undefined,
+      codexBridgeRolloutPath: undefined,
+      codexBridgeOffset: 0,
+      codexBridgePendingTail: '',
+      codexBridgeBaselineDone: false,
+      codexBridgeWatcher: null,
+      codexBridgePendingSessionId: undefined,
+      codexBridgeUnprovenSession: undefined,
+      codexAdoptPendingPid: undefined,
+      structuredBridgeRecoveryAttempted: false,
+      structuredBridgeDriverState: undefined,
+      ompQuietCandidateKey: undefined,
+      ompQuietCandidateCompleteOffset: undefined,
+      antigravityQuietCandidateKey: undefined,
+      antigravityQuietCandidateCompleteOffset: undefined,
+      antigravityFullUpgradeAttemptKey: undefined,
+      antigravitySpawnStartMs: Date.now(),
+      lastSpawnEffectiveResume: false,
+      lastInitConfig: { cliId: 'antigravity', workingDir: root },
+      cliAdapter,
+      isPromptReady: true,
+      codexBridgeQueue: queue,
+      codexSubagentLimitTracker: { clear: () => {}, observe: () => {}, poll: () => [] },
+      codexServiceTierTracker: { bind: () => {}, observe: () => {} },
+      rpcTurnsAwaitingActivation: new Map(),
+      rpcTranscriptIngestBlockedByAwaitingActivation: () => false,
+      structuredBridgeIs: (id: string) => id === 'antigravity',
+      bridgeSpecFor: (id?: string) => (id === 'antigravity' ? { stateCommit: 'ingest' } : undefined),
+      codexBridgeFallbackActive: () => true,
+      nativeSessionForkPending: () => false,
+      currentAntigravityObservedPid: () => AGY_PID,
+      resolveFileBridgePath: (_cliId: string, opts: { sessionId?: string; pid?: number }) => {
+        if (opts.sessionId) return resolveAntigravityTranscriptPath(opts.sessionId, { brainDir }) ?? undefined;
+        if (opts.pid) {
+          pidLookups.push(opts.pid);
+          return pidProbePath?.();
+        }
+        return undefined;
+      },
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
+        const res = drainAntigravityTranscript(
+          path,
+          offset,
+          (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
+          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+        );
+        return { ...res, state: res.state };
+      },
+      decideAntigravityNotifyAction,
+      decideAntigravityTickerAction,
+      decideAntigravityFullUpgrade,
+      antigravityRecoveryBindPath,
+      mapAntigravityCompactOffsetToFull,
+      existsSync,
+      statSync,
+      fsWatch: () => ({ close: () => {} }),
+      setInterval: (callback: () => void, interval: number) => {
+        expect(interval).toBe(1_000);
+        tickCallback = callback;
+        return 1;
+      },
+      // The quiet-tick flush and the compact→full upgrade are separate,
+      // already-tested policies; the rebind decision under test runs before both.
+      maybeUpgradeAntigravityBridgeToFull: () => {},
+      maybeFlushAntigravityTrailingFinalOnQuietTick: () => {},
+      checkpointStructuredBridgeRecovery: () => {},
+      observeStructuredBackgroundTasks: () => {},
+      noteSpawnArgvTurnStartTranscriptEvidence: () => {},
+      pruneExpiredStructuredHeadsAndEmit: () => false,
+      emitReadyCodexTurns: () => {
+        for (const ready of queue.drainEmittable()) {
+          if (ready.finalText !== undefined) emittedFinals.push({ turnId: ready.turnId, text: ready.finalText });
+        }
+      },
+      idleDetector: { fireIdle: vi.fn() },
+      OrcaBackend: class {},
+      backend: null,
+      log: vi.fn(),
+    };
+    scope.antigravityLateAttachMode = loadWorkerFunction('antigravityLateAttachMode', scope);
+    scope.codexBridgeDetachFile = loadWorkerFunction('codexBridgeDetachFile', scope);
+    scope.codexBridgeAttach = loadWorkerFunction('codexBridgeAttach', scope);
+    scope.codexBridgeIngest = loadWorkerFunction('codexBridgeIngest', scope);
+    scope.codexBridgeStartTimer = loadWorkerFunction('codexBridgeStartTimer', scope);
+    const notify = loadWorkerFunction<(sid: string) => void>('codexBridgeNotifyCliSessionId', scope);
+    const tick = () => {
+      if (!tickCallback) throw new Error('bridge ticker was not armed');
+      tickCallback();
+      expect(scope.log.mock.calls.filter(([message]: [string]) => /tick error/.test(message))).toEqual([]);
+    };
+    const flushQuietFinal = () => {
+      scope.codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+      scope.emitReadyCodexTurns();
+    };
+    return { scope, queue, emittedFinals, pidLookups, makeTranscript, notify, tick, flushQuietFinal };
+  }
+
+  it('ticker stays unbound through the startup window instead of pid-probing a sibling DB, then binds the streamed conversation', async () => {
+    const { adapter, logPath } = await startupAdapter();
+    // What a /proc fd probe of agy sees in that window: one sibling DB.
+    let siblingPath: string | undefined;
+    const h = bridgeHarness(adapter, () => siblingPath);
+    siblingPath = h.makeTranscript(SIBLING_ID);
+    h.scope.codexBridgeStartTimer();
+
+    // Our first turn is queued while a sibling agy in the same workspace
+    // happens to record the identical prompt and its own answer.
+    h.queue.mark('om_first', '继续', Date.now());
+    writeAntigravityUserStep(siblingPath, 1, '继续');
+    writeAntigravityFinalStep(siblingPath, 2, 'WRONG_SIBLING_FINAL');
+    for (let i = 0; i < 3; i++) h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBeUndefined();
+    expect(h.pidLookups).toEqual([]);
+    expect(h.queue.peek()[0]?.started).toBe(false);
+
+    // agy creates our conversation on submit and logs it; the transcript follows.
+    appendFileSync(logPath, streamingLine(REAL_ID));
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, '继续');
+    writeAntigravityFinalStep(realPath, 2, 'CORRECT_REAL_FINAL');
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.queue.peek()[0]?.started).toBe(true);
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'om_first', text: 'CORRECT_REAL_FINAL' }]);
+    expect(h.pidLookups).toEqual([]);
+  });
+
+  it('spawn observer neither persists nor binds a pid-probed sibling during the startup window', async () => {
+    const { adapter, logPath } = await startupAdapter();
+    const timers: Array<() => void> = [];
+    const pidProbe = vi.fn(() => SIBLING_ID);
+    const persistCliSessionId = vi.fn();
+    const ensureAntigravityCotReader = vi.fn();
+    const codexBridgeNotifyCliSessionId = vi.fn();
+    const backend = { getChildPid: () => AGY_PID };
+    const scope: Record<string, any> = {
+      cliAdapter: adapter,
+      lastInitConfig: { cliId: 'antigravity', workingDir: root },
+      backend,
+      lastSpawnEffectiveResume: false,
+      lastSpawnEffectiveCliSessionId: undefined,
+      nativeSessionForkPending: () => false,
+      findLaunchedCliPid: () => AGY_PID,
+      findAntigravityConversationIdByPid: pidProbe,
+      persistCliSessionId,
+      ensureAntigravityCotReader,
+      codexBridgeFallbackActive: () => true,
+      codexBridgeNotifyCliSessionId,
+      setTimeout: (callback: () => void) => { timers.push(callback); return timers.length; },
+      log: vi.fn(),
+    };
+    const runNextTimer = () => {
+      const next = timers.shift();
+      if (!next) throw new Error('observer stopped polling');
+      next();
+    };
+    loadWorkerFunction<(pid: number, label?: string) => void>('observeAntigravityCliSessionId', scope)(AGY_PID, 'spawn');
+
+    for (let i = 0; i < 4; i++) runNextTimer();
+    expect(pidProbe).not.toHaveBeenCalled();
+    expect(persistCliSessionId).not.toHaveBeenCalled();
+    expect(codexBridgeNotifyCliSessionId).not.toHaveBeenCalled();
+    expect(timers).toHaveLength(1);
+
+    appendFileSync(logPath, streamingLine(REAL_ID));
+    runNextTimer();
+    expect(persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(codexBridgeNotifyCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(timers).toEqual([]);
+    expect(pidProbe).not.toHaveBeenCalled();
+  });
+
+  it('ticker late-rotation to a lazily created transcript drops a misbound sibling without draining it', () => {
+    let streamingId: string | undefined = SIBLING_ID;
+    const h = bridgeHarness({ resolveActiveSessionId: () => streamingId });
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    expect(h.scope.codexBridgeRolloutPath).toBe(siblingPath);
+
+    h.queue.mark('om_turn', '继续', Date.now());
+    streamingId = REAL_ID;
+    h.notify(REAL_ID);
+    expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+
+    // While our brain file does not exist yet, the sibling keeps writing.
+    writeAntigravityUserStep(siblingPath, 1, '继续');
+    writeAntigravityFinalStep(siblingPath, 2, 'WRONG_SIBLING_FINAL');
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(siblingPath);
+    expect(h.queue.peek()[0]?.started).toBe(false);
+
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, '继续');
+    writeAntigravityFinalStep(realPath, 2, 'CORRECT_REAL_FINAL');
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.scope.codexBridgePendingSessionId).toBeUndefined();
+    expect(h.emittedFinals).toEqual([]);
+    expect(h.queue.peek()[0]?.started).toBe(true);
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'om_turn', text: 'CORRECT_REAL_FINAL' }]);
+  });
+
+  it('ticker late-rotation after a real /new still releases the retired conversation\'s held final', () => {
+    const OLD_ID = '0f6a2c1e-1111-4222-8333-444455556666';
+    const NEW_ID = '7d1e9b30-aaaa-4bbb-8ccc-dddd00001111';
+    let streamingId: string | undefined = OLD_ID;
+    const h = bridgeHarness({ resolveActiveSessionId: () => streamingId });
+    const oldPath = h.makeTranscript(OLD_ID);
+    h.notify(OLD_ID);
+    h.scope.codexBridgeStartTimer();
+    expect(h.scope.codexBridgeRolloutPath).toBe(oldPath);
+
+    // The previous turn's answer is on disk but still provisional (held in
+    // driver state until a quiet tick) when the user runs /new.
+    h.queue.mark('om_before_new', 'before-new-prompt', Date.now());
+    writeAntigravityUserStep(oldPath, 1, 'before-new-prompt');
+    writeAntigravityFinalStep(oldPath, 2, 'HELD_OLD_FINAL');
+    h.tick();
+    expect(h.queue.peek()[0]?.started).toBe(true);
+    expect(h.emittedFinals).toEqual([]);
+
+    // /new switches agy's stream immediately; the next Lark turn reports the
+    // new id before its brain file exists.
+    streamingId = NEW_ID;
+    h.queue.mark('om_after_new', 'after-new-prompt', Date.now());
+    h.notify(NEW_ID);
+    expect(h.scope.codexBridgePendingSessionId).toBe(NEW_ID);
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(oldPath);
+
+    const newPath = h.makeTranscript(NEW_ID);
+    writeAntigravityUserStep(newPath, 1, 'after-new-prompt');
+    writeAntigravityFinalStep(newPath, 2, 'AFTER_NEW_FINAL');
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(newPath);
+    expect(h.emittedFinals).toEqual([{ turnId: 'om_before_new', text: 'HELD_OLD_FINAL' }]);
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([
+      { turnId: 'om_before_new', text: 'HELD_OLD_FINAL' },
+      { turnId: 'om_after_new', text: 'AFTER_NEW_FINAL' },
+    ]);
+  });
+});
