@@ -61,6 +61,8 @@ export async function resolveReplyImages(
   options: {
     workingDir: string;
     allowTemporaryImages?: boolean;
+    /** Doubao native galleries can contain twelve comparison screenshots. */
+    maxImages?: 8 | 16;
     state: ReplyImageState;
     upload: (bytes: Buffer) => Promise<string>;
     owns: () => boolean;
@@ -89,7 +91,7 @@ export async function resolveReplyImages(
     if (!options.owns()) return;
     const existing = uploads.get(source);
     if (existing) return existing;
-    if ((options.state.uploadCount ?? 0) >= MAX_REPLY_IMAGES) return;
+    if ((options.state.uploadCount ?? 0) >= (options.maxImages ?? MAX_REPLY_IMAGES)) return;
     const pending = (async () => {
       try {
         const image = readWorkspaceImage(root, options.workingDir, source, temporaryRoots);

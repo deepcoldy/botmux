@@ -194,4 +194,18 @@ describe('automatic reply image upload', () => {
     expect(output.match(/img_v3_test_upload/g)).toHaveLength(8);
     expect(output).toContain('![Image 9](tmp/9.png)');
   });
+
+  it('allows a bounded sixteen-image budget for a Doubao gallery without changing the default', async () => {
+    const images = Array.from({ length: 18 }, (_, i) => {
+      vol.writeFileSync(`${root}/tmp/${i}.png`, png);
+      return `![Image ${i}](tmp/${i}.png)`;
+    }).join('\n\n');
+    const options = { ...fixture(), maxImages: 16 as const };
+    const output = await resolveReplyImages(images, options);
+    expect(options.upload).toHaveBeenCalledTimes(16);
+    expect(output.match(/img_v3_test_upload/g)).toHaveLength(16);
+    expect(output).toContain('![Image 17](tmp/17.png)');
+    expect(await resolveReplyImages(images, options)).toBe(output);
+    expect(options.upload).toHaveBeenCalledTimes(16);
+  });
 });

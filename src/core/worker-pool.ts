@@ -189,6 +189,7 @@ import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delive
 import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
+import { normalizeDoubaoReplyImages } from '../services/doubao-rich-media.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
@@ -548,20 +549,24 @@ function prepareLocalReplyImages(
 ): Promise<string> {
   const botCfg = getBot(ds.larkAppId).config;
   const workingDir = ds.workingDir ?? ds.session.workingDir ?? ds.adoptedFrom?.cwd;
-  const codexApp = isCodexAppCliId(sessionCliId(ds, botCfg));
+  const cliId = sessionCliId(ds, botCfg);
+  const codexApp = isCodexAppCliId(cliId);
+  const doubao = cliId === 'doubao';
+  if (doubao) markdown = normalizeDoubaoReplyImages(markdown);
   // Temporary-image roots (os.tmpdir() + POSIX /tmp) are computed from the
   // DAEMON's environment. A worker pins its own TMPDIR/TMP/TEMP to its
   // per-session scratch dir (~/.cache/botmux/session-tmp/…); images a CLI only
   // ever writes under that worker TMPDIR stay outside this allowlist and are
   // left as text. That is intentional (the scratch dir is not a stable host
   // location) and degrades to the permanent-rejection notice below.
-  if (!(ds.adoptedFrom || ds.session.adoptedFrom || codexApp) || !workingDir || ds.session.vcMeetingReceiver
+  if (!(ds.adoptedFrom || ds.session.adoptedFrom || codexApp || doubao) || !workingDir || ds.session.vcMeetingReceiver
     || botCfg.apiOnly || daemonCardLocalHomeLinkMode(ds) !== 'filesystem'
     || sandboxBoolValue(ds.session.sandbox ?? ds.initConfig?.sandbox ?? botCfg.sandbox)
     || (ds.initConfig?.readIsolation ?? botCfg.readIsolation)) return Promise.resolve(markdown);
   return resolveReplyImages(markdown, {
     workingDir, state,
-    allowTemporaryImages: codexApp,
+    allowTemporaryImages: codexApp || doubao,
+    maxImages: doubao ? 16 : 8,
     owns: () => owns() && ds.session.status !== 'closed',
     upload: bytes => uploadImage(ds.larkAppId, bytes),
   });
