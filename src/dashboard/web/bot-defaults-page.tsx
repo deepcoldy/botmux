@@ -1,4 +1,5 @@
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
+import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
 import type { OncallGroupPolicy } from '../../services/oncall-group-policy.js';
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
@@ -9387,15 +9388,21 @@ export function NativeSlashCommandRegistration(props: { bot: BotDefaultsRow }) {
   );
 }
 
-function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+  const [commandDraft, setCommandDraft] = useState('');
+  const [commandError, setCommandError] = useState('');
+  const commandHelpId = useId();
+  const commandTags = parseCustomPassthroughInput(passthrough);
   const [canTalk, setCanTalk] = useState(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setPassthrough(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+    setCommandDraft('');
+    setCommandError('');
   }, [props.bot.customPassthroughCommands]);
   // 分开两个 effect：只让「被保存的那个字段」的 prop 变化重置对应输入框，否则保存
   // 一个字段触发 patchBot 重渲染会连带把另一个字段的未保存草稿一并清空。
@@ -9403,9 +9410,26 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
     setCanTalk(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
   }, [props.bot.canTalkDaemonCommands]);
 
+  function commitCommandDraft(text = commandDraft): string | null {
+    if (!text.trim()) return passthrough;
+    const entries = text.trim().split(/[,;\r\n]+|\s+(?=\/)/).map(entry => entry.trim()).filter(Boolean);
+    const normalized = entries.map(entry => normalizePassthroughCommand(entry.startsWith('/') ? entry : `/${entry}`));
+    if (!entries.length || normalized.some(command => !command)) {
+      setCommandError(tr('botDefaults.commandTagInvalid'));
+      return null;
+    }
+    const next = [...new Set([...commandTags, ...normalized as string[]])].join(' ');
+    setPassthrough(next);
+    setCommandDraft('');
+    setCommandError('');
+    return next;
+  }
+
   async function savePassthrough(): Promise<void> {
+    const commands = commitCommandDraft();
+    if (commands === null) return;
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: passthrough }),
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: commands }),
       setStatus,
       setBusy: on => setBusy(on ? 'passthrough' : null),
       saved: tr('botDefaults.cardPrefSaved'),
@@ -9437,14 +9461,52 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
       <NativeSlashCommandRegistration bot={props.bot} />
       <div className="bd-subsection">
         <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
-        <textarea
-          data-input="customPassthroughCommands"
-          rows={2}
-          placeholder={tr('botDefaults.customPassthroughPlaceholder')}
-          value={passthrough}
-          disabled={busy === 'passthrough'}
-          onChange={event => setPassthrough(event.currentTarget.value)}
-        />
+        {props.bot.defaultPassthroughCommands?.length ? (
+          <div data-default-passthrough-commands="">
+            <p>{tr('botDefaults.defaultPassthrough')}</p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+              {props.bot.defaultPassthroughCommands.map(command => <code key={command}>{command}</code>)}
+            </div>
+          </div>
+        ) : null}
+        <p>{tr('botDefaults.customPassthroughInputHelp')}</p>
+        <div className={`bd-command-tags${busy === 'passthrough' ? ' is-disabled' : ''}`}>
+          {commandTags.map(command => (
+            <span className="bd-command-tag" key={command} data-command-tag={command}>
+              <code>{command}</code>
+              <button type="button" disabled={busy === 'passthrough'} data-remove-command={command}
+                aria-label={tr('botDefaults.commandTagRemove', { command })}
+                onClick={() => setPassthrough(commandTags.filter(value => value !== command).join(' '))}>×</button>
+            </span>
+          ))}
+          <input data-input="customPassthroughCommands" type="text" value={commandDraft}
+            aria-label={tr('botDefaults.customPassthrough')} aria-describedby={commandHelpId} aria-invalid={!!commandError}
+            placeholder={tr('botDefaults.customPassthroughPlaceholder')} disabled={busy === 'passthrough'}
+            onChange={event => { setCommandDraft(event.currentTarget.value); setCommandError(''); }}
+            onBlur={() => { if (busy !== 'passthrough') commitCommandDraft(); }}
+            onKeyDown={event => {
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === 'Enter' || event.key === ',' || event.key === ';') {
+                event.preventDefault(); commitCommandDraft();
+              } else if (event.key === 'Tab' && commandDraft.trim()) {
+                commitCommandDraft();
+              } else if (event.key === 'Backspace' && !commandDraft && commandTags.length) {
+                event.preventDefault(); setPassthrough(commandTags.slice(0, -1).join(' '));
+              }
+            }}
+            onPaste={event => {
+              const text = event.clipboardData.getData('text');
+              if (/[,;\r\n]|\s+\//.test(text)) {
+                event.preventDefault();
+                const start = event.currentTarget.selectionStart ?? commandDraft.length;
+                const end = event.currentTarget.selectionEnd ?? start;
+                const next = commandDraft.slice(0, start) + text + commandDraft.slice(end);
+                if (commitCommandDraft(next) === null) setCommandDraft(next);
+              }
+            }} />
+        </div>
+        <p className="bd-section-note" id={commandHelpId}>{tr('botDefaults.commandTagHelp')}</p>
+        {commandError ? <p role="alert" className="bd-command-error">{commandError}</p> : null}
         <div className="actions">
           <button type="button" className="primary" data-action="save-custom-passthrough" disabled={busy === 'passthrough'} onClick={() => void savePassthrough()}>{tr('botDefaults.customPassthroughSave')}</button>
         </div>

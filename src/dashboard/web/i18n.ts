@@ -5,6 +5,11 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  'botDefaults.commandTagHelp': '输入命令后按 Enter、逗号或 Tab 生成标签，也可粘贴多个命令。点击 × 删除；空输入框按退格删除最后一项。',
+  'botDefaults.commandTagInvalid': '请输入有效的 CLI 命令名；不能与 botmux 自身命令冲突。',
+  'botDefaults.commandTagRemove': '移除命令 {command}',
+  'botDefaults.defaultPassthrough': '当前 CLI 的默认透传命令',
+  'botDefaults.customPassthroughInputHelp': '这里只配置额外的命令名，例如 /goal、/export。参数在会话里填写，匹配名单后完整命令直接交给 CLI。',
   'feedback.storage.tokenSource': 'Token 来源',
   'feedback.storage.staticToken': '静态 Token / 引用',
   'feedback.storage.doasToken': 'doas 动态获取',
@@ -4790,6 +4795,11 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'botDefaults.commandTagHelp': 'Press Enter, comma, or Tab to create a tag, or paste multiple commands. Use × to remove a tag; Backspace in an empty input removes the last tag.',
+  'botDefaults.commandTagInvalid': 'Enter a valid CLI command name that does not conflict with a botmux command.',
+  'botDefaults.commandTagRemove': 'Remove command {command}',
+  'botDefaults.defaultPassthrough': 'Default passthrough commands for the current CLI',
+  'botDefaults.customPassthroughInputHelp': 'Configure extra command names here, such as /goal and /export. Enter arguments in the conversation; matching commands are delivered directly to the CLI.',
   'feedback.storage.tokenSource': 'Token source',
   'feedback.storage.staticToken': 'Static token / reference',
   'feedback.storage.doasToken': 'Dynamic doas',

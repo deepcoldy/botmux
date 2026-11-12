@@ -557,6 +557,7 @@ export type BotDefaultsRow = {
   } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
+  defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;

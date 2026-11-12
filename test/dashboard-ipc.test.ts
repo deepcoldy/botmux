@@ -13542,3 +13542,18 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
     } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });
 });
+
+describe('Dashboard default CLI passthrough configuration', () => {
+  it('reads native defaults separately from custom command names', async () => {
+    const appId = 'app_passthrough_defaults';
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', cliId: 'traex', customPassthroughCommands: ['/export'] });
+    setLarkAppId(appId);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.defaultPassthroughCommands).toContain('/goal');
+    expect(body.defaultPassthroughCommands).not.toContain('/export');
+    expect(body.customPassthroughCommands).toBe('/export');
+  });
+});

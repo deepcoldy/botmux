@@ -10026,6 +10026,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     residentSessionCount,
     dormantSessionCount,
     startupCommands,
+    defaultPassthroughCommands: [...resolvePassthroughCommands(cachedLarkAppId, undefined, false)],
     customPassthroughCommands,
     canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',

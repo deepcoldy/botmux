@@ -302,7 +302,7 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
  * cycle). Re-exported here so existing callers are unaffected. */
 export { cliHasNoRawPassthroughSurface } from './passthrough-commands.js';
 
-export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
+export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string, includeCustom = true): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
   // Resolve the EFFECTIVE CLI once and thread it through every layer below
@@ -336,7 +336,7 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
     effective.add(c);
   }
   try {
-    for (const c of getBot(larkAppId).config.customPassthroughCommands ?? []) {
+    for (const c of includeCustom ? getBot(larkAppId).config.customPassthroughCommands ?? [] : []) {
       const normalized = normalizePassthroughCommand(c);
       if (normalized) effective.add(normalized);
     }
