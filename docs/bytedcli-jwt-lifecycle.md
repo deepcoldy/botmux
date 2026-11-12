@@ -1,8 +1,8 @@
 # 按人 ByteCloud JWT 的区域与续期
 
-开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；签票材料来自宿主按人登录目录，而包装器执行命令时使用会话 scratch 内的按人空 HOME；两者不共享 SDK 登录。包装器按规范 `--site value`、`--site=value` 或 `BYTEDCLI_CLOUD_SITE` 选择对应区域，原始参数保持不变；显式参数优先于环境变量。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx。区域材料不以内部变量名传给子进程；claim 不符的签票结果被丢弃。
+开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；签票材料来自宿主按人登录目录，而包装器执行命令时使用会话 scratch 内的按人空 HOME；两者不共享 SDK 登录。包装器按 bytedcli 0.191 的读法认站点并选择对应区域，原始参数保持不变：`--site value` / `--site=value` 与等价写法 `--cloud-site`（最后一个生效），显式参数优先于 `BYTEDCLI_CLOUD_SITE`，但空的 `--site` 视为未给、由环境变量决定；取值两端的空白（含 JS `trim()` 会去掉的 Unicode 空白）被去掉后再大小写不敏感匹配。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx。区域材料不以内部变量名传给子进程；claim 不符的签票结果被丢弃。
 
-目标区域没有材料时，包装器**拒绝执行**（退出码 77），stderr 写明站点、所属分区和 `[reason=regional_jwt_missing]`，不会拿默认（cn）JWT 去请求该分区：分区服务对它只会回 401（使用者看到的是「用户未登录」），或者 bytedcli 因 region claim 不符跳过它、再去会话 scratch 内没有登录的按人 HOME 找，同样失败，而且掩盖了真正缺的是哪个分区的票。拒绝文案按区域材料的来源给出原因：本机签票没签到（发起人登录可能没有该分区权限，或这次签票失败）、平台没签出、或绑定的平台尚不签发分区票（需升级平台）。不涉及区域的站点（默认、`cn`、`boe` 等）照旧用默认 JWT。
+目标区域没有材料时，包装器**拒绝执行**（退出码 77），stderr 写明站点、所属分区和 `[reason=regional_jwt_missing]`，不会拿默认（cn）JWT 去请求该分区：分区服务对它只会回 401（使用者看到的是「用户未登录」），或者 bytedcli 因 region claim 不符跳过它、再去会话 scratch 内没有登录的按人 HOME 找，同样失败，而且掩盖了真正缺的是哪个分区的票。拒绝文案按区域材料的来源给出原因：本机签票没签到（发起人登录可能没有该分区权限，或这次签票失败）、平台没签出、或绑定的平台尚不签发分区票（需升级平台）。不涉及区域的站点（默认、`cn`、`boe` 等）照旧用默认 JWT。不会把该分区 ByteCloud JWT 发出去的调用也照常执行、不因缺票被拒：帮助与版本输出（`--help` 任意位置、命令前的 `-h` / `--version` / `-V`、没有命令）、`codebase`（用 Codebase JWT）、`meego`（用本人的 Meego 登录）——否则会话级设了海外 `BYTEDCLI_CLOUD_SITE` 时，缺票的人连这些命令都用不了。命令按 bytedcli 的 `getFirstCommandArgIndex` 找（跳过带值的根选项）；认不出的一律按需要分区票处理。
 
 ### 平台供票
 

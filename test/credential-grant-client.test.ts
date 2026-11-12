@@ -132,6 +132,15 @@ describe('requestCredentialGrant', () => {
     }
   });
 
+  it('drops only a partition JWT that arrives unusable, keeping the rest of the grant', async () => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: {
+      BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n',
+      BYTEDCLI_USER_CLOUD_JWT_TX: 'tx\nexport X=1', BYTEDCLI_USER_CLOUD_JWT_I18NBD: 7,
+    } } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(r.ok && r.value.variables).toEqual({ BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n' });
+  });
+
   it('rejects partition JWTs smuggled into a lark-cli grant', async () => {
     const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'lark-cli', unionId: 'on_alice', expiresAt: future(), variables: {
       LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n',

@@ -181,12 +181,13 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
   return null;
 }
 
-/** The `region` claim of a ByteCloud JWT (read, not verified). */
-function jwtRegionClaim(jwt: string): unknown {
+/** The claims of a ByteCloud JWT (read, not verified). */
+function jwtClaims(jwt: string): { region?: unknown; exp?: unknown } {
   try {
-    return JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'))?.region;
+    const claims = JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
+    return claims && typeof claims === 'object' ? claims : {};
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -200,11 +201,16 @@ function jwtRegionClaim(jwt: string): unknown {
  *
  * Regional ByteCloud JWTs come in the same grant as the default one — same
  * request, same union_id — so they are this turn's sender's as much as it is.
- * Each must claim the partition it is filed under, as the local mint requires:
- * one for another partition would only move the failure, so it is dropped and
- * that partition's calls are refused like any other missing region.
+ * Each must claim the partition it is filed under, as the local mint requires,
+ * and not be expired already: one that fails either would only move the
+ * failure, so it is dropped and that partition's calls are refused like any
+ * other missing region.
  */
-function toIdentity(tool: TriggerUserAuthTool, grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions'>): LarkCliIdentity | BytedCliIdentity | null {
+function toIdentity(
+  tool: TriggerUserAuthTool,
+  grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions'>,
+  now: number,
+): LarkCliIdentity | BytedCliIdentity | null {
   const { variables } = grant;
   const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
   if (tool === 'lark-cli') {
@@ -222,8 +228,14 @@ function toIdentity(tool: TriggerUserAuthTool, grant: Pick<CredentialGrant, 'var
     const jwt = variables[key];
     if (!nonEmpty(jwt)) continue;
     regionalIssued = true;
-    if (jwtRegionClaim(jwt) === region) regionalCloudJwts[region] = jwt;
-    else logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
+    const claims = jwtClaims(jwt);
+    if (claims.region !== region) {
+      logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
+    } else if (typeof claims.exp === 'number' && claims.exp * 1_000 <= now) {
+      logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} has already expired; dropped`);
+    } else {
+      regionalCloudJwts[region] = jwt;
+    }
   }
   return {
     tool,
@@ -264,7 +276,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
   }, { binding });
 
   if (result.ok) {
-    const identity = toIdentity(args.tool, result.value);
+    const identity = toIdentity(args.tool, result.value, deps.now());
     if (!identity) {
       logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
       return { state: 'unavailable', detail: 'malformed grant' };

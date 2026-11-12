@@ -666,12 +666,60 @@ const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
  */
 export type BytedcliRegionalJwtSource = 'local' | 'platform' | 'platform-legacy';
 const BYTEDCLI_REGIONAL_SOURCE_VAR = 'BOTMUX_IDENTITY_REGIONAL_SOURCE';
+// A turn's tickets are fixed when the turn is prepared, so a retry inside the
+// same turn gets the same answer: the hints say to send a new message.
 const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
-  local: '本机为发起人签票时没有签到这个分区的票：发起人的 ByteCloud 登录可能没有该分区的权限，也可能这次签票失败。确认有该分区权限后稍后重试。',
-  platform: '平台为发起人签票时没有签出这个分区的票：发起人在平台授权的 ByteCloud 登录可能没有该分区的权限，也可能这次签票失败。确认有该分区权限后稍后重试。',
-  'platform-legacy': '本机绑定的平台还不签发分区票（需要升级平台），海外分区的 bytedcli 命令暂时无法以发起人身份执行。请联系平台管理员。',
+  local: '本机为发起人签票时没有签到这个分区的票：发起人的 ByteCloud 登录可能没有该分区的权限，也可能这次签票失败。本轮内重试拿不到新票；确认有该分区权限后，稍后发一条新消息再试。',
+  platform: '平台为发起人签票时没有签出这个分区的票：发起人在平台授权的 ByteCloud 登录可能没有该分区的权限，也可能这次签票失败。本轮内重试拿不到新票；确认有该分区权限后，发一条新消息再试。',
+  'platform-legacy': '本机绑定的平台还不签发分区票（需要升级平台），海外分区的 bytedcli 命令暂时无法以发起人身份执行。请联系平台管理员；平台升级后发一条新消息再试。',
 };
-const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后重试。';
+const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后，发一条新消息再试。';
+
+/** bytedcli's root options that take a value (`ROOT_OPTIONS_WITH_VALUE` in its
+ *  root-argv, 0.191), so the command after them can be found. */
+const BYTEDCLI_ROOT_OPTIONS_WITH_VALUE = [
+  '--jq', '--site', '--cloud-site', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
+  '--bytecloud-user-jwt-file', '--profile', '--vregion', '--vdc', '--socks5-proxy', '--http-proxy',
+  '--http-print', '--http-header', '--http-trace-file', '--http-body-limit', '--http-timeout-ms',
+  '--http-retry-count', '--http-retry-base-delay-ms', '--http-retry-max-delay-ms',
+] as const;
+/** Commands that never send the ByteCloud JWT to the site's partition: Codebase
+ *  authenticates with the Codebase JWT, Meego with the person's Meego login,
+ *  help with nothing. A site set for the whole session (BYTEDCLI_CLOUD_SITE)
+ *  must not cost a person without that partition's ticket these commands. */
+const BYTEDCLI_REGION_FREE_COMMANDS = ['help', 'codebase', 'meego'] as const;
+
+/**
+ * `__botmux_bd_region_free "$@"`: 0 when this invocation does not use the
+ * ByteCloud JWT of its site's partition — help or version output, no command
+ * at all, or a {@link BYTEDCLI_REGION_FREE_COMMANDS} command. Finds the command
+ * the way bytedcli's getFirstCommandArgIndex does. Anything it cannot place
+ * answers 1, so a missing ticket is refused rather than let through.
+ */
+const BYTEDCLI_REGION_FREE_FN: readonly string[] = [
+  '__botmux_bd_region_free() {',
+  '  __botmux_rf_skip=; __botmux_rf_cmd=',
+  '  for __botmux_rf_a in "$@"; do',
+  '    if [ -n "$__botmux_rf_skip" ]; then __botmux_rf_skip=; continue; fi',
+  '    case "$__botmux_rf_a" in',
+  // Commander reserves --help at every level; past `--` nothing is an option.
+  '      --) [ -n "$__botmux_rf_cmd" ] && break; return 1 ;;',
+  '      --help|--all-help) return 0 ;;',
+  '    esac',
+  '    [ -n "$__botmux_rf_cmd" ] && continue',
+  '    case "$__botmux_rf_a" in',
+  '      -h|--version|-V) return 0 ;;',
+  `      ${BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.join('|')}) __botmux_rf_skip=1 ;;`,
+  '      -*) ;;',
+  '      *) __botmux_rf_cmd=$__botmux_rf_a ;;',
+  '    esac',
+  '  done',
+  '  case "$__botmux_rf_cmd" in',
+  `    ''|${BYTEDCLI_REGION_FREE_COMMANDS.join('|')}) return 0 ;;`,
+  '  esac',
+  '  return 1',
+  '}',
+];
 
 /** Case pattern matching `site` in any letter case. */
 function anyCaseGlob(site: string): string {
@@ -685,7 +733,14 @@ function anyCaseGlob(site: string): string {
  * default (cn) token there cannot work — the partition rejects it (HTTP 401,
  * read by the person as "not logged in") or bytedcli skips it for the other
  * site's login, which a per-person scratch HOME does not have — and it would
- * hide which ticket is actually missing.
+ * hide which ticket is actually missing. Commands that never use that
+ * partition's token run as before (see {@link BYTEDCLI_REGION_FREE_FN}).
+ *
+ * The site is read the way bytedcli 0.191 reads it: `--cloud-site` is its
+ * spelling of `--site`, an empty `--site` counts as not given (the variable
+ * then decides), and the value is trimmed with JS `trim()`, which also drops
+ * Unicode spaces. Stripping every non-site character at either end covers that
+ * trim; a value it over-strips is not a site bytedcli accepts either.
  */
 function bytedcliRegionalSelection(): string[] {
   const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
@@ -696,7 +751,7 @@ function bytedcliRegionalSelection(): string[] {
   const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
     `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
   return [
-    '  __botmux_site=${BYTEDCLI_CLOUD_SITE:-}',
+    '  __botmux_site=',
     '  __botmux_next=',
     // Last --site wins, as with the CLI's own option parsing. Arguments are
     // only read, never rewritten: "$@" is passed to the tool unchanged.
@@ -704,19 +759,21 @@ function bytedcliRegionalSelection(): string[] {
     '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
     '    case "$__botmux_arg" in',
     '      --) break ;;',
-    '      --site) __botmux_next=1 ;;',
+    '      --site|--cloud-site) __botmux_next=1 ;;',
     '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
+    '      --cloud-site=*) __botmux_site=${__botmux_arg#--cloud-site=} ;;',
     '    esac',
     '  done',
-    // bytedcli trims and lowercases the site before resolving it.
-    '  __botmux_site=${__botmux_site#"${__botmux_site%%[![:space:]]*}"}',
-    '  __botmux_site=${__botmux_site%"${__botmux_site##*[![:space:]]}"}',
+    '  if [ -z "$__botmux_site" ]; then __botmux_site=${BYTEDCLI_CLOUD_SITE:-}; fi',
+    // bytedcli trims (JS trim) and lowercases the site before resolving it.
+    '  __botmux_site=${__botmux_site#"${__botmux_site%%[[:alnum:]-]*}"}',
+    '  __botmux_site=${__botmux_site%"${__botmux_site##*[[:alnum:]-]}"}',
     '  __botmux_region=',
     '  __botmux_regional=',
     '  case "$__botmux_site" in',
     ...cases,
     '  esac',
-    '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ]; then',
+    '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ] && ! __botmux_bd_region_free "$@"; then',
     `    case "$${BYTEDCLI_REGIONAL_SOURCE_VAR}" in`,
     ...hints,
     `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
@@ -1447,6 +1504,7 @@ export function renderIdentityWrapper(
     // Function only; it runs AFTER identity resolution at each exec site, with
     // the HOME that exec will use (per-person scratch HOME or machine HOME).
     ...(tool === 'bytedcli' ? BYTEDCLI_LOGIN_GUARD_FN : []),
+    ...(tool === 'bytedcli' ? BYTEDCLI_REGION_FREE_FN : []),
     ...(tool === 'bytedcli' ? BYTEDCLI_MEEGO_FN : []),
     ...resolveBlock,
     '',

@@ -37,7 +37,9 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
-const { renderIdentityWrapper, IDENTITY_DENIED_EXIT_CODE } = await import('../src/core/cli-identity.js');
+const {
+  renderIdentityWrapper, IDENTITY_DENIED_EXIT_CODE, recallProvenIdentityContent, forgetProvenIdentityContent,
+} = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
 const { requestCredentialGrant } = await import('../src/platform/credential-grant-client.js');
@@ -50,9 +52,9 @@ const BINDING = { platformUrl: 'https://platform.example.test', machineToken: 'm
 
 const EXP = Math.floor(Date.now() / 1000) + 7200;
 /** A JWT-shaped string whose payload claims `region`; `who` keeps people apart. */
-function jwt(region: string, who: string): string {
+function jwt(region: string, who: string, exp = EXP): string {
   const part = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
-  return `${part({ alg: 'RS256' })}.${part({ region, who, exp: EXP })}.sig`;
+  return `${part({ alg: 'RS256' })}.${part({ region, who, exp })}.sig`;
 }
 
 const REGIONAL_VARIABLES: Record<string, string> = {
@@ -64,9 +66,19 @@ const REGIONAL_VARIABLES: Record<string, string> = {
  * login can mint. `upToDate: false` is a platform from before regional tokens —
  * it reads only the request fields it knows and answers with the default token.
  */
-let platform: { upToDate: boolean; partitions: Record<string, string[]>; wrongClaim?: boolean };
+let platform: {
+  upToDate: boolean; partitions: Record<string, string[]>;
+  /** Issue tickets claiming the wrong partition / already expired. */
+  wrongClaim?: boolean; expired?: boolean;
+  /** This partition's ticket arrives unusable (a value with a line break). */
+  malformed?: string;
+};
 let grantBodies: Array<Record<string, unknown>>;
 let dir: string;
+/** How the session keeps its identity: a file the wrapper sources (single), or
+ *  daemon memory the wrapper is served through a resolver (proven). */
+let storageModel: 'single' | 'proven';
+let lastTurn: string;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-regional-jwt-turn-'));
@@ -87,7 +99,9 @@ beforeEach(() => {
           const asked = platform.upToDate && Array.isArray(b.cloudJwtRegions) ? b.cloudJwtRegions as string[] : undefined;
           for (const region of asked ?? []) {
             if (!(platform.partitions[who] ?? []).includes(region)) continue;
-            variables[REGIONAL_VARIABLES[region]!] = jwt(platform.wrongClaim ? 'cn' : region, who);
+            variables[REGIONAL_VARIABLES[region]!] = platform.malformed === region ? 'broken\nvalue'
+              : platform.expired ? jwt(region, who, EXP - 9_000)
+                : jwt(platform.wrongClaim ? 'cn' : region, who);
           }
           return {
             status: 200,
@@ -103,6 +117,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   __setPlatformCredentialDepsForTest(null);
+  forgetProvenIdentityContent(dir, SESSION);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -116,21 +131,35 @@ function botConfig(credentialSource: 'local' | 'platform') {
 async function publishFor(source: 'local' | 'platform', sender: string, turnId = 'om_turn_1') {
   const out = await publishTurnCliIdentity({
     botConfig: botConfig(source), sessionDataDir: dir, sessionId: SESSION,
-    senderOpenId: sender, turnId, storageModel: 'single', privateChat: true,
+    senderOpenId: sender, turnId, storageModel, privateChat: true,
   });
   expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
+  lastTurn = turnId;
 }
 
 /** Run the session's bytedcli wrapper; the stand-in tool prints the JWT it got. */
 function bytedcli(...args: string[]): { status: number; jwt: string; stderr: string } {
+  return bytedcliWithEnv({}, ...args);
+}
+
+function bytedcliWithEnv(env: Record<string, string>, ...args: string[]): { status: number; jwt: string; stderr: string } {
   const tool = join(dir, 'real-bytedcli.sh');
   writeFileSync(tool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
   chmodSync(tool, 0o755);
   const wrapper = join(dir, 'bytedcli');
-  writeFileSync(wrapper, renderIdentityWrapper('bytedcli', tool, 'single'));
+  let resolver: string[] | undefined;
+  if (storageModel === 'proven') {
+    // Stands in for the daemon channel: serves the body the daemon holds for
+    // the turn it proved (here, the last one published).
+    const body = recallProvenIdentityContent(dir, SESSION, lastTurn, 'bytedcli');
+    expect(body).toBeDefined();
+    resolver = [join(dir, 'identity-resolver')];
+    writeFileSync(resolver[0]!, `#!/bin/sh\ncat <<'BOTMUX_IDENTITY_EOF'\n${body}\nBOTMUX_IDENTITY_EOF\n`, { mode: 0o755 });
+  }
+  writeFileSync(wrapper, renderIdentityWrapper('bytedcli', tool, storageModel, resolver));
   const r = spawnSync('/bin/sh', [wrapper, ...args], {
     encoding: 'utf8',
-    env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
+    env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env },
   });
   return { status: r.status ?? -1, jwt: r.stdout, stderr: r.stderr };
 }
@@ -143,6 +172,9 @@ function expectRefused(r: ReturnType<typeof bytedcli>, region: string, hint: str
   expect(r.stderr).toContain('[reason=regional_jwt_missing]');
 }
 
+describe.each(['single', 'proven'] as const)('%s identity storage', model => {
+beforeEach(() => { storageModel = model; });
+
 describe('local authorization (this machine mints from the sender\'s login)', () => {
   it('uses the sender\'s token for a partition they have one for', async () => {
     localJwts.set(ALICE, { cloudJwt: jwt('cn', 'alice'), regionalCloudJwts: { i18n: jwt('i18n', 'alice') } });
@@ -150,7 +182,7 @@ describe('local authorization (this machine mints from the sender\'s login)', ()
     expect(bytedcli('--site', 'i18n-tt', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('i18n', 'alice') });
     expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'alice') });
     // A partition this login minted nothing for is refused, not sent the cn token.
-    expectRefused(bytedcli('--site', 'us-ttp'), 'tx', '本机为发起人签票');
+    expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query'), 'tx', '本机为发起人签票');
   });
 
   it('refuses an overseas call when the sender has no token for its partition', async () => {
@@ -165,7 +197,7 @@ describe('local authorization (this machine mints from the sender\'s login)', ()
     localJwts.set(BOB, { cloudJwt: jwt('cn', 'bob') });
     await publishFor('local', ALICE, 'om_turn_1');
     await publishFor('local', BOB, 'om_turn_2');
-    expectRefused(bytedcli('--site', 'i18n-tt'), 'i18n', '本机为发起人签票');
+    expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '本机为发起人签票');
     expect(bytedcli()).toMatchObject({ status: 0, jwt: jwt('cn', 'bob') });
   });
 });
@@ -178,7 +210,7 @@ describe('platform grant', () => {
     expect(grantBodies[0]).toMatchObject({ unionId: 'on_alice', tool: 'bytedcli', cloudJwtRegions: ['i18n', 'i18nbd', 'tx'] });
     expect(bytedcli('--site', 'i18n-tt', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
     expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
-    expectRefused(bytedcli('--site', 'i18n-bd'), 'i18nbd', '平台为发起人签票');
+    expectRefused(bytedcli('--site', 'i18n-bd', 'aa', 'query'), 'i18nbd', '平台为发起人签票');
   });
 
   it('refuses a partition the platform issued no token for', async () => {
@@ -195,10 +227,37 @@ describe('platform grant', () => {
     expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   });
 
+  // A bot may set an overseas site for every session. Until the platform
+  // issues partition tickets, its people must keep what never used one.
+  it('keeps Codebase, Meego and help working under a session-wide overseas site', async () => {
+    platform = { upToDate: false, partitions: {} };
+    await publishFor('platform', ALICE);
+    const site = { BYTEDCLI_CLOUD_SITE: 'i18n-tt' };
+    for (const args of [['codebase', 'mr', 'list'], ['-j', 'meego', 'workitem', 'list'], ['--version'], ['aa', 'query', '--help'], []]) {
+      expect(bytedcliWithEnv(site, ...args)).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    }
+    expectRefused(bytedcliWithEnv(site, 'aa', 'query'), 'i18n', '升级平台');
+  });
+
   it('drops an issued token that claims another partition', async () => {
     platform = { upToDate: true, partitions: { on_alice: ['i18n'] }, wrongClaim: true };
     await publishFor('platform', ALICE);
-    expectRefused(bytedcli('--site', 'i18n-tt'), 'i18n', '平台为发起人签票');
+    expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '平台为发起人签票');
+  });
+
+  it('drops an issued token that has already expired', async () => {
+    platform = { upToDate: true, partitions: { on_alice: ['i18n'] }, expired: true };
+    await publishFor('platform', ALICE);
+    expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '平台为发起人签票');
+    expect(bytedcli()).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  });
+
+  it('loses only the partition whose ticket arrived malformed, not the default ticket', async () => {
+    platform = { upToDate: true, partitions: { on_alice: ['i18n', 'tx'] }, malformed: 'tx' };
+    await publishFor('platform', ALICE);
+    expect(bytedcli('--site', 'i18n-tt')).toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
+    expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query'), 'tx', '平台为发起人签票');
+    expect(bytedcli()).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   });
 
   it('gives each turn the partition tokens granted for that turn\'s sender', async () => {
@@ -211,6 +270,7 @@ describe('platform grant', () => {
     platform.partitions = { on_alice: ['i18n'], on_bob: [] };
     await publishFor('platform', ALICE, 'om_turn_3');
     await publishFor('platform', BOB, 'om_turn_4');
-    expectRefused(bytedcli('--site', 'i18n-tt'), 'i18n', '平台为发起人签票');
+    expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '平台为发起人签票');
   });
+});
 });

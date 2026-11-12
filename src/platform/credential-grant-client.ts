@@ -90,6 +90,7 @@ export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
 } as const;
 export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
 const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];
+const REGIONAL_GRANT_VARIABLE_SET: ReadonlySet<string> = new Set(Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES));
 /** Request field naming the partitions a bytedcli grant should cover, and the
  *  response field in which the platform says which ones it tried. */
 export const CLOUD_JWT_REGIONS_FIELD = 'cloudJwtRegions';
@@ -155,7 +156,12 @@ function pickVariables(tool: TriggerUserAuthTool, raw: unknown): Record<string, 
   }
   for (const key of spec.optional) {
     if (rec[key] === undefined || rec[key] === null || rec[key] === '') continue;
-    if (!isSafeValue(rec[key])) return `variable ${key} unsafe`;
+    if (!isSafeValue(rec[key])) {
+      // A broken partition ticket costs only that partition (its calls are
+      // refused as missing), not the person's default ticket with it.
+      if (REGIONAL_GRANT_VARIABLE_SET.has(key)) continue;
+      return `variable ${key} unsafe`;
+    }
     out[key] = rec[key] as string;
   }
   const allowed = new Set<string>([...spec.required, ...spec.optional]);
