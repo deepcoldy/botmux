@@ -14386,9 +14386,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
       // can't embed `<at>`), so it falls through to the card branch which renders
-      // the @ on the footer and sends the video as a follow-up attachment — same
-      // shape as an attachment-only `--files … --mention …` send, whose card body
-      // is likewise empty. See shouldSendAsPureVideo.
+      // the @ on the footer and sends the video as a follow-up attachment. That
+      // card needs a body: a mentioned media send without text or an image was
+      // already refused (primaryCardBodyMissing), never sent as an empty card.
+      // See shouldSendAsPureVideo.
       // No card/text primary here, so the FIRST media message must carry the
       // quote chain itself (dispatchPrimary applies the chat-scope quoteTargetId
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
