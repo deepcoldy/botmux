@@ -5347,14 +5347,28 @@ input.row-select,
   background: var(--qr-surface);
 }
 
-.onboarding-link {
-  color: var(--accent-strong);
-  font-weight: 800;
-  text-decoration: none;
+.onboarding-registration-qr {
+  display: block;
+  width: min(420px, 100%);
+  height: auto;
 }
 
-.onboarding-link:hover {
-  text-decoration: underline;
+.onboarding-link {
+  font-weight: 800;
+}
+
+.onboarding-qr-option {
+  width: 100%;
+  text-align: center;
+  color: var(--muted);
+}
+
+.onboarding-qr-option > summary {
+  cursor: pointer;
+}
+
+.onboarding-qr-option > :is(img, svg) {
+  margin: 12px auto 0;
 }
 
 .onboarding-form {

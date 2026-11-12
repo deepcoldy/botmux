@@ -1,24 +1,7 @@
-/**
- * 飞书扫码建应用 — 对接 `@larksuiteoapi/node-sdk` 的 `registerApp`.
- *
- * 走 OAuth 2.0 Device Flow (RFC 8628):
- *   1. SDK 向 `accounts.feishu.cn/oauth/v1/app/registration` 发 `action=begin`
- *      请求 (`archetype=PersonalAgent`), 拿到 device_code + 二维码 URL
- *   2. 在终端渲染二维码 + 链接, 等用户扫码
- *   3. SDK 轮询同端点 `action=poll` 直到拿到 client_id + client_secret
- *      (=AppID + AppSecret)
- *
- * 注意:
- * - 这个端点 archetype 写死 `PersonalAgent`, 但实测 PersonalAgent 应用是
- *   可以挂 bot 能力的 (`zarazhangrui/feishu-claude-code-bridge` 在用).
- * - 建出来的应用 **没有** 声明 botmux 需要的 scope, 用户仍要在开放平台
- *   「权限管理 → 批量导入/导出权限」粘贴 ~/.botmux/lark-scopes.json (setup
- *   末尾会自动写一份) 一次性提交审批. 事件订阅 + bot 能力维护者实测默认
- *   配好, 收不到消息时见 README 的 fallback 自查清单.
- * - secret 永远不打印; 错误只暴露 error code / 阶段标签, 不暴露 secret.
- */
 import { registerApp } from '@larksuiteoapi/node-sdk';
 import qrcode from 'qrcode-terminal';
+
+type SdkOptions = Parameters<typeof registerApp>[0];
 
 export type RegisterBrand = 'feishu' | 'lark';
 
@@ -45,7 +28,7 @@ export type RegisterAppErr = {
    * - `network`: 网络错误 / 端点不可达
    * - `unknown`: 其它 (含 SDK 抛非预期错误)
    */
-  error: 'aborted' | 'expired' | 'denied' | 'network' | 'unknown';
+  error: 'aborted' | 'expired' | 'denied' | 'network' | 'unconfirmed' | 'unknown';
   /** 给用户看的简短错误描述, 不含 secret. */
   message: string;
 };
@@ -53,6 +36,11 @@ export type RegisterAppErr = {
 export type RegisterAppResult = RegisterAppOk | RegisterAppErr;
 
 export interface RegisterAppOptions {
+  addons?: SdkOptions['addons'];
+  appPreset?: SdkOptions['appPreset'];
+  appId?: string;
+  /** 兼容模式只显示确认链接。 */
+  linkOnly?: boolean;
   /** 取消信号 (Ctrl-C 时填充). */
   signal?: AbortSignal;
   /**
@@ -63,11 +51,13 @@ export interface RegisterAppOptions {
   onStatusChange?: (info: { status: string; interval?: number }) => void;
 }
 
-function defaultPrintQRCode(info: { url: string; expireIn: number }): void {
+function printRegistrationLink(info: { url: string; expireIn: number }, linkOnly: boolean): void {
   const mins = Math.max(1, Math.round(info.expireIn / 60));
-  process.stderr.write('\n请用飞书 App 扫码完成应用创建：\n\n');
-  qrcode.generate(info.url, { small: true }, (qr) => process.stderr.write(qr + '\n'));
-  process.stderr.write(`\n二维码有效期约 ${mins} 分钟。也可在浏览器打开：\n  ${info.url}\n\n`);
+  process.stderr.write(`\n请打开飞书应用确认链接（约 ${mins} 分钟内有效）：\n  ${info.url}\n\n`);
+  // 二维码太密时，终端换行会使它无法扫描。此时保留上面的完整链接。
+  if (!linkOnly && info.url.length <= 450) {
+    qrcode.generate(info.url, { small: true }, qr => process.stderr.write(qr + '\n'));
+  }
 }
 
 function defaultPrintStatus(info: { status: string; interval?: number }): void {
@@ -86,15 +76,26 @@ function defaultPrintStatus(info: { status: string; interval?: number }): void {
  * - 错误链里只放错误 code / 阶段, 不带 secret
  */
 export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<RegisterAppResult> {
-  const onQR = opts.onQRCodeReady ?? defaultPrintQRCode;
+  const onQR = opts.onQRCodeReady ?? (info => printRegistrationLink(info, opts.linkOnly === true));
   const onStatus = opts.onStatusChange ?? defaultPrintStatus;
 
+  let switchedToLark = false;
+  let linkShown = false;
   try {
     const result = await registerApp({
       signal: opts.signal,
       source: 'botmux',
-      onQRCodeReady: onQR,
-      onStatusChange: onStatus,
+      addons: opts.addons,
+      appPreset: opts.appPreset,
+      ...(opts.appId ? { appId: opts.appId } : { createOnly: true }),
+      onQRCodeReady: info => {
+        onQR(info);
+        linkShown = true;
+      },
+      onStatusChange: info => {
+        if (info.status === 'domain_switched') switchedToLark = true;
+        onStatus(info);
+      },
     });
 
     if (!result.client_id || !result.client_secret) {
@@ -105,7 +106,10 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
       };
     }
 
-    const brand: RegisterBrand = result.user_info?.tenant_brand === 'lark' ? 'lark' : 'feishu';
+    if (opts.appId && result.client_id !== opts.appId) {
+      return { ok: false, error: 'unknown', message: '确认结果的 App ID 与请求更新的应用不一致' };
+    }
+    const brand: RegisterBrand = switchedToLark || result.user_info?.tenant_brand === 'lark' ? 'lark' : 'feishu';
     const userOpenId =
       typeof result.user_info?.open_id === 'string' && result.user_info.open_id.startsWith('ou_')
         ? result.user_info.open_id
@@ -118,22 +122,23 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
       brand,
       userOpenId,
     };
-  } catch (err: any) {
-    // SDK 抛 LarkChannelError, code 字段对齐 RFC 8628 的 device flow 错误
-    const code: string = err?.code ?? '';
-    const rawMsg: string = err?.message ?? String(err);
-    // SDK 不会把 secret 放进 message, 但保险起见再过一次
-    const safeMsg = rawMsg.replace(/[a-zA-Z0-9_-]{30,}/g, '***');
-
-    if (code === 'abort') return { ok: false, error: 'aborted', message: '用户取消扫码' };
-    if (code === 'expired_token') return { ok: false, error: 'expired', message: '二维码已过期, 请重试' };
-    if (code === 'access_denied') return { ok: false, error: 'denied', message: '用户在浏览器里拒绝授权' };
-
-    // 网络层错误 (axios) — 没固定 code, 看 message
-    if (/ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET|network/i.test(rawMsg)) {
-      return { ok: false, error: 'network', message: `网络错误: ${safeMsg}` };
+  } catch (err: unknown) {
+    const failure = err as { code?: string; message?: string } | undefined;
+    if (failure?.code === 'abort') return { ok: false, error: 'aborted', message: '用户取消确认' };
+    if (failure?.code === 'expired_token') return { ok: false, error: 'expired', message: '确认链接已过期，请重试' };
+    if (failure?.code === 'access_denied') return { ok: false, error: 'denied', message: '用户在浏览器里拒绝授权' };
+    if (linkShown) {
+      return {
+        ok: false,
+        error: 'unconfirmed',
+        message: '确认链接已发出，飞书未返回最终结果。请先到开放平台检查应用是否已创建或已更新。',
+      };
     }
-
-    return { ok: false, error: 'unknown', message: safeMsg };
+    if (/ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET|EAI_AGAIN|network/i.test(
+      `${failure?.code ?? ''} ${failure?.message ?? ''}`,
+    )) {
+      return { ok: false, error: 'network', message: '飞书注册接口网络错误' };
+    }
+    return { ok: false, error: 'unknown', message: '飞书注册接口返回异常' };
   }
 }

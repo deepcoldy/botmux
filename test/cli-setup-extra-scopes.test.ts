@@ -2,7 +2,7 @@
  * `botmux setup add|configure --extra-scopes-file`：记下的路径怎么落盘、怎么沿用、怎么降级。
  *
  * 直接跑 cmdSetupScripted，读写 vitest 临时 HOME 下的真 bots.json；只替换开放平台自动配置、
- * supervisor 启动、旧 pm2 清理和凭证 / owner 校验这些要出网或碰进程的出口。
+ * 官方注册、supervisor 启动、旧 pm2 清理和凭证 / owner 校验这些要出网或碰进程的出口。
  *
  * Run: pnpm vitest run test/cli-setup-extra-scopes.test.ts
  */
@@ -13,8 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   automateOpenPlatformSetup: vi.fn(),
-  createFeishuOpenPlatformApp: vi.fn(),
-  inspectCachedFeishuOpenPlatformSession: vi.fn(),
+  tryRegisterApp: vi.fn(),
   onReadDefaultScopeManifest: vi.fn(),
   startBotViaSupervisor: vi.fn(),
   validateCredentials: vi.fn(),
@@ -25,15 +24,16 @@ vi.mock('../src/setup/open-platform-automation.js', async importOriginal => {
   return {
     ...actual,
     automateOpenPlatformSetup: mocks.automateOpenPlatformSetup,
-    createFeishuOpenPlatformApp: mocks.createFeishuOpenPlatformApp,
-    inspectCachedFeishuOpenPlatformSession: mocks.inspectCachedFeishuOpenPlatformSession,
-    readStoredCookiesFromSessionFile: () => [],
     readDefaultScopeManifest: () => {
       mocks.onReadDefaultScopeManifest();
       return actual.readDefaultScopeManifest();
     },
   };
 });
+
+vi.mock('../src/setup/register-app.js', () => ({
+  tryRegisterApp: mocks.tryRegisterApp,
+}));
 
 vi.mock('../src/core/fleet-runtime.js', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -307,11 +307,12 @@ describe('setup add --extra-scopes-file', () => {
   it('应用已创建、配置未写入时的 partial JSON 也带 extraScopes，续跑命令带上清单路径', async () => {
     writeBots([botEntry('cli_a')]);
     const before = readFileSync(botsFile, 'utf8');
-    mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({
+    mocks.tryRegisterApp.mockResolvedValue({
       ok: true,
-      identity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
+      appId: 'cli_created',
+      appSecret: crypto.randomUUID(),
+      brand: 'feishu',
     });
-    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_created', appSecret: 'secret-created', brand: 'feishu' });
     mocks.validateCredentials.mockResolvedValue({ ok: false, error: 'invalid_secret', message: '凭证无效' });
 
     await cmdSetupScripted([
@@ -319,6 +320,12 @@ describe('setup add --extra-scopes-file', () => {
       '--extra-scopes-file', extraFile, '--json',
     ]);
 
+    expect(mocks.tryRegisterApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      addons: expect.objectContaining({
+        scopes: expect.objectContaining({ tenant: expect.arrayContaining(['spark:app:read']) }),
+      }),
+      linkOnly: true,
+    }));
     const out = lastJson();
     expect(out).toMatchObject({ ok: false, partial: true, appId: 'cli_created', extraScopes: { file: extraFile, merged: true } });
     expect(out.continueCommand).toContain(`--extra-scopes-file ${extraFile}`);

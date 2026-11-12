@@ -6362,10 +6362,11 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web 或 compat' });
       }
-      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const registrationMode = registrationModeRaw === 'web' || registrationModeRaw === 'compat'
+        ? registrationModeRaw : 'sdk';
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
       if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });

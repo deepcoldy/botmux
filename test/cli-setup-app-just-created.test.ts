@@ -69,39 +69,23 @@ beforeEach(() => {
 });
 
 describe('obtainCredentials 的 appJustCreated 信号', () => {
-  it('SDK 兼容模式建成新应用 → appJustCreated=true', async () => {
-    // Web console 建应用失败且没建出半成品（无 appId）→ 才会问「是否使用兼容模式」。
-    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: false, reason: 'network', message: 'console 不可达' });
+  it('默认以官方清单创建新应用，并标记为待回读注册结果', async () => {
     mocks.tryRegisterApp.mockResolvedValue({
       ok: true,
-      appId: 'cli_compat_new',
-      appSecret: 'compat-secret',
+      appId: 'cli_sdk_new',
+      appSecret: crypto.randomUUID(),
       brand: 'feishu',
       userOpenId: 'ou_scanner',
     });
 
-    const creds = await obtainCredentials(fakeRl([
-      '',   // 飞书应用来源 → 默认项「一次扫码创建新应用」
-      '',   // 机器人名称 → 默认建议名
-      '1',  // 是否使用兼容模式 → 「使用兼容模式」
-    ]));
-
-    expect(mocks.tryRegisterApp).toHaveBeenCalledTimes(1);
-    expect(creds.ok).toBe(true);
-    if (creds.ok) {
-      expect(creds.appId).toBe('cli_compat_new');
-      // device flow 只有「现场注册一个新应用」这一条语义，没有复用已有应用的分支。
-      expect(creds.appJustCreated).toBe(true);
-    }
-  });
-
-  it('Web console 一次扫码建成新应用 → appJustCreated=true（兼容模式与它同源）', async () => {
-    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_web_new', appSecret: 'web-secret' });
-
-    const creds = await obtainCredentials(fakeRl(['', '']));
-
-    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
-    expect(creds.ok && creds.appJustCreated).toBe(true);
+    const creds = await obtainCredentials(fakeRl(['', '我的机器人']));
+    expect(mocks.createFeishuOpenPlatformApp).not.toHaveBeenCalled();
+    expect(mocks.inspectCachedFeishuOpenPlatformSession).not.toHaveBeenCalled();
+    expect(mocks.tryRegisterApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appPreset: expect.objectContaining({ name: '我的机器人' }),
+      addons: expect.objectContaining({ scopes: expect.objectContaining({ tenant: expect.any(Array), user: expect.any(Array) }) }),
+    }));
+    expect(creds).toMatchObject({ ok: true, appId: 'cli_sdk_new', appJustCreated: true, registeredWithAddons: true });
   });
 
   it('选择已有应用 → appJustCreated 不置位（存量应用的白名单里有用户自己的条目）', async () => {

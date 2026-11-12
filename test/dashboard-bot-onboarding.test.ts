@@ -82,6 +82,7 @@ function installPrimaryBotsMutation(path: string, calls: string[]) {
 
 describe('BotOnboardingManager', () => {
   beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('unmocked network request'); }));
     userGetMock.mockReset();
     userGetMock.mockResolvedValue({ code: 99992361, msg: 'user is not visible to this app' });
     batchGetIdMock.mockReset();
@@ -91,6 +92,7 @@ describe('BotOnboardingManager', () => {
   afterEach(() => {
     setDurableConfigCoordinator(undefined);
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
   it('routes a primary-mode onboarding persist through the injected durable bots mutation', async () => {
@@ -180,12 +182,14 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('publishes a scannable QR status while registration is waiting', async () => {
+  it('publishes the official confirmation link and manifest by default', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const pending = deferred<RegisterAppResult>();
     const manager = new BotOnboardingManager({
       botsJsonPath: join(dir, 'bots.json'),
       registerApp: async (opts?: RegisterAppOptions) => {
+        expect(opts?.appPreset?.name).toBe('botmux-0');
+        expect(opts?.addons?.events?.items?.tenant).toContain('im.message.receive_v1');
         opts?.onQRCodeReady?.({ url: 'https://open.feishu.cn/scan-me', expireIn: 600 });
         return pending.promise;
       },
@@ -200,14 +204,14 @@ describe('BotOnboardingManager', () => {
     const status = manager.get(job.id);
     expect(status?.status).toBe('waiting_for_scan');
     expect(status?.qrUrl).toBe('https://open.feishu.cn/scan-me');
-    expect(status?.qrDataUrl).toContain('data:image/svg+xml;base64,');
+    expect(status?.qrDataUrl).toBeUndefined();
 
     pending.resolve({ ok: false, error: 'aborted', message: 'cancelled' });
     await job.done;
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('uses one Feishu Web QR as the primary path and carries the chosen app name through the job', async () => {
+  it('uses one Feishu Web QR in explicit Web mode and carries the chosen app name through the job', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-web-'));
     const pending = deferred<any>();
     const registerApp = vi.fn(async () => ({ ok: false as const, error: 'unknown' as const, message: 'must not run' }));
@@ -482,7 +486,7 @@ describe('BotOnboardingManager', () => {
         userOpenId: 'ou_owner',
       }),
       validateCredentials: async () => ({ ok: true }),
-      automateOpenPlatform: async () => autoOk(),
+      completeRegisteredApp: async () => autoOk(),
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
 
@@ -854,7 +858,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: (payload) => `data:image/svg+xml;base64,${Buffer.from(payload).toString('base64')}`,
     });
 
-    const job = manager.start({ cliId: 'claude-code', workingDir: '~' });
+    const job = manager.start({ cliId: 'claude-code', workingDir: '~', registrationMode: 'compat' });
     // onQrCode + onStatus 都跑过后的中间态: 第二个二维码必须还在 (onStatus 不能盖掉它).
     await new Promise(r => setTimeout(r, 0));
     const mid = manager.get(job.id);

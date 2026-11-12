@@ -1,11 +1,4 @@
-/**
- * Feishu Open Platform automation used by `botmux setup`.
- *
- * The primary Feishu path now uses one reusable Web session for the whole flow:
- * create app -> read AppID/AppSecret -> configure scopes/events/redirect ->
- * create and publish a version. The official SDK registerApp device flow stays
- * available as a fallback (notably for Lark international tenants).
- */
+/** Developer-console fallback for setup, platform configuration and permission recovery. */
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
@@ -190,9 +183,9 @@ export interface OpenPlatformPrivilegeState {
 export type OpenPlatformAutomationResult =
   | {
       ok: true;
-      sessionFile: string;
-      sessionSource: FeishuWebSessionSource;
-      cookieCount: number;
+      sessionFile?: string;
+      sessionSource?: FeishuWebSessionSource;
+      cookieCount?: number;
       scopeCount: number;
       skippedScopeCount: number;
       /** 清单里有、但当前租户开放平台目录中不存在而被跳过的权限名（按 token 类型分桶）。 */
@@ -325,6 +318,8 @@ export interface OpenPlatformAutomationOptions {
   appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
+  redirectAlreadyConfigured?: boolean;
+  redirectOnly?: boolean;
   /**
    * 调用方已经确知**当前已授权**的 scope 名字集合，**按 token 类型分桶**（来自
    * tenant-token `application/v6` 的 scope 列表，见 event-dispatcher 的
@@ -1617,7 +1612,7 @@ export async function automateOpenPlatformSetup(
   // return,把白名单一起拖死;而白名单缺失是 authorize 的**硬失败**(20029,用户
   // 连飞书授权页都进不去,群聊模式 p2pMode=group、会话群标签、`/login` 全部授权
   // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
-  let redirectConfigured = false;
+  let redirectConfigured = options.redirectAlreadyConfigured === true;
   let redirectWarning: string | undefined;
   let retryRedirectAfterReview = false;
   let wantedRedirectUrls: string[] = [];
@@ -1630,7 +1625,7 @@ export async function automateOpenPlatformSetup(
   // 所以这里以「本次 scope/update 是否真的发出且成功」作为保守近似：宁可偶尔
   // 多发一版，也不少发导致新权限不生效。
   let mutated = false;
-  try {
+  if (!redirectConfigured) try {
     // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
     // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
     // 猜——那正是 `updated_fallback` 被假报成成功的原因。
@@ -1665,8 +1660,27 @@ export async function automateOpenPlatformSetup(
     retryRedirectAfterReview = openPlatformUnderReview(err);
   }
 
+  if (options.redirectOnly) {
+    return {
+      ok: true,
+      sessionFile,
+      sessionSource: preparedSession.source,
+      cookieCount: preparedSession.cookieCount,
+      scopeCount: 0,
+      skippedScopeCount: 0,
+      privilegeRangeCount: 0,
+      subscribedEventCount: 0,
+      missingVcEvents: [],
+      eventModeReady: false,
+      redirectConfigured,
+      redirectWarning,
+      publishSkipped: true,
+    };
+  }
+
+  const manifest = options.scopeManifest ?? readDefaultScopeManifest();
   let allScopesPayload: unknown;
-  try {
+  if (manifest.scopes?.tenant?.length || manifest.scopes?.user?.length) try {
     allScopesPayload = await postJson(`/developers/v1/scope/all/${options.appId}`);
   } catch (err: any) {
     return {
@@ -1679,7 +1693,6 @@ export async function automateOpenPlatformSetup(
     };
   }
 
-  const manifest = options.scopeManifest ?? readDefaultScopeManifest();
   // 调用方给了「已授权」名字集合时，在**映射成 ID 之前**做 name 差集，把 manifest
   // 收窄成「本次真正还缺的」——只有它非空才需要发 scope/update、也才算一次变更。
   // 这正是「无变更短路」在走默认全量 manifest 的生产链路里能真正生效的关键：否则

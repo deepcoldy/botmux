@@ -9,6 +9,7 @@ import {
   resolveScannerAllowedUser,
   resolveSessionEmailAllowedUser,
 } from '../setup/owner-identity.js';
+import { completeRegisteredApp, createRegistrationOptions } from '../setup/registration-manifest.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import {
   validateCredentials,
@@ -53,7 +54,7 @@ export type BotOnboardingStatus =
   | 'verifying'
   // 正在自动配置开放平台权限 (导入 scope / redirect / 发版).
   | 'configuring_permissions'
-  // 仅显式兼容模式可能需要第二次扫码；Feishu 主路径不会进入此状态.
+  // 网页补配需要 owner 确认。
   | 'waiting_for_platform_scan'
   // 扫码人身份无法被新 app 验证 → 不落盘空 allowedUsers 的开放 bot, 等用户在
   // Dashboard 手动填写并通过校验的 owner 后才进入 completed (fail-closed).
@@ -72,6 +73,7 @@ export interface BotOnboardingPermission {
   versionId?: string;
   /** 部分权限注册失败的告警 */
   scopeWarning?: string;
+  eventWarning?: string;
   /** Exact same-session event mode ACK for MOSA-managed activation. */
   eventMode?: number;
   /** Exact baseline event + callback count ACK for MOSA-managed activation. */
@@ -106,7 +108,7 @@ export interface BotOnboardingSnapshot {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'sdk' | 'web' | 'compat';
   /** Existing onboarding job whose exact App permission setup is being resumed. */
   recoveryOfJobId?: string;
   /** Monotonic permission-recovery attempt within the same immutable target lineage. */
@@ -160,7 +162,7 @@ export interface BotOnboardingInput {
   appName?: string;
   cloneSourceAppId?: string;
   /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'sdk' | 'web' | 'compat';
   /**
    * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
    * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
@@ -313,13 +315,14 @@ export interface BotOnboardingManagerOptions {
   pendingStorePath?: string;
   /** Private, secret-free recovery lineage used to turn restart into a fresh owner QR. */
   permissionRecoveryStorePath?: string;
-  /** 单次 Feishu Web 登录建应用主路径；测试可注入。 */
+  /** 显式网页创建和受管 onboarding 使用。 */
   createApp?: CreateAppFn;
   inspectSession?: InspectSessionFn;
-  /** SDK device flow fallback；显式只注入 registerApp 时保留旧测试路径。 */
+  /** 官方注册接口。 */
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
   automateOpenPlatform?: AutomateOpenPlatformFn;
+  completeRegisteredApp?: typeof completeRegisteredApp;
   verifyCriticalScopes?: VerifyCriticalScopesFn;
   /**
    * A single complete application-info response is not an activation ACK:
@@ -437,6 +440,8 @@ export class BotOnboardingManager {
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
+  private readonly completeRegisteredApp: typeof completeRegisteredApp;
+  private readonly defaultRegistrationMode: NonNullable<BotOnboardingInput['registrationMode']>;
   private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
   private readonly criticalScopeStableReads: number;
   private readonly criticalScopeMaxAttempts: number;
@@ -453,13 +458,13 @@ export class BotOnboardingManager {
   private permissionRecoveryStateError?: string;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
-    // 生产默认走单次 Web session；旧单测/外部注入若只给 registerApp，则明确
-    // 视为要求直接测 SDK 路径，避免批量改写既有测试缝。
-    this.createApp = opts.createApp ?? (opts.registerApp ? undefined : createFeishuOpenPlatformApp);
+    this.createApp = opts.createApp ?? createFeishuOpenPlatformApp;
+    this.defaultRegistrationMode = opts.createApp ? 'web' : 'sdk';
     this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
+    this.completeRegisteredApp = opts.completeRegisteredApp ?? completeRegisteredApp;
     this.verifyCriticalScopes = opts.verifyCriticalScopes ?? readCriticalScopesFromApplicationInfo;
     this.criticalScopeStableReads = Number.isInteger(opts.criticalScopeStableReads)
       && (opts.criticalScopeStableReads ?? 0) > 0
@@ -1668,8 +1673,9 @@ export class BotOnboardingManager {
           this.now(),
         )
       : resolveSetupAppName(input.appName, configuredBots.length);
+    const registrationMode = input.registrationMode ?? this.defaultRegistrationMode;
     this.patch(id, {
-      registrationMode: input.registrationMode ?? 'web',
+      registrationMode,
       ...(input.requireCriticalScopesBeforeActivation
         ? { criticalScopeActivationRequired: true }
         : {}),
@@ -1682,8 +1688,9 @@ export class BotOnboardingManager {
     // Web 主路径的登录身份邮箱。免扫码/单扫链路没有 device-flow 的 userOpenId,
     // 自动确认 owner 只能靠它——正是表单顶部「将使用 …」展示并确认过的账号。
     let sessionEmail: string | undefined;
-    if (input.registrationMode === 'compat' || !this.createApp) {
-      result = await this.registerWithSdk(id);
+    const registration = registrationMode === 'sdk' ? createRegistrationOptions(appName) : undefined;
+    if (registrationMode !== 'web' || !this.createApp) {
+      result = await this.registerWithSdk(id, registration);
     } else {
       const created = await this.createApp({
         name: appName,
@@ -1723,12 +1730,12 @@ export class BotOnboardingManager {
     }
 
     if (!result.ok) {
-      this.patch(id, { status: 'failed', error: result.error, message: result.message });
+      this.patch(id, { status: 'failed', error: result.error, message: result.message, qrUrl: undefined, qrDataUrl: undefined });
       return;
     }
     // brand (feishu / lark) 由扫码 tenant_brand 自动识别后落盘；daemon 链路
     // 全程从 BotConfig.brand 派生域名，feishu / lark 都能直接跑。
-    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined });
+    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined, qrUrl: undefined, qrDataUrl: undefined });
     const validation = await this.validateCredentials(result.appId, result.appSecret, result.brand);
     if (!validation.ok) {
       this.patch(id, {
@@ -1797,7 +1804,8 @@ export class BotOnboardingManager {
     const auto = await this.runPermissionAutomation(id, result.appId, result.brand, {
       cliId,
       workingDir,
-      registrationMode: input.registrationMode ?? 'web',
+      registrationMode,
+      registration: registration?.addons && { credentials: result, addons: registration.addons },
       requireVerifiedEvents: input.requireCriticalScopesBeforeActivation === true,
     });
     // Every managed initial App first reaches one durable activation-pending
@@ -1851,13 +1859,14 @@ export class BotOnboardingManager {
     }
   }
 
-  private async registerWithSdk(id: string): Promise<RegisterAppResult> {
+  private async registerWithSdk(id: string, options?: RegisterAppOptions): Promise<RegisterAppResult> {
     return this.registerApp({
+      ...options,
       onQRCodeReady: info => {
         this.patch(id, {
           status: 'waiting_for_scan',
           qrUrl: info.url,
-          qrDataUrl: this.renderQrDataUrl(info.url),
+          qrDataUrl: options?.addons ? undefined : this.renderQrDataUrl(info.url),
           expireAt: this.now() + info.expireIn * 1000,
         });
       },
@@ -1947,7 +1956,8 @@ export class BotOnboardingManager {
     meta: {
       cliId: string;
       workingDir: string;
-      registrationMode: 'web' | 'compat';
+      registrationMode: 'sdk' | 'web' | 'compat';
+      registration?: { credentials: Extract<RegisterAppResult, { ok: true }>; addons: NonNullable<RegisterAppOptions['addons']> };
       requireVerifiedEvents: boolean;
     },
   ): Promise<OpenPlatformAutomationResult> {
@@ -1975,7 +1985,19 @@ export class BotOnboardingManager {
     };
 
     try {
-      if (meta.registrationMode === 'compat') {
+      if (meta.registration && !meta.requireVerifiedEvents) {
+        const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
+        try {
+          return await this.completeRegisteredApp(meta.registration.credentials, meta.registration.addons, this.automateOpenPlatform, {
+            ...callbacks,
+            sessionFilePath,
+            disableBytedcliFallback: true,
+          });
+        } finally {
+          rmSync(sessionFilePath, { force: true });
+        }
+      }
+      if (meta.registrationMode !== 'web') {
         const sessionFilePath = join(
           dirname(this.opts.botsJsonPath),
           'onboarding-sessions',
@@ -2141,6 +2163,7 @@ export class BotOnboardingManager {
           skippedScopeCount: auto.skippedScopeCount,
           versionId: auto.versionId,
           scopeWarning: auto.scopeWarning,
+          eventWarning: auto.eventWarning,
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
           // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
@@ -2161,6 +2184,8 @@ export class BotOnboardingManager {
       status,
       ...(addedBotIndex !== undefined ? { addedBotIndex } : {}),
       platformQrDataUrl: undefined,
+      qrUrl: undefined,
+      qrDataUrl: undefined,
       permission,
       ...(error ? { error } : {}),
       ...(auto.ok ? {} : { remainingSteps: buildRemainingSteps(appId, brand) }),

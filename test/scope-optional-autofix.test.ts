@@ -1,29 +1,9 @@
-/**
- * Startup scope self-check (checkRequiredScopes) and VC-event auto-subscribe
- * (ensureVcMeetingEventsSubscribed) in src/im/lark/event-dispatcher.ts, driven
- * through their real entry points: the Lark HTTP calls go through a stubbed
- * global fetch, while the Open Platform automation and the admin DM transport
- * are mocked at their module boundaries.
- *
- * What must hold (PR #715 and follow-ups):
- *  - All critical scopes granted + an optional one missing → a SILENT, QR-free
- *    top-up that requests only the missing scope and forwards the per-bucket
- *    granted set; nothing missing → no automation; a failed top-up changes nothing.
- *  - App stuck in review: DM the admin once per pending version, and only count it
- *    as notified once the DM was actually delivered (mark-then-send = one failure
- *    silences that version forever).
- *  - 99991672 (no self_manage): request every botmux-required scope in one shot,
- *    not the full manifest; fall back to the manual DM only when the auto-fix failed.
- *  - VC events: skip non-feishu / VC-inactive bots, probe read-only first, publish
- *    only when events are missing, never pop a QR at boot, DM only on failure.
- *
- * Run: bun run vitest run test/scope-optional-autofix.test.ts
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   bot: undefined as any,
   automate: vi.fn(),
+  register: vi.fn(),
   probe: vi.fn(),
   hints: vi.fn(),
   dm: vi.fn(),
@@ -32,6 +12,7 @@ const h = vi.hoisted(() => ({
 vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   ...(await importOriginal() as object),
   getBot: () => h.bot,
+  getOwnerOpenId: () => h.bot.resolvedAllowedUsers[0],
 }));
 vi.mock('../src/setup/open-platform-automation.js', async (importOriginal) => ({
   ...(await importOriginal() as object),
@@ -39,6 +20,7 @@ vi.mock('../src/setup/open-platform-automation.js', async (importOriginal) => ({
   probeVcMeetingEventSubscription: h.probe,
   inspectUnderReviewConfigHints: h.hints,
 }));
+vi.mock('../src/setup/register-app.js', () => ({ tryRegisterApp: h.register }));
 vi.mock('../src/im/lark/client.js', async (importOriginal) => ({
   ...(await importOriginal() as object),
   sendUserMessage: h.dm,
@@ -46,6 +28,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => ({
 
 import { checkRequiredScopes, ensureVcMeetingEventsSubscribed } from '../src/im/lark/event-dispatcher.js';
 import { readDefaultScopeManifest } from '../src/setup/open-platform-automation.js';
+import type { RegisterAppOptions } from '../src/setup/register-app.js';
 import { BOTMUX_REQUIRED_SCOPES } from '../src/setup/verify-permissions.js';
 
 const APP = 'cli_scope_selfcheck';
@@ -56,12 +39,19 @@ const makeBot = (config: Record<string, unknown> = {}) => ({
 });
 
 /** Lark app-info stub: `granted` scopes in both token buckets, or an error `code`. */
-function stubLark(app: { granted?: string[]; code?: number }): void {
+function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: string; approveRepair?: boolean; userOnly?: string }): void {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (String(url).includes('tenant_access_token')) return Response.json({ code: 0, tenant_access_token: 't' });
+    if (String(url).endsWith('/v6/scopes')) {
+      const buckets = h.register.mock.lastCall?.[0]?.addons.scopes;
+      const scopes = app.approveRepair ? ['tenant', 'user'].flatMap(scope_type =>
+        (buckets?.[scope_type] ?? []).map((scope_name: string) => ({ scope_name, scope_type, grant_status: 1 }))) : [];
+      return Response.json({ code: 0, data: { scopes } });
+    }
     if (app.code !== undefined) return Response.json({ code: app.code, msg: 'denied' });
     return Response.json({ code: 0, data: { app: {
-      scopes: (app.granted ?? []).map(scope => ({ scope, token_types: ['tenant', 'user'] })),
+      unaudit_version_id: app.reviewVersion,
+      scopes: (app.granted ?? []).map(scope => ({ scope, token_types: app.userOnly === scope ? ['user'] : ['tenant', 'user'] })),
     } } });
   }));
 }
@@ -70,86 +60,126 @@ const manifest = readDefaultScopeManifest();
 const inManifest = (name: string) => manifest.scopes.tenant.includes(name) || manifest.scopes.user.includes(name);
 const critical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).map(s => s.name);
 const optional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical).map(s => s.name);
-const requested = (call: number): string[] => {
-  const scopes = h.automate.mock.calls[call]![0].scopeManifest.scopes;
-  return [...new Set([...scopes.tenant, ...scopes.user])].sort();
+const requested = (): string[] => {
+  const scopes = h.register.mock.lastCall![0].addons.scopes;
+  return [...new Set<string>([...scopes.tenant, ...scopes.user])].sort();
 };
-const applied = { ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0, subscribedEventCount: 0, versionId: 'v9' };
-const underReview = (inReviewVersionId: string) => ({ ok: false, reason: 'app_under_review', message: '', inReviewVersionId });
+const link = 'https://open.feishu.cn/page/launcher?user_code=TEST';
 
 beforeEach(() => {
   h.bot = makeBot();
   h.automate.mockReset();
+  h.register.mockReset().mockImplementation(async (opts: RegisterAppOptions) => {
+    opts.onQRCodeReady?.({ url: link, expireIn: 600 });
+    return { ok: true, appId: APP, appSecret: crypto.randomUUID(), brand: 'feishu' };
+  });
   h.probe.mockReset();
   h.hints.mockReset().mockResolvedValue('');
   h.dm.mockReset().mockResolvedValue(undefined);
 });
 afterEach(() => { vi.unstubAllGlobals(); });
 
-describe('checkRequiredScopes — optional-scope top-up', () => {
-  it('runs no automation when every required scope is granted', async () => {
+describe('checkRequiredScopes — 官方增量确认', () => {
+  it('所有权限已授权时无需确认链接', async () => {
     stubLark({ granted: [...critical, ...optional] });
     await checkRequiredScopes(APP);
+    expect(h.register).not.toHaveBeenCalled();
     expect(h.automate).not.toHaveBeenCalled();
     expect(h.dm).not.toHaveBeenCalled();
   });
 
-  it('tops up only the missing optional scope, silently and without a QR, with the bucketed granted set', async () => {
+  it('只向 owner 申请缺失项，确认后回读再告知结果', async () => {
     const missing = optional.find(inManifest)!;
     const granted = [...critical, ...optional.filter(name => name !== missing)];
-    stubLark({ granted });
-    h.automate.mockResolvedValue(applied);
+    stubLark({ granted, approveRepair: true });
     await checkRequiredScopes(APP);
-    expect(h.automate).toHaveBeenCalledTimes(1);
-    expect(h.automate.mock.calls[0]![0]).toMatchObject({ disableQrLogin: true });
-    expect(requested(0)).toEqual([missing]);
-    expect(h.automate.mock.calls[0]![0].grantedScopeNames).toEqual({ tenant: granted, user: granted });
-    expect(h.dm).not.toHaveBeenCalled();
+    expect(h.register).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP }));
+    expect(requested()).toEqual([missing]);
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.dm.mock.calls[0]?.slice(0, 4)).toEqual([APP, 'ou_admin', expect.stringContaining(link), 'text']);
+    expect(h.dm.mock.calls[1]?.slice(0, 4)).toEqual([APP, 'ou_admin', expect.stringContaining('全部补齐'), 'text']);
   });
 
-  it('leaves a failed top-up (no cached web session) unannounced', async () => {
-    stubLark({ granted: [...critical, ...optional.slice(1)] });
-    h.automate.mockResolvedValue({ ok: false, reason: 'missing_session', message: '' });
-    await expect(checkRequiredScopes(APP)).resolves.toBeUndefined();
-    expect(h.dm).not.toHaveBeenCalled();
+  it('确认后仍缺失时报告实际结果', async () => {
+    const missing = optional.find(inManifest)!;
+    stubLark({ granted: [...critical, ...optional.filter(name => name !== missing)] });
+    await checkRequiredScopes(APP);
+    expect(h.dm.mock.calls[1]![2]).toContain('仍缺失');
+    expect(h.dm.mock.calls[1]![2]).toContain(missing);
+  });
+
+  it('待确认时合并同一应用的重复检查', async () => {
+    const missing = optional.find(inManifest)!;
+    stubLark({ granted: [...critical, ...optional.filter(name => name !== missing)], approveRepair: true });
+    let resolve!: (value: unknown) => void;
+    h.register.mockImplementationOnce(async (opts: RegisterAppOptions) => {
+      opts.onQRCodeReady?.({ url: link, expireIn: 600 });
+      return new Promise(done => { resolve = done; });
+    });
+    const first = checkRequiredScopes(APP);
+    await vi.waitFor(() => expect(h.dm).toHaveBeenCalledTimes(1));
+    await checkRequiredScopes(APP);
+    expect(h.register).toHaveBeenCalledTimes(1);
+    resolve({ ok: true, appId: APP, brand: 'feishu' });
+    await first;
+    expect(h.dm).toHaveBeenCalledTimes(2);
+  });
+
+  it('同名 scope 只授予 user 时仍为 tenant 申请缺失项', async () => {
+    const scope = 'im:message';
+    stubLark({ granted: [...critical, ...optional], approveRepair: true, userOnly: scope });
+    await checkRequiredScopes(APP);
+    expect(h.register.mock.lastCall?.[0].addons.scopes).toEqual({ tenant: [scope], user: [] });
+  });
+
+  it('生成链接期间更换 owner 时只向新 owner 发链接', async () => {
+    const missing = optional.find(inManifest)!;
+    stubLark({ granted: [...critical, ...optional.filter(name => name !== missing)], approveRepair: true });
+    let finishBegin!: () => void;
+    h.register.mockImplementationOnce(async (opts: RegisterAppOptions) => {
+      await new Promise<void>(done => { finishBegin = done; });
+      opts.onQRCodeReady?.({ url: link, expireIn: 600 });
+      return { ok: false, error: 'aborted' };
+    });
+    const first = checkRequiredScopes(APP);
+    await vi.waitFor(() => expect(h.register).toHaveBeenCalledTimes(1));
+    h.bot.resolvedAllowedUsers = ['ou_new_owner'];
+    await checkRequiredScopes(APP);
+    finishBegin();
+    await first;
+    expect(h.register).toHaveBeenCalledTimes(2);
+    expect(h.dm.mock.calls.map(call => call[1])).toEqual(['ou_new_owner', 'ou_new_owner']);
+  });
+
+  it('回读被拒时只申请 self_manage', async () => {
+    stubLark({ code: 99991672, approveRepair: true });
+    await checkRequiredScopes(APP);
+    expect(requested()).toEqual(['application:application:self_manage']);
+  });
+
+  it('确认链接生成失败时保留手动 self_manage 链接', async () => {
+    stubLark({ code: 99991672 });
+    h.register.mockResolvedValue({ ok: false, error: 'network', message: 'network' });
+    await checkRequiredScopes(APP);
+    expect(h.dm).toHaveBeenCalledTimes(1);
+    expect(h.dm.mock.calls[0]![2]).toContain('application:application:self_manage');
   });
 });
 
 describe('checkRequiredScopes — app stuck in review', () => {
   it('DMs once per pending version, and counts it only after the DM was delivered', async () => {
-    stubLark({ granted: optional });
-    h.automate.mockResolvedValue(underReview('ver-1'));
+    stubLark({ granted: optional, reviewVersion: 'ver-1' });
     h.hints.mockResolvedValue('HINT-DATA-RANGE');
     h.dm.mockRejectedValueOnce(new Error('network down'));
-    await checkRequiredScopes(APP); // delivery failed → not recorded
-    await checkRequiredScopes(APP); // retried and delivered → recorded
-    await checkRequiredScopes(APP); // same pending version → silent
+    await checkRequiredScopes(APP);
+    await checkRequiredScopes(APP);
+    await checkRequiredScopes(APP);
     expect(h.dm).toHaveBeenCalledTimes(2);
     expect(h.dm.mock.calls[1]![2]).toContain('HINT-DATA-RANGE');
-    h.automate.mockResolvedValue(underReview('ver-2'));
-    await checkRequiredScopes(APP); // a new pending version is news again
+    stubLark({ granted: optional, reviewVersion: 'ver-2' });
+    await checkRequiredScopes(APP);
     expect(h.dm).toHaveBeenCalledTimes(3);
-  });
-});
-
-describe('checkRequiredScopes — 99991672 (app lacks self_manage)', () => {
-  it('requests every botmux-required scope in one shot, not the full manifest', async () => {
-    stubLark({ code: 99991672 });
-    h.automate.mockResolvedValue(applied);
-    await checkRequiredScopes(APP);
-    expect(requested(0)).toEqual(BOTMUX_REQUIRED_SCOPES.map(s => s.name).filter(inManifest).sort());
-    expect(requested(0)).toContain('application:application:self_manage');
-  });
-
-  it('falls back to the manual self_manage DM only when the auto-fix failed', async () => {
-    stubLark({ code: 99991672 });
-    h.automate.mockResolvedValue(underReview('ver-x'));
-    await checkRequiredScopes(APP);
-    expect(h.dm).not.toHaveBeenCalled();
-    h.automate.mockResolvedValue({ ok: false, reason: 'missing_session', message: '' });
-    await checkRequiredScopes(APP);
-    expect(h.dm).toHaveBeenCalledTimes(1);
-    expect(h.dm.mock.calls[0]![2]).toContain('application:application:self_manage');
+    expect(h.register).not.toHaveBeenCalled();
   });
 });
 

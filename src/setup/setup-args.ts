@@ -101,13 +101,12 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
       列出已配置机器人（--json 输出完整字段，secret 脱敏）。
 
   botmux setup add --create-app --allowed-users <owner> [--app-name <name>] [选项]
-      首次扫码创建飞书应用；后续有效登录态下确认账号/企业后免扫码添加。
-      --app-name 留空自动使用 botmux-N；更换账号用 --switch-account。
+      打开飞书确认链接创建应用并申请权限、事件和回调。
+      --app-name 留空自动使用 botmux-N；--switch-account 或本地应用图标走网页创建。
       owner 请用完整邮箱、手机号或 union_id on_xxx；新应用尚不存在，不能
       预先拥有可用的 open_id ou_xxx。managed Agent 若传入 daemon 注入的
       当前 session owner，会由来源应用转换为 on_。
-      默认继续完成权限、长连接事件、redirect 与发版；可用
-      --no-open-platform-auto 跳过后半段自动配置。
+      默认回读权限并补齐长连接和 redirect；可用 --no-open-platform-auto 跳过配置。
 
   botmux setup add --create-app --compatibility-mode --allowed-users <owner> [选项]
       显式使用官方 SDK 兼容模式，可能需要额外扫码。兼容模式不支持

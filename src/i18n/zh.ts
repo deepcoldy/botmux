@@ -1847,7 +1847,7 @@ export const messages: Record<string, string> = {
   'setup.credentials.header': '── 飞书应用 ──',
   'setup.credentials.source_title': '飞书应用来源',
   'setup.credentials.one_scan': '一次扫码创建新应用（推荐）',
-  'setup.credentials.one_scan_hint': '飞书 Web 登录后自动命名、创建应用、取凭证并完成开放平台配置',
+  'setup.credentials.one_scan_hint': '打开飞书确认链接创建应用并申请权限、事件和回调',
   'setup.credentials.pick_existing': '选择已有应用',
   'setup.credentials.pick_existing_hint': '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）',
   'setup.credentials.manual': '手动输入 AppID/Secret',

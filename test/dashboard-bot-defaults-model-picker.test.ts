@@ -228,7 +228,7 @@ describe('BotOnboardingDialog 模型选择器', () => {
       if (url.startsWith('/api/cli-options/availability?')) {
         return new Response(JSON.stringify({ status: 'available' }));
       }
-      if (url === '/api/cli-options') {
+      if (url === '/api/cli-options?probe=none') {
         return new Response(JSON.stringify({
           options: [{ id: 'codex', label: 'Codex', modelChoices: [PINNED_MODEL] }],
           ttadkModelSuggestions: [],

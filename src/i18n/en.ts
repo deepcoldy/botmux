@@ -1841,7 +1841,7 @@ export const messages: Record<string, string> = {
   'setup.credentials.header': '── Feishu / Lark App ──',
   'setup.credentials.source_title': 'App Source',
   'setup.credentials.one_scan': 'One-scan create new app (Recommended)',
-  'setup.credentials.one_scan_hint': 'Log in via Web to auto-name, create app, obtain credentials and configure Open Platform',
+  'setup.credentials.one_scan_hint': 'Open the Feishu link to create the app and request permissions, events and callbacks',
   'setup.credentials.pick_existing': 'Select existing app',
   'setup.credentials.pick_existing_hint': 'Log in via Web to list apps you created, auto-retrieving AppID/Secret (Feishu only)',
   'setup.credentials.manual': 'Enter AppID/Secret manually',
