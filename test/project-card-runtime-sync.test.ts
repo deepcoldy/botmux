@@ -105,6 +105,27 @@ describe('project card runtime sync', () => {
     expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
   });
 
+  it('新摘要获得完整的独立失败预算，不继承旧摘要的失败计数', async () => {
+    const f = await fixture();
+    vi.mocked(f.transport.updateCard).mockImplementation(async () => { throw expiredError(); });
+    for (let i = 0; i < 20; i += 1) await f.sync.sync();
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
+
+    // 新摘要：前两次瞬时失败，第三次成功——新预算必须容忍这两次失败。
+    f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
+    vi.mocked(f.transport.updateCard)
+      .mockImplementationOnce(async () => { throw new Error('transient 1'); })
+      .mockImplementationOnce(async () => { throw new Error('transient 2'); })
+      .mockImplementation(async () => {});
+    await f.sync.sync();
+    await f.sync.sync();
+    await f.sync.sync();
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 3);
+    // 成功后同摘要不再打接口。
+    await f.sync.sync();
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 3);
+  });
+
   it('瞬时失败会在下一轮重试，成功后停止', async () => {
     const f = await fixture();
     vi.mocked(f.transport.updateCard)
