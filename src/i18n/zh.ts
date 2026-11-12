@@ -1662,6 +1662,8 @@ export const messages: Record<string, string> = {
   'worker.final_output_content_audit_redacted_note': '部分内容已自动打码',
   'worker.final_output_card_rejected': '⚠️ 本轮回复卡片被飞书拒收（错误码 {code}）。已停止重复回传，会话仍可继续使用。完整回答保留在 Web 终端中，可打开查看或要求以纯文字重新发送。',
   'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
+  'card.restored_turn_notice': '⚠️ 这是 {time}「{excerpt}」那一轮的回复：这一轮中途 botmux 重启过，以下内容从终端记录恢复，可能不完整。',
+  'card.restored_turn_notice_no_excerpt': '⚠️ 这是 {time} 那一轮的回复：这一轮中途 botmux 重启过，以下内容从终端记录恢复，可能不完整。',
   'worker.restart_interrupted.note': '【botmux 提示】这个会话刚刚重启过：CLI 进程中途退出，已用原上下文恢复。{details}请先核对这些工作的实际状态（例如 CI、测试、子任务的结果），再继续没做完的事；仍需要的监控或后台任务要重新启动。',
   'worker.restart_interrupted.note_turn': '重启前你正在处理的那一轮还没做完。',
   'worker.restart_interrupted.note_tasks': '以下后台任务随旧进程一起终止，不会再有完成通知：{tasks}。',

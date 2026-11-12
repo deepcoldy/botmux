@@ -546,7 +546,8 @@ import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { restoredTurnLabel } from './services/restored-turn-label.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -2066,9 +2067,22 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
   if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
-  // Queue observations span turns, including admissions not yet bound to the
-  // runtime. An unaccepted input must not invalidate its own backlog report.
-  if (msg.type === 'cli_input_backlog') delete context.scope.execution;
+  // Queue observations belong to this worker process, not to a turn or a
+  // runtime: they span turns (including admissions not yet bound to the
+  // runtime) and runtimes too. Whatever callback publishes one, it reports the
+  // queue as it is now, so it must not carry the binding that callback was
+  // started under: once the runtime is re-bound (the relay resolved the real
+  // CLI behind its launcher, then the native session id arrived), a report
+  // from the write that began before it would be dropped as a stale runtime's
+  // event. A backlog is reported only when it changes, so the daemon would keep
+  // the previous report — "the CLI has not taken its input" — for good. The
+  // producer is still this worker; the gateway admits it as a worker event.
+  if (msg.type === 'cli_input_backlog') {
+    delete context.scope.execution;
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
@@ -2092,6 +2106,14 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
+      // Likewise a re-attached Claude may be mid-turn and write nothing until
+      // that turn ends. Without its conversation the contract cannot tell this
+      // live CLI from another and its running attempt loses its origin. The
+      // process's own pid-state record names it — the source a write's session
+      // id comes from — when the record is provably this process's and agrees
+      // with what the process holds open.
+      nativeSessionId = readClaudeLiveSessionId(childPid, bridgeDataDir);
     }
     if (owned() && readProcessStartIdentity(childPid) === start) return { backend: backendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(nativeSessionId ? { nativeSessionId } : {}) };
   }
@@ -12018,12 +12040,11 @@ function emitReadyTurns(opts: {
     }
 
     // A restored turn's fallback is a RECOVERED partial/final produced around
-    // a worker restart — label it so the user can tell it from a live answer.
-    // Prefix is applied AFTER the suppress gate so dedup compares the model's
-    // own text, never the notice.
-    const deliveredText = turn.restoredFromJournal && !universalOutputHandoff
-      ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
-      : postText;
+    // a restart, possibly turns ago. The daemon notes which turn it answers
+    // above it; the content itself stays the model's own text, so the reply
+    // keeps one identity whether it is emitted live or after a restore.
+    const deliveredText = postText;
+    const restoredTurn = turn.restoredFromJournal ? restoredTurnLabel(turn) : undefined;
     usageLimitTracker.noteTurnCompleted('answered');
     const handoffOutput = { sessionId: sessionId!, content: deliveredText, lastUuid: lastUuid!, turnId: turn.turnId };
     if (workerFinalOutputHandoff && handoffTurnIds.has(turn.turnId) && !turn.isLocal && turn.dispatchAttempt === undefined
@@ -12055,6 +12076,7 @@ function emitReadyTurns(opts: {
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      ...(restoredTurn ? { restoredTurn } : {}),
     });
   }
   } catch (error) {

@@ -23,7 +23,17 @@
    目标访问拒绝、成员校验不可用（包括超过现有 2000 人分页上限）与个人未登录分别提示；校验不可用不要求重新登录。已被当前回合或精确恢复记录确证为真人的消息不查询委托存储，委托存储损坏只阻断需要从中取得身份的路径。
 
 9. `botmux send --mention <同机 Bot>` 交接同样附带委托（来源 Bot 的 `triggerUserAuth.delegateOnMention`，默认开，Dashboard「按触发人鉴权」里可关）。消息由 CLI 自己发出，所以分两步：发送前 CLI 调 `/api/dispatch-user/mention-prepare`，只传目标 Bot 的应用 ID 和群；来源 daemon 在当前回合是真人直接触发，或本回合已带有经验证的委托时写 pending 记录（定时任务、不带委托的机器人消息都不算）；后一种与 `botmux dispatch` 一致，按当前群重新检查原用户的访问权限，只能收窄工具，否则主编排收到一个 Bot 的回报后再 @ 下一个 Bot，原用户身份就会断掉，目标限本机已配置的其它 Bot、限本会话所在群。发送后 CLI 调 `/api/dispatch-user/mention-bind`，daemon 向飞书取回这条消息，确认是本 Bot 在发送前登记之后发到该群的，才把记录绑定到这个消息 ID；校验不过或发送失败都撤销登记。交接消息可能在普通群顶层、引用回复或话题里，所以这类记录不写话题根，只绑定精确的消息 ID；`botmux dispatch` 的记录仍要求话题根一致。任何一步不成，消息照常发出，只是接收方这一轮没有委托身份。正文里写的 `@Bot`（被注入成真正 @ 的那种）与 `--mention` 同样算交接目标。交接被拒时，接收方提示里的 `--dispatch-root` 指向这条交接消息本身；它在 dispatch 回报登记里没有条目，`botmux report` 会按「未送达主编排」的公告发到群里，而不是回到发起方会话。
-10. 接收方每次按委托发布身份时记一条 `[dispatch-user:audit] receive`（来源 Bot、目标 Bot、union_id、会话、回合、工具、结果）；来源 daemon 在登记和绑定时各记一条 `mention-prepare` / `mention-bind`，不签委托时记一条 `mention-prepare skipped` 及原因。
+10. 接收方每次按委托发布身份时记一条 `[dispatch-user:audit] receive`（来源 Bot、目标 Bot、union_id、会话、回合、工具、结果）；来源 daemon 在登记和绑定时各记一条 `mention-prepare` / `mention-bind`，不签委托时记一条 `mention-prepare skipped` 及原因。其中本轮确为真人直连、但本 Bot 策略对该目标签不出任何工具时记 `no_delegatable_tool`，与本轮根本没有真人直连的 `no_direct_human` 区分，避免排查审计日志时把「无工具可签」误读成「非真人发起」。
+
+### 指定目标的派发专用工具权限
+
+来源 Bot 可在 `triggerUserAuth.dispatchOnly` 配置 `tools`、`targetAppIds` 和 `chatIds`。这份工具权限仅在当前真人直接发起、来源群等于目标群、目标应用全部在白名单中，且本轮没有继承委托时，加入 `botmux dispatch` 或同机 `botmux send --mention` 的签名；配置缺失或任一条件不满足时不增加权限。策略启用时字段必须完整且使用精确应用 ID / 群 ID，非法配置拒绝加载；策略为 `enabled:false` 时该字段被接受但忽略、不参与加载校验，便于把 `enabled` 当手动总开关，而不会让一个 Bot 的编辑在下次启动时拖垮整份 bots.json。`--mention` 的白名单按过滤掉非本机 Bot 之后、实际接收签名的目标判定：同一条消息里一个不在本机的 @ 目标，不会否决命中白名单的本机目标。
+
+`dispatchOnly` 不改变来源 Bot 自己的 CLI 身份、定时任务的运行 scope 或机器人回合。自动附加的定时授权不得覆盖这份真人即时委派；显式请求定时授权仍遵循原授权规则。目标 Bot 仍逐项验证签名、真人访问权限、群成员关系，并按目标 Bot 自己的 `triggerUserAuth` 获取该人的凭据。部署新配置前须确认 Botmux 的 `capabilities --json` 包含 `dispatch_only_user_auth_v1`；旧版本不会执行这条派发规则。
+
+白名单只约束来源 Bot 自己发出的第一跳。目标 Bot 在后续机器人回合里把这份委托再转给第三方时，走的是既有「继承只能收窄」规则：按目标 Bot 自己的 `tools` 过滤，不再回头校验来源 Bot 的 `targetAppIds` / `chatIds`。因此「未列入白名单的目标不能获得额外权限」只对第一跳成立；第二跳及以后，第三方拿到的只是上游已签、并经每一跳收窄后的工具集，不会比本改动之前更宽。
+
+与定时授权的边界：自动附加的 `schedule:create` 不得覆盖非管理员真人的这份即时委派，管理员本人的定时权限可与其共存。但定时运行 scope 的可用性校验只看来源 Bot 的基础 `tools`、不看 `dispatchOnly.tools`；所以按推荐的 `tools: []` 配置、又同时命中宿主 `runScopes`（如 bytedcli）与默认定时授权时，管理员派发会收到 `schedule_delegation_source_run_scope_unavailable`，需要带 `--no-delegate schedule:create` 才能派发——这种情况下 dispatchOnly 工具仍照常签名。
 
 ## 边界与取舍
 

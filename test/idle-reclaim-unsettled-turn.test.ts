@@ -113,6 +113,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   initWorkerPool,
+  manualSuspendWaits,
+  queueManualSuspend as queueManualSuspendBehind,
   __testOnly_resetTurnTerminalReportingClis,
   __testOnly_setupWorkerHandlers,
   __testOnly_setSuspendBackingVerifier,
@@ -459,6 +461,55 @@ describe('a suspend queued while the session works', () => {
     await flush();
 
     expect(answering.worker).toBe(null);
+  });
+
+  // `botmux suspend` asked for after the prompt came back: the route queues
+  // only while one of these waits holds, and says which.
+  it('makes a suspend asked for once the screen is idle wait for the answer being delivered', async () => {
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    const finishDelivery = beginFinalOutputDelivery(answering, TURN);
+    turnTerminal(worker, answering);
+    screenIdle(worker);
+    await flush();
+
+    const waits = manualSuspendWaits(answering);
+    expect(waits.waitingFor).toEqual(['reply']);
+    expect(waits.replyHoldUntil).toBeGreaterThan(Date.now());
+    queueManualSuspendBehind(answering, waits);
+    await flush();
+    expect(answering.worker).toBe(worker);
+
+    finishDelivery();
+    await flush();
+    expect(answering.worker).toBe(null);
+    expect(answering.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('carries a suspend asked for during the terminal wait out at the wait\'s bound, with no further edge', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    claudeReportsTerminals();
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    screenIdle(worker);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const waits = manualSuspendWaits(answering);
+    expect(waits.waitingFor).toEqual(['reply']);
+    expect(waits.replyHoldUntil! - Date.now()).toBeGreaterThan(UNSETTLED_TURN_RECLAIM_GRACE_MS - 1_000);
+    expect(waits.replyHoldUntil! - Date.now()).toBeLessThanOrEqual(UNSETTLED_TURN_RECLAIM_GRACE_MS);
+    queueManualSuspendBehind(answering, waits);
+    await vi.advanceTimersByTimeAsync(UNSETTLED_TURN_RECLAIM_GRACE_MS - 1_000);
+    expect(answering.worker).toBe(worker);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(answering.worker).toBe(null);
+  });
+
+  it('has nothing to wait for once the answer is out', async () => {
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    turnTerminal(worker, answering);
+    screenIdle(worker);
+    await flush();
+
+    expect(manualSuspendWaits(answering)).toEqual({ waitingFor: [] });
   });
 });
 

@@ -356,7 +356,7 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, hasUnacceptedCliInput, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason } from './worker-pool.js';
+import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -3217,26 +3217,22 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     // already reached, so report idempotent success without a live kill.
     return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
   }
-  // Producing a reply, or still taking in a message — killing the worker now
-  // would drop this turn. Queue instead; worker-pool's runPendingSuspendIfSettled
-  // cashes it in once the turn has settled. Ordering matters: the idempotent
-  // no-worker branch above must win, so "worker was already gone" never
-  // reports as deferred.
+  // Producing a reply, still taking in a message, or the last reply not yet
+  // out — killing the worker now would drop that turn or its answer. Queue
+  // instead; worker-pool's runPendingSuspendIfSettled cashes it in once all of
+  // them have settled, and the response names what it waits for. Ordering
+  // matters: the idempotent no-worker branch above must win, so "worker was
+  // already gone" never reports as deferred.
   //
   // The suspendability check is part of the queueing condition, not a new guard
   // ahead of it: a non-suspendable (pty) backend must keep falling through to
   // suspendWorker's existing 409 rather than get a `deferred` that could only
   // fail silently at fulfillment time.
-  if (
-    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing' || hasUnacceptedCliInput(ds))
-    && isSuspendableBackendType(ds.initConfig?.backendType)
-  ) {
-    ds.pendingSuspendReason = 'manual_suspend';
-    // Bind the claim to the generation that is producing right now: it must not
-    // outlive that worker (see clearPendingSuspendClaim).
-    ds.pendingSuspendGeneration = ds.workerGeneration;
+  const waits = manualSuspendWaits(ds);
+  if (waits.waitingFor.length > 0 && isSuspendableBackendType(ds.initConfig?.backendType)) {
+    queueManualSuspend(ds, waits);
     return jsonRes(res, 200, {
-      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
+      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred', ...waits,
     });
   }
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) {

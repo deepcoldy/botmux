@@ -1662,6 +1662,8 @@ export const messages: Record<string, string> = {
   'worker.final_output_content_audit_redacted_note': 'Some content was automatically masked',
   'worker.final_output_card_rejected': '⚠️ Lark rejected this reply card (error {code}). Automatic redelivery has stopped; the conversation can continue. The full answer remains in the web terminal. Open it to read the answer or ask for a plain-text resend.',
   'worker.bridge_restored_turn_notice': '⚠️ This turn was interrupted by a botmux restart. Below is the output recovered from the terminal transcript (may be incomplete):',
+  'card.restored_turn_notice': '⚠️ Reply to the turn from {time} ("{excerpt}"): botmux restarted while it ran, so this was recovered from the terminal transcript and may be incomplete.',
+  'card.restored_turn_notice_no_excerpt': '⚠️ Reply to the turn from {time}: botmux restarted while it ran, so this was recovered from the terminal transcript and may be incomplete.',
   'worker.restart_interrupted.note': '[botmux] This session was just restarted: the CLI process exited mid-way and was resumed with its previous context. {details}Check the actual state of that work (CI, tests, sub-task results) before continuing whatever is unfinished; restart any monitor or background job you still need.',
   'worker.restart_interrupted.note_turn': 'The turn you were working on had not finished. ',
   'worker.restart_interrupted.note_tasks': 'These background tasks were terminated with the old process and will not send completion notifications: {tasks}. ',
