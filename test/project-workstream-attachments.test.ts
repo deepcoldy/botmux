@@ -810,6 +810,114 @@ describe('project workstream attachments', () => {
     });
   });
 
+  async function seedOrdinaryDispatch(
+    f: Awaited<ReturnType<typeof fixture>>,
+    rootMessageId: string,
+    entryMutate: (entry: Record<string, unknown>) => void,
+  ): Promise<void> {
+    await f.coordinator.run(f.context, {
+      action: 'dispatch',
+      dispatchRoot: rootMessageId,
+      title: '普通派单任务',
+      purpose: '验证收口边界',
+      owners: ['BotAlpha'],
+      status: 'in_progress',
+      progress: 20,
+    });
+    await updateDispatchRegistry(join(f.dataDir, 'orchestrate-dispatch.json'), registry => {
+      const entry: Record<string, unknown> = {
+        orchChatId: f.actor.chatId,
+        orchScope: 'chat',
+        orchAppId: f.actor.larkAppId,
+        orchSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetAppIds: ['cli_worker'],
+        title: '普通派单任务',
+        status: 'accepted',
+        createdAt: '2026-11-10T00:00:00.000Z',
+        updatedAt: '2026-11-10T00:00:00.000Z',
+      };
+      entryMutate(entry);
+      registry[rootMessageId] = entry;
+    });
+  }
+
+  it('refuses manual update on an ordinary dispatch whose signed binding targets another coordinator', async () => {
+    const f = await fixture();
+    await seedOrdinaryDispatch(f, 'om_foreign_binding', entry => {
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_foreign_binding',
+        targetLarkAppId: 'cli_other_coordinator',
+        targetSessionId: 'other-session',
+        targetChatId: 'oc_other_chat',
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+      });
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_foreign_binding',
+      status: 'completed',
+      progress: 100,
+      content: '越权收口必须被拒绝',
+    })).rejects.toThrow('workstream_not_found');
+    const item = readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === 'om_foreign_binding')!;
+    expect(item).toMatchObject({ status: 'in_progress', progress: 20 });
+    expect(item.lastReport).toBeUndefined();
+    expect(f.registry().om_foreign_binding.lastReport).toBeUndefined();
+  });
+
+  it('refuses manual update when the registry row already belongs to an imported attachment', async () => {
+    const f = await fixture();
+    // Attachment marker on the registry row wins regardless of binding shape.
+    await seedOrdinaryDispatch(f, 'om_marked_attachment', entry => {
+      entry.projectAttachmentOperationId = 'op-imported-elsewhere';
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_marked_attachment',
+        targetLarkAppId: f.actor.larkAppId,
+        targetSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+      });
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_marked_attachment',
+      status: 'completed',
+      content: '迁入登记行不得走普通派单收口',
+    })).rejects.toThrow('workstream_root_already_registered');
+
+    // A signed attachment payload without the operation marker must also stay on the imported path.
+    await seedOrdinaryDispatch(f, 'om_signed_attachment', entry => {
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_signed_attachment',
+        targetLarkAppId: f.actor.larkAppId,
+        targetSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+        attachment: {
+          sourceSessionId: 'source-one',
+          sourceLarkAppId: 'cli_worker',
+          ownerKey: 'union:on_owner',
+          sourceRouteRevision: 1,
+          revision: 1,
+          state: 'active',
+          reportCapability: 'verified',
+        },
+      });
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_signed_attachment',
+      status: 'completed',
+      content: '带 attachment 的签名不得走普通派单收口',
+    })).rejects.toThrow('workstream_not_found');
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === 'om_signed_attachment')!)
+      .toMatchObject({ status: 'in_progress', progress: 20 });
+  });
+
   it('passes resolveCardRuntime into published project card JSON', async () => {
     const f = await fixture();
     f.transport.resolveCardRuntime = vi.fn(async () => ({
