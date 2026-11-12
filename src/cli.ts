@@ -192,7 +192,7 @@ import {
 import {
   FLEET_DAEMON_EXIT_WAIT_MS,
 } from './core/shutdown-budgets.js';
-import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, primaryCardBodyMissing, sendBodyRequiredMessage, sendFileAttachments, sendVideoAttachments, shouldSendAsPureFile, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
 import { assertCardPatchChat, buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
@@ -344,6 +344,7 @@ import {
   type ManagedOriginAttestationContext,
 } from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
+import { classifySendStdin, describeEmptySendStdin, readSendStdin, sendStdinPolicy } from './cli/send-stdin.js';
 import {
   collaborationHelp,
   formatBotInfoEntriesForCli,
@@ -7950,7 +7951,8 @@ const SEND_HELP_BODY = [
   '       --images <path>                 内联图片（可重复）',
   '       --image-mode <mode>             独立单图：fit_horizontal（默认）|medium|small|tiny',
   '                                      medium/small/tiny 等比占宽 1/2、1/3、1/4，完整显示不裁剪',
-  '       --files <path>                  附件（可重复）',
+  '       --files <path>                  附件（可重复）。只发一个文件且不 @ 人时可以不写正文；',
+  '                                      多个附件或带 @ 时需要正文（位置参数 / --content-file / stdin）',
   '       --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）',
   '       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）',
   '       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON',
@@ -11018,27 +11020,57 @@ async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
     return { kind: 'error', message: t('xpi.send.as_usage') };
   }
 
-  // Read stdin before session/ledger/marker resolution. This is the same read
-  // the command used to perform later, but doing it here keeps a rejected body
-  // from advancing a queued turn or copying an open socket into a transport.
-  // Trade-off: this read also precedes the workflow/transport/capability gates
-  // inside cmdSend, so a non-TTY stdin that never reaches EOF blocks before
-  // those gates can refuse. That fd shape is not reachable in production (the
-  // worker hands the CLI a TTY; remote-runner uses --content-file with
-  // stdio:'ignore'), and the queued-turn ordering win is worth it.
-  const stdinContent = await readStdin();
+  // Read stdin before session/ledger/marker resolution, so a rejected body can
+  // neither advance a queued turn nor copy an open socket into a transport.
+  // How long to wait depends on what fd 0 is (src/cli/send-stdin.ts): a
+  // terminal or /dev/null never carries a body, and an attachment send only
+  // takes a piped body that is already flowing. A caller can hand the CLI a
+  // pipe that never reaches EOF — Claude Code's Bash tool does for a command
+  // that contains a heredoc — and waiting on it wedged attachment-only sends.
+  // A body-only send (or an explicit lone '-') still waits for EOF, so
+  // `slow-producer | botmux send` keeps working; it also still precedes the
+  // workflow/transport/capability gates inside cmdSend.
+  const flags = plan.invocation.flags;
   const loneDash = plan.invocation.positionals.length === 1 && plan.invocation.positionals[0] === '-';
+  const { images, files, videos, videoCovers } = plan.attachments;
+  const hasAttachments = images.length + files.length + videos.length + videoCovers.length > 0;
+  const stdinShape = classifySendStdin();
+  const stdinRead = await readSendStdin(sendStdinPolicy(stdinShape, { explicitDash: loneDash, hasAttachments }));
+  const stdinContent = decodeStdinBytes(stdinRead.bytes);
   if (loneDash && !stdinContent.trim()) {
     return {
       kind: 'error',
       message: "botmux send: 位置参数 '-' 表示从 stdin 读正文，但 stdin 没有内容；多行正文请直接用 botmux send <<'EOF' … EOF。",
     };
   }
-  const hasAttachments = plan.attachments.images.length + plan.attachments.files.length
-    + plan.attachments.videos.length + plan.attachments.videoCovers.length > 0;
-  if (!loneDash && !stdinContent.trim() && !hasAttachments
-    && !Object.hasOwn(plan.invocation.flags, '--diff') && !asChoice) {
-    return { kind: 'error', message: 'botmux send: 正文为空（stdin 没有内容）。' };
+  if (!loneDash && !stdinContent.trim()) {
+    const emptyReason = describeEmptySendStdin(stdinShape, stdinRead.outcome);
+    if (!hasAttachments && !Object.hasOwn(flags, '--diff') && !asChoice) {
+      return {
+        kind: 'error',
+        message: `botmux send: 正文为空（${emptyReason}）。请把正文写成位置参数，或用 --content-file <文件>；多行正文用 botmux send <<'EOF' … EOF。`,
+      };
+    }
+    // Same shape test cmdSend applies to the final rendered body; failing here
+    // keeps the refusal ahead of any session or transport resolution. Voice,
+    // slash and --diff primaries are not the reply card and report their own
+    // body errors; --as synthesizes its body.
+    const replyCardPrimary = !asChoice && !Object.hasOwn(flags, '--diff')
+      && !Object.hasOwn(flags, '--voice') && !Object.hasOwn(flags, '--slash');
+    if (hasAttachments && replyCardPrimary && primaryCardBodyMissing({
+      hasBodyText: false,
+      imageCount: images.length,
+      fileCount: files.length,
+      videoCount: videos.length,
+      mentionCount: (flags['--mention']?.length ?? 0) + (Object.hasOwn(flags, '--mention-back') ? 1 : 0),
+    })) {
+      return { kind: 'error', message: sendBodyRequiredMessage(emptyReason) };
+    }
+    if (stdinRead.outcome === 'no-input') {
+      // The only case where a body could still have been on its way: say so,
+      // rather than drop a slow producer's text without a trace.
+      console.error(`botmux send: ${emptyReason}，按不带正文发送附件；正文由较慢的管道产生时请加 '-'。`);
+    }
   }
   return { kind: 'plan', plan: { ...plan, stdinContent } };
 }
@@ -12600,14 +12632,16 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
   }
   if (!customCard && preparedText !== undefined) expectedLinkRenderedContent = preparedText;
-  const fileOnlyPrimaryRequested = !customCard
-    && !expectedLinkRenderedContent.trim()
-    && !asChoice
-    && images.length === 0
-    && files.length === 1
-    && videoAttachments.length === 0
-    && mentionArgs.length === 0
-    && !mentionBack;
+  // Requested mentions, not resolved ones: a mention that resolves to nobody
+  // must not silently turn an addressed send into a bare media message.
+  const primaryShape = {
+    hasBodyText: !!expectedLinkRenderedContent.trim(),
+    imageCount: images.length,
+    fileCount: files.length,
+    videoCount: videoAttachments.length,
+    mentionCount: mentionArgs.length + (mentionBack ? 1 : 0),
+  };
+  const fileOnlyPrimaryRequested = !customCard && !asChoice && shouldSendAsPureFile(primaryShape);
   // A file-only final intentionally has no card body. Its attachment is the
   // user-visible primary content, so inspect it only when link validation or a
   // durable final-answer fingerprint needs the bytes. The bounded streaming
@@ -12661,6 +12695,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file "${TMPDIR:-/tmp}/msg.md" --images "${TMPDIR:-/tmp}/chart.png"\n  botmux send --videos "${TMPDIR:-/tmp}/replay.mp4" --video-covers "${TMPDIR:-/tmp}/cover.png" --no-mention "视频预览"');
     process.exit(1);
+  }
+  // Every body source converges here before any upload or provider write: an
+  // empty --content-file, a blank positional, a relay's prepared copy. (A
+  // stdin body was already refused in preflight with its stdin-specific
+  // reason.) The pure file / pure video shapes are the only media primaries;
+  // anything else would publish a reply card with nothing in its body.
+  if (!customCard && !asChoice && !asVoice && !isSlashSend && primaryCardBodyMissing(primaryShape)) {
+    console.error(sendBodyRequiredMessage(contentFile ? '--content-file 的内容为空' : '正文为空'));
+    process.exit(2);
   }
 
   // --attention guard: only valid replying into the current session with a text
