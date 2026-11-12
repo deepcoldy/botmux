@@ -226,7 +226,7 @@ import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { applyClaudeEffortObservation } from './claude-effort-observation.js';
 import { applyNativeReasoningObservation } from './native-reasoning-observation.js';
 import { terminalEffortPreferenceKey } from '../services/terminal-effort-choice.js';
-import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, noteExplicitEffortPreferenceEdit } from './terminal-effort-writeback.js';
+import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, noteExplicitEffortPreferenceEdit, hasConfirmedNativeGrokEffort } from './terminal-effort-writeback.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
@@ -3882,7 +3882,8 @@ function sessionAgentConfig(
   // TraeX efforts are syntax-checked at load time; its live catalog owns capability.
   if (ds.session.reasoningEffort && !modelChoice.traexAutoModel
       && ds.session.cliId !== 'traex'
-      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)) {
+      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)
+      && !(config.terminalEffortWriteback && hasConfirmedNativeGrokEffort(ds.session, model))) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
   }

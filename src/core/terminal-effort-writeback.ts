@@ -19,9 +19,20 @@ export function terminalEffortChoiceWasSaved(ds: DaemonSession, nonce: string): 
 }
 type Source = { worker: DaemonSession['worker']; workerGeneration: number | undefined; cliId: string };
 type Observation = { reasoningEffort: unknown; claudeSessionId?: string; nativeSessionId?: string;
-  cliId?: string; cliSpawnGeneration?: number; observedAtMs?: number; source?: string; userSelection?: TerminalEffortChoice };
+  cliId?: string; cliSpawnGeneration?: number; model?: string; observedAtMs?: number; source?: string; userSelection?: TerminalEffortChoice };
 type Mutate = (ids: readonly string[], change: (rows: Map<string, Session>) => void,
   options?: { nonblocking?: boolean }) => { rows: Map<string, Session> };
+
+/** A successful Grok selection can precede Botmux's static catalog (for
+ * example Grok 4.7 xhigh). Reuse that fact only for its exact resumed model. */
+export function hasConfirmedNativeGrokEffort(session: Session, model: string | undefined): boolean {
+  const edit = session.terminalEffortPreferenceEdit;
+  return session.cliId === 'grok' && !session.dispatchLaunchSpec && !session.adoptedFrom && !!model
+    && edit?.source === 'terminal'
+    && edit.nativeSessionId === session.cliSessionId && edit.nativeModel?.toLowerCase() === model.toLowerCase()
+    && edit.nativeEffort === session.reasoningEffort && edit.nativeEffort === 'xhigh'
+    && edit.nativeSnapshotHash === JSON.parse(terminalEffortPreferenceKey(session))[4];
+}
 
 /** Save a confirmed user choice, leaving runtime/card observations independent.
  * The durable transaction commits before either the store cache or ds is changed. */
@@ -61,7 +72,10 @@ export function persistTerminalEffortChoice(ds: DaemonSession, observation: Obse
     || ds.session.dispatchLaunchSpec) return false;
   const model = ds.activeModel ?? ds.session.model;
   if (choice.model && model && choice.model.toLowerCase() !== model.toLowerCase()) return false;
-  if (!options.supportsEffort(source.cliId, model, choice.requestedEffort)) return false;
+  const nativeGrokXhigh = source.cliId === 'grok' && choice.requestedEffort === 'xhigh'
+    && observation.source === 'native-summary' && choice.model === model && observation.model === model
+    && /^grok-\d+\.\d+(?:-|$)/i.test(model ?? '');
+  if (!options.supportsEffort(source.cliId, model, choice.requestedEffort) && !nativeGrokXhigh) return false;
   const before = ds.session;
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
   const committed = options.mutate([before.sessionId], rows => {
@@ -91,6 +105,10 @@ export function persistTerminalEffortChoice(ds: DaemonSession, observation: Obse
       topic.effort = choice.requestedEffort;
     }
     row.terminalEffortPreferenceEdit = { atMs: now, source: 'terminal', requestedAtMs: choice.requestedAtMs, enableEpoch: choice.enableEpoch };
+    if (nativeGrokXhigh) Object.assign(row.terminalEffortPreferenceEdit, {
+      nativeSessionId: choice.nativeSessionId, nativeModel: model, nativeEffort: choice.requestedEffort,
+      nativeSnapshotHash: JSON.parse(terminalEffortPreferenceKey(row))[4],
+    });
     // modelPin remains authoritative on launch; never modify or clear it.
   }, { nonblocking: true });
   const row = committed.rows.get(before.sessionId);

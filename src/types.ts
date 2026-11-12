@@ -1249,7 +1249,7 @@ export interface Session {
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /** Last explicit preference edit, only recorded while terminal writeback is enabled. */
-  terminalEffortPreferenceEdit?: { atMs: number; source: 'explicit' | 'terminal'; requestedAtMs?: number; enableEpoch?: number };
+  terminalEffortPreferenceEdit?: { atMs: number; source: 'explicit' | 'terminal'; requestedAtMs?: number; enableEpoch?: number; nativeSessionId?: string; nativeModel?: string; nativeEffort?: string; nativeSnapshotHash?: string };
   /** Codex service tier frozen at session creation; legacy missing means inherit. */
   serviceTier?: CodexServiceTierPreference;
   /** Per-session opt-in idle auto-compaction (core/idle-auto-compact.ts).

@@ -45,3 +45,8 @@ for all four CLIs, non-user observations, identity/epoch mismatches, transaction
 failure and concurrent edits, pin/dispatch precedence, late Claude statusline versus command-success records, direct native commands
 after a previous preference edit, and a durable reload whose
 resolved launch arguments contain the saved effort.
+
+A confirmed native Grok xhigh selection can precede the static Botmux model
+catalog. With writeback enabled only, its persisted native-session/model/snapshot
+receipt permits that exact cold resume to keep xhigh. It never edits the global
+model catalog or changes switch-off launch validation.

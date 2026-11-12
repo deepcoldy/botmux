@@ -1,11 +1,11 @@
 import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Session } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved } from '../src/core/terminal-effort-writeback.js';
+import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, hasConfirmedNativeGrokEffort } from '../src/core/terminal-effort-writeback.js';
 import { terminalEffortPreferenceKey, type TerminalEffortChoice } from '../src/services/terminal-effort-choice.js';
 import { resolveSessionLaunchEffort } from '../src/core/session-model.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
@@ -14,7 +14,7 @@ import { applyClaudeEffortObservation } from '../src/core/claude-effort-observat
 import { applyNativeReasoningObservation } from '../src/core/native-reasoning-observation.js';
 import { ClaudeEffortObserver } from '../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker, readClaudeEffortCommandReceipt } from '../src/services/terminal-effort-choice.js';
-import { parseStatuslinePayload, writeStatuslineSnapshot } from '../src/services/statusline-snapshot.js';
+import { parseStatuslinePayload, writeStatuslineSnapshot, statuslineFilePath } from '../src/services/statusline-snapshot.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { admitSessionCommand } from '../src/services/session-command-gateway.js';
 
@@ -60,6 +60,20 @@ describe('terminal effort persistence', () => {
       expect(args[args.indexOf('--effort') + 1]).toBe('medium');
       expect(args[args.indexOf('--resume') + 1]).toBe('native');
     }
+  });
+
+  it('remembers native Grok xhigh for the exact resumed model even before the static table knows it', () => {
+    const f = fixture('grok');
+    f.state.activeModel = 'grok-4.7-build-fast'; f.row.model = f.state.activeModel; f.state.session.model = f.row.model;
+    store.updateSession(f.row);
+    const selection = { ...f.selection, requestedEffort: 'xhigh' as const, model: f.row.model,
+      expectedPreference: terminalEffortPreferenceKey(f.row) };
+    expect(persistTerminalEffortChoice(f.state, { ...f.observation, model: f.row.model, reasoningEffort: 'xhigh', userSelection: selection },
+      f.source, { ...f.options, supportsEffort: () => false })).toBe(true);
+    store.init(APP); const restored = store.getSession(f.row.sessionId)!;
+    expect(hasConfirmedNativeGrokEffort(restored, restored.model)).toBe(true);
+    expect(hasConfirmedNativeGrokEffort(restored, 'grok-other')).toBe(false);
+    expect(hasConfirmedNativeGrokEffort({ ...restored, cliSessionId: 'other' }, restored.model)).toBe(false);
   });
 
   it('off means no disk write, including an otherwise valid selection', () => {
@@ -224,6 +238,9 @@ describe('actual worker confirmation, transaction and ACK pipeline', () => {
     function snapshot(level: 'high' | 'medium', at = Date.now()) {
       writeStatuslineSnapshot(directory, f.row.sessionId, parseStatuslinePayload({ session_id: 'native',
         model: { id: f.row.model }, effort: { level } }, at)!);
+      // File-cache invalidation must advance along with the fake clock: Bun's
+      // stat can give rapid same-size fixture rewrites the same real mtime.
+      utimesSync(statuslineFilePath(directory, f.row.sessionId), at / 1000, at / 1000);
     }
     function command(at = Date.now(), success = true) {
       const content = '<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args>medium</command-args>';
@@ -277,7 +294,9 @@ describe('actual worker confirmation, transaction and ACK pipeline', () => {
     Object.assign(p.scope.config, { terminalEffortWriteback: true, terminalEffortWritebackEpoch: 1, terminalEffortWritebackEnabledAtMs: NOW + 1000 });
     p.snapshot('medium'); p.poll();
     expect(p.mutate).not.toHaveBeenCalled();
-    p.command(); vi.setSystemTime(NOW + 1001); p.snapshot('medium'); p.poll();
+    // A command stamped in the enabling tick remains ambiguous; exercise a
+    // genuinely later user command (both runners use millisecond timestamps).
+    vi.setSystemTime(NOW + 1001); p.command(); vi.setSystemTime(NOW + 1002); p.snapshot('medium'); p.poll();
     expect(p.mutate).toHaveBeenCalledTimes(1);
   });
 
