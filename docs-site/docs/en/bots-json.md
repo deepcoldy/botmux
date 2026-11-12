@@ -512,6 +512,7 @@ What the cards look like and what each switch does: see [Live streaming cards](/
 | `replyCardActions` | Show a compact action menu (open terminal / switch model / close session) on ordinary answer cards. Off by default |
 | `askOptionLayout` | Layout of `botmux ask` option buttons: `compact` (default, wraps) or `vertical` (one per row, easier for long options) |
 | `writableTerminalLinkInCard` | `true` puts a writable terminal link directly in the card (anyone who can see the card can drive the terminal). By default it's behind a "get write link" button and sent privately to whoever clicks |
+| `goalStatusCard` | `true` makes Codex / TRAE sessions post one goal status card when a native goal is set, updated in place with the status and the CLI-counted elapsed time. Off by default. Silent, private-reply, document and meeting sessions never show it |
 | `privateCard` | `true` makes `/card` send a private card visible only to admins; regular groups only, and it doesn't refresh live |
 | `silentTurnReactions` | `true` stops adding the GoGoGo / ✅ reactions in sessions with the live card turned off |
 | `receivedReactionEmoji` / `doneReactionEmoji` | Replace the "received" / "done" reactions (Feishu emoji_type); defaults `GoGoGo` / `DONE`. Setting both to the same value avoids an early ✅ when a CLI is judged idle too soon |

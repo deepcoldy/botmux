@@ -1,34 +1,187 @@
+import { deriveSessionTaskStatus, type SessionTaskFacts } from '../../core/session-task-status.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
   projectRemainingSummary,
   projectTitleWithoutTaskMarker,
+  visibleProjectWorkstreams,
   type ProjectGroupState,
   type ProjectWorkstream,
-  type ProjectWorkstreamStatus,
 } from '../../services/project-group-store.js';
 import {
+  resolveProjectProgressCardCompletedDisplay,
   resolveProjectProgressCardConfig,
   type ProjectProgressCardConfig,
   type ProjectProgressCardSectionId,
 } from '../../services/project-progress-card-config.js';
 
-const STATUS_META: Record<ProjectWorkstreamStatus, { label: string; color: string }> = {
-  pending: { label: '未开始', color: 'neutral' },
-  in_progress: { label: '进行中', color: 'blue' },
-  blocked: { label: '阻塞', color: 'orange' },
-  completed: { label: '已完成', color: 'green' },
-  failed: { label: '失败', color: 'red' },
+export const COLLAPSED_COMPLETED_WORKSTREAM_LIMIT = 15;
+export const RECENT_COMPLETED_WORKSTREAM_LIMIT = 5;
+
+export interface ProjectGroupCardRuntime {
+  /** Keyed by dispatchRoot: live or persisted SessionTaskFacts for attached source sessions. */
+  sessionFactsByRoot?: Readonly<Record<string, SessionTaskFacts | undefined>>;
+  /** Keyed by raw owner token (e.g. cli_xxx larkAppId): human-readable bot display name. */
+  ownerDisplayNames?: Readonly<Record<string, string>>;
+  /** Optional clock override for deterministic status derivation in tests. */
+  now?: number;
+}
+
+export type ProjectWorkstreamDisplayKind =
+  | 'blocked'
+  | 'failed'
+  | 'in_progress'
+  | 'running'
+  | 'waiting_reply'
+  | 'idle'
+  | 'pending'
+  | 'closed'
+  | 'completed';
+
+export interface ProjectWorkstreamDisplayStatus {
+  kind: ProjectWorkstreamDisplayKind;
+  label: string;
+  color: string;
+}
+
+const DISPLAY_STATUS_ORDER: Record<ProjectWorkstreamDisplayKind, number> = {
+  blocked: 0,
+  running: 1,
+  in_progress: 1,
+  waiting_reply: 2,
+  idle: 3,
+  pending: 4,
+  closed: 5,
+  failed: 6,
+  completed: 7,
 };
 
-const STATUS_ORDER: Record<ProjectWorkstreamStatus, number> = {
-  blocked: 0,
-  in_progress: 1,
-  pending: 2,
-  failed: 3,
-  completed: 4,
-};
+const ATTACHMENT_STATE_SUFFIXES = [
+  '（已迁出）',
+  '（连接已关闭）',
+  '（连接待核对）',
+  '（登记待完成）',
+  '（手工跟踪）',
+] as const;
+
+export function resolveWorkstreamDisplayStatus(
+  item: ProjectWorkstream,
+  runtime?: ProjectGroupCardRuntime,
+): ProjectWorkstreamDisplayStatus {
+  // Explicit terminal or blocker states from `botmux report` / coordinator `update` always win.
+  if (item.status === 'completed') return { kind: 'completed', label: '已完成', color: 'green' };
+  if (item.status === 'failed') return { kind: 'failed', label: '失败', color: 'red' };
+  if (item.status === 'blocked') return { kind: 'blocked', label: '阻塞', color: 'orange' };
+
+  if (!item.attachment) {
+    return item.status === 'in_progress'
+      ? { kind: 'in_progress', label: '进行中', color: 'blue' }
+      : { kind: 'pending', label: '未开始', color: 'neutral' };
+  }
+
+  if (item.attachment.state === 'closed') {
+    return { kind: 'closed', label: '已关闭', color: 'neutral' };
+  }
+  if (item.attachment.state === 'pending') {
+    return { kind: 'pending', label: '未开始', color: 'neutral' };
+  }
+
+  const facts = runtime?.sessionFactsByRoot?.[item.dispatchRoot];
+  if (facts) {
+    const derived = deriveSessionTaskStatus(facts, runtime?.now);
+    if (derived.kind === 'closed') return { kind: 'closed', label: '已关闭', color: 'neutral' };
+    if (derived.kind === 'working') return { kind: 'running', label: '在跑', color: 'blue' };
+    if (derived.kind === 'needs_you') return { kind: 'waiting_reply', label: '等回复', color: 'orange' };
+    if (derived.kind === 'delivered') return { kind: 'waiting_reply', label: '等回复', color: 'wathet' };
+    return item.status === 'in_progress'
+      ? { kind: 'in_progress', label: '进行中', color: 'blue' }
+      : { kind: 'idle', label: '空闲', color: 'neutral' };
+  }
+
+  if (item.status === 'in_progress') {
+    return { kind: 'in_progress', label: '进行中', color: 'blue' };
+  }
+  if (
+    runtime?.sessionFactsByRoot
+    && Object.prototype.hasOwnProperty.call(runtime.sessionFactsByRoot, item.dispatchRoot)
+    && item.attachment.state === 'active'
+  ) {
+    return { kind: 'idle', label: '空闲', color: 'neutral' };
+  }
+  return { kind: 'pending', label: '未开始', color: 'neutral' };
+}
+
+export function resolveWorkstreamOwnerNames(
+  item: ProjectWorkstream,
+  runtime?: ProjectGroupCardRuntime,
+): string[] {
+  const rawOwners = item.owners.length > 0
+    ? item.owners
+    : (item.attachment?.sourceLarkAppId ? [item.attachment.sourceLarkAppId] : []);
+  const out: string[] = [];
+  for (const raw of rawOwners) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const mapped = runtime?.ownerDisplayNames?.[trimmed]?.trim() || trimmed;
+    if (!out.includes(mapped)) out.push(mapped);
+  }
+  return out;
+}
+
+function formatWorkstreamOwnerText(item: ProjectWorkstream, runtime?: ProjectGroupCardRuntime): string {
+  return truncate(resolveWorkstreamOwnerNames(item, runtime).join('、') || '待认领', 32);
+}
+
+function dedupeTrailingAttachmentSuffixes(rawTitle: string): string {
+  let result = rawTitle.trim();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of ATTACHMENT_STATE_SUFFIXES) {
+      if (result.endsWith(`${suffix}${suffix}`)) {
+        result = result.slice(0, -suffix.length);
+        changed = true;
+      }
+    }
+  }
+  return result;
+}
+
+export function formatProjectWorkstreamTitle(item: ProjectWorkstream): string {
+  const cleaned = dedupeTrailingAttachmentSuffixes(item.title);
+  const label = cleaned && cleaned !== '子任务' && cleaned !== '子项目' ? truncate(cleaned, 32) : '待命名任务';
+  const attachment = item.attachment;
+  const state = attachment?.state;
+  const suffix = state === 'moved' ? '（已迁出）'
+    : state === 'closed' ? '（连接已关闭）'
+      : state === 'unknown' ? '（连接待核对）'
+        : state === 'pending' ? '（登记待完成）'
+          : attachment?.reportCapability === 'manual' ? '（手工跟踪）' : '';
+  return suffix && !label.endsWith(suffix) ? `${label}${suffix}` : label;
+}
+
+export function buildProjectGroupCardDigest(
+  project: ProjectGroupState,
+  runtime?: ProjectGroupCardRuntime,
+): string {
+  const visible = visibleProjectWorkstreams(project);
+  return JSON.stringify({
+    revision: project.revision,
+    status: project.status,
+    rows: visible.map(item => {
+      const display = resolveWorkstreamDisplayStatus(item, runtime);
+      return [
+        item.dispatchRoot,
+        display.kind,
+        display.label,
+        display.color,
+        formatWorkstreamOwnerText(item, runtime),
+        formatProjectWorkstreamTitle(item),
+      ];
+    }),
+  });
+}
 
 function escapeMarkdown(value: string): string {
   return value.replace(/[\\`*_{}\[\]()#+\-.!|>]/g, '\\$&');
@@ -53,25 +206,32 @@ function topicLink(project: ProjectGroupState, item: ProjectWorkstream, brand: B
   return `[进入话题](${threadAppLink(project.chatId, item.threadId, brand)})`;
 }
 
-function displayWorkstreams(project: ProjectGroupState): ProjectWorkstream[] {
-  return project.workstreams
+function displayWorkstreams(project: ProjectGroupState, runtime?: ProjectGroupCardRuntime): ProjectWorkstream[] {
+  return visibleProjectWorkstreams(project)
+    .map((item, index) => ({ item, index, order: DISPLAY_STATUS_ORDER[resolveWorkstreamDisplayStatus(item, runtime).kind] }))
+    .sort((left, right) => left.order - right.order || left.index - right.index)
+    .map(({ item }) => item);
+}
+
+function completedWorkstreamsByRecent(project: ProjectGroupState): ProjectWorkstream[] {
+  return visibleProjectWorkstreams(project)
     .map((item, index) => ({ item, index }))
-    .sort((left, right) => STATUS_ORDER[left.item.status] - STATUS_ORDER[right.item.status] || left.index - right.index)
+    .filter(({ item }) => item.status === 'completed')
+    .sort((left, right) => right.item.updatedAt.localeCompare(left.item.updatedAt) || right.index - left.index)
     .map(({ item }) => item);
 }
 
 function workstreamTitle(item: ProjectWorkstream): string {
-  const title = item.title.trim();
-  const label = title && title !== '子任务' && title !== '子项目' ? truncate(title, 32) : '待命名任务';
-  const attachment = item.attachment;
-  const state = attachment?.state;
-  return label + (state === 'moved' ? '（已迁出）' : state === 'closed' ? '（连接已关闭）'
-    : state === 'unknown' ? '（连接待核对）' : state === 'pending' ? '（登记待完成）'
-      : attachment?.reportCapability === 'manual' ? '（手工跟踪）' : '');
+  return formatProjectWorkstreamTitle(item);
 }
 
-function workstreamPlanItem(project: ProjectGroupState, item: ProjectWorkstream, brand: Brand): string {
-  const status = STATUS_META[item.status];
+function workstreamPlanItem(
+  project: ProjectGroupState,
+  item: ProjectWorkstream,
+  brand: Brand,
+  runtime?: ProjectGroupCardRuntime,
+): string {
+  const status = resolveWorkstreamDisplayStatus(item, runtime);
   const link = topicLink(project, item, brand);
   const title = escapeMarkdown(workstreamTitle(item));
   return `<text_tag color='${status.color}'>${status.label}</text_tag> **${title}**${link ? ` · ${link}` : ''}`;
@@ -93,26 +253,41 @@ function uniquePlanItems(items: string[]): string[] {
   return [...new Set(items.map(item => item.trim()).filter(Boolean))];
 }
 
-function projectProgressSummary(project: ProjectGroupState): string {
+function projectProgressSummary(project: ProjectGroupState, runtime?: ProjectGroupCardRuntime): string {
   if (project.status === 'completed') return '目标已完成';
-  if (project.workstreams.length === 0) {
+  const visible = visibleProjectWorkstreams(project);
+  if (visible.length === 0) {
     if (project.blockers.length > 0) return `${project.blockers.length} 项阻塞`;
     if (project.status === 'paused') return '项目已暂停';
     return '项目按当前阶段推进';
   }
-  const counts = project.workstreams.reduce((acc, item) => {
-    acc[item.status] += 1;
-    return acc;
-  }, { pending: 0, in_progress: 0, blocked: 0, completed: 0, failed: 0 });
+  const counts: Record<ProjectWorkstreamDisplayKind, number> = {
+    blocked: 0,
+    failed: 0,
+    in_progress: 0,
+    running: 0,
+    waiting_reply: 0,
+    idle: 0,
+    pending: 0,
+    closed: 0,
+    completed: 0,
+  };
+  for (const item of visible) {
+    counts[resolveWorkstreamDisplayStatus(item, runtime).kind] += 1;
+  }
   const parts = [
     counts.blocked > 0 ? `${counts.blocked} 项阻塞` : '',
     counts.failed > 0 ? `${counts.failed} 项失败` : '',
     counts.in_progress > 0 ? `${counts.in_progress} 项进行中` : '',
+    counts.running > 0 ? `${counts.running} 项在跑` : '',
+    counts.waiting_reply > 0 ? `${counts.waiting_reply} 项等回复` : '',
+    counts.idle > 0 ? `${counts.idle} 项空闲` : '',
     counts.pending > 0 ? `${counts.pending} 项待开始` : '',
+    counts.closed > 0 ? `${counts.closed} 项已关闭` : '',
     counts.completed > 0 ? `${counts.completed} 项已完成` : '',
   ].filter(Boolean);
   if (parts.length > 0) {
-    if (counts.completed === project.workstreams.length && remainingPlanItems(project).length > 0) {
+    if (counts.completed === visible.length && remainingPlanItems(project).length > 0) {
       return '子任务已完成，项目进入收尾';
     }
     return parts.join(' · ');
@@ -240,22 +415,33 @@ function planSurface(
   };
 }
 
-function planElements(project: ProjectGroupState, brand: Brand): Array<Record<string, unknown>> {
-  const ordered = displayWorkstreams(project);
-  const doing = ordered.filter(item => item.status === 'blocked' || item.status === 'failed' || item.status === 'in_progress')
-    .map(item => workstreamPlanItem(project, item, brand));
-  const pending = ordered.filter(item => item.status === 'pending')
+function planElements(
+  project: ProjectGroupState,
+  brand: Brand,
+  runtime?: ProjectGroupCardRuntime,
+): Array<Record<string, unknown>> {
+  const ordered = displayWorkstreams(project, runtime);
+  const doing = ordered.filter(item => {
+    const kind = resolveWorkstreamDisplayStatus(item, runtime).kind;
+    return kind === 'blocked'
+      || kind === 'failed'
+      || kind === 'in_progress'
+      || kind === 'running'
+      || kind === 'waiting_reply'
+      || kind === 'idle'
+      || kind === 'closed';
+  }).map(item => workstreamPlanItem(project, item, brand, runtime));
+  const pending = ordered.filter(item => resolveWorkstreamDisplayStatus(item, runtime).kind === 'pending')
     .map(item => workstreamTitleItem(project, item, brand));
   const todo = uniquePlanItems([
     ...pending,
     ...remainingPlanItems(project).map(item => escapeMarkdown(truncate(item, 80))),
   ]);
-  const done = ordered.filter(item => item.status === 'completed')
-    .slice(-4)
+  const done = completedWorkstreamsByRecent(project)
     .map(item => workstreamTitleItem(project, item, brand));
   return [
     {
-      tag: 'markdown', content: `<font color='indigo'>**推进概况**</font> · ${escapeMarkdown(projectProgressSummary(project))}`,
+      tag: 'markdown', content: `<font color='indigo'>**推进概况**</font> · ${escapeMarkdown(projectProgressSummary(project, runtime))}`,
       text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
     },
     ...(doing.length > 0
@@ -270,11 +456,54 @@ function planElements(project: ProjectGroupState, brand: Brand): Array<Record<st
   ];
 }
 
-function workstreamRows(project: ProjectGroupState, brand: Brand): Array<Record<string, string>> {
-  return displayWorkstreams(project).map(item => {
-    const status = STATUS_META[item.status];
+function compactWorkstreamLine(
+  project: ProjectGroupState,
+  item: ProjectWorkstream,
+  brand: Brand,
+  runtime?: ProjectGroupCardRuntime,
+): string {
+  const status = resolveWorkstreamDisplayStatus(item, runtime);
+  const owner = formatWorkstreamOwnerText(item, runtime);
+  const link = topicLink(project, item, brand);
+  return `- <text_tag color='${status.color}'>${status.label}</text_tag> **<font color='indigo'>${escapeMarkdown(workstreamTitle(item))}</font>** · <font color='purple'>${escapeMarkdown(owner)}</font>${link ? ` · ${link}` : ''}`;
+}
+
+function completedWorkstreamPanel(
+  project: ProjectGroupState,
+  completedRecent: ProjectWorkstream[],
+  brand: Brand,
+  runtime?: ProjectGroupCardRuntime,
+): Record<string, unknown> {
+  const visible = completedRecent.slice(0, COLLAPSED_COMPLETED_WORKSTREAM_LIMIT);
+  const hiddenCount = completedRecent.length - visible.length;
+  const lines = visible.map(item => compactWorkstreamLine(project, item, brand, runtime));
+  if (hiddenCount > 0) {
+    lines.push(`<font color='grey'>…另有 ${hiddenCount} 项更早已完成任务</font>`);
+  }
+  return {
+    tag: 'collapsible_panel', expanded: false, margin: '6px 0px 0px 0px',
+    padding: '4px 12px 12px 12px', background_color: 'grey-50',
+    header: {
+      title: { tag: 'plain_text', content: `已完成子任务（${completedRecent.length} 项）`, text_align: 'left' },
+      expanded_title: { tag: 'plain_text', content: `收起已完成子任务（${completedRecent.length} 项）`, text_align: 'left' },
+      padding: '12px 12px 12px 12px', width: 'fill',
+      icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+      icon_position: 'right', icon_expanded_angle: -180,
+    },
+    elements: [{ tag: 'markdown', content: lines.join('\n'), text_align: 'left', text_size: 'normal' }],
+  };
+}
+
+function workstreamRows(
+  items: ProjectWorkstream[],
+  project: ProjectGroupState,
+  brand: Brand,
+  runtime?: ProjectGroupCardRuntime,
+): Array<Record<string, string>> {
+  return items.map(item => {
+    const status = resolveWorkstreamDisplayStatus(item, runtime);
     const link = topicLink(project, item, brand);
-    const owner = escapeMarkdown(truncate(item.owners.join('、') || '待认领', 32));
+    const owner = escapeMarkdown(formatWorkstreamOwnerText(item, runtime));
     const blocker = item.status === 'blocked'
       ? `<font color='orange'>${escapeMarkdown(truncate(item.blocker || '原因待补充', 72))}</font>`
       : '';
@@ -283,6 +512,24 @@ function workstreamRows(project: ProjectGroupState, brand: Brand): Array<Record<
       status: `<text_tag color='${status.color}'>${status.label}</text_tag>${link ? `\n**${link}**` : ''}${blocker ? `\n${blocker}` : ''}`,
     };
   });
+}
+
+function workstreamTable(
+  items: ProjectWorkstream[],
+  project: ProjectGroupState,
+  brand: Brand,
+  runtime?: ProjectGroupCardRuntime,
+): Record<string, unknown> {
+  return {
+    tag: 'table',
+    columns: [
+      { data_type: 'markdown', name: 'wf', display_name: '子任务', horizontal_align: 'left', width: 'auto' },
+      { data_type: 'markdown', name: 'status', display_name: '状态 / 话题', horizontal_align: 'left', width: 'auto' },
+    ],
+    rows: workstreamRows(items, project, brand, runtime), ...TABLE_AUTO_ROW_HEIGHT,
+    header_style: { text_align: 'left', background_style: 'blue-50', text_color: 'blue', bold: true },
+    page_size: Math.min(10, items.length), margin: '8px 0px 0px 0px',
+  };
 }
 
 function milestonePanel(project: ProjectGroupState, expanded: boolean): Record<string, unknown> {
@@ -337,30 +584,69 @@ interface TemplateBodyContext {
   project: ProjectGroupState;
   brand: Brand;
   config: ProjectProgressCardConfig;
+  runtime?: ProjectGroupCardRuntime;
 }
 
 function statusDashboardBody(context: TemplateBodyContext): Array<Record<string, unknown>> {
-  const { project, brand, config } = context;
+  const { project, brand, config, runtime } = context;
+  const visible = visibleProjectWorkstreams(project);
   const body: Array<Record<string, unknown>> = [
     ...focusElements(project, config),
-    ...planElements(project, brand),
+    ...planElements(project, brand, runtime),
   ];
   if (sectionEnabled(config, 'blockers') && project.blockers.length > 0) body.push(blockerElement(project));
-  if (sectionEnabled(config, 'workstreams') && project.workstreams.length > 0) {
-    body.push({
-      tag: 'markdown', content: `<font color='blue'>**子任务状态（${project.workstreams.length}）**</font>`,
-      text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
-    });
-    body.push({
-      tag: 'table',
-      columns: [
-        { data_type: 'markdown', name: 'wf', display_name: '子任务', horizontal_align: 'left', width: 'auto' },
-        { data_type: 'markdown', name: 'status', display_name: '状态 / 话题', horizontal_align: 'left', width: 'auto' },
-      ],
-      rows: workstreamRows(project, brand), ...TABLE_AUTO_ROW_HEIGHT,
-      header_style: { text_align: 'left', background_style: 'blue-50', text_color: 'blue', bold: true },
-      page_size: Math.min(10, project.workstreams.length), margin: '8px 0px 0px 0px',
-    });
+  if (sectionEnabled(config, 'workstreams') && visible.length > 0) {
+    const completedDisplay = resolveProjectProgressCardCompletedDisplay(config);
+    const ordered = displayWorkstreams(project, runtime);
+    if (completedDisplay === 'all') {
+      body.push({
+        tag: 'markdown', content: `<font color='blue'>**子任务状态（${visible.length}）**</font>`,
+        text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
+      });
+      body.push(workstreamTable(ordered, project, brand, runtime));
+    } else if (completedDisplay === 'collapsed') {
+      const active = ordered.filter(item => item.status !== 'completed');
+      const completedRecent = completedWorkstreamsByRecent(project);
+      if (completedRecent.length === 0) {
+        body.push({
+          tag: 'markdown', content: `<font color='blue'>**子任务状态（${visible.length}）**</font>`,
+          text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
+        });
+        body.push(workstreamTable(active, project, brand, runtime));
+      } else if (active.length > 0) {
+        body.push({
+          tag: 'markdown',
+          content: `<font color='blue'>**子任务状态（未完成 ${active.length} / 共 ${visible.length}）**</font>`,
+          text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
+        });
+        body.push(workstreamTable(active, project, brand, runtime));
+        body.push(completedWorkstreamPanel(project, completedRecent, brand, runtime));
+      } else {
+        body.push({
+          tag: 'markdown',
+          content: `<font color='blue'>**子任务状态（未完成 0 / 共 ${visible.length}）**</font>\n<font color='grey'>当前无未完成子任务</font>`,
+          text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
+        });
+        body.push(completedWorkstreamPanel(project, completedRecent, brand, runtime));
+      }
+    } else {
+      const active = ordered.filter(item => item.status !== 'completed');
+      const completedRecent = completedWorkstreamsByRecent(project);
+      const shownCompleted = completedRecent.slice(0, RECENT_COMPLETED_WORKSTREAM_LIMIT);
+      const hiddenCount = completedRecent.length - shownCompleted.length;
+      body.push({
+        tag: 'markdown', content: `<font color='blue'>**子任务状态（${visible.length}）**</font>`,
+        text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
+      });
+      body.push(workstreamTable([...active, ...shownCompleted], project, brand, runtime));
+      if (hiddenCount > 0) {
+        body.push({
+          tag: 'markdown',
+          content: `<font color='grey'>已省略更早完成的 ${hiddenCount} 项子任务</font>`,
+          text_align: 'left', text_size: 'small', margin: '4px 0px 0px 0px',
+        });
+      }
+    }
   }
   if (sectionEnabled(config, 'milestones') && (project.milestones.length > 0 || project.nextMilestone)) {
     body.push(milestonePanel(project, config.milestonesExpanded));
@@ -369,7 +655,8 @@ function statusDashboardBody(context: TemplateBodyContext): Array<Record<string,
 }
 
 function compactListBody(context: TemplateBodyContext): Array<Record<string, unknown>> {
-  const { project, brand, config } = context;
+  const { project, brand, config, runtime } = context;
+  const visible = visibleProjectWorkstreams(project);
   const body: Array<Record<string, unknown>> = [
     ...focusElements(project, config),
     {
@@ -379,23 +666,59 @@ function compactListBody(context: TemplateBodyContext): Array<Record<string, unk
       horizontal_align: 'left', vertical_align: 'top', margin: '8px 0px 0px 0px',
       elements: [{
         tag: 'markdown',
-        content: `**<font color='indigo'>${escapeMarkdown(projectProgressSummary(project))}</font>** · <font color='blue'>阶段 ${escapeMarkdown(truncate(project.phase, 24))}</font>\n<font color='purple'>下一步：${escapeMarkdown(truncate(projectRemainingSummary(project), 80))}</font>`,
+        content: `**<font color='indigo'>${escapeMarkdown(projectProgressSummary(project, runtime))}</font>** · <font color='blue'>阶段 ${escapeMarkdown(truncate(project.phase, 24))}</font>\n<font color='purple'>下一步：${escapeMarkdown(truncate(projectRemainingSummary(project), 80))}</font>`,
         text_align: 'left', text_size: 'normal', margin: '0px 0px 0px 0px',
       }],
     },
   ];
   if (sectionEnabled(config, 'blockers') && project.blockers.length > 0) body.push(blockerElement(project));
-  if (sectionEnabled(config, 'workstreams') && project.workstreams.length > 0) {
-    const rows = displayWorkstreams(project).map(item => {
-      const status = STATUS_META[item.status];
-      const owner = truncate(item.owners.join('、') || '待认领', 32);
-      const link = topicLink(project, item, brand);
-      return `- <text_tag color='${status.color}'>${status.label}</text_tag> **<font color='indigo'>${escapeMarkdown(workstreamTitle(item))}</font>** · <font color='purple'>${escapeMarkdown(owner)}</font>${link ? ` · ${link}` : ''}`;
-    }).join('\n');
-    body.push({
-      tag: 'markdown', content: `<font color='blue'>**子任务（${project.workstreams.length}）**</font>\n${rows}`,
-      text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
-    });
+  if (sectionEnabled(config, 'workstreams') && visible.length > 0) {
+    const completedDisplay = resolveProjectProgressCardCompletedDisplay(config);
+    const ordered = displayWorkstreams(project, runtime);
+    if (completedDisplay === 'all') {
+      const rows = ordered.map(item => compactWorkstreamLine(project, item, brand, runtime)).join('\n');
+      body.push({
+        tag: 'markdown', content: `<font color='blue'>**子任务（${visible.length}）**</font>\n${rows}`,
+        text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
+      });
+    } else if (completedDisplay === 'collapsed') {
+      const active = ordered.filter(item => item.status !== 'completed');
+      const completedRecent = completedWorkstreamsByRecent(project);
+      if (completedRecent.length === 0) {
+        const rows = active.map(item => compactWorkstreamLine(project, item, brand, runtime)).join('\n');
+        body.push({
+          tag: 'markdown', content: `<font color='blue'>**子任务（${visible.length}）**</font>\n${rows}`,
+          text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
+        });
+      } else if (active.length > 0) {
+        const rows = active.map(item => compactWorkstreamLine(project, item, brand, runtime)).join('\n');
+        body.push({
+          tag: 'markdown',
+          content: `<font color='blue'>**子任务（未完成 ${active.length} / 共 ${visible.length}）**</font>\n${rows}`,
+          text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
+        });
+        body.push(completedWorkstreamPanel(project, completedRecent, brand, runtime));
+      } else {
+        body.push({
+          tag: 'markdown',
+          content: `<font color='blue'>**子任务（未完成 0 / 共 ${visible.length}）**</font>\n<font color='grey'>当前无未完成子任务</font>`,
+          text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
+        });
+        body.push(completedWorkstreamPanel(project, completedRecent, brand, runtime));
+      }
+    } else {
+      const active = ordered.filter(item => item.status !== 'completed');
+      const completedRecent = completedWorkstreamsByRecent(project);
+      const shownCompleted = completedRecent.slice(0, RECENT_COMPLETED_WORKSTREAM_LIMIT);
+      const hiddenCount = completedRecent.length - shownCompleted.length;
+      const rows = [...active, ...shownCompleted].map(item => compactWorkstreamLine(project, item, brand, runtime)).join('\n');
+      const overflow = hiddenCount > 0 ? `\n<font color='grey'>已省略更早完成的 ${hiddenCount} 项子任务</font>` : '';
+      body.push({
+        tag: 'markdown',
+        content: `<font color='blue'>**子任务（${visible.length}）**</font>\n${rows}${overflow}`,
+        text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
+      });
+    }
   }
   if (sectionEnabled(config, 'milestones') && (project.milestones.length > 0 || project.nextMilestone)) {
     body.push(milestonePanel(project, config.milestonesExpanded));
@@ -412,6 +735,7 @@ export function buildProjectGroupCard(
   project: ProjectGroupState,
   brand: Brand = 'feishu',
   rawConfig?: ProjectProgressCardConfig,
+  runtime?: ProjectGroupCardRuntime,
 ): Record<string, unknown> {
   const config = resolveProjectProgressCardConfig(rawConfig);
   const updated = new Date(project.updatedAt);
@@ -426,7 +750,7 @@ export function buildProjectGroupCard(
       ? { label: '已暂停', color: 'neutral', header: 'grey' }
       : { label: '进行中', color: 'blue', header: 'blue' };
   const title = displayProjectTitle(project.title);
-  const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config });
+  const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config, runtime });
   body.push(
     { tag: 'hr', margin: '12px 0px 0px 0px' },
     {
@@ -440,7 +764,7 @@ export function buildProjectGroupCard(
     config: {
       update_multi: true, compact_width: false, enable_forward: true,
       streaming_mode: false, width_mode: 'fill',
-      summary: { content: truncate(`${title} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
+      summary: { content: truncate(`${title} · ${projectProgressSummary(project, runtime)} · 当前 ${project.focus}`, 60) },
     },
     header: {
       template: statusMeta.header,

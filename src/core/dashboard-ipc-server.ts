@@ -4970,6 +4970,23 @@ function decisionBoardRoute(method: string, path: string,
   });
 }
 
+let projectCardRuntimeObserver: ((chatId: string) => void) | null = null;
+export function setProjectCardRuntimeObserver(observer: ((chatId: string) => void) | null): void {
+  projectCardRuntimeObserver = observer;
+}
+
+/**
+ * 本机其他 daemon 记下本轮结果、举手或会话关联变化时按群通知项目主控刷新置顶卡（host HMAC）。
+ */
+ipcRoute('POST', '/api/project-card/task-event', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const chatId = typeof body?.chatId === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(body.chatId) ? body.chatId : null;
+  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  projectCardRuntimeObserver?.(chatId);
+  return jsonRes(res, 200, { ok: true });
+});
+
 /**
  * 本机其他 daemon 记下本轮结果或举手时按群通知管家（host HMAC）。只带群 ID，管家自己重新读状态。
  * 不放在 /api/decision-board 下：Dashboard 不转发它。
@@ -9958,6 +9975,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     codexBrowser: cardPrefs.codexBrowser,
     codexBrowserAutoApproveOrigins: cardPrefs.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
+    goalStatusCard: cardPrefs.goalStatusCard,
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
@@ -10122,7 +10140,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -10144,7 +10162,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -10209,6 +10227,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   }
   if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
+  if (typeof body.goalStatusCard === 'boolean') patch.goalStatusCard = body.goalStatusCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;

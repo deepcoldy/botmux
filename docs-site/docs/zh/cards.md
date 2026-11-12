@@ -202,6 +202,7 @@ Claude Code 有些操作要在终端里弹确认框，比如内置安全检查�
 | `writableTerminalLinkInCard` | 卡片里直接放可写终端按钮，看到卡片的人都能操作，只在可信群开 | 关 |
 | `privateCard` | 普通群里的 `/card` 改为只给管理员看的静态快照（不会持续更新） | 关 |
 | `replyCardActions` | 普通回复卡右下角显示「打开终端 / 切换模型 / 关闭会话」菜单 | 关 |
+| `goalStatusCard` | Codex / TRAE 设定原生目标（`/goal`）时，在会话里发一张目标状态卡，原地更新进行中、完成等状态和 CLI 累计时长。开启后从新会话（或会话重启后）生效，关闭后已有的卡立即停止更新 | 关 |
 
 都可以在 Dashboard 改，或用 `/botconfig set <配置> on|off`。
 

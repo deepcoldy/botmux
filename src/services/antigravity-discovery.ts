@@ -14,8 +14,8 @@ export interface AntigravityDiscoveryOptions {
   allowWorkspaceFallbackWithPid?: boolean;
 }
 
-function getProcessFds(pid: number): string[] {
-  const fdDir = `/proc/${pid}/fd`;
+function getProcessFds(pid: number, procRoot = '/proc'): string[] {
+  const fdDir = join(procRoot, String(pid), 'fd');
   if (!existsSync(fdDir)) return [];
   try {
     const entries = readdirSync(fdDir);
@@ -34,8 +34,8 @@ function getProcessFds(pid: number): string[] {
   }
 }
 
-function getProcessChildPids(pid: number): number[] {
-  const taskDir = `/proc/${pid}/task`;
+function getProcessChildPids(pid: number, procRoot = '/proc'): number[] {
+  const taskDir = join(procRoot, String(pid), 'task');
   if (!existsSync(taskDir)) return [];
   const children: number[] = [];
   try {
@@ -66,29 +66,37 @@ function getProcessChildPids(pid: number): number[] {
  * Scan /proc/<pid>/fd (and its child processes) for open SQLite handles
  * matching ~/.gemini/antigravity-cli/conversations/<uuid>.db.
  *
- * This is process-authoritative: it identifies the exact conversation instance
- * this process tree owns, preventing collisions when multiple Antigravity
- * sessions run concurrently under the same user.
+ * Fails closed (`null`) when zero or multiple distinct conversation UUIDs are
+ * open across the process tree (for example during startup `ListConversations`
+ * summary indexing or after `/fork` retains the parent DB alongside the child).
+ * Multiple SQLite sidecar descriptors (`.db`, `.db-wal`, `.db-shm`) for the
+ * same conversation collapse to one UUID.
  */
 export function findAntigravityConversationIdByPid(
   pid: number,
   conversationsDir?: string,
+  procRoot = '/proc',
 ): string | null {
   if (!Number.isFinite(pid) || pid <= 0) return null;
-  const pidsToScan: number[] = [pid, ...getProcessChildPids(pid)];
+  const pidsToScan: number[] = [pid, ...getProcessChildPids(pid, procRoot)];
   const marker = conversationsDir ?? join('.gemini', 'antigravity-cli', 'conversations');
+  const found = new Map<string, string>();
 
   for (const p of pidsToScan) {
-    const links = getProcessFds(p);
+    const links = getProcessFds(p, procRoot);
     for (const link of links) {
       if (!link.includes(marker)) continue;
       const m = link.match(UUID_MATCH_RE);
       if (m && UUID_RE.test(m[0])) {
-        return m[0];
+        const key = m[0].toLowerCase();
+        if (!found.has(key)) {
+          found.set(key, m[0]);
+          if (found.size > 1) return null;
+        }
       }
     }
   }
-  return null;
+  return found.size === 1 ? (found.values().next().value ?? null) : null;
 }
 
 function uriToPath(uri: string): string {

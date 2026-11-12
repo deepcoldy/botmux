@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution, sameRuntime, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity, type ExecutionRef,
@@ -417,7 +418,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -2061,10 +2062,19 @@ function observeContractNativeSession(nativeSessionId: string): void {
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
+  if (msg.type === 'goal_update') {
+    const binding = workerSessionEventScope.contextBinding();
+    const context = workerSessionEventScope.envelope(binding ? { bindingId: binding.bindingId, runtime: binding.runtime } : undefined);
+    delete context.scope.execution;
+    return { ...msg, sessionContract: context };
+  }
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
+  const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
+    ? pendingManagedTurnOriginScope
+    : undefined);
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.
-  const captured = origin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
+  const captured = explicitOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
     : workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined)) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
@@ -2121,6 +2131,34 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'codex' && !lastInitConfig.existingAppServerEndpoint) {
+      // A busy re-attached Codex pane may stay silent until the running turn
+      // completes, and can hold internal/subagent rollouts open alongside the
+      // user's top-level rollout. Prefer header-verified top-level fd discovery,
+      // falling back to an active owned bridge journal turn when fd headers are
+      // unavailable in unit harnesses.
+      const liveSid = typeof readCodexLiveSessionId === 'function' ? readCodexLiveSessionId(childPid) : undefined;
+      const ownedRollouts = typeof findCodexRolloutSetByPid === 'function' ? findCodexRolloutSetByPid(childPid) : undefined;
+      if (liveSid && (!ownedRollouts || (typeof codexHistorySidIsOwned === 'function'
+        ? codexHistorySidIsOwned(liveSid, ownedRollouts)
+        : ownedRollouts.has(liveSid.toLowerCase())))) {
+        nativeSessionId = liveSid;
+      } else if (ownedRollouts?.size === 1 && typeof findCodexRolloutByPid === 'function') {
+        const observed = findCodexRolloutByPid(childPid);
+        const isOwned = observed && (typeof codexHistorySidIsOwned === 'function'
+          ? codexHistorySidIsOwned(observed.cliSessionId, ownedRollouts)
+          : ownedRollouts.has(observed.cliSessionId));
+        if (observed && isOwned) nativeSessionId = observed.cliSessionId;
+      } else if (ownedRollouts && ownedRollouts.size > 1
+        && typeof codexBridgeRolloutPath === 'string'
+        && typeof codexBridgeQueue !== 'undefined' && codexBridgeQueue.peek().length > 0
+        && typeof codexGenerationSessionIdFromRolloutPath === 'function'
+        && typeof codexHistorySidIsOwned === 'function') {
+        const bridgeSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
+        if (bridgeSid && codexHistorySidIsOwned(bridgeSid, ownedRollouts)) nativeSessionId = bridgeSid;
+      }
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'grok' && typeof findGrokSessionByPid === 'function') {
+      nativeSessionId = findGrokSessionByPid(childPid)?.sessionId;
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -2160,6 +2198,22 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   binding.identity = identity;
   send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity,
     ...(continuesBindingId ? { continuesBindingId } : {}), ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+}
+function refreshActiveRuntimeContract(): void {
+  const scope = workerSessionEventScope;
+  const active = scope?.currentBinding();
+  if (!scope || !active?.identity) return;
+  const context = scope.contextBinding();
+  if (context && !scope.bindingSharesCurrentProcess(context.bindingId)) return;
+  const next = runtimeIdentityForContract(active);
+  if (next.proof === 'opaque') return;
+  const prev = active.identity;
+  if (prev.backend === next.backend
+    && prev.physicalId === next.physicalId
+    && prev.proof === next.proof
+    && prev.nativeSessionId === next.nativeSessionId
+    && prev.nativeGeneration === next.nativeGeneration) return;
+  void publishRuntimeContract(active);
 }
 let cliSpawnGeneration = 0;
 /** What the TRAE install entry resolved to right before the spawn of
@@ -6972,6 +7026,19 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   sandboxPolicyCapability = policyCapability;
   writeCliPidMarker();
   if (sessionId) {
+    const scope = typeof workerSessionEventScope !== 'undefined' ? workerSessionEventScope : undefined;
+    const binding = scope?.contextBinding() ?? scope?.currentBinding();
+    const execution = capability.turnId
+      ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
+      : undefined;
+    publishedOriginContractScope = binding && execution
+      ? { bindingId: binding.bindingId, executionId: execution.executionId }
+      : undefined;
+    const explicitOrigin = binding?.runtime
+      ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
+      : undefined;
+    pendingManagedTurnOriginScope = explicitOrigin;
+    try {
     send({
       type: 'managed_turn_origin',
       sessionId,
@@ -6990,6 +7057,9 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
         : {}),
       ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
     });
+    } finally {
+      pendingManagedTurnOriginScope = undefined;
+    }
   }
   return true;
 }
@@ -7010,6 +7080,9 @@ function unlinkManagedOriginCapabilityFiles(): void {
   }
 }
 
+let publishedOriginContractScope: { bindingId: string; executionId: string } | undefined;
+let pendingManagedTurnOriginScope: CapturedSessionOrigin | undefined;
+
 function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
@@ -7020,6 +7093,7 @@ function completeManagedTurnOriginRevocation(
   // can otherwise win the small window between terminal publication and
   // revocation by submitting through the still-live host relay.
   sandboxRelayCapability = null;
+  publishedOriginContractScope = undefined;
   const revokedPolicyCapability = opts.revokePolicy ? sandboxPolicyCapability : null;
   if (opts.revokePolicy) sandboxPolicyCapability = null;
   currentVcMeetingImTurnOrigin = undefined;
@@ -7843,8 +7917,11 @@ function restoreCodexAppContractNativeSession(): void {
   );
   if (!processIdentity) return;
   const rollouts = findCodexRolloutSetByPid(processIdentity.enginePid);
-  const observed = rollouts?.size === 1 ? findCodexRolloutByPid(processIdentity.enginePid) : undefined;
-  if (!observed || !rollouts!.has(observed.cliSessionId.toLowerCase())
+  const liveSid = typeof readCodexLiveSessionId === 'function'
+    ? readCodexLiveSessionId(processIdentity.enginePid)
+    : undefined;
+  const enrichedSid = liveSid ?? (rollouts?.size === 1 ? findCodexRolloutByPid(processIdentity.enginePid)?.cliSessionId : undefined);
+  if (!enrichedSid || !rollouts?.has(enrichedSid.toLowerCase())
       || readProcessStartIdentity(processIdentity.enginePid) !== processIdentity.engineProcStart
       || backend !== observedBackend || backend?.getChildPid?.() !== backendPid
       || readProcessStartIdentity(backendPid!) !== backendStart
@@ -7852,7 +7929,7 @@ function restoreCodexAppContractNativeSession(): void {
   // Enrich the bare binding without moving attempts that may already belong
   // to it. The host separately grants historical result observation for exact
   // recovered executions of this proven surviving native session.
-  scope.run(previous, () => { void publishRuntimeContract(previous, observed.cliSessionId); });
+  scope.run(previous, () => { void publishRuntimeContract(previous, enrichedSid); });
 }
 
 function activateCodexAppControlConnection(
@@ -12369,6 +12446,53 @@ function currentHermesBridgeDbPath(): string {
   return hermesBridgeDbPath ?? resolveHermesStateDbPath();
 }
 
+let nativeGoalSourcePath: string | undefined;
+let nativeGoalSignature: string | undefined;
+let nativeGoalPendingSignature: string | undefined;
+let nativeGoalTimer: ReturnType<typeof setInterval> | undefined;
+let nativeGoalReadAt = 0;
+let nativeGoalGeneration = -1;
+let nativeGoalPhysicalId: string | undefined;
+let nativeGoalOrigin: { key: string; goalId?: string; turnId?: string; dispatchAttempt?: number } | undefined;
+function publishNativeGoal(goal: import('./services/native-goal-state.js').NativeGoalState | null): void {
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && (!binding?.runtime || binding.physicalId !== nativeGoalPhysicalId)) return;
+  const signature = createHash('sha256').update(JSON.stringify({ goal, generation: cliSpawnGeneration,
+    bindingId: binding?.bindingId, runtime: binding?.runtime })).digest('hex');
+  if (signature === nativeGoalSignature) return;
+  if (goal) {
+    const key = createHash('sha256').update(`${goal.createdAt}\0${goal.objective}`).digest('hex');
+    if (!nativeGoalOrigin || nativeGoalOrigin.key !== key || goal.goalId && nativeGoalOrigin.goalId && goal.goalId !== nativeGoalOrigin.goalId) {
+      nativeGoalOrigin = { key, goalId: goal.goalId, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
+    } else if (!nativeGoalOrigin.goalId && goal.goalId) nativeGoalOrigin.goalId = goal.goalId;
+  }
+  nativeGoalPendingSignature = signature;
+  const publish = () => send({ type: 'goal_update', goal, signature,
+    turnId: nativeGoalOrigin ? nativeGoalOrigin.turnId : currentBotmuxTurnId,
+    dispatchAttempt: nativeGoalOrigin ? nativeGoalOrigin.dispatchAttempt : currentBotmuxDispatchAttempt });
+  if (binding && workerSessionEventScope) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
+/** Opt-in per bot (goalStatusCard), fixed for this worker process. */
+function nativeGoalCardEnabled(): boolean {
+  return lastInitConfig?.goalStatusCard === true && (structuredBridgeIs('traex') || structuredBridgeIs('codex'));
+}
+function observeNativeGoal(): void {
+  if (!nativeGoalCardEnabled() || nativeGoalGeneration !== cliSpawnGeneration) {
+    nativeGoalSourcePath = undefined;
+    if (nativeGoalTimer) clearInterval(nativeGoalTimer);
+    nativeGoalTimer = undefined;
+    return;
+  }
+  const path = nativeGoalSourcePath;
+  if (!path || !backend || cliRestartInProgress) return;
+  if (Date.now() - nativeGoalReadAt < 2000) return;
+  nativeGoalReadAt = Date.now();
+  const nativeId = structuredBridgeIs('traex') ? traexSessionIdFromRolloutPath(path) : codexGenerationSessionIdFromRolloutPath(path);
+  const goal = nativeId ? readNativeGoalForRollout(path, nativeId) : undefined;
+  if (goal === undefined) return;
+  publishNativeGoal(goal);
+}
 function structuredBridgeIngestPath(
   path: string,
   offset: number,
@@ -12395,6 +12519,25 @@ function structuredBridgeIngestPath(
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
+    if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && nativeGoalCardEnabled()) {
+      nativeGoalSourcePath = path;
+      nativeGoalGeneration = cliSpawnGeneration;
+      nativeGoalSignature = undefined;
+      nativeGoalPendingSignature = undefined;
+      nativeGoalPhysicalId = workerSessionEventScope?.currentBinding()?.physicalId;
+      nativeGoalReadAt = 0;
+      const nativeId = structuredBridgeIs('traex') ? traexSessionIdFromRolloutPath(path) : codexGenerationSessionIdFromRolloutPath(path);
+      const currentGoal = nativeId ? readNativeGoalForRollout(path, nativeId) : undefined;
+      if (currentGoal !== undefined) result.latestGoal = currentGoal;
+      else if (result.latestGoal === undefined) result.latestGoal = readLatestNativeGoal(path, nativeId);
+      if (nativeGoalTimer) clearInterval(nativeGoalTimer);
+      nativeGoalTimer = setInterval(observeNativeGoal, 2000);
+      nativeGoalTimer.unref?.();
+    }
+    if (result.latestGoal !== undefined && nativeGoalCardEnabled()) {
+      publishNativeGoal(result.latestGoal);
+    }
+    if (nativeGoalSourcePath === path) observeNativeGoal();
     if (structuredBridgeIs('codex')) {
       // Codex resume can copy the whole conversation into a new generation
       // file; content-addressed ids let the queue dedup copied history across
@@ -12520,10 +12663,10 @@ function codexBridgeStartTimer(): void {
         // the pid fallback here recovers a probe that lost the race.
         //
         // Resolve while UNBOUND or while a lazy-created conversation is still
-        // pending — the latter also covers a /new rotation: the notify path
-        // stored the new id while its brain file did not exist yet, and the
-        // retired conversation's path is still bound. Gating only on
-        // !codexBridgeRolloutPath would leave the new file unattached forever.
+        // pending — the latter also covers a /new rotation or misbind
+        // correction: the notify path stored the new id while its brain file
+        // did not exist yet, and the previous path is still bound. Gating only
+        // on !codexBridgeRolloutPath would leave the new file unattached forever.
         if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
           const action = decideAntigravityTickerAction({
             boundPath: codexBridgeRolloutPath,
@@ -12531,27 +12674,34 @@ function codexBridgeStartTimer(): void {
             resolveBySid: sid => resolveFileBridgePath('antigravity', { sessionId: sid }),
             resolveByPid: () => {
               const pid = currentAntigravityObservedPid();
-              const activeId = cliAdapter?.resolveActiveSessionId?.({ cliPid: pid });
-              // /fork retains the parent's fd. An active child with a lazy
-              // brain file must wait for that file, never bind the parent.
-              if (activeId) return resolveFileBridgePath('antigravity', { sessionId: activeId });
+              // Honor cliAdapter.resolveActiveSessionId when present: on a
+              // fresh launch it withholds transient startup ListConversations
+              // DB fds until --log-file records `Streaming conversation`, and
+              // after /fork it disambiguates child vs retained parent DB fds.
+              if (cliAdapter?.resolveActiveSessionId) {
+                const activeId = cliAdapter.resolveActiveSessionId({ cliPid: pid, cliCwd: lastInitConfig?.workingDir });
+                return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
+              }
               return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
             },
           });
           if (action.kind === 'rotate') {
-            // A new conversation resolved while the retired one is bound
+            // A new conversation resolved while the previous one was bound
             // (either the pending SID authoritatively, or the pid's open
-            // conversation switched): release the retired conversation's held
-            // final, then bind the new one fresh so its live turn is ingested
-            // from byte 0 (never as history).
+            // conversation switched): flush the retired conversation's held
+            // final only when an earlier turn belongs to it, then bind the new
+            // one fresh so its live turn is ingested from byte 0.
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
-            try {
-              codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-              emitReadyCodexTurns();
-            } catch (err: any) {
-              log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+            if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+              try {
+                codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+                emitReadyCodexTurns();
+              } catch (err: any) {
+                log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+              }
             }
+            log(`Antigravity bridge late-rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
             codexBridgeDetachFile();
             codexBridgeAttach(action.path, 'fresh-empty');
           } else if (action.kind === 'bind-initial') {
@@ -12949,6 +13099,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
             });
           }
           log(`Structured bridge baseline-existing recovered: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
+          if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         } catch (error) {
           skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -13126,13 +13277,11 @@ function armAntigravityCotForTurn(): void {
   if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
-  let cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: backend?.getChildPid?.() ?? undefined, cliCwd: lastInitConfig.workingDir })
-    ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
-  if (!cid) {
-    const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
-    const effectivePid = pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
-    cid = effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined;
-  }
+  const effectivePid = currentAntigravityObservedPid();
+  const discoveredCid = cliAdapter?.resolveActiveSessionId
+    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
+    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
+  const cid = discoveredCid ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
   if (!cid) return;
   persistCliSessionId(cid);
   ensureAntigravityCotReader(cid);
@@ -13285,6 +13434,7 @@ function currentCodexObservedPid(): number | undefined {
       // The next observation retries that publication before the native fast path.
       codexOwnershipAttestationPending = true;
       log(`Codex ownership pid refreshed ${wired ?? '?'} → ${pid}`);
+      if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     }
     return withAttestation(pid);
   }
@@ -13681,7 +13831,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         codexBridgeStartTimer();
       }
     }
-    return;
+    if (!structuredBridgeIs('antigravity')) return;
   }
   if (structuredBridgeIs('mtr')) {
     const source = findMtrSessionById(cliSessionId);
@@ -13719,9 +13869,11 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   }
   if (structuredBridgeIs('antigravity')) {
     // cliSessionId is agy's conversation UUID, which names the brain
-    // transcript directory. writeInput reports the id on EVERY submit (it is
-    // also how `/new` surfaces the freshly-minted conversation in the same
-    // process), so this is both the first-attach and the rotation path.
+    // transcript directory. writeInput and the native --log-file observer
+    // report the id on every submit/stream switch, and `codexBridgeRolloutPath`
+    // above falls through for Antigravity so this handles both initial attach
+    // and in-binding rotation/rebind (e.g. `/new`, `/fork`, or correcting an
+    // early misbound transcript).
     const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
     // Compared by conversation, not path: a compact-log bind resolves to the
     // full log here once agy has created it, and that is NOT a /new. The
@@ -13733,27 +13885,29 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     if (action.kind !== 'wait-pending') {
       if (action.kind === 'rotate') {
-        // Conversation rotated (/new): drain the retired transcript so a
-        // trailing final is not stranded, then rebind. The new conversation's
-        // existing bytes are THIS session's live turn, never history →
-        // fresh-empty regardless of the spawn resume flag.
-        try {
-          // Flush the retired conversation's held candidate: the new
-          // conversation starting proves the old loop ended.
-          codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-          emitReadyCodexTurns();
-        } catch (err: any) {
-          log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
+        // Conversation rotated (/new) or corrected from an early misbind:
+        // drain the retired transcript only when an earlier turn actually
+        // belongs to it, then rebind fresh-empty so the current conversation's
+        // existing bytes are ingested from byte 0.
+        if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+          try {
+            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+            emitReadyCodexTurns();
+          } catch (err: any) {
+            log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
+          }
         }
+        log(`Antigravity bridge rebound ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
         codexBridgeDetachFile();
         codexBridgeAttach(action.path, 'fresh-empty');
       } else {
         codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
       }
       codexBridgePendingSessionId = undefined;
+      codexBridgeIngest();
     } else {
       // The brain file is created lazily after submit — keep id pending and
-      // let the 1s ticker late-attach (pid probe covers a lost race).
+      // let the 1s ticker late-attach or rotate once the file appears.
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
     }
@@ -13947,6 +14101,18 @@ function codexBridgeIngest(opts: {
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  // While a newly reported Antigravity conversation is still waiting for its
+  // lazily-created brain file (`codexBridgePendingSessionId`), do not let
+  // fs.watch or steady-state ticks ingest new unstarted turns from the
+  // superseded/misbound transcript.
+  if (
+    structuredBridgeIs('antigravity')
+    && !opts.flushAntigravityTrailingFinal
+    && codexBridgePendingSessionId
+    && !(codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1)
+  ) {
+    return;
+  }
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
     flushAntigravityTrailingFinal: opts.flushAntigravityTrailingFinal,
@@ -20741,8 +20907,9 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
     if (currentPid && currentPid !== pid) return;
 
     const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
-    const cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: realPid })
-      ?? findAntigravityConversationIdByPid(realPid);
+    const cid = cliAdapter?.resolveActiveSessionId
+      ? cliAdapter.resolveActiveSessionId({ cliPid: realPid, cliCwd: lastInitConfig?.workingDir })
+      : findAntigravityConversationIdByPid(realPid);
     if (cid) {
       if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
         log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
@@ -29276,6 +29443,7 @@ async function spawnCliBody(
     // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
+    if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     publishLocalProcessAttestation(realPid);
   };
   // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
@@ -29399,6 +29567,7 @@ async function spawnCliBody(
         // Same pair applyResolvedCliPid keeps in step: a launch-payload binding
         // may already have pointed the bridge pid at a layer above this leaf.
         bridgeCliPid = realPid;
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -29433,6 +29602,7 @@ async function spawnCliBody(
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         bridgeCliPid = realPid;
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         codexOwnershipAttestationPending = !publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -29527,6 +29697,7 @@ async function spawnCliBody(
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
           if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
         // pid too (mirrors the synchronous path above). No-op for non-wrapperCli.
@@ -34477,7 +34648,7 @@ function publishCliInputBacklog(): void {
   send({ type: 'cli_input_backlog', ...backlog });
 }
 
-function send(msg: WorkerToDaemon): void {
+function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
   if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) {
     log(`Dropped final output with unproven execution origin ${JSON.stringify({ turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
       origin: workerSessionEventScope.capture(), current: workerSessionEventScope.currentBinding(),
@@ -34491,7 +34662,7 @@ function send(msg: WorkerToDaemon): void {
     return;
   }
   if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
-  const payload = sessionEventMetadata(workerIpcPayload(msg));
+  const payload = sessionEventMetadata(workerIpcPayload(msg), origin);
   if (payload.type === 'final_output' && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew === true) universalOutputHandoff.publish(payload);
   else process.send?.(payload);
   if (isWorkflowWorker() && payload.type === 'final_output') workflowFinalOutputSent = true;
@@ -35553,6 +35724,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const scope = workerSessionEventScope;
       if (scope && !scope.bindingSharesCurrentProcess(msg.bindingId)) break;
       scope?.assign(msg.bindingId, msg.runtime);
+      const assignedBinding = scope?.bindingById(msg.bindingId) ?? scope?.currentBinding();
       const continuation = msg.continuation;
       if (continuation?.status === 'approved') {
         const state = msg.admissionStates?.find(value => value.ref.executionId === continuation.execution.executionId
@@ -35560,9 +35732,39 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         if (state && scope?.acceptContinuation(msg.bindingId, state)) clearTraexContinuationGrantWait(continuation.execution);
       }
       for (const state of msg.admissionStates ?? []) scope?.noteAdmission(state);
-      for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
+      for (const execution of msg.executions ?? []) scope?.rememberExecution(execution, assignedBinding);
       for (const observed of msg.observedExecutions ?? []) {
-        workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
+        scope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
+      }
+      const hasLiveTurnCapability = typeof currentBotmuxTurnId === 'string' && currentBotmuxTurnId.length > 0
+        && (typeof retiredTurnIds === 'undefined' || !retiredTurnIds.has(currentBotmuxTurnId))
+        && typeof sandboxRelayCapability !== 'undefined' && sandboxRelayCapability !== null
+        && sandboxRelayCapability.turnId === currentBotmuxTurnId
+        && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
+        && (typeof activeTurnAuthority === 'undefined' || !activeTurnAuthority.identity().turnId
+          || (activeTurnAuthority.identity().turnId === currentBotmuxTurnId
+            && activeTurnAuthority.identity().dispatchAttempt === currentBotmuxDispatchAttempt));
+      if (msg.mayExecute && scope && assignedBinding?.runtime && scope.currentBinding() === assignedBinding
+        && hasLiveTurnCapability) {
+        const directExecution = (msg.executions ?? []).find(execution =>
+          execution.turnId === currentBotmuxTurnId && execution.dispatchAttempt === currentBotmuxDispatchAttempt);
+        const observedEntry = !directExecution
+          ? (msg.observedExecutions ?? []).find(entry =>
+            entry.execution.turnId === currentBotmuxTurnId && entry.execution.dispatchAttempt === currentBotmuxDispatchAttempt)
+          : undefined;
+        const resumedExecution = directExecution ?? observedEntry?.execution;
+        const resumedState = resumedExecution
+          ? (msg.admissionStates ?? []).find(state => state.ref.executionId === resumedExecution.executionId)
+          : undefined;
+        const alreadyPublishedForExecution = !!resumedExecution
+          && publishedOriginContractScope?.bindingId === assignedBinding.bindingId
+          && publishedOriginContractScope.executionId === resumedExecution.executionId;
+        if (resumedExecution && !alreadyPublishedForExecution
+          && (!resumedState || !['succeeded', 'failed', 'cancelled'].includes(resumedState.phase))) {
+          scope.run(assignedBinding, () => {
+            publishSandboxRelayCapability();
+          }, resumedExecution);
+        }
       }
       if (continuation?.status === 'rejected') {
         const recovery = pendingMessages.find(item => item.traexAutoModelRecovery
@@ -36431,6 +36633,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       send({ type: 'prompt_cache_keepalive_result', injected: true });
       log('Prompt-cache keep-alive queued');
       void flushPendingInjections();
+      break;
+    }
+
+    case 'goal_update_ack': {
+      if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
       break;
     }
 

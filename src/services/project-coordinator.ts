@@ -4,12 +4,14 @@ import {
   buildProjectGroupCard,
   buildProjectGroupOnboardingCard,
   buildProjectGroupStartedNoticeCard,
+  type ProjectGroupCardRuntime,
   type ProjectGroupOnboardingCardInput,
 } from '../im/lark/project-group-card.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import {
   mutateProjectGroup,
   readProjectGroup,
+  visibleProjectWorkstreams,
   type ProjectGroupState,
   type ProjectGroupStatus,
   type ProjectWorkstreamStatus,
@@ -29,6 +31,10 @@ export interface ProjectCoordinatorTransport {
   isMessageWithdrawn(error: unknown): boolean;
   isMessageUpdateExpired(error: unknown): boolean;
   brand(larkAppId: string): Brand;
+  resolveCardRuntime?(
+    project: ProjectGroupState,
+    dataDir: string,
+  ): Promise<ProjectGroupCardRuntime | undefined> | ProjectGroupCardRuntime | undefined;
 }
 
 export type ProjectCoordinatorAction =
@@ -440,7 +446,7 @@ export class ProjectCoordinator {
 
   private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState): Promise<ProjectGroupState> {
     let project = initial;
-    const resolutions = await Promise.all(project.workstreams
+    const resolutions = await Promise.all(visibleProjectWorkstreams(project)
       .filter(item => !item.threadId)
       .map(async item => ({ dispatchRoot: item.dispatchRoot, threadId: await this.transport.resolveThreadId(project.larkAppId, item.dispatchRoot) })));
     const found = resolutions.filter((item): item is { dispatchRoot: string; threadId: string } => !!item.threadId);
@@ -456,7 +462,8 @@ export class ProjectCoordinator {
     }
     const mode = readGroupCollaborationMode(context.dataDir, context.chatId);
     const cardConfig = mode?.progressCard;
-    const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig));
+    const runtime = await this.transport.resolveCardRuntime?.(project, context.dataDir);
+    const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig, runtime));
     if (project.card?.messageId) {
       try {
         await this.transport.updateCard(project.larkAppId, project.card.messageId, cardJson);

@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import {
   findAntigravityConversationId,
+  findAntigravityConversationIdByPid,
   findAntigravityConversationIdByWorkspace,
 } from '../src/services/antigravity-discovery.js';
 
@@ -128,5 +129,36 @@ describe('antigravity-discovery', () => {
       allowWorkspaceFallbackWithPid: true,
     });
     expect(withFallback).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  });
+
+  it('deduplicates SQLite WAL/SHM sidecars for one conversation and fails closed when multiple conversations are open', () => {
+    const procRoot = join(tmpDir, 'proc');
+    const convDir = join(tmpDir, '.gemini', 'antigravity-cli', 'conversations');
+    mkdirSync(convDir, { recursive: true });
+
+    const parentPid = 4100;
+    const childPid = 4101;
+    mkdirSync(join(procRoot, String(parentPid), 'fd'), { recursive: true });
+    mkdirSync(join(procRoot, String(parentPid), 'task', String(parentPid)), { recursive: true });
+    writeFileSync(join(procRoot, String(parentPid), 'task', String(parentPid), 'children'), `${childPid}\n`);
+    mkdirSync(join(procRoot, String(childPid), 'fd'), { recursive: true });
+
+    const ownedId = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
+    const siblingId = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
+    for (const suffix of ['.db', '.db-wal', '.db-shm']) {
+      writeFileSync(join(convDir, `${ownedId}${suffix}`), '');
+    }
+    writeFileSync(join(convDir, `${siblingId}.db`), '');
+
+    symlinkSync(join(convDir, `${ownedId}.db`), join(procRoot, String(childPid), 'fd', '3'));
+    symlinkSync(join(convDir, `${ownedId}.db-wal`), join(procRoot, String(childPid), 'fd', '4'));
+    symlinkSync(join(convDir, `${ownedId}.db-shm`), join(procRoot, String(childPid), 'fd', '5'));
+
+    expect(findAntigravityConversationIdByPid(parentPid, convDir, procRoot)).toBe(ownedId);
+
+    // Startup ListConversations or post-/fork retention keeps a second distinct
+    // conversation DB open: fail closed rather than picking fd-order first.
+    symlinkSync(join(convDir, `${siblingId}.db`), join(procRoot, String(parentPid), 'fd', '6'));
+    expect(findAntigravityConversationIdByPid(parentPid, convDir, procRoot)).toBeNull();
   });
 });
