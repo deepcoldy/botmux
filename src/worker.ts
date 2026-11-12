@@ -4620,7 +4620,7 @@ const STARTUP_CMD_CAP_MS = 4_000;
 async function sendRawCommandLine(
   be: NonNullable<typeof backend>,
   content: string,
-  opts: { submit?: boolean; turnId?: string } = {},
+  opts: { submit?: boolean; turnId?: string; canSubmit?: () => boolean } = {},
 ): Promise<void> {
   // Long-lived framed runners (minimax, …) must receive even raw passthrough
   // lines through their frame protocol's full submit transaction. The generic
@@ -4659,6 +4659,7 @@ async function sendRawCommandLine(
   // bridge the two: turn an explicit `false` into the same throw the inline
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
   const writeOptions = rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId);
+  if (opts.canSubmit) writeOptions.canSubmit = opts.canSubmit;
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
   // come after a screen re-check (see typeRawCommandLine).
@@ -4847,6 +4848,7 @@ async function sendRawCommandLineWithRecoveryFence(
   content: string,
   beforeWrite?: () => void,
   turnId?: string,
+  canSubmit?: () => boolean,
 ): Promise<void> {
   const previous = commandLineWriteTail;
   let release!: () => void;
@@ -4856,7 +4858,7 @@ async function sendRawCommandLineWithRecoveryFence(
   try {
     const transaction = await runAmbiguousSubmissionTransaction(
       be,
-      () => sendRawCommandLine(be, content, { turnId }),
+      () => sendRawCommandLine(be, content, { turnId, canSubmit }),
       undefined,
       beforeWrite,
     );
@@ -5564,6 +5566,29 @@ function armSessionRenameIdleTimeout(): void {
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
 async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+  if (msg.nativeGoalControl) {
+    // Dashboard goal controls steer the existing task; they must not rotate
+    // its capture identity or retire its turn, even when the write fails.
+    if (!backend) return;
+    const target = backend;
+    const generation = cliSpawnGeneration;
+    const controlTurnId = currentBotmuxTurnId;
+    const current = () => backend === target && cliSpawnGeneration === generation && !cliRestartInProgress;
+    try {
+      await sendRawCommandLineWithRecoveryFence(target, msg.content, () => {
+        if (!current()) throw new Error('goal control CLI generation changed');
+      }, controlTurnId, current);
+      if (current()) {
+        isPromptReady = false;
+        idleDetector?.reset({ inputCycle: true });
+      }
+    } catch (error) {
+      log(`Native goal control input failed: ${error instanceof Error ? error.message : String(error)}`);
+      send({ type: 'user_notify', turnId: controlTurnId,
+        message: '目标控制命令未能确认送达，请检查 agent 终端状态后再操作。' });
+    } finally { void flushPending(); }
+    return;
+  }
   // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
   // queues native turns, so changing capture ownership while it is busy would
   // discard that ordinary turn's final. Keep ownership until the real prompt.
@@ -21418,7 +21443,10 @@ async function flushPending(): Promise<void> {
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
   // pending messages can still drain while busy; the rename stays queued.
   const sessionRenameReady = isPromptReady && pendingSessionRename !== null;
-  const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
+  // Goal controls delayed by a business text write may still pause a busy
+  // goal once that write settles. Startup/menu/restart gates above still apply.
+  const busyGoalControlReady = pendingRawInputs[0]?.nativeGoalControl === true && firstWriteLivenessConfirmed;
+  const rawInputReady = (isPromptReady || busyGoalControlReady) && pendingRawInputs.length > 0;
   const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
   const renameOnRemoteBackend = effectiveBackendType === 'riff'
@@ -21430,10 +21458,11 @@ async function flushPending(): Promise<void> {
     log(`Ignoring native session rename — unsupported by ${cliName()}${renameOnRemoteBackend ? ` on ${effectiveBackendType} backend` : ''}`);
     if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0) return;
   }
-  if (!isPromptReady && pendingMessages.length === 0) return;
-  if (!isPromptReady && !typeAheadAllowed) return;
+  if (!isPromptReady && pendingMessages.length === 0 && !busyGoalControlReady) return;
+  if (!isPromptReady && !typeAheadAllowed && !busyGoalControlReady) return;
 
   isFlushing = true;
+  const rawAtFlushStart = pendingRawInputs[0];
   const promptReadyAtFlushStart = isPromptReady;
   let itemsWrittenInThisFlush = 0;
   // An input-box hold wrote nothing, so the CLI is as idle as this flush found
@@ -22542,6 +22571,11 @@ async function flushPending(): Promise<void> {
   } finally {
     if (cliSubmissionInFlight) settleSubmission(cliSubmissionInFlight.item);
     isFlushing = false;
+    // A goal control may arrive during a business text write. Re-drive it
+    // after that write, without looping on a control held by startup gates.
+    if (pendingRawInputs[0]?.nativeGoalControl && pendingRawInputs[0] !== rawAtFlushStart) {
+      queueMicrotask(() => { void flushPending(); });
+    }
     // A write that failed or stopped the batch skipped the post-write re-drive.
     if (promptReadyDeferred) redriveRejectedStructuredReady();
     // The owner may have arrived while an earlier asynchronous write held the
@@ -35670,7 +35704,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const startupInputGateHolds = !firstWriteLivenessConfirmed
         || (!openingInputBoxSettled && pendingMessages.length > 0)
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
-      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
+      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight() || (msg.nativeGoalControl && isFlushing)
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked

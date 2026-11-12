@@ -2129,6 +2129,11 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2', 'codex-app').size).toBe(0);
   });
 
+  it.each(['seed', 'relay'])('enables goal cold-start through the generic %s capability', cliId => {
+    expect(resolveAdapterDefaultPassthroughCommands('app-2', cliId)).toContain('/goal');
+    expect(resolvePassthroughCommands('app-2', cliId).has('/goal')).toBe(true);
+  });
+
   it('forwards /fast as a global passthrough WITHOUT cold-start (not adapter-scoped)', () => {
     // /fast is a tier toggle, not "start a unit of work": it lives in the global
     // PASSTHROUGH_COMMANDS (forwarded to Codex on an existing session), and is

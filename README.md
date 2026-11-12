@@ -106,7 +106,7 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 ## 支持的 CLI / Agent
 
-使用支持原生目标模式的交互式 CLI（Claude Code、Codex、TRAE CLI）时，可在飞书发送 `/goal <目标与完成条件>`，开启背后 agent 的 goal 模式；新话题会自动创建会话。已有会话中的 `/goal`、`/goal pause`、`/goal resume` 等命令原样交给 CLI，具体子命令以所用 CLI 的版本为准。此入口使用终端透传，需要 CLI 支持原生命令输入。
+使用支持原生目标模式的交互式 CLI（Claude Code、Codex、Seed、Relay、TRAE CLI）时，可在飞书发送 `/goal <目标与完成条件>`；新话题会自动创建会话。Dashboard 的会话详情提供「目标模式」控制面：输入目标并启动、查询目标状态，以及后端已声明支持的暂停、恢复和清除操作。能力由通用适配器接口 `nativeGoal` 声明，前端不按 CLI 名称特判；TRAE CLI 提供完整控制，其他适配器目前提供启动和查询。目标状态与结果以 agent 终端输出为准。RPC viewer、远程后端和接入的外部终端暂不支持此命令控制入口。
 
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 

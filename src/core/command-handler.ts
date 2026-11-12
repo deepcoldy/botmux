@@ -273,7 +273,9 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
     const cliId = (cliIdOverride ?? bot.config.cliId) as CliId;
     const cliPathOverride = cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined;
     const adapter = createCliAdapterSync(cliId, cliPathOverride);
-    const normalized = (adapter.defaultPassthroughCommands ?? [])
+    const defaults = [...(adapter.defaultPassthroughCommands ?? [])];
+    if (adapter.nativeGoal) defaults.push(adapter.nativeGoal.start.split(/\s+/)[0]!);
+    const normalized = defaults
       .map(normalizePassthroughCommand)
       .filter((c): c is string => !!c);
     return [...new Set(normalized)];

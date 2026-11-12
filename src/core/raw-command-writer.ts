@@ -10,6 +10,8 @@ export interface RawCommandWriter {
 }
 
 export interface RawCommandWriteOptions {
+  /** A control write may outlive its CLI generation during the submit beat. */
+  canSubmit?: () => boolean;
   coco?: boolean;
   cocoThrottleMs?: number;
   pasteLine?: boolean;
@@ -87,22 +89,26 @@ export async function writeRawCommandLine(
         await delay(opts.cocoThrottleMs ?? 40);
       }
       await delay(beatMs);
+      if (opts.canSubmit && !opts.canSubmit()) return false;
       return sendSpecialKeys('Enter') !== false;
     }
     if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
       if (pasteText(content) === false) return false;
       await delay(opts.pasteSettleMs ?? beatMs);
+      if (opts.canSubmit && !opts.canSubmit()) return false;
       return sendSpecialKeys('Enter') !== false;
     }
     if (sendText) {
       if (sendText(content) === false) return false;
       await delay(beatMs);
+      if (opts.canSubmit && !opts.canSubmit()) return false;
       return sendSpecialKeys('Enter') !== false;
     }
   }
 
   if (backend.write(content) === false) return false;
   await delay(beatMs);
+  if (opts.canSubmit && !opts.canSubmit()) return false;
   return backend.write('\r') !== false;
 }
 

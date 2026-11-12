@@ -110,7 +110,7 @@ Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bo
 
 ## Supported CLIs & Agents
 
-For interactive CLIs with native goal mode (Claude Code, Codex, and TRAE CLI), send `/goal <objective and completion criteria>` in Lark to start the underlying agent's goal mode. A new topic creates a session automatically. Commands such as `/goal`, `/goal pause`, and `/goal resume` in an existing session are relayed verbatim; available subcommands depend on the CLI version. This entry uses terminal passthrough and requires native command input.
+For interactive CLIs with native goal mode (Claude Code, Codex, Seed, Relay, and TRAE CLI), send `/goal <objective and completion criteria>` in Lark; a new topic creates a session automatically. Dashboard session details provide a Goal mode panel to set and start a goal, query status, and invoke supported pause, resume, and clear operations. Adapters declare these operations through the generic `nativeGoal` interface, with no CLI-name checks in the frontend. TRAE CLI currently declares the full control set; the other adapters declare start and status. The agent terminal remains the source of goal status and results. RPC viewers, remote backends, and adopted external terminals do not currently support this command-based control surface.
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents:
 

@@ -1734,6 +1734,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 且刻意不带冷启动语义）。这里只保留 `/goal`：它是「开启一段目标工作」的命令，需要
     // 空 topic 冷启动能力（isInitialSessionPassthrough 只认 adapter 层的这个字段）。
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    nativeGoal: ['claude-code', 'seed', 'relay'].includes(variant.id)
+      ? { start: '/goal', status: '/goal' }
+      : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.
     buildSessionRenameCommand: variant.id === 'claude-code'

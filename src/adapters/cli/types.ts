@@ -1190,6 +1190,16 @@ export interface CliAdapter {
    *  adapters. */
   readonly defaultPassthroughCommands?: readonly string[];
 
+  /** Native goal controls, consumed by both IM routing and Dashboard.
+   * Only declare operations verified for this CLI's command interface. */
+  readonly nativeGoal?: {
+    start: string;
+    status?: string;
+    pause?: string;
+    resume?: string;
+    clear?: string;
+  };
+
   /** Build the CLI-native command that renames the current interactive session.
    *  The title has already been normalized to one control-character-free line
    *  by the daemon. Undefined means this adapter has no proven native rename
