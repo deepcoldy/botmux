@@ -2130,6 +2130,7 @@ export interface CodexAppEffortResult {
 type DaemonToWorkerBase =
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
+  | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   /** The host refused this binding; the worker returns to its predecessor. */
   | { type: 'runtime_binding_refused'; bindingId: string }
   | { type: 'runtime_contract_assigned'; bindingId: string; runtime: import('./services/session-contract.js').RuntimeRef; mayExecute: boolean; executions?: import('./services/session-contract.js').ExecutionRef[]; admissionStates?: import('./services/session-contract.js').ExecutionAdmissionState[]; observedExecutions?: Array<{ runtime: import('./services/session-contract.js').RuntimeRef; execution: import('./services/session-contract.js').ExecutionRef }>; continuation?: import('./services/session-contract.js').RuntimeExecutionContinuationResult }
@@ -2826,6 +2827,7 @@ export type WorkerToDaemonBase =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      continuationFailure?: import('./services/session-contract.js').RuntimeExecutionContinuationFailure;
       /** Provider-neutral recovery hint. Only an explicit true authorizes the
        * daemon's bounded ordinary-turn continuation policy. */
       retryable?: boolean;
