@@ -98,6 +98,8 @@ export interface CodexPendingTurn {
    *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
    *  semantics intentionally serve the outbound-send suppression window. */
   transcriptStartTimeMs?: number;
+  /** Exact native user record corroborated at the actual attribution edge. */
+  nativeUserProof?: { uuid: string; hash: string; timestampMs: number };
   /** Local observation time for a task_started-only provisional claim. Cleared
    *  once the fingerprinted user record corroborates the claim. */
   provisionalTaskStartedAtMs?: number;
@@ -1042,6 +1044,7 @@ export class CodexBridgeQueue {
         next!.sourceMessageId = ev.sourceMessageId;
         this.rememberNativeUserMessage(ev);
         next!.transcriptStartTimeMs = ev.timestampMs;
+        next!.nativeUserProof = { uuid: ev.uuid, hash: createHash('sha256').update(ev.text).digest('hex'), timestampMs: ev.timestampMs };
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
         // timestamp), not when the worker marked it. With type-ahead the

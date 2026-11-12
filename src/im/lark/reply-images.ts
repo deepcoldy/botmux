@@ -61,6 +61,8 @@ export async function resolveReplyImages(
   options: {
     workingDir: string;
     allowTemporaryImages?: boolean;
+    /** Host-derived artifact roots for the bound native session. */
+    additionalImageRoots?: readonly string[];
     /** Doubao native galleries can contain twelve comparison screenshots. */
     maxImages?: 8 | 16;
     state: ReplyImageState;
@@ -76,6 +78,14 @@ export async function resolveReplyImages(
     if (resolve(root, '..') === root || root === realpathSync(homedir())) return markdown;
   } catch { return markdown; }
   const temporaryRoots: string[] = [];
+  for (const dir of options.additionalImageRoots ?? []) {
+    try {
+      const resolved = realpathSync(dir);
+      if (resolve(resolved, '..') !== resolved && resolved !== realpathSync(homedir())) {
+        temporaryRoots.push(resolve(dir), resolved);
+      }
+    } catch { /* Missing artifact workspace. */ }
+  }
   if (options.allowTemporaryImages) {
     for (const dir of new Set([tmpdir(), ...(process.platform === 'win32' ? [] : ['/tmp'])])) {
       try {

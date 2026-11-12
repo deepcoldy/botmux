@@ -63,6 +63,24 @@ describe('automatic reply image upload', () => {
     expect(options.upload).not.toHaveBeenCalled();
   });
 
+  it('uploads an owned native artifact only inside the explicitly bound workspace', async () => {
+    const dir = '/native/account/workspace';
+    vol.mkdirSync(dir, { recursive: true });
+    vol.writeFileSync(`${dir}/architecture.png`, png);
+    vol.chownSync(`${dir}/architecture.png`, process.getuid?.() ?? 0, 0);
+    const markdown = `![Architecture](${dir}/architecture.png)`;
+    const rejected = fixture();
+    expect(await resolveReplyImages(markdown, rejected)).toBe(markdown);
+    expect(rejected.upload).not.toHaveBeenCalled();
+    const allowed = { ...fixture(), additionalImageRoots: [dir] };
+    expect(await resolveReplyImages(markdown, allowed)).toContain('img_v3_test_upload');
+    expect(allowed.upload).toHaveBeenCalledExactlyOnceWith(png);
+    vol.symlinkSync('/outside/private.png', `${dir}/escape.png`);
+    const escape = { ...fixture(), additionalImageRoots: [dir] };
+    await resolveReplyImages(`![Escape](${dir}/escape.png)`, escape);
+    expect(escape.upload).not.toHaveBeenCalled();
+  });
+
   it.each(['/tmp', tmpdir()])('uploads an owned temporary screenshot only when enabled: %s', async dir => {
     vol.mkdirSync(dir, { recursive: true });
     const path = `${dir}/receipt.png`;

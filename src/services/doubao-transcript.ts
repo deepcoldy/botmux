@@ -26,6 +26,7 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { readJsonlWindow } from './jsonl-cursor.js';
 import { logger } from '../utils/logger.js';
 import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
@@ -111,6 +112,17 @@ export function doubaoTrajectoryPathForSession(sessionId: string): string | unde
   return systemDir ? join(systemDir, TRAJECTORY_FILE) : undefined;
 }
 
+/** The native artifact workspace for this exact bound session, never a
+ * guessed account root or a workspace belonging only to another session. */
+export function doubaoWorkspaceForSession(sessionId: string | undefined,
+  sessionRoots: readonly string[] = doubaoSessionRoots()): string | undefined {
+  if (!sessionId || !SESSION_ID_RE.test(sessionId)) return;
+  const roots = sessionRoots.filter(root => {
+    try { return statSync(join(root, sessionId)).isDirectory(); } catch { return false; }
+  });
+  return roots.length === 1 ? dirname(roots[0]!) : undefined;
+}
+
 function parseHeadingTimestamp(raw: string): number {
   // Keep millisecond precision: take the first three fractional digits so
   // `Date.parse` accepts it (it rejects 9-digit nanosecond fractions).
@@ -189,6 +201,29 @@ function parseAssignmentSections(
     }
   }
   return sections;
+}
+
+/** Corroborate a live process marker against an exact previously attributed
+ * native record. Markdown headings and user-authored envelope tags alone are
+ * never proof of ownership. Legacy journals without proof fail closed. */
+export function doubaoLiveUser(path: string,
+  proof?: { uuid: string; hash: string; timestampMs: number }): (CodexBridgeEvent & { assignmentOffset: number }) | undefined {
+  if (!proof || typeof proof.uuid !== 'string' || !/^[a-f0-9]{64}$/.test(proof.hash) || !Number.isFinite(proof.timestampMs)) return;
+  const assignment = join(dirname(path), ASSIGNMENT_FILE);
+  try {
+    const size = statSync(assignment).size;
+    if (size > 4 * 1024 * 1024) return;
+    const window = readJsonlWindow(assignment, 0, size);
+    const sections = parseAssignmentSections(assignment, window.completeText, 0);
+    const latest = sections.at(-1);
+    // An exact previously attributed native record also covers opening/solo
+    // prompts, which intentionally have no message_location envelope.
+    return latest?.event && !latest.incomplete
+      && latest.event.uuid === proof.uuid
+      && latest.event.timestampMs === proof.timestampMs
+      && createHash('sha256').update(latest.event.text).digest('hex') === proof.hash
+      ? { ...latest.event, assignmentOffset: window.newOffset } : undefined;
+  } catch { return; }
 }
 
 interface ParsedTrajectoryEvent {

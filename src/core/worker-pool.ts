@@ -190,6 +190,7 @@ import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { normalizeDoubaoReplyImages } from '../services/doubao-rich-media.js';
+import { doubaoWorkspaceForSession } from '../services/doubao-transcript.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
@@ -565,6 +566,7 @@ function prepareLocalReplyImages(
     || (ds.initConfig?.readIsolation ?? botCfg.readIsolation)) return Promise.resolve(markdown);
   return resolveReplyImages(markdown, {
     workingDir, state,
+    additionalImageRoots: doubao ? [doubaoWorkspaceForSession(ds.session.cliSessionId)].filter((root): root is string => !!root) : undefined,
     allowTemporaryImages: codexApp || doubao,
     maxImages: doubao ? 16 : 8,
     owns: () => owns() && ds.session.status !== 'closed',
