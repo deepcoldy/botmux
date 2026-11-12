@@ -2,6 +2,7 @@ export const SESSION_CHAT_HELP = `botmux chat create --name <群名> [--member <
 botmux chat members [--chat-id <oc_...>]
 
 使用当前会话的机器人身份。建群自动加入当前真人发起人和机器人自身；不会发送通知。
+建群需要与 /group 相同的权限（管理员，或机器人已向对话用户开放 /group），且发起人在新群也能对话；只在来源群获得的授权（单群授权、oncall 群、整群放行）不延伸到新群。
 成员查询返回本应用下的 open_id，可用于 send --chat-id <群> --mention <open_id>。
 输出为 JSON；建群回执含 chatId、complete 和 invalidUserIds。已有 chatId 或结果未知时先核验，勿重建。`;
 

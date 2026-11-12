@@ -118,6 +118,8 @@ describe('host re-exec of a sandboxed routed send', () => {
         lookupMessageChatId: async () => null, getChatInfo: async () => ({ external: false, mode: 'group' }),
         isBotInChat: async () => true, listMemberOpenIds: async () => ['ou_caller', 'ou_qa'], canTalk: () => true,
       },
+      canCreateChat: () => true,
+      canTalkInNewChat: () => true,
       resolveMembers: async () => new Map([['qa@example.com', 'ou_qa']]),
       listMembers: async () => [{ openId: 'ou_qa', name: 'QA' }],
       create: async input => {

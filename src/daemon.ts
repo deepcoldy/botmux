@@ -10,7 +10,8 @@ import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
-import { handleSessionChatTool, SESSION_CHAT_TOOLS_ROUTE } from './core/session-chat-tools.js';
+import { buildSessionChatContext, handleSessionChatTool, SESSION_CHAT_TOOLS_ROUTE } from './core/session-chat-tools.js';
+import { sessionChatAuthority } from './core/session-chat-authority.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './core/decision-board/chat-task-reader.js';
@@ -9963,35 +9964,39 @@ ipcRoute('POST', SESSION_CHAT_TOOLS_ROUTE, async (req, res) => {
   try { body = await readJsonBody(req, 16 * 1024); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const ds = typeof body?.sessionId === 'string' ? findActiveBySessionId(body.sessionId) : undefined;
-  const appId = ds && ds.larkAppId === selfDaemonLarkAppId ? ds.larkAppId : undefined;
   const turnId = ds?.managedTurnOrigin?.turnId;
   const caller = ds && turnId ? scheduleCallerForTurn(ds, turnId) : undefined;
+  const ctx = buildSessionChatContext(ds ? {
+    sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, turnId, caller,
+    liveTurnId: () => findActiveBySessionId(ds.session.sessionId) === ds ? ds.managedTurnOrigin?.turnId : undefined,
+    availability: () => ({
+      vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+      silentListener: isSilentMessageListenerSession(ds.session),
+      larkTransport: larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly }),
+    }),
+  } : undefined, selfDaemonLarkAppId);
+  const appId = ctx?.larkAppId;
+  const authority = ds && appId
+    ? sessionChatAuthority(appId, { chatId: ds.chatId, chatType: ds.chatType }, caller?.requestUserUnionId)
+    : undefined;
   const { listChatUserMembers, resolveAllowedUsersWithMap } = await import('./im/lark/client.js');
   const { createChat } = await import('./services/groups-store.js');
   try {
-    const result = await handleSessionChatTool(body, ds && appId ? {
-      sessionId: ds.session.sessionId, larkAppId: appId, chatId: ds.chatId, turnId,
-      callerOpenId: caller?.requestUserOpenId,
-      humanCaller: caller?.senderType === 'user' && !caller.source && caller.requestLarkAppId === appId,
-      enabled: !ds.session.vcMeetingReceiver && !isSilentMessageListenerSession(ds.session)
-        && larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(appId).config.apiOnly }),
-      isCurrent: () => findActiveBySessionId(ds.session.sessionId) === ds && ds.managedTurnOrigin?.turnId === turnId
-        && !ds.session.vcMeetingReceiver && !isSilentMessageListenerSession(ds.session)
-        && larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(appId).config.apiOnly }),
-    } : undefined, {
+    const result = await handleSessionChatTool(body, ctx, {
       route: {
         lookupMessageChatId: id => lookupMessageChatId(appId!, id),
         getChatInfo: id => getChatRoutingFacts(appId!, id),
         isBotInChat: id => isCurrentBotInChat(appId!, id),
         listMemberOpenIds: id => listChatMemberOpenIds(appId!, id),
-        canTalk: (id, openId) => evaluateTalk(appId!, id, openId, undefined, undefined,
-          id === ds?.chatId ? ds.chatType : 'group').allowed,
+        canTalk: (id, openId) => authority!.canTalk(id, openId),
       },
+      canCreateChat: openId => authority!.canCreateChat(openId),
+      canTalkInNewChat: openId => authority!.canTalkInNewChat(openId),
       resolveMembers: async ids => (await resolveAllowedUsersWithMap(appId!, ids)).map,
       listMembers: id => listChatUserMembers(appId!, id),
       create: input => createChat(appId!, { ...input, botIds: [] }),
+      audit: line => logger.info(`[session-chat] ${line}`),
     });
-    logger.info(`[session-chat] session=${body?.sessionId} turn=${turnId ?? '-'} action=${body?.action} status=${result.status}`);
     return jsonRes(res, result.status, result.body);
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });

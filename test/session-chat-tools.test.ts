@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { handleSessionChatTool, type SessionChatContext, type SessionChatDeps } from '../src/core/session-chat-tools.js';
+import { buildSessionChatContext, handleSessionChatTool, type SessionChatContext, type SessionChatDeps, type SessionChatSessionView } from '../src/core/session-chat-tools.js';
 import { parseSessionChatArgs } from '../src/cli/session-chat.js';
 
 function fixture() {
@@ -14,6 +14,8 @@ function fixture() {
       isBotInChat: async () => true,
       listMemberOpenIds: async () => ['ou_caller', 'ou_qa'], canTalk: () => true,
     },
+    canCreateChat: () => true,
+    canTalkInNewChat: () => true,
     resolveMembers: vi.fn(async ids => new Map(ids.map(id => [id, id.includes('@') ? 'ou_qa' : id]))),
     listMembers: vi.fn(async () => [{ openId: 'ou_qa', name: 'QA' }]),
     create: vi.fn(async () => ({ chatId: 'oc_new', invalidUserIds: [] })),
@@ -60,16 +62,72 @@ describe('session chat commands', () => {
   });
 
   it('rechecks turn and talk permission after contact resolution', async () => {
-    for (const revoke of ['turn', 'permission']) {
+    for (const revoke of ['turn', 'permission', 'group-command', 'new-chat-talk']) {
       const { ctx, deps, body } = fixture();
       deps.resolveMembers = async () => {
         if (revoke === 'turn') ctx.isCurrent = () => false;
-        else deps.route.canTalk = () => false;
+        else if (revoke === 'permission') deps.route.canTalk = () => false;
+        else if (revoke === 'group-command') deps.canCreateChat = () => false;
+        else deps.canTalkInNewChat = () => false;
         return new Map([['qa@example.com', 'ou_qa']]);
       };
       expect((await handleSessionChatTool(body, ctx, deps)).status).toBeGreaterThanOrEqual(400);
       expect(deps.create).not.toHaveBeenCalled();
     }
+  });
+
+  it.each([
+    ['group-command', 'chat_create_not_authorized'],
+    ['new-chat-talk', 'new_chat_talk_not_authorized'],
+  ])('refuses creation without %s authority before any contact lookup', async (missing, error) => {
+    const { ctx, deps, body } = fixture();
+    if (missing === 'group-command') deps.canCreateChat = vi.fn(() => false);
+    else deps.canTalkInNewChat = vi.fn(() => false);
+    expect(await handleSessionChatTool(body, ctx, deps)).toEqual({ status: 403, body: { ok: false, error } });
+    expect(missing === 'group-command' ? deps.canCreateChat : deps.canTalkInNewChat).toHaveBeenCalledWith('ou_caller');
+    expect(deps.resolveMembers).not.toHaveBeenCalled();
+    expect(deps.create).not.toHaveBeenCalled();
+  });
+
+  it('does not require creation authority to list members', async () => {
+    const { ctx, deps } = fixture();
+    deps.canCreateChat = () => false;
+    deps.canTalkInNewChat = () => false;
+    expect((await handleSessionChatTool({ action: 'members', turnId: ctx.turnId }, ctx, deps)).status).toBe(200);
+  });
+
+  it('invites at most 49 people besides the caller', async () => {
+    const forty9 = Array.from({ length: 49 }, (_, i) => `ou_member${i}`);
+    const ok = fixture();
+    expect((await handleSessionChatTool({ ...ok.body, members: forty9 }, ok.ctx, ok.deps)).status).toBe(200);
+    expect(vi.mocked(ok.deps.create).mock.calls[0]![0].userIds).toHaveLength(50);
+    const over = fixture();
+    expect((await handleSessionChatTool({ ...over.body, members: [...forty9, 'ou_member49'] }, over.ctx, over.deps)).body)
+      .toEqual({ ok: false, error: 'invalid_chat_create' });
+    expect(over.deps.resolveMembers).not.toHaveBeenCalled();
+  });
+
+  it.each(['cli_other', 'on_union_member', '+15550100', 'Display Name'])(
+    'rejects member identifier %s before any contact lookup', async member => {
+      const { ctx, deps, body } = fixture();
+      const result = await handleSessionChatTool({ ...body, members: [member] }, ctx, deps);
+      expect(result.status).toBe(400);
+      expect(deps.resolveMembers).not.toHaveBeenCalled();
+    });
+
+  it('audits principal, created chat and invite counts, and marks an unknown creation outcome', async () => {
+    const lines: string[] = [];
+    const { ctx, deps, body } = fixture();
+    deps.audit = line => { lines.push(line); };
+    deps.create = vi.fn(async () => ({ chatId: 'oc_new', invalidUserIds: ['ou_qa'] }));
+    await handleSessionChatTool(body, ctx, deps);
+    expect(lines).toEqual(['session=session-1 turn=turn-1 action=create principal=ou_caller target=oc_new invited=2 invalid=1 status=200']);
+    deps.create = vi.fn(async () => { throw new Error('socket hang up'); });
+    await expect(handleSessionChatTool(body, ctx, deps)).rejects.toThrow('socket hang up');
+    expect(lines[1]).toBe('session=session-1 turn=turn-1 action=create principal=ou_caller target=create-attempted invited=2 invalid=- status=502 error=socket hang up');
+    deps.canCreateChat = () => false;
+    await handleSessionChatTool(body, ctx, deps);
+    expect(lines[2]).toBe('session=session-1 turn=turn-1 action=create principal=ou_caller target=- invited=- invalid=- status=403 error=chat_create_not_authorized');
   });
 
   it('retains a committed chat and rejected invitees when the turn changes during creation', async () => {
@@ -103,5 +161,58 @@ describe('session chat commands', () => {
     expect(result.status).toBeGreaterThanOrEqual(400);
     expect(deps.listMembers).not.toHaveBeenCalled();
     expect(result.body).not.toHaveProperty('members');
+  });
+});
+
+describe('session chat context from daemon state', () => {
+  function view(over: Partial<SessionChatSessionView> = {}, flags: Partial<ReturnType<SessionChatSessionView['availability']>> = {}) {
+    let live: string | undefined = 'turn-1';
+    const state = { vcMeetingReceiver: false, silentListener: false, larkTransport: true, ...flags };
+    const v: SessionChatSessionView = {
+      sessionId: 'session-1', larkAppId: 'cli_self', chatId: 'oc_source', turnId: 'turn-1',
+      caller: { senderType: 'user', requestLarkAppId: 'cli_self', requestUserOpenId: 'ou_caller' },
+      liveTurnId: () => live, availability: () => state, ...over,
+    };
+    return { v, state, rotate: (next?: string) => { live = next; } };
+  }
+
+  it('belongs only to this daemon app', () => {
+    expect(buildSessionChatContext(view().v, 'cli_other')).toBeUndefined();
+    expect(buildSessionChatContext(view().v, undefined)).toBeUndefined();
+    expect(buildSessionChatContext(undefined, 'cli_self')).toBeUndefined();
+    expect(buildSessionChatContext(view().v, 'cli_self')).toMatchObject({
+      sessionId: 'session-1', larkAppId: 'cli_self', chatId: 'oc_source', turnId: 'turn-1', callerOpenId: 'ou_caller', humanCaller: true, enabled: true,
+    });
+  });
+
+  it.each([
+    ['scheduled run-as creator', { senderType: 'user', source: 'schedule_creator', requestLarkAppId: 'cli_self', requestUserOpenId: 'ou_caller' }],
+    ['failed-turn recovery', { senderType: 'user', source: 'failed_turn_recovery', requestLarkAppId: 'cli_self', requestUserOpenId: 'ou_caller' }],
+    ['bot sender', { senderType: 'bot', requestLarkAppId: 'cli_self', requestUserOpenId: 'ou_peer_bot' }],
+    ['unknown sender type', { requestLarkAppId: 'cli_self', requestUserOpenId: 'ou_caller' }],
+    ['another app', { senderType: 'user', requestLarkAppId: 'cli_other', requestUserOpenId: 'ou_caller' }],
+    ['no caller record', undefined],
+  ] as const)('is not a human caller for %s', (_label, caller) => {
+    expect(buildSessionChatContext(view({ caller: caller as SessionChatSessionView['caller'] }).v, 'cli_self')!.humanCaller).toBe(false);
+  });
+
+  it.each([
+    { vcMeetingReceiver: true }, { silentListener: true }, { larkTransport: false },
+  ])('is disabled for %o', flags => {
+    expect(buildSessionChatContext(view({}, flags).v, 'cli_self')!.enabled).toBe(false);
+  });
+
+  it('stays current only for the same live turn while the session can still talk', () => {
+    const { v, state, rotate } = view();
+    const ctx = buildSessionChatContext(v, 'cli_self')!;
+    expect(ctx.isCurrent()).toBe(true);
+    state.silentListener = true;
+    expect(ctx.isCurrent()).toBe(false);
+    state.silentListener = false;
+    rotate('turn-2');
+    expect(ctx.isCurrent()).toBe(false);
+    rotate(undefined);
+    expect(ctx.isCurrent()).toBe(false);
+    expect(buildSessionChatContext(view({ turnId: undefined }).v, 'cli_self')!.isCurrent()).toBe(false);
   });
 });

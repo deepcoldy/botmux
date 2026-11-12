@@ -29,6 +29,8 @@ function fixture() {
       listMemberOpenIds: async () => ['ou_caller', 'ou_qa'],
       canTalk: id => permission.get(id) === true,
     },
+    canCreateChat: () => true,
+    canTalkInNewChat: () => true,
     resolveMembers: async () => new Map([['qa@example.com', 'ou_qa']]),
     listMembers: vi.fn(async () => [{ openId: 'ou_qa', name: 'QA' }]),
     create: vi.fn(async () => ({ chatId: 'oc_created', invalidUserIds: [] })),
