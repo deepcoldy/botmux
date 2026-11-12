@@ -5110,6 +5110,48 @@ export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boo
   return identity?.turnId !== undefined && identity.turnId !== turnId;
 }
 
+const deferredUnifiedReplyTurns = new WeakMap<DaemonSession, Set<string>>();
+
+/** Unified-reply placeholder waits while another turn still owns the terminal.
+ * No capture identity (fresh session) and an identity that already names this
+ * turn both post immediately. Do not reuse {@link streamingCardTurnQueued}:
+ * its waiting-exact-turn clause stays true for every turn id. */
+export function unifiedReplyTurnNotCapturing(ds: DaemonSession, turnId: string): boolean {
+  const identity = currentCaptureIdentity(ds);
+  return identity?.turnId !== undefined && identity.turnId !== turnId;
+}
+
+function rememberDeferredUnifiedReply(ds: DaemonSession, turnId: string): void {
+  let pending = deferredUnifiedReplyTurns.get(ds);
+  if (!pending) {
+    pending = new Set();
+    deferredUnifiedReplyTurns.set(ds, pending);
+  }
+  pending.add(turnId);
+  while (pending.size > 32) {
+    const oldest = pending.values().next().value;
+    if (oldest === undefined) break;
+    pending.delete(oldest);
+  }
+}
+
+function forgetDeferredUnifiedReply(ds: DaemonSession, turnId: string): void {
+  const pending = deferredUnifiedReplyTurns.get(ds);
+  if (!pending) return;
+  pending.delete(turnId);
+  if (pending.size === 0) deferredUnifiedReplyTurns.delete(ds);
+}
+
+/** Deferred turn the worker is now capturing. A turn that never becomes the
+ * capture identity is never posted, so an unused type-ahead leaves no card. */
+export function takeReadyUnifiedReply(ds: DaemonSession): string | undefined {
+  const pending = deferredUnifiedReplyTurns.get(ds);
+  const turnId = currentCaptureIdentity(ds)?.turnId;
+  if (!pending || !turnId || !pending.has(turnId) || unifiedReplyTurnNotCapturing(ds, turnId)) return undefined;
+  forgetDeferredUnifiedReply(ds, turnId);
+  return turnId;
+}
+
 /** Image for the card's presentation layer. A waiting card may show the live
  * predecessor frame only through the explicit in-memory preview slot; it is
  * never promoted into this turn's currentImageKey. */
@@ -6202,15 +6244,18 @@ export async function postTurnStartingCard(
   if (remoteRetirementAdmissionPhase(ds)) return false;
   let replyPost: Promise<boolean> = Promise.resolve(false);
   if (replyCardModeFor(ds, turnId) !== 'legacy') {
-    // Reserve the turn before the CLI can call `botmux send`. Its reply uses
-    // the same durable record even while the first card POST is in flight.
-    replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
-      { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
-      .then(result => !!result).catch(error => {
-        logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      });
+    if (unifiedReplyTurnNotCapturing(ds, turnId)) {
+      // beginNewTurn admits a follow-up while the previous turn still owns the
+      // terminal. Posting the 「正在处理你的请求…」 card now leaves it stuck when
+      // the follow-up is only queued. Release it from capture_identity once
+      // this turn is the producer; a turn that never captures is not posted.
+      rememberDeferredUnifiedReply(ds, turnId);
+    } else {
+      forgetDeferredUnifiedReply(ds, turnId);
+      // Reserve the turn before the CLI can call `botmux send`. Its reply uses
+      // the same durable record even while the first card POST is in flight.
+      replyPost = postUnifiedReplyPlaceholder(ds, sessionReply, turnId);
+    }
   }
   // The optional terminal card owns streamCardId/pending independently of the
   // durable reply card. Start both before awaiting either to preserve the
@@ -6221,6 +6266,31 @@ export async function postTurnStartingCard(
   trackStartingCardPublication(ds, statusPost);
   const [replyPosted, statusPosted] = await Promise.all([replyPost, statusPost]);
   return replyPosted || statusPosted;
+}
+
+function postUnifiedReplyPlaceholder(
+  ds: DaemonSession,
+  sessionReply: Parameters<typeof postTurnStartingCard>[1],
+  turnId: string,
+): Promise<boolean> {
+  return updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
+    (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
+    { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
+    .then(result => !!result).catch(error => {
+      logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    });
+}
+
+/** Post a placeholder that was held back until this turn became the capture
+ * identity. Returns false when nothing was waiting or this turn is not it. */
+export function releaseDeferredUnifiedReplyCard(
+  ds: DaemonSession,
+  sessionReply: Parameters<typeof postTurnStartingCard>[1],
+): Promise<boolean> {
+  const turnId = takeReadyUnifiedReply(ds);
+  if (!turnId || replyCardModeFor(ds, turnId) === 'legacy') return Promise.resolve(false);
+  return postUnifiedReplyPlaceholder(ds, sessionReply, turnId);
 }
 
 async function postTurnStartingStatusCard(
@@ -19691,12 +19761,18 @@ function setupWorkerHandlers(
             `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
-        } else if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
-          // The waiting turn has become the terminal producer. Repaint even
-          // when the worker remains working→working and no status edge would
-          // otherwise wake the card: this immediately removes the predecessor
-          // preview, before the first screenshot from the new turn arrives.
-          reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
+        } else {
+          if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
+            // The waiting turn has become the terminal producer. Repaint even
+            // when the worker remains working→working and no status edge would
+            // otherwise wake the card: this immediately removes the predecessor
+            // preview, before the first screenshot from the new turn arrives.
+            reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
+          }
+          // Type-ahead follow-ups defer their unified placeholder until the
+          // worker actually captures this turn. A newer identity leaves the
+          // still-queued turn unposted.
+          void releaseDeferredUnifiedReplyCard(ds, cb.sessionReply);
         }
         break;
       }

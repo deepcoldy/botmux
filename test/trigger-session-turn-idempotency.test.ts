@@ -204,10 +204,15 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     const triggerMeta = { requestId: key, receivedAt: '2026-09-25T07:00:00.000Z', turnIdempotencyKey: key };
     const shape = validateTriggerRequest(buildOrchestratorReportTrigger(decision, triggerMeta));
     expect(shape.ok).toBe(true);
+    if (!shape.ok) return;
+    expect(shape.request.options?.suppressFinalOutput).toBe(true);
+    expect(shape.request.options?.turnIdempotencyKey).toBe(key);
     let lost = true;
+    let acceptedTurnId = '';
     const fetchTarget = vi.fn(async (_path: string, init: RequestInit) => {
       const req = JSON.parse(init.body as string) as TriggerRequest;
       const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      if (result.triggerId) acceptedTurnId = result.triggerId;
       expect(result.ok).toBe(true);
       if (lost) { lost = false; throw new Error('response lost after acceptance'); }
       expect(result.idempotent).toBe(true);
@@ -225,6 +230,7 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     expect(ds.latestAsyncTriggerId).toBe('real-http-request');
     expect(asyncTriggerStore.lookup(SID)).toBeUndefined();
     expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBe(true);
+    expect(ds.suppressedTriggerFinalTurns?.has(acceptedTurnId)).toBe(true);
   });
 
   it('keeps explicit final suppression turn-scoped on an idempotent Lark follow-up', async () => {
