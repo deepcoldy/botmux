@@ -237,6 +237,7 @@ export interface PendingAsk {
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
    *  but not visible" — clicks can't physically arrive yet. */
   cardMessageId?: string;
+  cardDeliveredAt?: number;
   /** Once true, subsequent click attempts return `already_settled`. */
   settled: boolean;
   /** Stable Feishu IM dedupe token for the card send (≤50 chars, derived from

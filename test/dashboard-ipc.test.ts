@@ -11557,6 +11557,52 @@ describe('GET /api/groups (Phase B)', () => {
   });
 });
 
+describe('GET /api/groups/:chatId/members-display', () => {
+  // 机器人视角的成员列表含 bot 自己；精确授权拒绝把 receiver 当 subject，
+  // 所以必须把这一行标出来，前端才能不把它列为可授权对象。
+  it('flags only the viewing bot\'s own row as self', async () => {
+    registerBot({ larkAppId: 'cli_members_self', larkAppSecret: 'secret', cliId: 'codex', workingDir: process.cwd() });
+    getBot('cli_members_self').botOpenId = 'ou_self_bot';
+    setLarkAppId('cli_members_self');
+    const spy = vi.spyOn(groupsStore, 'listChatMemberDisplays').mockResolvedValue([
+      { openId: 'ou_person', name: 'Person', memberType: 'unknown' },
+      { openId: 'ou_self_bot', name: 'Self Bot', memberType: 'bot' },
+      { openId: 'ou_peer_bot', name: 'Peer Bot', memberType: 'bot' },
+    ]);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/oc_members_self/members-display`);
+      expect(res.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('cli_members_self', 'oc_members_self');
+      expect((await res.json()).members).toEqual([
+        { openId: 'ou_person', name: 'Person', memberType: 'unknown' },
+        { openId: 'ou_self_bot', name: 'Self Bot', memberType: 'bot', self: true },
+        { openId: 'ou_peer_bot', name: 'Peer Bot', memberType: 'bot' },
+      ]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('flags nothing while the bot\'s own open_id is not known yet', async () => {
+    registerBot({ larkAppId: 'cli_members_noid', larkAppSecret: 'secret', cliId: 'codex', workingDir: process.cwd() });
+    setLarkAppId('cli_members_noid');
+    const rows = [
+      { openId: 'ou_person', name: 'Person', memberType: 'user' as const },
+      { openId: 'ou_some_bot', name: 'Some Bot', memberType: 'bot' as const },
+    ];
+    const spy = vi.spyOn(groupsStore, 'listChatMemberDisplays').mockResolvedValue(rows);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/oc_members_noid/members-display`);
+      expect(res.status).toBe(200);
+      expect((await res.json()).members).toEqual(rows);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 describe('PUT /api/chat-pin-streaming-card/:chatId', () => {
   it('forwards the per-chat pin override and returns the accepted state', async () => {
     setLarkAppId('test-app');

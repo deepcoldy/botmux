@@ -27,6 +27,12 @@ export class AskArgsError extends Error {
   }
 }
 
+export function parseAskRequestId(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(raw)) throw new AskArgsError('questions_invalid', '--request-id 需要1至256位字母数字或_-');
+  return raw;
+}
+
 /** Parse `--options` CSV. Each item is either `key` (key==label) or `key=label`.
  *
  *  Rules:

@@ -47,6 +47,7 @@ import { clearHashQueryParam } from '../src/dashboard/web/dashboard-routes.js';
 import { setLeaveGuard } from '../src/dashboard/web/leave-guard.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { store } from '../src/dashboard/web/store.js';
+import { CLOSED_HISTORY_SEARCH_DEBOUNCE_MS } from '../src/dashboard/web/closed-history-search.js';
 import { loadNameMaps, ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -499,6 +500,48 @@ describe('CommandPalette interaction', () => {
     palette.press('ArrowUp');
     // 从第一条再往上回绕到最后一条（页面组的最后一项）。
     expect(palette.activeTitle()).toBe('全局设置');
+  });
+
+  it('searches older closed sessions on the server for the typed query and lists the matches', async () => {
+    vi.useFakeTimers();
+    try {
+      store.replaceSnapshot([...store.sessions.values()], [], undefined, { closedCursor: 'older', closedTotal: 900 });
+      apiResponses['/api/sessions?view=closed&q=ledger'] = async () => ({
+        sessions: [{ sessionId: 's-archived', status: 'closed', title: 'Archived ledger migration', lastMessageAt: now - 40 * 86_400_000 }],
+        closedCursor: null,
+      });
+      const fetchMock = vi.mocked(fetch);
+      const palette = mount();
+      const titles = () => palette.options().map(node => palette.textOf(node.findByProps({ className: 'cmdk-item-title' })));
+      // Typing in bursts asks once, for the settled query only.
+      palette.type('led');
+      await act(async () => { await vi.advanceTimersByTimeAsync(CLOSED_HISTORY_SEARCH_DEBOUNCE_MS - 50); });
+      palette.type('ledger');
+      expect(titles()).not.toContain('Archived ledger migration');
+      await act(async () => { await vi.advanceTimersByTimeAsync(CLOSED_HISTORY_SEARCH_DEBOUNCE_MS - 50); });
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/sessions'))).toEqual([]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/sessions'))).toEqual([['/api/sessions?view=closed&q=ledger']]);
+      expect(titles()).toContain('Archived ledger migration');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not search session history from a non-session tab', async () => {
+    vi.useFakeTimers();
+    try {
+      store.replaceSnapshot([...store.sessions.values()], [], undefined, { closedCursor: 'older', closedTotal: 900 });
+      const palette = mount();
+      palette.press('Tab');
+      palette.press('Tab');
+      expect(palette.selectedTab()).not.toMatch(/会话|全部/);
+      palette.type('ledger');
+      await act(async () => { await vi.advanceTimersByTimeAsync(CLOSED_HISTORY_SEARCH_DEBOUNCE_MS * 2); });
+      expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).startsWith('/api/sessions'))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('typing filters and highlights; Enter opens session details, ⌘↵ the cockpit', () => {

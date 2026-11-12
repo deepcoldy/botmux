@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
-import { sweepInterruptedReplyCards } from '../src/core/turn-reply-card.js';
+import { sweepInterruptedReplyCards, settleTurnReplyCardTerminal } from '../src/core/turn-reply-card.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
@@ -50,6 +50,17 @@ describe('reply-card recovery under partial writes and overlapping writers', () 
   await expect(store.update(key,{kind:'terminal',phase:'completed',durationMs:1234},io)).rejects.toThrow('PATCH unavailable');
   io.patch=real; vi.setSystemTime(2_000_000);
  }
+ it('settles an old disconnected reply while preserving the successor display owner',async()=>{
+  await store.update(key,{kind:'terminal',phase:'ambiguous',disconnected:true},io);
+  await store.update(key,{kind:'final',text:'RECOVERY_OK',source:'explicit',card:JSON.stringify({schema:'2.0',body:{elements:[{tag:'markdown',content:'RECOVERY_OK'}]}})},io);
+  const ds:any={larkAppId:key.larkAppId,chatId:input.chatId,chatType:'group',rootMessageId:input.rootId,
+    replyCardRunningTurnId:'successor',session:{sessionId:key.sessionId,status:'active',rootMessageId:input.rootId}};
+  await drain(settleTurnReplyCardTerminal(ds,{turnId:key.turnId,status:'completed',durationMs:123},async()=>{throw Error('must patch existing card')},()=>true));
+  expect(store.read(key)).toMatchObject({phase:'completed',finalDelivered:true,durationMs:123});
+  expect(store.read(key)?.disconnected).toBeUndefined();
+  expect(remote).toContain('RECOVERY_OK');expect(remote).not.toContain('执行状态待确认');
+  expect(ds.replyCardRunningTurnId).toBe('successor');
+ });
  it('masks a content-audit-rejected recovery PATCH instead of leaving the card unsettled',async()=>{
   // The final (with an email) is already in the card; the terminal PATCH is left
   // pending, and recovery re-renders the whole card including that final.

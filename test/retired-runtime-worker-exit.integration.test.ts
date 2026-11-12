@@ -14,11 +14,13 @@
  * showing a running turn, suspend only queued, Stop sent ^C into nothing.
  *
  * The first case replays that day: wake, compaction-start signal, next message.
- * The others take a retirement #214 does not cover — the identity update
- * landing while an exact-turn interrupt (a cancel operation) is in flight — and
- * check the ways out: the retired worker ends its generation and the message it
- * was holding is handed to a successor and answered without waiting for
- * another message; a close arriving before that still tears the CLI down.
+ * The others take a retirement that still happens with the live identity
+ * update fixed: the update lands while a close is in flight (a closing session
+ * never re-activates a runtime), and that close is then rejected, so the
+ * session stays active with its runtime retired. They check the ways out: the
+ * retired worker ends its generation and the message it was holding is handed
+ * to a successor and answered without waiting for another message; a close
+ * arriving before that still tears the CLI down.
  *
  * Real worker, real tmux backend on a private socket, a fake Claude; the daemon
  * side is the real worker IPC handler with the real SQLite session contract.
@@ -190,22 +192,21 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
     expect(log).not.toContain('mayExecute=false');
   }, 180_000);
 
-  /** Wake with an exact-turn interrupt of the waking turn in flight
-   *  (interruptExactWorkerTurn has opened its cancel operation) when the
-   *  message is written and the CLI then shows its native session id: that
-   *  identity update carries the resume operation, which is no longer the
-   *  active one, and the contract retires the live runtime. */
-  async function retireDuringInterrupt() {
+  /** Wake with a close in flight (closeSession has opened its close
+   *  operation) when the message is written and the CLI then shows its native
+   *  session id: a closing session retires the runtime that identity update
+   *  binds. The close is then rejected (closeSession reports a non-retryable
+   *  failure), which returns the session to active with no live runtime. */
+  async function retireDuringFailedClose() {
     const session = wakeSuspendedSession();
     const { controller, g } = session;
     await g.waitFor(() => g.logs.join('').includes('Startup command confirmed'), 'the startup command before the write', 120_000);
-    const execution = controller.store.executions(controller.ref)
-      .find(value => value.ref.turnId === WAKE_TURN && !value.terminal)!;
-    const cancel = controller.beginControl('cancel', undefined, execution.ref).operation.operationId;
-    controller.controlStarted(cancel);
+    const close = controller.beginControl('close').operation.operationId;
+    controller.controlStarted(close);
     await g.waitFor(() => g.logs.join('').includes('mayExecute=false'), 'the daemon retiring the runtime', 30_000);
     expect(g.logs.join('').indexOf('Published CLI session id')).toBeGreaterThan(g.logs.join('').indexOf('Writing to PTY'));
-    controller.controlResult(cancel, 'uncertain');
+    controller.controlResult(close, 'rejected', undefined, 'close_failed');
+    expect(controller.acceptsUserInput()).toBe(true);
     return session;
   }
 
@@ -216,7 +217,7 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
   });
 
   it('ends its generation and has the message it was holding answered by a successor', async () => {
-    const { h, ds, g, fork, replies, sendNext } = await retireDuringInterrupt();
+    const { h, ds, g, fork, replies, sendNext } = await retireDuringFailedClose();
     // The daemon starts a successor for handed-over input the way it re-forks
     // a worker-less session.
     let successor: Generation | undefined;
@@ -243,7 +244,7 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
   }, 300_000);
 
   it('still has a close that arrives before it ends tear down the CLI', async () => {
-    const { h, ds, g } = await retireDuringInterrupt();
+    const { h, ds, g } = await retireDuringFailedClose();
     const pane = `bmx-${h.sessionId.slice(0, 8)}`;
     const socket = join(h.root, `tmux-${process.getuid?.() ?? 0}`, preferredManagedTmuxSocket() ?? 'default');
     const paneAlive = () => {

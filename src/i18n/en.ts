@@ -1632,6 +1632,8 @@ export const messages: Record<string, string> = {
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',
   'worker.remote_close_in_progress': '⏳ The remote {backend} session is closing. Wait for the close result before sending another message.',
+  'worker.remote_close_late_cancel_restored': '✅ Confirmed that the remote {backend} task has stopped. The last close did not complete, so the session is back and accepts messages again; to close it, tap "Close session" again or send /close.',
+  'worker.remote_close_uncertain': '⚠️ The last close could not confirm that the remote {backend} task stopped, so this session is not accepting messages (they could reach a task that may still be running). Tap "Close session" again or send /close: once the remote is confirmed stopped the session closes normally; if it still cannot be confirmed, the session stays paused and says why.',
   'worker.working_dir_missing_again': '⚠️ The working directory {path} is still missing, so this message was not delivered. Rebuild the worktree or switch directories on the card above, then resend.',
   'worker.working_dir_missing_text': '⚠️ This session\'s working directory no longer exists: {path}\nThis message was not delivered and the CLI did not run anywhere else. Use `/cd <path>` to switch to another directory, or restore that directory and resend.',
   'worker.working_dir_missing_opening_text': '⚠️ The working directory does not exist: {path}\nThis message has not started and the CLI did not run anywhere else. Send `/repo <path|project name>` in this topic to pick a directory and it starts there.',

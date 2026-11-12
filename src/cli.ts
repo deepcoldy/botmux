@@ -8149,6 +8149,8 @@ ${SEND_HELP_BODY}
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
   ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
+  ask buttons --request-id <id>        显式稳定调用身份，重连同参数不创建第二张卡
+  ask control describe|inspect|retire|release --control-file <file>   宿主受管控制，精确绑定原请求/轮/代次
   ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
                                        否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
@@ -17457,8 +17459,9 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
   - --subject-open-id 与 --subject-bot 严格二选一，均可重复传入。
   - --subject-bot 是推荐的稳定 App 身份入口，由 receiver daemon 在自己视角解析 open_id；
     它仅支持 grant，revoke/readback 仍必须显式传 --subject-open-id。
-  - grant 只接受 receiver 视角下 Feishu /members/bots 实时返回的群内 Bot open_id；
-    接口失败时 fail-closed，不使用 observed/cross-ref 历史回退。
+  - grant 只接受 receiver 视角下当前在群的 open_id：Bot 以 Feishu /members/bots 实时结果为准，
+    真人以群成员列表 /members 实时结果为准（--subject-bot 只会是 Bot，只查 /members/bots）；
+    给不出确定结论时 fail-closed，不使用 observed/cross-ref 历史回退。receiver 自身不能作为 subject。
   - revoke 不依赖实时成员查询，Bot 已退群后仍可清理旧授权。
   - readback 只返回显式请求的 subject，不枚举整个授权表。
   - 只写 chatGrant（talk-only）；不改 allowedUsers / allowedChatGroups / team trust，
@@ -18109,6 +18112,50 @@ const CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS = 3_000;
 const CLI_RESOLVED_UNKNOWN_ASK_POLL_MS = 200;
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
+  if (sub === 'control') {
+    const action = rest[0];
+    const controlFile = argValue(rest, '--control-file');
+    if (!['describe', 'inspect', 'retire', 'release'].includes(action ?? '') || !controlFile) {
+      console.error('botmux ask control: use describe|inspect|retire|release --control-file <JSON>');
+      process.exit(2);
+    }
+    const { readFileSync } = await import('node:fs');
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(controlFile, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('control file must be a JSON object');
+      body = parsed as Record<string, unknown>;
+    } catch (error) {
+      console.error(`botmux ask control: cannot read --control-file: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+    if (typeof body.larkAppId !== 'string') {
+      console.error('botmux ask control: larkAppId required');
+      process.exit(2);
+    }
+    const daemon = findDaemon(body.larkAppId);
+    if (!daemon) {
+      console.error('botmux ask control: daemon unavailable');
+      process.exit(3);
+    }
+    // A lost or timed-out response leaves the outcome unknown: report it and
+    // let the caller inspect the original operation instead of retrying blind.
+    let response: Response;
+    let result: unknown;
+    try {
+      response = await fetchDaemonIpc(daemon.ipcPort, `/api/asks/managed/${action}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      }, loadDaemonIpcSecret());
+      result = await response.json();
+    } catch (error) {
+      console.error(`botmux ask control: outcome unknown, inspect before retrying: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(3);
+    }
+    await writeAndFlush(process.stdout, JSON.stringify(result) + '\n');
+    if (!response.ok) process.exit(3);
+    return;
+  }
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
   // approvals belong in humanGate / decision nodes so the choice is part of
@@ -18135,7 +18182,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, parseAskRequestId, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -18163,6 +18210,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let questions;
   let timeoutMs;
   let mentionedOpenId;
+  let requestId;
   try {
     if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
       && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
@@ -18180,6 +18228,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
     mentionedOpenId = parseAskMention(mentionRaw);
+    requestId = parseAskRequestId(argValue(rest, '--request-id'));
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -18220,7 +18269,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     // Stable invocation identity: reconnect without posting a second card.
     originKind: 'explicit',
     ...(answererOpenId ? { answererOpenId } : {}),
-    requestId: randomUUID(),
+    requestId: requestId ?? randomUUID(),
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }

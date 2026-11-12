@@ -83,6 +83,48 @@ describe('forwarded resource message ownership', () => {
     expect(mocks.userToken).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['image', 'image', 'om_second'], ['file', 'file', 'om_second'], ['video', 'media', 'om_second'],
+    ['image', 'image', 'om_right'], ['file', 'file', 'om_right'], ['video', 'media', 'om_right'],
+  ] as const)('downloads a repeated %s from a later owner (%s, %s)', async (type, msgType, owner) => {
+    const parsed: LarkMessage = {
+      messageId: 'om_root', rootId: '', senderId: 'ou_sender', senderType: 'user',
+      msgType: 'merge_forward', content: '[合并转发消息]', createTime: '0',
+    };
+    const { extraResources } = await expandMergeForward('cli_test', 'om_root', parsed, undefined, {
+      items: [
+        { message_id: 'om_root', msg_type: 'merge_forward', body: { content: '{}' } },
+        { message_id: 'om_shared', upper_message_id: 'om_root', msg_type: 'merge_forward', body: { content: '{}' } },
+        ...['om_left', 'om_right'].map(message_id => ({ message_id, upper_message_id: 'om_shared',
+          msg_type: 'merge_forward', body: { content: '{}' } })),
+        ...['om_first', 'om_second'].map((message_id, index) => ({ message_id,
+          upper_message_id: index === 0 ? 'om_left' : 'om_right', msg_type: msgType,
+          sender: { id: 'ou_sender', sender_type: 'user' },
+          body: { content: JSON.stringify(type === 'image' ? { image_key: 'shared_key' }
+            : { file_key: 'shared_key', file_name: index === 0 ? 'first.bin' : 'later.bin' }) },
+        })),
+      ],
+    });
+    mocks.request.mockImplementation(async request => {
+      if (request.url.includes(`/messages/${owner}/`)) return bytes;
+      throw mismatch();
+    });
+
+    const result = await downloadResources('cli_test', 'om_root', extraResources, 'ou_sender');
+
+    expect(result.attachments).toHaveLength(1);
+    expect(await readFile(result.attachments[0].path)).toEqual(bytes);
+    expect(result.needLogin).toBe(false);
+    expect(requestedMessages()).toEqual([
+      'om_root', 'om_first', 'om_left', 'om_shared', 'om_second', ...(owner === 'om_right' ? ['om_right'] : []),
+    ]);
+    expect(extraResources).toEqual([{ type, key: 'shared_key',
+      name: type === 'image' ? 'shared_key.jpg' : 'first.bin',
+      fallbackMessageIds: ['om_first', 'om_left', 'om_shared', 'om_second', 'om_right'],
+    }]);
+    expect(mocks.userToken).not.toHaveBeenCalled();
+  });
+
   it('keeps the parent download path when it already works', async () => {
     const { extraResources } = await forwardedResource();
     mocks.request.mockResolvedValue(bytes);
