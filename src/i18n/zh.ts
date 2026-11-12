@@ -1632,6 +1632,8 @@ export const messages: Record<string, string> = {
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
   'worker.remote_close_in_progress': '⏳ {backend} 远程会话正在关闭，请等待关闭结果后再发送消息。',
+  'worker.remote_close_late_cancel_restored': '✅ 已确认 {backend} 远端任务已停止。上一次关闭没有完成，会话已恢复，可以继续发消息；如仍要关闭，请再点「关闭会话」或发送 /close。',
+  'worker.remote_close_uncertain': '⚠️ 上一次关闭没能确认 {backend} 远端任务已停止，为免消息发给可能仍在运行的远端，本会话暂停接收消息。请再点一次「关闭会话」或发送 /close：确认远端已停止后会话会正常关闭；仍无法确认时会保持暂停并提示原因。',
   'worker.working_dir_missing_again': '⚠️ 工作目录 {path} 仍不存在，这条消息没有送达。请先用上方卡片重建 worktree 或换目录，再重发。',
   'worker.working_dir_missing_text': '⚠️ 会话的工作目录已不存在：{path}\n这条消息没有送达，CLI 也没有在其它目录运行。可以用 `/cd <路径>` 换到别的目录，或把该目录恢复后重发消息。',
   'worker.working_dir_missing_opening_text': '⚠️ 工作目录不存在：{path}\n这条消息还没有开始处理，CLI 也没有在其它目录运行。在本话题发送 `/repo <路径|项目名>` 选一个目录，消息会在那里开始。',
