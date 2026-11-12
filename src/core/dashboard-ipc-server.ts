@@ -9359,7 +9359,15 @@ ipcRoute('GET', '/api/groups/:chatId/members-display', requireBoundBot(async (_r
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   try {
     const members = await listChatMemberDisplays(cachedLarkAppId, p.chatId);
-    jsonRes(res, 200, { members });
+    // The list is this bot's viewpoint and includes the bot itself. Flag that
+    // row so pickers can keep it out of "grant to" choices: exact chat grants
+    // reject the receiver as its own subject (receiver_cannot_be_subject).
+    const selfOpenId = getBotOpenId(cachedLarkAppId);
+    jsonRes(res, 200, {
+      members: selfOpenId
+        ? members.map(member => (member.openId === selfOpenId ? { ...member, self: true } : member))
+        : members,
+    });
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
   }
