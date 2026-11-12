@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { pendingInputAllowsTypeAhead, pendingInputMayFlush, promoteInteractiveInputPastSchedules } from '../src/utils/pending-input-queue.js';
+import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 function harness(cliId = 'codex') {
@@ -43,7 +44,7 @@ function harness(cliId = 'codex') {
     shouldDeferUserFlush: () => false,
     refreshHookReviewInputHold: () => {},
     hookReviewHoldsQueuedWrite: () => false,
-    pendingInputMayFlush, pendingInputAllowsTypeAhead, promoteInteractiveInputPastSchedules,
+    pendingInputMayFlush, pendingInputAllowsTypeAhead, promoteInteractiveInputPastSchedules, programStatusBlockHoldsTypeAhead,
 
     rpcLifecycleFailClosedOwners: new Set(),
     probeStartupBlocker: () => false,
@@ -60,6 +61,7 @@ function harness(cliId = 'codex') {
   };
   scope.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', scope);
   scope.activeTurnBlocks = loadWorkerFunction('activeTurnBlocks', scope);
+  scope.programStatusBlockedHoldsTypeAhead = loadWorkerFunction('programStatusBlockedHoldsTypeAhead', scope);
   scope.promotePendingHumanInterruption = loadWorkerFunction('promotePendingHumanInterruption', scope);
   scope.flushPending = loadWorkerFunction('flushPending', scope);
   return scope;
@@ -174,6 +176,27 @@ describe('scheduled queue heads do not swallow human input', () => {
     await h.flushPending();
     expect(h.pendingMessages).toEqual(before);
     expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+  });
+
+  it('types nothing ahead while the CLI reports an approval block; a question block drains like no block', async () => {
+    // The live owner's message sits behind a scheduled head the active turn
+    // blocks, so flushPending would type it ahead into the running turn. An
+    // approval dialog on screen would take that text and its Enter as the
+    // answer; a question is answered by exactly that message.
+    const run = async (block: { kind?: string } | null) => {
+      const h = harness();
+      h.isPromptReady = false; // the turn that raised the dialog is running
+      h.cliAdapter = { programStatusBlockedHoldsInput: true };
+      h.idleDetector = { isStartupPending: () => false, programStatusBlock: () => block };
+      h.freshnessInputQueue = { takeNormal: vi.fn(() => { h.pendingMessages.shift(); return undefined; }) };
+      await h.flushPending();
+      return { taken: h.freshnessInputQueue.takeNormal.mock.calls.length, writes: h.beginCliWriteCycle.mock.calls.length };
+    };
+    const unblocked = await run(null);
+    expect(unblocked.taken).toBeGreaterThan(0);
+    expect(await run({ kind: 'permission' })).toEqual({ taken: 0, writes: 0 });
+    expect(await run({})).toEqual({ taken: 0, writes: 0 });
+    expect(await run({ kind: 'question' })).toEqual(unblocked);
   });
 
   it('drains the schedule first in FIFO order when no active turn blocks the head (CLI idle)', async () => {

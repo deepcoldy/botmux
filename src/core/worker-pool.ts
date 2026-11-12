@@ -67,9 +67,11 @@ import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js'
 import { config } from '../config.js';
 import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
+import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } from './retired-runtime-exit.js';
+import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
-import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-sweeper.js';
+import { reclaimIdleWorkersForAdmissionAfterTurnDrain, unsettledReplyHoldUntil } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -1647,6 +1649,18 @@ export function identityStorageModelForDaemonSession(ds: DaemonSession): Identit
   if (!report) return 'single';
   if (identityDecisionConflict(ds)) return 'single';
   return report.model;
+}
+
+/** Why the proven identity route refuses a session whose caller lineage is
+ *  already proven: which half of {@link identityStorageModelForDaemonSession}
+ *  kept it off `proven`. Undefined when the session IS proven. Reported to the
+ *  proven caller and to the daemon log so a refusal names the failing step
+ *  instead of looking like an authorization problem. */
+export type IdentityModelRefusalReason = 'identity_decision_missing' | 'identity_decision_conflict' | 'identity_model_single';
+export function identityModelRefusalReason(ds: DaemonSession): IdentityModelRefusalReason | undefined {
+  if (!ds.reportedIdentityModel) return 'identity_decision_missing';
+  if (identityDecisionConflict(ds)) return 'identity_decision_conflict';
+  return identityStorageModelForDaemonSession(ds) === 'proven' ? undefined : 'identity_model_single';
 }
 
 /** Whether an identity-decision report's turn may be replayed on a flip.
@@ -10017,6 +10031,7 @@ function noteAcceptedInputTurn(
         phase: unproven.phase === 'native-submit' ? 'native-submit' : phase,
         at: Date.now(),
       });
+      if (ds.latestAcceptedInputKey === unprovenKey) ds.latestAcceptedInputKey = key;
       return;
     }
   } else {
@@ -10035,6 +10050,7 @@ function noteAcceptedInputTurn(
   }
 
   const previous = turns.get(key);
+  if (!previous) ds.latestAcceptedInputKey = key;
   // A later queue-commit observation must never downgrade proven native submit.
   const nextPhase = previous?.phase === 'native-submit' ? 'native-submit' : phase;
   turns.delete(key);
@@ -10092,6 +10108,7 @@ function clearAcceptedInputTurns(ds: DaemonSession): void {
   ds.acceptedInputTurns = undefined;
   ds.settledInputTurns = undefined;
   ds.acceptedInputOverflow = undefined;
+  ds.latestAcceptedInputKey = undefined;
 }
 
 /** Does the CURRENT generation still own an accepted input with no terminal? */
@@ -10103,6 +10120,35 @@ export function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
     if (entry.workerGeneration === ds.workerGeneration) return true;
   }
   return false;
+}
+
+/** The input this generation accepted last, while its turn has no terminal
+ *  yet. Earlier unsettled inputs are not reported: a session runs one turn at
+ *  a time, so a turn that never reported its terminal is over once a later
+ *  input was accepted (hasUnsettledAcceptedInput keeps counting it). */
+export function latestUnsettledAcceptedInput(ds: DaemonSession): { turnId: string; at: number } | undefined {
+  const key = ds.latestAcceptedInputKey;
+  const entry = key === undefined ? undefined : ds.acceptedInputTurns?.get(key);
+  if (!entry || entry.workerGeneration !== ds.workerGeneration) return undefined;
+  return { turnId: entry.turnId, at: entry.at };
+}
+
+/** CLIs a worker of this daemon has reported a turn terminal for. A CLI whose
+ *  worker never reports one (no transcript bridge: the screen idle is its only
+ *  turn end) would otherwise leave every accepted input unsettled. */
+const turnTerminalReportingCliIds = new Set<string>();
+
+function workerCliId(ds: DaemonSession): string | undefined {
+  return ds.initConfig?.cliId ?? ds.session.cliId;
+}
+
+export function cliReportsTurnTerminals(ds: DaemonSession): boolean {
+  const cliId = workerCliId(ds);
+  return cliId !== undefined && turnTerminalReportingCliIds.has(cliId);
+}
+
+export function __testOnly_resetTurnTerminalReportingClis(): void {
+  turnTerminalReportingCliIds.clear();
 }
 
 /** Whether a direct keystroke command (e.g. `/model <value>`) may be injected
@@ -10272,6 +10318,18 @@ export function destroySuspendBackingVerified(
 let suspendBackingVerifier: (ds: DaemonSession) => boolean = destroySuspendBackingVerified;
 
 /** Unit-test seam; production never overrides the exact kill + post-probe path. */
+/** When a worker that ended itself after its runtime was retired last got a
+ *  successor started for the input it handed over (see the worker exit handler). */
+const retiredRuntimeSuccessorStartedAt = new WeakMap<DaemonSession, number>();
+const startRetiredRuntimeSuccessorDefault = (ds: DaemonSession): boolean => forkWorker(ds, '', { resume: true });
+let startRetiredRuntimeSuccessor = startRetiredRuntimeSuccessorDefault;
+
+export function __testOnly_setRetiredRuntimeSuccessorStarter(
+  starter?: (ds: DaemonSession) => boolean,
+): void {
+  startRetiredRuntimeSuccessor = starter ?? startRetiredRuntimeSuccessorDefault;
+}
+
 export function __testOnly_setSuspendBackingVerifier(
   verifier?: (ds: DaemonSession) => boolean,
 ): void {
@@ -10532,6 +10590,22 @@ function reconcileInstallChangeClaim(ds: DaemonSession): InstallClaimVerdict | u
   return verdict;
 }
 
+const pendingSuspendRetryTimers = new WeakMap<DaemonSession, { at: number; timer: ReturnType<typeof setTimeout> }>();
+
+/** Re-run a queued suspend's checkpoint once its reply hold has run out. */
+function retryPendingSuspendAt(ds: DaemonSession, at: number, ownsGeneration?: () => boolean): void {
+  const previous = pendingSuspendRetryTimers.get(ds);
+  if (previous?.at === at) return;
+  if (previous) clearTimeout(previous.timer);
+  else logger.info(`[${tag(ds)}] Queued suspend (${ds.pendingSuspendReason}) waits for the last reply to settle`);
+  const timer = setTimeout(() => {
+    if (pendingSuspendRetryTimers.get(ds)?.timer === timer) pendingSuspendRetryTimers.delete(ds);
+    runPendingSuspendIfSettled(ds, ownsGeneration);
+  }, Math.max(0, at - Date.now()) + 1);
+  timer.unref?.();
+  pendingSuspendRetryTimers.set(ds, { at, timer });
+}
+
 function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
@@ -10563,6 +10637,17 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // its way into the CLI; retiring the CLI now destroys it. The claim stays and
   // is cashed in once the worker reports that input taken.
   if (hasUnacceptedCliInput(ds)) return;
+  // The output side of the same rule, shared with the automatic reclaims: the
+  // turn that just ended may not have handed its answer over yet, or the
+  // daemon is still writing it to Lark. Suspending now drops that answer. The
+  // claim stays; the turn's terminal or the delivery's end re-runs this
+  // checkpoint, and a timer at the hold's bound makes sure it runs even if
+  // neither comes.
+  const replyHoldUntil = unsettledReplyHoldUntil(ds);
+  if (replyHoldUntil !== undefined) {
+    retryPendingSuspendAt(ds, replyHoldUntil, ownsGeneration);
+    return;
+  }
   if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
     // A TRAE reclaim carries an exact running-object claim; re-prove it right
     // before acting. A Pi `cli_install_changed` report has no claim and keeps
@@ -10589,6 +10674,8 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
   if (suspendWorker(ds, reason)) {
+    const retry = pendingSuspendRetryTimers.get(ds);
+    if (retry) { clearTimeout(retry.timer); pendingSuspendRetryTimers.delete(ds); }
     // suspendWorker already consumed the claim (goal state reached); logging
     // here keeps the "fulfilled by the deferred path" signal distinguishable
     // from a suspend that came from anywhere else.
@@ -10755,8 +10842,18 @@ export function sweepTraexInstallChanges(
 // still being delivered. The drain module notifies after each delivery settles;
 // re-run the settlement checkpoint only when such a claim is queued.
 onFinalOutputDeliverySettled(ds => {
-  if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+  if (ds.pendingSuspendReason !== undefined) runPendingSuspendIfSettled(ds);
+  requestLiveSessionCapAfterTurnSettled(ds);
 });
+
+/** The automatic reclaims hold an idle session while its last turn is not
+ *  settled (idle-worker-sweeper). Re-check the cap when such a turn settles,
+ *  instead of waiting for the next idle edge or the periodic backstop. */
+function requestLiveSessionCapAfterTurnSettled(ds: DaemonSession): void {
+  if (ds.lastScreenStatus !== 'idle' || !ds.worker || ds.worker.killed) return;
+  const enforce = callbacks?.enforceLiveSessionCap;
+  if (enforce) queueMicrotask(enforce);
+}
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -16228,6 +16325,21 @@ export function forkWorker(
   return true;
 }
 
+/** Turns a re-attached worker may treat as finished: only an ordinary-turn
+ *  recovery that settled `completed` proves its turn ended. `cancelled` means
+ *  only that auto-continuation was given up (Esc / Ctrl+C / a new message);
+ *  the CLI may still be running that turn. The worker's own opening turn is
+ *  never one of them. */
+function completedRecoveryTurnTerminals(
+  recovery: Session['ordinaryTurnRecovery'],
+  openingTurnId: string | undefined,
+): Array<{ turnId: string; status: 'completed' }> | undefined {
+  if (recovery?.status !== 'completed') return undefined;
+  const ids = [...new Set([recovery.logicalTurnId, recovery.currentTurnId])]
+    .filter((id): id is string => Boolean(id) && id !== openingTurnId);
+  return ids.length > 0 ? ids.map(turnId => ({ turnId, status: 'completed' as const })) : undefined;
+}
+
 function forkWorkerPrepared(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -17563,6 +17675,8 @@ function forkWorkerPrepared(
       sessionStore.updateSession(ds.session);
     }
   }
+  const settledTurnTerminals = completedRecoveryTurnTerminals(ds.session.ordinaryTurnRecovery, initMsg.turnId);
+  if (settledTurnTerminals) initMsg.settledTurnTerminals = settledTurnTerminals;
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
@@ -20128,6 +20242,20 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
+        const activeController = typeof sessionController !== 'undefined' ? sessionController : undefined;
+        const admittedExecution = activeController?.admittedExecution();
+        const openingExecution = msg.turnId && ds.initConfig?.turnId === msg.turnId ? ds.initConfig.sessionCommand?.execution : undefined;
+        const screenTurnProven = Boolean(msg.turnId) && (
+          !activeController
+          || (admittedExecution !== undefined
+            && admittedExecution.turnId === msg.turnId
+            && (msg.dispatchAttempt === undefined || admittedExecution.dispatchAttempt === msg.dispatchAttempt))
+          || (openingExecution !== undefined
+            && openingExecution.turnId === msg.turnId
+            && (msg.dispatchAttempt === undefined || openingExecution.dispatchAttempt === msg.dispatchAttempt)
+            && activeController.store.execution(activeController.ref, openingExecution.executionId)?.phase === 'queued')
+        );
+        const screenTurnId = screenTurnProven ? msg.turnId : undefined;
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         updateUsageLimitState(ds, msg.usageLimit);
@@ -20143,7 +20271,7 @@ function setupWorkerHandlers(
           const published = cb.onScreenStatus?.(ds, {
             prevStatus,
             status: ds.lastScreenStatus as ScreenStatus,
-            turnId: msg.turnId,
+            turnId: screenTurnId,
           });
           void Promise.resolve(published).catch((err: any) => {
             logger.debug(`[${t}] runtime status card bridge failed: ${err?.message ?? err}`);
@@ -20217,7 +20345,7 @@ function setupWorkerHandlers(
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
               if (ds.session.workflowNode && !ds.session.workflowNode.submittedAt) {
-                cb.onWorkflowNodeTurnSettled?.(ds, { ...(msg.turnId ? { turnId: msg.turnId } : {}), at: Date.now() });
+                cb.onWorkflowNodeTurnSettled?.(ds, { ...(screenTurnId ? { turnId: screenTurnId } : {}), at: Date.now() });
               }
             }
           }
@@ -20236,26 +20364,26 @@ function setupWorkerHandlers(
         // Never borrow a shared session's current/queued turn.
         // Notify once per idle episode, including a first frame already at idle,
         // so repeated snapshots cannot keep resetting the settlement debounce.
-        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId)
-          ?? (msg.turnId && scheduledSessionRun(ds.session, msg.turnId) ? msg.turnId : undefined);
-        if (msg.turnId && msg.turnId === ds.deferredScheduleUnconfirmedTurnId) {
+        const deferredTurnId = resolveDeferredScheduledTurnId(ds, screenTurnId)
+          ?? (screenTurnId && scheduledSessionRun(ds.session, screenTurnId) ? screenTurnId : undefined);
+        if (screenTurnId && screenTurnId === ds.deferredScheduleUnconfirmedTurnId) {
           ds.deferredScheduleUnconfirmedTurnId = undefined;
         }
         if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnIds.clear();
         if (ds.lastScreenStatus === 'idle' && deferredTurnId
           && !deferredScheduleIdleTurnIds.has(deferredTurnId)
-          && (msg.turnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
+          && (screenTurnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
           deferredScheduleIdleTurnIds.add(deferredTurnId);
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
 
-        if (msg.turnId && prevStatus !== ds.lastScreenStatus && replyCardModeFor(ds, msg.turnId) !== 'legacy'
+        if (screenTurnId && prevStatus !== ds.lastScreenStatus && replyCardModeFor(ds, screenTurnId) !== 'legacy'
           && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'stalled')) {
-          void updateTurnReplyCard(ds, msg.turnId,
+          void updateTurnReplyCard(ds, screenTurnId,
             { kind: 'phase', phase: ds.lastScreenStatus === 'stalled' ? 'waiting' : 'working' },
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, screenTurnId, { uuid, beforeWrite }),
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
@@ -20294,7 +20422,7 @@ function setupWorkerHandlers(
           );
           const ownerOpenId = ds.session.ownerOpenId;
           const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
-          scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
+          scopedReply(notifyText, 'text', screenTurnId).catch((err: any) => {
             logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
           });
         }
@@ -20315,7 +20443,7 @@ function setupWorkerHandlers(
           && quotaFallback.kinds.includes(ds.usageLimit.kind)
         ) {
           const limitKey = usageLimitStateKey(ds.usageLimit);
-          const fallbackTurn = fallbackTurnId(ds, msg.turnId);
+          const fallbackTurn = fallbackTurnId(ds, screenTurnId);
           if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
             logger.info(
               `[${t}] Quota fallback deduplicated within five minutes `
@@ -20466,7 +20594,7 @@ function setupWorkerHandlers(
             ownsFreshScreenPost()
             && remoteRetirementAdmissionPhase(ds) === null
             && retainsLarkStreamingCardTransport(ds);
-          const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
+          const cardReplyTarget = captureStreamingCardReplyTarget(ds, screenTurnId);
           if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) break;
           const screenPost = scopedReplyTo(
             postingDisplayAnchor,
@@ -21960,6 +22088,9 @@ function setupWorkerHandlers(
         // accepted-input guard for it, and only for the exact attempt it names:
         // a late terminal from an older attempt must not release a newer one.
         settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
+        const terminalCliId = workerCliId(ds);
+        if (terminalCliId !== undefined) turnTerminalReportingCliIds.add(terminalCliId);
+        requestLiveSessionCapAfterTurnSettled(ds);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,
@@ -22650,6 +22781,10 @@ function setupWorkerHandlers(
           releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
         }
         collectSessionTurnGarbage(ds);
+        // A suspend queued for this turn may have been held for its terminal.
+        // Only now, after the terminal's own card and receipt work has run and
+        // registered its deliveries (which the hold then waits for).
+        if (ds.pendingSuspendReason !== undefined) runPendingSuspendIfSettled(ds, ownsWorkerSession);
         break;
       }
 
@@ -23163,9 +23298,11 @@ function setupWorkerHandlers(
       } catch (error) { logger.warn(`[${t}] Recovered output origin unproven: ${String(error)}`); return; }
     }
     // Losing the current worker's turn origin leaves --as user and actor
-    // current without a requesting user, so it must be visible in production.
+    // current without a requesting user, and losing its identity decision
+    // leaves every proven identity wrapper refused (exit 77), so both must be
+    // visible in production.
     const logRejected = (reason: string) => {
-      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked') && ds.worker === worker) {
+      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision') && ds.worker === worker) {
         logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
@@ -23226,8 +23363,13 @@ function setupWorkerHandlers(
       ? taskContinuationWorkerExitRecovery(ds, workerGeneration)
       : undefined;
     const preReadyExit = !startupState.ready;
+    // The worker ended itself because this daemon retired its live runtime and
+    // no lifecycle operation took it over: as deliberate as a suspend, and it
+    // handed its unwritten inputs to the next worker the same way.
+    const retiredRuntimeExit = code === WORKER_EXIT_RUNTIME_RETIRED;
+    const deliberateRetirement = lifecycleRetirement || retiredRuntimeExit;
     const suppressDeliveryFailure = transferRetirement
-      || lifecycleRetirement
+      || deliberateRetirement
       || worker.killed
       || ds.session.status === 'closed';
     const ordinaryImTurnIds = ordinaryImTurnIdsForWorker(worker);
@@ -23242,16 +23384,19 @@ function setupWorkerHandlers(
       // A deliberate retirement suppresses the misleading crash/ambiguity
       // notices, but a tracked turn that never committed still owes the user
       // a terminal outcome: it will never run and nothing redelivers it.
-      retiredBeforeCommit: lifecycleRetirement
+      retiredBeforeCommit: deliberateRetirement
         && !transferRetirement
         && ds.session.status !== 'closed',
     });
     settleWorkerCliInputBacklog(ds, worker, {
-      notify: lifecycleRetirement
+      notify: deliberateRetirement
         && !transferRetirement
         && ds.session.status !== 'closed',
       ownedByDeliveryTracker: ordinaryImTurnIds,
     });
+    if (retiredRuntimeExit) {
+      logger.warn(`[${t}] Worker ended its generation after its runtime was retired; the next message starts a successor`);
+    }
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);
     logger.info(`[${t}] Worker process exited (code: ${code})`);
@@ -23454,6 +23599,34 @@ function setupWorkerHandlers(
         void Promise.resolve(workerExitReconciled).then(
           resumeAfterReconcile,
           resumeAfterReconcile,
+        );
+      }
+      if (retiredRuntimeExit) {
+        // What the retired worker handed over waits in the journal for the next
+        // worker. Start it now rather than whenever another message arrives.
+        const startSuccessorAfterReconcile = (): void => {
+          if (ds.session.status !== 'active'
+            || (ds.worker && !ds.worker.killed)
+            || (activeSessionsRegistry && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds)
+            || controllerForSession(ds)?.acceptsUserInput() === false
+            || isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)
+            || !hasUnsentInputs(unsentInputJournalFile(config.session.dataDir, ds.session.sessionId))) return;
+          const lastStartAtMs = retiredRuntimeSuccessorStartedAt.get(ds);
+          if (lastStartAtMs !== undefined && Date.now() - lastStartAtMs < RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS) {
+            logger.warn(`[${t}] Handed-over input waits for the next message: a successor was already started ${Math.round((Date.now() - lastStartAtMs) / 1000)}s ago`);
+            return;
+          }
+          retiredRuntimeSuccessorStartedAt.set(ds, Date.now());
+          logger.info(`[${t}] Starting a successor worker for the input the retired worker handed over`);
+          try {
+            startRetiredRuntimeSuccessor(ds);
+          } catch (err) {
+            logger.error(`[${t}] Successor worker for handed-over input failed to start: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        };
+        void Promise.resolve(workerExitReconciled).then(
+          startSuccessorAfterReconcile,
+          startSuccessorAfterReconcile,
         );
       }
     } else {
@@ -25583,6 +25756,8 @@ export function forkAdoptWorker(
     // way out of date if the user has /clear'd since).
     adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
+  const settledTurnTerminals = completedRecoveryTurnTerminals(ds.session.ordinaryTurnRecovery, opts?.turnId);
+  if (settledTurnTerminals) initMsg.settledTurnTerminals = settledTurnTerminals;
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
