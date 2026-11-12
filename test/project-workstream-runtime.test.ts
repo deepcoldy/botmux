@@ -561,4 +561,40 @@ describe('project workstream runtime report freshness', () => {
     expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
     expect(lookups).toBe(2);
   });
+
+  it('rejects a report when the worker generation is replaced and fully recovers mid-validation', async () => {
+    const f = importedFixture();
+    const live = mocks.live.get(SOURCE_ID);
+    live.workerGeneration = 1;
+    live.cliReady = false;
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      if (lookups === 2) {
+        // forkWorker reserves a new generation and the replacement worker comes
+        // fully online before the final gate: liveness alone cannot tell the
+        // generations apart, so the generation snapshot must reject the report.
+        live.workerGeneration = 2;
+        live.worker = { killed: false };
+        live.workerReady = true;
+      }
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(2);
+  });
+
+  it('rejects a report when the source session is marked for cold resume even with a live worker', async () => {
+    const f = importedFixture();
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      if (lookups === 2) mocks.live.get(SOURCE_ID).session.suspendedColdResume = true;
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(2);
+  });
 });
