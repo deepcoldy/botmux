@@ -249,8 +249,16 @@ export class SessionController {
     if (active.kind !== 'current' && active.kind !== 'worker') return false;
     const state = this.store.read(this.ref)!;
     const runtime = active.context.scope.runtime;
+    const execution = active.context.scope.execution;
+    const attempt = execution ? this.store.execution(this.ref, execution.executionId) : undefined;
+    const continuedRuntime = !!runtime && !!state.activeRuntime
+      && this.store.runtimeContinues(this.ref, runtime, state.activeRuntime, active.context.producer)
+      && (!execution || (!!attempt && sameExecution(attempt.ref, execution) && (!attempt.runtime
+        || (this.store.runtimeContinues(this.ref, runtime, attempt.runtime, active.context.producer)
+          && this.store.runtimeContinues(this.ref, attempt.runtime, state.activeRuntime, active.context.producer)))));
     return sameWorker(state.worker, active.context.producer) && (!runtime || sameRuntime(state.activeRuntime, runtime)
-      || this.store.continuedExecution(this.ref, runtime, active.context.producer, active.context.scope.execution)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
+      || continuedRuntime
+      || this.store.continuedExecution(this.ref, runtime, active.context.producer, execution)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
   }
   run<T>(admission: SessionEventAdmission, work: () => T): T { return eventScope.run(admission, work); }
   admittedExecution(): ExecutionRef | undefined {

@@ -6269,14 +6269,17 @@ async function postTurnStartingStatusCard(
   const stillOwnsPost = (): boolean =>
     ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null && !handoffCardClosed(ds, turnId);
   const restorePrePostIdentityForRetirement = (): boolean => {
-    if (remoteRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    if (!ownsPostIdentity()) return false;
     ds.streamCardId = previousCardId;
     ds.streamCardNonce = previousNonce;
     ds.streamCardReplyTargetKey = previousReplyTargetKey;
     persistStreamCardState(ds);
     return true;
   };
-  if (!stillOwnsPost()) return false;
+  if (!stillOwnsPost()) {
+    restorePrePostIdentityForRetirement();
+    return false;
+  }
   try {
     const messageId = await sessionReply(
       displayAnchorAtPost, cardJson, 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
@@ -6421,7 +6424,7 @@ export async function postFreshStreamingCard(
     && ds.streamCardNonce === postingNonce
     && activeSessionsRegistry?.get(runtimeKeyAtPost) === ds;
   const restorePrePostIdentityForRetirement = (): boolean => {
-    if (remoteRetirementAdmissionPhase(ds) === null || !ownsPost()) return false;
+    if (!ownsPost()) return false;
     ds.streamCardId = prevCardId;
     ds.streamCardNonce = prevNonce;
     ds.streamCardReplyTargetKey = prevReplyTargetKey;
@@ -6433,7 +6436,10 @@ export async function postFreshStreamingCard(
     ownsPost()
     && remoteRetirementAdmissionPhase(ds) === null
     && retainsLarkStreamingCardTransport(ds);
-  if (!stillOwnsPost()) return false;
+  if (!stillOwnsPost()) {
+    restorePrePostIdentityForRetirement();
+    return false;
+  }
   try {
     const messageId = await sessionReply(
       displayAnchorAtPost, cardJson, 'interactive', appIdAtPost, cardReplyTarget.turnId,
@@ -20251,6 +20257,7 @@ function setupWorkerHandlers(
         const postingAppId = ds.larkAppId;
         const postingDisplayAnchor = sessionAnchorId(ds);
         const postingRuntimeKey = activeSessionKey(ds);
+        const previousReadyNonce = ds.streamCardNonce;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         let ownsFreshReadyPost = (): boolean => false;
         let restoreFreshReadyPrePostIdentityForRetirement = (): boolean => false;
@@ -20269,8 +20276,9 @@ function setupWorkerHandlers(
             && ds.streamCardNonce === postingNonce
             && activeSessionsRegistry?.get(postingRuntimeKey) === ds;
           restoreFreshReadyPrePostIdentityForRetirement = (): boolean => {
-            if (remoteRetirementAdmissionPhase(ds) === null || !ownsFreshReadyPost()) return false;
+            if (!ownsFreshReadyPost()) return false;
             ds.streamCardId = undefined;
+            ds.streamCardNonce = previousReadyNonce;
             persistStreamCardState(ds);
             return true;
           };
@@ -20316,7 +20324,10 @@ function setupWorkerHandlers(
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
           );
-          if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
+          if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
+            restoreFreshReadyPrePostIdentityForRetirement();
+            break;
+          }
           const readyPost = scopedReplyTo(
             postingDisplayAnchor,
             postingAppId,
@@ -21231,7 +21242,7 @@ function setupWorkerHandlers(
             && ds.streamCardNonce === postingNonce
             && activeSessionsRegistry?.get(postingRuntimeKey) === ds;
           const restoreFreshScreenPrePostIdentityForRetirement = (): boolean => {
-            if (remoteRetirementAdmissionPhase(ds) === null || !ownsFreshScreenPost()) return false;
+            if (!ownsFreshScreenPost()) return false;
             ds.streamCardId = undefined;
             persistStreamCardState(ds);
             return true;
@@ -21241,7 +21252,10 @@ function setupWorkerHandlers(
             && remoteRetirementAdmissionPhase(ds) === null
             && retainsLarkStreamingCardTransport(ds);
           const cardReplyTarget = captureStreamingCardReplyTarget(ds, screenTurnId);
-          if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) break;
+          if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) {
+            restoreFreshScreenPrePostIdentityForRetirement();
+            break;
+          }
           const screenPost = scopedReplyTo(
             postingDisplayAnchor,
             postingAppId,
