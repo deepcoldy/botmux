@@ -47,7 +47,8 @@ const SIX_LEVEL_MODELS = new Set([
   'gpt-5.6-sol', 'gpt-5.6-terra',
 ]);
 const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
-const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
+// Grok's model catalog advertises xhigh for both 4.7 variants too.
+const GROK_XHIGH_MODELS = new Set(['grok-4.6', 'grok-4.7', 'grok-4.7-build-fast']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
   ['gpt-6-astra', CODEX_COMMON_REASONING_EFFORTS],
   ['gpt-6.1-sol', CODEX_COMMON_REASONING_EFFORTS],
