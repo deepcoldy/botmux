@@ -409,7 +409,7 @@ import {
 import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import { BridgeBlindTurnWatch, blindTurnNeedsNotice, type BridgeReadPosition } from './services/claude-bridge-blind-turn.js';
-import { terminalInputSubmits } from './adapters/cli/tui-input.js';
+import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -434,7 +434,9 @@ import {
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
-import { bridgeCodexUserInput } from './services/codex-user-input.js';
+import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
+import { TraexQuestionBridge } from './core/traex-question-bridge.js';
+import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
@@ -564,7 +566,7 @@ import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
-import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -4304,6 +4306,9 @@ function adapterRendersCodexFamilyStuckPages(): boolean {
  *  menu as well); every other CLI keeps the hook-review-only hold it always
  *  had. */
 function hookReviewHoldBlocks(snapshot: string): boolean {
+  // TraeX terminal sessions also hold on TRAE's native question page (see
+  // traexQuestionHoldBlocks); its answer goes through the question card.
+  if (traexQuestionHoldBlocks(snapshot)) return true;
   const family = cliAdapter?.stuckPageFamily;
   return family
     ? shouldHoldInputForStuckPage(snapshot, family)
@@ -4501,6 +4506,7 @@ function refreshHookReviewInputHold(snapshot: string, opts: { settled?: boolean 
   if (!snapshot.trim()) return;
   const blocked = hookReviewHoldBlocks(snapshot);
   if (blocked) hookReviewInputHoldSnapshot = snapshot;
+  if (blocked && traexQuestionBridgeActive()) traexQuestionBridge.kick();
   if (blocked === hookReviewInputHold) return;
   if (!blocked && cliAdapter?.stuckPageFamily && !opts.settled) {
     scheduleHookReviewReleaseProbe();
@@ -4519,6 +4525,8 @@ function refreshHookReviewInputHold(snapshot: string, opts: { settled?: boolean 
   hookReviewInputHoldSnapshot = '';
   log('Blocking page cleared — releasing queued input');
   kimiCacheExpiry?.menuGone();
+  // A question that left the screen may be carded again if asked again.
+  if (traexQuestionBridgeActive()) traexQuestionBridge.kick();
   if (hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
 }
 
@@ -4556,6 +4564,10 @@ function heldStuckPage(freshScreen?: string): { pageType: StuckPageType; snapsho
 function notifyHookReviewInputHold(freshScreen?: string): void {
   if (hookReviewInputHoldNotified) return;
   hookReviewInputHoldNotified = true;
+  if (traexQuestionHoldsHeldInput(freshScreen)) {
+    notifyTraexQuestionInputHeld();
+    return;
+  }
   const held = heldStuckPage(freshScreen);
   if (held && kimiCacheExpiry && isKimiCacheExpiryPage(held.pageType)) {
     // The menu event decides: press "Compact and continue" for a session that
@@ -17617,6 +17629,215 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
   }
 }
 
+// ─── TraeX native question page (core/traex-question-bridge.ts) ─────────────
+
+/** The TraeX terminal path: TRAE draws its own AskUserQuestion page in this
+ *  session's terminal. The RPC path (an engine or its `--remote` viewer)
+ *  bridges the same tool through onRequestUserInput instead, and adopted panes
+ *  keep their own behaviour. Only an authoritative local screen may drive it. */
+function traexQuestionBridgeActive(): boolean {
+  return cliAdapter?.nativeQuestionPage === 'traex'
+    && !!backend && !remoteWsUrl && !codexRpcEngine
+    && lastInitConfig?.adoptMode !== true
+    && !(lastInitConfig && isRemoteBackendType(lastInitConfig.backendType))
+    && backendScreenEvidenceIsAuthoritativeForMutation();
+}
+
+/** OSC 7501 (traecli 0.214.1+) reports the turn waiting on a question. It
+ *  arrives in the same burst as the page, ahead of the renderer: it holds
+ *  input until the page itself is on screen to be read. */
+function traexQuestionBlockReported(): boolean {
+  return idleDetector?.programStatusBlock()?.kind === 'question';
+}
+
+/** Input must stay off the question flow (see hookReviewHoldBlocks): typed
+ *  or pasted text lands in the page's notes field and its Enter submits the
+ *  highlighted option. */
+function traexQuestionHoldBlocks(snapshot: string): boolean {
+  if (!traexQuestionBridgeActive()) return false;
+  return traexQuestionBlockReported() || traexQuestionFlowVisible(snapshot);
+}
+
+/** The held input waits behind the question flow (rather than a hook page). */
+function traexQuestionHoldsHeldInput(freshScreen?: string): boolean {
+  if (!traexQuestionBridgeActive()) return false;
+  if (traexQuestionBlockReported()) return true;
+  let rendered = '';
+  try { rendered = renderer?.rawSnapshot() ?? ''; } catch { rendered = ''; }
+  return [freshScreen, rendered, lastAnalyzerSnapshot, hookReviewInputHoldSnapshot]
+    .some(screen => !!screen && traexQuestionFlowVisible(screen));
+}
+
+/** One notice per hold: answer on the card (a plain reply in the thread is
+ *  taken as the card's custom answer by the daemon while the card is out). */
+function notifyTraexQuestionInputHeld(): void {
+  const { turnId, dispatchAttempt } = heldInputTurnIdentity();
+  log('Holding queued input behind the TraeX question page');
+  send({
+    type: 'user_notify',
+    turnId,
+    dispatchAttempt,
+    message: t('worker.traex_question.input_held', { cliName: cliName() }),
+  });
+  traexQuestionBridge.kick();
+}
+
+/** Screen-idle veto: the question page replaced the composer and the agent
+ *  waits for its answer — a quiet screen there is not a finished turn (CLIs
+ *  without OSC 7501, or before its first busy report). The turn ends from
+ *  the CLI's own terminal once the question is answered. */
+function traexQuestionHoldsIdle(source: string, be: SessionBackend | null | undefined): boolean {
+  if (!be || backend !== be || !traexQuestionBridgeActive()) return false;
+  let screen = '';
+  try { screen = captureBackendScreen(be); } catch { screen = ''; }
+  const onScreen = screen.trim()
+    ? traexQuestionFlowVisible(screen)
+    // No capture: fail closed while the hold still stands on the page.
+    : hookReviewInputHold && traexQuestionFlowVisible(hookReviewInputHoldSnapshot);
+  if (!onScreen) return false;
+  if (!hookReviewInputHold) log(`${source}: TraeX question page owns the input surface; not marking the prompt ready`);
+  if (screen.trim()) refreshHookReviewInputHold(screen, { settled: true });
+  idleDetector?.reset();
+  traexQuestionBridge.kick();
+  return true;
+}
+
+/** Fresh, exact screen of the current CLI for the question bridge (the card
+ *  reads option labels from their columns). tmux captures the pane; a plain
+ *  PTY backend's screen is the worker's renderer (it parses every byte of the
+ *  stream), drained first so it holds all bytes received, read without the
+ *  display cleanup that collapses those columns. */
+async function traexQuestionCapture(): Promise<string | undefined> {
+  const be = backend;
+  const lifetime = cliLifetimeNonce;
+  if (!be || cliRestartInProgress) return undefined;
+  let screen: string | undefined;
+  try {
+    if (be.captureViewportAsync) screen = await be.captureViewportAsync();
+    else if (be.captureViewport || be.captureCurrentScreen) screen = captureBackendScreen(be);
+    else if (renderer) {
+      const target = renderer;
+      await target.writeAndFlush('');
+      if (renderer !== target) return undefined;
+      screen = target.rawSnapshot({ preserveFormatting: true });
+    }
+  } catch {
+    return undefined;
+  }
+  if (backend !== be || cliLifetimeNonce !== lifetime || cliRestartInProgress) return undefined;
+  return screen?.trim() ? screen : undefined;
+}
+
+/** How long a typed-ahead message whose Enter the question page pre-empted
+ *  waits in the composer for the page to go before it is given up on. */
+const TRAEX_QUESTION_DRAFT_WAIT_MS = 60 * 60_000;
+const TRAEX_QUESTION_DRAFT_POLL_MS = 500;
+/** A message's paste sits in TRAE's composer waiting for the question page to
+ *  go: nothing else may be typed there until its Enter (a raw passthrough line
+ *  would be glued onto it). Cleared when the write returns. */
+let traexQuestionDraftWaiting = false;
+
+/** WriteInputContext.submitGuard for TraeX terminal sessions: right before a
+ *  message's Enter, has TRAE's question page taken the input surface (OSC
+ *  report, or the page on a fresh screen)? Then the Enter would answer it.
+ *  Bound to the CLI the write started on; the sender is told once when the
+ *  pasted message has to wait for the question. */
+function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>): SubmitGuard {
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  let toldWaiting = false;
+  const current = () => backend === target && cliSpawnGeneration === generation && !cliRestartInProgress;
+  return {
+    maxWaitMs: TRAEX_QUESTION_DRAFT_WAIT_MS,
+    pollMs: TRAEX_QUESTION_DRAFT_POLL_MS,
+    current,
+    blocked: async phase => {
+      if (!current() || !traexQuestionBridgeActive()) {
+        traexQuestionDraftWaiting = false;
+        return undefined;
+      }
+      let blocked = traexQuestionBlockReported();
+      if (!blocked) {
+        const screen = await traexQuestionCapture();
+        blocked = !!screen && traexQuestionFlowVisible(screen);
+      }
+      if (phase === 'draft') traexQuestionDraftWaiting = !!blocked;
+      if (!blocked) return undefined;
+      if (phase === 'draft' && !toldWaiting) {
+        toldWaiting = true;
+        log('TraeX question page appeared before a message\'s Enter; the message waits in the composer');
+        send({
+          type: 'user_notify',
+          turnId: item.turnId ?? currentBotmuxTurnId,
+          dispatchAttempt: item.dispatchAttempt,
+          message: t('worker.traex_question.draft_waiting', { cliName: cliName() }),
+        });
+        traexQuestionBridge.kick();
+      }
+      return t('worker.traex_question.submit_blocked', { cliName: cliName() });
+    },
+  };
+}
+
+/** One answer input into the current CLI, serialized with other terminal
+ *  writes; false when the backend changed or refused it. */
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void): Promise<boolean> {
+  const target = backend;
+  if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
+  try {
+    return await runAfterAmbiguousSubmissionWrites(
+      target,
+      () => backend === target && write(adapterInputHandle(target)) !== false,
+    );
+  } catch (err: any) {
+    log(`TraeX question answer write failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+const traexQuestionBridge = new TraexQuestionBridge({
+  now: () => Date.now(),
+  setTimer: (fn, ms) => {
+    const handle = setTimeout(fn, ms);
+    handle.unref?.();
+    return handle;
+  },
+  clearTimer: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  enabled: () => traexQuestionBridgeActive() && !cliRestartInProgress,
+  lifetime: () => cliLifetimeNonce,
+  capture: traexQuestionCapture,
+  // The same daemon ask broker (and card) as the RPC path's native questions.
+  ask: (question, signal) => {
+    const cfg = lastInitConfig;
+    if (!cfg) return Promise.reject(new Error('session not initialised'));
+    return postCodexAsk({
+      sessionId: cfg.sessionId,
+      larkAppId: cfg.larkAppId,
+      chatId: cfg.chatId,
+      rootMessageId: cfg.rootMessageId,
+      originTurnId: currentBotmuxTurnId,
+      originDispatchAttempt: currentBotmuxDispatchAttempt,
+    }, [question], signal);
+  },
+  writeKey: key => traexQuestionWrite(target => {
+    if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
+    target.write(KEY_TO_ANSI[key] ?? key);
+    return true;
+  }),
+  paste: text => traexQuestionWrite(target => {
+    if (target.pasteText) target.pasteText(text);
+    else target.write(wrapBracketedPaste(text));
+    return true;
+  }),
+  notify: (key, params) => send({
+    type: 'user_notify',
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    message: t(key, { cliName: cliName(), ...params }),
+  }),
+  log,
+});
+
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
@@ -19685,6 +19906,9 @@ function onPtyData(data: string, isLiveStream = true): void {
         // accepted status report is the evidence the CLI took the handshake.
         log(`[program-status] status received (state=${part.event.state}); authority engaged`);
       }
+      // TRAE reports its question page as it draws it: look at the screen
+      // once the renderer has the page.
+      if (traexQuestionBlockReported() && traexQuestionBridgeActive()) traexQuestionBridge.kick();
     } else if (part.type === 'data') {
       handlePtyDataChunk(part.text);
     }
@@ -22095,6 +22319,12 @@ async function flushPending(): Promise<void> {
       // The entry check protects a new drain. These checks protect subsequent
       // items when a terminal or late receipt arrives during awaited writes.
       if (currentInputDeliveryQuarantine()) break;
+      // TRAE's question page can come up while an earlier item of this drain
+      // still awaits its receipt: the next item must not be pasted into it.
+      if (traexQuestionBridgeActive() && hookReviewHoldsQueuedWrite()) {
+        keepPromptReadyAfterHold();
+        break;
+      }
       if (cliAdapter.postTerminalPromptFence === true) {
         const target: SessionBackend = backend;
         const generation = cliSpawnGeneration;
@@ -22603,11 +22833,12 @@ async function flushPending(): Promise<void> {
                   ? { correlateTranscript: true as const } : {}),
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+                ...(traexQuestionBridgeActive() ? { submitGuard: traexQuestionSubmitGuard(item) } : {}),
               },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
-          );
+          ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
         }
@@ -23198,6 +23429,9 @@ function sendToPty(
       scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
     }
   }
+  // Queued behind a message that waits in the composer for TRAE's question
+  // page: no drain looks at the hold until that write returns.
+  if (traexQuestionDraftWaiting && hookReviewInputHold) notifyHookReviewInputHold();
   return true;
 }
 
@@ -23335,6 +23569,13 @@ function startScreenUpdates(): void {
         return { content, changed };
       }, projectedRuntimeScreenStatus);
       if (!snapshot) return;
+      // TRAE's question page sits still once drawn: the tick's screen catches
+      // one the per-chunk hold check missed (its card is raised from a fresh
+      // capture, see core/traex-question-bridge.ts).
+      if (traexQuestionBridgeActive()
+        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen))) {
+        traexQuestionBridge.kick();
+      }
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
@@ -23848,6 +24089,10 @@ function cliProcessAliveProbe(be: SessionBackend): () => boolean | undefined {
   return () => cliProcessAliveFromBackend(be);
 }
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
+  if (traexQuestionHoldsIdle(source, be)) {
+    scheduleBusyPatternIdleProbe(source);
+    return true;
+  }
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
@@ -23901,6 +24146,7 @@ function probeBusyPatternIdle(
   be: SessionBackend,
   opts: { requireReadyPattern?: boolean } = {},
 ): boolean {
+  if (traexQuestionHoldsIdle(source, be)) return false;
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
@@ -26223,6 +26469,7 @@ async function spawnCliBody(
   hookReviewInputHoldNotified = false;
   hookReviewInputHoldSnapshot = '';
   cancelHookReviewReleaseProbe();
+  traexQuestionBridge.reset('CLI respawned');
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 0 (adapter capability): adapters whose buildArgs can only resume a
@@ -30012,6 +30259,9 @@ async function spawnCliBody(
       if (evidenceSource === 'screen' && await codexModelMigrationHoldsIdleInput(idleBackend)) return;
       // Nor is Kimi's cache-expiry menu, which may be parking a written turn.
       if (evidenceSource === 'screen' && kimiCacheExpiryHoldsIdle(idleBackend)) return;
+      // Nor is TRAE's question page: the agent waits for the card's answer.
+      // Any evidence source — a re-driven prompt edge arrives as `external`.
+      if (traexQuestionHoldsIdle(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       // xterm-headless parses renderer.write() asynchronously. A transcript
       // terminal can arrive in the same tick as the TUI's busy redraw; drain
       // queued render bytes before the post-terminal composer fence inspects
@@ -30857,6 +31107,8 @@ function killCli(opts: {
   clearPostHookEvidenceFallback();
   stopStuckDetector();
   tuiPromptBlocking = false;
+  traexQuestionBridge.reset('CLI stopped');
+  traexQuestionDraftWaiting = false;
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -36212,7 +36464,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || startupInputGateHolds
         || (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
           && isFlushing)
-        || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
+        || hookReviewInputHold || traexQuestionDraftWaiting || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
           // Card / notice only when the admission screen itself shows the

@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.214.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Use /skills to list available skills.
+
+
+▍ ask me
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Question 1/3 (3 unanswered)
+  Which database should the new service use?
+
+  ❯ 1. PostgreSQL (Recommended)  Mature, strong consistency
+    2. MySQL                     Widely deployed
+    3. None of the above         Optionally, add details in notes (tab).
+
+  tab add notes  |  enter submit answer  |  ←/→ navigate questions  |  esc interrupt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
