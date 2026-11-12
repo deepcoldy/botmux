@@ -19,6 +19,7 @@ import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 import { RUNTIME_RESERVATION_DEADLINE_MS, RuntimeReservationExpiredError } from '../src/services/runtime-reservation.js';
 import { prepareCodexAppDispatch, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
+import { publishCliSessionIdToDaemon } from '../src/core/cli-session-id-publisher.js';
 import { createManagedAskControl, managedAskOriginKey } from '../src/core/managed-ask-control.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
@@ -37,6 +38,38 @@ function fixture() {
   controller.bindRuntime('binding-old', worker, { backend: 'tmux', physicalId: '111:start1', nativeSessionId: 'native1', proof: 'process_start' });
   const context = (sequence: number, scope: any = { runtime }) => ({ version: 2 as const, session: ref, producer: worker, eventId: `${worker.workerId}:${sequence}`, sequence, scope });
   return { data, appId, ref, store, ds, controller, worker, runtime, context };
+}
+function nativeSessionHandler(s: ReturnType<typeof fixture>, cliId = 'codex-app') {
+  const worker: any = { send: vi.fn() }; s.ds.worker = worker;
+  const persisted: unknown[] = [];
+  const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+    logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => cliId,
+    isLocalCliOpenReady: () => false, managedAuxUiSuppressed: () => true,
+    isSharedAdoptSession: () => false, recordOwnershipForDaemonSession: vi.fn(),
+    noteProjectAssociationChanged: vi.fn(),
+    sessionStore: { updateSession: (session: unknown) => persisted.push(structuredClone(session)) },
+  };
+  env.handleLegacyWorkerMessage = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleLegacyWorkerMessage', env);
+  const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+  return { handle, persisted };
+}
+/** The worker's real send chain (identity publication, native ID observation,
+ * metadata) for a CLI whose wired PID is `backend.cliPid`. */
+function nativeSessionWorker(scope: WorkerSessionEventScope, cliPid = 111) {
+  const wires: WorkerToDaemon[] = [];
+  const env: any = { workerSessionEventScope: scope, backend: { cliPid }, codexRpcEngine: null,
+    effectiveBackendType: 'tmux', readProcessStartIdentity: (pid: number) => `start${pid}`,
+    lastInitConfig: { cliId: 'cursor' }, cliAdapter: {}, publishedCliInputBacklog: undefined,
+    closeRequested: false, workerIpcPayload: (message: WorkerToDaemon) => message,
+    process: { send: (message: WorkerToDaemon) => wires.push(message) }, isWorkflowWorker: () => false,
+  };
+  env.runtimeIdentityForContract = loadWorkerFunction('runtimeIdentityForContract', env);
+  env.publishRuntimeContract = loadWorkerFunction('publishRuntimeContract', env);
+  env.refreshActiveRuntimeContract = loadWorkerFunction('refreshActiveRuntimeContract', env);
+  env.observeContractNativeSession = loadWorkerFunction('observeContractNativeSession', env);
+  env.sessionEventMetadata = loadWorkerFunction('sessionEventMetadata', env);
+  env.send = loadWorkerFunction('send', env);
+  return { env, wires };
 }
 afterEach(() => {
   vi.useRealTimers(); vi.unstubAllEnvs();
@@ -859,6 +892,195 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.ds.localProcessAttestation).toMatchObject({ cliPid: 111, cliProcStart: 'start1', workerGeneration: 1 });
     expect(wire.sessionContract.scope).toEqual({ runtime: s.runtime });
     expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'queued' });
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+  });
+  it.each(['codex-app', 'claude-code'])('persists the %s native session before the opening attempt is accepted', async cliId => {
+    const s = fixture(); const execution = s.controller.admitInput('opening-turn', 1);
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    scope.rememberExecution(execution, binding);
+    const metadata = loadWorkerFunction<(message: WorkerToDaemon) => WorkerToDaemon>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const sent: WorkerToDaemon[] = [];
+    scope.run(binding, () => publishCliSessionIdToDaemon({
+      sessionId: s.ref.sessionId, cliSessionId: 'native1', initConfig: {},
+      turnId: execution.turnId, dispatchAttempt: execution.dispatchAttempt,
+      send: message => sent.push(metadata(message)),
+    }), execution);
+    const { handle, persisted } = nativeSessionHandler(s, cliId);
+    await handle(sent[0]);
+    expect(s.ds.session.cliSessionId).toBe('native1');
+    expect(persisted).toEqual([expect.objectContaining({ cliSessionId: 'native1' })]);
+    // Learning a conversation ID must not claim that its opening input ran.
+    expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'queued' });
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+  });
+  it('does not create an input attempt from a native session notification\'s turn label', () => {
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const message = scope.run(binding, () => metadata({ type: 'cli_session_id', cliSessionId: 'native1', turnId: 'display-only' }));
+    expect(s.controller.ingest(message, s.worker).kind).toBe('current');
+    expect(s.store.executions(s.ref)).toEqual([]);
+  });
+  it('persists the live native ID across an in-process rebind without moving the submitted execution', async () => {
+    vi.useFakeTimers(); const s = fixture(); s.ds.session.cliSessionId = 'native1';
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime();
+    binding.identity = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start', nativeSessionId: 'native1' };
+    s.controller.reserveBinding(binding.bindingId, s.worker);
+    const originalRuntime = s.controller.bindRuntime(binding.bindingId, s.worker, binding.identity).ref;
+    scope.assign(binding.bindingId, originalRuntime);
+    const execution = s.controller.admitInput('running-turn', 1); scope.rememberExecution(execution, binding);
+    const wires: WorkerToDaemon[] = [];
+    const env: any = { workerSessionEventScope: scope, backend: { cliPid: 111 }, codexRpcEngine: null,
+      effectiveBackendType: 'tmux', readProcessStartIdentity: () => 'start1',
+      lastInitConfig: { cliId: 'codex-app' }, cliAdapter: {}, publishedCliInputBacklog: undefined,
+      closeRequested: false, workerIpcPayload: (message: WorkerToDaemon) => message,
+      process: { send: (message: WorkerToDaemon) => wires.push(message) }, isWorkflowWorker: () => false,
+    };
+    env.runtimeIdentityForContract = loadWorkerFunction('runtimeIdentityForContract', env);
+    env.publishRuntimeContract = loadWorkerFunction('publishRuntimeContract', env);
+    env.observeContractNativeSession = loadWorkerFunction('observeContractNativeSession', env);
+    env.sessionEventMetadata = loadWorkerFunction('sessionEventMetadata', env);
+    env.send = loadWorkerFunction('send', env);
+    scope.run(binding, () => {
+      scope.recordSubmission(execution.turnId, 1);
+      s.controller.ingest(env.sessionEventMetadata({ type: 'turn_execution_started', turnId: execution.turnId, dispatchAttempt: 1 }), s.worker);
+      env.send({ type: 'cli_session_id', cliSessionId: 'native2', turnId: execution.turnId, dispatchAttempt: 1 });
+    }, execution);
+    const { handle, persisted } = nativeSessionHandler(s);
+    let delivery: Promise<void> | undefined;
+    setTimeout(() => { delivery = (async () => { for (const message of wires) await handle(message); })(); }, 10);
+    await vi.advanceTimersByTimeAsync(10); await delivery;
+    expect(s.ds.session.cliSessionId).toBe('native2');
+    expect(persisted).toEqual([expect.objectContaining({ cliSessionId: 'native2' })]);
+    expect(s.store.runtime(s.ref)?.identity?.nativeSessionId).toBe('native2');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toEqual(originalRuntime);
+
+    // An envelope already stamped with the superseded runtime must not
+    // overwrite the newly observed conversation. (send() reports a live
+    // observation of this same process under its current binding instead.)
+    const stale = scope.run(binding, () => env.sessionEventMetadata({ type: 'cli_session_id',
+      cliSessionId: 'native1', turnId: execution.turnId, dispatchAttempt: 1 }), execution);
+    await handle(stale);
+    expect(s.ds.session.cliSessionId).toBe('native2');
+    expect(persisted).toHaveLength(1);
+  });
+  it('persists a later native rotation seen by a poller created before an in-process rebind', async () => {
+    const s = fixture(); s.ds.session.cliSessionId = 'native1';
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime();
+    binding.identity = { backend: 'tmux', physicalId: '111:start111', proof: 'process_start', nativeSessionId: 'native1' };
+    s.controller.reserveBinding(binding.bindingId, s.worker);
+    const originalRuntime = s.controller.bindRuntime(binding.bindingId, s.worker, binding.identity).ref;
+    scope.assign(binding.bindingId, originalRuntime);
+    const opening = s.controller.admitInput('opening-turn', 1); scope.rememberExecution(opening, binding);
+    const { env, wires } = nativeSessionWorker(scope);
+    const { handle, persisted } = nativeSessionHandler(s);
+    const deliver = async () => { for (const message of wires.splice(0)) await handle(message); };
+    // A spawn-time poller (the structured-bridge ticker following /new, a
+    // startup chat-ID observer) runs every tick under the binding it was
+    // created with, like scope.bind().
+    const poll = scope.run(binding, () => scope.bind((cliSessionId: string) =>
+      env.send({ type: 'cli_session_id', cliSessionId, turnId: opening.turnId, dispatchAttempt: 1 })), opening);
+    poll('native2'); await deliver();
+    expect(s.ds.session.cliSessionId).toBe('native2');
+    expect(scope.currentBinding()).not.toBe(binding);
+    // The CLI rotates again; the same poller still carries the superseded binding.
+    poll('native3'); await deliver();
+    expect(s.ds.session.cliSessionId).toBe('native3');
+    expect(persisted).toEqual([expect.objectContaining({ cliSessionId: 'native2' }), expect.objectContaining({ cliSessionId: 'native3' })]);
+    expect(s.store.runtime(s.ref)?.identity?.nativeSessionId).toBe('native3');
+    expect(s.store.execution(s.ref, opening.executionId)).toMatchObject({ phase: 'queued' });
+    expect(s.store.execution(s.ref, opening.executionId)?.runtime).toBeUndefined();
+  });
+  it('persists the first native ID after the launcher resolves while the opening input is still queued', async () => {
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime();
+    binding.identity = { backend: 'tmux', physicalId: '111:start111', proof: 'process_start' };
+    s.controller.reserveBinding(binding.bindingId, s.worker);
+    scope.assign(binding.bindingId, s.controller.bindRuntime(binding.bindingId, s.worker, binding.identity).ref);
+    const opening = s.controller.admitInput('opening-turn', 1); scope.rememberExecution(opening, binding);
+    const { env, wires } = nativeSessionWorker(scope);
+    const { handle, persisted } = nativeSessionHandler(s, 'cursor');
+    const deliver = async () => { for (const message of wires.splice(0)) await handle(message); };
+    const observe = scope.run(binding, () => scope.bind((cliSessionId: string) =>
+      env.send({ type: 'cli_session_id', cliSessionId, turnId: opening.turnId, dispatchAttempt: 1 })), opening);
+    // The relay / session scope launcher resolves to the real CLI: same
+    // process, new runtime binding (refreshActiveRuntimeContract).
+    env.backend.cliPid = 222;
+    scope.run(binding, () => env.refreshActiveRuntimeContract()); await deliver();
+    expect(scope.currentBinding()).not.toBe(binding);
+    expect(scope.bindingSharesCurrentProcess(binding.bindingId)).toBe(true);
+    observe('chat1'); await deliver();
+    expect(s.ds.session.cliSessionId).toBe('chat1');
+    expect(persisted).toEqual([expect.objectContaining({ cliSessionId: 'chat1' })]);
+    expect(s.store.execution(s.ref, opening.executionId)).toMatchObject({ phase: 'queued' });
+    expect(s.store.execution(s.ref, opening.executionId)?.runtime).toBeUndefined();
+  });
+  it('refuses a native ID from a poller of a replaced CLI process', async () => {
+    const s = fixture(); s.ds.session.cliSessionId = 'native2';
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const old = scope.beginRuntime();
+    old.identity = { backend: 'tmux', physicalId: '111:start111', proof: 'process_start', nativeSessionId: 'native1' };
+    s.controller.reserveBinding(old.bindingId, s.worker);
+    scope.assign(old.bindingId, s.controller.bindRuntime(old.bindingId, s.worker, old.identity).ref);
+    const { env, wires } = nativeSessionWorker(scope, 222);
+    const { handle, persisted } = nativeSessionHandler(s);
+    const poll = scope.run(old, () => scope.bind((cliSessionId: string) => env.send({ type: 'cli_session_id', cliSessionId })));
+    // A restart spawned a new CLI process (a fresh physical binding).
+    const replacement = scope.beginRuntime();
+    replacement.identity = { backend: 'tmux', physicalId: '222:start222', proof: 'process_start', nativeSessionId: 'native2' };
+    s.controller.reserveBinding(replacement.bindingId, s.worker);
+    scope.assign(replacement.bindingId, s.controller.bindRuntime(replacement.bindingId, s.worker, replacement.identity).ref);
+    expect(scope.bindingSharesCurrentProcess(old.bindingId)).toBe(false);
+    poll('native1');
+    for (const message of wires.splice(0)) await handle(message);
+    expect(s.ds.session.cliSessionId).toBe('native2');
+    expect(persisted).toEqual([]);
+  });
+  it('holds a native session notification until its runtime binding is proven', async () => {
+    vi.useFakeTimers(); const s = fixture();
+    const execution = s.controller.admitInput('opening-turn', 1);
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime();
+    const runtime = s.controller.reserveBinding(binding.bindingId, s.worker);
+    scope.assign(binding.bindingId, runtime); scope.rememberExecution(execution, binding);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const message = scope.run(binding, () => metadata({ type: 'cli_session_id', cliSessionId: 'native2',
+      turnId: execution.turnId, dispatchAttempt: 1 }), execution);
+    expect(s.controller.ingest(message, s.worker).kind).toBe('defer');
+    setTimeout(() => s.controller.bindRuntime(binding.bindingId, s.worker,
+      { backend: 'tmux', physicalId: '222:start2', proof: 'process_start', nativeSessionId: 'native2' }), 10);
+    await vi.advanceTimersByTimeAsync(10);
+    const [deferred] = s.store.deferredEvents<WorkerToDaemon>(s.ref, binding.bindingId);
+    expect(s.controller.ingest(deferred, s.worker).kind).toBe('current');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+  });
+  it.each(['runtime', 'worker', 'close', 'suspend'] as const)('does not apply an old native session notification after %s retirement', async change => {
+    const s = fixture(); const execution = s.controller.admitInput('opening-turn', 1);
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    scope.rememberExecution(execution, binding);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const message = scope.run(binding, () => metadata({ type: 'cli_session_id', cliSessionId: 'native1',
+      turnId: execution.turnId, dispatchAttempt: 1 }), execution);
+    const { handle, persisted } = nativeSessionHandler(s);
+    if (change === 'runtime') {
+      s.controller.reserveBinding('replacement', s.worker);
+      s.controller.bindRuntime('replacement', s.worker,
+        { backend: 'tmux', physicalId: '222:start2', proof: 'process_start', nativeSessionId: 'native2' });
+    } else if (change === 'worker') s.controller.bindWorker(2);
+    else {
+      s.controller.beginControl(change, 'retire'); s.controller.controlStarted('retire');
+      s.controller.controlResult('retire', 'confirmed');
+      if (change === 'suspend') s.ds.worker = null;
+    }
+    await handle(message);
+    expect(s.ds.session.cliSessionId).toBeUndefined();
+    expect(persisted).toEqual([]);
     expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
   });
   it('keeps a frozen callback origin through the actual metadata wrapper', async () => {

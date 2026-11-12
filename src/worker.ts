@@ -2072,7 +2072,10 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
     : undefined);
-  const captured = explicitOrigin ?? workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined) ?? operationOrigin;
+  // Runtime identity follows the physical observer's binding. A submitted
+  // turn may still name the previous runtime after an in-process rebind.
+  const captured = explicitOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
+    : workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined)) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
@@ -2086,7 +2089,9 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   }
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
-  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
+  // The native conversation ID is also learned before the first input runs;
+  // its turnId is display context, not proof that this attempt was accepted.
+  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation' || msg.type === 'cli_session_id') delete context.scope.execution;
   // Queue observations belong to this worker process, not to a turn or a
   // runtime: they span turns (including admissions not yet bound to the
   // runtime) and runtimes too. Whatever callback publishes one, it reports the
@@ -34644,6 +34649,21 @@ function publishCliInputBacklog(): void {
 }
 
 function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
+  // A native conversation ID is read from the live CLI when the callback runs.
+  // Pollers and timers keep the binding they were created under, and an
+  // in-process rebind (the relay or session scope resolving the real CLI
+  // behind its launcher, or an earlier native ID) supersedes that binding
+  // while the process stays the same. Report such an observation under the
+  // live binding of that process; a callback of a replaced process keeps its
+  // own binding, so its report is still refused as a stale runtime's.
+  if (msg.type === 'cli_session_id' && !origin && workerSessionEventScope) {
+    const scope = workerSessionEventScope;
+    const live = scope.currentBinding(); const observer = scope.contextBinding();
+    if (live && observer && observer !== live && scope.bindingSharesCurrentProcess(observer.bindingId)) {
+      scope.run(live, () => send(msg));
+      return;
+    }
+  }
   if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) {
     log(`Dropped final output with unproven execution origin ${JSON.stringify({ turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
       origin: workerSessionEventScope.capture(), current: workerSessionEventScope.currentBinding(),
