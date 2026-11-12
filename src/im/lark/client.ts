@@ -3284,6 +3284,25 @@ export async function getChatRoutingFacts(
   return { external: res.data.external, mode };
 }
 
+/** Native invite links let non-members join without BotMux user authorization. */
+export async function getChatInviteLink(larkAppId: string, chatId: string): Promise<string> {
+  const response = await getBotClient(larkAppId).request({
+    method: 'POST', url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/link`,
+    data: { validity_period: 'permanently' }, ...larkRequestDeadline({ timeoutMs: 10_000 }),
+  });
+  if (response.code !== 0 || !response.data?.is_permanent || !response.data.share_link) {
+    throw new Error('人工群入群邀请暂不可用，请确认机器人在人工群中并有分享群权限');
+  }
+  const link = new URL(response.data.share_link);
+  const brand = normalizeBrand(getBot(larkAppId).config.brand);
+  const officialHost = link.hostname === larkHosts(brand).applink
+    || (brand === 'feishu' && link.hostname === 'applink.larkoffice.com');
+  if (link.protocol !== 'https:' || !officialHost
+    || link.pathname !== '/client/chat/chatter/add_by_link' || !link.searchParams.get('link_token')
+    || link.username || link.password) throw new Error('人工群未返回有效入群邀请');
+  return response.data.share_link;
+}
+
 export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
   const response: any = await larkGet(getBotClient(larkAppId),
     `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);

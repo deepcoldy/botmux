@@ -10727,6 +10727,42 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
 
 export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
 
+/** What a manual suspend has to wait for so that taking the worker loses
+ *  nothing: the CLI is producing a turn ('turn'), input delivered to the
+ *  session has not been taken by its CLI yet ('input'), or the reply to the
+ *  last turn may still be on its way to the group ('reply'; bounded, see
+ *  unsettledReplyHoldUntil). These are the conditions
+ *  runPendingSuspendIfSettled cashes a queued request in on. */
+export type ManualSuspendWait = 'turn' | 'input' | 'reply';
+
+export interface ManualSuspendWaits {
+  waitingFor: ManualSuspendWait[];
+  /** With 'reply': when that wait ends at the latest (epoch ms). */
+  replyHoldUntil?: number;
+}
+
+/** Empty `waitingFor` means the worker may be suspended now. */
+export function manualSuspendWaits(ds: DaemonSession, now: number = Date.now()): ManualSuspendWaits {
+  const waitingFor: ManualSuspendWait[] = [];
+  if (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing') waitingFor.push('turn');
+  if (hasUnacceptedCliInput(ds)) waitingFor.push('input');
+  const replyHoldUntil = unsettledReplyHoldUntil(ds, now);
+  if (replyHoldUntil !== undefined) waitingFor.push('reply');
+  return { waitingFor, ...(replyHoldUntil !== undefined ? { replyHoldUntil } : {}) };
+}
+
+/** Queue a manual suspend of the live worker behind `waits`. */
+export function queueManualSuspend(ds: DaemonSession, waits: ManualSuspendWaits): void {
+  ds.pendingSuspendReason = 'manual_suspend';
+  // Bind the claim to the generation that holds the work right now: it must
+  // not outlive that worker (see clearPendingSuspendClaim).
+  ds.pendingSuspendGeneration = ds.workerGeneration;
+  logger.info(`[${tag(ds)}] Manual suspend queued: waiting for ${waits.waitingFor.join(', ')}`);
+  // A settled session may emit no further edge before the reply hold runs
+  // out: re-run the checkpoint at its bound, as the checkpoint itself does.
+  if (waits.replyHoldUntil !== undefined) retryPendingSuspendAt(ds, waits.replyHoldUntil);
+}
+
 /**
  * May this generation be retired because the CLI install changed under it?
  *
@@ -12395,6 +12431,16 @@ const workerCliInputBacklogs = new WeakMap<ChildProcess, WorkerCliInputBacklog>(
  *  a recency guess. Keyed by the process, like the backlog. */
 const workerCommittedTurnIds = new WeakMap<ChildProcess, Set<string>>();
 
+/** Workers whose own screen report has set `ds.lastScreenStatus`. Until the
+ *  live worker is in here, that status may still be the previous generation's
+ *  (a crashed or killed worker leaves its last status on the session). Keyed
+ *  by the process, so a replacement never inherits it. */
+const workersWithScreenStatus = new WeakSet<ChildProcess>();
+
+function screenStatusIsCurrentWorkers(ds: DaemonSession): boolean {
+  return !!ds.worker && !ds.worker.killed && workersWithScreenStatus.has(ds.worker);
+}
+
 function recordWorkerCommittedTurn(worker: ChildProcess, turnId: string): void {
   let committed = workerCommittedTurnIds.get(worker);
   if (!committed) {
@@ -12468,6 +12514,17 @@ function failOrdinaryImDelivery(
     + `attempts=${record.attempt} reason=${reason}`,
   );
   reportOrdinaryTurnUndelivered(record.ds, record.turnId, reason, messageKey);
+  // A suspend queued behind this input waits for nothing more from it: it
+  // never reached the CLI, so no backlog report or screen edge follows to
+  // re-check the claim. Only once the live worker has reported a screen
+  // status itself: before that, the status the checkpoint reads may still be
+  // the previous generation's idle, and the turn the new CLI is running would
+  // look settled. A commit settles its delivery elsewhere and is never
+  // re-checked here: the CLI's own reports cover the turn it took.
+  const ds = record.ds;
+  if (ds.pendingSuspendReason !== undefined && screenStatusIsCurrentWorkers(ds)) {
+    queueMicrotask(() => runPendingSuspendIfSettled(ds));
+  }
 }
 
 /** The user-facing outcome of an ordinary turn whose input never reached the
@@ -20287,6 +20344,7 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit, msg.content);
+        workersWithScreenStatus.add(worker);
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
@@ -20777,6 +20835,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and

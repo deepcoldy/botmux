@@ -271,6 +271,12 @@ export class SessionController {
     }
     return value;
   }
+  /** The active runtime when `channel` continued `runtime` into it in process
+   *  (same physical CLI), else `runtime` itself. */
+  private continuedInto(runtime: RuntimeRef, channel: WorkerRef): RuntimeRef {
+    const active = this.store.read(this.ref)?.activeRuntime;
+    return active && !sameRuntime(runtime, active) && this.store.runtimeContinues(this.ref, runtime, active, channel) ? active : runtime;
+  }
   ingest(message: ControlledWorkerMessage, channel: WorkerRef, recoveredOrigin?: SessionEventContext): SessionEventAdmission {
     return this.store.atomic(() => this.ingestInside(message, channel, recoveredOrigin));
   }
@@ -371,12 +377,21 @@ export class SessionController {
       try { this.store.bindQueuedExecution(this.ref, execution, runtime); }
       catch { return { kind: 'reject', reason: 'execution_runtime_conflict' }; }
     }
-    if (runtime && ['prompt_ready', 'screen_update', 'active_runtime', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
-      && !this.store.acceptObservation(this.ref, channel, runtime, context.sequence)) return { kind: 'reject', reason: 'stale_observation_sequence' };
+    // Prompt and screen frames observe the live CLI. A turn that was running
+    // when a semantic rebind (the relay resolving the real CLI behind its
+    // launcher, a new native session id) moved this CLI to the active runtime
+    // keeps reporting under the runtime it was submitted on; its frames still
+    // describe this CLI now, so they land on the runtime it continued into.
+    // Without this, every `working` frame of that turn is refused as a stale
+    // runtime's, and the daemon keeps the turn looking idle until it ends.
+    const liveRuntime = runtime && (message.type === 'prompt_ready' || message.type === 'screen_update')
+      ? this.continuedInto(runtime, channel) : runtime;
+    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
+      && !this.store.acceptObservation(this.ref, channel, liveRuntime, context.sequence)) return { kind: 'reject', reason: 'stale_observation_sequence' };
     let event: ContractEvent | undefined;
     if (message.type === 'ready') event = { type: 'worker_online', worker: channel };
-    if (message.type === 'prompt_ready' && runtime) event = { type: 'runtime_ready', runtime };
-    if (message.type === 'screen_update' && runtime && message.status === 'working') event = { type: 'runtime_busy', runtime };
+    if (message.type === 'prompt_ready' && liveRuntime) event = { type: 'runtime_ready', runtime: liveRuntime };
+    if (message.type === 'screen_update' && liveRuntime && message.status === 'working') event = { type: 'runtime_busy', runtime: liveRuntime };
     if (message.type === 'claude_exit' && runtime) event = { type: 'runtime_lost', runtime, confirmed: true, reason: 'native_exit' };
     if (message.type === 'turn_execution_started' && runtime && execution) event = { type: 'execution_phase', runtime, execution, phase: 'submitting' };
     if (message.type === 'native_input_consumed' && runtime && execution) event = { type: 'execution_phase', runtime, execution, phase: 'accepted' };

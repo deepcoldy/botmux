@@ -21,7 +21,7 @@ import {
   triggerUserAuthApplies,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
-  tokenStoreProtection, credentialSourceOf, delegatesOnMention } from '../src/services/trigger-user-auth.js';
+  tokenStoreProtection, credentialSourceOf, delegatesOnMention, dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parseTriggerUserAuthConfig', () => {
@@ -87,6 +87,39 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(() => parseTriggerUserAuthConfig([])).toThrow(TriggerUserAuthConfigError);
     expect(() => parseTriggerUserAuthConfig({ enabled: 'true' })).toThrow(/enabled/);
     expect(() => parseTriggerUserAuthConfig({ enabled: true, tools: 'lark-cli' })).toThrow(/tools/);
+  });
+
+  it('parses exact dispatch-only scopes and keeps them out of source CLI auth', () => {
+    const config = parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'],
+      dispatchOnly: { tools: ['bytedcli', 'bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] } });
+    expect(config?.dispatchOnly).toEqual({ tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] });
+    expect(triggerUserAuthApplies(config, 'bytedcli')).toBe(false);
+    expect(delegatesOnMention(config)).toBe(true);
+  });
+
+  it('rejects malformed dispatch-only scopes while the policy is enabled', () => {
+    const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, chatIds: [] } })).toThrow(/chatIds/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, targetAppIds: ['*'] } })).toThrow(/targetAppIds/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, tools: ['git'] } })).toThrow(/tools/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: 'nope' })).toThrow(/object/);
+  });
+
+  it('accepts and ignores dispatch-only scopes while the policy is disabled', () => {
+    const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
+    // A natural manual kill switch: turning `enabled` off must not invalidate
+    // the whole bots.json load, even if the dormant scope is malformed.
+    const disabled = parseTriggerUserAuthConfig({ enabled: false, tools: [], dispatchOnly: valid });
+    expect(disabled).not.toHaveProperty('dispatchOnly');
+    expect(disabled?.enabled).toBe(false);
+    const malformed = parseTriggerUserAuthConfig({ enabled: false, dispatchOnly: { tools: ['nope'] } });
+    expect(malformed).not.toHaveProperty('dispatchOnly');
+    // And the disabled policy neither hands off on mention nor signs tools.
+    expect(delegatesOnMention(disabled)).toBe(false);
+    expect(dispatchOnlyToolsForTurn(disabled, {
+      sourceChatId: 'oc_group', targetChatId: 'oc_group', targetAppIds: ['cli_target'],
+      directHuman: true, inherited: false,
+    })).toEqual([]);
   });
 });
 
