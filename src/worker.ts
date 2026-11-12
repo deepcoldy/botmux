@@ -14649,13 +14649,13 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     // A stale journal can contain an already-settled predecessor that cannot
     // receive an observer grant. Retire only that proven, unowned attempt;
     // owned output retries and unresolved executions keep their delivery path.
-    ready = ready.filter(turn => scope.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt)
+    ready = ready.filter(turn => scope.provesExecutionEvent(turn.turnId, turn.dispatchAttempt)
       || !scope.isExecutionSettled(turn.turnId, turn.dispatchAttempt));
     // Restored transcript terminals can precede the host's observer grant.
     // Keep them queued only while that grant can still arrive; the FIFO queue
     // holds every successor behind them. Afterwards an ungranted turn returns
     // to ordinary admission, which refuses its cross-runtime terminal.
-    const unproven = ready.filter(turn => !scope.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt));
+    const unproven = ready.filter(turn => !scope.provesExecutionEvent(turn.turnId, turn.dispatchAttempt));
     if (unproven.length > 0) {
       if (restoredObserverGrantWait.hold(scope.currentBinding()?.bindingId,
         executionObserverSupported(lastInitConfig?.cliId, effectiveBackendType), () => codexBridgeDrainAndMaybeEmit())) {

@@ -22,6 +22,15 @@ Codex 的非隔离托管 tmux 会话在 Worker 断开后保留 CLI。原生 CoT 
 
 Worker 断开时，属于其进程延续链的未终结轮次一起进入待核实状态。新 Worker 观察到的历史终态仅结算原轮次及其原卡片，不修改当前运行的就绪状态、队列或后继轮次。卡片 PATCH 失败保留原有可重试记录，不阻断业务完成回调。
 
+## 两种事件归属判定的分工（与重挂来源恢复 #3363 共存）
+
+`WorkerSessionEventScope` 上有两个相似但用途不同的判定，不能混用：
+
+- `provesExecutionEvent`（严格）：只在结构化桥 `emitReadyCodexTurns` 的两处使用——剔除「已结算、本 worker 没跑过」的前任轮次，以及对未结算前任轮次做有界观察授权等待。它只认本 worker 实际跑过该执行的 binding，或宿主授予观察者后建出的 binding；证明不了就先排队等授权，落空再回普通准入。这保证 Codex+tmux 恢复轮次在授权到达前不会被提前发出而被跨运行时拒收、永久卡在 reconciling。
+- `ownsExecutionEvent`（宽松，#3363 放宽）：用于 worker 的 `send` 与 `emitTurnTerminal` 闸门。在严格判定之外，额外接受「本 worker 没有 binding 跑过、但事件从当前存活 CLI 的回调发出」的前任执行，把是否同运行时的决定交给宿主做可见拒收。这支撑 Claude 重挂后把前任回复交给 daemon 的路径，不受严格等待影响。
+
+两者按路径分离而非按 CLI 名称分离：结构化桥（codex/traex/coco/hermes 等）的剔除与等授权走严格判定；发送与终态闸门统一走宽松判定。`executionObserverSupported` 只对 codex+tmux 成立，所以实际只有 Codex+tmux 的未结算前任轮次会真正等待（上限 30 秒），其它 CLI/后端立即回落宽松路径。
+
 ## 影响与验证
 
 - 会话绑定修复位于公共控制层；需要覆盖提前/延迟补报、数据库重开、进程身份变化及新关闭操作。

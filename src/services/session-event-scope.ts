@@ -204,6 +204,26 @@ export class WorkerSessionEventScope {
     }
     return this.isCurrentContext();
   }
+  /**
+   * Strict ownership proof used by the Codex restored-turn bridge to decide
+   * whether a predecessor turn already has an observer grant. Unlike
+   * ownsExecutionEvent (relaxed so the host decides on predecessor attempts
+   * re-attached to the live CLI), this returns true only when a binding of
+   * THIS worker actually ran the execution, or an observer-created binding for
+   * it exists. Turns that fail this stay queued until the host grants
+   * observation; without the grant they fall back to ordinary admission where
+   * the host visibly rejects cross-runtime terminals.
+   */
+  provesExecutionEvent(turnId: string, dispatchAttempt?: number): boolean {
+    const origin = this.storage.getStore()?.binding;
+    if (!origin) return true;
+    const submission = this.submissions.get(this.turnKey(turnId, dispatchAttempt));
+    if (submission) return submission === origin || sameRuntime(submission.runtime, origin.runtime) || submission.physicalId === origin.physicalId;
+    const execution = this.executionForTurn(turnId, dispatchAttempt);
+    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
+    if (state?.runtime) return sameRuntime(state.runtime, origin.runtime) || this.bindingForRuntime(state.runtime)?.physicalId === origin.physicalId;
+    return this.isCurrentContext();
+  }
   isExecutionSettled(turnId: string, dispatchAttempt?: number): boolean {
     const execution = this.executionForTurn(turnId, dispatchAttempt);
     const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
