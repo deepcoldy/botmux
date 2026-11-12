@@ -202,6 +202,7 @@ Values: `output` (show output, export text, refresh), `terminal`, `writeLink`, `
 | `writableTerminalLinkInCard` | Puts a writable terminal button in the card; anyone who sees the card can operate the terminal, so only enable it in trusted chats | Off |
 | `privateCard` | In regular groups, `/card` sends an admin-only static snapshot (it does not keep updating) | Off |
 | `replyCardActions` | Shows an "Open terminal / Switch model / Close session" menu at the bottom right of ordinary reply cards | Off |
+| `goalStatusCard` | When a Codex / TRAE session sets a native goal (`/goal`), posts one goal status card and updates it in place with the status and the CLI-counted elapsed time. Turning it on applies to new sessions (or after a session restarts); turning it off stops updating existing cards right away | Off |
 
 All of these can be changed in the Dashboard or with `/botconfig set <setting> on|off`.
 

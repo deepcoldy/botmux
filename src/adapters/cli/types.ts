@@ -1220,6 +1220,7 @@ export type StructuredBridgeAttachMode =
 
 /** One incremental drain of a path-addressed transcript. */
 export interface StructuredBridgeDrainResult {
+  latestGoal?: import('../../services/native-goal-state.js').NativeGoalState | null;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully parsed line; hand it back as the next `offset`. */
   newOffset: number;

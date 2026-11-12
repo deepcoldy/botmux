@@ -50,6 +50,7 @@ import {
   type Dirent,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { nativeGoalFromEvent, type NativeGoalState } from './native-goal-state.js';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { codexHome, codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
@@ -957,6 +958,7 @@ export function splitCodexEventsByCutoff(
 }
 
 export interface CodexDrainResult {
+  latestGoal?: NativeGoalState | null;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully-parsed line + its trailing \n. The next
    *  drain should pass this back as fromOffset. */
@@ -1772,6 +1774,7 @@ export function drainCodexRollout(
 
   const events: CodexBridgeEvent[] = [];
   const spawnedSubagents: CodexSpawnedSubagent[] = [];
+  let latestGoal: NativeGoalState | null | undefined;
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
@@ -1817,6 +1820,8 @@ export function drainCodexRollout(
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
     if (obj.type === 'session_meta' && typeof p.id === 'string' && p.id) sourceSessionId = p.id;
+    const goal = nativeGoalFromEvent(obj, sourceSessionId);
+    if (goal !== undefined) latestGoal = goal;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const lineId = codexRolloutLineId(line);
@@ -2033,6 +2038,7 @@ export function drainCodexRollout(
     latestThreadSettings,
     latestModel,
     latestReasoningEffort,
+    ...(latestGoal !== undefined ? { latestGoal } : {}),
     ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
       state: { nextOffset: newOffset, turnStartOffset,
