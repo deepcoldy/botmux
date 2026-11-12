@@ -1,4 +1,4 @@
-import { setChatFeedGroup } from '../services/chat-feed-groups.js';
+import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
@@ -8393,6 +8393,24 @@ ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, re
   res.once('close', onClose);
   try {
     const result = await setChatFeedGroup(cachedLarkAppId, p.chatId, actorOpenId, label, cancelled.signal);
+    return jsonRes(res, result.ok ? 200 : result.error === 'permission_denied' ? 403 : 400, result);
+  } finally { res.off('close', onClose); }
+}, NOT_BOUND_BODY.okFalse));
+
+/** Generic plugin operation: an explicit scope prevents unrelated personal-group removal. */
+ipcRoute('PUT', '/api/groups/:chatId/feed-groups', requireBoundBot(async (req, res, p) => {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const { actorOpenId, label, managedLabels } = body as Record<string, unknown>;
+  if (typeof actorOpenId !== 'string' || !isFeedGroupSelection(label, managedLabels)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_label' });
+  }
+  const cancelled = new AbortController();
+  const onClose = () => { if (!res.writableEnded) cancelled.abort(); };
+  res.once('close', onClose);
+  try {
+    const result = await setChatFeedGroup(cachedLarkAppId, p.chatId, actorOpenId, label as string | null, cancelled.signal, managedLabels);
     return jsonRes(res, result.ok ? 200 : result.error === 'permission_denied' ? 403 : 400, result);
   } finally { res.off('close', onClose); }
 }, NOT_BOUND_BODY.okFalse));
