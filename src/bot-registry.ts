@@ -1402,7 +1402,7 @@ export interface SessionGroupConfig {
     mode?: 'ai-summary' | 'session-title' | 'truncate';
     /** Optional model for Codex AI-summary calls; absent inherits the bot model. */
     model?: string;
-    /** Max title length in characters for the AI summary (12). */
+    /** Max title length in characters for generated or reused titles (20). */
     maxLen?: number;
   };
   /**
