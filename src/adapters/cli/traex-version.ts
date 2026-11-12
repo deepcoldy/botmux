@@ -12,6 +12,9 @@ import { basename } from 'node:path';
  */
 export const TRAEX_HOOK_TRUST_FLAG = '--dangerously-bypass-hook-trust';
 export const TRAEX_HOOK_TRUST_MIN_VERSION = '0.200.16';
+/** First traecli release that emits OSC 7501 program status; 0.213.1 sends
+ *  none (recorded byte streams, both releases on one host). */
+export const TRAEX_PROGRAM_STATUS_MIN_VERSION = '0.214.1';
 
 export type TraexHookTrustSupport =
   | { status: 'supported' | 'unsupported'; version: string }

@@ -266,11 +266,22 @@ describe('ordinary IM follow-up turn origin', () => {
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
     expect(s.ds.worker).toBe(s.worker);
 
-    // Once the worker reports its queue drained, the claim is cashed in.
+    // Once the worker reports its queue drained, the claim is held rather than
+    // cashed in: the follow-up turn is now the live turn but has not reported
+    // its terminal, so the queued suspend waits for that reply to settle instead
+    // of stopping the CLI at the start of the turn (and dropping its answer).
     s.ws.pendingMessages.length = 0;
     await s.scope.run(s.binding, async () => { s.ws.publishCliInputBacklog(); await s.drain(); });
     await new Promise(resolve => setImmediate(resolve));
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(false);
+    expect(s.ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(s.ds.worker).toBe(s.worker);
+
+    // The follow-up turn completes; its terminal re-runs the suspend checkpoint
+    // and the now-settled claim is fulfilled.
+    const followUpCapability = await s.writeTurn(FOLLOW_UP, caller('ou_follow_up_sender'), false);
+    await s.finishTurn(FOLLOW_UP, followUpCapability);
+    await new Promise(resolve => setImmediate(resolve));
     expect(s.ds.pendingSuspendReason).toBeUndefined();
   });
 
