@@ -14341,7 +14341,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (addressedMentions.length !== mentions.length) {
         mentions = mentions.filter(mention => addressedMentions.includes(mention.open_id));
         console.error(
-          'botmux send: 本话题是派单话题，已去掉对派单 Bot 的 @（避免群内循环触发）；botmux send 不会自动向主控交回结果，请在本轮前台执行 `botmux report --status in_progress|completed "<正文>"` 回报原会话。',
+          'botmux send: 本话题是派单话题，已去掉对派单 Bot 的 @（避免群内循环触发）；botmux send 不会自动向主控交回结果：本轮还没回报的，请在前台执行 `botmux report --status in_progress|completed "<正文>"` 回报原会话；本轮已经回报过的不要重复执行。',
         );
       }
     }
