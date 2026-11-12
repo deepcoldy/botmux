@@ -57,6 +57,21 @@ function commit(id = 'a1b2c3d4') {
   });
 }
 
+describe('creation observer', () => {
+  afterEach(() => scheduler.setScheduleCreatedObserver(undefined));
+
+  it('hears addTask with the creating turn when the route holds it; delegated commits (another app\'s credential key) are not announced', () => {
+    const seen: Array<[string, string | undefined, string | undefined]> = [];
+    scheduler.setScheduleCreatedObserver((task, turn) => { seen.push([task.id, task.ownerOpenId, turn?.turnId]); });
+    scheduler.addTask({ id: 'direct01', name: 'a', schedule: 'every 30m', prompt: 'p', workingDir: '/repo', chatId: 'oc_chat',
+      larkAppId: APP, ownerOpenId: 'ou_owner' }, { creatingTurn: { sessionId: 's1', turnId: 'om_t1' } });
+    scheduler.addTask({ id: 'direct02', name: 'b', schedule: 'every 30m', prompt: 'p', workingDir: '/repo', chatId: 'oc_chat',
+      larkAppId: APP, ownerOpenId: 'ou_owner' });
+    commit('a1b2c3d4');
+    expect(seen).toEqual([['direct01', 'ou_owner', 'om_t1'], ['direct02', 'ou_owner', undefined]]);
+  });
+});
+
 describe('scheduler host authority integration', () => {
   const params = {
     id: 'direct01', name: 'poll', schedule: 'every 30m', prompt: 'check',

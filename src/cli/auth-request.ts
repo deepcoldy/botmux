@@ -14,11 +14,12 @@ Daemon 自动完成授权；本轮结束后，用户也可在有效期内授权�
 wait 每 2 秒查询一次，最多等待 5 分钟，返回 JSON。
 --provider 由 bytedcli 包装脚本调用：botmux 把 Meego / ByteCloud 授权链接直接私下发给本轮发起人，只输出一句不含链接的说明。
 --tenant 仅用于 Meego，取值同 bytedcli meego login --tenant。
+--unattended 由包装脚本在无人值守的运行里调用：只把授权链接私下发给任务执行人（同一链接不重复发），不等待、不返回链接。
 退出码 0 已授权，3 尚未授权（链接已发出或发不出去），4 授权服务暂不可用。`;
 
 export type ParsedAuthArgs =
   | { help: true }
-  | { help: false; command: 'request'; scopes: string[]; allowUnknown: boolean; provider?: AuthProvider; tenant?: MeegoTenant; json?: boolean }
+  | { help: false; command: 'request'; scopes: string[]; allowUnknown: boolean; provider?: AuthProvider | 'lark-cli'; tenant?: MeegoTenant; json?: boolean; unattended?: boolean }
   | { help: false; command: 'wait'; requestId: string };
 
 export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
@@ -30,8 +31,9 @@ export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
   if (command !== 'request' && command !== 'wait') throw new Error('需要 auth request 或 auth wait 子命令');
   let scopes: string[] | undefined;
   let requestId: string | undefined;
-  let provider: AuthProvider | undefined;
+  let provider: AuthProvider | 'lark-cli' | undefined;
   let tenant: MeegoTenant | undefined;
+  let unattended = false;
   let json = false;
   let allowUnknown = false;
   for (let index = 1; index < args.length; index++) {
@@ -47,8 +49,10 @@ export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
       if (scopes.length === 0) throw new Error('--scope 需要权限名称');
     } else if (command === 'request' && argument === '--provider' && provider === undefined) {
       const value = args[++index];
-      if (!AUTH_PROVIDERS.includes(value as AuthProvider)) throw new Error(`--provider 只支持 ${AUTH_PROVIDERS.join(' / ')}`);
-      provider = value as AuthProvider;
+      if (!AUTH_PROVIDERS.includes(value as AuthProvider) && value !== 'lark-cli') throw new Error(`--provider 只支持 ${AUTH_PROVIDERS.join(' / ')} / lark-cli`);
+      provider = value as AuthProvider | 'lark-cli';
+    } else if (command === 'request' && argument === '--unattended' && !unattended) {
+      unattended = true;
     } else if (command === 'request' && argument === '--tenant' && tenant === undefined) {
       const value = args[++index];
       if (!MEEGO_TENANTS.includes(value as MeegoTenant)) throw new Error(`--tenant 只支持 ${MEEGO_TENANTS.join(' / ')}`);
@@ -65,8 +69,10 @@ export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
     return { help: false, command, requestId };
   }
   if (provider && (scopes || allowUnknown)) throw new Error('--provider 不能和 --scope / --allow-unknown 一起用');
+  if (unattended && !provider) throw new Error('--unattended 只能和 --provider 一起用');
+  if (provider === 'lark-cli' && !unattended) throw new Error('--provider lark-cli 只能和 --unattended 一起用');
   if (tenant && provider !== 'meego') throw new Error('--tenant 只能和 --provider meego 一起用');
-  return { help: false, command, scopes: scopes ?? [], allowUnknown, ...(provider ? { provider, json, ...(tenant ? { tenant } : {}) } : {}) };
+  return { help: false, command, scopes: scopes ?? [], allowUnknown, ...(provider ? { provider, json, ...(tenant ? { tenant } : {}), ...(unattended ? { unattended } : {}) } : {}) };
 }
 
 /** Exit status of `auth request --provider`, which the bytedcli wrapper reads. */

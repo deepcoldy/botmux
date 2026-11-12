@@ -334,3 +334,11 @@ describe('auth request CLI', () => {
     expect(requests).toHaveLength(0);
   });
 });
+
+describe('auth request --unattended', () => {
+  it('is a provider-only flag', () => {
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego', '--unattended'])).toMatchObject({ provider: 'meego', unattended: true });
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego'])).not.toHaveProperty('unattended');
+    expect(() => parseAuthRequestArgs(['request', '--unattended'])).toThrow(/--provider/);
+  });
+});

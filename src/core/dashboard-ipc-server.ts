@@ -576,7 +576,7 @@ import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBo
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
-import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, capabilityOn, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
@@ -584,6 +584,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope, isValidLarkScopeSyntax } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
+import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
@@ -597,6 +598,9 @@ import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
+import { capabilityOfTool } from './identity-policy.js';
+import { reasonTag } from './platform-credential-source.js';
+import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, unattendedTask, type UnattendedProvider } from './capability-authorization.js';
 import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
@@ -1665,10 +1669,9 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     ? body as Record<string, unknown> : undefined;
   const sessionId = typeof record?.sessionId === 'string' && record.sessionId && record.sessionId.length <= 256
     ? record.sessionId : undefined;
-  // The Codebase CLI companion mirrors bytedcli's proven identity, so its
-  // wrapper uses the same proof channel and tool name.
-  const identityRouteTools = ['lark-cli', 'bytedcli', 'codebase'] as const;
-  type IdentityRouteTool = typeof identityRouteTools[number];
+  // The Codebase and Bits CLI companions mirror bytedcli's proven identity, so
+  // their wrappers use the same proof channel and tool name.
+  const identityRouteTools = IDENTITY_ROUTE_TOOLS;
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
@@ -1699,13 +1702,13 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     if (delegation?.workflowHandoff && delegation.denialReason === 'delegation_inactive') {
       publishDelegationRefusal({
         sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
-        tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
+        tool: tool === 'codebase' || tool === 'bitscli' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
       });
     }
     // A refusal published when the turn was prepared — the platform was
     // unreachable, or the person had not authorized yet — gets another chance
     // on this call (rate-limited per refusal kind, CAS-guarded).
-    // The Codebase companion is published together with bytedcli.
+    // The Codebase and Bits companions are published together with bytedcli.
     //
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
     // the whole bot config object, so anything captured here would be a stale
@@ -1714,7 +1717,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const liveAppId = ds.larkAppId;
     await retryTransientTurnIdentity({
       sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
-      tool: tool === 'codebase' ? 'bytedcli' : tool,
+      tool: tool === 'codebase' || tool === 'bitscli' ? 'bytedcli' : tool,
       // A bot that no longer exists is "no longer governed": policyStillWants
       // treats a throwing reader as a refusal to publish.
       currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
@@ -4099,6 +4102,28 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || (!detachedForUser && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated))) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
+  // Nobody attends an unattended run: the agent gets a link-free refusal (never the
+  // platform page or an instruction to request scopes), and the person gets the private notice.
+  // A credential that resolves again ends the lapse, so the next one is a new notice.
+  if (isUnattendedIdentityTurnId(identityTurnId ?? turnId) && triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli')) {
+    const locale = localeForBot(bot.larkAppId);
+    const task = unattendedTask(bot.larkAppId, params.sessionId, identityTurnId ?? turnId, locale);
+    if (resolved.ok) {
+      if (!delegated) clearUnattendedLapse(bot.larkAppId, task.taskId, sender, 'lark-cli');
+    } else {
+      // bot_app_missing also occurs with a local credential source: only the platform reason has a page to link.
+      if (!delegated && (resolved.reason === 'bot_app_missing' || definitelyNotAuthorized(resolved.error))) {
+        await noticeUnattendedLapse({
+          appId: bot.larkAppId, openId: sender, locale, botConfig: bot, provider: 'lark-cli',
+          url: (resolved.reason === 'platform' ? resolved.authorizeUrl : undefined) ?? null, ...task,
+          sendDirect: (to, text) => sendUserMessage(bot.larkAppId, to, text),
+        });
+      }
+      return jsonRes(res, 403, {
+        ok: false, error: `${t('trigger_user_auth.denied_unattended', { capability: 'lark-user' }, locale)}\n${reasonTag('unattended')}`,
+      });
+    }
+  }
   if (!resolved.ok && resolved.reason === 'platform') {
     return jsonRes(res, 403, { ok: false, error: resolved.error, ...(resolved.authorizeUrl ? { authorizeUrl: resolved.authorizeUrl } : {}) });
   }
@@ -4161,9 +4186,9 @@ function trackSessionAuthorization(
  * privately and answers with a message that does not carry it.
  */
 async function handleProviderAuthRequest(
-  res: ServerResponse, ds: DaemonSession, sessionId: string, provider: unknown, tenant: unknown,
+  res: ServerResponse, ds: DaemonSession, sessionId: string, provider: unknown, tenant: unknown, unattended?: unknown,
 ): Promise<void> {
-  if (!AUTH_PROVIDERS.includes(provider as AuthProvider)
+  if (!(AUTH_PROVIDERS.includes(provider as AuthProvider) || unattended === true && provider === 'lark-cli')
     || tenant !== undefined && (provider !== 'meego' || !MEEGO_TENANTS.includes(tenant as MeegoTenant))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
   }
@@ -4178,8 +4203,29 @@ async function handleProviderAuthRequest(
   if (!origin?.turnId || !openId || !isUsableOpenId(openId)) {
     return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   }
-  if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'bytedcli')) {
-    return refuse('bytedcli_user_auth_disabled', 'bytedcli user identity is not enabled for this bot');
+  const turnId = origin.identityTurnId ?? origin.turnId;
+  // lark-cli is only ever asked about by a refusal in an unattended run.
+  if (provider === 'lark-cli' && !isUnattendedIdentityTurnId(turnId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+  }
+  if (!capabilityOn(cfg.triggerUserAuth, provider === 'meego' ? 'meego' : provider === 'lark-cli' ? 'lark-user' : 'bytecloud')) {
+    return jsonRes(res, 409, {
+      ok: false, status: 'refused', error: 'native_capability',
+      message: t('provider_auth.native', { provider: provider === 'meego' ? 'Meego' : 'ByteCloud' }, loc),
+    });
+  }
+  // Nobody attends a scheduled or background run: it never starts an authorization.
+  // The wrapper that refused a command may only ask for the one private notice,
+  // which is answered at once.
+  if (isUnattendedIdentityTurnId(turnId)) {
+    if (unattended !== true) return refuse('unattended_turn', 'unattended run');
+    const status = await requestUnattendedAuthorization({
+      appId: ds.larkAppId, openId, locale: loc, botConfig: cfg, provider: provider as UnattendedProvider,
+      ...(tenant ? { tenant: tenant as MeegoTenant } : {}),
+      ...unattendedTask(ds.larkAppId, ds.session.sessionId, turnId, loc),
+      sendDirect: (to, text) => sendUserMessage(ds.larkAppId, to, text),
+    });
+    return jsonRes(res, 200, { ok: true, provider, status, message: '' });
   }
   // A delegated turn acts for someone who is not here to approve anything.
   if (getLarkToolDelegation(config.session.dataDir, sessionId, origin.identityTurnId ?? origin.turnId)) {
@@ -4189,6 +4235,9 @@ async function handleProviderAuthRequest(
     return refuse('platform_credentials', 'ByteCloud identity comes from the platform');
   }
   const privateChat = ds.chatType === 'p2p';
+  // Whatever else the person still lacks goes in the same message.
+  const others = (await missingAuthorizationEntries(cfg, openId, { except: provider as AuthProvider }).catch(() => []))
+    .flatMap(({ provider: other, url }) => url ? [t('auth_link.also_needed', { capability: other === 'meego' ? 'meego' : capabilityOfTool(other), url }, loc)] : []);
   const result = await requestProviderAuth({
     provider: provider as AuthProvider, openId, locale: loc, chatId: ds.chatId,
     ...(tenant ? { tenant: tenant as MeegoTenant } : {}),
@@ -4208,7 +4257,7 @@ async function handleProviderAuthRequest(
     deliver: (text, privateCommand) => deliverAuthLink({
       privateChat,
       openId,
-      text,
+      text: [text, ...others].join('\n\n'),
       locale: loc,
       privateCommand,
       replyInPlace: content => replyInSession(ds, content),
@@ -4289,7 +4338,7 @@ for (const action of ['auth-request', 'auth-status']) {
     }
     const cfg = getBot(ds.larkAppId).config;
     if (action === 'auth-request' && 'provider' in body) {
-      return await handleProviderAuthRequest(res, ds, params.sessionId, body.provider, body.tenant);
+      return await handleProviderAuthRequest(res, ds, params.sessionId, body.provider, body.tenant, body.unattended);
     }
     // Only the daemon's verified, turn-bound dispatch can supply a delegated
     // human. The CLI still cannot choose a user or an application.
@@ -4444,6 +4493,22 @@ for (const action of ['auth-request', 'auth-status']) {
       bot: cfg, openId: callerOpenId, delegated: !!delegated, scopes,
       botAppToken: openId => resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), openId),
     });
+    // Nobody attends an unattended run: its authorization entry goes to the person
+    // privately, once, and the request is answered at once, never waited on.
+    const unattendedTurn = isUnattendedIdentityTurnId(identityTurnId) && triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli');
+    const deliverUnattendedEntry = (url: string | null) => noticeUnattendedLapse({
+      appId: ds.larkAppId, openId: callerOpenId, locale: localeForBot(ds.larkAppId), botConfig: cfg, provider: 'lark-cli', url,
+      ...unattendedTask(ds.larkAppId, ds.session.sessionId, identityTurnId, localeForBot(ds.larkAppId)),
+      sendDirect: (to, text) => sendUserMessage(ds.larkAppId, to, text),
+    });
+    const unattendedRefused = () => jsonRes(res, 409, {
+      ok: false, status: 'refused', error: 'unattended_turn',
+      message: t('trigger_user_auth.denied_unattended', { capability: 'lark-user' }, localeForBot(ds.larkAppId)),
+    });
+    if (platformRedirect && unattendedTurn) {
+      await deliverUnattendedEntry(platformRedirect.authorizeUrl ?? null);
+      return unattendedRefused();
+    }
     if (platformRedirect) {
       return jsonRes(res, 409, {
         ok: false, error: 'platform_authorization_required', message: platformRedirect.error,
@@ -4490,6 +4555,7 @@ for (const action of ['auth-request', 'auth-status']) {
         && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
         && request.expiresAt > Date.now()
         && scopes.every(scope => request.authorization.scopes.includes(scope))) {
+        if (unattendedTurn) return unattendedRefused();
         const remaining = Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000));
         // Outside a 1:1 chat the link already went to the person privately when
         // this request was created; never hand it to the agent to post.
@@ -4515,6 +4581,13 @@ for (const action of ['auth-request', 'auth-status']) {
     accepted = true;
     trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
       callerOpenId, identityTurnId, authorization, isCurrent, isValid: isAuthorizationValid });
+    if (unattendedTurn) {
+      if (await deliverUnattendedEntry(authorization.authUrl) !== 'delivered') {
+        sessionAuthRequests.get(requestId)?.dispose();
+        sessionAuthRequests.delete(requestId);
+      }
+      return unattendedRefused();
+    }
     if (!privateChat) {
       const delivery = await deliverAuthLink({
         privateChat: false,
@@ -11969,7 +12042,7 @@ ipcRoute('POST', '/api/bot-codex-config/resync', requireBoundBot(async (_req, re
 //   • parser 从未被调用，`fallback:'device'` 这类被刻意禁止的值也会 200 落盘；
 //   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
 //     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
-const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback', 'credentialSource']);
+const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'legacyFallback', 'credentialSource']);
 // delegateOnMention is NOT in the set above: a save that does not mention it
 // (an older Dashboard bundle) keeps the stored value through the merge below,
 // so a deliberate `false` is never silently turned back on. The current page

@@ -1280,6 +1280,14 @@ export function assertScheduleChatTargetLimit(chatIds: readonly string[], previo
   }
 }
 
+/** The live turn whose agent created a task, when the creating route holds it. */
+export interface ScheduleCreatingTurn { sessionId: string; turnId: string }
+
+let createdObserver: ((task: ScheduledTask, creatingTurn?: ScheduleCreatingTurn) => void) | undefined;
+
+/** Registers the one observer told about every newly created task; the person it runs as is `task.ownerOpenId`. */
+export function setScheduleCreatedObserver(observer: typeof createdObserver): void { createdObserver = observer; }
+
 export function addTask(params: {
   id?: string;
   preconditionRef?: string;
@@ -1327,6 +1335,8 @@ export function addTask(params: {
    *  request body). Recorded in the authority row's target_turn_id column only —
    *  not in the task JSON — and counted against maxTasksPerTurn. */
   directTurn?: { turnId: string; maxTasksPerTurn: number };
+  /** The live turn whose agent creates this task; the creation observer reads what that turn published. */
+  creatingTurn?: ScheduleCreatingTurn;
 }): ScheduledTask {
   assertScheduleAuthorityAvailable();
   if (audit?.directTurn && !(params.larkAppId && authorityStore?.isInitialized(params.larkAppId))) {
@@ -1423,6 +1433,7 @@ export function addTask(params: {
     ...untilDoneConfig,
   }, authoritativeCreateFor(params.larkAppId, audit?.directTurn));
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
+  createdObserver?.(task, audit?.creatingTurn);
   return task;
 }
 

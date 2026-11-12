@@ -39,6 +39,8 @@ vi.mock('../src/services/lark-cli-auth.js', async (importOriginal) => ({
 
 const ts = (await import('typescript')).default;
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { clearRestoredLapses, unattendedTask } = await import('../src/core/capability-authorization.js');
 const { recallProvenIdentityContent, renderIdentityWrapper, publishActiveTurn } = await import('../src/core/cli-identity.js');
 const { execFileSync } = await import('node:child_process');
 const fs = await import('node:fs');
@@ -134,6 +136,7 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: 
     evaluateTalk: () => ({ allowed: true }),
     listChatMemberOpenIds: vi.fn(async () => [...members]),
     publishTurnCliIdentity, localeForBot: () => 'en',
+    isUnattendedIdentityTurnId, clearRestoredLapses, unattendedTask,
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
     identityStorageModelForDaemonSession: () => 'proven',
     identityDecisionConflict: () => undefined,

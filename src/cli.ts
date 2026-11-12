@@ -15527,7 +15527,8 @@ async function cmdAuth(rest: string[]): Promise<void> {
       }
       const provider = parsed.command === 'request' ? parsed.provider : undefined;
       const tenant = parsed.command === 'request' ? parsed.tenant : undefined;
-      const authBody = provider ? { provider, ...(tenant ? { tenant } : {}) }
+      const unattendedRequest = parsed.command === 'request' && parsed.unattended === true;
+      const authBody = provider ? { provider, ...(tenant ? { tenant } : {}), ...(unattendedRequest ? { unattended: true } : {}) }
         : parsed.command === 'request'
           ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
           : { requestId: parsed.requestId };

@@ -646,7 +646,7 @@ import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secr
 import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
 import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
-import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import { clearSingleIdentityArtifacts, forgetProvenIdentityContent, recallProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
@@ -678,6 +678,8 @@ import {
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
+import { offerAuthorizationAtCreation, clearRestoredLapses, unattendedTask } from './core/capability-authorization.js';
+import { isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -4719,7 +4721,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
     noteScheduledIdentityRestored(ds, task, turnId, identity);
   } else noteScheduledIdentityGap(ds, task, turnId, identity);
-  await publishTurnCliIdentity({
+  const outcomes = await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -4729,6 +4731,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  if (senderOpenId) clearRestoredLapses({ appId: ds.larkAppId, taskId, openId: senderOpenId, outcomes });
   assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
     { turnId, allowCompleted: true });
 }
@@ -4905,20 +4908,26 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       + `result=${delegatedIdentity.denialReason ?? 'delegated'}`,
     );
   }
-  await publishTurnCliIdentity({
+  const turnSenderOpenId = delegationBlocked
+    || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
+    || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
+    ? undefined : reply?.senderOpenId;
+  const outcomes = await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
-    senderOpenId: delegationBlocked
-      || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
-      || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
-      ? undefined : reply?.senderOpenId,
+    senderOpenId: turnSenderOpenId,
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  // An external or workflow turn is unattended too: credentials in force end its lapse.
+  if (turnSenderOpenId && !delegatedIdentity && isUnattendedIdentityTurnId(turnId)) {
+    clearRestoredLapses({ appId: ds.larkAppId, openId: turnSenderOpenId, outcomes,
+      taskId: unattendedTask(ds.larkAppId, ds.session.sessionId, turnId, localeForBot(ds.larkAppId)).taskId });
+  }
 
   // NO chat notice here.
   //
@@ -9884,6 +9893,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
             maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
               ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
           },
+          creatingTurn: { sessionId: ds.session.sessionId, turnId },
         });
       } catch (error) {
         if (error instanceof Error && error.message === 'schedule_direct_task_limit') {
@@ -35998,6 +36008,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // a blocked run is not re-driven, so the drive hook alone would miss them).
   void workflowMainWake.coldAttach().catch((err) => {
     logger.warn(`[v3] main-wake cold-attach failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+
+  // The person a task runs as is present now and is not later: every creation route offers them what unattended runs will need.
+  // When the creating route holds the live turn of that same person, what the turn published says what they lack.
+  scheduler.setScheduleCreatedObserver((task, creatingTurn) => {
+    const appId = task.larkAppId ?? task.creatorLarkAppId;
+    const runnerOpenId = task.ownerOpenId;
+    if (!runnerOpenId || !appId) return;
+    const ds = creatingTurn ? findActiveBySessionId(creatingTurn.sessionId) : undefined;
+    const sameTurn = !!ds && ds.larkAppId === appId && ds.managedTurnOrigin?.callerOpenId === runnerOpenId
+      && ds.managedTurnOrigin.turnId === creatingTurn!.turnId
+      && identityStorageModelForDaemonSession(ds) === 'proven';
+    const identityTurnId = ds?.managedTurnOrigin?.identityTurnId ?? creatingTurn?.turnId;
+    void offerAuthorizationAtCreation({
+      botConfig: getBot(appId).config, openId: runnerOpenId,
+      locale: localeForBot(appId), sendDirect: (to, text) => sendUserMessage(appId, to, text),
+      ...(sameTurn ? { published: tool => recallProvenIdentityContent(config.session.dataDir, creatingTurn!.sessionId, identityTurnId!, tool) } : {}),
+    });
   });
 
   // Opt-in owner notifications (`schedule add --notify`); target and wording

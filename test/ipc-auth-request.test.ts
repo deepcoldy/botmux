@@ -12,6 +12,9 @@ import * as larkClient from '../src/im/lark/client.js';
 import { config } from '../src/config.js';
 import { rememberLarkToolDelegation, clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import * as meegoAuth from '../src/services/meego-auth.js';
+import * as bytedcliAuth from '../src/services/bytedcli-auth.js';
+import * as larkCliAuth from '../src/services/lark-cli-auth.js';
+import { __resetUnattendedNoticesForTest } from '../src/core/capability-authorization.js';
 import { sessionAuthRequests } from '../src/core/session-auth-requests.js';
 import { __resetProviderAuthForTest } from '../src/core/provider-auth-request.js';
 
@@ -37,7 +40,7 @@ beforeEach(async () => {
       workerPid: process.pid, workerGeneration: 4, reportedAt: 1 },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'auth-session' ? session : undefined);
-  vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
+  vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 });
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
   poll = vi.fn().mockResolvedValue({ status: 'pending' });
@@ -95,6 +98,23 @@ describe('agent authorization in a group chat', () => {
     expect(again.requestId).toBe(body.requestId);
     expect(again.authUrl).toBeUndefined();
     expect(dm).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unattended turn asking for scopes: one deduped private DM, answered at once, no link and no waiting', async () => {
+    __resetUnattendedNoticesForTest();
+    session.managedTurnOrigin.identityTurnId = 'schedule:abc12345:11111111-1111-1111-1111-111111111111';
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    for (let i = 0; i < 2; i++) {
+      const response = await post();
+      expect(response.status).toBe(409);
+      const body = await response.json();
+      expect(body).toMatchObject({ ok: false, status: 'refused', error: 'unattended_turn' });
+      expect(JSON.stringify(body)).not.toContain(AUTH_URL);
+    }
+    expect(dm).toHaveBeenCalledTimes(1);
+    expect(dm.mock.calls[0].slice(0, 2)).toEqual(['cli_test', 'ou_sender']);
+    expect(dm.mock.calls[0][2]).toContain(AUTH_URL);
+    expect(poll).not.toHaveBeenCalled();
   });
 
   it('falls back to a requester-only group card and reuses its actual delivery receipt', async () => {
@@ -366,8 +386,8 @@ describe('agent authorization', () => {
 
   it.each([
     undefined,
-    { enabled: false, tools: ['lark-cli'], fallback: 'none' },
-    { enabled: true, tools: ['bytedcli'], fallback: 'none' },
+    { enabled: false, tools: ['lark-cli'] },
+    { enabled: true, tools: ['bytedcli'] },
   ])('rejects authorization when Lark identity injection is unavailable: %j', async policy => {
     vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
       larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: policy,
@@ -615,7 +635,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
   beforeEach(async () => {
     session = hostSession();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'host-session' ? session : undefined);
-    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } } as any);
     vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_host', type: 'user', source: 'sender', updatedAt: 0 });
     vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
     poll = vi.fn().mockResolvedValue({ status: 'pending' });
@@ -738,7 +758,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
     session.session.rootMessageId = 'om_root';
     vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
       larkAppId: 'cli_test', larkAppSecret: 'test-secret',
-      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' },
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'] },
     } } as any);
     vi.spyOn(meegoAuth, 'requestMeegoLogin').mockResolvedValue({ state: 'link', authUrl: MEEGO_URL });
     replies = [];
@@ -827,7 +847,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
   it('refuses when the bot does not run bytedcli as the person', async () => {
     vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
       larkAppId: 'cli_test', larkAppSecret: 'test-secret',
-      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' },
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
     } } as any);
     const response = await ask();
     expect(response.status).toBe(409);
@@ -837,12 +857,130 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
   it('platform-supplied ByteCloud identity: no ByteCloud login is started here', async () => {
     vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
       larkAppId: 'cli_test', larkAppSecret: 'test-secret',
-      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none', credentialSource: 'platform' },
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'], credentialSource: 'platform' },
     } } as any);
     const dm = vi.spyOn(larkClient, 'sendUserMessage');
     const response = await ask({ provider: 'bytedcli' });
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ ok: false, status: 'refused', error: 'platform_credentials' });
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
+  it('an attended ByteCloud refusal also carries the Meego link when that login is missing too: one DM', async () => {
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
+    vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: 'https://cloud.example/device?code=B1' } as any);
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const body = await (await ask({ provider: 'bytedcli' })).json();
+    expect(body).toMatchObject({ ok: true, status: 'delivered' });
+    expect(dm).toHaveBeenCalledTimes(1);
+    expect(dm.mock.calls[0][2]).toContain('https://cloud.example/device?code=B1');
+    expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
+  });
+
+  describe('unattended turns', () => {
+    const SCHEDULED = 'schedule:abc12345:11111111-1111-1111-1111-111111111111';
+    beforeEach(() => {
+      session.managedTurnOrigin.identityTurnId = SCHEDULED;
+      __resetUnattendedNoticesForTest();
+      vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
+      vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: 'https://cloud.example/device?code=B1' } as any);
+      vi.spyOn(larkCliAuth, 'describeLarkCliAuth').mockReturnValue({ state: 'needs-login' });
+      vi.spyOn(larkCliAuth, 'beginLarkCliLogin').mockResolvedValue({ authUrl: 'https://lark.example/device?code=L1' } as any);
+    });
+    afterEach(() => { delete session.managedTurnOrigin.identityTurnId; });
+
+    it('never get an interactive authorization: refused without the flag, nothing sent', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      for (const overrides of [{}, { provider: 'bytedcli' }]) {
+        const response = await ask(overrides);
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ ok: false, status: 'refused', error: 'unattended_turn' });
+      }
+      expect(meegoAuth.requestMeegoLogin).not.toHaveBeenCalled();
+      expect(dm).not.toHaveBeenCalled();
+      expect(replies).toEqual([]);
+    });
+
+    it('--unattended Meego: one private DM with every missing link, nothing in the group, no link back to the agent, deduped across providers', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ unattended: true })).json() as Record<string, unknown>;
+      expect(body).toMatchObject({ ok: true, status: 'delivered' });
+      expect(JSON.stringify(body)).not.toContain(MEEGO_URL);
+      expect(dm).toHaveBeenCalledTimes(1);
+      expect(dm.mock.calls[0].slice(0, 2)).toEqual(['cli_test', 'ou_sender']);
+      expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
+      expect(dm.mock.calls[0][2]).toContain('https://cloud.example/device?code=B1');
+      expect(replies).toEqual([]);
+      await ask({ unattended: true });
+      await ask({ unattended: true, provider: 'bytedcli' });
+      expect(dm).toHaveBeenCalledTimes(1);
+    });
+
+    it('--unattended ByteCloud answers at once with one DM and no wait', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ unattended: true, provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'delivered', message: '' });
+      expect(dm).toHaveBeenCalledTimes(1);
+    });
+
+    it('a turn that is not scheduled or background (trg_, workflow-event:) is unattended too, keyed by its session with a fixed label', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      for (const id of ['trg_abc123', 'workflow-event:run-1']) {
+        session.managedTurnOrigin.identityTurnId = id;
+        expect((await ask({ provider: 'bytedcli' })).status).toBe(409);
+      }
+      expect(dm).not.toHaveBeenCalled();
+      for (const id of ['trg_abc123', 'workflow-event:run-1', 'trg_other']) {
+        session.managedTurnOrigin.identityTurnId = id;
+        expect(await (await ask({ provider: 'bytedcli', unattended: true })).json()).toMatchObject({ status: 'delivered' });
+      }
+      expect(dm).toHaveBeenCalledTimes(1);
+      expect(dm.mock.calls[0][2]).toContain('无人值守的运行');
+      expect(dm.mock.calls[0][2]).not.toContain('trg_');
+    });
+
+    it('--provider lark-cli is accepted only with --unattended and only in an unattended turn', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'], capabilities: ['lark-user'] },
+      } } as any);
+      expect((await ask({ provider: 'lark-cli' })).status).toBe(400);
+      expect(await (await ask({ provider: 'lark-cli', unattended: true })).json()).toMatchObject({ ok: true, status: 'delivered' });
+      session.managedTurnOrigin.identityTurnId = undefined;
+      expect((await ask({ provider: 'lark-cli', unattended: true })).status).toBe(400);
+      expect(dm).toHaveBeenCalledTimes(1);
+    });
+
+    it('--unattended Meego whose private notice could not be sent reports undelivered', async () => {
+      (await import('../src/core/capability-authorization.js')).__resetUnattendedNoticesForTest();
+      vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('down'));
+      expect(await (await ask({ unattended: true })).json()).toMatchObject({ ok: true, status: 'undelivered' });
+    });
+
+    it('--unattended Meego with the login already there: nothing sent', async () => {
+      vi.spyOn(meegoAuth, 'requestMeegoLogin').mockResolvedValue({ state: 'ready' });
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      expect(await (await ask({ unattended: true })).json()).toMatchObject({ ok: true, status: 'ready' });
+      expect(dm).not.toHaveBeenCalled();
+    });
+  });
+
+  it('a native capability answers that this machine\'s own login is used, minting no link', async () => {
+    const dm = vi.spyOn(larkClient, 'sendUserMessage');
+    for (const [provider, capabilities] of [['meego', ['bytecloud']], ['bytedcli', ['meego']]] as const) {
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+        triggerUserAuth: { enabled: true, tools: ['bytedcli'], capabilities },
+      } } as any);
+      const response = await ask({ provider });
+      expect(response.status).toBe(409);
+      const body = await response.json() as { status: string; error: string; message: string };
+      expect(body).toMatchObject({ ok: false, status: 'refused', error: 'native_capability' });
+      expect(body.message).toContain(provider === 'meego' ? 'Meego' : 'ByteCloud');
+    }
+    expect(meegoAuth.requestMeegoLogin).not.toHaveBeenCalled();
     expect(dm).not.toHaveBeenCalled();
     expect(replies).toEqual([]);
   });

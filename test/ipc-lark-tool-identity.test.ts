@@ -7,6 +7,10 @@ import * as workerPool from '../src/core/worker-pool.js';
 import * as bots from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
+import * as larkClient from '../src/im/lark/client.js';
+import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import * as bytedcliAuth from '../src/services/bytedcli-auth.js';
+import { __resetUnattendedNoticesForTest } from '../src/core/capability-authorization.js';
 import { config } from '../src/config.js';
 import { prepareLarkToolEnv, larkToolBindingPath, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
@@ -121,7 +125,7 @@ describe('session application identity route', () => {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
       larkToolBinding: true,
-      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } as any;
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } as any;
     vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
     await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
       senderOpenId: 'ou_dispatch_bot', turnId: options.turnId ?? 'om_turn', delegatedIdentity: {
@@ -558,7 +562,7 @@ describe('platform-issued user credentials in a bound session', () => {
   // availability range excludes them), so their --as user comes from the platform.
   const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
   const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
-    triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none', ...(credentialSource ? { credentialSource } : {}) } });
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'], ...(credentialSource ? { credentialSource } : {}) } });
   let grants: any[];
   beforeEach(() => {
     grants = [];
@@ -707,6 +711,79 @@ describe('platform-issued user credentials in a bound session', () => {
       const run = await runTool(['docs', '+fetch', ...extra as string[]], port());
       expect(run.code).not.toBe(0);
       expect(run.out).toBe('');
+    });
+  });
+
+  describe('an unattended turn that cannot get the person\'s credential', () => {
+    const SCHEDULED = 'trg_abc12345';
+    beforeEach(() => {
+      session.managedTurnOrigin.turnId = SCHEDULED;
+      session.managedTurnOrigin.identityTurnId = SCHEDULED;
+      __resetUnattendedNoticesForTest();
+      __setPlatformCredentialDepsForTest({ readBinding: () => null });
+      vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+      vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
+      vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: 'https://cloud.example/device?code=B1' } as any);
+    });
+    const withPolicy = (triggerUserAuth: unknown) => vi.mocked(bots.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
+      triggerUserAuth: triggerUserAuth && parseTriggerUserAuthConfig(triggerUserAuth),
+    } } as any);
+
+    it('lark-user on: a link-free refusal for the agent, one private notice that also lists the other missing capability', async () => {
+      withPolicy({ enabled: true, capabilities: ['lark-user', 'bytecloud'], credentialSource: 'local' });
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      for (let i = 0; i < 2; i++) {
+        const response = await request('user');
+        expect(response.status).toBe(403);
+        const { error } = await response.json() as { error: string };
+        expect(error).toContain('[reason=unattended]');
+        expect(error).not.toMatch(/platform page|auth request|https?:/);
+      }
+      expect(dm).toHaveBeenCalledTimes(1);
+      expect(dm.mock.calls[0].slice(0, 2)).toEqual(['cli_bound', 'ou_sender']);
+      expect(dm.mock.calls[0][2]).toContain('https://cloud.example/device?code=B1');
+    });
+
+    it('a credential that resolves again ends the lapse: a later lapse sends a new notice, and bot_app_missing carries the /login text', async () => {
+      withPolicy({ enabled: true, capabilities: ['lark-user'], credentialSource: 'local' });
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      await request('user'); await request('user');
+      expect(dm).toHaveBeenCalledTimes(1);
+      expect(dm.mock.calls[0][2]).toContain('/login');
+      vi.mocked(tokens.resolveUserToken).mockResolvedValue('bound-user-token');
+      expect((await request('user')).status).toBe(200);
+      vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+      await request('user');
+      expect(dm).toHaveBeenCalledTimes(2);
+    });
+
+    it('the scope request of an unattended turn keeps upstream behaviour when lark-user is off or there is no policy', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
+        authUrl: 'https://accounts.example/device?code=X', scopes: ['im:chat:read'], expiresIn: 600, poll: vi.fn(),
+      } as any);
+      for (const policy of [undefined, { enabled: true, capabilities: ['bytecloud'] }]) {
+        withPolicy(policy);
+        const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+          body: JSON.stringify({ scopes: ['im:chat:read'] }),
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ ok: true, authUrl: 'https://accounts.example/device?code=X' });
+      }
+      expect(dm).not.toHaveBeenCalled();
+    });
+
+    it('lark-user off or no policy: upstream behaviour, nothing sent', async () => {
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      for (const policy of [undefined, { enabled: true, capabilities: ['bytecloud'] }]) {
+        withPolicy(policy);
+        const response = await request('user');
+        expect(response.status).toBe(403);
+        expect(((await response.json()) as { error: string }).error).toContain('needs this user\'s authorization');
+      }
+      expect(dm).not.toHaveBeenCalled();
     });
   });
 });

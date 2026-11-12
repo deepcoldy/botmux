@@ -38,7 +38,7 @@ const handler = ${handler.getText(source)}`, {
  *  server-side live turn, never a body value. */
 const DIRECT_TURN = { directTurn: {
   turnId: 'om_kickoff', maxTasksPerTurn: SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-} };
+}, creatingTurn: { sessionId: 'target-session', turnId: 'om_kickoff' } };
 
 function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
