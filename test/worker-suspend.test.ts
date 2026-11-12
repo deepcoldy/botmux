@@ -86,6 +86,14 @@ function fakeWorker() {
 }
 
 describe('suspendWorker', () => {
+  it('does not retire resources when the request-bound ownership predicate has changed', () => {
+    const worker = fakeWorker();
+    const ds: any = { session: { sessionId: 'sid-managed', status: 'active' }, worker,
+      larkAppId: 'cli_test', initConfig: { backendType: 'tmux' } };
+    expect(suspendWorker(ds, 'managed_ask_retired', () => false)).toBe(false);
+    expect(ds.worker).toBe(worker);
+    expect(worker.send).not.toHaveBeenCalled();
+  });
   it('kills the exact backing and requires a positive missing post-probe', () => {
     const ds: any = {
       session: { sessionId: 'sid-verified', status: 'active' },

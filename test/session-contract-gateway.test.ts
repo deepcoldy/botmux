@@ -19,6 +19,7 @@ import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 import { RUNTIME_RESERVATION_DEADLINE_MS, RuntimeReservationExpiredError } from '../src/services/runtime-reservation.js';
 import { prepareCodexAppDispatch, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
+import { createManagedAskControl, managedAskOriginKey } from '../src/core/managed-ask-control.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return fixtureConfig.dataDir; } } } }));
@@ -103,6 +104,118 @@ describe('contract gateway and real worker boundaries', () => {
     // Still only from this worker.
     const forged = { ...report, sessionContract: { ...report.sessionContract, producer: { workerId: 'retired-worker', generation: 0 } } };
     expect(s.controller.ingest(forged, s.worker)).toMatchObject({ kind: 'reject' });
+  });
+  it('continues its exact claimed managed suspend after primary control withdraws worker readiness', async () => {
+    const fixtureState = fixture();
+    const daemon = fixtureState.ds;
+    daemon.worker = { killed: false, send: vi.fn(), kill: vi.fn() } as any;
+    daemon.initConfig = { backendType: 'tmux' } as any;
+    fixtureState.store.apply(fixtureState.ref, { type: 'worker_online', worker: fixtureState.worker });
+    vi.spyOn(fixtureState.controller, 'flushPrimary').mockResolvedValue();
+    let destructiveChecks = 0;
+    const scope: any = {
+      primarySuspendInFlight: new WeakMap(), primarySuspendApplying: new WeakSet(), sameRuntime,
+      controllerForSession: () => fixtureState.controller, sessionContractPrimary: () => true,
+      hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
+      isSuspendableBackendType: () => true, trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(),
+      suspendBackingVerifier: () => { destructiveChecks++; return destructiveChecks > 1; },
+      hasPendingOrdinaryImInput: () => false, hasUnsettledAcceptedInput: () => false,
+      isSessionRestartInFlight: () => false, isSessionEffortChangeInFlight: () => false,
+      logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test',
+      restartCoordinator: { cancelSession: vi.fn() }, armWorkerKillBackstop: vi.fn(),
+      clearAcceptedInputTurns: vi.fn(), invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(),
+      clearIdleAutoCompactStretch: vi.fn(), takeSessionPreviewTarget: () => undefined,
+      sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
+      dashboardEventBus: { publish: vi.fn() }, clearPendingSuspendClaim: vi.fn(),
+    };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
+    scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
+    const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
+    const safe = loadWorkerPoolFunction('canSafelyReclaimWorkerForInstallChange', scope);
+    const request = { larkAppId: fixtureState.appId, sessionId: daemon.session.sessionId, requestId: 'request',
+      chatId: 'oc_test', rootMessageId: 'root', origin: { turnId: 'turn', workerGeneration: 1 },
+      operationId: 'retire', reason: 'ended' };
+    const receipt: any = { version: 1, input: { ...request, questions: [], timeoutMs: 0 }, origin: request.origin,
+      retirement: { operationId: 'retire', reason: 'ended', requestedAt: 1 }, result: { kind: 'invalidated' } };
+    const control = createManagedAskControl({
+      appId: fixtureState.appId, inspect: () => receipt, retire: () => receipt, snapshot: () => undefined,
+      session: (_sessionId, operationId) => ({ larkAppId: fixtureState.appId, chatId: 'oc_test', rootMessageId: 'root',
+        workerGeneration: 1, workerAlive: true, resourceOwned: true, safeToSuspend: safe(daemon, operationId),
+        terminalExecutionKeys: [managedAskOriginKey(request.origin)] }),
+      suspend: (_sessionId, guard, operationId) => suspend(daemon, 'managed_ask_retired', guard, operationId),
+    });
+    expect(daemon.workerReady).toBe(true);
+    await expect(control.release(request)).resolves.toMatchObject({ status: 'unknown' });
+    expect(destructiveChecks).toBe(1);
+    expect(fixtureState.controller.operation()?.phase).toBe('uncertain');
+    const originalOperationId = fixtureState.controller.operation()!.operationId;
+    await expect(control.release(request)).resolves.toMatchObject({ status: 'suspended' });
+    expect(destructiveChecks).toBe(2);
+    expect(fixtureState.controller.operation(originalOperationId)?.phase).toBe('confirmed');
+    expect(fixtureState.store.read(fixtureState.ref)?.lifecycle).toBe('suspended');
+    expect(daemon.worker).toBeNull();
+  });
+
+  it('settles a claimed managed suspend without effects when accepted input arrives during primary flush', async () => {
+    const fixtureState = fixture();
+    const daemon = fixtureState.ds;
+    daemon.worker = { killed: false, send: vi.fn(), kill: vi.fn() } as any;
+    daemon.initConfig = { backendType: 'tmux' } as any;
+    fixtureState.store.apply(fixtureState.ref, { type: 'worker_online', worker: fixtureState.worker });
+    let pending = false;
+    let suspendOperationId: string | undefined;
+    vi.spyOn(fixtureState.controller, 'flushPrimary').mockImplementation(async () => {
+      suspendOperationId ??= fixtureState.controller.operation()?.operationId;
+      pending = true;
+    });
+    let destructiveChecks = 0;
+    const scope: any = {
+      primarySuspendInFlight: new WeakMap(), primarySuspendApplying: new WeakSet(), sameRuntime,
+      controllerForSession: () => fixtureState.controller, sessionContractPrimary: () => true,
+      hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
+      isSuspendableBackendType: () => true, trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(),
+      suspendBackingVerifier: () => { destructiveChecks++; return false; },
+      logger: { warn: vi.fn() }, tag: () => 'test',
+    };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
+    scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
+    const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
+    expect(await suspend(daemon, 'managed_ask_retired', () => !pending)).toBe(false);
+    expect(destructiveChecks).toBe(0);
+    expect(fixtureState.controller.operation(suspendOperationId)?.phase).toBe('failed_before_effect');
+    expect(fixtureState.controller.allowsInput()).toBe(true);
+    expect(fixtureState.store.read(fixtureState.ref)?.lifecycle).toBe('active');
+  });
+  it('uses a new linked attempt only after the prior managed suspend proved no effects', async () => {
+    const fixtureState = fixture();
+    const daemon = fixtureState.ds;
+    daemon.worker = { killed: false, send: vi.fn(), kill: vi.fn() } as any;
+    daemon.initConfig = { backendType: 'tmux' } as any;
+    fixtureState.store.apply(fixtureState.ref, { type: 'worker_online', worker: fixtureState.worker });
+    let pending = false;
+    let first = true;
+    vi.spyOn(fixtureState.controller, 'flushPrimary').mockImplementation(async () => {
+      if (first) { first = false; pending = true; }
+    });
+    let effects = 0;
+    const scope: any = {
+      primarySuspendInFlight: new WeakMap(), primarySuspendApplying: new WeakSet(), sameRuntime,
+      controllerForSession: () => fixtureState.controller, sessionContractPrimary: () => true,
+      hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
+      isSuspendableBackendType: () => true, trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(),
+      suspendBackingVerifier: () => { effects++; return false; },
+      logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test',
+    };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
+    scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
+    const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
+    expect(await suspend(daemon, 'managed_ask_retired', () => !pending, 'managed-ask-retire')).toBe(false);
+    expect(fixtureState.controller.operation('managed-ask-retire')?.phase).toBe('failed_before_effect');
+    pending = false;
+    expect(await suspend(daemon, 'managed_ask_retired', () => !pending, 'managed-ask-retire')).toBe(false);
+    expect(effects).toBe(1);
+    expect(fixtureState.controller.operation()?.operationId).not.toBe('managed-ask-retire');
+    expect(fixtureState.controller.operation()?.phase).toBe('uncertain');
   });
   it.each([
     { turnId: undefined, retry: false },
@@ -343,6 +456,7 @@ describe('contract gateway and real worker boundaries', () => {
       dashboardEventBus: { publish: vi.fn() }, restartCoordinator: { cancelSession: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction<(ds: DaemonSession) => Promise<boolean>>('suspendWorkerAsync', scope);
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
     expect(await suspend(s.ds)).toBe(false);
     const operation = controller.operation()!;
     expect(operation).toMatchObject({ kind: 'suspend', phase: 'uncertain' });

@@ -10886,11 +10886,33 @@ export function __testOnly_setSuspendBackingVerifier(
 
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
 const primarySuspendApplying = new WeakSet<DaemonSession>();
-export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle'): Promise<boolean> {
-  const result = suspendWorker(ds, reason);
+function managedSuspendAttemptId(ds: DaemonSession, baseOperationId?: string): string | undefined {
+  if (!baseOperationId) return undefined;
+  const controller = controllerForSession(ds);
+  if (!controller) return baseOperationId;
+  let attempt = 0;
+  while (attempt < 10000) {
+    const operationId = attempt === 0 ? baseOperationId : `${baseOperationId}-${attempt}`;
+    const operation = controller.operation(operationId);
+    if (!operation || !['failed_before_effect', 'rejected'].includes(operation.phase)) return operationId;
+    attempt++;
+  }
+  throw new Error('managed suspend attempts exhausted');
+}
+
+export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): Promise<boolean> {
+  const result = suspendWorker(ds, reason, stillOwned, managedSuspendAttemptId(ds, expectedOperationId));
   return primarySuspendInFlight.get(ds) ?? result;
 }
-export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
+export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
+  const continuingController = primarySuspendApplying.has(ds) || expectedOperationId ? controllerForSession(ds) : undefined;
+  const continuingOperationId = expectedOperationId ?? continuingController?.operation()?.operationId;
+  if (stillOwned && !stillOwned(continuingOperationId)) {
+    if (continuingOperationId && continuingController?.operation(continuingOperationId)?.phase === 'applying') {
+      continuingController.controlResult(continuingOperationId, 'failed_before_effect', undefined, 'managed_suspend_ownership_changed');
+    }
+    return false;
+  }
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
     return false;
@@ -10914,12 +10936,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   if (controller && sessionContractPrimary(ds.larkAppId) && !primarySuspendApplying.has(ds)) {
     if (!primarySuspendInFlight.has(ds)) {
       let operationId: string;
-      try { operationId = controller.beginControl('suspend').operation.operationId; controller.controlStarted(operationId); }
+      try { operationId = controller.beginControl('suspend', expectedOperationId).operation.operationId; controller.controlStarted(operationId); }
       catch { return false; }
       const pending = controller.flushPrimary().then(async () => {
         if (controller.operation()?.operationId !== operationId) return false;
         primarySuspendApplying.add(ds);
-        try { const result = suspendWorker(ds, reason); await controller.flushPrimary(); return result; }
+        try { const result = suspendWorker(ds, reason, stillOwned, operationId); await controller.flushPrimary(); return result; }
         finally { primarySuspendApplying.delete(ds); }
       });
       primarySuspendInFlight.set(ds, pending);
@@ -10930,7 +10952,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   let operationId: string | undefined;
   if (controller) {
     try {
-      const value = controller.beginControl('suspend'); operationId = value.operation.operationId;
+      const value = controller.beginControl('suspend', expectedOperationId); operationId = value.operation.operationId;
       const reverify = value.operation.phase === 'uncertain' && sameRuntime(value.operation.targetRuntime, controller.currentRuntime());
       if (value.joined && value.operation.phase !== 'planned' && !reverify && !primarySuspendApplying.has(ds)) return false;
       controller.controlStarted(operationId);
@@ -11307,12 +11329,21 @@ export function queueManualSuspend(ds: DaemonSession, waits: ManualSuspendWaits)
  *
  * `pendingSuspend*` is intentionally absent; see above.
  */
-export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession): boolean {
+export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession, suspendOperationId?: string): boolean {
   if (!ds.worker || ds.worker.killed) return false;
   if (ds.session.status !== 'active') return false;
   if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return false;
   if (ds.session.locked === true) return false;
-  if (ds.workerReady !== true) return false;
+  if (suspendOperationId) {
+    suspendOperationId = managedSuspendAttemptId(ds, suspendOperationId);
+    const controller = controllerForSession(ds);
+    const operation = controller?.operation();
+    if (operation) {
+      if (operation.operationId !== suspendOperationId || operation.kind !== 'suspend'
+        || !['applying', 'uncertain'].includes(operation.phase)
+        || !sameRuntime(operation.targetRuntime, controller!.currentRuntime())) return false;
+    } else if (ds.workerReady !== true) return false;
+  } else if (ds.workerReady !== true) return false;
   if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
   if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;
   if (ds.initialStartPending) return false;
