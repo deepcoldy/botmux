@@ -71,6 +71,7 @@ describe.skipIf(process.platform === 'win32')('Doubao worker execution progress'
     { backendType: 'pty', resumed: false, restart: 'none' }, { backendType: 'tmux', resumed: false, restart: 'none' },
     { backendType: 'pty', resumed: true, restart: 'none' },
     { backendType: 'tmux', resumed: false, restart: 'tools' },
+    { backendType: 'tmux', resumed: false, restart: 'tools-during-restart' },
     { backendType: 'tmux', resumed: false, restart: 'partial-final' },
     { backendType: 'tmux', resumed: false, restart: 'completed-final' },
   ] as const) {
@@ -174,6 +175,10 @@ setInterval(() => {
         const exited = new Promise<void>(done => old.once('exit', () => done()));
         old.disconnect();
         await exited;
+        if (restart === 'tools-during-restart') {
+          appendFileSync(trajectory, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'read-after-restart',
+            function: { name: 'Read', arguments: '{"file_path":"src/next.ts"}' } }] }) + '\n');
+        }
         if (restart === 'completed-final') {
           appendFileSync(trajectory, JSON.stringify({ role: 'assistant', content: 'Answer completed during restart.' }) + '\n');
           writeFileSync(completeFlag, 'done');
@@ -181,11 +186,11 @@ setInterval(() => {
         messages.length = 0;
         logs.length = 0;
         ds = { ...ds, session: { ...ds.session } };
+        request.mockClear();
         launchWorker();
         child!.send({ ...init, resume: true, prompt: undefined, turnId: undefined });
         await waitUntil(() => logs.some(line => line.includes('Doubao live execution restored')), logs);
         expect(readFileSync(inputFile, 'utf8')).toBe(inputBefore);
-        request.mockClear();
         if (restart === 'completed-final') {
           await waitUntil(() => messages.some(msg => msg.type === 'final_output'), logs);
           expect(messages.filter(msg => msg.type === 'final_output')).toMatchObject([
@@ -202,8 +207,8 @@ setInterval(() => {
           ]);
           return;
         }
-        if (restart === 'tools') {
-          appendFileSync(trajectory, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'read-after-restart',
+        if (restart === 'tools' || restart === 'tools-during-restart') {
+          if (restart === 'tools') appendFileSync(trajectory, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'read-after-restart',
             function: { name: 'Read', arguments: '{"file_path":"src/next.ts"}' } }] }) + '\n');
           await waitUntil(() => messages.some(msg => msg.type === 'thinking_update'), logs);
           expect(messages.find(msg => msg.type === 'thinking_update')).toMatchObject({ turnId: 'om_doubao_turn',
@@ -213,7 +218,7 @@ setInterval(() => {
       }
 
       appendFileSync(trajectory, restart === 'partial-final' ? 'ted."}\n'
-        : JSON.stringify({ role: 'tool', tool_call_id: restart === 'tools' ? 'read-after-restart' : 'read-1', content: 'entry point' }) + '\n'
+        : JSON.stringify({ role: 'tool', tool_call_id: restart === 'tools' || restart === 'tools-during-restart' ? 'read-after-restart' : 'read-1', content: 'entry point' }) + '\n'
         + JSON.stringify({ role: 'assistant', content: 'Entry point inspected.' }) + '\n');
       writeFileSync(completeFlag, 'done');
       await waitUntil(() => messages.some(msg => msg.type === 'final_output'), logs);

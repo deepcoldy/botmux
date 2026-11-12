@@ -12813,8 +12813,10 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
         const user = validFrontier ? doubaoLiveUser(rolloutPath, proof) : undefined;
         if (!user) log('Doubao bridge recovery skipped (missing exact native owner/frontier proof)');
         if (user) {
+          // Progress written during the detach still belongs to this owner.
+          // Its replay floor is the saved frontier, not the new attach EOF.
           codexBridgeQueue.mark(restored.turnId, user.text, user.timestampMs, restored.dispatchAttempt,
-            { jsonlPath: rolloutPath, offsetAtMark: traj.newOffset }, currentBotmuxLinkRefMode);
+            { jsonlPath: rolloutPath, offsetAtMark: proof!.trajectoryOffset }, currentBotmuxLinkRefMode);
           codexBridgeQueue.confirmPendingTurn(restored.turnId, undefined, restored.dispatchAttempt);
           codexBridgeQueue.ingest([user]);
           restoredLiveOwner = codexBridgeQueue.peek().some(turn => turn.turnId === restored.turnId && turn.started);

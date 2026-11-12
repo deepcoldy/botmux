@@ -253,7 +253,7 @@ function parseTrajectoryLine(path: string, line: string, lineStart: number): Cod
   if (obj?.role === 'tool') {
     if (typeof obj.tool_call_id !== 'string' || !obj.tool_call_id) return null;
     const result = typeof obj.content === 'string' ? obj.content : '';
-    return { ...base, kind: 'cot', cotEntries: [{
+    return { ...base, kind: 'cot', progressCursor: { jsonlPath: path, offset: lineStart }, cotEntries: [{
       kind: 'tool_result', id: obj.tool_call_id,
       result: result.length > 800 ? `${result.slice(0, 800)}…` : result,
     }] };
@@ -278,7 +278,7 @@ function parseTrajectoryLine(path: string, line: string, lineStart: number): Cod
         ...(subject ? { subject } : {}),
       });
     }
-    return cotEntries.length ? { ...base, kind: 'cot', cotEntries } : null;
+    return cotEntries.length ? { ...base, kind: 'cot', progressCursor: { jsonlPath: path, offset: lineStart }, cotEntries } : null;
   }
   if (!content.trim()) return null;
   return { ...base, kind: 'assistant_final', text: content };

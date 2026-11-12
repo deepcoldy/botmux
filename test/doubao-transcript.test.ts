@@ -10,7 +10,7 @@
  * the real logged-in account's session store.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -65,6 +65,37 @@ function makeSession(root: string): { roots: string[]; systemDir: string; assign
 }
 
 describe('doubao transcript bridge', () => {
+  it('drops stopped-turn tools written before the successor submit frontier without losing its own progress or final', () => {
+    const { assignment, trajectory } = makeSession(join(tmpdir(), `doubao-cancel-frontier-${process.pid}`));
+    const now = Date.parse('2026-11-12T00:00:00Z');
+    const queue = new CodexBridgeQueue(() => now);
+    const updates: Array<{ turnId: string; id: string }> = [];
+    queue.setCotObserver((entries, turn) => entries.forEach(entry => {
+      if (entry.kind === 'tool_call' || entry.kind === 'tool_result') updates.push({ turnId: turn.turnId, id: entry.id });
+    }));
+    queue.mark('A', 'Canceled old task', now);
+    writeFileSync(assignment, '## [2026-11-12T00:00:00Z] 需求\nCanceled old task\n');
+    writeFileSync(trajectory, '');
+    let drained = drainDoubaoTranscript(trajectory, 0);
+    queue.ingest(drained.events);
+    expect(queue.dropPendingTurn('A', undefined, true)).toBeDefined();
+    const rows = (id: string) => JSON.stringify({ role: 'assistant', tool_calls: [{ id, function: {
+      name: 'Read', arguments: '{"file_path":"中文.ts"}',
+    } }] }) + '\n' + JSON.stringify({ role: 'tool', tool_call_id: id, content: 'Tool completed' }) + '\n';
+    // The native CLI flushes old progress after handling the stop; the next
+    // poll has not run when B captures its submit frontier and gets accepted.
+    appendFileSync(trajectory, rows('old-task-a'));
+    queue.mark('B', 'New unrelated task', now, undefined, { jsonlPath: trajectory, offsetAtMark: statSync(trajectory).size });
+    appendFileSync(assignment, '## [2026-11-12T00:00:01Z] 需求\nNew unrelated task\n');
+    appendFileSync(trajectory, rows('new-task-b'));
+    drained = drainDoubaoTranscript(trajectory, drained.newOffset, { state: drained.state, openTurns: 0 });
+    queue.ingest(drained.events);
+    expect(updates).toEqual([{ turnId: 'B', id: 'new-task-b' }, { turnId: 'B', id: 'new-task-b' }]);
+    appendFileSync(trajectory, JSON.stringify({ role: 'assistant', content: 'B final' }) + '\n');
+    drained = drainDoubaoTranscript(trajectory, drained.newOffset, { state: drained.state, openTurns: 1 });
+    queue.ingest(drained.events);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'B', finalText: 'B final' }]);
+  });
   it('selects the artifact workspace only for an unambiguous bound native session', () => {
     const root = join(tmpdir(), `doubao-artifact-root-${process.pid}`);
     const { roots } = makeSession(root);

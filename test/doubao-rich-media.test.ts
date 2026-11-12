@@ -3,6 +3,11 @@ import { normalizeDoubaoReplyImages } from '../src/services/doubao-rich-media.js
 import { cardMarkdownImageReferences } from '../src/im/lark/card-markdown-image-references.js';
 import { spawnSync } from 'node:child_process';
 import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { resolveReplyImages } from '../src/im/lark/reply-images.js';
 
 const block = (refs: unknown, close = 'RichMediaCard') => `<RichMediaCard>${JSON.stringify({ refs })}</${close}>`;
 
@@ -28,6 +33,26 @@ describe('Doubao native image blocks', () => {
   it('escapes path punctuation without changing an already escaped file URL', () => {
     const output = normalizeDoubaoReplyImages(block(['/tmp/a (1)#?.png', 'file:///tmp/a%20b).png', 'file:///tmp/a(.png']));
     expect(cardMarkdownImageReferences(output).map(ref => ref.source)).toEqual(['/tmp/a%20%281%29%23%3F.png', 'file:///tmp/a%20b%29.png', 'file:///tmp/a%28.png']);
+  });
+
+  it.each([
+    { fileUrl: false, neighbor: false }, { fileUrl: true, neighbor: false },
+    { fileUrl: false, neighbor: true }, { fileUrl: true, neighbor: true },
+  ])('uploads the exact entity-shaped filename ($fileUrl, neighbor=$neighbor)', async ({ fileUrl, neighbor }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'doubao-entity-image-'));
+    try {
+      const source = join(dir, 'shot&amp;compare.png');
+      const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+      writeFileSync(source, png);
+      if (neighbor) writeFileSync(join(dir, 'shot&compare.png'), Buffer.concat([png, Buffer.from('different image')]));
+      const uploads: Buffer[] = [];
+      const output = await resolveReplyImages(normalizeDoubaoReplyImages(block([fileUrl ? pathToFileURL(source).href : source])), {
+        workingDir: dir, state: { omitImages: false }, owns: () => true,
+        upload: async bytes => { uploads.push(bytes); return 'img_v3_exact_source'; },
+      });
+      expect(uploads).toEqual([png]);
+      expect(output).toContain('![图片 1](img_v3_exact_source)');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('does not mistake unrelated inline code in the preceding prose for a quoted gallery', () => {

@@ -59,8 +59,9 @@ export function normalizeDoubaoReplyImages(input: string): string {
       const markdown = refs.map((ref: string, index: number) => {
         // Encode plain paths as destinations, including parentheses and fragments.
         // A file URL is already escaped; URL preserves its existing percent escapes.
+        // Escape ampersands too: Markdown would decode entity-shaped filenames.
         const source = (ref.startsWith('file:') ? new URL(ref).href : encodeURI(ref).replace(/[?#]/g,
-          char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).replace(/[()]/g,
+          char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).replace(/[()&]/g,
           char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
         return `${opening[0].slice(0, opening[0].indexOf('<'))}![图片 ${index + 1}](${source})`;
       }).join('\n\n');

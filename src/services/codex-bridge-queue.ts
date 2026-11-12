@@ -912,6 +912,11 @@ export class CodexBridgeQueue {
       // buffered — a late replay into the wrong turn is worse than a gap).
       const target = this.targetForNativeEvent(ev);
       if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+        // Native tool rows can flush after a stop but before the next submit.
+        // A parse-time timestamp must not turn those old bytes into new work.
+        if (ev.progressCursor && ev.progressCursor.jsonlPath === target.recoveryJsonlPathAtMark
+          && target.recoveryOffsetAtMark !== undefined
+          && ev.progressCursor.offset < target.recoveryOffsetAtMark) return;
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
