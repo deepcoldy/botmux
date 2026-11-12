@@ -8989,6 +8989,8 @@ describe('worker startup failure delivery', () => {
     expect(replacement.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init', adoptMode: true, adoptSource: target.source ?? 'tmux',
       adoptCliPid: 4242, cliId: target.cliId, prompt: '',
+      // A retry re-attaches; it must not re-post the "last turn before /adopt" preamble.
+      adoptRestoredFromMetadata: true,
     }));
     if (target.cliId !== 'claude-code') {
       expect(ds.initConfig?.cliSessionId).toBe('original-cli-session');
