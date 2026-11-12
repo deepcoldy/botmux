@@ -20,7 +20,7 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
-import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import { larkUserNative, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import { larkToolPrompt } from '../../core/lark-tool-binding.js';
 import type { CliId } from './types.js';
 
@@ -302,7 +302,7 @@ export function buildManagedLarkToolPromptBlocks(
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',
-      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel))}`,
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel, larkUserNative(policy)))}`,
       '</botmux_lark_tool>',
     ].join('\n')
     : '';

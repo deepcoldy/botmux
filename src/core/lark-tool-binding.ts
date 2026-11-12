@@ -42,6 +42,8 @@ export interface LarkToolBinding {
   appId: string;
   brand: Brand;
   defaultAs: 'bot' | 'user';
+  /** `--as user` runs natively (per-person auth is on without `lark-user`); only changes the guidance text. */
+  userNative?: boolean;
   ipcPort?: number;
   accessKey: string;
   realBinary: string;
@@ -235,6 +237,7 @@ export function prepareLarkToolEnv(input: {
   appId: string;
   brand?: Brand;
   defaultAs?: 'bot' | 'user';
+  userNative?: boolean;
   effectivePath?: string;
   runner?: { command: string; args: string[] };
   /** Sandboxed session: the wrapper must name its runner by realpath, since a
@@ -255,6 +258,7 @@ export function prepareLarkToolEnv(input: {
   const binding: LarkToolBinding = {
     version: 2, sessionId: input.sessionId, appId: input.appId,
     brand: normalizeBrand(input.brand), defaultAs: input.defaultAs ?? 'bot',
+    ...(input.userNative ? { userNative: true } : {}),
     ipcPort: Number(input.env.BOTMUX_DAEMON_IPC_PORT) || undefined,
     accessKey: prior?.appId === input.appId && prior.brand === normalizeBrand(input.brand)
       ? prior.accessKey : randomBytes(32).toString('hex'),
@@ -301,7 +305,10 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
   catch { return false; }
 }
 
-export function larkToolPrompt(appId: string, locale?: string, headlessNoUserChannel = false): string {
+export function larkToolPrompt(appId: string, locale?: string, headlessNoUserChannel = false, userNative = false): string {
+  if (userNative) return locale === 'en'
+    ? `lark-cli uses application ${appId} by default and calls default to this bot. --as user runs with this machine's own lark-cli configuration and user login (the account is named on stderr by each call), not the current user's authorization; botmux neither picks nor requests an authorization for it. If it reports that the machine login is missing or lacks a permission, report that as is; do not run botmux auth request for it. To use a different application or profile, specify --profile <profile>. Do not repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。--as user 使用本机 lark-cli 自己的配置和用户登录（每次调用会在 stderr 提示所用账号），不是当前用户的授权，botmux 不为它选择或申请授权。提示本机未登录或缺权限时原样说明，不要为它运行 botmux auth request；若需使用其他应用或 profile，可显式指定 --profile <profile>。不要重复执行结果尚不确定的写操作。`;
   if (headlessNoUserChannel) return locale === 'en'
     ? `lark-cli uses application ${appId}. Calls default to this bot. This headless session has no human authorization channel; --as user is unavailable. If the bot lacks access, report the blocked resource through the session result channel so the caller can resolve it. Do not change profiles or repeat writes whose result is uncertain.`
     : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用。本后台会话没有真人授权通道，--as user 不可用。bot 无权时，通过会话结果通道报告受阻资源，由调用方处理权限。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
@@ -316,7 +323,10 @@ export function larkToolPromptFromEnv(
 ): string {
   const path = env.BOTMUX_LARK_TOOL_BINDING;
   if (!path) return '';
-  try { return larkToolPrompt(readLarkToolBinding(path).appId, locale, isHeadlessSessionChatId(env.BOTMUX_CHAT_ID ?? '')); }
+  try {
+    const binding = readLarkToolBinding(path);
+    return larkToolPrompt(binding.appId, locale, isHeadlessSessionChatId(env.BOTMUX_CHAT_ID ?? ''), binding.userNative === true);
+  }
   catch { return ''; }
 }
 

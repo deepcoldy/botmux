@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -693,6 +693,54 @@ describe('platform-issued user credentials in a bound session', () => {
     const bot = await runTool(['docs', '+fetch'], ipc!.port); expect(bot.code, bot.err).toBe(0);
     expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
   });
+  describe('per-person auth on without lark-user: --as user is native to the machine', () => {
+    const withBot = (triggerUserAuth?: unknown) => vi.mocked(bots.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
+      ...(triggerUserAuth ? { triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) } : {}),
+    } } as any);
+    const installHomeTool = () => {
+      installFakeTool();
+      writeFileSync(binding.realBinary, '#!/usr/bin/env node\nif (process.argv[2] === "auth" && process.argv[3] === "status") { require("fs").appendFileSync(__filename + ".status", process.env.HOME + "\\n"); process.stdout.write(JSON.stringify({ userName: "机器\\u001b[0m用户" })); process.exit(0); }\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.HOME,process.env.LARKSUITE_CLI_CONFIG_DIR,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n');
+    };
+    it('bytecloud only: the real lark-cli runs with the machine HOME and config, no credential and no authorization request', async () => {
+      withBot({ enabled: true, capabilities: ['bytecloud'] });
+      installHomeTool();
+      const requestAuth = vi.spyOn(tokens, 'requestUserAuthorization');
+      const run = await runTool(['docs', '+fetch', '--as', 'user'], ipc!.port);
+      expect(run.code, run.err).toBe(0);
+      expect(run.out).toBe(`${process.env.HOME}|||docs +fetch --as user`);
+      expect(run.err).toContain('botmux: --as user 使用本机 lark-cli 登录（机器[0m用户）');
+      expect(run.err).not.toContain('\u001b');
+      // Only the runner asks the machine's lark-cli who is logged in (with the caller's HOME); the daemon spawns nothing.
+      expect(readFileSync(`${binding.realBinary}.status`, 'utf8')).toBe(`${process.env.HOME}\n`);
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+      expect(grants).toEqual([]);
+      const scope = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+        body: JSON.stringify({ scopes: ['im:chat:read'] }),
+      });
+      expect(scope.status).toBe(409);
+      expect(requestAuth).not.toHaveBeenCalled();
+    });
+    it('--as bot keeps the bound application and its tenant token', async () => {
+      withBot({ enabled: true, capabilities: ['bytecloud'] });
+      installFakeTool();
+      const bot = await runTool(['docs', '+fetch', '--as', 'bot'], ipc!.port);
+      expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
+    });
+    it.each([
+      ['lark-user on', { enabled: true, capabilities: ['lark-user'] }],
+      ['no triggerUserAuth', undefined],
+      ['enabled false', { enabled: false, capabilities: ['bytecloud'] }],
+      ['a legacy config naming only tools', { enabled: true, tools: ['bytedcli'] }],
+    ])('%s: --as user keeps the person\'s own credential', async (_label, policy) => {
+      withBot(policy);
+      installFakeTool();
+      const user = await runTool(['docs', '+fetch', '--as', 'user'], ipc!.port);
+      expect(user.code, user.err).toBe(0);
+      expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
+    });
+  });
   describe('the runner trusts a different application only for an explicit platform user grant', () => {
     let fake: Server; let reply: Record<string, unknown>;
     beforeEach(async () => {
@@ -758,12 +806,12 @@ describe('platform-issued user credentials in a bound session', () => {
       expect(dm).toHaveBeenCalledTimes(2);
     });
 
-    it('the scope request of an unattended turn keeps upstream behaviour when lark-user is off or there is no policy', async () => {
+    it('the scope request of an unattended turn keeps upstream behaviour when per-person auth is off or there is no policy', async () => {
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
         authUrl: 'https://accounts.example/device?code=X', scopes: ['im:chat:read'], expiresIn: 600, poll: vi.fn(),
       } as any);
-      for (const policy of [undefined, { enabled: true, capabilities: ['bytecloud'] }]) {
+      for (const policy of [undefined, { enabled: false, capabilities: ['bytecloud'] }]) {
         withPolicy(policy);
         const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
           method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
@@ -775,9 +823,9 @@ describe('platform-issued user credentials in a bound session', () => {
       expect(dm).not.toHaveBeenCalled();
     });
 
-    it('lark-user off or no policy: upstream behaviour, nothing sent', async () => {
+    it('per-person auth off or no policy: upstream behaviour, nothing sent', async () => {
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
-      for (const policy of [undefined, { enabled: true, capabilities: ['bytecloud'] }]) {
+      for (const policy of [undefined, { enabled: false, capabilities: ['bytecloud'] }]) {
         withPolicy(policy);
         const response = await request('user');
         expect(response.status).toBe(403);

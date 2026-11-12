@@ -576,7 +576,7 @@ import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBo
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
-import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, capabilityOn, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies, larkUserNative, credentialSourceOf, capabilityOn, capabilitiesOf, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
@@ -4012,6 +4012,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let bot: ReturnType<typeof getBot>['config'];
   try { bot = getBot(targetLarkAppId!).config; }
   catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  // Per-person auth is on but lark-user is not among its capabilities: the machine's own lark-cli login serves `--as user`.
+  if (body.mode === 'user' && larkUserNative(bot.triggerUserAuth)) {
+    return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', native: true });
+  }
   if (body.mode === 'user' && validHeadlessSession) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
   }
@@ -4372,7 +4376,7 @@ for (const action of ['auth-request', 'auth-status']) {
     // keeps completing it while the session/app stay valid (isAuthorizationValid),
     // and auth-status publishes the token only to a live turn whose caller is
     // the same human (frozen on the request). A different caller stays refused.
-    if (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
+    if (larkUserNative(cfg.triggerUserAuth) || (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli'))) {
       return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
     }
 
@@ -12075,6 +12079,20 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) =
         }
       } catch { /* 未注册 bot → applyConfigField 会给出 bot_not_registered */ }
       merged = { ...preserved, ...(incoming as Record<string, unknown>) };
+      // A legacy config (tools only) shown with its derived capabilities, saved unchanged in that
+      // respect, stays legacy: writing the list out would change what `--as user` does.
+      try {
+        const prev = getBot(cachedLarkAppId).config.triggerUserAuth;
+        const sent = (incoming as { capabilities?: unknown }).capabilities;
+        if (prev && prev.capabilities === undefined && Array.isArray(sent)) {
+          const derived = capabilitiesOf({ ...prev, enabled: true });
+          if (sent.length === derived.size && sent.every(c => derived.has(c as never))) {
+            const legacy: Record<string, unknown> = { ...(merged as Record<string, unknown>), tools: prev.tools };
+            delete legacy.capabilities;
+            merged = legacy;
+          }
+        }
+      } catch { /* 未注册 bot → applyConfigField 会给出 bot_not_registered */ }
     }
     // coerceConfigValue 吃 JSON 文本（与 IM 入口一致），返回 parser 归一化后的对象。
     const coerced = coerceConfigValue(spec, JSON.stringify(merged));

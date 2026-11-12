@@ -431,6 +431,8 @@ export type BotDefaultsRow = {
     tools?: Array<'lark-cli' | 'bytedcli'>;
     /** Per-capability switches. The daemon fills it for stored tools-only configs. */
     capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
+    /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
+    legacyCapabilities?: boolean;
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';

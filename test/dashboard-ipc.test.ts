@@ -4,6 +4,7 @@
 // outside the test fence instead of touching live botmux data (see the helper).
 import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { codexRpcEligible } from '../src/codex-rpc-lifecycle.js';
+import { larkUserNative } from '../src/services/trigger-user-auth.js';
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
 
@@ -4288,6 +4289,43 @@ describe('PUT + GET /api/bot-trigger-user-auth — 开关刷新回显', () => {
       // An invalid capability is refused and leaves the stored policy alone.
       expect((await put({ enabled: true, capabilities: ['bits'] })).status).toBe(400);
       expect(stored()).toMatchObject({ capabilities: ['lark-user', 'meego'] });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('saving a legacy tools-only config unchanged in its capabilities keeps it legacy; changing them writes the list', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-legacy-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-legacy-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+        triggerUserAuth: { enabled: true, tools: ['bytedcli'] },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (triggerUserAuth: object) => fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ triggerUserAuth }),
+      });
+      const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth;
+      // What the page sends for an unrelated save: the derived capabilities of the legacy config.
+      expect((await put({ enabled: true, capabilities: ['bytecloud', 'meego'], delegateOnMention: false })).status).toBe(200);
+      expect(stored()).toMatchObject({ tools: ['bytedcli'], delegateOnMention: false });
+      expect(stored()).not.toHaveProperty('capabilities');
+      expect(larkUserNative(getBot(appId).config.triggerUserAuth)).toBe(false);
+      // A real change of the capabilities is an explicit choice.
+      expect((await put({ enabled: true, capabilities: ['bytecloud'] })).status).toBe(200);
+      expect(stored()).toMatchObject({ capabilities: ['bytecloud'] });
+      expect(larkUserNative(getBot(appId).config.triggerUserAuth)).toBe(true);
     } finally {
       if (handle) await handle.close();
       handle = null;

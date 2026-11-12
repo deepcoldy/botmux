@@ -87,8 +87,13 @@ export function brandMapByAppId(
 function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig | null {
   try {
     const parsed = parseTriggerUserAuthConfig(raw);
-    // The page edits capabilities, whichever form the config was stored in.
-    return parsed && { ...parsed, capabilities: parsed.capabilities ?? [...capabilitiesOf({ ...parsed, enabled: true })] };
+    // The page edits capabilities, whichever form the config was stored in; `legacyCapabilities`
+    // says they were derived from `tools`, so the page does not describe them as an explicit choice.
+    return parsed && {
+      ...parsed,
+      capabilities: parsed.capabilities ?? [...capabilitiesOf({ ...parsed, enabled: true })],
+      ...(parsed.capabilities ? {} : { legacyCapabilities: true }),
+    };
   } catch { return null; }
 }
 

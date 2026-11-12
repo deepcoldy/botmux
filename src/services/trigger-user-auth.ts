@@ -385,6 +385,15 @@ export function capabilityOn(
   return capabilitiesOf(config).has(capability);
 }
 
+/**
+ * Whether a bot with per-person auth on leaves `lark-cli --as user` to the machine's own lark-cli
+ * login: an explicit `capabilities` list without `lark-user`. A config that only names `tools`
+ * (legacy) keeps its upstream behaviour.
+ */
+export function larkUserNative(config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined): boolean {
+  return config?.enabled === true && config.capabilities !== undefined && !capabilityOn(config, 'lark-user');
+}
+
 /** The effective credential source; absent means `auto`. */
 export function credentialSourceOf(
   config: Pick<TriggerUserAuthConfig, 'credentialSource'> | null | undefined,
