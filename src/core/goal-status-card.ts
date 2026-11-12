@@ -10,10 +10,38 @@ export interface GoalStatusCardRecord {
   postState: 'prepared' | 'sending' | 'sent' | 'uncertain';
   pendingPatch: boolean;
   sequence?: number;
-  /** A replacement card has already been posted after a terminal PATCH
-   *  failure. Cleared by the next successful write, so a persistently broken
-   *  write surface cannot alternate POST/PATCH forever. */
-  reposted?: boolean;
+  /** The stored message can never accept another write (withdrawn, or its
+   *  topic is gone). The goal it shows stays frozen there; only a different
+   *  goal opens a new card. */
+  dead?: boolean;
+  /** Identity of the goal the message last displayed (or was posted with, while
+   *  the POST is unconfirmed). A goal the message never showed is not frozen
+   *  with it when the message turns out dead or its POST unconfirmed. */
+  shownGoal?: GoalIdentity;
+}
+
+type GoalIdentity = Pick<NativeGoalState, 'goalId' | 'createdAt'>;
+
+/** Retry delay after consecutive failed PATCHes doubles from the 2 s tick up to
+ *  5 minutes. The Lark gate already retries rate limits inside each call; what
+ *  fails here is an outage (minutes) or a message that can no longer be written
+ *  (e.g. past its edit window). Never giving up lets a pending completion land
+ *  after an outage; the cap keeps a permanently broken card at ~12 calls/hour. */
+const RETRY_BASE_MS = 2000;
+const RETRY_MAX_MS = 5 * 60_000;
+
+/** The same native goal across objective edits and status changes. */
+function sameGoalIdentity(a: GoalIdentity, b: GoalIdentity): boolean {
+  return a.goalId && b.goalId ? a.goalId === b.goalId : a.createdAt === b.createdAt;
+}
+
+function goalIdentity(goal: NativeGoalState): GoalIdentity {
+  return goal.goalId ? { goalId: goal.goalId, createdAt: goal.createdAt } : { createdAt: goal.createdAt };
+}
+
+function sameGoalState(a: NativeGoalState, b: NativeGoalState): boolean {
+  return a.goalId === b.goalId && a.objective === b.objective && a.status === b.status
+    && a.createdAt === b.createdAt && a.updatedAt === b.updatedAt && a.timeUsedSeconds === b.timeUsedSeconds;
 }
 
 export interface GoalStatusCardOrigin {
@@ -49,8 +77,10 @@ export function goalElapsedSeconds(goal: NativeGoalState): number {
 export function buildGoalStatusCard(goal: NativeGoalState, now = Date.now(), locale: 'zh' | 'en' = 'zh'): string {
   const completed = goal.status === 'complete';
   const labels = locale === 'en'
-    ? { active: 'Goal in progress', complete: 'Goal completed', paused: 'Goal paused', blocked: 'Goal blocked', cleared: 'Goal cleared' }
-    : { active: '目标进行中', complete: '目标已完成', paused: '目标已暂停', blocked: '目标受阻', cleared: '目标已清除' };
+    ? { active: 'Goal in progress', complete: 'Goal completed', paused: 'Goal paused', blocked: 'Goal blocked', cleared: 'Goal cleared',
+      usage_limited: 'Goal hit usage limits', budget_limited: 'Goal budget used up' }
+    : { active: '目标进行中', complete: '目标已完成', paused: '目标已暂停', blocked: '目标受阻', cleared: '目标已清除',
+      usage_limited: '目标已达用量上限', budget_limited: '目标预算已用完' };
   const seconds = goalElapsedSeconds(goal);
   const elapsed = `${Math.floor(seconds / 3600).toString().padStart(2, '0')}:${Math.floor(seconds / 60 % 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
   const objective = Array.from(goal.objective.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim());
@@ -74,9 +104,8 @@ export interface GoalStatusCardDeps {
   patch(messageId: string, card: string, sequence: number, uuid: string): Promise<unknown>;
   owns(): boolean;
   canDisplay?(): boolean;
-  /** Errors that can never succeed on retry (message withdrawn, edit window
-   *  expired, topic unavailable). They force a replacement POST instead of
-   *  an endless PATCH loop. */
+  /** Errors that prove the message can never be written again (withdrawn,
+   *  topic gone). The card is left as it is instead of retried or reposted. */
   isTerminalError?(error: unknown): boolean;
   warn(error: unknown): void;
   locale?: 'zh' | 'en';
@@ -91,6 +120,8 @@ export class GoalStatusCardController {
   private timer?: ReturnType<typeof setInterval>;
   private disposed = false;
   private rendered?: string;
+  private failures = 0;
+  private retryAt = 0;
   constructor(private deps: GoalStatusCardDeps) {
     const previous = deps.read();
     if (previous && deps.binding && previous.binding !== deps.binding) {
@@ -105,7 +136,8 @@ export class GoalStatusCardController {
     const previous = this.deps.read();
     const now = this.deps.now?.() ?? Date.now();
     if (!goal) {
-      if (!previous) return;
+      // A replacement worker re-reports the same clear; the card already shows it.
+      if (!previous || previous.goal.status === 'cleared' && !previous.pendingPatch) return;
       goal = { ...previous.goal, status: 'cleared', updatedAt: now / 1000,
         timeUsedSeconds: goalElapsedSeconds(previous.goal) };
     }
@@ -113,8 +145,22 @@ export class GoalStatusCardController {
       || goal.createdAt === previous.goal.createdAt && goal.updatedAt < previous.goal.updatedAt
       || goal.createdAt === previous.goal.createdAt && goal.objective === previous.goal.objective
         && previous.goal.status === 'complete' && goal.status !== 'complete' && goal.updatedAt <= previous.goal.updatedAt)) return;
-    this.deps.save({ ...previous, goal, binding: this.deps.binding, uuid: previous?.uuid ?? randomUUID(),
-      turnId: previous?.turnId ?? turnId, postState: previous?.postState ?? 'prepared', pendingPatch: true });
+    // A replacement worker re-reports the goal it last saw. A settled card
+    // already shows it, and re-PATCHing an old message can only fail.
+    if (previous?.messageId && !previous.pendingPatch && goal.status !== 'active' && sameGoalState(goal, previous.goal)) return;
+    this.failures = 0; this.retryAt = 0;
+    const sameGoal = !!previous && sameGoalIdentity(goal, previous.goal);
+    if (previous && (previous.dead || !previous.messageId && previous.postState === 'uncertain')) {
+      // A dead card keeps the goal it last showed; reposting it would undo a
+      // deliberate recall, and an unconfirmed POST may already exist. A
+      // different goal is new content and gets its own card.
+      if (sameGoalIdentity(goal, previous.shownGoal ?? previous.goal)) { this.deps.save({ ...previous, goal }); return; }
+      this.deps.save({ goal, binding: this.deps.binding, uuid: randomUUID(), turnId, postState: 'prepared', pendingPatch: true });
+    } else {
+      this.deps.save({ ...previous, goal, binding: this.deps.binding, uuid: previous?.uuid ?? randomUUID(),
+        turnId: sameGoal ? previous!.turnId ?? turnId : turnId ?? previous?.turnId,
+        postState: previous?.postState ?? 'prepared', pendingPatch: true });
+    }
     this.refresh();
   }
 
@@ -136,7 +182,8 @@ export class GoalStatusCardController {
   private arm(): void {
     if (this.disposed) return;
     const state = this.deps.read();
-    if (!this.deps.owns() || this.deps.canDisplay?.() === false || !state || !state.messageId && state.postState === 'uncertain'
+    if (!this.deps.owns() || this.deps.canDisplay?.() === false || !state || state.dead
+      || !state.messageId && state.postState === 'uncertain'
       || state.goal.status !== 'active' && !state.pendingPatch) {
       if (this.timer) clearInterval(this.timer); this.timer = undefined; return;
     }
@@ -148,11 +195,11 @@ export class GoalStatusCardController {
     if (this.deps.canDisplay?.() === false) { this.suspend(); return; }
     let state = this.deps.read();
     if (!state) return;
-    if (state.messageId && state.goal.status !== 'active' && !state.pendingPatch) { this.arm(); return; }
+    if (state.dead || state.messageId && state.goal.status !== 'active' && !state.pendingPatch) { this.arm(); return; }
     if (!state.messageId) {
       // A restart or unknown POST result must never create a second card.
       if (state.postState !== 'prepared') { this.arm(); return; }
-      this.deps.save({ ...state, postState: 'sending' });
+      this.deps.save({ ...state, postState: 'sending', shownGoal: goalIdentity(state.goal) });
       let messageId: string;
       try { messageId = await this.deps.post(buildGoalStatusCard(state.goal, this.deps.now?.(), this.deps.locale), state.uuid, state.turnId); }
       catch (error) {
@@ -170,32 +217,36 @@ export class GoalStatusCardController {
     if (this.deps.canDisplay?.() === false) { this.suspend(); return; }
     const card = buildGoalStatusCard(state.goal, this.deps.now?.(), this.deps.locale);
     if (card === this.rendered) {
-      if (state.pendingPatch || state.reposted) this.deps.save({ ...state, pendingPatch: false, reposted: false });
+      if (state.pendingPatch) this.deps.save({ ...state, pendingPatch: false });
       this.arm(); return;
     }
+    if ((this.deps.now?.() ?? Date.now()) < this.retryAt) { this.arm(); return; }
     const sequence = (state.sequence ?? 0) + 1;
     const sentState = { ...state, sequence };
     this.deps.save(sentState);
     try {
       await this.deps.patch(state.messageId!, card, sequence, `${state.uuid}-${sequence}`);
       this.rendered = card;
+      this.failures = 0;
       const latest = this.deps.read();
-      if (latest === sentState) this.deps.save({ ...latest, pendingPatch: false, reposted: false });
+      // A newer change that arrived meanwhile stays pending, but this goal is now on the card.
+      if (latest?.uuid === state.uuid) {
+        this.deps.save({ ...latest, shownGoal: goalIdentity(state.goal), ...(latest === sentState ? { pendingPatch: false } : {}) });
+      }
     } catch (error) {
       this.deps.warn(error);
-      // A withdrawn/expired/blocked message can never accept another PATCH:
-      // drop the dead message id and re-enter the POST path once. If the
-      // conversation itself is unavailable the replacement POST fails too and
-      // lands in 'uncertain', which disarms the timer instead of looping.
-      if (this.deps.isTerminalError?.(error)) {
-        const latest = this.deps.read();
-        if (latest?.uuid !== state.uuid) { this.arm(); return; }
-        if (latest.reposted) {
-          // The replacement card already carries the latest full card content
-          // from its POST, so leaving it un-patched loses nothing.
-          this.deps.save({ ...latest, pendingPatch: false });
+      const latest = this.deps.read();
+      if (latest?.uuid === state.uuid) {
+        if (this.deps.isTerminalError?.(error)) {
+          if (latest.shownGoal && !sameGoalIdentity(latest.goal, latest.shownGoal)) {
+            // The dead message never showed this goal: give it its own card.
+            this.deps.save({ goal: latest.goal, binding: latest.binding, uuid: randomUUID(), turnId: latest.turnId,
+              postState: 'prepared', pendingPatch: true });
+          } else this.deps.save({ ...latest, dead: true, pendingPatch: false });
         } else {
-          this.deps.save({ ...latest, messageId: undefined, postState: 'prepared', reposted: true });
+          // Keep pendingPatch so a completion still lands after an outage.
+          this.failures++;
+          this.retryAt = (this.deps.now?.() ?? Date.now()) + Math.min(RETRY_BASE_MS * 2 ** (this.failures - 1), RETRY_MAX_MS);
         }
       }
     }

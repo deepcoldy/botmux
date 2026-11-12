@@ -1563,10 +1563,20 @@ export async function updateCardJson(larkAppId: string, cardId: string, messageI
   return executeWithLarkGate(larkAppId, 'updateCardJson', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     if (options?.beforeWrite) await options.beforeWrite();
-    const response = await getBotClient(larkAppId).cardkit.v1.card.update({
-      path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
-    });
-    if (response.code !== 0) throw larkApiError('update CardKit card', response);
+    let response: any;
+    try {
+      response = await getBotClient(larkAppId).cardkit.v1.card.update({
+        path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
+      });
+    } catch (err) {
+      // Same withdrawn signal resolveCardKitId maps for the CardKit API.
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw err;
+    }
+    if (response.code !== 0) {
+      if (response.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw larkApiError('update CardKit card', response);
+    }
   });
 }
 

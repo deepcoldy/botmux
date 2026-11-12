@@ -177,6 +177,16 @@ describe('stop policy at the actual Lark write boundary', () => {
     expect(error).toBeInstanceOf(TopicSendError); expect(error).not.toBeInstanceOf(MessageWithdrawnError);
     expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.hook).not.toHaveBeenCalled();
   });
+  it('reports a withdrawn whole-card update as withdrawn under both topic policies', async () => {
+    mocks.cardUpdate.mockResolvedValue({ code: 230011, msg: 'withdrawn' });
+    await expect(updateCardJson('app', 'card', 'om_card', '{}', 1, 'one')).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
+    mocks.config.topicUnavailablePolicy = 'legacy';
+    mocks.cardUpdate.mockRejectedValue({ isAxiosError: true, response: { status: 400, data: { code: 230011 } } });
+    await expect(updateCardJson('app', 'card', 'om_card', '{}', 2, 'two')).rejects.toBeInstanceOf(MessageWithdrawnError);
+    mocks.cardUpdate.mockResolvedValue({ code: 99991400, msg: 'busy' });
+    const other = await updateCardJson('app', 'card', 'om_card', '{}', 3, 'three').catch(value => value);
+    expect(other).not.toBeInstanceOf(MessageWithdrawnError); expect(other).not.toBeInstanceOf(TopicSendError);
+  });
   it('does not pin a surviving card beneath an unavailable root', async () => {
     rootDeleted = true;
     await expect(pinMessage('app', 'om_card')).resolves.toBeNull();

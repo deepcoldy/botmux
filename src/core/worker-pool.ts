@@ -20852,8 +20852,10 @@ function setupWorkerHandlers(
           },
           owns: goalCardOwns,
           canDisplay: goalCardCanDisplay,
-          isTerminalError: error => error instanceof MessageWithdrawnError
-            || error instanceof MessageUpdateExpiredError || error instanceof TopicSendError,
+          // TOPIC_SEND_CHECK_FAILED is a lookup that may succeed next tick; only a
+          // proven withdrawal retires the card.
+          isTerminalError: error => error instanceof MessageWithdrawnError || error instanceof MessageUpdateExpiredError
+            || error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED',
           locale: localeForBot(ds.larkAppId) === 'en' ? 'en' : 'zh',
           warn: error => logger.warn(`[${t}] Goal status card update failed: ${error instanceof Error ? error.message : String(error)}`),
           post: (card, uuid, turnId) => scopedReply(card, 'interactive', turnId, {
@@ -20861,8 +20863,11 @@ function setupWorkerHandlers(
           }),
           patch: async (messageId, card, sequence, uuid) => {
             if (goalCardEntity?.messageId !== messageId) {
+              // Convert first: it classifies a withdrawn card, while the chat
+              // lookup of a withdrawn message only yields null.
+              const cardId = await resolveCardKitId(ds.larkAppId, messageId);
               if (await getMessageChatId(ds.larkAppId, messageId) !== ds.chatId) throw new Error('goal card chat mismatch');
-              goalCardEntity = { messageId, cardId: await resolveCardKitId(ds.larkAppId, messageId) };
+              goalCardEntity = { messageId, cardId };
             }
             return updateCardJson(ds.larkAppId, goalCardEntity.cardId, messageId, card, sequence, uuid, {
               beforeWrite: () => { if (!goalCardCanDisplay()) throw new Error('goal card owner retired'); },
