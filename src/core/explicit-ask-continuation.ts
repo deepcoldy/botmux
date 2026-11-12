@@ -85,6 +85,7 @@ export function createExplicitAskContinuation(deps: {
   shouldInvalidate?: (receipt: ExplicitAskReceipt) => boolean;
   invalidate?: (input: CreateAskInput, reason: string) => void;
   retire?: (input: CreateAskInput, reason: string) => AskResult | undefined;
+  canRetire?: (receipt: ExplicitAskReceipt) => boolean;
   snapshot?: (input: CreateAskInput) => {
     askId: string;
     cardMessageId?: string;
@@ -141,6 +142,7 @@ export function createExplicitAskContinuation(deps: {
       || receipt.retirement.reason !== control.reason)) throw new Error('explicit Ask retirement conflict');
     if (receipt.result) return receipt;
     if (!deps.retire) throw new Error('explicit Ask retirement unsupported');
+    if (!deps.canRetire?.(receipt)) throw new Error('explicit Ask retirement authority conflict');
     const key = keyFor(receipt.input);
     receipt = { ...receipt, retirement: receipt.retirement ?? {
       operationId: control.operationId, reason: control.reason, requestedAt: now(),
@@ -202,12 +204,18 @@ export function createExplicitAskContinuation(deps: {
           const receipt = read(key)!;
           if (receipt.version !== 1 || receipt.input.larkAppId !== deps.appId
             || keyFor(receipt.input) !== key) continue;
-          if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result) {
+          if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result?.kind === 'invalidated') {
             if (now() - receipt.settledAt! >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
             continue;
           }
           if (!receipt.result) {
             if (receipt.retirement && deps.retire) {
+              const winner = deps.snapshot?.(receipt.input)?.result;
+              if (winner?.kind === 'answered') {
+                write(key, { ...receipt, result: winner, settledAt: now() });
+                continue;
+              }
+              if (!deps.canRetire?.(receipt)) continue;
               const result = deps.retire(receipt.input, receipt.retirement.reason);
               if (result) write(key, { ...receipt, result, settledAt: now() });
               continue;

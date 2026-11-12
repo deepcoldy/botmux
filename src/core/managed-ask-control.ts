@@ -30,10 +30,25 @@ export interface ManagedAskSession {
   workerGeneration?: number;
   workerAlive: boolean;
   turnId?: string;
+  dispatchAttempt?: number;
   safeToSuspend: boolean;
   resourceOwned: boolean;
   suspensionConfirmed?: boolean;
-  terminatedTurnIds?: ReadonlyArray<string>;
+  terminalExecutionKeys?: ReadonlyArray<string>;
+}
+
+export function managedAskOriginKey(origin: ExplicitAskControl['origin']): string {
+  return JSON.stringify([origin.workerGeneration, origin.turnId, origin.dispatchAttempt ?? null]);
+}
+
+export function managedAskExecutionOwned(request: ExplicitAskControl, session: ManagedAskSession | undefined): boolean {
+  if (!session || session.larkAppId !== request.larkAppId || session.chatId !== request.chatId
+    || session.rootMessageId !== request.rootMessageId || !session.resourceOwned
+    || session.workerGeneration !== request.origin.workerGeneration) return false;
+  if (session.workerAlive && session.turnId !== undefined) {
+    return session.turnId === request.origin.turnId && session.dispatchAttempt === request.origin.dispatchAttempt;
+  }
+  return session.terminalExecutionKeys?.includes(managedAskOriginKey(request.origin)) === true;
 }
 
 export function createManagedAskControl(deps: {
@@ -81,9 +96,7 @@ export function createManagedAskControl(deps: {
     const receipt = validate(request);
     if (receipt.result?.kind === 'answered') return result(request, receipt, 'answered');
     const session = deps.session(request.sessionId)!;
-    if (session.workerGeneration !== request.origin.workerGeneration
-      || (session.workerAlive && session.turnId !== request.origin.turnId)
-      || !session.resourceOwned) return result(request, receipt, 'conflict');
+    if (!managedAskExecutionOwned(request, session)) return result(request, receipt, 'conflict');
     const retired = deps.retire(request);
     return result(request, retired, retired.result?.kind === 'answered' ? 'answered' : 'draining');
   }
@@ -95,19 +108,14 @@ export function createManagedAskControl(deps: {
       throw new Error('managed Ask retirement conflict');
     }
     const session = deps.session(request.sessionId)!;
-    if (session.workerGeneration !== request.origin.workerGeneration || !session.resourceOwned
-      || (session.workerAlive && session.turnId !== request.origin.turnId
-        && !(session.turnId === undefined && session.terminatedTurnIds?.includes(request.origin.turnId)))) {
+    if (!managedAskExecutionOwned(request, session)) {
       return result(request, receipt, 'conflict');
     }
     if (!session.workerAlive) return result(request, receipt, session.suspensionConfirmed ? 'suspended' : 'unknown');
     const stillOwned = () => {
       const current = deps.session(request.sessionId);
-      return !!current && current.larkAppId === request.larkAppId && current.chatId === request.chatId
-        && current.rootMessageId === request.rootMessageId && current.workerGeneration === request.origin.workerGeneration
-        && current.workerAlive && current.resourceOwned && current.safeToSuspend
-        && current.terminatedTurnIds?.includes(request.origin.turnId) === true
-        && (current.turnId === undefined || current.turnId === request.origin.turnId);
+      return managedAskExecutionOwned(request, current) && !!current?.workerAlive && current.safeToSuspend
+        && current.terminalExecutionKeys?.includes(managedAskOriginKey(request.origin)) === true;
     };
     if (!stillOwned() || releasing.has(request.sessionId)) return result(request, receipt, 'draining');
     releasing.add(request.sessionId);

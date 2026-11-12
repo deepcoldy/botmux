@@ -27,12 +27,73 @@ function setup() {
   const register = vi.fn(async () => answer);
   const dispatch = vi.fn(async () => true);
   const onError = vi.fn();
-  const deps = { dir, appId: 'app', register, dispatch, onError, now: () => clock, canResume: () => resumable };
+  const deps = { dir, appId: 'app', register, dispatch, onError, now: () => clock, canResume: () => resumable, canRetire: () => true };
   return { deps, manager: createExplicitAskContinuation(deps), register, dispatch, onError,
     tick: () => { clock += 6000; }, advance: (ms: number) => { clock += ms; },
     setResumable: (value: boolean) => { resumable = value; } };
 }
 describe('explicit Ask durable continuation', () => {
+  it('recovers the first answer after strict retirement failure and a lost original caller', async () => {
+    const fixture = setup();
+    const store = createAskPersistStore(join(fixture.deps.dir, 'broker'));
+    let card: PendingAsk | undefined;
+    let failWrite = false;
+    const wire = () => {
+      setAskPersistStore({ ...store, put: (value, options) => {
+        if (failWrite && options?.strict) throw new Error('retirement write failed');
+        store.put(value, options);
+      } });
+      setCanTalkChecker(() => true);
+      setCardDispatcher({ send: async ask => { card = ask; return { messageId: 'card' }; } });
+    };
+    wire();
+    const waitingInput = { ...input, timeoutMs: 0 };
+    const origin = { turnId: 'turn', workerGeneration: 3 };
+    const manager = createExplicitAskContinuation({ ...fixture.deps, snapshot: explicitAskSnapshot,
+      retire: retireExplicitAsk, register: async value => { await registerHostAsk(value); throw new Error('caller lost'); } });
+    const waiting = manager.wait(waitingInput, origin);
+    await vi.waitFor(() => expect(card).toBeDefined());
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'operation', reason: 'ended' };
+    failWrite = true;
+    expect(() => manager.retire(request)).toThrow('retirement write failed');
+    failWrite = false;
+    expect(tryResolveAsk({ askId: card!.askId, nonce: card!.nonce, selected: 'yes', by: 'human' })).toBe('accepted');
+    await expect(waiting).rejects.toThrow('caller lost');
+    _resetForTest(); wire(); restorePersistedAsks(Date.now(), 'app');
+    const restored = createExplicitAskContinuation({ ...fixture.deps, register: registerHostAsk,
+      retire: retireExplicitAsk, snapshot: explicitAskSnapshot });
+    await restored.sweep();
+    await restored.wait(waitingInput);
+    fixture.advance(6000);
+    await restored.sweep();
+    expect(fixture.dispatch).toHaveBeenCalledTimes(1);
+    expect(restored.inspect(request).result).toEqual(answer);
+  });
+
+  it('keeps interrupted retirement pending when live authority no longer owns the original execution', async () => {
+    const fixture = setup();
+    let owns = true;
+    let result: AskResult | undefined;
+    const waitingInput = { ...input, timeoutMs: 0 };
+    const origin = { turnId: 'turn', workerGeneration: 3, dispatchAttempt: 1 };
+    const first = createExplicitAskContinuation({ ...fixture.deps, register: () => new Promise(() => {}),
+      canRetire: () => owns, retire: () => { throw new Error('interrupted'); } });
+    void first.wait(waitingInput, origin);
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request',
+      chatId: 'chat', rootMessageId: null, origin, operationId: 'operation', reason: 'ended' };
+    expect(() => first.retire(request)).toThrow('interrupted');
+    owns = false;
+    const restored = createExplicitAskContinuation({ ...fixture.deps, canRetire: () => owns,
+      retire: () => { result = { kind: 'invalidated', reason: 'ended', by: null, selected: null, comment: null, timedOut: false }; return result; } });
+    expect(() => restored.retire(request)).toThrow('authority');
+    await restored.sweep();
+    expect(result).toBeUndefined();
+    expect(restored.inspect(request).result).toBeUndefined();
+    owns = true;
+    await restored.sweep();
+    expect(restored.inspect(request).result?.kind).toBe('invalidated');
+  });
   it('describes a registered invocation for host discovery without granting mutation authority', async () => {
     const fixture = setup();
     const origin = { turnId: 'turn', workerGeneration: 3 };

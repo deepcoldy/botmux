@@ -45,7 +45,7 @@ import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
-import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
+import { createManagedAskControl, managedAskExecutionOwned, parseManagedAskControl } from './core/managed-ask-control.js';
 import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -10736,6 +10736,10 @@ const explicitAskContinuation = createExplicitAskContinuation({
   hasHandoff: hasExplicitAskHandoff,
   invalidate: invalidateExplicitAsk,
   retire: retireExplicitAsk,
+  canRetire: receipt => !!receipt.origin && managedAskExecutionOwned({
+    larkAppId: receipt.input.larkAppId, sessionId: receipt.input.sessionId, requestId: receipt.input.requestId,
+    chatId: receipt.input.chatId, rootMessageId: receipt.input.rootMessageId, origin: receipt.origin,
+  }, managedAskSession(receipt.input.sessionId)),
   snapshot: explicitAskSnapshot,
   shouldInvalidate: receipt => sessionsRestored
     && !explicitAskSessionBound(receipt.input, findActiveBySessionId(receipt.input.sessionId)),
@@ -10755,13 +10759,7 @@ const explicitAskContinuation = createExplicitAskContinuation({
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
 
-const managedAskControl = createManagedAskControl({
-  get appId() { return selfDaemonLarkAppId ?? ''; },
-  inspect: explicitAskContinuation.inspect,
-  describe: explicitAskContinuation.describe,
-  retire: explicitAskContinuation.retire,
-  snapshot: receipt => explicitAskSnapshot(receipt.input),
-  session: sessionId => {
+function managedAskSession(sessionId: string) {
     const ds = findActiveBySessionId(sessionId);
     if (!ds) return undefined;
     return {
@@ -10770,14 +10768,23 @@ const managedAskControl = createManagedAskControl({
       workerGeneration: ds.workerGeneration,
       workerAlive: !!ds.worker && !ds.worker.killed,
       turnId: ds.managedTurnOrigin?.turnId,
+      dispatchAttempt: ds.managedTurnOrigin?.dispatchAttempt,
       safeToSuspend: (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited')
         && canSafelyReclaimWorkerForInstallChange(ds),
       resourceOwned: !ds.adoptedFrom && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode
         && ds.session.locked !== true && !isSessionTransferring(ds),
       suspensionConfirmed: ds.session.suspendedColdResume === true,
-      terminatedTurnIds: [...ds.terminalIdentityTurnIds ?? []],
+      terminalExecutionKeys: [...ds.replyExecutionTerminals?.keys() ?? []],
     };
-  },
+}
+
+const managedAskControl = createManagedAskControl({
+  get appId() { return selfDaemonLarkAppId ?? ''; },
+  inspect: explicitAskContinuation.inspect,
+  describe: explicitAskContinuation.describe,
+  retire: explicitAskContinuation.retire,
+  snapshot: receipt => explicitAskSnapshot(receipt.input),
+  session: managedAskSession,
   suspend: async (sessionId, stillOwned) => {
     const ds = findActiveBySessionId(sessionId);
     return !!ds && await suspendWorkerAsync(ds, 'managed_ask_retired', stillOwned);

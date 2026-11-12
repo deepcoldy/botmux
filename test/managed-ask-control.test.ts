@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createManagedAskControl, parseManagedAskControl } from '../src/core/managed-ask-control.js';
+import { createManagedAskControl, managedAskOriginKey, parseManagedAskControl } from '../src/core/managed-ask-control.js';
 import type { ExplicitAskReceipt } from '../src/core/explicit-ask-continuation.js';
 
 describe('managed explicit Ask retirement control', () => {
@@ -37,7 +37,7 @@ describe('managed explicit Ask retirement control', () => {
       snapshot: () => undefined,
       session: () => ({ larkAppId: 'app', chatId: 'chat', rootMessageId: 'root', workerGeneration: generation,
         workerAlive: alive, turnId: 'turn', safeToSuspend: safe, resourceOwned: true,
-        suspensionConfirmed: !alive, terminatedTurnIds: terminal ? ['turn'] : [] }),
+        suspensionConfirmed: !alive, terminalExecutionKeys: terminal ? [managedAskOriginKey(request.origin)] : [] }),
       suspend: async () => { alive = false; return true; },
     });
     await expect(controller.retire(request)).resolves.toMatchObject({ status: 'draining', questions: receipt().input.questions });
@@ -66,7 +66,7 @@ describe('managed explicit Ask retirement control', () => {
     const controller = createManagedAskControl({
       appId: 'app', inspect: () => receipt, retire: () => receipt, snapshot: () => undefined,
       session: () => ({ larkAppId: 'app', chatId: 'chat', rootMessageId: 'root', workerGeneration: generation,
-        workerAlive: alive, turnId: 'turn', safeToSuspend: true, resourceOwned: true, terminatedTurnIds: ['turn'] }),
+        workerAlive: alive, turnId: 'turn', safeToSuspend: true, resourceOwned: true, terminalExecutionKeys: [managedAskOriginKey(request.origin)] }),
       suspend: async (_sessionId, stillOwned) => {
         await Promise.resolve();
         generation = 4;
@@ -77,6 +77,22 @@ describe('managed explicit Ask retirement control', () => {
     });
     await expect(controller.release(request)).resolves.toMatchObject({ status: 'unknown' });
     expect(alive).toBe(true);
+  });
+
+  it('rejects the original request when the current attempt changed within the same generation', async () => {
+    const request = { larkAppId: 'app', sessionId: 'session', requestId: 'request', chatId: 'chat',
+      rootMessageId: 'root', origin: { turnId: 'turn', workerGeneration: 3, dispatchAttempt: 1 },
+      operationId: 'operation', reason: 'ended' };
+    let writes = 0;
+    const receipt: ExplicitAskReceipt = { version: 1, input: { ...request, timeoutMs: 0, questions: [] }, origin: request.origin };
+    const controller = createManagedAskControl({
+      appId: 'app', inspect: () => receipt, retire: () => { writes++; return receipt; }, snapshot: () => undefined,
+      session: () => ({ larkAppId: 'app', chatId: 'chat', rootMessageId: 'root', workerGeneration: 3,
+        turnId: 'turn', dispatchAttempt: 2, workerAlive: true, resourceOwned: true, safeToSuspend: false }),
+      suspend: async () => false,
+    });
+    await expect(controller.retire(request)).resolves.toMatchObject({ status: 'conflict' });
+    expect(writes).toBe(0);
   });
 
   it('rejects foreign bindings and never retires or releases an answered Ask', async () => {
