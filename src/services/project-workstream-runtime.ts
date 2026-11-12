@@ -63,11 +63,20 @@ function isSourceSessionRuntimeLive(ds: DaemonSession | undefined): ds is Daemon
   return ds.worker !== undefined ? true : ds.cliReady === true;
 }
 
-/** Only the display title may refresh mid-turn. Every other field stays in the
- *  comparison, so a field later added to ProjectAttachmentSource is checked by
- *  default instead of silently dropping out of the freshness proof. */
+/** Display-only metadata may refresh mid-turn (the pinned/topic cards read it);
+ *  every other field stays in the comparison, so a field later added to
+ *  ProjectAttachmentSource is checked by default instead of silently dropping
+ *  out of the freshness proof. `title`, `recentSummary` and `botName` are the
+ *  display fields: they are excluded from `sourceIdentity()` in the attachment
+ *  journal and stripped before the record is persisted, so a busy-turn summary
+ *  refresh must not fail a report that is otherwise the same source. */
 function authoritativeSourceIdentity(source: ProjectAttachmentSource): string {
-  const { title: _displayOnly, ...authoritative } = source;
+  const {
+    title: _displayOnlyTitle,
+    recentSummary: _displayOnlySummary,
+    botName: _displayOnlyBotName,
+    ...authoritative
+  } = source;
   return JSON.stringify(authoritative);
 }
 
