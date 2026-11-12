@@ -14,6 +14,8 @@ import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restar
 import { protectedMcpRedactedEnvKeys } from '../src/core/protected-mcp-capabilities.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { ClaudeEffortObserver } from '../src/services/claude-effort-observer.js';
+import { TerminalEffortChoiceTracker } from '../src/services/terminal-effort-choice.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from '../src/core/restart-fresh-budget.js';
 import { join } from 'node:path';
 
@@ -116,6 +118,9 @@ describe('worker restart input fence', () => {
     inputDeliveryEvidence.observeStructuredTerminal(old);
     const scope = {
       cliSpawnGeneration: 7,
+      claudeEffortObserver: new ClaudeEffortObserver(),
+      terminalEffortTracker: new TerminalEffortChoiceTracker(),
+      config: { terminalEffortWriteback: false },
       inputDeliveryEvidence,
       networkPolicySupportError: () => undefined,
       networkProxyLaunchError: async () => undefined,
