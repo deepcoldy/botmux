@@ -422,7 +422,7 @@ export interface CardUsageSnapshot {
   } | null;
   /** Observed runtime model, or the configured launch model when unavailable. */
   model?: string;
-  /** Observed reasoning effort, or the configured session effort when unavailable. */
+  /** Observed reasoning effort. Non-Claude CLIs may fall back to session configuration. */
   reasoningEffort?: string;
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {

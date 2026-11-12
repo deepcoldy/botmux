@@ -555,6 +555,7 @@ import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid,
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
+import { ClaudeEffortObserver } from './services/claude-effort-observer.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
 import { readySignalLogDir, readySignalLogPath } from './services/ready-signal-log.js';
@@ -9275,6 +9276,27 @@ const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
  *  reaches it through observeModelFallbackEvents. The worker reports
  *  observations only — the daemon owns the state and decides. */
 const modelFallbackTracker = new ClaudeModelFallbackTracker();
+const claudeEffortObserver = new ClaudeEffortObserver();
+let claudeEffortNotBeforeMs = 0;
+
+/** Statusline is emitted on native effort changes (Claude 2.1.322's effortValue
+ * dependency), even without an assistant turn. Do not infer from argv/settings. */
+function publishClaudeEffortObservation(): void {
+  if (!backend || closeRequested || lastInitConfig?.cliId !== 'claude-code') return;
+  // The primary transcript follows in-pane /clear and /resume; pid-state can
+  // continue naming the session that existed when the process was launched.
+  const claudeSessionId = (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined)
+    ?? bridgeObservedCliSessionId
+    ?? lastInitConfig.cliSessionId ?? lastInitConfig.sessionId;
+  const observed = claudeEffortObserver.observe(config.session.dataDir, lastInitConfig.sessionId, {
+    claudeSessionId, notBefore: claudeEffortNotBeforeMs,
+  });
+  if (!observed) return;
+  const publish = () => send({ type: 'claude_effort', ...observed });
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && binding) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -24477,6 +24499,8 @@ async function spawnCliBody(
   const spawnGeneration = ++cliSpawnGeneration;
   localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
+  claudeEffortNotBeforeMs = spawnStartedAtMs;
+  claudeEffortObserver.reset();
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -31068,6 +31092,7 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  claudeEffortObserver.reset();
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
   if (backend) previousCliEndedAtMs = Date.now();
@@ -37592,12 +37617,16 @@ process.on('message', (raw: unknown, handle: unknown) => {
 // The daemon starts every worker with an empty backlog.
 publishedCliInputBacklog = cliInputBacklogKey({ pending: false });
 setInterval(publishCliInputBacklog, 1_000).unref?.();
+// Runtime effort reporting cannot depend on a PTY redraw or a new model turn.
+const claudeEffortPollTimer = setInterval(publishClaudeEffortObservation, 1_000);
+claudeEffortPollTimer.unref?.();
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。
 (process as NodeJS.EventEmitter).emit(WORKER_IPC_HANDLER_READY_EVENT);
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  clearInterval(claudeEffortPollTimer);
   workerFinalOutputHandoff?.stop();
   if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
   codexUpgradeTimer = undefined;

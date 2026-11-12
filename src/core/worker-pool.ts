@@ -223,6 +223,7 @@ import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/re
 import { buildReplyConsoleUrl } from './dashboard-url.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
+import { applyClaudeEffortObservation } from './claude-effort-observation.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
@@ -20930,6 +20931,13 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'claude_effort': {
+        if (applyClaudeEffortObservation(ds, msg, { worker, workerGeneration, cliId: effectiveCliId })) {
+          scheduleActiveRuntimePatch(ds);
+        }
+        break;
+      }
+
       case 'model_fallback': {
         if (
           ds.worker !== worker
@@ -20953,8 +20961,8 @@ function setupWorkerHandlers(
         // has the session answering on something else. The serving model is a
         // per-reply observation of the real thing, so it is the runtime model:
         // same "only write when it changed, then patch" semantics as the
-        // active_runtime handler. Effort is untouched — Claude reports none,
-        // and a blank one would erase what another channel wrote.
+        // active_runtime handler. Effort is observed separately from statusline;
+        // this model-only channel must not erase it.
         let runtimeChanged = false;
         const servingModel = normalizeClaudeModelId(msg.servingModel);
         if (servingModel && ds.activeModel !== servingModel) {

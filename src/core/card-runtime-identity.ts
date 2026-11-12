@@ -15,7 +15,10 @@ export function withCardRuntimeIdentity(
   effectiveCliId: CliId | undefined = ds.session.cliId,
 ): CardUsageSnapshot {
   const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
-  const reasoningEffort = ds.activeReasoningEffort?.trim() || ds.session.reasoningEffort?.trim();
+  // Claude can change effort within the CLI. Its frozen launch preference is
+  // not a runtime observation; omit it until statusline supplies a current value.
+  const reasoningEffort = ds.activeReasoningEffort?.trim()
+    || (effectiveCliId !== 'claude-code' ? ds.session.reasoningEffort?.trim() : undefined);
   const remoteRunner = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';
   const remoteUsage = remoteRunner ? normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage) : undefined;
   const remoteState = remoteRunner ? normalizeRemoteRunnerBackendState(ds.session.remoteBackendState) : undefined;
@@ -42,7 +45,8 @@ export function withCardRuntimeIdentity(
   return {
     ...snapshot,
     ...(model ? { model } : {}),
-    ...(effort ? { reasoningEffort: effort } : {}),
+    ...(effort ? { reasoningEffort: effort }
+      : effectiveCliId === 'claude-code' ? { reasoningEffort: undefined } : {}),
     ...(ds.activeModelBackendVariant !== undefined
       ? { modelBackendVariant: variant || undefined }
       : variant ? { modelBackendVariant: variant } : {}),
