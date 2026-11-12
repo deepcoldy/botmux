@@ -407,12 +407,20 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   {
     key: 'ai.send.after_success_hint', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: 'send 成功后的常规回显',
+    label: '最终答复发送成功回显',
+  },
+  {
+    key: 'ai.send.after_success_progress', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '进度发送成功回显（未标记 final）',
+  },
+  {
+    key: 'ai.send.after_success_auxiliary', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '补充消息发送成功回显',
   },
   {
     key: 'ai.send.after_success_unified', block: 'send_feedback', stage: 'send', kind: 'editable',
     label: '统一回复卡片：进度已更新回显',
-    gateLabel: '仅本轮发送走统一回复卡片、且未标记 --response-kind final 时',
+    gateLabel: '仅本轮发送走统一回复卡片、且发送类型为 progress 时',
   },
 ];
 

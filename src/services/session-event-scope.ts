@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef, type ExecutionRef, type SessionEventContext, type RuntimeIdentity, type ExecutionAdmissionState } from './session-contract.js';
+import { sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef, type ExecutionRef, type SessionEventContext, type RuntimeIdentity, type ExecutionAdmissionState, type RuntimeExecutionContinuationFailure } from './session-contract.js';
 
 export interface CapturedSessionOrigin {
   bindingId: string;
@@ -33,6 +33,7 @@ export class WorkerSessionEventScope {
   private readonly predecessors = new Map<string, RuntimeEventBinding | undefined>();
   private readonly aborted = new Set<string>();
   private readonly abortReports = new Map<string, { timer?: ReturnType<typeof setTimeout> }>();
+  private readonly failureReports = new Map<string, { execution: ExecutionRef; timer?: ReturnType<typeof setTimeout> }>();
   private sequence = 0;
   constructor(readonly session: ContractSessionRef, readonly worker: WorkerRef) {}
   beginRuntime(operationId?: string, physicalId: string = randomUUID()): RuntimeEventBinding {
@@ -80,6 +81,28 @@ export class WorkerSessionEventScope {
     if (pending.timer) clearTimeout(pending.timer);
     this.abortReports.delete(bindingId);
   }
+  reportContinuationFailure(failure: RuntimeExecutionContinuationFailure, report: () => boolean): void {
+    const key = failure.bindingId;
+    if (this.failureReports.has(key)) return;
+    const pending: { execution: ExecutionRef; timer?: ReturnType<typeof setTimeout> } = { execution: failure.continuation.execution };
+    this.failureReports.set(key, pending);
+    const publish = this.bind(() => {
+      if (this.failureReports.get(key) !== pending) return;
+      try {
+        if (!report()) { this.confirmContinuationFailure(key, pending.execution); return; }
+      } catch {}
+      if (this.failureReports.get(key) !== pending) return;
+      pending.timer = setTimeout(publish, 1_000);
+      pending.timer.unref?.();
+    });
+    publish();
+  }
+  confirmContinuationFailure(bindingId: string, execution: ExecutionRef): void {
+    const pending = this.failureReports.get(bindingId);
+    if (!pending || !sameExecution(pending.execution, execution)) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    this.failureReports.delete(bindingId);
+  }
   isCurrentContext(): boolean {
     const origin = this.storage.getStore()?.binding;
     // A semantic rebind keeps the physical CLI, so callbacks started with it still drive it.
@@ -90,6 +113,7 @@ export class WorkerSessionEventScope {
     this.knownExecutions.set(state.ref.executionId, state.ref);
     const previous = this.admissionStates.get(state.ref.executionId);
     if (previous && previous.phase !== 'queued' && state.phase === 'queued') return;
+    if (previous && ['succeeded', 'failed', 'cancelled'].includes(previous.phase)) return;
     this.admissionStates.set(state.ref.executionId, structuredClone(state));
   }
   /** Only an explicit host grant may reset the state of an already submitted
@@ -131,6 +155,16 @@ export class WorkerSessionEventScope {
     if (!this.canSubmitContinuation(turnId, execution)) throw new Error('execution_continuation_unproven');
     this.enterRuntime(this.continuations.get(this.turnKey(turnId))!, execution);
   }
+  abandonContinuation(execution: ExecutionRef): CapturedSessionOrigin | undefined {
+    if (execution.dispatchAttempt !== undefined || !sameExecution(this.executionForTurn(execution.turnId), execution)) return;
+    const key = this.turnKey(execution.turnId);
+    const source = this.submissions.get(key);
+    const state = this.admissionStates.get(execution.executionId);
+    if (!source?.runtime || (state && ['succeeded', 'failed', 'cancelled'].includes(state.phase))) return;
+    this.continuations.delete(key);
+    this.noteAdmission({ ref: execution, runtime: state?.runtime ?? source.runtime, phase: 'failed' });
+    return this.snapshot(source, execution);
+  }
   canSubmit(turnId?: string, dispatchAttempt?: number, admitted?: ExecutionRef): boolean {
     if (!turnId) return true;
     if (admitted && admitted.turnId !== turnId) return false;
@@ -158,7 +192,16 @@ export class WorkerSessionEventScope {
     if (submission) return submission === origin || sameRuntime(submission.runtime, origin.runtime) || submission.physicalId === origin.physicalId;
     const execution = this.executionForTurn(turnId, dispatchAttempt);
     const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
-    if (state?.runtime) return sameRuntime(state.runtime, origin.runtime) || this.bindingForRuntime(state.runtime)?.physicalId === origin.physicalId;
+    if (state?.runtime) {
+      const executor = this.bindingForRuntime(state.runtime);
+      if (sameRuntime(state.runtime, origin.runtime) || executor?.physicalId === origin.physicalId) return true;
+      // An attempt no binding of this worker ran — a predecessor's, still in
+      // the CLI this worker re-attached. Whether the live CLI's runtime is the
+      // one it ran on is the host's decision: it holds the events of a binding
+      // it has not confirmed yet, and refuses, visibly, an attempt it cannot
+      // tie to this runtime. Older generations' observers stay silent.
+      return !executor && !!this.current && origin.physicalId === this.current.physicalId;
+    }
     return this.isCurrentContext();
   }
   bindingForRuntime(runtime: RuntimeRef): RuntimeEventBinding | undefined {

@@ -128,6 +128,9 @@ interface CotState {
   recovery?: CotRecoveryIdentity;
   resumeRequested?: boolean;
   createSuperseded?: boolean;
+  /** A confirmed steer merged this turn's work into a newer turn: its display
+   * ended without leaving any progress of its own to hand back. */
+  mergedIntoNewerTurn?: boolean;
 }
 
 interface CotRecoveryIdentity {
@@ -1180,11 +1183,14 @@ export function handleCotThinkingUpdate(
 }
 
 /** The initial answer waits for native create + prologue (or its bounded failure).
- * Once started, keep waiting even when the operator turns the switch off. */
+ * Once started, keep waiting even when the operator turns the switch off.
+ * Resolves true only when this turn's native thinking display actually exists
+ * and is still accepting updates; a failed create, a disabled stream or a
+ * switched-off channel resolves false so the answer card keeps carrying progress. */
 export async function prepareCotMessageBeforeReply(
   ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number },
   owns?: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
   const key = turnKeyOf(binding);
   let state = states.get(ds);
   if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
@@ -1192,7 +1198,26 @@ export async function prepareCotMessageBeforeReply(
     handleCotThinkingUpdate(ds, { type: 'thinking_update', ...binding, entries: [] }, 'unified', owns);
     state = states.get(ds);
   }
-  if (state?.turnKey === key) await state.publication;
+  if (state?.turnKey !== key) return false;
+  await state.publication;
+  return cotMessageCarriesTurn(ds, binding);
+}
+
+/** Whether this turn's native thinking display still carries its progress.
+ * False once it failed or was never created, was retired before the turn's own
+ * terminal (a newer turn's display replaced it, or the worker was lost), the
+ * channel was switched off, or no display state survived a daemon restart.
+ * Its own terminal closing the display is the normal end and stays true, as
+ * does a steer that merged the turn's remaining work into a newer turn. */
+export function cotMessageCarriesTurn(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): boolean {
+  const key = turnKeyOf(binding);
+  let state = states.get(ds);
+  if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
+  if (state?.turnKey === key && state.mergedIntoNewerTurn) return true;
+  if (!state || state.turnKey !== key || !state.cotId || state.disabled) return false;
+  if (earlyTerminals.get(ds)?.has(key)) return true;
+  if (state.finishStatus || state.pausedForRestore || retiredKeys.get(ds)?.includes(key)) return false;
+  return cotEnabled(ds, 'unified');
 }
 
 export function hasCotMessageForTurn(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): boolean {
@@ -1215,6 +1240,7 @@ export function handleCotThinkingSuperseded(
   let state = states.get(ds);
   if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
   if (!state || state.turnKey !== key) return false;
+  state.mergedIntoNewerTurn = true;
   // Still close a created bubble if /cot was turned off after its last update.
   settleSupersededState(ds, state);
   return true;

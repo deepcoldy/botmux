@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
 import { updateMessage } from '../src/im/lark/client.js';
-import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay } from '../src/core/turn-reply-card.js';
-import { handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
+import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard, __testOnlyDrainTurnReplyTools } from '../src/core/turn-reply-card.js';
+import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
@@ -48,7 +48,14 @@ describe('unified replies with an independent native CoT channel', () => {
       session: { sessionId: 'native-session', rootMessageId: 'om_root', chatId: 'oc_native', status: 'active', cliId: 'claude-code', backendType: 'tmux' },
     } as DaemonSession;
   });
-  afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+  afterEach(async () => {
+    // Queued tool flushes run on 1200ms unref timers and write through the
+    // mutable config.session.dataDir. Drain them before removing this test's
+    // dir so a late flush can neither race the rmdir nor land in the next test.
+    await __testOnlyDrainTurnReplyTools();
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   function worker(owns = true, suppressed = false) {
     return loadWorkerPoolMessageHandlers(['thinking_update'], {
@@ -60,6 +67,8 @@ describe('unified replies with an independent native CoT channel', () => {
   const update = (text: string) => ({ type: 'thinking_update', sessionId: 'native-session', turnId: 'om_turn', entries: [{ kind: 'thinking', text }] });
   const events = () => request.mock.calls.filter(([req]) => req.method === 'PUT')
     .flatMap(([req]) => req.data.events.map((e: any) => ({ type: e.event_type, content: JSON.parse(e.content) })));
+  const finalAnswer = (text: string) => ({ kind: 'final' as const, text, source: 'bridge' as const,
+    card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } }) });
 
   it.each(['claude-code', 'codex'] as const)('keeps a long %s turn on one answer card plus one native bubble', async cli => {
     ds.session.cliId = cli;
@@ -73,7 +82,7 @@ describe('unified replies with an independent native CoT channel', () => {
       await settle();
       await flushTurnReplyTools(ds, 'om_turn');
     }
-    await updateTurnReplyCard(ds, 'om_turn', { kind: 'final', text: 'final answer', card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'final answer' }] } }), source: 'bridge' }, send);
+    await updateTurnReplyCard(ds, 'om_turn', finalAnswer('final answer'), send);
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
     finalizeCotMessage(ds, 'om_turn', 'completed');
     await settle();
@@ -103,14 +112,14 @@ describe('unified replies with an independent native CoT channel', () => {
     send.mockImplementation(async (_body, _type, _uuid, beforeWrite) => {
       await beforeWrite(); order.push('answer'); return 'om_answer';
     });
-    const posting = updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    const posting = updateTurnReplyCard(ds, 'om_turn', finalAnswer('first answer'), send);
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     expect(send).not.toHaveBeenCalled();
     release(); await posting;
     expect(order).toEqual(['thinking-created', 'thinking-initialized', 'answer']);
-    // Normal card PATCH and explicit CLI readiness reuse the same native entity.
+    // Later refreshes and explicit CLI readiness reuse the same native entity.
     await prepareReplyCardNativeThinking(ds, 'om_turn');
-    await updateTurnReplyCard(ds, 'om_turn', { kind: 'progress', text: 'later' }, send);
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'refresh' }, send);
     expect(request.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1);
     expect(send).toHaveBeenCalledTimes(1);
   });
@@ -130,7 +139,7 @@ describe('unified replies with an independent native CoT channel', () => {
     bot.config.replyCardNativeCot = true;
     const healthySend = send.getMockImplementation()!;
     send.mockRejectedValue(new Error('answer ACK lost'));
-    await expect(updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send)).rejects.toThrow('answer ACK lost');
+    await expect(updateTurnReplyCard(ds, 'om_turn', finalAnswer('answer'), send)).rejects.toThrow('answer ACK lost');
     const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
     expect(record.nativeCotReady).toBe(true);
     const failedSends = send.mock.calls.length;
@@ -150,7 +159,7 @@ describe('unified replies with an independent native CoT channel', () => {
     expect(request.mock.calls.some(([req]) => req.method === 'POST')).toBe(native === true);
     const card = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
     expect(card.activity).not.toEqual([]);
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(native === true ? 0 : 1);
     finalizeCotMessage(ds, 'om_turn', 'completed'); await settle();
   });
 
@@ -162,21 +171,159 @@ describe('unified replies with an independent native CoT channel', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it('continues the answer card when native CoT fails, without sending a fallback answer', async () => {
+  it.each(['rejected', 'business-error', 'prologue-failed', 'chat-off-after-admission'] as const)('continues the answer card when native CoT is unavailable (%s), without sending a fallback answer', async failure => {
     bot.config.replyCardNativeCot = true;
-    request.mockRejectedValue(new Error('CoT unavailable'));
+    if (failure === 'rejected') request.mockRejectedValue(new Error('CoT unavailable'));
+    if (failure === 'business-error') request.mockResolvedValue({ code: 99991672, msg: 'Access denied' });
+    // The bubble exists, but its first push failed: it no longer carries progress.
+    if (failure === 'prologue-failed') request.mockImplementation(async (req: any) => {
+      if (req.method === 'POST' && String(req.url).endsWith('/message_cot')) return { code: 0, data: { cot_id: 'cot_native', message_id: 'om_cot' } };
+      throw new Error('CoT push unavailable');
+    });
+    // Admission froze nativeCot=true; `/cot off` afterwards pauses the native channel.
+    expect(replyCardModeFor(ds, 'om_turn')).toBe('unified');
+    if (failure === 'chat-off-after-admission') bot.config.noCotChats = [ds.chatId];
     const handle = worker();
     handle(update('first')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
-    handle(update('later')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
-    await updateTurnReplyCard(ds, 'om_turn', { kind: 'final', text: 'answer survives', card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer survives' }] } }), source: 'bridge' }, send);
+    // Without a live thinking display the answer card is the progress surface.
     expect(send).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledTimes(1);
+    handle(update('later')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    await updateTurnReplyCard(ds, 'om_turn', finalAnswer('answer survives'), send);
+    expect(send).toHaveBeenCalledTimes(1);
+    const creates = request.mock.calls.filter(([req]) => req.method === 'POST' && String(req.url).endsWith('/message_cot'));
+    expect(creates).toHaveLength(failure === 'chat-off-after-admission' ? 0 : 1);
     expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('answer survives');
+    const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
+    expect(record).toMatchObject({ nativeCot: true, nativeCotReady: true });
+    expect(record.nativeCotVisible).toBeUndefined();
+  });
+
+  it.each(['newer-turn', 'worker-lost', 'switched-off'] as const)('hands progress back to the answer card when native thinking retires mid-turn (%s)', async retirement => {
+    bot.config.replyCardNativeCot = true;
+    let cot = 0;
+    request.mockImplementation(async (req: any) => ({ code: 0,
+      data: req.method === 'POST' && String(req.url).endsWith('/message_cot') ? { cot_id: `cot_${++cot}`, message_id: `om_cot_${cot}` } : {} }));
+    const handle = worker();
+    const turnUpdate = (turnId: string, ...texts: string[]) => ({ type: 'thinking_update', sessionId: 'native-session', turnId,
+      entries: texts.map(text => ({ kind: 'thinking', text })) });
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'refresh' }, send);
+    handle(turnUpdate('om_turn', 'reading')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    expect(send).not.toHaveBeenCalled();
+    if (retirement === 'newer-turn') {
+      // A type-ahead follow-up is admitted while this turn keeps running.
+      ds.currentTurnId = 'om_next';
+      await updateTurnReplyCard(ds, 'om_next', { kind: 'refresh' }, send);
+      await settle();
+      expect(send).not.toHaveBeenCalled();
+    } else if (retirement === 'worker-lost') {
+      abortCotMessage(ds); await settle();
+    } else {
+      bot.config.noCotChats = [ds.chatId];
+    }
+    handle(turnUpdate('om_turn', 'reading', 'fixing')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'progress', text: 'fix applied, running tests' }, send);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('fix applied, running tests');
+    const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
+    expect(record.nativeCotVisible).toBeUndefined();
+    if (retirement === 'newer-turn') {
+      const next = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_next' })!;
+      expect(next).toMatchObject({ nativeCotVisible: true });
+      expect(next.messageId).toBeUndefined();
+    }
+  });
+
+  it.each([false, true])('keeps a handed-back turn on the answer card when the native channel is switched on again (/cot show=%s)', async shown => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    const pushedText = () => JSON.stringify(request.mock.calls.filter(([req]) => req.method === 'PUT'));
+    // Worker snapshots are cumulative.
+    const steps = (count: number) => ({ ...update(''), entries: Array.from({ length: count }, (_, i) => ({ kind: 'thinking', text: `step ${i + 1}` })) });
+    handle(steps(1)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    bot.config.noCotChats = [ds.chatId];
+    handle(steps(2)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' }))
+      .toMatchObject({ nativeCotHandedBack: true });
+    // Switching the channel back on keeps progress on the card; `/cot show` asks for both.
+    if (shown) ds.cotForced = true;
+    else bot.config.noCotChats = [];
+    handle(steps(3)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    expect(pushedText()).toContain('step 1');
+    if (shown) expect(pushedText()).toContain('step 3');
+    else expect(pushedText()).not.toContain('step 3');
+    expect(vi.mocked(updateMessage).mock.calls.length).toBeGreaterThan(0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps feeding native thinking when the barrier record predates the visibility field', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    // An older CLI ran the barrier: the display exists, but only nativeCotReady was written.
+    expect(replyCardModeFor(ds, 'om_turn')).toBe('unified');
+    expect(await prepareReplyCardNativeThinking(ds, 'om_turn')).toBe(true);
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    await store.update(key, { kind: 'progress', text: 'from an older CLI' }, {
+      render: () => JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'card' }] } }),
+      beforeEffect: () => {}, beforeCreate: async () => undefined, isWithdrawn: () => false,
+      send: async () => 'om_cli_card', patch: async () => {},
+    });
+    expect(store.read(key)).toMatchObject({ nativeCotReady: true, messageId: 'om_cli_card' });
+    handle({ ...update(''), entries: [{ kind: 'thinking', text: 'thinking 1' }, { kind: 'thinking', text: 'thinking 2' }] });
+    await settle();
+    expect(JSON.stringify(request.mock.calls.filter(([req]) => req.method === 'PUT'))).toContain('thinking 2');
+  });
+
+  it('does not hand a steer-merged turn back to a card before it is superseded', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    handle(update('reading')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    // The worker's last cumulative update is still buffered when the steer is confirmed.
+    handle(update('reading', 'merging')); await settle();
+    expect(handleCotThinkingSuperseded(ds, { type: 'thinking_superseded', sessionId: 'native-session', turnId: 'om_turn' } as any)).toBe(true);
+    await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    await supersedeTurnReplyCard(ds, { turnId: 'om_turn' }, send, () => true);
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })).toMatchObject({ phase: 'superseded', nativeCotVisible: true });
+  });
+
+  it.each([true, false])('reports native thinking as live to the answer barrier only when it carries the turn (switched off mid-create=%s)', async switchedOff => {
+    bot.config.replyCardNativeCot = true;
+    let releaseCreate!: () => void;
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'POST' && String(req.url).endsWith('/message_cot')) {
+        await new Promise<void>(resolve => { releaseCreate = resolve; });
+        return { code: 0, data: { cot_id: 'cot_native', message_id: 'om_cot' } };
+      }
+      return { code: 0, data: {} };
+    });
+    expect(replyCardModeFor(ds, 'om_turn')).toBe('unified');
+    const ready = prepareReplyCardNativeThinking(ds, 'om_turn');
+    await vi.waitFor(() => expect(releaseCreate).toBeTypeOf('function'));
+    if (switchedOff) bot.config.noCotChats = [ds.chatId];
+    releaseCreate();
+    expect(await ready).toBe(!switchedOff);
+  });
+
+  it('keeps a finished turn on native thinking so a separately sent final adds no summary card', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    handle(update('reading')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    expect(await new TurnReplyCardStore(dir).noteExternalFinal(key, ds.chatId)).toBe(true);
+    // worker-pool starts the terminal card update, then settles the native display.
+    const terminal = updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    await terminal; await settle();
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'completed', nativeCotVisible: true, externalFinal: true });
   });
 
   it.each([false, true])('settles eager thinking when its transcript never starts (card update failure=%s)', async fail => {
     bot.config.replyCardNativeCot = true;
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    expect(send).not.toHaveBeenCalled();
     const fallback = vi.fn(async () => {});
     const handle = loadWorkerPoolMessageHandlers(['turn_display_retired'], {
       ds, t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() }, emitSessionLifecycleHook: vi.fn(),
@@ -188,13 +335,16 @@ describe('unified replies with an independent native CoT channel', () => {
     }, true);
     await handle({ type: 'turn_display_retired', turnId: 'om_turn', message: 'Transcript unavailable' });
     await settle();
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(fail ? 0 : 1);
     expect(request.mock.calls.some(([req]) => req.url.includes('/complete/'))).toBe(true);
-    if (fail) expect(fallback).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: 'om_turn', content: 'Transcript unavailable' }), expect.any(Function));
+    if (fail) {
+      expect(fallback).toHaveBeenCalledTimes(1);
+      expect(fallback).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: 'om_turn', content: 'Transcript unavailable' }), expect.any(Function));
+    }
     else {
       expect(fallback).not.toHaveBeenCalled();
       expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })?.phase).toBe('ambiguous');
-      expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('Transcript unavailable');
+      expect(send.mock.calls.at(-1)?.[0]).toContain('Transcript unavailable');
     }
   });
 
@@ -319,5 +469,41 @@ describe('unified replies with an independent native CoT channel', () => {
     handle(update('legacy enabled')); await settle();
     expect(request.mock.calls.some(([req]) => req.method === 'POST')).toBe(true);
     finalizeCotMessage(ds, 'om_turn', 'completed'); await settle();
+  });
+
+  it('drain cancels a queued tools timer so it cannot write into a later test data dir', async () => {
+    // A test that queues tool activity without an explicit flush leaves a
+    // 1200ms unref timer. The store reads config.session.dataDir only when the
+    // timer fires, so an undrained timer from a finished test writes into the
+    // next test's dir (and races its teardown). Drain must cancel it outright.
+    const nextDir = mkdtempSync(join(tmpdir(), 'unified-native-cot-drain-'));
+    try {
+      queueTurnReplyTools(ds, { turnId: 'om_turn', entries: [{ kind: 'thinking', text: 'buffered' }] }, send, () => true);
+      await __testOnlyDrainTurnReplyTools();
+      config.session.dataDir = nextDir;
+      await new Promise(resolve => setTimeout(resolve, 1300));
+      expect(readdirSync(nextDir)).toEqual([]);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = dir;
+      rmSync(nextDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drain waits for a tools flush already writing, so teardown cannot remove the dir under it', async () => {
+    bot.config.cotEnabled = true;
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    let releasePatch!: () => void;
+    vi.mocked(updateMessage).mockImplementationOnce(() => new Promise<void>(resolve => { releasePatch = resolve; }));
+    queueTurnReplyTools(ds, { turnId: 'om_turn', entries: [{ kind: 'thinking', text: 'in flight' }] }, send, () => true);
+    const flushing = flushTurnReplyTools(ds, 'om_turn');
+    await vi.waitFor(() => expect(releasePatch).toBeTypeOf('function'));
+    let drained = false;
+    const draining = __testOnlyDrainTurnReplyTools().then(() => { drained = true; });
+    await settle();
+    expect(drained).toBe(false);
+    releasePatch();
+    await Promise.all([flushing, draining]);
+    expect(drained).toBe(true);
   });
 });

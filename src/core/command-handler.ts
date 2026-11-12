@@ -167,7 +167,7 @@ import {
 import { isSessionGroup } from '../services/session-groups-store.js';
 import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
 import { dismissSessionGroup } from './dismiss-command.js';
-import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from './resume-result-message.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
@@ -1855,10 +1855,7 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   if (result.ok) {
     const cliName = sessionCliDisplayName(result.ds);
     const resultLoc = localeForBot(result.ds.larkAppId);
-    if (result.recoveryPending) return t('card.action.resume_started_remote', { cliName }, resultLoc);
-    return resumeStartsFresh(result.ds.session)
-      ? t('card.action.resume_success_fresh', { cliName }, resultLoc)
-      : t('card.action.resume_success', { cliName }, resultLoc);
+    return resumeSuccessMessage(result, cliName, resultLoc);
   }
   switch (result.error) {
     case 'not_closed': return t('card.action.resume_not_closed', undefined, loc);

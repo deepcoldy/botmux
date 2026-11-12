@@ -59,3 +59,61 @@ describe('chat feed-group replacement', () => {
     await expect(replaceChatFeedGroups({ request }, 'oc_current', null)).rejects.toThrow('permission denied');
   });
 });
+
+// Generic scope is plugin-owned; unrelated personal groups must survive both switch and close.
+describe('scoped plugin feed groups', () => {
+  const scope = ['P0', 'P1', 'Backlog', 'LongRun'];
+  it('accepts configured names and removes only the explicit scope after joining', async () => {
+    const client = api([{ group_id: 'work', name: '工作' }, { group_id: 'p0', name: 'P0' }, { group_id: 'backlog', name: 'Backlog' }]);
+    await replaceChatFeedGroups(client, 'oc_current', 'Backlog', scope);
+    expect(client.request.mock.calls.filter(call => call[1] !== undefined).map(call => call[0])).toEqual([
+      '/open-apis/im/v1/groups/backlog/batch_add_item', '/open-apis/im/v1/groups/p0/batch_remove_item',
+    ]);
+    client.request.mockClear();
+    await replaceChatFeedGroups(client, 'oc_current', null, scope);
+    expect(client.request.mock.calls.filter(call => call[1] !== undefined).map(call => call[0])).toEqual([
+      '/open-apis/im/v1/groups/p0/batch_remove_item', '/open-apis/im/v1/groups/backlog/batch_remove_item',
+    ]);
+  });
+
+  it('creates arbitrary configured names and supports additive mode with a one-name scope', async () => {
+    const client = api([{ group_id: 'p0', name: 'P0' }]);
+    await replaceChatFeedGroups(client, 'oc_current', '研发待办', ['研发待办']);
+    expect(client.request.mock.calls.filter(call => call[1] !== undefined)).toEqual([
+      ['/open-apis/im/v1/groups', { feed_group_creator: { type: 'normal', name: '研发待办' } }],
+      ['/open-apis/im/v1/groups/new-label/batch_add_item', { items: [{ feed_id: 'oc_current', feed_type: 'chat' }] }],
+    ]);
+  });
+
+  it.each([
+    ['Unknown', ['P0']], ['P0', []], ['P0', ['P0', 'P0']],
+    ['P0', ['P0', ' ']], ['P0', ['P0', 'invisible\u202ename']],
+    ['P0', ['P0', 'a'.repeat(51)]], ['n0', Array.from({ length: 51 }, (_, i) => `n${i}`)],
+  ])('rejects malformed or out-of-scope selection %s before reading or writing', async (target, names) => {
+    const client = api([]);
+    await expect(replaceChatFeedGroups(client, 'oc_current', target as string, names as string[])).rejects.toThrow('invalid_chat_label');
+    expect(client.request).not.toHaveBeenCalled();
+  });
+
+  it('does no network access for an empty explicit cleanup scope', async () => {
+    const client = api([]);
+    await replaceChatFeedGroups(client, 'oc_current', null, []);
+    expect(client.request).not.toHaveBeenCalled();
+  });
+
+  it('rejects ambiguous target names without mutations', async () => {
+    const client = api([{ group_id: 'one', name: 'P0' }, { group_id: 'two', name: 'P0' }]);
+    await expect(replaceChatFeedGroups(client, 'oc_current', 'P0', scope)).rejects.toThrow('ambiguous_feed_group');
+    expect(client.request.mock.calls.every(call => call[1] === undefined)).toBe(true);
+  });
+
+  it('leaves all other associations untouched when scoped target add fails', async () => {
+    const client = api([{ group_id: 'one', name: 'P0' }, { group_id: 'two', name: 'P1' }]);
+    client.request.mockImplementation(async (_path, body) => {
+      if (body === undefined) return { groups: [{ group_id: 'one', name: 'P0' }, { group_id: 'two', name: 'P1' }] };
+      throw new Error('join failed');
+    });
+    await expect(replaceChatFeedGroups(client, 'oc_current', 'P1', scope)).rejects.toThrow('join failed');
+    expect(client.request.mock.calls.some(call => call[0].includes('remove'))).toBe(false);
+  });
+});

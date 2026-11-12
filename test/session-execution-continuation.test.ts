@@ -255,6 +255,24 @@ function scopedFixture() {
   return { ...s, scope, sourceBinding: source, replacement, admission };
 }
 describe('worker continuation permits', () => {
+  it('keeps abandonment terminal across duplicate late approval snapshots', () => {
+    const fixtureState = scopedFixture();
+    expect(fixtureState.scope.acceptContinuation(fixtureState.replacement.bindingId, fixtureState.admission)).toBe(true);
+    const origin = fixtureState.scope.abandonContinuation(fixtureState.execution);
+    expect(origin?.runtime).toEqual(fixtureState.source);
+    expect(origin?.execution).toEqual(fixtureState.execution);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      fixtureState.scope.noteAdmission(fixtureState.admission);
+      expect(fixtureState.scope.acceptContinuation(fixtureState.replacement.bindingId, fixtureState.admission)).toBe(false);
+      expect(fixtureState.scope.canSubmitContinuation(fixtureState.execution.turnId, fixtureState.execution)).toBe(false);
+      expect(fixtureState.scope.canSubmit(fixtureState.execution.turnId)).toBe(false);
+    }
+    expect(fixtureState.scope.abandonContinuation(fixtureState.execution)).toBeUndefined();
+    const successor = fixtureState.controller.admitInput('successor');
+    fixtureState.scope.noteAdmission({ ref: successor, phase: 'queued' });
+    expect(fixtureState.scope.canSubmit(successor.turnId)).toBe(true);
+  });
+
   it('grants one internal submission without opening ordinary duplicate admission', () => {
     const s = scopedFixture();
     expect(s.scope.acceptContinuation(s.replacement.bindingId, s.admission)).toBe(true);
@@ -349,5 +367,181 @@ describe('worker continuation gate', () => {
     expect(g.env.pendingMessages).toHaveLength(1);
     expect(g.env.pendingMessages[0]).toMatchObject({ traexAutoModelRecovery: true,
       traexAutoModelContinuation: { reason: 'traex-auto-model', execution: g.s.execution, from: g.s.source, nativeSessionId: 'native-task' } });
+  });
+
+  it('keeps independent Auto selections when an older host cannot settle continuation failures', () => {
+    const fixtureState = gate('tmux', true);
+    delete fixtureState.env.lastInitConfig.sessionContract.executionContinuationFailures;
+    expect(fixtureState.env.traexAutoModelRuntimeEligible()).toBe(true);
+    expect(fixtureState.execute(fixtureState.action('capacity_timeout'), { resumeCurrentTurn: true })).toBe(false);
+    expect(fixtureState.env.pendingMessages).toEqual([]);
+    expect(fixtureState.env.restartCliProcess).not.toHaveBeenCalled();
+    expect(fixtureState.execute(fixtureState.action('preflight_available'), { resumeCurrentTurn: false })).toBe(true);
+    expect(fixtureState.env.restartCliProcess.mock.calls[0][1]).not.toHaveProperty('restartCause');
+  });
+});
+
+function continuationFailureEvent(fixtureState: ReturnType<typeof fixture>, sequence = 1) {
+  return {
+    type: 'turn_terminal' as const,
+    sessionId: fixtureState.ref.sessionId,
+    turnId: fixtureState.execution.turnId,
+    status: 'failed' as const,
+    errorCode: 'traex_auto_model_continuation_timeout',
+    continuationFailure: { bindingId: 'replacement', continuation: structuredClone(fixtureState.request) },
+    sessionContract: {
+      version: 2 as const, session: fixtureState.ref, producer: fixtureState.worker,
+      eventId: `${fixtureState.worker.workerId}:${sequence}`, sequence, bindingId: 'source',
+      scope: { runtime: fixtureState.source, execution: fixtureState.execution },
+    },
+  };
+}
+
+describe('continuation failure settlement', () => {
+  it.each(['not-reserved', 'planned', 'rejected', 'approved'] as const)(
+    'settles the exact original execution once after %s recovery', phase => {
+      const fixtureState = fixture();
+      if (phase !== 'not-reserved') fixtureState.reserve();
+      if (phase === 'rejected') fixtureState.store.rejectExecutionContinuation(fixtureState.ref, 'replacement');
+      if (phase === 'approved') fixtureState.bind();
+      const successor = fixtureState.controller.admitInput('successor');
+      const runtime = fixtureState.controller.currentRuntime();
+      const message = continuationFailureEvent(fixtureState);
+      expect(fixtureState.controller.ingest(message, fixtureState.worker).kind).not.toBe('reject');
+      expect(fixtureState.currentExecution()).toMatchObject({
+        phase: 'failed', terminal: { status: 'failed', errorCode: message.errorCode, evidence: 'continuation_abandoned' },
+      });
+      expect(fixtureState.store.execution(fixtureState.ref, successor.executionId)?.phase).toBe('queued');
+      expect(fixtureState.controller.currentRuntime()).toEqual(runtime);
+      const revision = fixtureState.store.read(fixtureState.ref)!.revision;
+      expect(fixtureState.controller.ingest(message, fixtureState.worker).kind).not.toBe('reject');
+      expect(fixtureState.store.read(fixtureState.ref)!.revision).toBe(revision);
+      if (phase !== 'not-reserved') {
+        expect(fixtureState.store.executionContinuation(fixtureState.ref, 'replacement')?.status).toBe('rejected');
+      }
+    });
+
+  it.each(['producer', 'new-worker', 'native', 'execution', 'source', 'origin', 'binding', 'status', 'error', 'malformed'] as const)(
+    'rejects an unrelated continuation failure (%s)', condition => {
+      const fixtureState = fixture();
+      fixtureState.reserve(); fixtureState.bind();
+      const message: any = continuationFailureEvent(fixtureState);
+      if (condition === 'producer') message.sessionContract.producer = { workerId: 'other', generation: 99 };
+      if (condition === 'new-worker') fixtureState.controller.bindWorker(2);
+      if (condition === 'native') message.continuationFailure.continuation.nativeSessionId = 'other-native';
+      if (condition === 'execution') message.continuationFailure.continuation.execution = { executionId: 'other', turnId: 'other' };
+      if (condition === 'source') message.continuationFailure.continuation.from = { runtimeId: 'other', epoch: 1 };
+      if (condition === 'origin') message.sessionContract.scope.runtime = fixtureState.controller.currentRuntime();
+      if (condition === 'binding') message.continuationFailure.bindingId = 'unknown';
+      if (condition === 'status') message.status = 'completed';
+      if (condition === 'error') message.errorCode = 'unrelated_error';
+      if (condition === 'malformed') message.continuationFailure = null;
+      const before = fixtureState.store.snapshot(fixtureState.ref);
+      expect(fixtureState.controller.ingest(message, fixtureState.worker).kind).toBe('reject');
+      expect(fixtureState.currentExecution().terminal).toBeUndefined();
+      expect(fixtureState.store.snapshot(fixtureState.ref)).toEqual(before);
+    });
+
+  it('does not use ordinary continuation failure to settle a durable attempt', () => {
+    const fixtureState = fixture('submitting', 4);
+    const before = fixtureState.store.snapshot(fixtureState.ref);
+    expect(fixtureState.controller.ingest(continuationFailureEvent(fixtureState), fixtureState.worker).kind).toBe('reject');
+    expect(fixtureState.store.snapshot(fixtureState.ref)).toEqual(before);
+  });
+
+  it('does not relax ordinary stale-terminal admission after a grant', () => {
+    const fixtureState = fixture();
+    fixtureState.reserve(); fixtureState.bind();
+    const { continuationFailure: _failure, ...message } = continuationFailureEvent(fixtureState);
+    expect(fixtureState.controller.ingest(message, fixtureState.worker).kind).toBe('reject');
+    expect(fixtureState.currentExecution().phase).toBe('accepted');
+  });
+
+  it('does not expire a grant after the replacement has consumed its continuation', () => {
+    const fixtureState = fixture();
+    const target = fixtureState.reserve(); fixtureState.bind();
+    for (const [sequence, type] of [[1, 'turn_execution_started'], [2, 'native_input_consumed']] as const) {
+      const message = {
+        type, turnId: fixtureState.execution.turnId,
+        sessionContract: {
+          version: 2 as const, session: fixtureState.ref, producer: fixtureState.worker,
+          eventId: `${fixtureState.worker.workerId}:${sequence}`, sequence, bindingId: 'replacement',
+          scope: { runtime: target, execution: fixtureState.execution },
+        },
+      };
+      expect(fixtureState.controller.ingest(message, fixtureState.worker).kind).not.toBe('reject');
+    }
+    expect(fixtureState.currentExecution().phase).toBe('accepted');
+    expect(fixtureState.controller.ingest(continuationFailureEvent(fixtureState, 3), fixtureState.worker).kind).toBe('reject');
+    expect(fixtureState.currentExecution().terminal).toBeUndefined();
+  });
+
+  it('rolls back terminalization and grant revocation together after a persistence failure', () => {
+    const fixtureState = fixture();
+    fixtureState.reserve(); fixtureState.bind();
+    const database = openDatabaseSyncOrThrow(fixtureState.store.filename); handles.push(database);
+    database.exec("CREATE TRIGGER fail_abandonment BEFORE INSERT ON entities WHEN NEW.kind='execution_continuation' AND NEW.phase='rejected' BEGIN SELECT RAISE(ABORT,'abandonment_write_failed'); END");
+    const before = fixtureState.store.snapshot(fixtureState.ref);
+    const message = continuationFailureEvent(fixtureState);
+    expect(() => fixtureState.controller.ingest(message, fixtureState.worker)).toThrow('abandonment_write_failed');
+    expect(fixtureState.store.snapshot(fixtureState.ref)).toEqual(before);
+    database.exec('DROP TRIGGER fail_abandonment');
+    expect(fixtureState.controller.ingest(message, fixtureState.worker).kind).not.toBe('reject');
+    expect(fixtureState.currentExecution().phase).toBe('failed');
+    const reopened = new SessionContractStore(fixtureState.data, fixtureState.ref.appId); handles.push(reopened);
+    expect(reopened.execution(fixtureState.ref, fixtureState.execution.executionId)?.phase).toBe('failed');
+    expect(reopened.executionContinuation(fixtureState.ref, 'replacement')?.status).toBe('rejected');
+  });
+
+  it('serializes delivery and keeps its completion receipt across a host restart', async () => {
+    const fixtureState = fixture();
+    fixtureState.reserve(); fixtureState.bind();
+    const message = continuationFailureEvent(fixtureState);
+    fixtureState.controller.ingest(message, fixtureState.worker);
+    let release!: () => void;
+    const deliver = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    const first = fixtureState.controller.deliverContinuationFailure(fixtureState.execution, message.errorCode, deliver);
+    const second = fixtureState.controller.deliverContinuationFailure(fixtureState.execution, message.errorCode, deliver);
+    expect(deliver).toHaveBeenCalledOnce();
+    release();
+    await Promise.all([first, second]);
+    const reopened = new SessionContractStore(fixtureState.data, fixtureState.ref.appId); handles.push(reopened);
+    const restarted = new SessionController(fixtureState.ds, reopened);
+    await restarted.deliverContinuationFailure(fixtureState.execution, message.errorCode, deliver);
+    expect(deliver).toHaveBeenCalledOnce();
+  });
+
+  it('retries a failed delivery-receipt write without repeating completed effects', async () => {
+    const fixtureState = fixture();
+    fixtureState.reserve(); fixtureState.bind();
+    const message = continuationFailureEvent(fixtureState);
+    fixtureState.controller.ingest(message, fixtureState.worker);
+    const database = openDatabaseSyncOrThrow(fixtureState.store.filename); handles.push(database);
+    database.exec("CREATE TRIGGER fail_delivery_receipt BEFORE INSERT ON entities WHEN NEW.kind='continuation_failure_delivery' BEGIN SELECT RAISE(ABORT,'receipt_write_failed'); END");
+    const deliver = vi.fn(async () => {});
+    await expect(fixtureState.controller.deliverContinuationFailure(fixtureState.execution, message.errorCode, deliver)).rejects.toThrow('receipt_write_failed');
+    expect(fixtureState.store.continuationFailureDelivered(fixtureState.ref, fixtureState.execution, message.errorCode)).toBe(false);
+    database.exec('DROP TRIGGER fail_delivery_receipt');
+    await fixtureState.controller.deliverContinuationFailure(fixtureState.execution, message.errorCode, deliver);
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(fixtureState.store.continuationFailureDelivered(fixtureState.ref, fixtureState.execution, message.errorCode)).toBe(true);
+  });
+
+  it('retries the primary checkpoint after a transient write failure', async () => {
+    const fixtureState = fixture('submitting', undefined, 'cli_continuation_retry_primary');
+    fixtureState.reserve(); fixtureState.bind(); fixtureState.ds.session.rootMessageId = 'om_primary_retry';
+    let primary: any = { value: { type: 'botmux.session.primary', session: structuredClone(fixtureState.ds.session) } };
+    let fail = true;
+    const write = vi.fn(async (_key: string, update: any) => {
+      if (fail) throw new Error('primary_unavailable');
+      primary = { value: structuredClone(update(primary)) };
+      return { kind: 'written' };
+    });
+    registerSessionContractPrimary(fixtureState.ref.appId, { writeExactFromCurrent: write } as any, () => {});
+    await expect(fixtureState.controller.flushPrimary()).rejects.toThrow('primary_unavailable');
+    fail = false;
+    await fixtureState.controller.flushPrimary();
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(primary.value.session.sessionRuntimeContract.session.revision).toBe(fixtureState.store.read(fixtureState.ref)!.revision);
   });
 });

@@ -73,7 +73,7 @@ function idleQueue(worker: ReturnType<typeof rawWorker>) {
     refreshHookReviewInputHold: noop, hookReviewHoldsQueuedWrite: off, pendingInputMayFlush: () => true,
     rpcLifecycleFailClosedOwners: new Set(), codexBridgeFallbackActive: off,
     runtimePtyInputPolicy: () => ({ supportsTypeAhead: false, allowBackToBackWrites: false }),
-    pendingInputAllowsTypeAhead: off, directRpcTurnBlocksTypeAhead: off, activeTurnBlocks: off,
+    pendingInputAllowsTypeAhead: off, directRpcTurnBlocksTypeAhead: off, programStatusBlockedHoldsTypeAhead: off, activeTurnBlocks: off,
     promotePendingHumanInterruption: noop,
     effectiveBackendType: 'tmux', CodexAppFlushPromptReplay, codexAppTurnLiveness: { hasActiveTurn: off },
     bareShellChecked: true, firstWriteMayProceed: () => true, hasRunStartupCommands: true,

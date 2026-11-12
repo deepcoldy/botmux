@@ -1,4 +1,4 @@
-import { setChatFeedGroup } from '../services/chat-feed-groups.js';
+import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
@@ -9,7 +9,7 @@ import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
-import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from './resume-result-message.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import {
   BOARD_HTML_CSP,
@@ -250,7 +250,7 @@ import {
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
-import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
+import { archiveCodexForCleanup, codexCleanupArchiveEnabled } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
   getChatReplyModeState,
@@ -356,7 +356,7 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, hasUnacceptedCliInput, identityStorageModelForDaemonSession, identityDecisionConflict } from './worker-pool.js';
+import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -1612,20 +1612,52 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
 });
 
+/** One daemon log line per session and refusal kind per minute: a wrapper
+ *  retried in a loop must not flood the log, yet the first refusal of a kind
+ *  has to be visible without debug logging.
+ *
+ *  The session id in the request is whatever the caller chose, and an
+ *  unproven caller can be any local process. So only a LIVE session's own id
+ *  is ever used as a key or printed; every request naming an unknown session
+ *  shares one key, and the table drops its oldest entry rather than resetting
+ *  the limit of every real session at once. */
+const IDENTITY_REFUSAL_LOG_INTERVAL_MS = 60_000;
+const IDENTITY_REFUSAL_LOG_KEYS_MAX = 1_000;
+const identityRefusalLoggedAt = new Map<string, number>();
+function logIdentityRouteRefusal(requestedSessionId: string, tool: string, reason: string, detail?: string): void {
+  const sessionId = findActiveBySessionId(requestedSessionId)?.session.sessionId;
+  const key = `${sessionId ?? ''}\0${reason}`;
+  const now = Date.now();
+  if (now - (identityRefusalLoggedAt.get(key) ?? -Infinity) < IDENTITY_REFUSAL_LOG_INTERVAL_MS) return;
+  identityRefusalLoggedAt.delete(key);
+  while (identityRefusalLoggedAt.size >= IDENTITY_REFUSAL_LOG_KEYS_MAX) {
+    identityRefusalLoggedAt.delete(identityRefusalLoggedAt.keys().next().value!);
+  }
+  identityRefusalLoggedAt.set(key, now);
+  logger.warn(`[trigger-user-auth] refused ${tool} identity for ${sessionId ? sessionId.slice(0, 8) : 'an unknown session'}: ${reason}${detail ? ` (${detail})` : ''}`);
+}
+
 /** Storage model the daemon publishes for a managed session is resolved with
  *  the same predicate (worker-pool.identityStorageModelForDaemonSession) the
- *  worker uses to render the wrapper; they must never disagree for one session. */
+ *  worker uses to render the wrapper; they must never disagree for one session.
+ *
+ *  Every refusal carries a `reason` naming the step that failed, so the wrapper
+ *  can tell the person what to do instead of one undifferentiated
+ *  `current_execution_unverified`. Before the caller's lineage is proven the
+ *  reason only says THAT it is not proven (`peer_unresolved` /
+ *  `lineage_unproven`), never anything about the session; the finer reasons
+ *  are given only to a proven caller of the current execution. */
 ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
-  const blocked = {
-    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified',
-  };
+  const blocked = (reason: string) => ({
+    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified', reason,
+  });
   let body: unknown;
   try { body = await readBoundedJsonBody(req, 1024, 1000); }
   catch (error) {
     if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
     }
-    return jsonRes(res, error instanceof IpcBodyTooLargeError ? 413 : 400, blocked);
+    return jsonRes(res, error instanceof IpcBodyTooLargeError ? 413 : 400, blocked('invalid_request'));
   }
   const record = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown> : undefined;
@@ -1638,15 +1670,25 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
-  if (!sessionId || !tool) return jsonRes(res, 400, blocked);
+  if (!sessionId || !tool) return jsonRes(res, 400, blocked('invalid_request'));
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
-  if (!peer.ok) return jsonRes(res, 403, blocked);
+  if (!peer.ok) {
+    logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.reason);
+    return jsonRes(res, 403, blocked('peer_unresolved'));
+  }
   const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
   if (document) {
     const ds = findActiveBySessionId(sessionId);
-    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
+    if (!ds) return jsonRes(res, 403, blocked('lineage_unproven'));
+    // The caller is proven to be the current execution; only the session's
+    // identity model keeps it from its identity. Say which half.
+    const modelRefusal = identityModelRefusalReason(ds);
+    if (modelRefusal) {
+      logIdentityRouteRefusal(sessionId, tool, modelRefusal);
+      return jsonRes(res, 403, blocked(modelRefusal));
+    }
     const identityTurnId = document.identityTurnId ?? document.turnId;
     // A workflow handoff's delegation is re-checked on every use: once its
     // attempt ended or it was withdrawn, this turn's tool refuses from now on
@@ -1702,6 +1744,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // Lineage is proven, but no identity material exists for this turn (never
     // prepared, collected at a terminal boundary, daemon restart). Distinct
     // from a proof failure so the wrapper denies without confusing the two.
+    logIdentityRouteRefusal(sessionId, tool, 'identity_material_unavailable', `turn ${identityTurnId}`);
     return jsonRes(res, 404, {
       schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'identity_material_unavailable',
     });
@@ -1716,7 +1759,12 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       identityTurnId: detached.identityTurnId, env: detached.env,
     });
   }
-  return jsonRes(res, 403, blocked);
+  // Operator-only detail: which daemon-side precondition of the lineage proof
+  // is absent. The caller is not proven, so it gets the coarse reason only.
+  const live = findActiveBySessionId(sessionId);
+  logIdentityRouteRefusal(sessionId, tool, 'lineage_unproven',
+    !live ? 'no active session' : !live.managedTurnOrigin?.turnId ? 'no live turn origin' : 'caller outside the live turn');
+  return jsonRes(res, 403, blocked('lineage_unproven'));
 });
 
 for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
@@ -2153,7 +2201,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
     || (attempt !== undefined && (!Number.isSafeInteger(attempt) || Number(attempt) < 1))) {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
-  await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
+  const nativeThinkingVisible = await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
   const current = findActiveBySessionId(params.sessionId);
   if (!sessionCliIpcAuth(req, current, params.sessionId, body).ok || (current && replyCardDispatchAttempt(current, turnId) !== attempt)) {
     return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
@@ -2161,7 +2209,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
   if (current !== ds || current?.currentTurnId !== turnId || current?.session.status === 'closed') {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
-  return jsonRes(res, 200, { ok: true });
+  // The CLI persists this with the barrier; absent (older daemon) means the
+  // answer card keeps showing progress.
+  return jsonRes(res, 200, { ok: true, nativeThinkingVisible: nativeThinkingVisible === true });
 });
 
 /** Session-bound single-message delivery through the primary durable outbox.
@@ -2498,21 +2548,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const initial = findSessionRecord(params.sessionId);
   const initiallyClosed = initial?.status === 'closed';
   let codexArchiveReleaseTicket: CodexCleanupReleaseTicket | undefined;
-  const closeCurrentGeneration = () => closeSession(params.sessionId, {
-    ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
-      ? { backgroundExecutionCleanup: true } : {}),
-    // Dashboard "close" and `botmux delete` are human closes (empty body); only
-    // idle/auto cleanup (idleCleanup: true) stays resumable.
-    ...(body.idleCleanup === true ? {} : { userClosed: true }),
-    onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
-  });
+  let archiveCodex = false;
+  const closeCurrentGeneration = () => {
+    const current = findSessionRecord(params.sessionId);
+    archiveCodex = codexCleanupArchiveEnabled(findActiveBySessionId(params.sessionId)?.larkAppId ?? current?.larkAppId);
+    return closeSession(params.sessionId, {
+      archiveCodex,
+      ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
+        ? { backgroundExecutionCleanup: true } : {}),
+      // Dashboard "close" and `botmux delete` are human closes (empty body); only
+      // idle/auto cleanup (idleCleanup: true) stays resumable.
+      ...(body.idleCleanup === true ? {} : { userClosed: true }),
+      onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
+    });
+  };
   const cleanupSource = body.idleCleanupSource === 'manual' ? 'manual'
     : body.idleCleanupSource === 'scheduled' ? 'scheduled' : 'unspecified';
   logger.info(`[session-close] session=${params.sessionId} intent=${body.idleCleanup === true ? `idle_cleanup:${cleanupSource}` : 'explicit_close'}`);
   const cleanupArchive = async (): Promise<string | undefined> => {
     const row = sessionStore.getOwnedSession(params.sessionId);
     if (!row) return;
-    const enabled = readGlobalConfig().sessionCleanup?.archiveCodex === true;
+    const enabled = archiveCodex;
     const error = await archiveCodexForCleanup(row, enabled, sessionStore.updateSession, undefined,
       async () => codexArchiveReleaseTicket?.released);
     const outcome = error === 'codex_archive_target_unverified' || error === 'codex_archive_target_invalid'
@@ -2538,6 +2594,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     // never clear a stale pre-drain snapshot while a turn is still preparing.
     const current = findSessionRecord(params.sessionId);
     if (current && current.status === 'closed') {
+      archiveCodex = codexCleanupArchiveEnabled(findActiveBySessionId(params.sessionId)?.larkAppId ?? current.larkAppId);
       // Manual re-close must revoke jobs preserved by automatic cleanup. Do
       // not return before the canonical durable close clears that marker.
       if (current.backgroundExecutionCleanupClosedAt
@@ -3160,26 +3217,22 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     // already reached, so report idempotent success without a live kill.
     return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
   }
-  // Producing a reply, or still taking in a message — killing the worker now
-  // would drop this turn. Queue instead; worker-pool's runPendingSuspendIfSettled
-  // cashes it in once the turn has settled. Ordering matters: the idempotent
-  // no-worker branch above must win, so "worker was already gone" never
-  // reports as deferred.
+  // Producing a reply, still taking in a message, or the last reply not yet
+  // out — killing the worker now would drop that turn or its answer. Queue
+  // instead; worker-pool's runPendingSuspendIfSettled cashes it in once all of
+  // them have settled, and the response names what it waits for. Ordering
+  // matters: the idempotent no-worker branch above must win, so "worker was
+  // already gone" never reports as deferred.
   //
   // The suspendability check is part of the queueing condition, not a new guard
   // ahead of it: a non-suspendable (pty) backend must keep falling through to
   // suspendWorker's existing 409 rather than get a `deferred` that could only
   // fail silently at fulfillment time.
-  if (
-    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing' || hasUnacceptedCliInput(ds))
-    && isSuspendableBackendType(ds.initConfig?.backendType)
-  ) {
-    ds.pendingSuspendReason = 'manual_suspend';
-    // Bind the claim to the generation that is producing right now: it must not
-    // outlive that worker (see clearPendingSuspendClaim).
-    ds.pendingSuspendGeneration = ds.workerGeneration;
+  const waits = manualSuspendWaits(ds);
+  if (waits.waitingFor.length > 0 && isSuspendableBackendType(ds.initConfig?.backendType)) {
+    queueManualSuspend(ds, waits);
     return jsonRes(res, 200, {
-      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
+      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred', ...waits,
     });
   }
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) {
@@ -6684,11 +6737,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // Mirror the card-button / /resume receipt wording: when the adapter can only
   // resume a precise cliSessionId and none was persisted, the next spawn is a
   // fresh CLI, so say so instead of claiming the old history is back.
-  const notice = result.recoveryPending
-    ? t('card.action.resume_started_remote', { cliName }, loc)
-    : resumeStartsFresh(ds.session)
-      ? t('card.action.resume_success_fresh', { cliName }, loc)
-      : t('card.action.resume_success', { cliName }, loc);
+  const notice = resumeSuccessMessage(result, cliName, loc);
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
@@ -8351,6 +8400,24 @@ ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, re
   } finally { res.off('close', onClose); }
 }, NOT_BOUND_BODY.okFalse));
 
+/** Generic plugin operation: an explicit scope prevents unrelated personal-group removal. */
+ipcRoute('PUT', '/api/groups/:chatId/feed-groups', requireBoundBot(async (req, res, p) => {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const { actorOpenId, label, managedLabels } = body as Record<string, unknown>;
+  if (typeof actorOpenId !== 'string' || !isFeedGroupSelection(label, managedLabels)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_label' });
+  }
+  const cancelled = new AbortController();
+  const onClose = () => { if (!res.writableEnded) cancelled.abort(); };
+  res.once('close', onClose);
+  try {
+    const result = await setChatFeedGroup(cachedLarkAppId, p.chatId, actorOpenId, label as string | null, cancelled.signal, managedLabels);
+    return jsonRes(res, result.ok ? 200 : result.error === 'permission_denied' ? 403 : 400, result);
+  } finally { res.off('close', onClose); }
+}, NOT_BOUND_BODY.okFalse));
+
 ipcRoute('PUT', '/api/group-default-models/:chatId', requireBoundBot(async (req, res, p) => {
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   let models;
@@ -9834,6 +9901,9 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // on THIS daemon. Advice next to the choice; saving is never blocked on it.
     scratchCapability: (() => { try { return probeScratchCapability(); } catch { return null; } })(),
     codexAuthSync,
+    // Per-bot archive override (null = inherit sessionCleanup.archiveCodex). Read
+    // from the live config so a `/config set archiveCodex` shows up without reload.
+    archiveCodex: (() => { try { const v = getBot(cachedLarkAppId).config.archiveCodex; return typeof v === 'boolean' ? v : null; } catch { return null; } })(),
     envPolicy: (() => { try { return getBot(cachedLarkAppId).config.envPolicy ?? { mode: 'inherit' }; } catch { return { mode: 'inherit' }; } })(),
     sandboxPaths: sandboxPathsForDashboard ?? null,
     // Already-stored readWrite entries the save path would now refuse; the
@@ -12064,6 +12134,20 @@ botConfigPutRoute('/api/bot-max-live-workers', 'maxLiveWorkers', {
 botConfigPutRoute('/api/bot-idle-suspend-minutes', 'idleSuspendMinutes', {
   normalize: nullableNumberField('idleSuspendMinutes'),
   respond: value => ({ ok: true, idleSuspendMinutes: value }),
+});
+
+// Per-bot 关闭/清理时原生归档 Codex 的覆盖。Body `{ archiveCodex: true | false | null }`:
+//   • true / false → 显式开 / 关，写进 bots.json（显式 false 也落盘，不随全局变化）
+//   • null         → 删除覆盖，继承全局 sessionCleanup.archiveCodex
+// 缺少该键或类型不对一律 400，不把空 body 当清除。走 applyConfigField（与 /config 同一
+// 写盘 + 内存热更新路径），下一次关闭/清理即按新值冻结，已开始的关闭不受影响。
+botConfigPutRoute('/api/bot-archive-codex', 'archiveCodex', {
+  normalize: raw => {
+    const value = typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).archiveCodex : undefined;
+    return value === null || typeof value === 'boolean' ? fieldOk(value) : fieldInvalid('invalid_archive_codex');
+  },
+  respond: value => ({ ok: true, archiveCodex: value }),
 });
 
 ipcRoute('PUT', '/api/bot-session-owner-reminder', requireBoundBot(async (req, res) => {

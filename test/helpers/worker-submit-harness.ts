@@ -38,6 +38,7 @@ export function workerSubmitHarness() {
     runtimePtyInputPolicy: () => ({ supportsTypeAhead: true, allowBackToBackWrites: true }),
     pendingInputAllowsTypeAhead: () => true,
     directRpcTurnBlocksTypeAhead: () => false,
+    programStatusBlockedHoldsTypeAhead: () => false,
     activeTurnBlocks: () => false,
     promotePendingHumanInterruption: () => false,
     pendingSessionRename: null, pendingMessages, pendingRawInputs: [], pendingAdoptMessages: [], pendingInjections: [],
