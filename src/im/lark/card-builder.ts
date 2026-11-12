@@ -1304,6 +1304,16 @@ export function buildStreamingCard(
       { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
+  // 缓存过期自动压缩（Kimi Code，core/kimi-cache-expiry.ts）：同样随 usage 快照到卡、
+  // 跟随「压缩」的隐藏配置，按钮值带目标状态 desired。
+  const kimiExpiryCompact = !adoptMode && !hidden.has('compact') ? usage?.kimiCacheExpiryAutoCompact : undefined;
+  if (kimiExpiryCompact) {
+    morePanelButtons.push(callbackButton(
+      t(kimiExpiryCompact.enabled ? 'card.btn.kimi_expiry_compact_on' : 'card.btn.kimi_expiry_compact_off', undefined, locale),
+      'default',
+      { action: 'toggle_kimi_expiry_compact', desired: kimiExpiryCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
   // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
   // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
   if (!hidden.has('substitute') && substituteControl) {

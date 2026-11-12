@@ -67,12 +67,23 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 const sendWorkerSessionInputMock = vi.fn();
+const sendKimiCacheExpiryAutoCompactSettingMock = vi.fn(() => true);
 const isSessionTransferringMock = vi.fn(() => false);
 const sessionAcceptsDirectCommandMock = vi.fn(() => true);
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const { supportsIdleAutoCompact } = await vi.importActual<typeof import('../src/core/idle-auto-compact.js')>('../src/core/idle-auto-compact.js');
+  const { supportsKimiCacheExpiryAutoCompact } = await vi.importActual<typeof import('../src/core/kimi-cache-expiry.js')>('../src/core/kimi-cache-expiry.js');
   return {
+  // Same projection as the real helper, over the pure support predicate.
+  sessionSupportsKimiCacheExpiryAutoCompact: (ds: any) => supportsKimiCacheExpiryAutoCompact({
+    cliId: ds.session.cliId ?? 'claude-code',
+    backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+    adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
+    headless: !!ds.session.headless,
+    vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+  }),
+  sendKimiCacheExpiryAutoCompactSetting: (...args: any[]) => sendKimiCacheExpiryAutoCompactSettingMock(...(args as [])),
   // Same projection as the real helper, over the pure support predicate.
   sessionSupportsIdleAutoCompact: (ds: any) => supportsIdleAutoCompact({
     cliId: ds.session.cliId ?? 'claude-code',
@@ -681,6 +692,80 @@ describe('toggle_idle_compact card action', () => {
     expect(result.toast.type).toBe('warning');
     expect(ds.session.idleAutoCompact).toBeUndefined();
     expect(sensitiveCardActionMeta('toggle_idle_compact')).toBeDefined();
+  });
+});
+
+// ─── toggle_kimi_expiry_compact ───────────────────────────────────────────
+
+describe('toggle_kimi_expiry_compact card action', () => {
+  function toggle(desired?: 'on' | 'off', clicked = 'om_clicked'): any {
+    const data = actionData('toggle_kimi_expiry_compact');
+    if (desired) data.action.value.desired = desired;
+    data.context.open_message_id = clicked;
+    return data;
+  }
+  const kimiDs = (overrides: Parameters<typeof makeDs>[0] = {}) =>
+    makeDs({ ...overrides, sessionOverrides: { cliId: 'kimi', ...overrides.sessionOverrides } as any });
+
+  beforeEach(() => { sendKimiCacheExpiryAutoCompactSettingMock.mockClear(); });
+
+  it('turns the session on, persists it, tells the live worker and re-renders the clicked live card', async () => {
+    const store = await import('../src/services/session-store.js');
+    vi.mocked(store.updateSession).mockClear();
+    const ds = kimiDs({ streamCardId: 'om_clicked' });
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.kimiCacheExpiryAutoCompact).toEqual({ enabled: true });
+    expect(store.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(sendKimiCacheExpiryAutoCompactSettingMock).toHaveBeenCalledWith(ds, true);
+    expect(result.toast.type).toBe('success');
+    expect(result.card.type).toBe('raw');
+  });
+
+  it('turns it off; desired state makes stale-card double clicks idempotent', async () => {
+    const ds = kimiDs();
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.kimiCacheExpiryAutoCompact).toEqual({ enabled: true });
+    const result = await handleCardAction(toggle('off'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.kimiCacheExpiryAutoCompact).toEqual({ enabled: false });
+    expect(sendKimiCacheExpiryAutoCompactSettingMock).toHaveBeenLastCalledWith(ds, false);
+    expect(result.toast.type).toBe('success');
+    expect(result.card).toBeUndefined();
+  });
+
+  it('refuses every other CLI, adopted sessions and non-local backends without touching the session', async () => {
+    for (const ds of [
+      makeDs(),
+      makeDs({ sessionOverrides: { cliId: 'codex' } as any }),
+      kimiDs({ adoptedFrom: { cliId: 'kimi' } as any }),
+      kimiDs({ sessionOverrides: { backendType: 'zmx' } as any }),
+    ]) {
+      const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+      expect(result.toast.type).toBe('warning');
+      expect(ds.session.kimiCacheExpiryAutoCompact).toBeUndefined();
+    }
+    expect(sendKimiCacheExpiryAutoCompactSettingMock).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the in-memory setting and tells the worker nothing when the save fails', async () => {
+    const store = await import('../src/services/session-store.js');
+    const ds = kimiDs();
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    sendKimiCacheExpiryAutoCompactSettingMock.mockClear();
+    vi.mocked(store.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    const result = await handleCardAction(toggle('off'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.kimiCacheExpiryAutoCompact).toEqual({ enabled: true });
+    expect(sendKimiCacheExpiryAutoCompactSettingMock).not.toHaveBeenCalled();
+  });
+
+  it('non-operators are refused with a toast and nothing changes', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = kimiDs();
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.kimiCacheExpiryAutoCompact).toBeUndefined();
+    expect(sendKimiCacheExpiryAutoCompactSettingMock).not.toHaveBeenCalled();
   });
 });
 

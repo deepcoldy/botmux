@@ -699,10 +699,19 @@ import {
 import {
   StuckDetector,
   classifyStuckPage,
+  isKimiCacheExpiryPage,
   shouldHoldInputForHookReview,
   shouldHoldInputForStuckPage,
   type StuckPageType,
 } from './utils/stuck-detector.js';
+import { kimiCacheExpiryMenuTail } from './utils/kimi-cache-expiry-menu.js';
+import {
+  KIMI_CACHE_EXPIRY_WORKING_WINDOW_MS,
+  KimiCacheExpiryController,
+  type KimiCacheExpiryCardReason,
+  type KimiCacheExpiryPage,
+  type KimiCompactPressResult,
+} from './core/kimi-cache-expiry.js';
 import { isAllowedStuckKeySequence, redactStuckPageTail, stuckScreenTail } from './core/stuck-page-catalog.js';
 import { turnFailureDiagnostics } from './services/turn-failure-diagnostics.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
@@ -3992,12 +4001,13 @@ function probeStartupBlocker(source: string): CliStartupBlocker | null {
  *  screen. */
 function holdFirstPromptForStuckPage(source: string): boolean {
   const be = backend;
-  if (!be || !lastInitConfig || !adapterRendersCodexFamilyStuckPages()) return false;
+  const family = cliAdapter?.stuckPageFamily;
+  if (!be || !lastInitConfig || !family) return false;
   if (isRemoteBackendType(lastInitConfig.backendType)) return false;
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
   let screen = '';
   try { screen = captureBackendScreen(be); } catch { return false; }
-  const pageType = screen ? classifyStuckPage(screen) : undefined;
+  const pageType = screen ? classifyStuckPage(screen, family) : undefined;
   if (!pageType) return false;
   const wasHeld = hookReviewInputHold;
   refreshHookReviewInputHold(screen);
@@ -4220,19 +4230,23 @@ let hookReviewInputHoldNotified = false;
 let hookReviewInputHoldSnapshot = '';
 
 /** The adapter declares the codex_core blocking pages (hook review flow and
- *  the TRAE legacy-data migration picker) that classifyStuckPage recognises,
- *  and the stuck card that offers their safe keys. */
+ *  the TRAE legacy-data migration picker) that classifyStuckPage recognises.
+ *  Gates only the StuckDetector's turn_stalled card; the input hold, the held
+ *  input's card and the key guard follow any declared `stuckPageFamily`
+ *  (Kimi's cache-expiry menu included). */
 function adapterRendersCodexFamilyStuckPages(): boolean {
   return cliAdapter?.stuckPageFamily === 'codex-family';
 }
 
-/** Whether `snapshot` shows a page the hold applies to. Codex-family
- *  adapters hold on every recognised blocking page (a pasted message is
- *  consumed as keystrokes by the migration picker as well); every other CLI
- *  keeps the hook-review-only hold it always had. */
+/** Whether `snapshot` shows a page the hold applies to. Adapters that declare
+ *  a page family hold on every page of their family (a pasted message is
+ *  consumed as keystrokes by the migration picker and by Kimi's cache-expiry
+ *  menu as well); every other CLI keeps the hook-review-only hold it always
+ *  had. */
 function hookReviewHoldBlocks(snapshot: string): boolean {
-  return adapterRendersCodexFamilyStuckPages()
-    ? shouldHoldInputForStuckPage(snapshot)
+  const family = cliAdapter?.stuckPageFamily;
+  return family
+    ? shouldHoldInputForStuckPage(snapshot, family)
     : shouldHoldInputForHookReview(snapshot);
 }
 
@@ -4276,7 +4290,7 @@ function hookReviewAdmissionCapture(): { screen: string; freshCaptureFailed: boo
     if (hookReviewHoldBlocks(lastAnalyzerSnapshot)) return true;
     try { return hookReviewHoldBlocks(renderer?.rawSnapshot() ?? ''); } catch { return false; }
   };
-  if (be && adapterRendersCodexFamilyStuckPages() && (hookReviewInputHold || cachedShowsPage())
+  if (be && cliAdapter?.stuckPageFamily && (hookReviewInputHold || cachedShowsPage())
     && backendScreenEvidenceIsAuthoritativeForMutation()
     && !(lastInitConfig && isRemoteBackendType(lastInitConfig.backendType))) {
     try {
@@ -4285,7 +4299,7 @@ function hookReviewAdmissionCapture(): { screen: string; freshCaptureFailed: boo
     } catch { /* fall back to the cached screens */ }
     freshCaptureFailed = true;
   }
-  if (adapterRendersCodexFamilyStuckPages()) {
+  if (cliAdapter?.stuckPageFamily) {
     // No fresh capture: the tick cache can lag the renderer and vice versa —
     // a page on either one holds.
     let rendered = '';
@@ -4302,7 +4316,48 @@ function hookReviewAdmissionCapture(): { screen: string; freshCaptureFailed: boo
  *  its release probe — the admission screen no longer shows the page — keeps
  *  the input parked silently: the page is (probably) gone, so a card or a
  *  "finish the hook review" notice for it would be spurious. */
+/** Kimi draws its cache-expiry menu on a resumed long-idle session right
+ *  after the resume finishes loading — in the real 2.5.3 probe ~0.2s AFTER
+ *  its first `idle` report — while the worker flushes the opening input on
+ *  that report at once (writeInput then pastes ~0.25s later): the check below
+ *  ran before the menu existed and the paste landed in it (swallowed, its
+ *  Enter picked a row, the message was lost). So a resumed Kimi's opening
+ *  input first waits for its screen to stay quiet briefly; the menu, when it
+ *  comes, is painted by then and the hold below catches it. Bounded by a cap
+ *  from the first flush attempt; any other spawn and any later write skip it. */
+const KIMI_RESUME_OPENING_QUIET_MS = 1_000;
+const KIMI_RESUME_OPENING_CAP_MS = 4_000;
+let kimiResumeOpeningSettle: { generation: number; firstCheckAtMs?: number } | undefined;
+let kimiResumeOpeningTimer: ReturnType<typeof setTimeout> | null = null;
+
+function kimiResumeOpeningSettleHolds(): boolean {
+  const settle = kimiResumeOpeningSettle;
+  if (!settle) return false;
+  if (settle.generation !== cliSpawnGeneration) {
+    kimiResumeOpeningSettle = undefined;
+    return false;
+  }
+  const now = Date.now();
+  settle.firstCheckAtMs ??= now;
+  const quietForMs = now - lastPtyOutputAtMs;
+  const waitedMs = now - settle.firstCheckAtMs;
+  if (quietForMs >= KIMI_RESUME_OPENING_QUIET_MS || waitedMs >= KIMI_RESUME_OPENING_CAP_MS) {
+    kimiResumeOpeningSettle = undefined;
+    return false;
+  }
+  if (!kimiResumeOpeningTimer) {
+    const waitMs = Math.max(50, Math.min(KIMI_RESUME_OPENING_QUIET_MS - quietForMs, KIMI_RESUME_OPENING_CAP_MS - waitedMs));
+    kimiResumeOpeningTimer = setTimeout(() => {
+      kimiResumeOpeningTimer = null;
+      void flushPending();
+    }, waitMs);
+    kimiResumeOpeningTimer.unref?.();
+  }
+  return true;
+}
+
 function hookReviewHoldsQueuedWrite(): boolean {
+  if (cliAdapter?.stuckPageFamily === 'kimi' && kimiResumeOpeningSettleHolds()) return true;
   const screen = hookReviewAdmissionScreen();
   refreshHookReviewInputHold(screen);
   if (!hookReviewInputHold) return false;
@@ -4387,19 +4442,23 @@ function refreshHookReviewInputHold(snapshot: string, opts: { settled?: boolean 
   const blocked = hookReviewHoldBlocks(snapshot);
   if (blocked) hookReviewInputHoldSnapshot = snapshot;
   if (blocked === hookReviewInputHold) return;
-  if (!blocked && adapterRendersCodexFamilyStuckPages() && !opts.settled) {
+  if (!blocked && cliAdapter?.stuckPageFamily && !opts.settled) {
     scheduleHookReviewReleaseProbe();
     return;
   }
   hookReviewInputHold = blocked;
   if (blocked) {
-    log('Hook review menu visible — holding queued input until the menu is resolved');
+    log('Blocking page visible — holding queued input until it is resolved');
+    // Kimi's cache-expiry menu: one menu event per appearance (the hold's
+    // own lifecycle), decided by core/kimi-cache-expiry.ts.
+    if (cliAdapter?.stuckPageFamily === 'kimi') kimiCacheExpiry?.menuShown();
     return;
   }
   cancelHookReviewReleaseProbe();
   hookReviewInputHoldNotified = false;
   hookReviewInputHoldSnapshot = '';
-  log('Hook review menu cleared — releasing queued input');
+  log('Blocking page cleared — releasing queued input');
+  kimiCacheExpiry?.menuGone();
   if (hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
 }
 
@@ -4420,14 +4479,15 @@ function heldInputTurnIdentity(): { turnId: string | undefined; dispatchAttempt:
  *  rendered screen, then the snapshot that last set the hold (a PTY chunk
  *  appended to the render). */
 function heldStuckPage(freshScreen?: string): { pageType: StuckPageType; snapshot: string } | undefined {
-  if (!adapterRendersCodexFamilyStuckPages() || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  const family = cliAdapter?.stuckPageFamily;
+  if (!family || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
   let rendered = '';
   if (!freshScreen) {
     try { rendered = lastAnalyzerSnapshot || renderer?.rawSnapshot() || ''; } catch { rendered = ''; }
   }
   const candidates = freshScreen ? [freshScreen] : [rendered, hookReviewInputHoldSnapshot];
   for (const snapshot of candidates) {
-    const pageType = snapshot ? classifyStuckPage(snapshot) : undefined;
+    const pageType = snapshot ? classifyStuckPage(snapshot, family) : undefined;
     if (pageType) return { pageType, snapshot };
   }
   return undefined;
@@ -4437,6 +4497,12 @@ function notifyHookReviewInputHold(freshScreen?: string): void {
   if (hookReviewInputHoldNotified) return;
   hookReviewInputHoldNotified = true;
   const held = heldStuckPage(freshScreen);
+  if (held && kimiCacheExpiry && isKimiCacheExpiryPage(held.pageType)) {
+    // The menu event decides: press "Compact and continue" for a session that
+    // opted in, or raise this same card (core/kimi-cache-expiry.ts).
+    kimiCacheExpiry.kick();
+    return;
+  }
   if (held) {
     const { turnId, dispatchAttempt } = heldInputTurnIdentity();
     log(`Holding queued input behind ${held.pageType} — raising stuck card`);
@@ -4505,8 +4571,9 @@ function afterStuckKeyObserved(after: { screen?: string; pageType?: string }): v
  *  otherwise only let the hold re-check it — one capture is not a settled
  *  screen, so a release still goes through the bounded probe. */
 function afterStuckKeyExpired(screen: string | undefined): void {
-  if (!screen || !adapterRendersCodexFamilyStuckPages()) return;
-  const pageType = classifyStuckPage(screen);
+  const family = cliAdapter?.stuckPageFamily;
+  if (!screen || !family) return;
+  const pageType = classifyStuckPage(screen, family);
   if (!pageType) {
     refreshHookReviewInputHold(screen);
     return;
@@ -4535,9 +4602,13 @@ function screenShowsCredentialPage(screen: string): boolean {
  *  page's free-form value rows masked (redactStuckPageTail). Any other screen,
  *  and any credential page, yields '' and the notice stays plain text. */
 function shareableStuckScreenTail(screen: string): string {
-  if (!screen || !adapterRendersCodexFamilyStuckPages()) return '';
-  if (!classifyStuckPage(screen)) return '';
+  const family = cliAdapter?.stuckPageFamily;
+  if (!screen || !family) return '';
+  if (!classifyStuckPage(screen, family)) return '';
   if (screenShowsCredentialPage(screen)) return '';
+  // Kimi draws its menu under the live conversation: only the menu rows leave
+  // the terminal, never the transcript above them.
+  if (family === 'kimi') return kimiCacheExpiryMenuTail(screen);
   // Redact the whole page before bounding it: the line / char cut can drop a
   // row's label and leave its value (or a wrapped continuation) unmasked.
   const unbounded = stuckScreenTail(screen, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
@@ -16085,6 +16156,189 @@ function stopStuckDetector(): void {
   stuckDetector = null;
 }
 
+// ─── Kimi cache-expiry menu (core/kimi-cache-expiry.ts) ─────────────────────
+
+/** Session setting 缓存过期自动压缩: the daemon sends it in `init` and pushes
+ *  every toggle (`kimi_cache_expiry_auto_compact`). Off unless opted in. */
+let kimiCacheExpiryAutoCompact = false;
+/** Interrupt-class keys (/stop and the card's stop send Ctrl-C / Esc as
+ *  `term_action`; an exact-turn interrupt) sent to the CLI, counted at the IPC
+ *  switch. A menu event that saw one is never answered automatically. */
+let cliInterruptGeneration = 0;
+
+/** A fresh authoritative capture read as Kimi pages (same capture and scope
+ *  as the input hold's admission check); undefined when none can be taken. */
+function kimiCacheExpiryPage(): KimiCacheExpiryPage | undefined {
+  const be = backend;
+  if (!be || cliAdapter?.stuckPageFamily !== 'kimi' || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  if (lastInitConfig && isRemoteBackendType(lastInitConfig.backendType)) return undefined;
+  let screen = '';
+  try { screen = captureBackendScreen(be); } catch { return undefined; }
+  if (!screen.trim()) return undefined;
+  return { pageType: classifyStuckPage(screen, 'kimi'), screen };
+}
+
+/** The stuck card for the menu: the same `stuck_warning` a held message
+ *  raises, for the turn the menu blocks (the written one, or the held one). */
+function raiseKimiCacheExpiryCard(input: {
+  reason: KimiCacheExpiryCardReason;
+  page: KimiCacheExpiryPage;
+  elapsedMs: number;
+  noticeKey?: 'worker.kimi_cache_expiry.auto_failed' | 'worker.kimi_cache_expiry.auto_write_failed';
+}): void {
+  const { turnId, dispatchAttempt } = input.reason === 'input_held'
+    ? heldInputTurnIdentity()
+    : { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
+  const screenTail = shareableStuckScreenTail(input.page.screen);
+  // A parked turn's card says how long ago its message was written, not how
+  // long the menu has been up.
+  const sinceWrite = input.reason === 'turn_stalled'
+    ? turnExecutionClock.peek(turnId, dispatchAttempt)?.durationMs
+    : undefined;
+  send({
+    type: 'stuck_warning',
+    reason: input.reason,
+    elapsedMs: sinceWrite ?? input.elapsedMs,
+    snapshot: screenTail,
+    screenTail,
+    matchedPattern: input.page.pageType,
+    ...(input.noticeKey ? {
+      noticeText: t(input.noticeKey, {
+        cliName: cliName(),
+        secs: String(Math.round(KIMI_CACHE_EXPIRY_WORKING_WINDOW_MS / 1000)),
+      }),
+    } : {}),
+    turnId,
+    dispatchAttempt,
+    cliLifetime: cliLifetimeNonce,
+  });
+}
+
+/** Fresh screen for the stuck-key guard on a Kimi session (card click or the
+ *  automatic press). snapshotToText reads observe backends (tmux) only; a
+ *  plain PTY backend has no capture of its own and the worker's renderer IS
+ *  its screen (it parses every byte of the stream), so drain the renderer and
+ *  read it. A backend that can capture but did not stays fail-closed. Other
+ *  CLIs keep the guard's tmux-only capture. */
+async function kimiStuckKeyCapture(
+  be: SessionBackend,
+  cols: number,
+  rows: number,
+  opts: { filter: boolean },
+): Promise<{ content: string | null } | null> {
+  const piped = await snapshotToText(be, cols, rows, opts);
+  if (piped) return piped;
+  if (be !== backend || !renderer || be.captureViewport || be.captureCurrentScreen) return null;
+  const target = renderer;
+  await target.writeAndFlush('');
+  if (be !== backend || renderer !== target) return null;
+  return { content: target.rawSnapshot() };
+}
+
+/** "Compact and continue" through the stuck-card key guard: CLI lifetime,
+ *  fresh capture on the same backend, page re-classified as `kimi cache
+ *  expiry` (pointer still on that row) and the catalog's key allow-list —
+ *  the exact checks a card click gets. Nothing is reported to the daemon:
+ *  no card owns this key. */
+async function pressKimiCacheExpiryCompact(
+  expectedLifetime: number,
+  veto: () => string | undefined,
+): Promise<KimiCompactPressResult> {
+  const result = await processStuckWarningTuiKeys(
+    {
+      stuckNonce: 0,
+      stuckPageType: 'kimi cache expiry',
+      stuckCliLifetime: expectedLifetime,
+      keys: ['Enter'],
+      isFinal: true,
+    },
+    {
+      getBackend: () => backend,
+      getCurrentLifetime: () => cliLifetimeNonce,
+      renderCols,
+      renderRows,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      capture: kimiStuckKeyCapture,
+      match: snap => classifyStuckPage(snap, 'kimi'),
+      writeKeys: handleTuiKeys,
+      sendExpired: () => {},
+      sendDelivered: () => {},
+      sendFailed: () => {},
+      log,
+      // Runs after the guard's fresh capture (its last await) and right
+      // before the write: an Esc, a keystroke, a toggle or a restart that
+      // landed during that capture refuses the key.
+      allowKeys: (pageType, keys) => isAllowedStuckKeySequence(pageType, keys) && veto() === undefined,
+    },
+  );
+  if (result.wroteKeys) return { kind: 'written' };
+  return result.sent === 'failed' ? { kind: 'failed' } : { kind: 'expired' };
+}
+
+const kimiCacheExpiry: KimiCacheExpiryController | null = new KimiCacheExpiryController({
+  now: () => Date.now(),
+  setTimer: (fn, ms) => {
+    const handle = setTimeout(fn, ms);
+    handle.unref?.();
+    return handle;
+  },
+  clearTimer: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  autoCompactEnabled: () => kimiCacheExpiryAutoCompact,
+  lifetime: () => cliLifetimeNonce,
+  interruptGeneration: () => cliInterruptGeneration,
+  webInputGeneration: () => webTerminalInputGeneration,
+  pausedReason: () => {
+    if (cliRestartInProgress) return 'CLI restarting';
+    if (currentInputDeliveryQuarantine()) return 'input delivery quarantined';
+    if (!backendScreenEvidenceIsAuthoritativeForMutation()) return 'screen not authoritative';
+    return undefined;
+  },
+  turnInFlight: () => !isPromptReady && inflightInputs.hasUnacked(),
+  inputHeld: () => hookReviewInputHold && hasPendingInputForFlush(),
+  capturePage: kimiCacheExpiryPage,
+  lastKnownPage: () => {
+    if (!hookReviewInputHold || cliAdapter?.stuckPageFamily !== 'kimi') return undefined;
+    const pageType = classifyStuckPage(hookReviewInputHoldSnapshot, 'kimi');
+    return pageType ? { pageType, screen: hookReviewInputHoldSnapshot } : undefined;
+  },
+  pressCompact: pressKimiCacheExpiryCompact,
+  programStatusWorking: () => idleDetector?.programStatusHeldWorking() === true,
+  raiseCard: raiseKimiCacheExpiryCard,
+  notify: (key, params) => send({
+    type: 'user_notify',
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    message: t(key, { cliName: cliName(), ...params }),
+  }),
+  log,
+});
+
+/** Screen-idle veto: Kimi's cache-expiry menu replaced the composer. OSC 7501
+ *  reports nothing for it, so once the submit's busy deadline passes the 2s
+ *  quiet screen reads as idle — the parked turn must not end there. Its
+ *  completion comes from Kimi's own `working` → `done` after the menu is
+ *  answered (on any backend whose screen is authoritative: PTY and tmux). */
+function kimiCacheExpiryHoldsIdle(idleBackend: typeof backend): boolean {
+  if (cliAdapter?.stuckPageFamily !== 'kimi' || !idleBackend || backend !== idleBackend) return false;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  let screen = '';
+  try { screen = captureBackendScreen(idleBackend); } catch { screen = ''; }
+  if (screen.trim()) {
+    if (!isKimiCacheExpiryPage(classifyStuckPage(screen, 'kimi'))) return false;
+    log('Kimi cache-expiry menu owns the input surface; not marking the prompt ready');
+    refreshHookReviewInputHold(screen, { settled: true });
+  } else {
+    // No capture: fail closed while the input hold still stands on the menu
+    // (only a settled screen without it releases the hold).
+    if (!hookReviewInputHold || !isKimiCacheExpiryPage(classifyStuckPage(hookReviewInputHoldSnapshot, 'kimi'))) return false;
+    log('Kimi cache-expiry menu still held (no screen capture); not marking the prompt ready');
+  }
+  idleDetector?.reset();
+  kimiCacheExpiry?.kick();
+  return true;
+}
+
 // ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
 
 const SCREENSHOT_INTERVAL_MS = 10_000;
@@ -19221,6 +19475,9 @@ function onPtyData(data: string, isLiveStream = true): void {
       }
       const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (part.event.state === 'working' && cliAdapter?.stuckPageFamily === 'kimi') {
+        kimiCacheExpiry?.programStatusWorking();
+      }
       if (!wasAuthoritative && idleDetector?.programStatusActive()) {
         // The probe log above only proves a probe was seen and answered; an
         // accepted status report is the evidence the CLI took the handshake.
@@ -20568,8 +20825,8 @@ function submitUnconfirmedNotice(input: {
   const screenTail = screenUsable && input.diagnosisReason !== 'logged_out'
     ? shareableStuckScreenTail(input.screen)
     : '';
-  const pageType = screenUsable && adapterRendersCodexFamilyStuckPages()
-    ? classifyStuckPage(input.screen)
+  const pageType = screenUsable && cliAdapter?.stuckPageFamily
+    ? classifyStuckPage(input.screen, cliAdapter.stuckPageFamily)
     : undefined;
   if (pageType) {
     return {
@@ -22878,6 +23135,18 @@ function startScreenUpdates(): void {
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+      }
+      // Kimi paints its cache-expiry menu once and then sits still: the
+      // per-chunk hold check can miss it while the renderer is still parsing
+      // the last bytes. The tick's screen catches it within one interval, so
+      // a parked turn's menu event opens without waiting for the screen-idle
+      // veto (core/kimi-cache-expiry.ts).
+      if (cliAdapter?.stuckPageFamily === 'kimi' && backendScreenEvidenceIsAuthoritativeForMutation()) {
+        const tickScreen = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+        if (tickScreen) refreshHookReviewInputHold(tickScreen);
+        // A menu event still undecided (its captures failed, or nothing
+        // waited yet) is looked at again every tick while the hold stands.
+        if (hookReviewInputHold) kimiCacheExpiry?.kick();
       }
       const usageAware = classifyUsageLimitWithNativeEvidence(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a
@@ -29365,6 +29634,11 @@ async function spawnCliBody(
       workingDir: buildArgsWorkingDir,
       env: { ...process.env, ...perBotInjectEnv },
     });
+    // A resumed long-idle session may show the cache-expiry menu right after
+    // loading: the opening input waits for the screen to settle first.
+    kimiResumeOpeningSettle = effectiveResume && cfg.adoptMode !== true
+      ? { generation: cliSpawnGeneration }
+      : undefined;
   }
 
   // Arm the ready-gate for FRESH ready-integrated spawns. Until
@@ -29529,6 +29803,8 @@ async function spawnCliBody(
       }
       // A Codex model-migration picker is not a prompt (see the helper).
       if (evidenceSource === 'screen' && await codexModelMigrationHoldsIdleInput(idleBackend)) return;
+      // Nor is Kimi's cache-expiry menu, which may be parking a written turn.
+      if (evidenceSource === 'screen' && kimiCacheExpiryHoldsIdle(idleBackend)) return;
       // xterm-headless parses renderer.write() asynchronously. A transcript
       // terminal can arrive in the same tick as the TUI's busy redraw; drain
       // queued render bytes before the post-terminal composer fence inspects
@@ -34706,6 +34982,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
+      kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
         // Per-bot liveness window override (#1162). The value is normalized at
@@ -36013,8 +36290,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             renderRows,
             turnId: currentBotmuxTurnId,
             dispatchAttempt: currentBotmuxDispatchAttempt,
-            capture: snapshotToText,
-            match: classifyStuckPage,
+            capture: cliAdapter?.stuckPageFamily === 'kimi' ? kimiStuckKeyCapture : snapshotToText,
+            // Re-classified as this CLI's own pages: a Kimi card's Enter is
+            // written only while the pointer is still on "Compact and continue".
+            match: snap => (cliAdapter?.stuckPageFamily ? classifyStuckPage(snap, cliAdapter.stuckPageFamily) : classifyStuckPage(snap)),
             writeKeys: handleTuiKeys,
             sendExpired: (nonce, turnId, dispatchAttempt) => send({ type: 'stuck_warning_expired', nonce, turnId, dispatchAttempt }),
             sendDelivered: (nonce, turnId, dispatchAttempt, details) => send({
@@ -36070,6 +36349,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // disarmed until the next real stall. t/Esc and all ScreenAnalyzer cards
       // never set this flag.
       if (shouldRearmStuckDetector(!!msg.rearmStuckDetector, wroteKeys)) stuckDetector?.arm();
+      break;
+    }
+
+    case 'kimi_cache_expiry_auto_compact': {
+      kimiCacheExpiryAutoCompact = msg.enabled === true;
+      log(`Kimi cache-expiry auto-compact ${kimiCacheExpiryAutoCompact ? 'on' : 'off'}`);
       break;
     }
 
@@ -36298,11 +36583,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'term_action': {
+      if (isCriticalInterruptKey(msg.key)) cliInterruptGeneration++;
       await handleTermAction(msg.key);
       break;
     }
 
     case 'interrupt_turn': {
+      cliInterruptGeneration++;
       await handleExactTurnInterrupt(msg.requestId, msg.turnId);
       break;
     }

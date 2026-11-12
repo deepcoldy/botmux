@@ -1,0 +1,50 @@
+
+ [38;5;111m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+[39m [38;5;111m│[39m                                                                                                                                                            [38;5;111m│
+[39m [38;5;111m│[39m  [38;5;111m▐█▛█▛█▌[39m  [1m[38;5;111mWelcome to Kimi Code![0m[39m[49m                                                                                                                            [38;5;111m│
+[39m [38;5;111m│[39m  [38;5;111m▐█████▌[39m  [38;5;244mSend /help for help information.[39m                                                                                                                 [38;5;111m│
+[39m [38;5;111m│[39m                                                                                                                                                            [38;5;111m│
+[39m [38;5;111m│[39m  [1m[38;5;244mDirectory: [0m[39m[49m/tmp/kimi-cache-probe                                                                                                                          [38;5;111m│
+[39m [38;5;111m│[39m  [1m[38;5;244mSession:   [0m[39m[49msession_74b53e19-8605-4fe7-921b-94b3167d37fe                                                                                                   [38;5;111m│
+[39m [38;5;111m│[39m  [1m[38;5;244mModel:     [0m[39m[49mK3                                                                                                                                             [38;5;111m│
+[39m [38;5;111m│[39m  [1m[38;5;244mVersion:   [0m[39m[49m2.5.3                                                                                                                                          [38;5;111m│
+[39m [38;5;111m│[39m                                                                                                                                                            [38;5;111m│
+[39m [38;5;111m╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+[39m
+   [38;5;215mSkipped refreshing managed:kimi-code: not found[39m
+   [38;5;244mNo session yet — one will be created on your first message.[39m
+   [38;5;215mtmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.[39m
+
+ [1m[38;5;222m❯ Summarize the project layout[0m[39m[49m
+
+ [38;5;253m● [39mPROBE-REPLY-1
+
+ [38;5;111m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;111m This session has been idle for 1m and is ~201 tokens.
+[0m[39m[49m [38;5;242m ↑↓ navigate · Enter select · Esc cancel
+[39m
+ [38;5;253m Cache expired — the next message re-sends the entire history at full price.
+[39m [38;5;111m  ❯ [1mCompact and continue[0m[39m[49m    [38;5;242mone-time compact cost · cheapest way to keep this topic
+[39m [38;5;244m    [38;5;253mStart a new session[39m     [38;5;242mzero context cost · best for a new task
+[39m [38;5;244m    [38;5;253mContinue as-is[39m          [38;5;242mfull history kept · highest cost per turn
+[39m [38;5;244m    [38;5;253mDon't ask me again
+[39m
+ [38;5;111m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;215mNever Ask[0m[39m[49m  [38;5;253mK3[39m  [38;5;244m/tmp/kimi-cache-probe[39m                                                  [38;5;242m! to run a shell command | /compact compresses context when it gets long
+[39m                                                                                                                                         [38;5;253mcontext: 1% (201/256k)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

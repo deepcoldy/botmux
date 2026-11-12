@@ -1,0 +1,50 @@
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                                 │
+ │                                                                                                                                                            │
+ │  Directory: /tmp/kimi-cache-probe                                                                                                                          │
+ │  Session:   session_74b53e19-8605-4fe7-921b-94b3167d37fe                                                                                                   │
+ │  Model:     K3                                                                                                                                             │
+ │  Version:   2.5.3                                                                                                                                          │
+ │                                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   Skipped refreshing managed:kimi-code: not found
+   No session yet — one will be created on your first message.
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.
+
+ ❯ Summarize the project layout
+
+ ● PROBE-REPLY-1
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  This session has been idle for 1m and is ~201 tokens.
+  ↑↓ navigate · Enter select · Esc cancel
+
+  Cache expired — the next message re-sends the entire history at full price.
+   ❯ Compact and continue    one-time compact cost · cheapest way to keep this topic
+     Start a new session     zero context cost · best for a new task
+     Continue as-is          full history kept · highest cost per turn
+     Don't ask me again
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Never Ask  K3  /tmp/kimi-cache-probe                                                  ! to run a shell command | /compact compresses context when it gets long
+                                                                                                                                         context: 1% (201/256k)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

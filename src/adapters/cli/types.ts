@@ -949,12 +949,15 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
-  /** This CLI renders the codex_core hook-review / migration pages recognised
-   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
-   *  the "CLI is stuck" card: queued input is held off any of those pages and
-   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
-   *  Undefined = only the legacy hook-review input hold, never a card. */
-  readonly stuckPageFamily?: 'codex-family';
+  /** Which blocking pages this CLI renders, as recognised by
+   *  `classifyStuckPage(screen, family)` (utils/stuck-detector.ts):
+   *  `codex-family` = the codex_core hook-review / migration / session-lock
+   *  pages; `kimi` = Kimi Code's cache-expiry menu. Opts the session into the
+   *  "CLI is stuck" card: queued input is held off any of those pages and the
+   *  card offers the page's safe keys (core/stuck-page-catalog.ts). Pages are
+   *  read as this family's only. Undefined = only the legacy hook-review input
+   *  hold, never a card. */
+  readonly stuckPageFamily?: import('../../utils/stuck-detector.js').StuckPageFamily;
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
