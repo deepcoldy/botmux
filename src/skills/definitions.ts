@@ -576,6 +576,8 @@ EOF
 botmux send --files "$TMPDIR/report.pdf" "报告已生成，请查收附件。"
 \`\`\`
 
+只发一个文件且不 @ 人时可以不写正文，文件本身就是这条消息；多个附件或带 @ 时会先发一张正文卡片，必须给正文（位置参数、\`--content-file\` 或 heredoc），否则直接拒发、什么都不发。
+
 ### 带视频预览
 
 \`--videos <path>\` 发送本地 H.264 MP4 预览消息，可重复；\`--video-covers <path>\` 按顺序提供每个视频的封面图片（当前必须显式提供 cover）。视频会作为飞书/Lark media message 单独发送；正文存在时先发正文卡片，再发视频。
