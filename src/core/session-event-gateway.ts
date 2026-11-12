@@ -47,7 +47,8 @@ export class SessionEventGateway {
         || this.store.authorizedExecutionObserver(this.session, runtime, recoveredOrigin.producer, recoveredOrigin.scope.execution)
         || (recoveredOrigin.bindingId && this.store.bindingProducer(this.session, recoveredOrigin.bindingId, recoveredOrigin.producer)
           && sameRuntime(this.store.binding(this.session, recoveredOrigin.bindingId)?.ref, runtime)));
-    const observation = sameWorker(state.worker, channel) && ['final_output', 'turn_terminal'].includes(type)
+    const observation = sameWorker(state.worker, channel)
+      && ['final_output', 'turn_terminal'].includes(type)
       && this.store.authorizedExecutionObserver(this.session, runtime, channel, context.scope.execution);
     if (!this.store.authorizedProducer(this.session, runtime, channel) && !recovery && !observation) return { kind: 'reject', reason: 'runtime_producer_unproven' };
     if (context.scope.execution) {
@@ -62,7 +63,15 @@ export class SessionEventGateway {
       const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
         && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
           || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity'].includes(type)));
-      if (!sameRuntime(execution.runtime, runtime)
+      const sourceRuntime = execution.runtime ? this.store.runtime(this.session, execution.runtime.runtimeId) : undefined;
+      const sameContinuedExecutionRuntime = !!execution.runtime && sameWorker(state.worker, channel)
+        && (this.store.runtimeContinues(this.session, execution.runtime, runtime, channel)
+          || this.store.runtimeContinues(this.session, runtime, execution.runtime, channel)
+          || (sameRuntime(state.activeRuntime, runtime)
+            && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)
+            && !!sourceRuntime
+            && this.store.runtimeContinues(this.session, sourceRuntime.ref, runtime, sourceRuntime.worker)));
+      if (!sameRuntime(execution.runtime, runtime) && !sameContinuedExecutionRuntime
         && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }
