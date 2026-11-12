@@ -225,6 +225,8 @@ import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { applyClaudeEffortObservation } from './claude-effort-observation.js';
 import { applyNativeReasoningObservation } from './native-reasoning-observation.js';
+import { terminalEffortPreferenceKey } from '../services/terminal-effort-choice.js';
+import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, noteExplicitEffortPreferenceEdit } from './terminal-effort-writeback.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
@@ -10442,12 +10444,15 @@ function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['
   const beforeTopic = ds.session.topicReasoningEffort;
   const snapshot = ds.session.cliLaunchSnapshot;
   const beforeSnapshot = snapshot?.reasoningEffort ?? null;
+  const beforePreferenceEdit = ds.session.terminalEffortPreferenceEdit;
+  const preferenceEdit = config.terminalEffortWriteback ? { atMs: Date.now(), source: 'explicit' as const } : undefined;
   const matched = !!beforePin && samePinModel(beforePin.model, model);
   if (matched) {
     // Read and compare inside the write transaction. A detached/stale session
     // must never resurrect a cleared pin or replace a newer explicit choice.
     const { rows } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
       const row = fresh.get(ds.session.sessionId)!;
+      if (preferenceEdit) row.terminalEffortPreferenceEdit = preferenceEdit;
       if (JSON.stringify(row.modelPin) !== JSON.stringify(beforePin)) throw new Error('model_pin_changed');
       row.modelPin = { ...row.modelPin!, effort, ...actor, setAt: new Date().toISOString() };
       if (topic && model) row.topicReasoningEffort = { model, effort };
@@ -10463,15 +10468,18 @@ function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['
       ds.session.reasoningEffort = effort;
       if (snapshot) snapshot.reasoningEffort = effort;
     }
+    if (preferenceEdit) ds.session.terminalEffortPreferenceEdit = preferenceEdit;
     try { sessionStore.updateSession(ds.session); }
     catch (error) {
       ds.session.modelPin = beforePin;
+      ds.session.terminalEffortPreferenceEdit = beforePreferenceEdit;
       ds.session.reasoningEffort = beforeEffort;
       ds.session.topicReasoningEffort = beforeTopic;
       if (ds.session.cliLaunchSnapshot) ds.session.cliLaunchSnapshot.reasoningEffort = beforeSnapshot;
       throw error;
     }
   }
+  noteExplicitEffortPreferenceEdit(ds);
   if (matched) {
     dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId, patch: { modelPin: sessionModelPinView(ds) } } });
     try { scheduleActiveRuntimePatch(ds); } catch { /* saved selection remains authoritative */ }
@@ -20942,6 +20950,19 @@ function setupWorkerHandlers(
       }
 
       case 'native_reasoning': {
+        if (config.terminalEffortWriteback && msg.userSelection) {
+          try {
+            const saved = persistTerminalEffortChoice(ds, msg, { worker, workerGeneration, cliId: effectiveCliId }, {
+              enabled: config.terminalEffortWriteback, enableEpoch: config.terminalEffortWritebackEpoch, mutate: sessionStore.mutateOwnedSessionsAtomically,
+              supportsEffort: cliModelSupportsReasoningEffort,
+            });
+            if (saved || terminalEffortChoiceWasSaved(ds, msg.userSelection.nonce)) {
+              worker.send({ type: 'terminal_effort_writeback_ack', nonce: msg.userSelection.nonce, preference: terminalEffortPreferenceKey(ds.session) } satisfies DaemonToWorker);
+            }
+          } catch (error) {
+            logger.warn(`[${t}] Terminal effort preference was not saved: ${(error as Error).message}`);
+          }
+        }
         if (applyNativeReasoningObservation(ds, msg, { worker, workerGeneration, cliId: effectiveCliId })) {
           scheduleActiveRuntimePatch(ds);
         }
@@ -20949,6 +20970,19 @@ function setupWorkerHandlers(
       }
 
       case 'claude_effort': {
+        if (config.terminalEffortWriteback && msg.userSelection) {
+          try {
+            const saved = persistTerminalEffortChoice(ds, msg, { worker, workerGeneration, cliId: effectiveCliId }, {
+              enabled: config.terminalEffortWriteback, enableEpoch: config.terminalEffortWritebackEpoch, mutate: sessionStore.mutateOwnedSessionsAtomically,
+              supportsEffort: cliModelSupportsReasoningEffort,
+            });
+            if (saved || terminalEffortChoiceWasSaved(ds, msg.userSelection.nonce)) {
+              worker.send({ type: 'terminal_effort_writeback_ack', nonce: msg.userSelection.nonce, preference: terminalEffortPreferenceKey(ds.session) } satisfies DaemonToWorker);
+            }
+          } catch (error) {
+            logger.warn(`[${t}] Terminal effort preference was not saved: ${(error as Error).message}`);
+          }
+        }
         if (applyClaudeEffortObservation(ds, msg, { worker, workerGeneration, cliId: effectiveCliId })) {
           scheduleActiveRuntimePatch(ds);
         }

@@ -86,6 +86,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
     if (key === 'executionObserverSupported') return executionObserverSupported;
     if (key === 'isNativeReasoningEffort') return isNativeReasoningEffort;

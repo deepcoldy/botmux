@@ -1248,6 +1248,8 @@ export interface Session {
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Last explicit preference edit, only recorded while terminal writeback is enabled. */
+  terminalEffortPreferenceEdit?: { atMs: number; source: 'explicit' | 'terminal'; requestedAtMs?: number; enableEpoch?: number };
   /** Codex service tier frozen at session creation; legacy missing means inherit. */
   serviceTier?: CodexServiceTierPreference;
   /** Per-session opt-in idle auto-compaction (core/idle-auto-compact.ts).
@@ -2168,6 +2170,7 @@ type DaemonToWorkerBase =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
+  | { type: 'terminal_effort_writeback_ack'; nonce: string; preference: string }
   | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it

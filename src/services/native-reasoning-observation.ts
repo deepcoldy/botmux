@@ -12,6 +12,7 @@ export interface NativeReasoningObservation {
   cliSpawnGeneration?: number;
   /** Only Grok uses this field; the other CLIs retain their model observer. */
   model?: string;
+  userSelection?: import('./terminal-effort-choice.js').TerminalEffortChoice;
 }
 
 export function isNativeReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -23,6 +24,7 @@ export interface AppliedReasoningSelection {
   reasoningEffort: CodexReasoningEffort | null;
   atMs: number;
   nativeSessionId?: string;
+  model?: string;
 }
 
 /** A native settings ACK is a selection, not proof that an already-running
@@ -44,5 +46,6 @@ export function appliedReasoningSelectionFromRecord(obj: any): AppliedReasoningS
   const nativeSessionId = obj.payload.thread_id;
   if (nativeSessionId !== undefined && (typeof nativeSessionId !== 'string' || !nativeSessionId)) return;
   return { reasoningEffort: isNativeReasoningEffort(value) ? value : null, atMs,
+    ...(typeof raw.model === 'string' && raw.model.trim() ? { model: raw.model.trim() } : {}),
     ...(nativeSessionId ? { nativeSessionId } : {}) };
 }

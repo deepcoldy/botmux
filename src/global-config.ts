@@ -480,6 +480,11 @@ export interface DashboardGlobalConfig {
    *  default OFF; read live so an explicit true starts scheduling upgrades and
    *  removing it stops them, both without restarting the daemon. */
   autoUpgradeCodexSessions?: boolean;
+  /** Opt in to saving confirmed terminal effort choices for managed sessions. Default OFF. */
+  terminalEffortWriteback?: boolean;
+  /** Internal monotonic toggle generation; expires intents across off/on flips. */
+  terminalEffortWritebackEpoch?: number;
+  terminalEffortWritebackEnabledAtMs?: number;
   /** Experimental: at daemon startup, SIGTERM tmux SERVERS orphaned by a
    *  previous daemon generation (a displaced server whose socket was rebound
    *  still hosts the old managed CLIs holding per-session file locks). This is
@@ -686,6 +691,9 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
+  if (typeof d.terminalEffortWriteback === 'boolean') out.terminalEffortWriteback = d.terminalEffortWriteback;
+  if (Number.isSafeInteger(d.terminalEffortWritebackEpoch) && (d.terminalEffortWritebackEpoch as number) >= 0) out.terminalEffortWritebackEpoch = d.terminalEffortWritebackEpoch as number;
+  if (typeof d.terminalEffortWritebackEnabledAtMs === 'number' && Number.isFinite(d.terminalEffortWritebackEnabledAtMs)) out.terminalEffortWritebackEnabledAtMs = d.terminalEffortWritebackEnabledAtMs;
   if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
   if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
   if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
@@ -1113,6 +1121,24 @@ export function readGlobalConfig(): GlobalConfig {
 export function invalidateGlobalConfigCache(): void {
   readCache = null;
   vcMeetingAgentLiveCache = null;
+  terminalEffortLiveCache = null;
+}
+
+let terminalEffortLiveCache: { path: string; identity: string; value: { enabled: boolean; epoch: number; enabledAtMs: number } } | null = null;
+/** Preference authority cannot use the general two-second cache: a rapid
+ * off/on must invalidate a pending terminal choice in every process. */
+export function globalTerminalEffortWritebackConfigLive(): { enabled: boolean; epoch: number; enabledAtMs: number } {
+  const path = globalConfigPath();
+  try {
+    const stat = statSync(path);
+    const identity = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    if (terminalEffortLiveCache?.path === path && terminalEffortLiveCache.identity === identity) return terminalEffortLiveCache.value;
+    const dashboard = readDashboard(readRawConfig().dashboard);
+    const value = { enabled: dashboard?.terminalEffortWriteback === true,
+      epoch: dashboard?.terminalEffortWritebackEpoch ?? 0, enabledAtMs: dashboard?.terminalEffortWritebackEnabledAtMs ?? 0 };
+    terminalEffortLiveCache = { path, identity, value };
+    return value;
+  } catch { return { enabled: false, epoch: 0, enabledAtMs: 0 }; }
 }
 
 /** Live VC meeting listener global config. Missing config means enabled.
@@ -1361,6 +1387,7 @@ export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, Glob
   // (e.g. dashboard PUT /api/settings responds with the resolved config).
   readCache = null;
   vcMeetingAgentLiveCache = null;
+  terminalEffortLiveCache = null;
 }
 
 /** The stored `sessionEnv` exactly as written (for hand-edit diagnostics). */
@@ -1385,7 +1412,13 @@ export function mergeDashboardConfig(patch: DashboardGlobalConfig): DashboardGlo
   const existing = raw.dashboard && typeof raw.dashboard === 'object' && !Array.isArray(raw.dashboard)
     ? raw.dashboard as Record<string, unknown>
     : {};
-  mergeGlobalConfig({ dashboard: { ...existing, ...patch } as DashboardGlobalConfig });
+  const next = { ...existing, ...patch } as DashboardGlobalConfig;
+  if (typeof patch.terminalEffortWriteback === 'boolean' && patch.terminalEffortWriteback !== (existing.terminalEffortWriteback === true)) {
+    const epoch = Number.isSafeInteger(existing.terminalEffortWritebackEpoch) ? existing.terminalEffortWritebackEpoch as number : 0;
+    next.terminalEffortWritebackEpoch = epoch + 1;
+    next.terminalEffortWritebackEnabledAtMs = patch.terminalEffortWriteback ? Date.now() : 0;
+  }
+  mergeGlobalConfig({ dashboard: next });
   return readGlobalConfig().dashboard ?? {};
 }
 

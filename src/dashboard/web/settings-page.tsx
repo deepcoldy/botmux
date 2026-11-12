@@ -52,6 +52,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback: boolean;
   reapOrphanTmuxServers: boolean;
   tmuxOrphanSessionSweep: boolean;
   tmuxOrphanSessionBareWrapperKill: boolean;
@@ -227,6 +228,7 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    terminalEffortWriteback: s?.terminalEffortWriteback === true,
     reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     tmuxOrphanSessionSweep: s?.tmuxOrphanSessionSweep !== false,
     tmuxOrphanSessionBareWrapperKill: s?.tmuxOrphanSessionBareWrapperKill === true,
@@ -907,7 +909,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'terminalEffortWriteback' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -1070,6 +1072,13 @@ export function SettingsBody(props: {
             checked={settings.codexRpcInput}
             disabled={dis || savingKey === 'codexRpcInput'}
             onChange={value => saveBoolean('codexRpcInput', value)}
+          />
+          <ToggleRow
+            title={tr('settings.terminalEffortWriteback')}
+            help={tr('settings.terminalEffortWritebackHelp')}
+            checked={settings.terminalEffortWriteback}
+            disabled={dis || savingKey === 'terminalEffortWriteback'}
+            onChange={value => saveBoolean('terminalEffortWriteback', value)}
           />
           <ToggleRow
             title={tr('settings.autoUpgradeCodexSessions')}

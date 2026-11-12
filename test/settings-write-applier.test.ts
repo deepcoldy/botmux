@@ -234,6 +234,20 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
   });
 
+  it.each([false, true])('writes terminalEffortWriteback=%s without touching other settings', async enabled => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ terminalEffortWriteback: enabled }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ terminalEffortWriteback: enabled });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('refuses invalid terminal effort writeback value %s', async value => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ terminalEffortWriteback: value }, deps)).toEqual({ ok: false, error: 'invalid_terminalEffortWriteback' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('writes autoUpgradeCodexSessions=%s through the dashboard segment', async (enabled) => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
