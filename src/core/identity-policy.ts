@@ -3,7 +3,7 @@ import {
   type TriggerUserAuthCapability,
   type TriggerUserAuthConfig,
   type TriggerUserAuthCredentialSource,
-  type TriggerUserAuthTool,
+  type IdentityRouteTool,
 } from '../services/trigger-user-auth.js';
 
 export interface IdentityPolicy {
@@ -20,7 +20,7 @@ export function policyFromConfig(
 
 /** The capability whose switch governs a published tool's identity. Meego is
  *  published through bytedcli but is its own switch (see publishMeegoOnly). */
-export function capabilityOfTool(tool: TriggerUserAuthTool): TriggerUserAuthCapability {
+export function capabilityOfTool(tool: IdentityRouteTool): TriggerUserAuthCapability {
   return tool === 'lark-cli' ? 'lark-user' : 'bytecloud';
 }
 

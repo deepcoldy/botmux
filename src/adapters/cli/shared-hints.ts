@@ -262,18 +262,37 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * `lark-cli auth login --scope` that lark-cli's own hints suggest, which
  * prints a device link to the agent.
  */
+function turnSpeakersLines(speakers: ReadonlyArray<{ openId: string; name?: string }> | undefined, locale?: Locale): string[] {
+  return speakers && speakers.length > 1
+    ? [`  ${escapeXmlTagLikeTokens(t('ai.credentials.turn_speakers', {
+      speakers: speakers.map(s => s.name ? `${s.name} (${s.openId})` : s.openId).join(', '),
+    }, locale))}`]
+    : [];
+}
+
+/** The credentials block of a follow-up message: only what changed for this turn, its speakers. */
+export function buildTurnSpeakersBlock(
+  speakers: ReadonlyArray<{ openId: string; name?: string }> | undefined, locale?: Locale,
+): string {
+  const lines = turnSpeakersLines(speakers, locale);
+  return lines.length ? ['<botmux_credentials>', ...lines, '</botmux_credentials>'].join('\n') : '';
+}
+
 export function buildCredentialBoundaryBlock(
   policy: TriggerUserAuthConfig | undefined,
   locale?: Locale,
   larkAuthFlow = false,
+  /** The people who spoke in the running turn; listed only when there are several. */
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
   if (!policy?.enabled || policy.tools.length === 0) return '';
-  const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+  const line = (key: string, vars?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, vars, locale))}`;
   const lark = larkAuthFlow && triggerUserAuthApplies(policy, 'lark-cli');
   return [
     '<botmux_credentials>',
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
+    ...turnSpeakersLines(speakers, locale),
     ...(lark ? [
       line('ai.credentials.on_auth_failure'),
       line('ai.credentials.on_auth_link'),
@@ -297,8 +316,10 @@ export function buildManagedLarkToolPromptBlocks(
   /** Only takes effect with larkToolAppId set; the only transport-less
    *  sessions that get a managed binding are verified headless sessions. */
   headlessNoUserChannel = false,
+  /** The people of the running turn, when it has several. */
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
-  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale, !larkToolAppId);
+  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale, !larkToolAppId, speakers);
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',

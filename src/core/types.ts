@@ -1,3 +1,4 @@
+import type { TurnSpeaker } from './turn-speakers.js';
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
@@ -941,6 +942,9 @@ export interface DaemonSession {
     identityTurnId?: string;
     dispatchAttempt?: number;
     trustedCaller?: TrustedCaller | null;
+    /** Humans whose messages are in the running turn, in order of their latest
+     * message (the last one spoke last). Worker-reported, never CLI-supplied. */
+    speakers?: TurnSpeaker[];
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the

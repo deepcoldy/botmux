@@ -37,8 +37,8 @@ Botmux 提供的短期 bot token。
 - 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
 - **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
-- **无人值守的运行（定时任务、`execution background`、外部触发 `trg_`、工作流事件 `workflow-event:`）**：运行时不发起任何授权。创建定时任务时，任务执行人会私下收到一条授权入口，列出尚未授权的已开启能力（只读检查，不向平台申请授权。任务执行人就是创建任务那一轮的发起人时，读取该轮已发布的身份：已授权则不提示，明确未授权则附平台凭据页或设备码链接，平台故障或尚未发布则不提示；其他情况只检查本机登录，平台来源的凭据无法只读判断，不在此列）。运行时只取任务执行人已有的凭据；受管命令因凭据缺失被拒绝时以 77 退出，命令未执行，不发链接给 agent、不往群里发任何内容，同时由包装脚本向 botmux 发一次非交互请求（`botmux auth request --provider <bytedcli|lark-cli|meego> --unattended`），botmux 私聊本人一条通知，列出该人所有缺失能力的授权入口（平台已绑定时是平台凭据页，未绑定时是设备码链接）；同一任务同一人同一能力的同一链接只发一次，送达成功后才记录，设备码过期后下一次拒绝会发新链接，凭据恢复后重置；没有触及受管工具的运行不发任何通知。重新授权后任务会再次运行。无人值守运行里的 `bytedcli auth login`、`bitscli ... auth login`、`meego login` 同样直接拒绝；只有 `auth login` 和 `meego login` 视为登录命令，`login` 作为其他参数（如 `codebase search login`）照常执行。带 `--session` 或 `--session-method` 的 `bytedcli auth login` 是浏览器会话登录（Meego GoAPI 需要的飞书网页会话），不是 ByteCloud 登录：有人值守时在本人的目录下运行真实命令，会话落在本人名下；无人值守时以 77 拒绝且不运行。这条命令仍要先取到本人的身份，没有 ByteCloud 授权的人会先收到 ByteCloud 授权入口，授权后再重试。
 - **能力开关（`triggerUserAuth.capabilities`）**：`lark-user`、`bytecloud`、`meego` 三项各自开关。`bytecloud` 覆盖 bytedcli、codebase、git push 与 bitscli / bits-cli（后两者读取同一份 ByteCloud 授权派生的 JWT，在按人 scratch HOME 下执行，不会读到机器上的登录文件）；`meego` 只覆盖 `bytedcli meego`，独立的 `meegle` 命令不受管。没开的能力保持原生：命令直接使用这台机器自己的登录态，botmux 不注入身份、不改 HOME。只开 `meego`（不开 `bytecloud`）时，`bytedcli meego` 使用本人的 Meego 登录，其余 bytedcli 子命令原生执行。未写 `capabilities` 时由 `tools` 推导（`lark-cli`→`lark-user`，`bytedcli`→`bytecloud`+`meego`）。绑定会话里 `--as user` 的归属见上表：`triggerUserAuth` 开启且不含 `lark-user` 时它原生执行。
+- **无人值守的运行（定时任务、`execution background`、外部触发 `trg_`、工作流事件 `workflow-event:`）**：运行时不发起任何授权。创建定时任务时，任务执行人会私下收到一条授权入口，列出尚未授权的已开启能力（只读检查，不向平台申请授权。任务执行人就是创建任务那一轮的发起人时，读取该轮已发布的身份：已授权则不提示，明确未授权则附平台凭据页或设备码链接，平台故障或尚未发布则不提示；其他情况只检查本机登录，平台来源的凭据无法只读判断，不在此列）。运行时只取任务执行人已有的凭据；受管命令因凭据缺失被拒绝时以 77 退出，命令未执行，不发链接给 agent、不往群里发任何内容，同时由包装脚本向 botmux 发一次非交互请求（`botmux auth request --provider <bytedcli|lark-cli|meego> --unattended`），botmux 私聊本人一条通知，列出该人所有缺失能力的授权入口（平台已绑定时是平台凭据页，未绑定时是设备码链接）；同一任务同一人同一能力的同一链接只发一次，送达成功后才记录，设备码过期后下一次拒绝会发新链接，凭据恢复后重置；没有触及受管工具的运行不发任何通知。重新授权后任务会再次运行。无人值守运行里的 `bytedcli auth login`、`bitscli ... auth login`、`meego login` 同样直接拒绝；只有 `auth login` 和 `meego login` 视为登录命令，`login` 作为其他参数（如 `codebase search login`）照常执行。带 `--session` 或 `--session-method` 的 `bytedcli auth login` 是浏览器会话登录（Meego GoAPI 需要的飞书网页会话），不是 ByteCloud 登录：有人值守时在本人的目录下运行真实命令，会话落在本人名下；无人值守时以 77 拒绝且不运行。这条命令仍要先取到本人的身份，没有 ByteCloud 授权的人会先收到 ByteCloud 授权入口，授权后再重试。
 - 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
 - **绑定会话（`larkToolBinding` 默认开启）里的 `--as user` 同样会用平台凭据。** 自建 bot 应用的可用范围通常只有所有者本人，别人打开该应用的授权链接只会看到「你没有使用权限」，所以对他们来说平台是唯一可用的来源。取法：
   - `auto`：该人已有对本 bot 应用的授权就用它（所有者保留 bot 应用更多的权限）；没有则向平台申请，lark-cli 的用户调用改用平台应用的 app id 执行；机器未绑定平台时与以前一致。
@@ -47,6 +47,21 @@ Botmux 提供的短期 bot token。
   - `--as bot` 始终是本 bot 应用，不受影响；只有 daemon 明确标注为平台签发的用户票，lark-cli 包装器才接受与绑定应用不同的 app id。
   - 这种情况下 `botmux auth request` 不再发 bot 应用的设备码链接，而是返回 `platform_authorization_required` 与平台凭据页地址；平台应用缺某个权限时，需要先在平台应用后台开通，再让用户在平台重新授权。
   - 平台应用拿不到某些敏感权限（例如以用户身份读群聊/私聊消息，全员可见的应用通常批不下来）时，数据若在本 bot 能访问的群或文档里，提示会先引导模型对这次**读取**改用 `--as bot`，再考虑补权限；写操作不改用 bot 身份。执行者由模型在命令里显式选择，包装器不会自动换身份重试。
+
+## 多人发言的回合：按调用选择身份（`BOTMUX_AS`）
+
+多人话题里，后来者的消息可能并入正在运行的回合。daemon 为每个回合记录发言人集合（含第一位，每位发言人对应自己最近一条消息的身份材料）。**默认始终是发起本轮的人**（回合主体，回合开始时固定）：后来者并入不会改变默认，新的回合开始后以新回合的发送者为默认。发言人集合只用来校验显式的 `BOTMUX_AS`。
+
+**默认关闭**：`triggerUserAuth.allowSpeakerSwitch`（Dashboard「多人话题里，允许替其他发言人执行单条命令」）为 `true` 时才启用；关闭时 `BOTMUX_AS` 在所有路由上以 `as_unavailable` 拒绝，提示词也不介绍发言人列表。开启跨身份打断隔离（XPI）时消息不会并入同一回合，Dashboard 里该开关不可用（已开启的可以关掉）；设置了「串行输入」的群里每条消息各自成回合，提示词同样不列发言人。开关关闭时的拒绝文案是「该 bot 不允许替其他发言人执行命令」，只让 agent 去掉 `BOTMUX_AS` 重试，不会让它去指定发言人。
+
+**只对已开启能力的受管调用生效**：`--as user` 需要 `lark-user`；bytedcli、codebase、bitscli 需要 `bytecloud`。能力关闭（或没有 `triggerUserAuth`、`enabled: false`）时和上游一致：沿用回合的原主体，`BOTMUX_AS` 一律拒绝。仅开 `meego` 时 `bytedcli meego` 同样沿用回合主体。
+
+- 要以本轮另一位发言人的身份做某一条命令，只在那一条命令前加 `BOTMUX_AS=<open_id> <命令>`（例如 `BOTMUX_AS=ou_x bytedcli codebase mr create ...`），只对这一次调用生效。daemon 只接受当前回合发言人集合里的 open_id，凭据按与发言人相同的方式（平台或本机）解析。
+- 被选中的发言人缺凭据时，授权入口只私发给该发言人；后续的 `botmux auth request` / `botmux auth wait` 要带同一个 `BOTMUX_AS`，拒绝文案和提示词都会这样说明。
+- 指定了发言人但该发言人那一轮的身份材料已不存在时，和不指定时一样返回 `identity_material_unavailable`（404）。
+- 会话不会重启或拆分，其他调用不受影响。凭证提示块在多人发言时列出发言人姓名与 open_id。
+
+`BOTMUX_AS` 指定了不在发言人集合里的人时原因为 `as_not_speaker`；能力关闭、无人值守或后台任务等没有可指定发言人的情形为 `as_unavailable`。以下情形无法按人选择，带 `BOTMUX_AS` 的调用以退出码 77 和一行原因拒绝：无人值守回合（没有发言人）、后台 `background:` 任务、委托（dispatch）回合、带 `--profile <其他应用>` 的 lark-cli 调用（用该 profile 自己的登录）、原生执行的调用（`lark-user` 关闭时的 `lark-cli --as user`，原生的 bytedcli / Meego），没有包装脚本的工具（能力关闭时它们不受管，看不到 `BOTMUX_AS`，也不会按它换身份），以及按单快照模式运行的会话（文件式包装脚本不逐次向 daemon 取身份，这类会话的提示词也不介绍 `BOTMUX_AS`）。
 
 ## 使用
 

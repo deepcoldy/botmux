@@ -1,4 +1,5 @@
 import type { TrustedCaller } from '../types.js';
+import { speakerOf, withSpeaker, type TurnSpeaker } from './turn-speakers.js';
 
 export interface TurnAuthorityIdentity {
   /** Authenticated collaborative input must wait even when sent by the same caller. */
@@ -16,6 +17,8 @@ export interface TurnAuthorityIdentity {
 export interface ActiveTurnAuthoritySnapshot extends TurnAuthorityIdentity {
   started: boolean;
   reservedAtMs: number;
+  /** Humans whose messages are in this turn, in order of their latest message. */
+  speakers?: readonly TurnSpeaker[];
 }
 
 function mayControlActiveTurn(
@@ -102,6 +105,10 @@ export class ActiveTurnAuthority {
     };
   }
 
+  speakers(): TurnSpeaker[] {
+    return [...(this.active?.speakers ?? [])];
+  }
+
   identity(): TurnAuthorityIdentity {
     if (!this.active) return {};
     return {
@@ -129,6 +136,7 @@ export class ActiveTurnAuthority {
         : {}),
       ...(identity.caller ? { caller: frozenCaller(identity.caller) } : {}),
       ...(identity.controller ? { controller: frozenCaller(identity.controller) } : {}),
+      speakers: withSpeaker(undefined, speakerOf(identity)),
       started: false,
       reservedAtMs: nowMs,
     });
@@ -169,6 +177,7 @@ export class ActiveTurnAuthority {
         : identity.controller
         ? { controller: frozenCaller(identity.controller) }
         : {}),
+      speakers: withSpeaker(active?.speakers, speakerOf(identity)),
       started: false,
       reservedAtMs: nowMs,
     });
@@ -194,6 +203,7 @@ export class ActiveTurnAuthority {
           : identity.controller
           ? { controller: frozenCaller(identity.controller) }
           : {}),
+        speakers: withSpeaker(previous.speakers, speakerOf(identity)),
         started: true,
         reservedAtMs: Date.now(),
       });

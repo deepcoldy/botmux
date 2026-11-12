@@ -4581,6 +4581,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
+  const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4589,6 +4590,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     mcpAdvisory?: string;
     platformBound?: boolean;
     platformCredentialsUrl?: string;
+    crossPrincipalIsolation?: boolean;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -4620,12 +4622,13 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean }) {
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
     return {
       enabled: true,
       capabilities: next.capabilities ?? capabilities,
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
+      allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
       ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
     };
   }
@@ -4704,6 +4707,17 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
             help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
             onChange={checked => saveWith({ delegateOnMention: checked })}
           />
+          <ToggleRow
+            checked={allowSpeakerSwitch}
+            disabled={busy || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
+            dataAction="toggle-trigger-user-auth-allow-speaker-switch"
+            title={tr('botDefaults.triggerUserAuthAllowSpeakerSwitch')}
+            help={tr('botDefaults.triggerUserAuthAllowSpeakerSwitchHelp')}
+            onChange={checked => saveWith({ allowSpeakerSwitch: checked })}
+          />
+          {info?.crossPrincipalIsolation === true ? (
+            <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
+          ) : null}
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
           {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>

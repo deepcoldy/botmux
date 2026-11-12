@@ -135,6 +135,8 @@ export const IDENTITY_REFUSAL_REASONS = [
   'identity_decision_missing', 'identity_decision_conflict', 'identity_model_single',
   // daemon: caller proven, no identity material for the turn (HTTP 404)
   'identity_material_unavailable',
+  // daemon: caller proven, BOTMUX_AS names nobody who spoke in this turn / cannot name anyone here
+  'as_not_speaker', 'as_unavailable',
   // client side
   'invalid_invocation', 'daemon_unreachable', 'daemon_timeout', 'response_mismatch', 'unspecified',
 ] as const;
@@ -171,6 +173,8 @@ export async function resolveCurrentExecutionIdentity(options: {
   sessionId: string;
   larkAppId: string;
   tool: string;
+  /** `BOTMUX_AS`: the speaker of the current turn this call runs as. */
+  as?: string;
   fetchImpl?: typeof fetch;
 }): Promise<CurrentExecutionIdentityDocument> {
   if (!Number.isSafeInteger(options.ipcPort) || options.ipcPort <= 0 || options.ipcPort > 65535
@@ -190,7 +194,7 @@ export async function resolveCurrentExecutionIdentity(options: {
     response = await (options.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool }),
+        body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool, ...(options.as ? { as: options.as } : {}) }),
         redirect: 'error', signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
       },
     );

@@ -596,6 +596,7 @@ import {
 import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
+import { chooseTurnSpeaker, type TurnSpeaker } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { capabilityOfTool } from './identity-policy.js';
@@ -1643,6 +1644,16 @@ function logIdentityRouteRefusal(requestedSessionId: string, tool: string, reaso
   logger.warn(`[trigger-user-auth] refused ${tool} identity for ${sessionId ? sessionId.slice(0, 8) : 'an unknown session'}: ${reason}${detail ? ` (${detail})` : ''}`);
 }
 
+/** The speakers of a turn count only where the capability governing `tool` is on; with it off the
+ *  turn keeps its own caller and `BOTMUX_AS` has nobody to name. */
+const AS_UNAVAILABLE_NATIVE = 'BOTMUX_AS cannot be used here: --as user runs natively with this machine\'s own lark-cli login, not as a person of the turn';
+
+function governedSpeakers(
+  policy: TriggerUserAuthConfig | undefined, tool: IdentityRouteTool, speakers: readonly TurnSpeaker[] | undefined,
+): readonly TurnSpeaker[] | undefined {
+  return policy?.allowSpeakerSwitch === true && capabilityOn(policy, capabilityOfTool(tool)) ? speakers : undefined;
+}
+
 /** Storage model the daemon publishes for a managed session is resolved with
  *  the same predicate (worker-pool.identityStorageModelForDaemonSession) the
  *  worker uses to render the wrapper; they must never disagree for one session.
@@ -1675,7 +1686,8 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
-  if (!sessionId || !tool) return jsonRes(res, 400, blocked('invalid_request'));
+  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')) return jsonRes(res, 400, blocked('invalid_request'));
+  const requestedAs = record?.as as string | undefined;
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
@@ -1684,6 +1696,12 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     return jsonRes(res, 403, blocked('peer_unresolved'));
   }
   const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
+  const refuseAs = (reason: 'as_not_speaker' | 'as_unavailable') => {
+    logIdentityRouteRefusal(sessionId, tool, reason);
+    return jsonRes(res, 403, blocked(reason));
+  };
+  // A detached background job runs for the person who registered it: nobody else can be named.
+  if (!document && requestedAs !== undefined) return refuseAs('as_unavailable');
   if (document) {
     const ds = findActiveBySessionId(sessionId);
     if (!ds) return jsonRes(res, 403, blocked('lineage_unproven'));
@@ -1695,6 +1713,16 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       return jsonRes(res, 403, blocked(modelRefusal));
     }
     const identityTurnId = document.identityTurnId ?? document.turnId;
+    // Without `BOTMUX_AS` the call runs as the turn principal; the speakers of the turn only validate a named one.
+    let policy: TriggerUserAuthConfig | undefined;
+    try { policy = getBot(ds.larkAppId).config.triggerUserAuth; } catch { /* bot missing: nothing is governed */ }
+    const governed = governedSpeakers(policy, tool, ds.managedTurnOrigin?.speakers);
+    const principal = ds.managedTurnOrigin?.callerOpenId
+      ? { openId: ds.managedTurnOrigin.callerOpenId, turnId: identityTurnId } : undefined;
+    const choice = chooseTurnSpeaker(principal, governed, requestedAs);
+    // No speakers here (capability off, unattended turn): nobody can be named; otherwise the name is not among them.
+    if (!choice.ok) return refuseAs(governed ? 'as_not_speaker' : 'as_unavailable');
+    const speakerTurnId = choice.speaker?.turnId ?? identityTurnId;
     // A workflow handoff's delegation is re-checked on every use: once its
     // attempt ended or it was withdrawn, this turn's tool refuses from now on
     // (even if the stop never reached this daemon).
@@ -1716,27 +1744,28 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // exactly the window in which the answer gets written to disk.
     const liveAppId = ds.larkAppId;
     await retryTransientTurnIdentity({
-      sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
+      sessionDataDir: config.session.dataDir, sessionId, turnId: speakerTurnId,
       tool: tool === 'codebase' || tool === 'bitscli' ? 'bytedcli' : tool,
       // A bot that no longer exists is "no longer governed": policyStillWants
       // treats a throwing reader as a refusal to publish.
       currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
     });
-    let env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    let env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     if (!env) {
       // The turn's identity may still be on its way (a new session's opening
       // turn is republished after the worker reports its model). Wait for that
       // publication instead of refusing as if nothing would ever come.
       await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
-      env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+      env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     }
     if (env) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
-        sessionId, larkAppId: document.larkAppId, tool, identityTurnId, env,
+        sessionId, larkAppId: document.larkAppId, tool, identityTurnId: speakerTurnId, env,
       });
     }
-    const detachedFromLive = await resolveDetachedScheduledExecutionIdentity({
+    // A named speaker whose material is gone gets the same answer as the default path; a background job cannot be named.
+    const detachedFromLive = requestedAs !== undefined ? null : await resolveDetachedScheduledExecutionIdentity({
       sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
     });
     if (detachedFromLive) {
@@ -1749,7 +1778,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // Lineage is proven, but no identity material exists for this turn (never
     // prepared, collected at a terminal boundary, daemon restart). Distinct
     // from a proof failure so the wrapper denies without confusing the two.
-    logIdentityRouteRefusal(sessionId, tool, 'identity_material_unavailable', `turn ${identityTurnId}`);
+    logIdentityRouteRefusal(sessionId, tool, 'identity_material_unavailable', `turn ${speakerTurnId}`);
     return jsonRes(res, 404, {
       schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'identity_material_unavailable',
     });
@@ -4005,7 +4034,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
-  if (!body || Object.keys(body).some(key => key !== 'mode') || !['bot', 'user'].includes(String(body.mode))) {
+  if (!body || Object.keys(body).some(key => key !== 'mode' && key !== 'as') || !['bot', 'user'].includes(String(body.mode))
+    || (body.as !== undefined && (body.mode !== 'user' || typeof body.as !== 'string'))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
   res.setHeader('cache-control', 'no-store');
@@ -4014,6 +4044,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
   // Per-person auth is on but lark-user is not among its capabilities: the machine's own lark-cli login serves `--as user`.
   if (body.mode === 'user' && larkUserNative(bot.triggerUserAuth)) {
+    if (body.as !== undefined) return jsonRes(res, 403, { ok: false, error: AS_UNAVAILABLE_NATIVE });
     return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', native: true });
   }
   if (body.mode === 'user' && validHeadlessSession) {
@@ -4056,7 +4087,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (detachedForUser?.runIdentity.ok) {
     noteSenderUnionId(detachedForUser.larkAppId, detachedForUser.runIdentity.openId, detachedForUser.runIdentity.unionId);
   }
-  const originSender = liveOrigin?.callerOpenId
+  const turnCaller = liveOrigin?.callerOpenId
     ?? (detachedForUser?.runIdentity.ok ? detachedForUser.runIdentity.openId : undefined);
   const turnId = liveOrigin?.turnId ?? detachedForUser?.scheduledTurnId;
   if (!turnId) {
@@ -4078,6 +4109,19 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
     return jsonRes(res, 403, { ok: false, error: delegatedError(delegated.denialReason ?? 'target user/tool access unavailable') });
   }
+  // Without `BOTMUX_AS` the call runs as the turn principal; the speakers of the turn only validate a named one.
+  if (delegated && body.as !== undefined) {
+    return jsonRes(res, 403, { ok: false, error: 'BOTMUX_AS is not available in a delegated run: it acts for the original requester only' });
+  }
+  const governedForAs = governedSpeakers(bot.triggerUserAuth, 'lark-cli', liveOrigin?.speakers);
+  const choice = delegated ? { ok: true as const, speaker: undefined }
+    : chooseTurnSpeaker(turnCaller ? { openId: turnCaller, turnId: turnId } : undefined, governedForAs, body.as);
+  if (!choice.ok) {
+    return jsonRes(res, 403, { ok: false, error: governedForAs
+      ? 'BOTMUX_AS names nobody who spoke in this turn; run the command without it to act as the person who started the turn'
+      : 'This bot does not allow running a command for another speaker; run the command without BOTMUX_AS to act as the person who started the turn' });
+  }
+  const originSender = choice.speaker?.openId ?? turnCaller;
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
@@ -4090,6 +4134,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // The bot application's own grant first (the owner keeps its wider scopes);
   // anyone else can only get credentials through the platform, since a bot
   // app's availability range normally excludes them.
+  // A follow-up authorization step must name the same person, or its entry goes to the turn's default speaker.
+  const asPrefix = body.as !== undefined ? `BOTMUX_AS=${body.as} ` : '';
   const resolved = await resolveBoundLarkUserCredential({
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
     ...(delegated ? { unionId: delegated.unionId } : {}),
@@ -4098,7 +4144,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const stableAfterAwait = liveOrigin?.turnId
     ? (!!ds && findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
       && (!execution || currentTurnPeerAttestationStable(execution, executionInput!))
-      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.callerOpenId === originSender
+      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.callerOpenId === turnCaller
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
   if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
@@ -4133,7 +4179,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   }
   if (!resolved.ok) return jsonRes(res, 403, { ok: false, error: delegated
     ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
-    : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
+    : `Application ${bot.larkAppId} needs this user's authorization. Run ${asPrefix}botmux auth request --scope "<required scopes>" --json${asPrefix ? ` and ${asPrefix}botmux auth wait` : ', or send /login in this conversation'}, then retry with --as user.` });
   return jsonRes(res, 200, {
     ok: true, appId: resolved.appId, mode: 'user', credentialType: 'user_access_token', credential: resolved.credential,
     ...(resolved.issuer ? { issuer: resolved.issuer } : {}),
@@ -4190,7 +4236,7 @@ function trackSessionAuthorization(
  * privately and answers with a message that does not carry it.
  */
 async function handleProviderAuthRequest(
-  res: ServerResponse, ds: DaemonSession, sessionId: string, provider: unknown, tenant: unknown, unattended?: unknown,
+  res: ServerResponse, ds: DaemonSession, sessionId: string, provider: unknown, tenant: unknown, unattended?: unknown, as?: unknown,
 ): Promise<void> {
   if (!(AUTH_PROVIDERS.includes(provider as AuthProvider) || unattended === true && provider === 'lark-cli')
     || tenant !== undefined && (provider !== 'meego' || !MEEGO_TENANTS.includes(tenant as MeegoTenant))) {
@@ -4203,8 +4249,8 @@ async function handleProviderAuthRequest(
     message: t('provider_auth.refused', { provider: provider === 'meego' ? 'Meego' : 'ByteCloud', reason }, loc),
   });
   const origin = ds.managedTurnOrigin;
-  const openId = origin?.callerOpenId;
-  if (!origin?.turnId || !openId || !isUsableOpenId(openId)) {
+  const callerOpenId = origin?.callerOpenId;
+  if (!origin?.turnId || !callerOpenId || !isUsableOpenId(callerOpenId)) {
     return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   }
   const turnId = origin.identityTurnId ?? origin.turnId;
@@ -4218,6 +4264,12 @@ async function handleProviderAuthRequest(
       message: t('provider_auth.native', { provider: provider === 'meego' ? 'Meego' : 'ByteCloud' }, loc),
     });
   }
+  // The person asked is the speaker `BOTMUX_AS` names, else the turn principal.
+  const governed = governedSpeakers(cfg.triggerUserAuth, provider === 'lark-cli' ? 'lark-cli' : 'bytedcli', origin.speakers);
+  const choice = chooseTurnSpeaker({ openId: callerOpenId, turnId }, governed, as);
+  if (!choice.ok) return jsonRes(res, 403, { ok: false, error: governed ? 'as_not_speaker' : 'as_unavailable' });
+  const openId = choice.speaker?.openId ?? callerOpenId;
+  if (!isUsableOpenId(openId)) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   // Nobody attends a scheduled or background run: it never starts an authorization.
   // The wrapper that refused a command may only ask for the one private notice,
   // which is answered at once.
@@ -4255,7 +4307,7 @@ async function handleProviderAuthRequest(
     },
     beginBytedcliLogin,
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
-      sessionDataDir: config.session.dataDir, sessionId, turnId: origin.identityTurnId ?? origin.turnId!,
+      sessionDataDir: config.session.dataDir, sessionId, turnId: choice.speaker?.turnId ?? origin.identityTurnId ?? origin.turnId!,
       botConfig: cfg, senderOpenId: person,
     }),
     deliver: (text, privateCommand) => deliverAuthLink({
@@ -4342,7 +4394,7 @@ for (const action of ['auth-request', 'auth-status']) {
     }
     const cfg = getBot(ds.larkAppId).config;
     if (action === 'auth-request' && 'provider' in body) {
-      return await handleProviderAuthRequest(res, ds, params.sessionId, body.provider, body.tenant, body.unattended);
+      return await handleProviderAuthRequest(res, ds, params.sessionId, body.provider, body.tenant, body.unattended, body.as);
     }
     // Only the daemon's verified, turn-bound dispatch can supply a delegated
     // human. The CLI still cannot choose a user or an application.
@@ -4350,14 +4402,27 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
       const grant = currentLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
-      if (!grant) return liveOrigin.callerOpenId;
+      if (!grant) {
+        // `BOTMUX_AS` names the speaker asked; else the turn principal.
+        const principal = liveOrigin.callerOpenId ? { openId: liveOrigin.callerOpenId, turnId: liveOrigin.turnId } : undefined;
+        const speaker = chooseTurnSpeaker(principal, governedSpeakers(cfg.triggerUserAuth, 'lark-cli', liveOrigin.speakers), body.as);
+        const chosen = speaker.ok ? speaker.speaker?.openId : undefined;
+        return body.as === undefined || (chosen && isUsableOpenId(chosen)) ? chosen : undefined;
+      }
       if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
         || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;
       return grant.targetOpenId;
     };
     const identityTurnId = origin.identityTurnId ?? origin.turnId;
     const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId);
+    if (delegated && body.as !== undefined) {
+      return jsonRes(res, 403, { ok: false, error: 'BOTMUX_AS is not available in a delegated run: it acts for the original requester only' });
+    }
     const callerOpenId = requestingUser();
+    if (!callerOpenId && body.as !== undefined && !delegated
+      && !governedSpeakers(cfg.triggerUserAuth, 'lark-cli', origin.speakers)) {
+      return jsonRes(res, 403, { ok: false, error: 'as_unavailable' });
+    }
     if (!callerOpenId) return denyCurrentActor('caller_unavailable');
     const originCallerOpenId = origin.callerOpenId;
     const turnId = origin.turnId;
@@ -12185,6 +12250,7 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
       authorizedCount,
       credentialSource: credentialSourceOf(policy),
       platformBound: platformUrl !== null,
+      crossPrincipalIsolation: config.crossPrincipalInterruption,
       ...(platformUrl ? { platformCredentialsUrl: platformUrl } : {}),
       tokenStoreEnforced: protection.enforced,
       ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),

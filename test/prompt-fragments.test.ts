@@ -83,6 +83,7 @@ describe('prompt fragment catalog', () => {
       'ai.credentials.never_forward',
       'ai.credentials.on_auth_failure',
       'ai.credentials.on_auth_link',
+      'ai.credentials.turn_speakers',
       'ai.credentials.on_missing_scope',
     ]);
   });

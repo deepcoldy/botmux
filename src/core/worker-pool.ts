@@ -23762,6 +23762,7 @@ function setupWorkerHandlers(
               ? { trustedCaller: previousOrigin.trustedCaller }
               : {}),
           ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
+          ...(msg.speakers?.length ? { speakers: msg.speakers } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }

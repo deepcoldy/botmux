@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   }
   const execution = await resolveCurrentExecutionIdentity({
     ipcPort: Number(values['ipc-port']), sessionId: values['session-id'], larkAppId: values['app-id'],
-    tool: tool!,
+    tool: tool!, as: process.env.BOTMUX_AS || undefined,
   });
   // The daemon proved the caller's lineage and returns the identity env
   // ASSIGNMENTS themselves. Print only the body for the wrapper to eval. The

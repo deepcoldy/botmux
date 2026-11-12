@@ -94,6 +94,13 @@ export interface TriggerUserAuthConfig {
    * key live on this machine).
    */
   delegateOnMention?: boolean;
+  /**
+   * Whether, in a turn several people spoke in, one command can run as another
+   * speaker of that turn (`BOTMUX_AS=<open_id> <command>`). Default off; only
+   * an explicit `true` is stored. Without it `BOTMUX_AS` is refused and the
+   * prompts do not mention it.
+   */
+  allowSpeakerSwitch?: boolean;
   /** Extra tools signed only for a direct human's dispatch into the exact
    * listed chat and target apps. They never govern this bot's own CLI calls. */
   dispatchOnly?: {
@@ -259,6 +266,11 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     throw new TriggerUserAuthConfigError('triggerUserAuth.delegateOnMention must be a boolean');
   }
 
+  if (rec.allowSpeakerSwitch !== undefined && rec.allowSpeakerSwitch !== null
+    && typeof rec.allowSpeakerSwitch !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.allowSpeakerSwitch must be a boolean');
+  }
+
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -304,6 +316,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     ...(rec.fallback === 'none' || rec.fallback === 'bot-identity' ? { legacyFallback: rec.fallback } : {}),
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
+    ...(rec.allowSpeakerSwitch === true ? { allowSpeakerSwitch: true } : {}),
     ...(dispatchOnly ? { dispatchOnly } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),

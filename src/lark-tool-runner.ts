@@ -33,13 +33,16 @@ async function main(): Promise<void> {
     },
   ));
   const isPassthrough = Boolean(invocation.passthroughProfile);
+  if (isPassthrough && !invocation.offline && process.env.BOTMUX_AS) {
+    throw new Error('BOTMUX_AS cannot be used with --profile: that call runs with the profile\'s own login, not as a person of the turn');
+  }
   let identity: { mode: 'bot' | 'user'; credential: string; appId?: string } | undefined;
   let native = false;
   if (!invocation.offline && !isPassthrough) {
     const port = parseDaemonIpcPort(findOnlineDaemon(binding.appId, binding.dataDir)?.ipcPort)
       ?? binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
     if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) throw new Error('The bound bot daemon is unavailable');
-    const payload = JSON.stringify({ mode: invocation.mode });
+    const payload = JSON.stringify({ mode: invocation.mode, ...(invocation.mode === 'user' && process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}) });
     // `--as user` can run a platform credential grant inside this request.
     const response = await loopbackFetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(binding.sessionId)}/${LARK_TOOL_ROUTE}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },

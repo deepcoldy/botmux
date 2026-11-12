@@ -1583,12 +1583,17 @@ export interface NativeBytedcliCapabilities {
   bytecloud?: boolean;
 }
 
+const AS_UNAVAILABLE_MSG = 'botmux: 这次调用无法使用 BOTMUX_AS（命令使用本机原生登录，或本会话按单快照模式运行，不逐次向 daemon 取身份），命令未执行；去掉 BOTMUX_AS 重试。';
+/** Shell line refusing a call that names `BOTMUX_AS` where the wrapper cannot honour it. */
+const refuseBotmuxAs = (leave: string): string =>
+  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(AS_UNAVAILABLE_MSG)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
+
 function bytedcliNativePassthrough(realBinaryPath: string, native: NativeBytedcliCapabilities): string[] {
   if (!native.meego && !native.bytecloud) return [];
   // An option of unknown arity makes the first operand uncertain: the call
   // stays governed rather than running natively on a guess.
   const condition = `[ -z "$__botmux_sc_unknown" ] && [ "$__botmux_sc_w1" ${native.meego ? '=' : '!='} meego ]`;
-  return [`if ${condition}; then exec ${shellSingleQuote(realBinaryPath)} "$@"; fi`];
+  return [`if ${condition}; then ${refuseBotmuxAs('exit')}; exec ${shellSingleQuote(realBinaryPath)} "$@"; fi`];
 }
 
 export function renderIdentityWrapper(
@@ -1617,6 +1622,8 @@ export function renderIdentityWrapper(
     `case "$BOTMUX_IDENTITY_MODE" in user|bot|user-home|turn-mismatch|denied) ;; *) return ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
     'unset __botmux_cred_body',
   ] : [
+    // The file-based wrapper never asks the daemon, so it cannot run a call as another speaker.
+    refuseBotmuxAs('return'),
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
     `  __botmux_cred="$__botmux_d/${tool}.env"`,

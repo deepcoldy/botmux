@@ -6962,7 +6962,7 @@ function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const policyCapability = sandboxPolicyCapability ?? randomBytes(32).toString('hex');
-  const activeIdentity = activeTurnAuthority.identity();
+  const activeIdentity = { ...activeTurnAuthority.identity(), speakers: activeTurnAuthority.speakers() };
   const authorityTurnId = activeIdentity.turnId ?? currentBotmuxTurnId;
   const authorityDispatchAttempt = activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt;
   const authorityLinkRefMode = currentBotmuxLinkRefMode;
@@ -7069,6 +7069,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(activeIdentity.turnId ? {
         trustedCaller: activeIdentity.caller ?? null,
         identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
+        ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
       } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }

@@ -1,3 +1,4 @@
+import type { TurnSpeaker } from './core/turn-speakers.js';
 import type { BackendType, HerdrBackendConfig, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 // The IPC carries the USER-facing MojoConfig. EffectiveMojoConfig exists only
@@ -2790,7 +2791,7 @@ export type WorkerToDaemonBase =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; linkRefMode?: 'observe' | 'enabled' }
   /** Worker→daemon single-source identity storage decision, sent right after
    *  the worker resolved the actual spawn (or RPC engine): the effective model
    *  plus the spawn facts it was derived from. The daemon publishes identity
