@@ -251,7 +251,9 @@ if (subagent) {
   });
 }
 `);
-        writeFileSync(launcher, `#!${node}
+        // env execs Node itself, so Linux does not retain the script basename
+        // as comm (the parent must be an observable Node process on both OSes).
+        writeFileSync(launcher, `#!/usr/bin/env node
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 fs.writeFileSync(${JSON.stringify(launcherPidFile)} + '.tmp', JSON.stringify(process.pid));
