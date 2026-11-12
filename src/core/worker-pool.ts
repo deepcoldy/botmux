@@ -3779,7 +3779,7 @@ function sessionAgentConfig(
         && !cliModelSupportsReasoningEffort(selected.cliId, model, reasoningEffort)
         && !(config.terminalEffortWriteback && hasConfirmedNativeGrokEffort(ds.session, model))) {
       ds.session.reasoningEffort = undefined;
-      selected.reasoningEffort = undefined;
+      selected.reasoningEffort = null;
       reasoningEffort = undefined;
       sessionStore.updateSession(ds.session);
     }

@@ -107,7 +107,7 @@ describe('terminal effort persistence', () => {
     expect(cold(true).args).toContain('xhigh');
     const off = cold(false); expect(off.args).not.toContain('xhigh');
     expect(off.session.reasoningEffort).toBeUndefined();
-    if (snapshot) expect(off.session.cliLaunchSnapshot?.reasoningEffort).toBeUndefined();
+    if (snapshot) expect(off.session.cliLaunchSnapshot?.reasoningEffort).toBeNull();
     expect(cold(true, 'grok-4.5').args).not.toContain('xhigh');
     const pin: NonNullable<Session['modelPin']> = { model: saved.model!, effort: 'high', source: 'command', setBy: 'fixture', setAt: new Date(NOW).toISOString() };
     store.mutateOwnedSessionsAtomically([saved.sessionId], rows => { rows.get(saved.sessionId)!.modelPin = pin; }, { modelPinWrite: true });
