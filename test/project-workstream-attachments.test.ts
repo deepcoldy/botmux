@@ -932,4 +932,80 @@ describe('project workstream attachments', () => {
     expect(lastCardPayload).not.toContain('cli_worker');
     expect(lastCardPayload).toContain('等回复');
   });
+
+  it('refuses manual update when the signed binding differs from this coordinator in app only or chat only', async () => {
+    const f = await fixture();
+    const cases = [
+      { root: 'om_other_app', targetLarkAppId: 'cli_other_coordinator', targetChatId: f.actor.chatId },
+      { root: 'om_other_chat', targetLarkAppId: f.actor.larkAppId, targetChatId: 'oc_other_chat' },
+    ];
+    for (const item of cases) {
+      await seedOrdinaryDispatch(f, item.root, entry => {
+        entry.reportBinding = createDispatchReportBinding(SECRET, {
+          dispatchRoot: item.root,
+          targetLarkAppId: item.targetLarkAppId,
+          targetSessionId: f.actor.sessionId,
+          targetChatId: item.targetChatId,
+          targetScope: 'chat',
+          sourceName: '普通派单任务',
+          issuedAt: '2026-11-10T00:00:00.000Z',
+        });
+      });
+      await expect(f.service.update(f.actor, {
+        rootMessageId: item.root, status: 'completed', content: '越权收口必须被拒绝',
+      }), item.root).rejects.toThrow('workstream_not_found');
+      const row = readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === item.root)!;
+      expect(row, item.root).toMatchObject({ status: 'in_progress', progress: 20 });
+      expect(f.registry()[item.root].lastReport, item.root).toBeUndefined();
+    }
+  });
+
+  it('does not record a registry report when the project generation changes before the manual update commits', async () => {
+    const f = await fixture();
+    await seedOrdinaryDispatch(f, 'om_generation_race', entry => {
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_generation_race',
+        targetLarkAppId: f.actor.larkAppId,
+        targetSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+      });
+    });
+    // The project is re-created after the registry check but before the business write commits.
+    f.projectRun.mockImplementationOnce(async (ctx, action, beforeApply) => {
+      await mutateProjectGroup(f.dataDir, 'oc_group', current => {
+        current!.createdAt = '2026-11-11T00:00:00.000Z';
+        return current;
+      });
+      return f.coordinator.run(ctx, action, beforeApply);
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_generation_race', status: 'completed', progress: 100, content: '旧一代项目的收口',
+    })).rejects.toThrow('project_generation_changed');
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === 'om_generation_race'))
+      .toMatchObject({ status: 'in_progress', progress: 20 });
+    expect(f.registry().om_generation_race.lastReport).toBeUndefined();
+  });
+
+  it('only replaces an owner that is exactly the raw source app id; human-entered owners survive attach and reconcile', async () => {
+    const f = await fixture();
+    f.source().botName = 'BotAlpha';
+    await f.coordinator.run(f.context, {
+      action: 'dispatch', dispatchRoot: 'om_topic', title: '已有子任务', purpose: '人工维护负责人',
+      owners: ['人工负责人'], status: 'in_progress', progress: 30,
+    });
+    await f.service.attach(f.actor, f.request);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners).toEqual(['人工负责人']);
+
+    for (const owners of [['另一位负责人'], ['cli_worker', '协作负责人']]) {
+      await mutateProjectGroup(f.dataDir, 'oc_group', current => {
+        current!.workstreams[0]!.owners = owners;
+        return current;
+      });
+      await f.service.reconcile(f.actor);
+      expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners, owners.join(',')).toEqual(owners);
+    }
+  });
 });

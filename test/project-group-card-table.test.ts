@@ -382,6 +382,7 @@ describe('imported workstream status derivation, bot name display, and moved fil
         om_closed_live: { status: 'closed', closedAt: nowMs },
         om_completed_override: { status: 'idle', lastTurn: null },
         om_blocked_override: { status: 'working', busySinceAt: nowMs },
+        om_failed_override: { status: 'working', busySinceAt: nowMs },
       },
     };
 
@@ -405,6 +406,8 @@ describe('imported workstream status derivation, bot name display, and moved fil
       .toEqual({ kind: 'completed', label: '已完成', color: 'green' });
     expect(resolveWorkstreamDisplayStatus(attachedItem('om_blocked_override', '显式受阻', 'cli_claude', { status: 'blocked' }), runtime))
       .toEqual({ kind: 'blocked', label: '阻塞', color: 'orange' });
+    expect(resolveWorkstreamDisplayStatus(attachedItem('om_failed_override', '显式失败', 'cli_claude', { status: 'failed' }), runtime))
+      .toEqual({ kind: 'failed', label: '失败', color: 'red' });
 
     expect(resolveWorkstreamOwnerNames(attachedItem('om_working', '在跑任务', 'cli_claude'), runtime)).toEqual(['BotAlpha']);
   });
