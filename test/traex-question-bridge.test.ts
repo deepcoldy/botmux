@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AskQuestion, AskResult } from '../src/core/ask-types.js';
 import {
@@ -156,6 +157,8 @@ const answered = (answers: string[], extra: Partial<Extract<AskResult, { kind: '
 
 const DB: Question = { prompt: 'Which database should the new service use?', options: ['PostgreSQL (Recommended)', 'MySQL', 'SQLite'] };
 const DEPLOY: Question = { prompt: 'Where should it be deployed first?', options: ['Staging (Recommended)', 'Production'] };
+/** traecli 0.214.1's "Submit with unanswered questions?" page (real capture). */
+const CONFIRM = readFileSync(new URL('./fixtures/traex-question/traex-0.214.1-submit-confirm-160x50.txt', import.meta.url), 'utf8');
 const FEATURES: Question = { prompt: 'Which features do you want to enable?', options: ['Caching', 'Metrics', 'Tracing'], multiSelect: true };
 
 /** Kick and let the page settle until a card is out. */
@@ -395,6 +398,90 @@ describe('TraexQuestionBridge', () => {
     h.asks.at(-1)!.answer(answered(['2']));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(h.tui.answers).toEqual(['1:MySQL']);
+  });
+
+  it('a page must look the same for the whole stable window before its card goes out', async () => {
+    const h = harness([DB]);
+    h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(200);
+    // A second look well inside the window (a kick from the next PTY chunk).
+    h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.asks).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(TRAEX_QUESTION_STABLE_MS * 2);
+    expect(h.asks).toHaveLength(1);
+  });
+
+  it('another question taking the screen withdraws the open card before carding the new one', async () => {
+    const h = harness([DB, DEPLOY]);
+    await raiseCard(h);
+    h.tui.key('1'); // question 1 answered in the Web terminal: question 2 is up
+    await vi.advanceTimersByTimeAsync(TRAEX_QUESTION_POLL_MS + TRAEX_QUESTION_STABLE_MS * 2 + 400);
+    expect(h.asks[0]!.signal.aborted).toBe(true);
+    expect(h.asks).toHaveLength(2);
+    expect(h.asks[1]!.question.prompt).toBe('(2/2) Where should it be deployed first?');
+    expect(h.asks[1]!.signal.aborted).toBe(false);
+  });
+
+  it('a card left open when the CLI is replaced is withdrawn on the next look', async () => {
+    const h = harness([DB]);
+    await raiseCard(h);
+    h.state.lifetime = 2;
+    h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(h.asks[0]!.signal.aborted).toBe(true);
+  });
+
+  it('a page that leaves mid-answer is reported, not taken for an entered answer', async () => {
+    const h = harness([DB]);
+    await raiseCard(h);
+    // Interrupted in the terminal right after the answer's first key (Up).
+    h.state.beforeCapture = () => {
+      if (h.tui.inputs.length === 1) h.state.screen = () => '❯ \n  model · /tmp/repo · Context 99% left';
+    };
+    h.asks[0]!.answer(answered([], { customAnswers: ['用 TiDB'] }));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.tui.inputs).toEqual(['Up']);
+    expect(h.notices).toEqual(['worker.traex_question.not_written']);
+    expect(h.logs.some(line => line.includes('card answer entered'))).toBe(false);
+  });
+
+  it('a final key that leaves the page on the same question is never pressed again', async () => {
+    const h = harness([FEATURES]);
+    await raiseCard(h);
+    // TRAE takes the Enter without moving on, but its pointer moves.
+    const key = h.tui.key.bind(h.tui);
+    h.tui.key = k => {
+      if (k !== 'Enter') return key(k);
+      h.tui.inputs.push(k);
+      h.tui.pointer = 2;
+    };
+    h.asks[0]!.answer(answered(['1']));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.tui.inputs).toEqual(['1', 'Enter']);
+    expect(h.notices).toEqual(['worker.traex_question.not_confirmed']);
+  });
+
+  it('the unreadable-page notice is said once per appearance, however often the worker looks', async () => {
+    const h = harness([DB]);
+    h.state.screen = () => h.tui.screen().split('\n').map(row => row.replace(/ {2,}/g, ' ')).join('\n');
+    for (let i = 0; i < 6; i++) {
+      h.bridge.kick(); // the worker's screen tick keeps kicking while the page is up
+      await vi.advanceTimersByTimeAsync(TRAEX_QUESTION_POLL_MS);
+    }
+    expect(h.asks).toHaveLength(0);
+    expect(h.notices).toEqual(['worker.traex_question.unreadable']);
+  });
+
+  it('the "Submit with unanswered questions?" confirmation raises no card and no unreadable notice', async () => {
+    const h = harness([DB]);
+    h.state.screen = () => CONFIRM;
+    for (let i = 0; i < 4; i++) {
+      h.bridge.kick();
+      await vi.advanceTimersByTimeAsync(TRAEX_QUESTION_POLL_MS);
+    }
+    expect(h.asks).toHaveLength(0);
+    expect(h.notices).toEqual([]);
   });
 
   it('a question re-asked a few seconds after it left is carded again', async () => {

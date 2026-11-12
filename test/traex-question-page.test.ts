@@ -156,6 +156,36 @@ describe('parseTraexQuestionPage on real traecli 0.214.1 screens', () => {
     expect(traexQuestionFlowVisible(screen.replace('esc interrupt', 'esc cancel'))).toBe(false);
   });
 
+  it('fails closed on a page one detail away from what TRAE draws', () => {
+    // Each look-alike is a real capture with a single edit TRAE never makes.
+    // The card reads its options and the answer's keys from this parse, so
+    // anything off in the layout must read as "no page", never as a guess.
+    const single = fixture('traex-0.214.1-single-160x50.txt');
+    const notes = fixture('traex-0.214.1-single-notes-typed-160x50.txt');
+    const multi = fixture('traex-0.214.1-multi-q2-multiselect-160x50.txt');
+    expect(parseTraexQuestionPage(single)).toBeDefined();
+    expect(parseTraexQuestionPage(notes)).toBeDefined();
+    expect(parseTraexQuestionPage(multi)).toBeDefined();
+    const lookAlikes: Array<[string, string]> = [
+      ['two pointers', single.replace('    2. MySQL', '  ❯ 2. MySQL')],
+      ['options out of sequence', single.replace('    2. MySQL ', '    5. MySQL ')],
+      ['a row between the options and the footer', single.replace('\n\n  tab add notes', '\n  see the notes below\n\n  tab add notes')],
+      ['an open notes field without its upper rule', notes.replace(/\n {2}─+\n {2}❯ 用第二个方案吧/, '\n  ❯ 用第二个方案吧')],
+      ['a question number past the batch size', single.replace('Question 1/1 (1 unanswered)', 'Question 3/1 (1 unanswered)')],
+      ['a footer offering both submits', single.replace('enter submit answer', 'enter submit answer  |  enter submit all')],
+      ['checkboxes without the toggle hint', multi.replace('space toggle  |  ', '')],
+      ['the toggle hint without checkboxes', single.replace('  tab add notes', '  space toggle  |  tab add notes')],
+    ];
+    for (const [what, screen] of lookAlikes) {
+      expect(screen, what).not.toBe(single);
+      expect(parseTraexQuestionPage(screen), what).toBeUndefined();
+    }
+    // Holding input keys on the chrome only, but that chrome still has to be
+    // TRAE's: numbered in sequence, ending with its own described row.
+    expect(traexQuestionFlowVisible(single.replace('    2. MySQL ', '    5. MySQL '))).toBe(false);
+    expect(traexQuestionFlowVisible(single.replace('Optionally, add details in notes (tab).', 'Pick this one if unsure.'))).toBe(false);
+  });
+
   it('keeps the question identity across pointer, ticks and notes, and changes it per question', () => {
     const base = traexQuestionSignature(page('traex-0.214.1-single-160x50.txt'));
     for (const name of ['traex-0.214.1-single-highlight3-160x50.txt', 'traex-0.214.1-single-notes-empty-160x50.txt', 'traex-0.214.1-single-notes-typed-160x50.txt']) {

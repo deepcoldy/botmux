@@ -41,6 +41,7 @@ const WORKER_FUNCTIONS = [
   'adapterRendersCodexFamilyStuckPages',
   'cancelHookReviewReleaseProbe',
   'scheduleHookReviewReleaseProbe',
+  'traexQuestionSubmitGuard',
 ] as const;
 
 function harness(cliId: CliId, opts: {
@@ -98,6 +99,12 @@ function harness(cliId: CliId, opts: {
     redactStuckPageTail: (s: string) => s,
     screenShowsCredentialPage: () => false,
     shareableStuckScreenTail: () => '',
+    cliSpawnGeneration: 1,
+    cliRestartInProgress: false,
+    traexQuestionDraftWaiting: false,
+    TRAEX_QUESTION_DRAFT_WAIT_MS: 60 * 60_000,
+    TRAEX_QUESTION_DRAFT_POLL_MS: 500,
+    traexQuestionCapture: async () => scope.screen || undefined,
   };
   for (const name of WORKER_FUNCTIONS) scope[name] = loadWorkerFunction(name, scope);
   return { scope, sent, logs, kicks: () => kicks, idleResets: () => idleResets, fn: (name: (typeof WORKER_FUNCTIONS)[number]) => scope[name] };
@@ -170,6 +177,54 @@ describe('holding input off the question page', () => {
   });
 });
 
+describe('the submit guard handed to a TraeX write', () => {
+  it('stays bound to the CLI the write started on', () => {
+    for (const replace of [
+      (scope: Record<string, any>) => { scope.backend = { captureViewport: () => scope.screen }; },
+      (scope: Record<string, any>) => { scope.cliSpawnGeneration += 1; },
+      (scope: Record<string, any>) => { scope.cliRestartInProgress = true; },
+    ]) {
+      const h = harness('traex', { screen: QUESTION });
+      const guard = h.fn('traexQuestionSubmitGuard')({ turnId: 'om_draft', dispatchAttempt: 2 });
+      expect(guard.current()).toBe(true);
+      replace(h.scope);
+      expect(guard.current()).toBe(false);
+    }
+  });
+
+  it('marks the pasted draft as waiting while the page is up, tells its sender once, and lets go on another CLI', async () => {
+    const h = harness('traex', { screen: QUESTION });
+    const guard = h.fn('traexQuestionSubmitGuard')({ turnId: 'om_draft', dispatchAttempt: 2 });
+    const reason = t('worker.traex_question.submit_blocked', { cliName: 'TRAE CLI' });
+    expect(await guard.blocked('draft')).toBe(reason);
+    expect(await guard.blocked('draft')).toBe(reason);
+    expect(h.scope.traexQuestionDraftWaiting).toBe(true);
+    expect(h.sent).toEqual([{
+      type: 'user_notify',
+      turnId: 'om_draft',
+      dispatchAttempt: 2,
+      message: t('worker.traex_question.draft_waiting', { cliName: 'TRAE CLI' }),
+    }]);
+    // A retry Enter is held off the page too, but it is no draft.
+    h.scope.traexQuestionDraftWaiting = false;
+    expect(await guard.blocked('retry')).toBe(reason);
+    expect(h.scope.traexQuestionDraftWaiting).toBe(false);
+    // The page leaves: the draft's Enter may go.
+    h.scope.traexQuestionDraftWaiting = true;
+    h.scope.screen = COMPOSER;
+    expect(await guard.blocked('draft')).toBeUndefined();
+    expect(h.scope.traexQuestionDraftWaiting).toBe(false);
+    // The CLI is replaced while the page is still drawn on the new one: this
+    // write's draft is gone with its CLI, nothing is held for it any more.
+    h.scope.screen = QUESTION;
+    h.scope.traexQuestionDraftWaiting = true;
+    h.scope.cliSpawnGeneration += 1;
+    expect(await guard.blocked('draft')).toBeUndefined();
+    expect(h.scope.traexQuestionDraftWaiting).toBe(false);
+    expect(h.sent).toHaveLength(1);
+  });
+});
+
 describe('the quiet question page is not a finished turn', () => {
   it('vetoes a prompt-ready edge while the page is on screen', () => {
     for (const screen of [QUESTION, NOTES_TYPED, CONFIRM]) {
@@ -178,6 +233,17 @@ describe('the quiet question page is not a finished turn', () => {
       expect(h.idleResets()).toBe(1);
       expect(h.scope.hookReviewInputHold).toBe(true);
     }
+  });
+
+  it('keeps vetoing on a failed capture while the hold still stands on the page', () => {
+    const h = harness('traex', { screen: QUESTION });
+    h.fn('refreshHookReviewInputHold')(QUESTION);
+    expect(h.scope.hookReviewInputHold).toBe(true);
+    h.scope.screen = '';
+    expect(h.fn('traexQuestionHoldsIdle')('TRAE CLI screen-idle', h.scope.backend)).toBe(true);
+    // Nothing held, nothing captured: no evidence of a page, no veto.
+    const fresh = harness('traex', { screen: '' });
+    expect(fresh.fn('traexQuestionHoldsIdle')('TRAE CLI screen-idle', fresh.scope.backend)).toBe(false);
   });
 
   it('leaves other screens, sessions and backends alone', () => {
