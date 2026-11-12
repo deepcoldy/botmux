@@ -308,12 +308,10 @@ import {
   projectHumanCallerKey,
   projectSessionOwnerKey,
   projectWorkstreamAttachments,
-  resolveHumanOpenIdOnApp,
   resolveSourceBotDisplayName,
   setProjectWorkstreamPool,
   type ClaimOwnerlessProjectSourceInput,
 } from '../services/project-workstream-runtime.js';
-import { readBotAdminUnions } from '../services/bot-admin-unions-store.js';
 import {
   isDirectHumanTurnCaller,
   isProjectWorkstreamForbiddenError,
@@ -412,7 +410,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import { ensureChatCoordinatorSessionForImport, triggerSessionTurn } from './trigger-session.js';
+import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import {
   listHeadlessSessions,
@@ -3853,60 +3851,102 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
 ipcRoute('POST', '/api/project-workstream/coordinators', async (req, res) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
-  const chatId = typeof body?.chatId === 'string' ? body.chatId : '';
-  const project = chatId ? readProjectGroup(config.session.dataDir, chatId) : undefined;
-  const mode = chatId ? readGroupCollaborationMode(config.session.dataDir, chatId) : undefined;
-  if (project) {
-    const ds = findActiveBySessionId(project.coordinatorSessionId);
-    const valid = ds && mode?.mode === 'project' && mode.coordinatorAppId === cachedLarkAppId
-      && body?.coordinatorLarkAppId === cachedLarkAppId
-      && (!body.coordinatorSessionId || body.coordinatorSessionId === project.coordinatorSessionId)
-      && ds.larkAppId === cachedLarkAppId && ds.chatId === project.chatId && ds.scope === 'chat'
-      && ds.session.status === 'active' && !ds.session.vcMeetingReceiver;
-    return jsonRes(res, 200, { ok: true, coordinators: valid ? [{
-      sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, scope: ds.scope, status: 'active',
-    }] : [] });
-  }
-  if (body?.ensureUninitializedCoordinator === true
-    && chatId
-    && mode?.mode === 'project'
-    && mode.coordinatorAppId === cachedLarkAppId
-    && body?.coordinatorLarkAppId === cachedLarkAppId
-    && effectiveProjectImportPolicy(mode, undefined) === 'notify') {
-    const registry = getActiveSessionsRegistry();
-    const ds = registry
-      ? await ensureChatCoordinatorSessionForImport({
-          larkAppId: cachedLarkAppId,
-          chatId,
-          activeSessions: registry,
-        }).catch(() => undefined)
-      : undefined;
-    const valid = ds && ds.larkAppId === cachedLarkAppId && ds.chatId === chatId && ds.scope === 'chat'
-      && ds.session.status === 'active' && !ds.session.vcMeetingReceiver;
-    return jsonRes(res, 200, { ok: true, coordinators: valid ? [{
-      sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, scope: ds.scope, status: 'active',
-    }] : [] });
-  }
-  return jsonRes(res, 200, { ok: true, coordinators: [] });
+  const project = typeof body?.chatId === 'string' ? readProjectGroup(config.session.dataDir, body.chatId) : undefined;
+  const mode = project && readGroupCollaborationMode(config.session.dataDir, project.chatId);
+  const ds = project && findActiveBySessionId(project.coordinatorSessionId);
+  const valid = ds && project && mode?.mode === 'project' && mode.coordinatorAppId === cachedLarkAppId
+    && body?.coordinatorLarkAppId === cachedLarkAppId && body.coordinatorSessionId === project.coordinatorSessionId
+    && ds.larkAppId === cachedLarkAppId && ds.chatId === project.chatId && ds.scope === 'chat'
+    && ds.session.status === 'active' && !ds.session.vcMeetingReceiver;
+  return jsonRes(res, 200, { ok: true, coordinators: valid ? [{
+    sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, scope: ds.scope, status: 'active',
+  }] : [] });
 });
 
-/** Host-only metadata notification. It may queue a turn (and bootstrap a
- * dormant chat-scope coordinator session in an uninitialized project group)
- * without granting access to any source transcript. */
+type ProjectImportWireNotification = {
+  id?: string;
+  operationId?: string;
+  projectGeneration?: string;
+  coordinatorAppId?: string;
+  snapshot?: import('../services/project-import-notifications.js').ProjectImportSnapshot;
+};
+
+/** Shape/identity check shared by the host-only import routes: the notification
+ * must be addressed to this coordinator app and its id must be derived from the
+ * snapshot's operation id, so a peer cannot point a card or turn elsewhere. */
+function validProjectImportNotification(
+  notification: ProjectImportWireNotification | undefined,
+): notification is ProjectImportWireNotification & {
+  id: string; operationId: string; projectGeneration: string; coordinatorAppId: string;
+  snapshot: import('../services/project-import-notifications.js').ProjectImportSnapshot;
+} {
+  const snapshot = notification?.snapshot;
+  return !!snapshot && !!notification?.id && !!notification.operationId
+    && typeof notification.projectGeneration === 'string'
+    && notification.coordinatorAppId === cachedLarkAppId
+    && notification.operationId === projectImportOperationId(snapshot)
+    && notification.id === createHash('sha256').update(notification.operationId).digest('hex');
+}
+
+/** Host-only: an import arrived in a project-mode group whose project is not
+ * initialized yet while import notifications are on. Post (or keep) the visible
+ * waiting card in the imported topic. It never creates a coordinator session,
+ * never runs a model turn and never touches any session owner; the outbox keeps
+ * the notification pending until a human initializes the project. */
+ipcRoute('POST', '/api/project-import/awaiting-project', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 16 * 1024).catch(() => undefined);
+  const notification = body?.notification as ProjectImportWireNotification | undefined;
+  if (!validProjectImportNotification(notification)
+    || notification.projectGeneration !== UNINITIALIZED_PROJECT_GENERATION) {
+    return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target' });
+  }
+  const snapshot = notification.snapshot;
+  const mode = readGroupCollaborationMode(config.session.dataDir, snapshot.chatId);
+  const project = readProjectGroup(config.session.dataDir, snapshot.chatId);
+  if (project) return jsonRes(res, 409, { ok: false, error: 'project_initialized' });
+  if (mode?.mode !== 'project' || effectiveProjectImportPolicy(mode, undefined) !== 'notify'
+    || mode.coordinatorAppId !== cachedLarkAppId || !mode.workerAppIds?.includes(snapshot.larkAppId)) {
+    return jsonRes(res, 409, { ok: false, error: 'policy_disabled' });
+  }
+  try {
+    const current = projectImportSnapshotFromSource(await getProjectAttachmentSource(snapshot.larkAppId, snapshot.sessionId));
+    if (!current || !current.ordinary || current.status !== 'active' || current.chatType !== 'group'
+      || current.scope !== 'thread' || JSON.stringify(current) !== JSON.stringify(snapshot)) {
+      return jsonRes(res, 409, { ok: false, error: 'source_changed' });
+    }
+    const card = await publishOrRefreshProjectImportCard({
+      coordinatorAppId: cachedLarkAppId,
+      chatId: snapshot.chatId,
+      rootMessageId: snapshot.rootMessageId,
+      sourceSessionId: snapshot.sessionId,
+      sourceLarkAppId: snapshot.larkAppId,
+      sourceKindFallback: snapshot.source,
+      routeRevisionFallback: snapshot.routeRevision,
+    });
+    return jsonRes(res, 200, { ok: true, cardPosted: card.cardPosted, status: card.status, reason: card.reason });
+  } catch (error) {
+    logger.warn(
+      `[project-import] awaiting-project card failed chat=${snapshot.chatId} root=${snapshot.rootMessageId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return jsonRes(res, 502, { ok: false, error: 'card_publish_failed' });
+  }
+});
+
+/** Host-only metadata notification. It may queue a turn but cannot mint a new
+ * coordinator session or grant access to any source transcript. */
 ipcRoute('POST', '/api/project-import/deliver', async (req, res) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   const body = await readJsonBody<Record<string, unknown>>(req, 16 * 1024).catch(() => undefined);
-  const notification = body?.notification as { id?: string; operationId?: string; projectGeneration?: string; coordinatorAppId?: string; snapshot?: import('../services/project-import-notifications.js').ProjectImportSnapshot } | undefined;
-  const snapshot = notification?.snapshot;
+  const notification = body?.notification as ProjectImportWireNotification | undefined;
   const target = body?.target as { sessionId?: string; larkAppId?: string; chatId?: string; scope?: string } | undefined;
   const key = body?.idempotencyKey;
-  if (!snapshot || !notification?.id || !notification.operationId || !target?.sessionId
-    || target.larkAppId !== cachedLarkAppId || typeof key !== 'string' || key.length > 200
-    || notification.coordinatorAppId !== cachedLarkAppId
-    || notification.operationId !== projectImportOperationId(snapshot)
-    || notification.id !== createHash('sha256').update(notification.operationId).digest('hex')) {
+  if (!validProjectImportNotification(notification) || !target?.sessionId
+    || target.larkAppId !== cachedLarkAppId || typeof key !== 'string' || key.length > 200) {
     return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target', preDispatch: true });
   }
+  const snapshot = notification.snapshot;
   const expectedKey = `project-import:${notification.id}:${createHash('sha256').update(target.sessionId).digest('hex').slice(0, 24)}`;
   if (key !== expectedKey) return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target', preDispatch: true });
   const ds = findActiveBySessionId(target.sessionId);
@@ -3917,25 +3957,18 @@ ipcRoute('POST', '/api/project-import/deliver', async (req, res) => {
       || mode.coordinatorAppId !== cachedLarkAppId || !mode.workerAppIds?.includes(snapshot.larkAppId)) {
       throw new Error('policy_disabled');
     }
-    if (project) {
-      if (project.createdAt !== notification.projectGeneration
-        && notification.projectGeneration !== UNINITIALIZED_PROJECT_GENERATION) {
-        throw new Error('policy_disabled');
-      }
-      if (!ds || findActiveBySessionId(target.sessionId!) !== ds || ds.session.status !== 'active'
-        || ds.scope !== 'chat' || ds.chatId !== snapshot.chatId || ds.session.vcMeetingReceiver
-        || project.coordinatorSessionId !== target.sessionId || project.larkAppId !== ds.larkAppId) {
-        throw new Error('coordinator_unavailable');
-      }
-    } else {
-      if (notification.projectGeneration !== UNINITIALIZED_PROJECT_GENERATION) {
-        throw new Error('policy_disabled');
-      }
-      if (!ds || findActiveBySessionId(target.sessionId!) !== ds || ds.session.status !== 'active'
-        || ds.scope !== 'chat' || ds.chatId !== snapshot.chatId || ds.larkAppId !== cachedLarkAppId
-        || ds.session.vcMeetingReceiver) {
-        throw new Error('coordinator_unavailable');
-      }
+    // A notice is only ever delivered to the human-established coordinator of
+    // an initialized project. A record queued while the group was still
+    // uninitialized carries the placeholder generation and is accepted by
+    // whichever project a human initializes later.
+    if (!project || (project.createdAt !== notification.projectGeneration
+      && notification.projectGeneration !== UNINITIALIZED_PROJECT_GENERATION)) {
+      throw new Error('policy_disabled');
+    }
+    if (!ds || findActiveBySessionId(target.sessionId!) !== ds || ds.session.status !== 'active'
+      || ds.scope !== 'chat' || ds.chatId !== snapshot.chatId || ds.session.vcMeetingReceiver
+      || project.coordinatorSessionId !== target.sessionId || project.larkAppId !== ds.larkAppId) {
+      throw new Error('coordinator_unavailable');
     }
     // Cross-bot session-store reads are read-only and intentionally narrow.
     // Recheck the committed physical source immediately before claiming or
@@ -3947,39 +3980,19 @@ ipcRoute('POST', '/api/project-import/deliver', async (req, res) => {
       || source.projectImportSource !== snapshot.source || source.workflowNode || source.vcMeetingReceiver
       || source.messageListenerRun || source.deferredScheduleRun) throw new Error('source_changed');
   };
-  let rawSource: Awaited<ReturnType<typeof getProjectAttachmentSource>>;
   try {
     fence();
-    rawSource = await getProjectAttachmentSource(snapshot.larkAppId, snapshot.sessionId);
-    const current = projectImportSnapshotFromSource(rawSource);
+    const current = projectImportSnapshotFromSource(await getProjectAttachmentSource(snapshot.larkAppId, snapshot.sessionId));
     if (!current || !current.ordinary || current.status !== 'active' || current.chatType !== 'group'
       || current.scope !== 'thread' || JSON.stringify(current) !== JSON.stringify(snapshot)) throw new Error('source_changed');
     fence();
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: ipcErrorText(error), preDispatch: true });
   }
-  if (ds && !ds.session.ownerOpenId && !ds.session.ownerUnionId && rawSource?.ownerKey?.startsWith('union:')) {
-    const sourceUnionId = rawSource.ownerKey.slice('union:'.length);
-    const persistedSource = sessionStore.getSession(snapshot.sessionId);
-    const openIdOnCoord = snapshot.larkAppId === cachedLarkAppId
-      ? persistedSource?.ownerOpenId
-      : await resolveHumanOpenIdOnApp(cachedLarkAppId, sourceUnionId);
-    const coordBot = getBot(cachedLarkAppId);
-    const adminUnions = readBotAdminUnions(config.session.dataDir, cachedLarkAppId, coordBot?.config.allowedUsers)?.admins;
-    if (canHumanOperateBot(cachedLarkAppId, openIdOnCoord) || adminUnions?.has(sourceUnionId)) {
-      ds.session.ownerUnionId = sourceUnionId;
-      if (openIdOnCoord && canHumanOperateBot(cachedLarkAppId, openIdOnCoord)) {
-        ds.session.ownerOpenId = openIdOnCoord;
-        ds.session.lastCallerOpenId ??= openIdOnCoord;
-      }
-      try { sessionStore.updateSession(ds.session); } catch { /* ignore */ }
-    }
-  }
-  const liveProject = readProjectGroup(config.session.dataDir, snapshot.chatId);
-  const projectInitialized = !!liveProject;
-  const noticeInstruction = projectInitialized
-    ? 'An existing session arrived in this project (a host card has been posted in its topic). This is a silent metadata-only notice turn: do NOT call `botmux send` or speak in chat. In this notice turn, run `botmux project workstream inspect --root <rootMessageId> --source-app <sourceLarkAppId> --source-session <sourceSessionId>`; when the session belongs to the same project owner, run `botmux project workstream attach --root <rootMessageId> --source-app <sourceLarkAppId> --source-session <sourceSessionId> --title "<24字内具体标题>"` (if `--title` is omitted, `attach` synthesizes a concrete <=24-char title from the session summary; you may also refine it immediately via `botmux project workstream rename --root <rootMessageId> --title "<24字内新标题>"`). Both the pinned project card and the topic migration card refresh automatically. If `attach` reports `source_owner_unknown` or `source_owner_authorization_required`, leave it for the human to confirm on the topic card and do not create a new task automatically.'
-    : '本群处于项目群协作模式，但**本群尚未初始化项目**（`project_not_found`），已有迁入会话进入话题（宿主已在话题内发出「项目未初始化，已通知主控」卡片）。本轮是静默通知回合（不要调 `botmux send` 在群里发言）：请先执行 `botmux project init --title "<项目名>" --goal "<项目目标>"` 完成项目初始化（与真人在群里首次发言触发初始化一致），再依次执行 `botmux project workstream inspect --root <rootMessageId> --source-app <sourceLarkAppId> --source-session <sourceSessionId>`、`botmux project workstream attach --root <rootMessageId> --source-app <sourceLarkAppId> --source-session <sourceSessionId> --title "<24字内具体标题>"`（需要时可再 `botmux project workstream rename --root <rootMessageId> --title "<24字内新标题>"`）；置顶项目卡与话题迁入卡会自动更新。若 `attach` 返回 `source_owner_unknown` 或 `source_owner_authorization_required`，留给真人在迁入卡上确认认领即可。';
+  // The notice never establishes or changes any owner: the coordinator acts as
+  // its own human-established session owner, so only same-owner sources can be
+  // attached here; everything else waits for a human on the topic card.
+  const noticeInstruction = 'An existing session arrived in this project (a host card has been posted in its topic). This is a silent metadata-only notice turn: do NOT call `botmux send` or speak in chat. In this notice turn, run `botmux project workstream inspect --root <rootMessageId> --source-app <sourceLarkAppId> --source-session <sourceSessionId>`; when the session belongs to the same project owner, run `botmux project workstream attach --root <rootMessageId> --source-app <sourceLarkAppId> --source-session <sourceSessionId> --title "<24字内具体标题>"` (if `--title` is omitted, `attach` synthesizes a concrete <=24-char title from the session summary; you may also refine it immediately via `botmux project workstream rename --root <rootMessageId> --title "<24字内新标题>"`). Both the pinned project card and the topic migration card refresh automatically. If `attach` reports `source_owner_unknown` or `source_owner_authorization_required`, leave it for the human to confirm on the topic card and do not create a new task automatically.';
   let dispatched = false;
   let preDispatchError: string | undefined;
   const turnLeaseKey = `${target.sessionId}\u0000${key}`;
@@ -3991,8 +4004,6 @@ ipcRoute('POST', '/api/project-import/deliver', async (req, res) => {
       envelope: { format: 'project-import/v1', sourceName: '项目会话迁入', trusted: false, payload: {
         sourceSessionId: snapshot.sessionId, sourceLarkAppId: snapshot.larkAppId,
         rootMessageId: snapshot.rootMessageId, source: snapshot.source, routeRevision: snapshot.routeRevision,
-        projectInitialized,
-        ...(!projectInitialized ? { projectStatus: 'project_not_found', notice: '本群尚未初始化项目' } : {}),
       } },
       instruction: noticeInstruction,
       presentation: { thinking: 'hidden', topicMessage: null },

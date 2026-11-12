@@ -113,7 +113,7 @@ function formatSessionLine(input: ProjectImportCardCommon): string {
 function formatUnattachedReason(reason: ProjectImportUnattachedReason): string {
   switch (reason) {
     case 'project_uninitialized':
-      return '项目未初始化，已通知主控：本群处于项目群协作模式但尚未创建项目记录，已自动通知主控先执行 `botmux project init` 初始化项目并登记看板。';
+      return '本群处于项目模式，但还没有初始化项目，暂时无法登记看板。请项目负责人在群里 @主控 说明项目目标完成初始化；初始化后本卡片会刷新，主控也会收到这次迁入的通知。';
     case 'source_owner_unknown':
       return '源会话缺少主人身份记录（`source_owner_unknown`），主控无法在静默回合自动核验归属；需本人点击下方「确认登记」认领该会话并纳入项目看板。';
     case 'pending_confirmation':
@@ -168,7 +168,7 @@ export function buildProjectImportCard(input: ProjectImportCardInput): Record<st
   }
 
   const headerTitle = input.reason === 'project_uninitialized'
-    ? '项目会话迁入 · 项目未初始化，已通知主控'
+    ? '项目会话迁入 · 等待项目初始化'
     : input.canConfirm
       ? '项目会话迁入 · 待确认登记'
       : '项目会话迁入 · 尚未登记看板';

@@ -135,6 +135,26 @@ describe('localClaimOwnerlessProjectSource owner-boundary denial matrix', () => 
     expect(updateSession).not.toHaveBeenCalled();
   });
 
+  // A human-turn `attach --claim-owner` claims before the attachment service
+  // checks `ordinary`, so this is the only backend gate that keeps dedicated
+  // workflow / meeting / listener / scheduled sessions from being re-owned.
+  it.each([
+    ['workflow node', () => { workerSession.workflowNode = { runId: 'wf-run', nodeId: 'node-a' }; }],
+    ['meeting receiver', () => { workerSession.vcMeetingReceiver = { meetingId: 'vc-1' }; }],
+    ['message listener run', () => { workerSession.messageListenerRun = { listenerId: 'listener-1' }; }],
+    ['deferred schedule run', () => { workerSession.deferredScheduleRun = { scheduleId: 'sch-1' }; }],
+    ['pending repo setup', () => { workerSession.pendingRepoSetup = true; }],
+    ['live pending repo selection', () => { workerDs.pendingRepo = { cardMessageId: 'om_repo_card' }; }],
+  ])('refuses to claim a managed %s session (source_managed_elsewhere) and leaves it ownerless', async (_kind, mark) => {
+    mark();
+    const result = await localClaimOwnerlessProjectSource(baseInput());
+    expect(result).toEqual({ ok: false, error: 'source_managed_elsewhere' });
+    expect(workerSession.ownerUnionId).toBeUndefined();
+    expect(workerSession.ownerOpenId).toBeUndefined();
+    expect(workerDs.ownerOpenId).toBeUndefined();
+    expect(updateSession).not.toHaveBeenCalled();
+  });
+
   it('rejects a claim carrying a stale route revision (source_route_mismatch) without persisting an owner', async () => {
     const result = await localClaimOwnerlessProjectSource({
       ...baseInput(),

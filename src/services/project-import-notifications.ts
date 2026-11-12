@@ -86,6 +86,12 @@ export interface ProjectImportNotificationDeps {
   /** Required to retarget a previously attempted notification safely. Without
    * a definitive not_delivered result, a successor must not get a second copy. */
   reconcileDelivery?(notification: ProjectImportNotification): Promise<'delivered' | 'not_delivered' | 'unknown'>;
+  /** Uninitialized project group with notifications on: no coordinator exists and
+   * none is created for an import. The host may post a visible waiting card in
+   * the imported topic; the notification itself stays pending until a human
+   * initializes the project. Failures are ignored (best-effort, retried with
+   * the pending record). */
+  onAwaitingProject?(notification: ProjectImportNotification): Promise<void>;
   now?(): number;
   leaseMs?: number;
   log?(message: string): void;
@@ -345,7 +351,15 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
           return { record: current, result: structuredClone(current) };
         });
       }
-      if (!candidate) throw new NotificationFenceError('coordinator_unavailable', false);
+      if (!candidate) {
+        const latest = deps.getPolicy(record.snapshot.chatId);
+        if (!record.delivery && latest && !latest.projectExists
+          && latest.projectGeneration === UNINITIALIZED_PROJECT_GENERATION) {
+          await deps.onAwaitingProject?.(structuredClone(record)).catch(() => undefined);
+          throw new NotificationFenceError('project_uninitialized', false);
+        }
+        throw new NotificationFenceError('coordinator_unavailable', false);
+      }
       if (!record.delivery) {
         record = mutateRecord(id, current => {
           if (!current || current.state !== 'pending' || current.lease?.token !== token) {

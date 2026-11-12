@@ -113,9 +113,15 @@ describe('committed project import marker', () => {
     expect(source.projectImportPending).toBe(false);
   });
 
-  it('marks uninitialized project-mode groups with a valid coordinator and allowed worker so import wakes project bootstrap', () => {
+  it('governs an uninitialized project-mode group by the same opt-in switch (default off)', () => {
     mocks.readProject.mockReturnValue(undefined);
-    mocks.readMode.mockReturnValue({ ...mode, importedSessionPolicy: 'ignore' });
+    for (const policy of [undefined, 'ignore' as const]) {
+      mocks.readMode.mockReturnValue({ ...mode, importedSessionPolicy: policy });
+      const off = session({ projectImportPending: true });
+      markProjectImportPending(off);
+      expect(off.projectImportPending).toBe(false);
+    }
+    mocks.readMode.mockReturnValue(mode);
     const source = session();
     markProjectImportPending(source);
     expect(source.projectImportPending).toBe(true);

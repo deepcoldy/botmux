@@ -22,6 +22,7 @@ import { effectiveProjectImportPolicy } from '../core/project-session-associatio
 
 export const PROJECT_IMPORT_DELIVER_ROUTE = '/api/project-import/deliver';
 export const PROJECT_IMPORT_COORDINATORS_ROUTE = '/api/project-workstream/coordinators';
+export const PROJECT_IMPORT_AWAITING_PROJECT_ROUTE = '/api/project-import/awaiting-project';
 
 export type ProjectImportRuntimeSource = ProjectAttachmentSource & { chatType?: 'group' | 'p2p' };
 
@@ -53,8 +54,6 @@ export interface ProjectImportRuntimeDeps {
   /** The local daemon may have the exact coordinator in memory. This is not a
    * fallback to another arbitrary chat session. */
   localCoordinator(sessionId: string): ProjectImportCoordinator | undefined;
-  /** Optional local resolver/bootstrapper for an uninitialized project group's chat coordinator. */
-  localUninitializedCoordinator?(chatId: string, appId: string): Promise<ProjectImportCoordinator | undefined> | ProjectImportCoordinator | undefined;
   findDaemon(appId: string): { ipcPort: number } | undefined;
   fetchIpc(port: number, path: string, init?: RequestInit): Promise<Response>;
   now?(): number;
@@ -115,26 +114,20 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
   async function coordinators(chatId: string, appId: string): Promise<ProjectImportCoordinator[]> {
     const project = deps.getProject(chatId);
     const mode = deps.getMode(chatId);
-    if (mode?.mode !== 'project' || mode.coordinatorAppId !== appId) return [];
-    if (project && project.larkAppId !== appId) return [];
-    if (project) {
-      const local = deps.localCoordinator(project.coordinatorSessionId);
-      if (local) return local.larkAppId === appId && local.chatId === chatId
-        && local.sessionId === project.coordinatorSessionId && local.scope === 'chat'
-        && local.status === 'active' ? [local] : [];
-    } else if (deps.localUninitializedCoordinator) {
-      const local = await deps.localUninitializedCoordinator(chatId, appId);
-      if (local) return local.larkAppId === appId && local.chatId === chatId
-        && local.scope === 'chat' && local.status === 'active' ? [local] : [];
-    }
+    // An uninitialized project group has no coordinator to notify yet, and an
+    // import never creates one: delivery waits for a human `project init`.
+    if (!project || mode?.mode !== 'project' || mode.coordinatorAppId !== appId
+      || project.larkAppId !== appId) return [];
+    const local = deps.localCoordinator(project.coordinatorSessionId);
+    if (local) return local.larkAppId === appId && local.chatId === chatId
+      && local.sessionId === project.coordinatorSessionId && local.scope === 'chat'
+      && local.status === 'active' ? [local] : [];
     const daemon = deps.findDaemon(appId);
     if (!daemon) return [];
     try {
       const response = await deps.fetchIpc(daemon.ipcPort, PROJECT_IMPORT_COORDINATORS_ROUTE, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(project
-          ? { chatId, coordinatorLarkAppId: appId, coordinatorSessionId: project.coordinatorSessionId }
-          : { chatId, coordinatorLarkAppId: appId, ensureUninitializedCoordinator: true }),
+        body: JSON.stringify({ chatId, coordinatorLarkAppId: appId, coordinatorSessionId: project.coordinatorSessionId }),
         signal: AbortSignal.timeout(5_000),
       });
       if (!response.ok) return [];
@@ -143,9 +136,7 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
       // Never let an old/faulty peer select a different session or destination.
       return body.coordinators.filter((c): c is ProjectImportCoordinator => !!c
         && typeof c === 'object' && !Array.isArray(c)
-        && typeof c.sessionId === 'string' && ID.test(c.sessionId)
-        && (!project || c.sessionId === project.coordinatorSessionId)
-        && c.larkAppId === appId
+        && c.sessionId === project.coordinatorSessionId && c.larkAppId === appId
         && c.chatId === chatId && c.scope === 'chat' && c.status === 'active')
         .map(c => ({ sessionId: c.sessionId, larkAppId: c.larkAppId, chatId: c.chatId, scope: c.scope, status: c.status }));
     } catch { return []; }
@@ -169,6 +160,15 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
     dataDir: deps.dataDir, now: deps.now, log: deps.log,
     getPolicy: policy, getCurrent: current, getCoordinator: coordinators,
     reconcileDelivery: registration,
+    onAwaitingProject: async notification => {
+      const daemon = deps.findDaemon(notification.coordinatorAppId);
+      if (!daemon) return;
+      await deps.fetchIpc(daemon.ipcPort, PROJECT_IMPORT_AWAITING_PROJECT_ROUTE, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ notification }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    },
     deliver: async (notification, input) => {
       await input.beforeDeliver();
       const daemon = deps.findDaemon(input.target.larkAppId);

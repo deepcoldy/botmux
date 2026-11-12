@@ -1047,6 +1047,7 @@ function collaborationModeSignature(
   coordinatorAppId: string,
   workerAppIds: Iterable<string>,
   autoEnrollWorkers: boolean,
+  importNotify: boolean,
   progressCard: ProjectProgressCardConfig,
 ): string {
   return JSON.stringify({
@@ -1054,6 +1055,7 @@ function collaborationModeSignature(
     coordinatorAppId: mode === 'project' ? coordinatorAppId : '',
     workerAppIds: mode === 'project' ? [...workerAppIds].sort() : [],
     autoEnrollWorkers: mode === 'project' ? autoEnrollWorkers : false,
+    importNotify: mode === 'project' ? importNotify : false,
     progressCard: mode === 'project' ? progressCard : null,
   });
 }
@@ -1086,6 +1088,9 @@ export function ProjectGroupModeSection(props: {
   const [autoEnrollWorkers, setAutoEnrollWorkers] = useState(
     chat.collaborationMode === 'project' ? chat.projectAutoEnrollWorkers === true : true,
   );
+  const [importNotify, setImportNotify] = useState(
+    chat.collaborationMode === 'project' && chat.projectImportNotify === true,
+  );
   const [progressCard, setProgressCard] = useState<ProjectProgressCardConfig>(
     () => chat.projectProgressCard ?? defaultProjectProgressCardConfig(),
   );
@@ -1093,10 +1098,12 @@ export function ProjectGroupModeSection(props: {
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' } | null>(null);
   const savedSignatureRef = useRef(collaborationModeSignature(
-    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard,
+    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, importNotify, progressCard,
   ));
 
-  const signature = collaborationModeSignature(mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard);
+  const signature = collaborationModeSignature(
+    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, importNotify, progressCard,
+  );
   const dirty = signature !== savedSignatureRef.current;
 
   function selectMode(nextMode: 'standard' | 'project'): void {
@@ -1146,16 +1153,21 @@ export function ProjectGroupModeSection(props: {
         chat.chatId,
         mode === 'standard'
           ? { mode }
-          : { mode, coordinatorAppId, workerAppIds: [...workerAppIds], autoEnrollWorkers, progressCard },
+          : {
+              mode, coordinatorAppId, workerAppIds: [...workerAppIds], autoEnrollWorkers,
+              importedSessionPolicy: importNotify ? 'notify' : 'ignore', progressCard,
+            },
       );
       const nextCoordinator = response.config.coordinatorAppId ?? coordinatorAppId;
       const nextWorkers = response.config.workerAppIds ?? [];
       const nextAutoEnrollWorkers = response.config.autoEnrollWorkers === true;
+      const nextImportNotify = response.config.importedSessionPolicy === 'notify';
       const nextProgressCard = response.config.progressCard ?? progressCard;
       setAutoEnrollWorkers(nextAutoEnrollWorkers);
+      setImportNotify(nextImportNotify);
       setProgressCard(nextProgressCard);
       savedSignatureRef.current = collaborationModeSignature(
-        response.config.mode, nextCoordinator, nextWorkers, nextAutoEnrollWorkers, nextProgressCard,
+        response.config.mode, nextCoordinator, nextWorkers, nextAutoEnrollWorkers, nextImportNotify, nextProgressCard,
       );
       setRuntime(response.project);
       setStatus(response.cardRefresh === 'deferred'
@@ -1252,6 +1264,22 @@ export function ProjectGroupModeSection(props: {
               <span className="checkbox-row-main">
                 <strong>{tr('groups.projectAutoEnrollWorkers')}</strong>
                 <small>{tr('groups.projectAutoEnrollWorkersHelp')}</small>
+              </span>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                data-project-import-notify={chat.chatId}
+                checked={importNotify}
+                disabled={props.disabled || saving}
+                onChange={event => {
+                  setImportNotify(event.currentTarget.checked);
+                  setStatus(null);
+                }}
+              />
+              <span className="checkbox-row-main">
+                <strong>{tr('groups.projectImportNotify')}</strong>
+                <small>{tr('groups.projectImportNotifyHelp')}</small>
               </span>
             </label>
           </div>

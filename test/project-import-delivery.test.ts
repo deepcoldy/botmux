@@ -12,10 +12,14 @@ import * as groups from '../src/services/groups-store.js';
 import * as client from '../src/im/lark/client.js';
 import { setIpcAuthSecret, setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
-import { writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
+import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
 import { mutateProjectGroup, readProjectGroup } from '../src/services/project-group-store.js';
 import { projectImportOperationId } from '../src/services/project-import-notifications.js';
-import { projectImportSnapshotFromSource } from '../src/services/project-import-runtime.js';
+import {
+  PROJECT_IMPORT_AWAITING_PROJECT_ROUTE,
+  PROJECT_IMPORT_COORDINATORS_ROUTE,
+  projectImportSnapshotFromSource,
+} from '../src/services/project-import-runtime.js';
 import { readTurnRegistration } from '../src/core/trigger-registration.js';
 import * as idempotency from '../src/services/idempotency-store.js';
 import { ProjectCoordinator, type ProjectCoordinatorTransport } from '../src/services/project-coordinator.js';
@@ -117,6 +121,14 @@ async function post(body = request(), host = true) {
     headers: host ? daemonIpcAuthHeaders({
       secret: 'synthetic-import-secret', port: handle.port, method: 'POST', path, headers,
     }) : headers,
+  });
+  return { status: response.status, body: await response.json() as Record<string, any> };
+}
+async function hostPost(path: string, body: unknown) {
+  const headers = new Headers({ 'content-type': 'application/json' });
+  const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+    method: 'POST', body: JSON.stringify(body),
+    headers: daemonIpcAuthHeaders({ secret: 'synthetic-import-secret', port: handle.port, method: 'POST', path, headers }),
   });
   return { status: response.status, body: await response.json() as Record<string, any> };
 }
@@ -362,70 +374,125 @@ describe('project import actual delivery endpoint with real trigger and durable 
     });
   });
 
-  it('delivers uninitialized project group import notice (even when importedSessionPolicy=ignore on disk), posts 项目未初始化 card, and lets coordinator run init -> inspect -> attach (auto-title <=24) -> rename in the same silent notice turn', async () => {
+  it('confines a notice turn to the notified source and to registration actions only', async () => {
+    const bot = registry.registerBot({ larkAppId: APP, larkAppSecret: 'synthetic-only', cliId: 'codex', allowedUsers: ['ou_owner'] });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.ownerUnionId = 'on_owner';
+    // Another same-owner thread in the same project group: a valid attach target
+    // for a human turn, but not the session this notice is about.
+    const other = { ...source, sessionId: 'source-other', rootMessageId: 'om_other_topic' };
+    const sourceById = async (_app: string, id: string) => structuredClone(id === other.sessionId ? other : source);
+    sourceLookup.mockImplementation(sourceById);
+    const coordinator = new ProjectCoordinator({
+      sendCard: vi.fn(async () => 'om_pinned_project_card'), updateCard: vi.fn(async () => {}),
+      pinMessage: vi.fn(async () => true), unpinMessage: vi.fn(async () => true),
+      resolveThreadId: vi.fn(async () => null), isMessageWithdrawn: () => false,
+      isMessageUpdateExpired: () => false, brand: () => 'feishu',
+    });
+    const service = createProjectWorkstreamAttachments({
+      dataDir, getSource: sourceById,
+      getProject: chatId => readProjectGroup(dataDir, chatId),
+      getMode: chatId => ({ chatId, mode: 'project', coordinatorAppId: APP, workerAppIds: [WORKER], importedSessionPolicy: 'notify' }),
+      projectRun: (ctx, action, beforeApply) => coordinator.run(ctx, action, beforeApply),
+      reportSecret: () => 'synthetic-report-secret', lookupRoot: async () => true,
+    });
+    for (const method of ['inspect', 'attach', 'rename', 'update', 'reconcile'] as const) {
+      vi.spyOn(sources.projectWorkstreamAttachments, method).mockImplementation(((actor: any, req: any) => (service as any)[method](actor, req)) as any);
+    }
+
+    let turnId = '';
+    send.mockImplementationOnce((target, _content, triggerId) => {
+      turnId = triggerId!;
+      const entry = target.idempotentAsyncTurns?.get(triggerId!);
+      if (entry) idempotency.recordTurnInputCommit({
+        ownerLarkAppId: APP, key: entry.key, sessionId: target.session.sessionId,
+        triggerId: triggerId!, ownerBootId: 'synthetic-import-boot', workerGeneration: 1, observedAt: Date.now(),
+      });
+      return true;
+    });
+    expect(await post()).toMatchObject({ status: 200, body: { delivered: true } });
+    expect(replyCardSpy).toHaveBeenCalledTimes(1);
+    const cap = 'ef'.repeat(32);
+    ds.managedTurnOrigin = { capability: cap, turnId, dispatchAttempt: 1 };
+    const cliPost = async (payload: Record<string, unknown>) => {
+      const r = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${ds.session.sessionId}/project-workstream`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...payload, originCapability: cap, originTurnId: turnId, originDispatchAttempt: 1 }),
+      });
+      return { status: r.status, body: await r.json() as Record<string, any> };
+    };
+    const notified = { sourceSessionId: source.sessionId, sourceLarkAppId: WORKER, rootMessageId: source.rootMessageId };
+    const otherIds = { sourceSessionId: other.sessionId, sourceLarkAppId: WORKER, rootMessageId: other.rootMessageId };
+    for (const payload of [
+      // Only the notified (root, app, session) is reachable from this turn.
+      { action: 'inspect', ...otherIds },
+      { action: 'attach', ...otherIds, title: '旁路登记' },
+      { action: 'confirm', ...otherIds },
+      { action: 'rename', rootMessageId: other.rootMessageId, title: '旁路改名' },
+      // Even naming the notified source, the turn cannot change policy, status or grants.
+      { action: 'notifications', mode: 'ignore', ...notified },
+      { action: 'update', status: 'in_progress', content: '通知回合改状态', ...notified },
+      { action: 'status', ...notified },
+      { action: 'grant', ...notified },
+    ]) {
+      expect(await cliPost(payload), JSON.stringify(payload)).toMatchObject({ status: 403, body: { ok: false, error: 'actor_nonhuman' } });
+    }
+    expect(readGroupCollaborationMode(dataDir, CHAT)?.importedSessionPolicy).toBe('notify');
+    expect(replyCardSpy).toHaveBeenCalledTimes(1);
+    expect(readProjectGroup(dataDir, CHAT)?.workstreams).toEqual([]);
+
+    // Positive control: the notified same-owner source does register from this turn.
+    expect(await cliPost({ action: 'attach', ...notified, title: '同主人自动登记' }))
+      .toMatchObject({ status: 200, body: { ok: true, result: { registered: true } } });
+    expect(readProjectGroup(dataDir, CHAT)?.workstreams.map(item => item.dispatchRoot)).toEqual([source.rootMessageId]);
+  });
+
+  it('never sets the coordinator owner from an import: an ownerless coordinator stays ownerless and cannot register', async () => {
+    const bot = registry.registerBot({ larkAppId: APP, larkAppSecret: 'synthetic-only', cliId: 'codex', allowedUsers: ['ou_owner'] });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    // The source owner can operate the coordinator bot and resolves on it, so the
+    // removed inference would have made them the coordinator owner.
+    vi.spyOn(client, 'resolveTargetAppOpenId').mockResolvedValue({ status: 'resolved', openId: 'ou_owner' });
+    const updateSession = vi.mocked(sessionStore.updateSession);
+    let turnId = '';
+    send.mockImplementationOnce((target, _content, triggerId) => {
+      turnId = triggerId!;
+      const entry = target.idempotentAsyncTurns?.get(triggerId!);
+      if (entry) idempotency.recordTurnInputCommit({
+        ownerLarkAppId: APP, key: entry.key, sessionId: target.session.sessionId,
+        triggerId: triggerId!, ownerBootId: 'synthetic-import-boot', workerGeneration: 1, observedAt: Date.now(),
+      });
+      return true;
+    });
+    expect(await post()).toMatchObject({ status: 200, body: { delivered: true } });
+    expect(ds.session.ownerOpenId).toBeUndefined();
+    expect(ds.session.ownerUnionId).toBeUndefined();
+    expect(updateSession).not.toHaveBeenCalledWith(expect.objectContaining({ sessionId: ds.session.sessionId, ownerUnionId: 'on_owner' }));
+    const cap = 'ab'.repeat(32);
+    ds.managedTurnOrigin = { capability: cap, turnId, dispatchAttempt: 1 };
+    const r = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${ds.session.sessionId}/project-workstream`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        action: 'attach', sourceSessionId: source.sessionId, sourceLarkAppId: WORKER, rootMessageId: source.rootMessageId,
+        title: '无主主控不应登记', originCapability: cap, originTurnId: turnId, originDispatchAttempt: 1,
+      }),
+    });
+    expect(r.status).toBe(403);
+    expect(await r.json()).toMatchObject({ ok: false, error: 'project_coordinator_owner_required' });
+  });
+
+  it('uninitialized opted-in group: host posts only a waiting card (no coordinator session, turn or owner), then a human init lets the same notice reach the human coordinator', async () => {
     const bot = registry.registerBot({
-      larkAppId: APP, larkAppSecret: 'synthetic-only', cliId: 'codex',
-      allowedUsers: ['ou_owner'], defaultWorkingDir: '/tmp',
+      larkAppId: APP, larkAppSecret: 'synthetic-only', cliId: 'codex', allowedUsers: ['ou_owner'], defaultWorkingDir: '/tmp',
     });
     bot.resolvedAllowedUsers = ['ou_owner'];
     registry.registerBot({
-      larkAppId: WORKER, larkAppSecret: 'synthetic-worker', cliId: 'claude-code', name: 'WorkerBot',
-      allowedUsers: ['ou_owner'],
+      larkAppId: WORKER, larkAppSecret: 'synthetic-worker', cliId: 'claude-code', name: 'WorkerBot', allowedUsers: ['ou_owner'],
     });
-    vi.spyOn(client, 'resolveTargetAppOpenId').mockResolvedValue({ status: 'resolved', openId: 'ou_owner' });
-
-    // Simulate an uninitialized project group (`project-groups.json` has NO record for CHAT,
-    // and `group-collaboration-modes.json` has `importedSessionPolicy: 'ignore'` from Dashboard's default).
-    await mutateProjectGroup(dataDir, CHAT, () => undefined as any);
     rmSync(join(dataDir, 'project-groups.json'), { force: true });
-    await writeGroupCollaborationMode(dataDir, {
-      chatId: CHAT, mode: 'project', coordinatorAppId: APP, workerAppIds: [WORKER], importedSessionPolicy: 'ignore',
-    });
-
-    // Simulate no active coordinator session yet; `/api/project-workstream/coordinators` with
-    // `ensureUninitializedCoordinator: true` must bootstrap a dormant chat-scope session.
-    const activeMap = new Map<string, any>();
-    vi.mocked(pool.getActiveSessionsRegistry).mockReturnValue(activeMap);
-    vi.mocked(pool.findActiveBySessionId).mockImplementation(id => {
-      for (const entry of activeMap.values()) {
-        if (entry.session.sessionId === id) return entry;
-      }
-      return undefined;
-    });
-    vi.spyOn(sessionStore, 'createSession').mockImplementation((chatId, rootMessageId, title, chatType, scope) => ({
-      sessionId: 'bootstrapped-coord',
-      chatId,
-      rootMessageId,
-      title,
-      chatType,
-      scope,
-      status: 'active',
-      createdAt: new Date().toISOString(),
-      lastMessageAt: new Date().toISOString(),
-    } as any));
-
-    const coordPath = '/api/project-workstream/coordinators';
-    const coordHeaders = new Headers({ 'content-type': 'application/json' });
-    const coordRes = await fetch(`http://127.0.0.1:${handle.port}${coordPath}`, {
-      method: 'POST',
-      body: JSON.stringify({ chatId: CHAT, coordinatorLarkAppId: APP, ensureUninitializedCoordinator: true }),
-      headers: daemonIpcAuthHeaders({
-        secret: 'synthetic-import-secret', port: handle.port, method: 'POST', path: coordPath, headers: coordHeaders,
-      }),
-    });
-    expect(coordRes.status).toBe(200);
-    const coordJson = await coordRes.json() as { ok: boolean; coordinators: Array<{ sessionId: string; scope: string }> };
-    expect(coordJson).toMatchObject({
-      ok: true,
-      coordinators: [{ sessionId: 'bootstrapped-coord', scope: 'chat' }],
-    });
-    const bootstrappedDs = [...activeMap.values()][0]!;
-    bootstrappedDs.worker = { killed: false, send: vi.fn() };
-    bootstrappedDs.workerGeneration = 1;
-    bootstrappedDs.hasHistory = true;
-
-    // Source has a generic title ('新会话') + a concrete recentSummary so we also verify
-    // `inspect` summary extraction and `attach` <=24-char concrete auto-title fallback.
+    expect(readProjectGroup(dataDir, CHAT)).toBeUndefined();
+    const createSession = vi.spyOn(sessionStore, 'createSession');
     source = {
       ...source,
       sessionId: 'source-uninit-1',
@@ -436,44 +503,56 @@ describe('project import actual delivery endpoint with real trigger and durable 
       botName: 'WorkerBot',
       ownerKey: 'union:on_owner',
     };
-
-    let dispatchedTurnId = '';
-    let deliveredPrompt = '';
-    send.mockImplementationOnce((target, content, triggerId) => {
-      dispatchedTurnId = triggerId!;
-      deliveredPrompt = JSON.stringify(content);
-      const entry = target.idempotentAsyncTurns?.get(triggerId!);
-      if (entry) {
-        idempotency.recordTurnInputCommit({
-          ownerLarkAppId: APP, key: entry.key, sessionId: target.session.sessionId,
-          triggerId: triggerId!, ownerBootId: 'synthetic-import-boot', workerGeneration: 1, observedAt: Date.now(),
-        });
-      }
-      return true;
-    });
-    replyCardSpy.mockResolvedValueOnce('om_uninit_topic_card');
-
     const snapshot = projectImportSnapshotFromSource(source)!;
     const operationId = projectImportOperationId(snapshot);
     const id = createHash('sha256').update(operationId).digest('hex');
-    const target = { sessionId: 'bootstrapped-coord', larkAppId: APP, chatId: CHAT, scope: 'chat' };
+    const notification = { id, operationId, projectGeneration: '__uninitialized__', coordinatorAppId: APP, snapshot };
+
+    // Off by default: the Dashboard default writes `ignore` and an uninitialized group follows it.
+    await writeGroupCollaborationMode(dataDir, {
+      chatId: CHAT, mode: 'project', coordinatorAppId: APP, workerAppIds: [WORKER], importedSessionPolicy: 'ignore',
+    });
+    expect(await hostPost(PROJECT_IMPORT_AWAITING_PROJECT_ROUTE, { notification }))
+      .toMatchObject({ status: 409, body: { ok: false, error: 'policy_disabled' } });
+    expect(replyCardSpy).not.toHaveBeenCalled();
+
+    await writeGroupCollaborationMode(dataDir, {
+      chatId: CHAT, mode: 'project', coordinatorAppId: APP, workerAppIds: [WORKER], importedSessionPolicy: 'notify',
+    });
+    replyCardSpy.mockResolvedValueOnce('om_uninit_topic_card');
+    expect(await hostPost(PROJECT_IMPORT_AWAITING_PROJECT_ROUTE, { notification }))
+      .toMatchObject({ status: 200, body: { ok: true, cardPosted: true, reason: 'project_uninitialized' } });
+    expect(replyCardSpy).toHaveBeenCalledTimes(1);
+    expect(replyCardSpy).toHaveBeenCalledWith(APP, 'om_uninit_topic', expect.any(String), 'interactive', true);
+    const waitingCard = String(replyCardSpy.mock.calls[0]?.[2] ?? '');
+    expect(waitingCard).toContain('等待项目初始化');
+    expect(waitingCard).not.toContain('project_import_confirm');
+    // An outbox retry keeps the same card instead of posting another one.
+    expect(await hostPost(PROJECT_IMPORT_AWAITING_PROJECT_ROUTE, { notification }))
+      .toMatchObject({ status: 200, body: { ok: true, cardPosted: false } });
+    expect(replyCardSpy).toHaveBeenCalledTimes(1);
+
+    // An import never mints a coordinator: the old bootstrap request is inert and
+    // a turn delivery is refused before dispatch while no project exists.
+    expect(await hostPost(PROJECT_IMPORT_COORDINATORS_ROUTE, {
+      chatId: CHAT, coordinatorLarkAppId: APP, ensureUninitializedCoordinator: true,
+    })).toMatchObject({ status: 200, body: { ok: true, coordinators: [] } });
+    const target = { sessionId: ds.session.sessionId, larkAppId: APP, chatId: CHAT, scope: 'chat' };
     const deliverBody = {
-      notification: { id, operationId, projectGeneration: '__uninitialized__', coordinatorAppId: APP, snapshot },
-      target,
+      notification, target,
       idempotencyKey: `project-import:${id}:${createHash('sha256').update(target.sessionId).digest('hex').slice(0, 24)}`,
     };
-    expect(await post(deliverBody)).toMatchObject({ status: 200, body: { delivered: true, unknown: false } });
-    expect(deliveredPrompt).toContain('本群尚未初始化项目');
-    expect(deliveredPrompt).toContain('project_not_found');
-    expect(bootstrappedDs.session.ownerUnionId).toBe('on_owner');
+    expect(await post(deliverBody as any)).toMatchObject({ status: 409, body: { ok: false, error: 'policy_disabled', preDispatch: true } });
+    expect(createSession).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(fork).not.toHaveBeenCalled();
+    expect(ds.session.ownerOpenId).toBeUndefined();
+    expect(ds.session.ownerUnionId).toBeUndefined();
 
-    // Visible topic migration card is published immediately with "项目未初始化，已通知主控".
-    expect(replyCardSpy).toHaveBeenCalledTimes(1);
-    const uninitCardJson = String(replyCardSpy.mock.calls[0]?.[2] ?? '');
-    expect(uninitCardJson).toContain('项目未初始化，已通知主控');
-
-    // Wire real ProjectCoordinator + ProjectWorkstreamAttachments to verify the full silent-turn flow:
-    // `project init` -> `inspect` -> `attach` (omitting --title!) -> `rename`.
+    // A human talks to the coordinator; that session carries the human's owner
+    // identity and initializes the project.
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.ownerUnionId = 'on_owner';
     const transport: ProjectCoordinatorTransport = {
       sendCard: vi.fn(async () => 'om_pinned_after_init'),
       updateCard: vi.fn(async () => {}),
@@ -488,12 +567,11 @@ describe('project import actual delivery endpoint with real trigger and durable 
     const projectRuntimeModule = await import('../src/services/project-coordinator-runtime.js');
     vi.spyOn(projectRuntimeModule.projectCoordinator, 'run').mockImplementation((ctx, action, beforeApply) =>
       coordinator.run(ctx, action, beforeApply));
-
     const service = createProjectWorkstreamAttachments({
       dataDir,
       getSource: async () => structuredClone(source),
       getProject: chatId => readProjectGroup(dataDir, chatId),
-      getMode: chatId => ({ chatId, mode: 'project', coordinatorAppId: APP, workerAppIds: [WORKER], importedSessionPolicy: 'ignore' }),
+      getMode: chatId => ({ chatId, mode: 'project', coordinatorAppId: APP, workerAppIds: [WORKER], importedSessionPolicy: 'notify' }),
       projectRun: (ctx, action, beforeApply) => coordinator.run(ctx, action, beforeApply),
       reportSecret: () => 'synthetic-report-secret',
       lookupRoot: async () => true,
@@ -502,46 +580,56 @@ describe('project import actual delivery endpoint with real trigger and durable 
     vi.spyOn(sources.projectWorkstreamAttachments, 'attach').mockImplementation((actor, req) => service.attach(actor, req));
     vi.spyOn(sources.projectWorkstreamAttachments, 'rename').mockImplementation((actor, req) => service.rename(actor, req));
 
-    const cap = 'ab'.repeat(32);
-    bootstrappedDs.managedTurnOrigin = { capability: cap, turnId: dispatchedTurnId, dispatchAttempt: 1 };
-
-    // Step 1: Coordinator runs `botmux project init` inside the silent import notice turn.
-    const initRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/bootstrapped-coord/project`, {
+    const humanCap = 'cd'.repeat(32);
+    ds.managedTurnOrigin = {
+      capability: humanCap, turnId: 'om_human_init', dispatchAttempt: 1,
+      trustedCaller: { requestLarkAppId: APP, requestUserOpenId: 'ou_owner', requestUserUnionId: 'on_owner', senderType: 'user' },
+    };
+    const initRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${ds.session.sessionId}/project`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        action: 'init',
-        title: '插件领域专项',
-        goal: '收敛宿主与插件类加载器边界问题',
-        originCapability: cap,
-        originTurnId: dispatchedTurnId,
-        originDispatchAttempt: 1,
+        action: 'init', title: '插件领域专项', goal: '收敛宿主与插件类加载器边界问题',
+        originCapability: humanCap, originTurnId: 'om_human_init', originDispatchAttempt: 1,
       }),
     });
     expect(initRes.status).toBe(200);
+    expect(readProjectGroup(dataDir, CHAT)?.coordinatorSessionId).toBe(ds.session.sessionId);
+    // The waiting card turns into a same-owner confirm card in place.
     expect(updateCardSpy).toHaveBeenCalledWith(APP, 'om_uninit_topic_card', expect.stringContaining('项目会话迁入 · 待确认登记'));
 
-    // Step 2: Coordinator runs `inspect` -> `attach` (WITHOUT `--title`) -> `rename` in the SAME silent notice turn!
-    const wsPath = '/api/sessions/bootstrapped-coord/project-workstream';
+    // The pending notice (still carrying the placeholder generation) now reaches
+    // the human coordinator; its silent turn inspects, attaches and renames.
+    let dispatchedTurnId = '';
+    let deliveredPrompt = '';
+    send.mockImplementationOnce((target, content, triggerId) => {
+      dispatchedTurnId = triggerId!;
+      deliveredPrompt = JSON.stringify(content);
+      const entry = target.idempotentAsyncTurns?.get(triggerId!);
+      if (entry) idempotency.recordTurnInputCommit({
+        ownerLarkAppId: APP, key: entry.key, sessionId: target.session.sessionId,
+        triggerId: triggerId!, ownerBootId: 'synthetic-import-boot', workerGeneration: 1, observedAt: Date.now(),
+      });
+      return true;
+    });
+    expect(await post(deliverBody as any)).toMatchObject({ status: 200, body: { delivered: true, unknown: false } });
+    expect(deliveredPrompt).not.toContain('project init');
+    expect(deliveredPrompt).not.toContain(source.recentSummary);
+    expect(createSession).not.toHaveBeenCalled();
+
+    const cap = 'ab'.repeat(32);
+    ds.managedTurnOrigin = { capability: cap, turnId: dispatchedTurnId, dispatchAttempt: 1 };
     const wsPost = async (payload: Record<string, unknown>) => {
-      const r = await fetch(`http://127.0.0.1:${handle.port}${wsPath}`, {
+      const r = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${ds.session.sessionId}/project-workstream`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          ...payload,
-          originCapability: cap,
-          originTurnId: dispatchedTurnId,
-          originDispatchAttempt: 1,
-        }),
+        body: JSON.stringify({ ...payload, originCapability: cap, originTurnId: dispatchedTurnId, originDispatchAttempt: 1 }),
       });
       return { status: r.status, body: await r.json() as Record<string, any> };
     };
 
     const inspected = await wsPost({
-      action: 'inspect',
-      sourceSessionId: source.sessionId,
-      sourceLarkAppId: WORKER,
-      rootMessageId: source.rootMessageId,
+      action: 'inspect', sourceSessionId: source.sessionId, sourceLarkAppId: WORKER, rootMessageId: source.rootMessageId,
     });
     expect(inspected.status).toBe(200);
     expect(inspected.body.result).toMatchObject({
@@ -553,10 +641,7 @@ describe('project import actual delivery endpoint with real trigger and durable 
     expect(['子任务', '子项目', '新会话']).not.toContain(inspected.body.result.suggestedTitle);
 
     const attached = await wsPost({
-      action: 'attach',
-      sourceSessionId: source.sessionId,
-      sourceLarkAppId: WORKER,
-      rootMessageId: source.rootMessageId,
+      action: 'attach', sourceSessionId: source.sessionId, sourceLarkAppId: WORKER, rootMessageId: source.rootMessageId,
     });
     expect(attached.status).toBe(200);
     const autoTitle = readProjectGroup(dataDir, CHAT)?.workstreams.find(w => w.dispatchRoot === 'om_uninit_topic')?.title ?? '';
@@ -565,11 +650,7 @@ describe('project import actual delivery endpoint with real trigger and durable 
     expect(autoTitle).toContain('排查插件领域宿主类加载器隔离异常');
     expect(updateCardSpy).toHaveBeenLastCalledWith(APP, 'om_uninit_topic_card', expect.stringContaining(autoTitle));
 
-    const renamed = await wsPost({
-      action: 'rename',
-      rootMessageId: source.rootMessageId,
-      title: '插件类加载器隔离排障',
-    });
+    const renamed = await wsPost({ action: 'rename', rootMessageId: source.rootMessageId, title: '插件类加载器隔离排障' });
     expect(renamed.status).toBe(200);
     expect(readProjectGroup(dataDir, CHAT)?.workstreams).toContainEqual(
       expect.objectContaining({ dispatchRoot: 'om_uninit_topic', title: '插件类加载器隔离排障' }),

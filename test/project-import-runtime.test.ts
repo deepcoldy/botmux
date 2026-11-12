@@ -6,6 +6,7 @@ import {
   createProjectImportRuntime,
   installProjectImportRuntime,
   projectImportRegistrationOutcome,
+  PROJECT_IMPORT_AWAITING_PROJECT_ROUTE,
   PROJECT_IMPORT_COORDINATORS_ROUTE,
   PROJECT_IMPORT_DELIVER_ROUTE,
   type ProjectImportRecoverableSession,
@@ -125,22 +126,45 @@ describe('project import runtime wiring', () => {
     },
   );
 
-  it('defaults to notify and bootstraps coordinator when group is in project mode without an initialized project', async () => {
+  it('keeps an uninitialized group silent while its import switch is off (the default)', async () => {
     const f = fixture();
     f.setProject(undefined);
     f.setMode({ ...f.mode(), importedSessionPolicy: 'ignore' });
-    expect(await f.runtime.tick()).toMatchObject({ recovered: 1, delivered: 1 });
+    expect(await f.runtime.tick()).toEqual({ recovered: 0, delivered: 0, pending: 0, cancelled: 0 });
+    expect(f.fetchIpc).not.toHaveBeenCalled();
+    expect(readdirSync(f.dataDir)).toEqual([]);
+    expect(f.markEnqueued).toHaveBeenCalledWith(f.sessions()[0], 'skipped');
+  });
+
+  it('opted-in uninitialized group: only asks for the waiting card, never looks up or creates a coordinator, and delivers after a human init', async () => {
+    const f = fixture();
+    const initialized = f.project();
+    f.setProject(undefined);
+    expect(await f.runtime.tick()).toMatchObject({ recovered: 1, delivered: 0, pending: 1, cancelled: 0 });
+    expect(f.fetchIpc.mock.calls.map(([, path]) => path)).toEqual([PROJECT_IMPORT_AWAITING_PROJECT_ROUTE]);
+    const awaiting = JSON.parse(String(f.fetchIpc.mock.calls[0]![2]?.body));
+    expect(awaiting.notification).toMatchObject({ projectGeneration: '__uninitialized__', coordinatorAppId: 'cli_main' });
+    expect(JSON.stringify(awaiting)).not.toContain(f.source().title);
     expect(f.markEnqueued).toHaveBeenCalledWith(f.sessions()[0], 'queued');
-    const coordCall = f.fetchIpc.mock.calls.find(([, path]) => path === PROJECT_IMPORT_COORDINATORS_ROUTE);
-    expect(coordCall).toBeDefined();
-    expect(JSON.parse(String(coordCall![2]?.body))).toEqual({
-      chatId: 'oc_project',
-      coordinatorLarkAppId: 'cli_main',
-      ensureUninitializedCoordinator: true,
+
+    // A failing card post is best-effort: the notice stays pending, still undelivered.
+    f.fetchIpc.mockClear();
+    f.fetchIpc.mockImplementationOnce(async () => { throw new Error('peer offline'); });
+    f.tick(10 * 60_000);
+    expect(await f.runtime.tick()).toMatchObject({ delivered: 0, pending: 1 });
+    expect(f.fetchIpc.mock.calls.map(([, path]) => path)).toEqual([PROJECT_IMPORT_AWAITING_PROJECT_ROUTE]);
+
+    // A human initializes the project: the same pending notice now goes to that human-established coordinator.
+    f.setProject(initialized);
+    f.fetchIpc.mockClear();
+    f.tick(10 * 60_000);
+    expect(await f.runtime.tick()).toMatchObject({ delivered: 1, pending: 0 });
+    const paths = f.fetchIpc.mock.calls.map(([, path]) => path);
+    expect(paths).not.toContain(PROJECT_IMPORT_AWAITING_PROJECT_ROUTE);
+    const deliver = f.fetchIpc.mock.calls.find(([, path]) => path === PROJECT_IMPORT_DELIVER_ROUTE);
+    expect(JSON.parse(String(deliver![2]?.body))).toMatchObject({
+      target: { sessionId: 'main_one' }, notification: { projectGeneration: '__uninitialized__' },
     });
-    const deliverCall = f.fetchIpc.mock.calls.find(([, path]) => path === PROJECT_IMPORT_DELIVER_ROUTE);
-    expect(deliverCall).toBeDefined();
-    expect(JSON.parse(String(deliverCall![2]?.body)).notification.projectGeneration).toBe('__uninitialized__');
   });
 
   it('does not rediscover arbitrary historical imports without a pending marker', async () => {

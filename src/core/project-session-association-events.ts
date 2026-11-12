@@ -4,23 +4,22 @@ import { readGroupCollaborationMode, type GroupCollaborationModeConfig } from '.
 import { readProjectGroup, type ProjectGroupState } from '../services/project-group-store.js';
 
 /**
- * Effective import notification policy for a chat:
+ * Effective import notification policy for a chat. `importedSessionPolicy` is
+ * the single group-level switch (default `'ignore'`, Dashboard → 群组 → 项目模式):
  * - Initialized project (`project` exists and matches `mode.coordinatorAppId`):
- *   respects `mode.importedSessionPolicy` (`'notify'` vs `'ignore'`).
+ *   `'notify'` wakes the coordinator with a metadata-only notice turn.
  * - Uninitialized project group (`mode.mode === 'project'` with no `project` yet):
- *   defaults to `'notify'` so `/relay` or `/adopt` wakes the coordinator to initialize
- *   the project just like a human's first message in the group.
+ *   the same switch still governs. When on, the host only posts a waiting card in
+ *   the imported topic and keeps the notification pending until a human
+ *   initializes the project; no coordinator session is created for it.
+ * - A project owned by another coordinator app never notifies.
  */
 export function effectiveProjectImportPolicy(
   mode: GroupCollaborationModeConfig | undefined,
   project: ProjectGroupState | undefined,
 ): 'ignore' | 'notify' {
-  if (mode?.mode !== 'project' || !mode.coordinatorAppId) return 'ignore';
-  if (project) {
-    return project.larkAppId === mode.coordinatorAppId && mode.importedSessionPolicy === 'notify'
-      ? 'notify'
-      : 'ignore';
-  }
+  if (mode?.mode !== 'project' || !mode.coordinatorAppId || mode.importedSessionPolicy !== 'notify') return 'ignore';
+  if (project && project.larkAppId !== mode.coordinatorAppId) return 'ignore';
   return 'notify';
 }
 
