@@ -18,7 +18,6 @@ import { parseApiMessage } from './message-parser.js';
 import { chatAppLink } from './lark-hosts.js';
 import type { CardActionData } from './card-handler.js';
 import { extractLarkBusinessCode, LARK_CODE_FORWARD_RESTRICTED } from './lark-errors.js';
-import { TopicSendError } from '../../cli/topic-send-guard.js';
 
 export function buildOncallGroupColumn(options: { href?: string; status?: string; joinGroup?: boolean; disabled?: boolean; retryForward?: boolean; handoffStatus?: string; confirmText?: string } = {}): Record<string, any> {
   return { tag: 'column', element_id: 'botmux_oncall_group_column', width: 'auto', direction: 'horizontal',
@@ -128,6 +127,10 @@ export function reconcileOncallReplyCard(appId: string, messageId: string, card:
   }));
 }
 
+/** Cards that already received the invitation as a reply because they cannot be
+ * updated. In memory: after a restart one more reply is harmless. */
+const oncallInviteReplies = new Set<string>();
+
 export async function handleOncallGroupAction(data: CardActionData, appId: string): Promise<any> {
   const store = new OncallGroupStore(config.session.dataDir);
   let source: OncallGroupSource | undefined;
@@ -136,6 +139,10 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
     if (!source || (data.context?.open_chat_id && data.context.open_chat_id !== source.chatId)
       || !data.operator?.open_id?.startsWith('ou_') || store.getRequest(source)?.status !== 'succeeded') {
       return oncallError(new Error('人工群入口已失效，请从原结果卡进入'));
+    }
+    const replyKey = JSON.stringify([config.session.dataDir, appId, source.messageId]);
+    if (oncallInviteReplies.has(replyKey) && store.getRequest(source)?.inviteLink) {
+      return { toast: { type: 'info', content: '入群邀请已回复在本卡下方，请点击该链接进入人工群' } };
     }
     try {
       await prepareOncallGroupInvite(source);
@@ -148,7 +155,14 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
           try {
             await refreshOncallSessionCard(source, { onExpired: messageId => { if (messageId === source.messageId) replyWithLink = true; } });
           } finally {
-            if (replyWithLink) await replyMessage(appId, source.messageId, `人工 Oncall 群入群邀请：${store.getRequest(source)!.inviteLink}`, 'text', true);
+            const link = store.getRequest(source)?.inviteLink;
+            // The in-flight dedupe ends at ACK, so repeated or concurrent clicks reach here.
+            if (replyWithLink && link && !oncallInviteReplies.has(replyKey)) {
+              if (oncallInviteReplies.size >= 10_000) oncallInviteReplies.clear();
+              oncallInviteReplies.add(replyKey);
+              try { await replyMessage(appId, source.messageId, `人工 Oncall 群入群邀请：${link}`, 'text', true); }
+              catch (error) { oncallInviteReplies.delete(replyKey); throw error; }
+            }
           }
         },
       };
@@ -475,13 +489,13 @@ export async function prepareOncallGroupInvite(source: OncallGroupSource): Promi
   });
 }
 
-/** Cards that can never be updated again: withdrawn, blocked under the stop
- * topic policy, or past Lark's edit window. */
+/** Cards that can never be updated again: withdrawn (also as recorded by the
+ * reply-card store, or blocked under the stop topic policy) or past Lark's edit window. */
 function oncallCardUnchangeable(error: unknown): 'expired' | 'gone' | undefined {
   if (!(error instanceof Error)) return undefined;
   if (error.name === 'MessageUpdateExpiredError') return 'expired';
-  if (error.name === 'MessageWithdrawnError') return 'gone';
-  return error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED' ? 'gone' : undefined;
+  if (error.name === 'MessageWithdrawnError' || error.name === 'ReplyCardWithdrawnError') return 'gone';
+  return error.name === 'TopicSendError' && (error as { code?: string }).code === 'TOPIC_SEND_BLOCKED' ? 'gone' : undefined;
 }
 
 export async function refreshOncallSessionCard(source: OncallGroupSource, options: {
@@ -668,6 +682,8 @@ export async function forwardOncallConversation(source: OncallGroupSource, owns:
 
 const ONCALL_HANDOFF_WINDOW_MS = 24 * 60 * 60_000;
 const ONCALL_REPAIR_RETRY_MAX_MS = 30 * 60_000;
+/** A late bot join gives no other signal in a no-forwarding handoff. */
+const ONCALL_ACTIVE_REPAIR_RETRY_MAX_MS = 2 * 60_000;
 interface OncallRepairRetry { failures: number; nextAtMs: number; state: string }
 /** Per app, per created group: the request state at the last failed repair and
  * when the same state may be retried. In memory, so a restart retries once. */
@@ -710,8 +726,10 @@ export async function retryPendingOncallHandoffs(appId: string, owns: () => bool
     }
     if (inviteFailed || (refreshFailed && !handoffOpen)) {
       const failures = (retry?.failures ?? 0) + 1;
+      const maxWaitMs = handoffOpen && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId)
+        ? ONCALL_ACTIVE_REPAIR_RETRY_MAX_MS : ONCALL_REPAIR_RETRY_MAX_MS;
       retries.set(key, { failures, state: JSON.stringify(store.getRequest(source)),
-        nextAtMs: Date.now() + Math.min(ONCALL_REPAIR_RETRY_MAX_MS, 5_000 * 2 ** failures) });
+        nextAtMs: Date.now() + Math.min(maxWaitMs, 5_000 * 2 ** failures) });
     } else if (!waiting) retries.delete(key);
   }
 }

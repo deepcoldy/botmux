@@ -1,6 +1,6 @@
 import { loadOncallPresetOptions } from '../src/services/oncall-preset-options.js';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,6 +22,7 @@ import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { larkApiError } from '../src/im/lark/lark-errors.js';
 import { TopicSendError } from '../src/cli/topic-send-guard.js';
+import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 vi.mock('@larksuiteoapi/node-sdk', () => ({ DefaultCache: class {}, Client: class { request = mocks.identityRequest; } }));
 let dir: string; let fetcher: ReturnType<typeof vi.fn>;
 const source: OncallGroupSource = { appId: 'app', sessionId: 'session', chatId: 'oc_source', rootId: 'om_root', messageId: 'om_reply', questionId: 'om_question', answer: 'answer' };
@@ -685,10 +686,29 @@ describe('public entry to a created Oncall group', () => {
     expect(mocks.invite.mock.calls.length).toBeGreaterThan(before);
     expect(groups.getRequest(source)?.inviteLink).toContain('add_by_link');
   });
-  it('backs off the invitation with Oncall disabled too',async()=>{
+  it('backs off the invitation with Oncall disabled too, beyond the short in-window wait',async()=>{
     seedWithoutInvite();mocks.bot.config.oncallGroup.enabled=false;mocks.invite.mockRejectedValue(Error('share disabled'));
-    for(let i=0;i<12;i++) await retryPendingOncallHandoffs('app');
-    expect(mocks.invite.mock.calls.length).toBeLessThan(3);
+    const start=Date.now();const clock=vi.spyOn(Date,'now');const attempts:number[]=[];
+    try {
+      for(let ms=0;ms<=40*60_000;ms+=5_000){
+        clock.mockReturnValue(start+ms);const before=mocks.invite.mock.calls.length;
+        await retryPendingOncallHandoffs('app');
+        if(mocks.invite.mock.calls.length>before)attempts.push(ms);
+      }
+    } finally { clock.mockRestore(); }
+    const gaps=attempts.slice(1).map((at,i)=>at-attempts[i]);
+    expect(Math.max(...gaps)).toBeGreaterThan(5*60_000);
+  });
+  it('does not reply an empty invitation for a legacy record without a created group id',async()=>{
+    const groups=new OncallGroupStore(dir);
+    const legacy=join(dir,'oncall-groups','requests',`${createHash('sha256').update(JSON.stringify(['app',source.chatId,source.questionId])).digest('hex')}.json`);
+    mkdirSync(join(dir,'oncall-groups','requests'),{recursive:true});
+    writeFileSync(legacy,JSON.stringify({status:'succeeded',flowId:'f1'}));
+    expect(groups.getRequest(source)?.status).toBe('succeeded');
+    mocks.update.mockRejectedValue(Object.assign(Error('past the edit window'),{name:'MessageUpdateExpiredError'}));
+    const result=await handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app');
+    await result.afterAck?.();
+    expect(mocks.update).toHaveBeenCalled();expect(mocks.reply).not.toHaveBeenCalled();expect(mocks.invite).not.toHaveBeenCalled();
   });
   it('refreshes a pending card inside the window without checking membership when nothing is left to forward',async()=>{
     const groups=new OncallGroupStore(dir);
@@ -719,6 +739,63 @@ describe('public entry to a created Oncall group', () => {
     expect(link).toContain('add_by_link');
     expect(mocks.reply).toHaveBeenCalledWith('app','om_reply',expect.stringContaining(link),'text',true);
     expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+  });
+  it('replies the invitation once when an expired card is clicked again or by several people at once',async()=>{
+    const groups=seedWithoutInvite();groups.markCardsRefreshed(source,groups.getRequest(source)!);
+    mocks.update.mockRejectedValue(Object.assign(Error('past the edit window'),{name:'MessageUpdateExpiredError'}));
+    const click=()=>handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app');
+    const [one,two]=await Promise.all([click(),click()]);
+    await Promise.all([one.afterAck(),two.afterAck()]);
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    const again=await click();
+    expect(again.toast.type).toBe('info');expect(again.afterAck).toBeUndefined();
+    expect(mocks.reply).toHaveBeenCalledOnce();
+  });
+  it('replies again after a failed invitation reply',async()=>{
+    const groups=seedWithoutInvite();groups.markCardsRefreshed(source,groups.getRequest(source)!);
+    mocks.update.mockRejectedValue(Object.assign(Error('past the edit window'),{name:'MessageUpdateExpiredError'}));
+    mocks.reply.mockRejectedValueOnce(Error('reply unavailable'));
+    const click=()=>handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app');
+    await expect((await click()).afterAck()).rejects.toThrow();
+    await (await click()).afterAck();
+    expect(mocks.reply).toHaveBeenCalledTimes(2);
+  });
+  it('does not reply for an expired card in the session when another, updatable card was clicked',async()=>{
+    const groups=seedWithoutInvite();
+    groups.registerTurn('app','session','om_question_old');
+    groups.recordSource({...source,messageId:'om_reply_old',questionId:'om_question_old',cardJson:JSON.stringify({schema:'2.0',body:{elements:[]}})});
+    mocks.update.mockImplementation(async(_app:string,id:string)=>{ if(id==='om_reply_old') throw Object.assign(Error('past the edit window'),{name:'MessageUpdateExpiredError'}); });
+    await (await handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app')).afterAck();
+    expect(mocks.update.mock.calls.map(call=>call[1]).sort()).toEqual(['om_reply','om_reply_old']);
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+  });
+  it('shows the invitation within minutes of a late bot join while the handoff window is open',async()=>{
+    const groups=seedWithoutInvite();groups.markCardsRefreshed(source,groups.getRequest(source)!);
+    const start=Date.now();const joinedAt=start+1_300_000;const clock=vi.spyOn(Date,'now');
+    mocks.invite.mockImplementation(async()=>{ if(Date.now()<joinedAt) throw Error('bot not in group yet'); return 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created'; });
+    let shownAt:number|undefined;
+    try {
+      for(let ms=0;ms<=1_800_000&&shownAt===undefined;ms+=5_000){
+        clock.mockReturnValue(start+ms);await retryPendingOncallHandoffs('app');
+        if(groups.getRequest(source)?.inviteLink) shownAt=start+ms;
+      }
+    } finally { clock.mockRestore(); }
+    expect(shownAt).toBeDefined();
+    expect(shownAt!-joinedAt).toBeLessThanOrEqual(150_000);
+    expect(mocks.update).toHaveBeenCalled();
+  });
+  it('settles a reply card that the turn store has recorded as withdrawn',async()=>{
+    const groups=seedWithoutInvite();const published=groups.findSource('app',source.messageId)!;
+    const cards=new TurnReplyCardStore(dir);
+    const key={larkAppId:'app',sessionId:'session',turnId:source.questionId,dispatchAttempt:undefined};
+    await cards.prepare(key,{mode:'unified',chatId:'oc_source',rootId:'om_root'} as any);
+    const file=join(cards.directory,`${cards.id(key)}.json`);
+    writeFileSync(file,JSON.stringify({...JSON.parse(readFileSync(file,'utf8')),messageId:source.messageId,phase:'completed',finalText:'answer',finalDelivered:true,lastCard:'{}',withdrawn:true}));
+    await refreshOncallSessionCard(published);
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+    expect(groups.pendingHandoffs('app')).toEqual([]);
   });
   it('does not reply when the clicked card was updated, or was withdrawn meanwhile',async()=>{
     seedWithoutInvite();
