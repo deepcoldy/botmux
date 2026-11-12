@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution, sameRuntime, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity, type ExecutionRef,
@@ -2061,6 +2062,12 @@ function observeContractNativeSession(nativeSessionId: string): void {
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
+  if (msg.type === 'goal_update') {
+    const binding = workerSessionEventScope.contextBinding();
+    const context = workerSessionEventScope.envelope(binding ? { bindingId: binding.bindingId, runtime: binding.runtime } : undefined);
+    delete context.scope.execution;
+    return { ...msg, sessionContract: context };
+  }
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
   const captured = origin ?? workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
@@ -12364,6 +12371,49 @@ function currentHermesBridgeDbPath(): string {
   return hermesBridgeDbPath ?? resolveHermesStateDbPath();
 }
 
+let nativeGoalSourcePath: string | undefined;
+let nativeGoalSignature: string | undefined;
+let nativeGoalPendingSignature: string | undefined;
+let nativeGoalTimer: ReturnType<typeof setInterval> | undefined;
+let nativeGoalReadAt = 0;
+let nativeGoalGeneration = -1;
+let nativeGoalPhysicalId: string | undefined;
+let nativeGoalOrigin: { key: string; goalId?: string; turnId?: string; dispatchAttempt?: number } | undefined;
+function publishNativeGoal(goal: import('./services/native-goal-state.js').NativeGoalState | null): void {
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && (!binding?.runtime || binding.physicalId !== nativeGoalPhysicalId)) return;
+  const signature = createHash('sha256').update(JSON.stringify({ goal, generation: cliSpawnGeneration,
+    bindingId: binding?.bindingId, runtime: binding?.runtime })).digest('hex');
+  if (signature === nativeGoalSignature) return;
+  if (goal) {
+    const key = createHash('sha256').update(`${goal.createdAt}\0${goal.objective}`).digest('hex');
+    if (!nativeGoalOrigin || nativeGoalOrigin.key !== key || goal.goalId && nativeGoalOrigin.goalId && goal.goalId !== nativeGoalOrigin.goalId) {
+      nativeGoalOrigin = { key, goalId: goal.goalId, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
+    } else if (!nativeGoalOrigin.goalId && goal.goalId) nativeGoalOrigin.goalId = goal.goalId;
+  }
+  nativeGoalPendingSignature = signature;
+  const publish = () => send({ type: 'goal_update', goal, signature,
+    turnId: nativeGoalOrigin ? nativeGoalOrigin.turnId : currentBotmuxTurnId,
+    dispatchAttempt: nativeGoalOrigin ? nativeGoalOrigin.dispatchAttempt : currentBotmuxDispatchAttempt });
+  if (binding && workerSessionEventScope) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
+function observeNativeGoal(): void {
+  if (!structuredBridgeIs('traex') && !structuredBridgeIs('codex') || nativeGoalGeneration !== cliSpawnGeneration) {
+    nativeGoalSourcePath = undefined;
+    if (nativeGoalTimer) clearInterval(nativeGoalTimer);
+    nativeGoalTimer = undefined;
+    return;
+  }
+  const path = nativeGoalSourcePath;
+  if (!path || !backend || cliRestartInProgress) return;
+  if (Date.now() - nativeGoalReadAt < 2000) return;
+  nativeGoalReadAt = Date.now();
+  const nativeId = structuredBridgeIs('traex') ? traexSessionIdFromRolloutPath(path) : codexGenerationSessionIdFromRolloutPath(path);
+  const goal = nativeId ? readNativeGoalForRollout(path, nativeId) : undefined;
+  if (goal === undefined) return;
+  publishNativeGoal(goal);
+}
 function structuredBridgeIngestPath(
   path: string,
   offset: number,
@@ -12390,6 +12440,25 @@ function structuredBridgeIngestPath(
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
+    if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && (structuredBridgeIs('traex') || structuredBridgeIs('codex'))) {
+      nativeGoalSourcePath = path;
+      nativeGoalGeneration = cliSpawnGeneration;
+      nativeGoalSignature = undefined;
+      nativeGoalPendingSignature = undefined;
+      nativeGoalPhysicalId = workerSessionEventScope?.currentBinding()?.physicalId;
+      nativeGoalReadAt = 0;
+      const nativeId = structuredBridgeIs('traex') ? traexSessionIdFromRolloutPath(path) : codexGenerationSessionIdFromRolloutPath(path);
+      const currentGoal = nativeId ? readNativeGoalForRollout(path, nativeId) : undefined;
+      if (currentGoal !== undefined) result.latestGoal = currentGoal;
+      else if (result.latestGoal === undefined) result.latestGoal = readLatestNativeGoal(path, nativeId);
+      if (nativeGoalTimer) clearInterval(nativeGoalTimer);
+      nativeGoalTimer = setInterval(observeNativeGoal, 2000);
+      nativeGoalTimer.unref?.();
+    }
+    if (result.latestGoal !== undefined) {
+      publishNativeGoal(result.latestGoal);
+    }
+    if (nativeGoalSourcePath === path) observeNativeGoal();
     if (structuredBridgeIs('codex')) {
       // Codex resume can copy the whole conversation into a new generation
       // file; content-addressed ids let the queue dedup copied history across
@@ -36426,6 +36495,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       send({ type: 'prompt_cache_keepalive_result', injected: true });
       log('Prompt-cache keep-alive queued');
       void flushPendingInjections();
+      break;
+    }
+
+    case 'goal_update_ack': {
+      if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
       break;
     }
 

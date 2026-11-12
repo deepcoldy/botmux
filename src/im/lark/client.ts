@@ -1555,6 +1555,21 @@ export async function resolveCardKitId(larkAppId: string, messageId: string): Pr
   });
 }
 
+/** Sequenced whole-card updates prevent a delayed pre-restart frame overwriting a newer status. */
+export async function updateCardJson(larkAppId: string, cardId: string, messageId: string, content: string,
+  sequence: number, uuid: string, options?: OutboundMessageOptions): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardJson');
+  content = prepareLocalAddressContent(content, 'interactive', linkFieldContext(larkAppId));
+  return executeWithLarkGate(larkAppId, 'updateCardJson', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
+    const response = await getBotClient(larkAppId).cardkit.v1.card.update({
+      path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
+    });
+    if (response.code !== 0) throw larkApiError('update CardKit card', response);
+  });
+}
+
 /** Enable/finalize native CardKit streaming without replacing the whole card. */
 export async function updateCardStreamingSettings(
   larkAppId: string,

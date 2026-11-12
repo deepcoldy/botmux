@@ -3,7 +3,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   config: { topicUnavailablePolicy: 'stop' as 'stop' | 'legacy', apiOnly: false },
   request: vi.fn(), create: vi.fn(), reply: vi.fn(), patch: vi.fn(), forward: vi.fn(),
-  settings: vi.fn(), content: vi.fn(), element: vi.fn(), convert: vi.fn(), hook: vi.fn(),
+  settings: vi.fn(), content: vi.fn(), element: vi.fn(), cardUpdate: vi.fn(), convert: vi.fn(), hook: vi.fn(),
   reaction: vi.fn(), removeReaction: vi.fn(), pin: vi.fn(), unpin: vi.fn(),
 }));
 vi.mock('../src/bot-registry.js', () => ({
@@ -12,14 +12,14 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({ request: mocks.request,
     im: { v1: { message: { create: mocks.create, reply: mocks.reply, patch: mocks.patch, forward: mocks.forward },
       messageReaction: { create: mocks.reaction, delete: mocks.removeReaction }, pin: { create: mocks.pin, delete: mocks.unpin } } },
-    cardkit: { v1: { card: { settings: mocks.settings, idConvert: mocks.convert },
+    cardkit: { v1: { card: { settings: mocks.settings, idConvert: mocks.convert, update: mocks.cardUpdate },
       cardElement: { content: mocks.content, patch: mocks.element } } },
   }),
 }));
 vi.mock('../src/services/hook-runner.js', () => ({ emitHookEvent: mocks.hook }));
 import { sendMessage, replyMessage, updateMessage, forwardMessage, urgentMessage,
   updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
-  resolveCardKitId, MessageWithdrawnError, addReaction, removeReaction, pinMessage, unpinMessage } from '../src/im/lark/client.js';
+  resolveCardKitId, updateCardJson, MessageWithdrawnError, addReaction, removeReaction, pinMessage, unpinMessage } from '../src/im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError, type TopicMessageLookup } from '../src/cli/topic-send-guard.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
@@ -29,6 +29,7 @@ const operations = [
   ['whole card', () => updateMessage('app', 'om_card', '{}'), () => mocks.patch],
   ['forward', () => forwardMessage('app', 'om_card', 'oc_dest'), () => mocks.forward],
   ['CardKit conversion', () => resolveCardKitId('app', 'om_card'), () => mocks.convert],
+  ['CardKit whole update', () => updateCardJson('app', 'card', 'om_card', '{}', 1, 'one'), () => mocks.cardUpdate],
   ['CardKit settings', () => updateCardStreamingSettings('app', 'card', { messageId: 'om_card', streamingMode: true, sequence: 1, uuid: 'one' }), () => mocks.settings],
   ['CardKit content', () => updateCardStreamElementContent('app', 'card', 'body', 'text', 1, 'one', 'om_card'), () => mocks.content],
   ['CardKit element', () => patchCardStreamElement('app', 'card', 'body', { content: 'text' }, 1, 'one', 'om_card'), () => mocks.element],
@@ -45,7 +46,7 @@ beforeEach(() => {
     return { code: 0, data: { items: [{ message_id: id, deleted: id === 'om_root' && rootDeleted,
       ...(id === 'om_card' ? { root_id: 'om_root' } : {}) }] } };
   });
-  for (const mock of [mocks.create, mocks.reply, mocks.patch, mocks.forward, mocks.settings, mocks.content, mocks.element]) {
+  for (const mock of [mocks.create, mocks.reply, mocks.patch, mocks.forward, mocks.settings, mocks.content, mocks.element, mocks.cardUpdate]) {
     mock.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_sent' } });
   }
   mocks.convert.mockReset().mockResolvedValue({ code: 0, data: { card_id: 'card' } });

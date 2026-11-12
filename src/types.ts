@@ -543,6 +543,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  nativeGoalStatusCard?: import('./core/goal-status-card.js').GoalStatusCardRecord;
+  nativeGoalCardOrigin?: import('./core/goal-status-card.js').GoalStatusCardOrigin;
   sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
   sessionContractRevision?: number;
   sessionRuntimeContract?: import('./services/session-contract-store.js').SessionContractSnapshot;
@@ -2132,6 +2134,7 @@ export interface CodexAppEffortResult {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | { type: 'goal_update_ack'; signature: string }
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
@@ -2677,6 +2680,7 @@ export type WorkerToDaemonBase =
   /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
+  | { type: 'goal_update'; goal: import('./services/native-goal-state.js').NativeGoalState | null; turnId?: string; dispatchAttempt?: number; signature?: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** The main turn has ended but this many background tasks it launched are
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
