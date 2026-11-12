@@ -63,7 +63,18 @@ describe.sequential('browser connection recovery', () => {
   let broker: CodexBrowserBroker | undefined;
   afterEach(async () => { await broker?.close(); broker = undefined; });
 
-  it.each(['Browser is not available: 1', 'native pipe closed before response'])(
+  it('closes the service created by a failed plugin setup before retrying', async () => {
+    const f = fakeModules();
+    const close = vi.fn(async () => {});
+    f.modules.setupBrowserRuntime.mockRejectedValueOnce(new Error('plugin setup failed'));
+    broker = new CodexBrowserBroker({ sessionId: 'setup-cleanup', family: 'chrome', modules: { ...f.modules, close } });
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(false);
+    expect(close).toHaveBeenCalledOnce();
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(f.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['Browser is not available: 1', 'native pipe closed before response', 'Debugger unattached'])(
     'rediscovers after a cached browser disconnects: %s', async message => {
       const previousRuntime = (globalThis as any).nodeRepl;
       const stale = fakeModules();

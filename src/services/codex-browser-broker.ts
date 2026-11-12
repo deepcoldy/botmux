@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { findMissingAskEnv } from '../core/ask-args.js';
 import type { CodexBrowserFamily } from '../core/codex-browser-config.js';
 import { CodexBrowserAuthenticatedFetch } from './codex-browser-authenticated-fetch.js';
+import { CodexBrowserNodeService } from './codex-browser-node-service.js';
 
 type Json = Record<string, any>;
 
@@ -230,6 +231,8 @@ interface BrowserAgent {
 interface BrowserPluginModules {
   setupBrowserRuntime(): Promise<BrowserAgent>;
   handleRpc(request: { method: string; params?: unknown }): Promise<unknown>;
+  handleTurnEnded?(event: unknown): Promise<void>;
+  close?(): Promise<void>;
 }
 
 interface BrowserTurnEndedHandler {
@@ -622,15 +625,21 @@ async function connectNativePipe(path: string): Promise<Socket> {
 }
 
 async function loadBrowserPluginModules(root: string): Promise<BrowserPluginModules> {
-  const service = await import(pathToFileURL(join(root, 'scripts/browser-service.mjs')).href) as {
+  // The bundled service requires Node's WASI reactor API; Bun currently lacks
+  // getImportObject/initialize. Keep the public typed tool unchanged while
+  // hosting the trusted service in one owner-scoped Node process.
+  const nodeService = process.versions.bun
+    ? new CodexBrowserNodeService(root, () => (globalThis as Json).nodeRepl) : undefined;
+  const service = nodeService ?? await import(pathToFileURL(join(root, 'scripts/browser-service.mjs')).href) as {
     handleRpc(request: { method: string; params?: unknown }): Promise<unknown>;
   };
   const client = await import(pathToFileURL(join(root, 'scripts/browser-client.mjs')).href) as {
     setupBrowserRuntime(): Promise<BrowserAgent>;
   };
   return {
-    handleRpc: service.handleRpc,
+    handleRpc: nodeService ? request => nodeService.handleRpc(request) : service.handleRpc,
     setupBrowserRuntime: client.setupBrowserRuntime,
+    ...(nodeService ? { handleTurnEnded: (event: unknown) => nodeService.handleTurnEnded(event), close: () => nodeService.close() } : {}),
   };
 }
 
@@ -653,6 +662,7 @@ export class CodexBrowserBroker {
   private previousNodeRepl: unknown;
   private runtimeShim?: Json;
   private authenticatedFetch?: CodexBrowserAuthenticatedFetch;
+  private pluginModules?: BrowserPluginModules;
 
   constructor(private readonly opts: CodexBrowserBrokerOptions) {}
 
@@ -685,6 +695,9 @@ export class CodexBrowserBroker {
         timeoutMs,
       );
     }));
+    if (this.pluginModules?.handleTurnEnded) {
+      results.push(...await Promise.allSettled([withTimeout(this.pluginModules.handleTurnEnded(event), 4_000)]));
+    }
     const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (failure) throw failure.reason;
   }
@@ -703,13 +716,19 @@ export class CodexBrowserBroker {
       const message = error instanceof Error ? error.message : String(error);
       if (this.browser === browser && this.browserGeneration === generation
         // Error-text contract with the bundled Codex chrome plugin
-        // (scripts/browser-client.mjs): only these two prefixes prove the
+        // (scripts/browser-client.mjs) and the owner-scoped Node host: these prefixes prove the
         // binding/transport is dead. The match is anchored at message start, so
         // if the plugin ever wraps its errors with a leading context string,
         // invalidation silently stops — update both sides together.
-        && /^(?:Browser is not available:|native pipe closed before response\b)/i.test(message)) {
+        && /^(?:Browser is not available:|native pipe closed before response\b|Debugger unattached\b|Browser Node runtime (?:exited|is unavailable)\b)/i.test(message)) {
         // Rediscover on the next explicit call. Never replay an operation that
         // may have run, or discard a newer binding for an older call's error.
+        if (/^Browser Node runtime /i.test(message)) {
+          await this.pluginModules?.close?.();
+          this.pluginModules = undefined;
+          this.agent = undefined;
+          this.turnEndedHandlers.clear();
+        }
         this.browserGeneration++;
         this.browser = undefined;
         this.init = undefined;
@@ -1244,15 +1263,16 @@ export class CodexBrowserBroker {
       const modules = this.opts.modules ?? await loadBrowserPluginModules(
         resolveCodexBrowserPluginRoot(this.opts.pluginRoot),
       );
+      this.pluginModules = modules;
       if (!this.runtimeShim) {
         this.previousNodeRepl = (globalThis as Json).nodeRepl;
         const nodeRepl = this.createRuntimeShim();
         (globalThis as Json).nodeRepl = nodeRepl;
-        nodeRepl.rpc = async (name: string, request: { method: string; params?: unknown }) => {
-          if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);
-          return modules.handleRpc(request);
-        };
       }
+      this.runtimeShim!.rpc = async (name: string, request: { method: string; params?: unknown }) => {
+        if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);
+        return modules.handleRpc(request);
+      };
       if (metadata) this.updateTurnMetadata(metadata.threadId, metadata.turnId);
       const previousHandlers = new Set(this.turnEndedHandlers);
       try {
@@ -1263,6 +1283,8 @@ export class CodexBrowserBroker {
         for (const handler of this.turnEndedHandlers) {
           if (!previousHandlers.has(handler)) this.turnEndedHandlers.delete(handler);
         }
+        await modules.close?.();
+        if (this.pluginModules === modules) this.pluginModules = undefined;
         throw error;
       }
     }
@@ -1418,12 +1440,12 @@ export class CodexBrowserBroker {
   }
 
   /** Test/process cleanup; production runner teardown exits the process. */
-  close(): Promise<void> {
+  async close(): Promise<void> {
     this.turnEndedHandlers.clear();
     if ((globalThis as Json).nodeRepl === this.runtimeShim) {
       if (this.previousNodeRepl === undefined) delete (globalThis as Json).nodeRepl;
       else (globalThis as Json).nodeRepl = this.previousNodeRepl;
     }
-    return this.authenticatedFetch?.close() ?? Promise.resolve();
+    await Promise.all([this.pluginModules?.close?.(), this.authenticatedFetch?.close()]);
   }
 }
