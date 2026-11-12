@@ -63,7 +63,11 @@ afterEach(async () => {
 
 describe.skipIf(!runnable)('a message waking a suspended Claude session', () => {
   it('forwards the reply once when the ready gate falls back and a startup command runs first', async () => {
-    const h = setup({ turnMs: 800 });
+    // Claude's own pid-state record becomes readable only once the worker has
+    // bound the CLI's runtime, so the native session id first arrives with the
+    // write, after the resume was confirmed — the identity update this case is
+    // about. (Readable at the first binding, the id would already be there.)
+    const h = setup({ turnMs: 800, pidStateGated: true });
     const transcript = h.transcript(h.sessionId);
     // What the session answered before it was suspended.
     const ago = (ms: number) => new Date(Date.now() - 3_600_000 + ms).toISOString();
@@ -120,6 +124,9 @@ describe.skipIf(!runnable)('a message waking a suspended Claude session', () => 
     const g = h.startWorker(init as any);
     (ds as any).worker = g.child;
     workerPool.__testOnly_setupWorkerHandlers(ds, g.child as any, undefined, 1);
+    await g.waitFor(() => !!controller.store.runtime(controller.ref)?.identity, 'the CLI runtime to be bound', 60_000);
+    expect(controller.store.runtime(controller.ref)?.identity?.nativeSessionId).toBeUndefined();
+    writeFileSync(h.pidStateGate, '');
 
     const replies = () => sessionReply.mock.calls.map(args => String(args[1]));
     const wakeReplies = () => replies().filter(text => text.includes(`reply: ${WAKE_TEXT}`));

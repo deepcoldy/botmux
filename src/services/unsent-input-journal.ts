@@ -22,7 +22,7 @@
  * must never be replayed (see {@link isUnsentInputReplayable}).
  */
 import { mkdirSync, renameSync, rmSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 import type { PendingCliInput } from '../utils/pending-input-queue.js';
@@ -59,6 +59,18 @@ export function isUnsentInputReplayable(item: PendingCliInput): boolean {
     && !item.mojoLivePatch
     && typeof item.content === 'string'
     && item.content.length > 0;
+}
+
+/** The journal a worker of `sessionId` writes under its SESSION_DATA_DIR,
+ *  which the daemon sets to its own session data dir. Read by the daemon to
+ *  tell whether an exiting worker left inputs for a successor. */
+export function unsentInputJournalFile(dataDir: string, sessionId: string): string {
+  return join(dataDir, 'turn-marks', `${sessionId}.unsent.json`);
+}
+
+/** Saved inputs no worker has taken back yet. */
+export function hasUnsentInputs(path: string): boolean {
+  return (readUnsentInputFile(path)?.length ?? 0) > 0;
 }
 
 /** Save the replayable inputs (nothing to save removes any older file). */

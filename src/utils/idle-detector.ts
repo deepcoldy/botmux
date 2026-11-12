@@ -143,9 +143,23 @@ export class IdleDetector {
   private submitBusyDeadlineMs = 0;
   /** See CliAdapter.programStatusStartupIdleUntrusted. */
   private readonly programStatusStartupIdleUntrusted: boolean;
+  /** See CliAdapter.programStatusFollowsInputCycle. */
+  private readonly followsInputCycle: boolean;
+  /** See CliAdapter.programStatusYieldsToTranscriptTerminal. */
+  private readonly yieldsToTranscriptTerminal: boolean;
+  /** followsInputCycle: a botmux write cycle has begun on this process
+   *  (reset({ inputCycle: true })). Until then every report is ignored. */
+  private inputCycleStarted = false;
+  /** followsInputCycle: the current write cycle has not seen the CLI report
+   *  busy yet, so the screen decides and terminal reports are ignored. */
+  private awaitingCycleBusy = false;
+  /** The latest root report this process sent, whether or not it was acted on. */
+  private lastRootReport: ProgramStatusEvent | undefined;
 
   constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
     this.submitAwaitsBusy = cli.programStatusSubmitAwaitsBusy === true;
+    this.followsInputCycle = cli.programStatusFollowsInputCycle === true;
+    this.yieldsToTranscriptTerminal = cli.programStatusYieldsToTranscriptTerminal === true;
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
     this.staticBusyPattern = cli.staticBusyPattern;
@@ -356,7 +370,11 @@ export class IdleDetector {
     this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), quiescenceMs);
   }
 
-  reset(): void {
+  /** Start a new detection cycle. `inputCycle`: a botmux write is about to
+   *  reach the CLI (or a flush is about to try one); it also ends the startup
+   *  phase of `programStatusFollowsInputCycle`. */
+  reset(opts: { inputCycle?: boolean } = {}): void {
+    if (opts.inputCycle) this.inputCycleStarted = true;
     const keepAuthority = this.programStatusAuthority;
     this.isIdle = false;
     this.busyTransitionArmed = false;
@@ -383,6 +401,34 @@ export class IdleDetector {
       this.programStatusErrorMsg = undefined;
     }
     this.clearProgramStatusFallback();
+    if (this.followsInputCycle) {
+      // A cycle re-armed inside a turn OSC 7501 holds busy (input typed ahead,
+      // a deferred ready) stays with the CLI: its next terminal report covers
+      // it. So does a write that lands while the CLI's latest report, ignored
+      // until now (startup), says busy: neither CLI re-reports `working` for
+      // input queued behind work it is already doing (recorded: a first
+      // message during MCP boot gets only the turn's `done`). Otherwise the
+      // screen decides until the CLI reports busy again; an idle in between
+      // only acknowledges the previous result, and a command that starts no
+      // work (`/status`, `/rename`) reports nothing at all.
+      if (keepAuthority && hasBusyRecord) {
+        this.awaitingCycleBusy = false;
+        return;
+      }
+      this.dropProgramStatusState();
+      const latest = this.lastRootReport;
+      if (opts.inputCycle && (latest?.state === 'working' || latest?.state === 'blocked')) {
+        this.awaitingCycleBusy = false;
+        // Same record a live report would have made (blocked keeps its kind
+        // and message, so programStatusBlock() holds type-ahead).
+        this.programStatusRecords.set('', this.programStatusRecordFrom(latest));
+        this.programStatusAuthority = true;
+        this.applyProgramStatus();
+      } else {
+        this.awaitingCycleBusy = true;
+      }
+      return;
+    }
     if (keepAuthority) {
       this.programStatusAuthority = true;
       if (!hasBusyRecord && this.programStatusRecords.size === 0) {
@@ -441,6 +487,19 @@ export class IdleDetector {
     ) {
       return;
     }
+    if (event.id === undefined) this.lastRootReport = event;
+    const busyReport = event.state === 'working' || event.state === 'blocked';
+    if (this.followsInputCycle) {
+      // Before the first write the screen gates own readiness: Codex reports
+      // idle on its provisional composer (#3289), both CLIs report working
+      // while MCP servers boot although input is accepted, and a resumed
+      // TraeX reports idle in the very burst that draws its session-lock page.
+      if (!this.inputCycleStarted) return;
+      if (this.awaitingCycleBusy) {
+        if (!busyReport) return;
+        this.awaitingCycleBusy = false;
+      }
+    }
     this.programStatusLastAtMs = Date.now();
 
     if (event.state === 'clear') {
@@ -475,27 +534,7 @@ export class IdleDetector {
     if (id) {
       this.evictedBusyIds.delete(id);
     }
-    const kind = event.state === 'blocked' && event.kind && PROGRAM_STATUS_KINDS.has(event.kind)
-      ? event.kind as ProgramStatusBlock['kind']
-      : undefined;
-    const progress = (event.state === 'working' || event.state === 'blocked')
-      && typeof event.progress === 'number'
-      && Number.isInteger(event.progress)
-      && event.progress >= 0
-      && event.progress <= 100
-      ? event.progress
-      : undefined;
-    const app = typeof event.app === 'string' && PROGRAM_STATUS_APP.test(event.app)
-      ? event.app
-      : undefined;
-    this.programStatusRecords.set(id, {
-      state: event.state,
-      kind,
-      msg: typeof event.msg === 'string' ? sanitizeProgramStatusMsg(event.msg) : undefined,
-      progress,
-      app,
-      at: ++this.programStatusClock,
-    });
+    this.programStatusRecords.set(id, this.programStatusRecordFrom(event));
     if (event.state === 'working' || event.state === 'blocked') this.submitBusyDeadlineMs = 0;
     this.evictProgramStatusRecords();
     this.programStatusAuthority = true;
@@ -505,6 +544,12 @@ export class IdleDetector {
 
   programStatusActive(): boolean {
     return this.programStatusAuthority;
+  }
+
+  /** The latest root state this CLI process reported, including reports the
+   *  detector did not act on (before the first write cycle). */
+  lastProgramStatusReport(): ProgramStatusEvent['state'] | undefined {
+    return this.lastRootReport?.state;
   }
 
   /** OSC 7501 currently holds the session busy with a `working` record (a
@@ -522,6 +567,13 @@ export class IdleDetector {
   /** Milliseconds since the last accepted OSC 7501 report. */
   programStatusQuietMs(now: number = Date.now()): number {
     return this.programStatusLastAtMs === 0 ? Number.POSITIVE_INFINITY : now - this.programStatusLastAtMs;
+  }
+
+  /** OSC 7501 holds the session busy: a `working` or `blocked` record. The
+   *  same condition on which fireIdle() and adoptPromptReady() refuse to end
+   *  the turn — for a caller that would otherwise end it from the screen. */
+  programStatusHeldBusy(): boolean {
+    return this.programStatusAuthority && this.hasBusyProgramStatus();
   }
 
   /**
@@ -564,7 +616,13 @@ export class IdleDetector {
     if (this.isIdle) return;
     // A transcript Stop must not flush queued input into a permission or
     // question prompt that OSC 7501 still reports as working or blocked.
-    if (this.programStatusAuthority && this.hasBusyProgramStatus()) return;
+    if (this.programStatusAuthority && this.hasBusyProgramStatus()) {
+      // Opt-in: the transcript's exact terminal outranks a `working` that
+      // also covers work beyond the turn (an active goal), or whose closing
+      // report never arrived. Never a `blocked` record: a human gate.
+      if (!this.yieldsToTranscriptTerminal || this.hasBlockedProgramStatus()) return;
+      this.dropProgramStatusState();
+    }
     // Actual transcript completion proves the session initialized, even if
     // its loaded banner was omitted or the operator customized the footer.
     this.markStartupComplete();
@@ -689,6 +747,7 @@ export class IdleDetector {
   dispose(): void {
     this.clearTimer();
     this.clearProgramStatusFallback();
+    this.awaitingCycleBusy = false;
     this.programStatusAuthority = false;
     this.programStatusRecords.clear();
     this.evictedBusyIds.clear();
@@ -820,6 +879,13 @@ export class IdleDetector {
     return false;
   }
 
+  private hasBlockedProgramStatus(): boolean {
+    for (const rec of this.programStatusRecords.values()) {
+      if (rec.state === 'blocked') return true;
+    }
+    return false;
+  }
+
   private isTerminalProgramStatus(): boolean {
     if (this.hasBusyProgramStatus()) return false;
     const root = this.programStatusRecords.get('');
@@ -868,6 +934,32 @@ export class IdleDetector {
     return true;
   }
 
+  /** The validated table record for a non-`clear` report. */
+  private programStatusRecordFrom(event: ProgramStatusEvent): ProgramStatusRecord {
+    const state = event.state as ProgramStatusRecord['state'];
+    const kind = state === 'blocked' && event.kind && PROGRAM_STATUS_KINDS.has(event.kind)
+      ? event.kind as ProgramStatusBlock['kind']
+      : undefined;
+    const progress = (state === 'working' || state === 'blocked')
+      && typeof event.progress === 'number'
+      && Number.isInteger(event.progress)
+      && event.progress >= 0
+      && event.progress <= 100
+      ? event.progress
+      : undefined;
+    const app = typeof event.app === 'string' && PROGRAM_STATUS_APP.test(event.app)
+      ? event.app
+      : undefined;
+    return {
+      state,
+      kind,
+      msg: typeof event.msg === 'string' ? sanitizeProgramStatusMsg(event.msg) : undefined,
+      progress,
+      app,
+      at: ++this.programStatusClock,
+    };
+  }
+
   private applyProgramStatus(): void {
     let blocked: ProgramStatusRecord | undefined;
     let busy = this.hasBusyProgramStatus();
@@ -900,7 +992,13 @@ export class IdleDetector {
 
   private lockProgramStatusBusy(): void {
     this.clearTimer();
-    const wasIdle = this.isIdle;
+    // PTY output between the published idle edge and this report (a local /
+    // web-terminal input, or a report-less command the screen just settled)
+    // already cleared `isIdle`, while the one-shot busy edge stays armed.
+    // Taking OSC authority here must still emit that edge: once authoritative,
+    // the later painted Working row can no longer trip idleToBusyPattern in
+    // feed(), so without this the whole locally started turn reads as idle.
+    const wasIdle = this.isIdle || this.busyTransitionArmed;
     this.isIdle = false;
     this.busyTransitionArmed = false;
     if (wasIdle) this.busyCallback?.();
@@ -952,6 +1050,16 @@ export class IdleDetector {
       }
       this.programStatusRecords.delete(oldestId);
     }
+  }
+
+  /** Leave authority with an empty state table; the screen path owns idle. */
+  private dropProgramStatusState(): void {
+    this.programStatusAuthority = false;
+    this.programStatusRecords.clear();
+    this.evictedBusyIds.clear();
+    this.programStatusBlockInfo = null;
+    this.programStatusErrorMsg = undefined;
+    this.clearProgramStatusFallback();
   }
 
   private exitProgramStatusAuthority(): void {

@@ -1,8 +1,20 @@
 import type { CodexCleanupRelease } from './codex-cleanup-release.js';
 import { isAbsolute } from 'node:path';
 import type { Session } from '../types.js';
+import { getBot } from '../bot-registry.js';
+import { readGlobalConfig } from '../global-config.js';
 import { applySessionOwnerEnv } from '../utils/child-env.js';
 import { setCodexAppThreadArchived } from './codex-app-threads.js';
+
+export function codexCleanupArchiveEnabled(larkAppId: string | undefined): boolean {
+  if (larkAppId) {
+    try {
+      const override = getBot(larkAppId).config.archiveCodex;
+      if (typeof override === 'boolean') return override;
+    } catch { /* Unregistered historical rows retain the global policy. */ }
+  }
+  return readGlobalConfig().sessionCleanup?.archiveCodex === true;
+}
 
 export function ownedLocalCodex(session: Session): boolean {
   return (session.cliId === 'codex' || session.cliId === 'codex-app')

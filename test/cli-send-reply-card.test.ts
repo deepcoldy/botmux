@@ -8,6 +8,7 @@ import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { OncallGroupStore } from '../src/services/oncall-group-store.js';
+import { attachOncallGroupButton } from '../src/im/lark/oncall-group.js';
 import { projectGroupContextCard } from '../src/im/lark/group-context-card.js';
 import { setGroupContextSettings } from '../src/services/group-context-settings-store.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
@@ -30,8 +31,9 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'traex', timing: 'first', unified: true },
     { cliId: 'traex', timing: 'final', unified: true },
     { cliId: 'codex', timing: 'final', unified: true },
+    { cliId: 'codex', timing: 'final', unified: true, notify: true },
     { cliId: 'claude-code', timing: 'final', unified: false },
-  ])('keeps a bare send as progress and attaches Oncall to the final answer ($cliId/$timing/$unified)', async ({ cliId, timing, unified }) => {
+  ])('keeps a bare send as progress and attaches Oncall to the final answer ($cliId/$timing/$unified notify=$notify)', async ({ cliId, timing, unified, notify }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-kind-'));
     const dataDir = join(root, 'data');
     try {
@@ -48,7 +50,8 @@ describe('real CLI send into a running reply card', () => {
       } });
       const store = new TurnReplyCardStore(dataDir);
       if (unified) await store.prepare(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
-      const send = (kind?: string) => spawnSyncTsScript(fixture, ['send', '--no-mention',
+      const send = (kind?: string) => spawnSyncTsScript(fixture, ['send',
+        ...(kind === 'final' && notify ? ['--mention', 'ou_first:First', '--mention', 'ou_second:Second'] : ['--no-mention']),
         ...(kind ? ['--response-kind', kind] : []), 'A complete answer.'], {
         cwd: fileURLToPath(new URL('..', import.meta.url)),
         env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
@@ -58,7 +61,11 @@ describe('real CLI send into a running reply card', () => {
       });
       const unclassified = send();
       expect(unclassified.status, String(unclassified.stderr)).toBe(0);
-      expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
+      if (!unified || timing === 'first') expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
+      else {
+        expect(String(unclassified.stdout)).not.toContain('CAPTURE_REPLY=');
+        expect(String(unclassified.stdout)).toContain('"delivered":false');
+      }
       if (!unified) return;
       expect(store.read(key)).toMatchObject({ progress: ['A complete answer.'] });
       expect(store.read(key)?.finalCard).toBeUndefined();
@@ -67,9 +74,24 @@ describe('real CLI send into a running reply card', () => {
       await store.update(key, { kind: 'terminal', phase: 'completed' }, {
         beforeEffect: () => {}, isWithdrawn: () => false,
         send: async () => { throw new Error('terminal must reuse the published answer'); }, patch: async () => {},
-        render: record => buildTurnReplyCard(record, { showProcess: false, showToolResults: false, canStop: false }),
+        render: record => {
+          const raw = buildTurnReplyCard(record, { showProcess: false, showToolResults: false, canStop: false });
+          return notify ? attachOncallGroupButton(raw, { enabled: true, chatIds: ['oc_test'], button: { timing, minTurns: 1 } },
+            'oc_test', 'group', { appId: key.larkAppId, sessionId: key.sessionId, questionId: key.turnId, phase: 'final' }) : raw;
+        },
       });
       const record = store.read(key)!;
+      if (notify) {
+        const captures = String(final.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
+        expect(captures).toHaveLength(1);
+        expect(captures[0]).toContain('ou_first');
+        expect(captures[0]).toContain('ou_second');
+        expect(captures[0]).toContain('A complete answer.');
+        expect(record.phase).toBe('completed');
+        expect(record.messageId).toBeUndefined();
+        expect(record.externalFinal).toBe(true);
+        return;
+      }
       expect(record.finalDelivered).toBe(true);
       expect(record.finalSource).toBe('explicit');
       const card = JSON.parse(record.lastCard!);
@@ -78,6 +100,96 @@ describe('real CLI send into a running reply card', () => {
       expect(record.lastCard).toContain('oncall_group_create');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 35_000);
+
+  it.each([
+    { barrier: 'ready', visible: true },
+    { barrier: 'ready-hidden', visible: false },
+    { barrier: 'ready-legacy', visible: false },
+  ])('lets only a live native thinking display take over bare progress ($barrier)', ({ barrier, visible }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-native-visible-cli-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'fixture', cliId: 'codex', replyCardMode: 'unified', replyCardNativeCot: true }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'codex', larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root',
+        scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const store = new TurnReplyCardStore(dataDir);
+      store.prepareSync(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', 'Still checking the logs'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_DAEMON_IPC_PORT: '49501', BOTMUX_TEST_NATIVE_COT_BARRIER: barrier },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const stdout = String(result.stdout);
+      expect(stdout).toContain('CAPTURE_NATIVE_READY');
+      const record = store.read(key)!;
+      expect(record).toMatchObject({ nativeCotReady: true, progress: ['Still checking the logs'] });
+      if (visible) {
+        expect(stdout).not.toContain('CAPTURE_REPLY=');
+        expect(stdout).toContain('"delivered":false');
+        expect(record).toMatchObject({ nativeCotVisible: true });
+        expect(record.messageId).toBeUndefined();
+      } else {
+        expect(stdout.split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))).toHaveLength(1);
+        expect(record.nativeCotVisible).toBeUndefined();
+        expect(record.messageId).toBeTruthy();
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
+
+  it('marks only a final in this conversation as closing the turn, and completes a lost mark on retry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-external-final-cli-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'fixture', cliId: 'codex', replyCardMode: 'unified', replyCardNativeCot: true }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'codex', larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root',
+        scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const store = new TurnReplyCardStore(dataDir);
+      const topLevelTurn = key;
+      const notifyTurn = { ...key, turnId: 'om_turn_notify' };
+      for (const turn of [topLevelTurn, notifyTurn]) store.prepareSync(turn, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
+      const sendFinal = (turnId: string, ...args: string[]) => {
+        writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId }));
+        return spawnSyncTsScript(fixture, ['send', ...args, '--response-kind', 'final', 'Answer for everyone'], {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+            BOTMUX_DAEMON_IPC_PORT: '49501', BOTMUX_TEST_NATIVE_COT_BARRIER: 'ready' },
+          encoding: 'utf8', timeout: 30_000,
+        });
+      };
+      // A final posted at the group's top level leaves this topic without a closing message.
+      const elsewhere = sendFinal(topLevelTurn.turnId, '--no-mention', '--top-level');
+      expect(elsewhere.status, String(elsewhere.stderr)).toBe(0);
+      expect(String(elsewhere.stdout)).toContain('CAPTURE_REPLY=');
+      expect(store.read(topLevelTurn)?.externalFinal).toBeUndefined();
+      // A final that notifies others stays in this topic and closes the turn.
+      const first = sendFinal(notifyTurn.turnId, '--mention', 'ou_first:First');
+      expect(first.status, String(first.stderr)).toBe(0);
+      expect(String(first.stdout)).toContain('CAPTURE_REPLY=');
+      expect(store.read(notifyTurn)?.externalFinal).toBe(true);
+      // The mark is lost after delivery; the model retries the same final.
+      const notifyPath = join(store.directory, `${store.id(notifyTurn)}.json`);
+      const lost = JSON.parse(readFileSync(notifyPath, 'utf8'));
+      delete lost.externalFinal;
+      writeFileSync(notifyPath, JSON.stringify(lost));
+      const retry = sendFinal(notifyTurn.turnId, '--mention', 'ou_first:First');
+      expect(retry.status, String(retry.stderr)).toBe(0);
+      expect(String(retry.stdout)).toContain('"replayed":true');
+      expect(String(retry.stdout)).not.toContain('CAPTURE_REPLY=');
+      expect(store.read(notifyTurn)?.externalFinal).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 70_000);
 
   it.each(['ready', 'denied'])('waits for the native thinking barrier before its first answer (%s)', async barrier => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-native-order-cli-'));
@@ -123,7 +235,10 @@ describe('real CLI send into a running reply card', () => {
       sendArgs: ['--no-mention', '--top-level'],
       deliveryKind: 'detoured_send',
     },
-  ] as const)('records $name as exact empty-final reply evidence', ({ cliId, sendArgs, deliveryKind }) => {
+  ].flatMap(scenario => (['progress', 'final', 'auxiliary'] as const)
+    .map(responseKind => ({ ...scenario, responseKind }))))(
+    'records $name/$responseKind and only treats final as completed delivery',
+    ({ cliId, sendArgs, deliveryKind, responseKind }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-visible-reply-marker-'));
     const dataDir = join(root, 'data');
     const turnId = `om_${cliId}_visible_reply`;
@@ -152,7 +267,10 @@ describe('real CLI send into a running reply card', () => {
       } });
       const result = spawnSyncTsScript(
         fixture,
-        ['send', ...sendArgs, 'Visible result already delivered.'],
+        ['send', ...sendArgs,
+          // A bare send defaults to progress; it must not mask missing final delivery.
+          ...(responseKind === 'progress' ? [] : ['--response-kind', responseKind]),
+          'Visible result already delivered.'],
         {
           cwd: fileURLToPath(new URL('..', import.meta.url)),
           env: {
@@ -178,6 +296,7 @@ describe('real CLI send into a running reply card', () => {
         deliveryKind,
         targetChatId: 'oc_test',
         messageId: 'om_separate_message',
+        responseKind,
       });
       expect(shouldEmitEmptyCompletedBridgeFallback({
         sessionId: key.sessionId,
@@ -186,7 +305,7 @@ describe('real CLI send into a running reply card', () => {
         isLocal: false,
         finalText: '',
         terminalStatus: 'completed',
-      }, undefined, markers, false)).toBe(false);
+      }, undefined, markers, false)).toBe(responseKind !== 'final');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -997,7 +1116,9 @@ describe('session Oncall after the CLI turn lease retires', () => {
           BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: key.sessionId, BOTMUX_LARK_APP_ID: key.larkAppId }, encoding: 'utf8', timeout: 30_000 });
       expect(result.status, String(result.stderr)).toBe(0);
       const delivered = String(result.stdout).split('\n').find(line => line.startsWith('CAPTURE_REPLY='));
-      expect(delivered).toContain('oc_existing');
+      expect(delivered).toContain('oncall_group_join');
+      expect(delivered).not.toContain('oncall_group_create');
+      expect(store.getRequest(source)?.openChatId).toBe('oc_existing');
       expect(store.findSource(key.larkAppId, 'om_separate_message')?.questionId).toBe(key.turnId);
       store.recordSource(source); expect(store.latest(key.larkAppId, key.sessionId)?.messageId).toBe('om_separate_message');
     } finally { rmSync(root, { recursive: true, force: true }); }

@@ -17,6 +17,8 @@ import { WorkerSessionEventScope } from '../src/services/session-event-scope.js'
 import { admitSessionCommand } from '../src/services/session-command-gateway.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
+import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { unsettledReplyHoldUntil } from '../src/core/idle-worker-sweeper.js';
 import { logger } from '../src/utils/logger.js';
 import { t } from '../src/i18n/index.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -219,7 +221,12 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
       await bridge({ type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
         cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) });
     },
-    publishNativeSession: (nativeSessionId: string) => bridge({ type: 'cli_session_id', cliSessionId: nativeSessionId }) };
+    publishNativeSession: (nativeSessionId: string) => bridge({ type: 'cli_session_id', cliSessionId: nativeSessionId }),
+    /** Worker code a callback the spawn started runs (the flush typing the
+     *  opening turn, the transcript bridge). */
+    inSpawnContext: (work: () => void) => scope.run(binding, async () => { work(); await drain(); }, openingExecution),
+    /** A live screen callback: it runs under the binding current at the time. */
+    inCurrentBinding: (work: () => void) => scope.run(scope.currentBinding()!, async () => { work(); await drain(); }) };
 }
 
 const answers = (...turnIds: string[]) => turnIds.map(turnId => expect.stringContaining(`answer for ${turnId}`));
@@ -414,6 +421,117 @@ describe('turns around a semantic runtime rebind', () => {
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(s.replies()).toHaveLength(3);
     expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+});
+
+describe('the CLI input queue around a semantic runtime rebind', () => {
+  let ipc: IpcServerHandle | undefined;
+  beforeEach(() => { workerPool.__testOnly_setSuspendBackingVerifier(() => true); });
+  afterEach(async () => {
+    await ipc?.close(); ipc = undefined;
+    workerPool.__testOnly_setSuspendBackingVerifier();
+  });
+  const postSuspend = async (): Promise<unknown> => {
+    ipc ??= await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${ipc.port}/api/sessions/${SESSION}/suspend`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    return res.json();
+  };
+
+  // Production (2026-11-11): a message woke a dormant Claude session. The
+  // write of that message, its settlement and the transcript bridge kept the
+  // binding the spawn started them under; Claude's native session id, shown
+  // after the write, re-bound the runtime to the real CLI pid. The worker's
+  // "queue drained" report then carried the replaced runtime and was dropped,
+  // while its "writing the waking message" report had been admitted, and the
+  // worker reports a backlog only when it changes. A minute after the reply
+  // was out, the screen idle, `botmux suspend` answered "queued" and the
+  // suspend only ran when the next turn ended, twelve minutes later.
+  it('lets botmux suspend take the idle session at once after the write settled under the replaced binding', async () => {
+    const s = await startWorker();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => (id === SESSION ? s.ds : undefined));
+    // The flush starts typing the waking message: the CLI has not taken it yet.
+    s.ws.cliSubmissionInFlight = { item: { turnId: TURNS[0] }, generation: 1 };
+    const first = await s.writeOpeningTurn();
+    expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
+
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+
+    // The write settles in the flush that started it: the queue is drained.
+    await s.inSpawnContext(() => { s.ws.cliSubmissionInFlight = null; s.ws.publishCliInputBacklog(); });
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+    await vi.waitFor(() => expect(unsettledReplyHoldUntil(s.ds)).toBeUndefined());
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+    expect(s.ds.lastScreenStatus).toBe('idle');
+
+    expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(false);
+    expect(await postSuspend()).toEqual({ ok: true, sessionId: SESSION, suspended: true });
+    expect(s.ds.worker).toBeNull();
+    expect(s.ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  // The turn that was running when the runtime moved keeps reporting under the
+  // runtime it was submitted on. Its `working` frames must still reach the
+  // daemon: they are what keeps a suspend from cutting the turn off before
+  // its reply is out.
+  it('queues botmux suspend behind the turn that was running when the runtime moved, and its reply goes out', async () => {
+    const s = await startWorker();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => (id === SESSION ? s.ds : undefined));
+    s.ws.cliSubmissionInFlight = { item: { turnId: TURNS[0] }, generation: 1 };
+    const first = await s.writeOpeningTurn();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    // The write settles: the CLI took the turn and is working on it.
+    await s.inSpawnContext(() => {
+      s.ws.send({ type: 'screen_update', status: 'working', content: '', turnId: TURNS[0] });
+      s.ws.cliSubmissionInFlight = null; s.ws.publishCliInputBacklog();
+    });
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'working', content: 'spinner', turnId: TURNS[0] }));
+    expect(s.ds.lastScreenStatus).toBe('working');
+
+    const body = await postSuspend() as { suspended: boolean; reason: string; waitingFor: string[] };
+    expect(body).toMatchObject({ suspended: false, reason: 'deferred' });
+    expect(body.waitingFor).toContain('turn');
+    expect(s.ds.worker).not.toBeNull();
+
+    await s.answer(TURNS[0], first);
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+    await vi.waitFor(() => expect(s.ds.worker).toBeNull());
+    expect(s.replies()).toEqual(answers(TURNS[0]));
+  });
+
+  it('keeps a message the CLI has not taken protected across the rebind', async () => {
+    const s = await startWorker();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => (id === SESSION ? s.ds : undefined));
+    const first = await s.writeOpeningTurn();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(unsettledReplyHoldUntil(s.ds)).toBeUndefined());
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+
+    const worker = s.ds.worker;
+    // A follow-up waits in the worker's queue; the spawn-era flush reports it.
+    await s.inSpawnContext(() => { s.ws.pendingMessages.push({ turnId: TURNS[1], content: 'queued' }); s.ws.publishCliInputBacklog(); });
+    expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
+    expect(await postSuspend()).toEqual({
+      ok: true, sessionId: SESSION, suspended: false, reason: 'deferred', waitingFor: ['input'],
+    });
+    expect(s.ds.worker).toBe(worker);
+    expect(s.ds.pendingSuspendReason).toBe('manual_suspend');
+    // An idle edge before the CLI took it does not cash the suspend in.
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(s.ds.worker).toBe(worker);
+
+    // The CLI takes it: the queued suspend is cashed in on that report.
+    await s.inSpawnContext(() => { s.ws.pendingMessages.length = 0; s.ws.publishCliInputBacklog(); });
+    await vi.waitFor(() => expect(s.ds.worker).toBeNull());
+    expect(s.ds.pendingSuspendReason).toBeUndefined();
   });
 });
 

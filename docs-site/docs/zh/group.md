@@ -38,7 +38,7 @@ botmux 里有两种「会话群」，本页都会讲到：
 ### 群名和头像
 
 - **写了群名**：用你的群名，之后不会再改。
-- **不写群名**（只发 `/g`）：先用占位名「新会话 MM/DD HH:mm」。你在新群里发出第一条有内容的消息后，机器人会根据内容总结一个不超过 12 字的标题，自动改群名。
+- **不写群名**（只发 `/g`）：先用占位名「新会话 MM/DD HH:mm」。你在新群里发出第一条有内容的消息后，机器人会根据内容总结一个不超过 20 字的标题，自动改群名。
 - **头像**：默认是 botmux logo 加渐变底色（十种配色里按群固定选一种）。加 `--avatar name` 改用群名文字头像，`--avatar off` 保留飞书默认头像。
 
 ![群名文字头像示例](/img/group-name-avatar.png)
@@ -178,12 +178,12 @@ botmux 里有两种「会话群」，本页都会讲到：
 ```json
 {
   "sessionGroup": {
-    "naming": { "mode": "session-title", "maxLen": 12 }
+    "naming": { "mode": "session-title", "maxLen": 20 }
   }
 }
 ```
 
-`mode` 可选 `ai-summary` / `session-title` / `truncate`，`maxLen` 是标题最大字数（默认 12）。
+`mode` 可选 `ai-summary` / `session-title` / `truncate`，`maxLen` 是标题最大字数（默认 20）。
 
 几点说明：
 

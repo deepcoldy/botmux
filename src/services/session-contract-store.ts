@@ -9,6 +9,7 @@ import {
   type ContractSessionRef, type SessionContract, type RuntimeContract, type RuntimeIdentity, type RuntimeRef,
   type ExecutionContract, type ExecutionRef, type ControlOperation, type ControlKind, type ContractEvent,
   type ContractTransition, type ContractTransitionInput, type WorkerRef, type RuntimeExecutionContinuation, type RuntimeExecutionContinuationResult,
+  type RuntimeExecutionContinuationFailure,
 } from './session-contract.js';
 
 export class SessionContractConflict extends Error {
@@ -19,6 +20,7 @@ interface PlannedExecutionContinuation extends RuntimeExecutionContinuation {
   executionRuntime: RuntimeRef;
   worker: WorkerRef;
   status: 'planned' | 'approved' | 'rejected';
+  consumed?: true;
 }
 export interface SessionContractSnapshot {
   version: 2;
@@ -256,11 +258,14 @@ export class SessionContractStore {
   /** Continuation decisions are checkpointed authority, not an auxiliary
    * cache. Advance the version in the same transaction as the entity write. */
   private saveExecutionContinuation(ref: ContractSessionRef, bindingId: string, value: PlannedExecutionContinuation): void {
+    this.saveVersionedEntity(ref, 'execution_continuation', bindingId, value.status, value);
+  }
+  private saveVersionedEntity(ref: ContractSessionRef, kind: string, id: string, phase: string, value: unknown): void {
     this.transaction(() => {
-      const previous = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+      const previous = this.entity<unknown>(ref, kind, id);
       if (JSON.stringify(previous) === JSON.stringify(value)) return;
       const state = this.read(ref); if (!state) throw new Error('contract_session_missing');
-      this.saveEntity(ref, 'execution_continuation', bindingId, value.status, value);
+      this.saveEntity(ref, kind, id, phase, value);
       const updated = { ...state, revision: state.revision + 1 };
       const changed = this.db.prepare('UPDATE contracts SET revision=?,value=? WHERE session_key=? AND revision=?')
         .run(updated.revision, JSON.stringify(updated), sessionKey(ref), state.revision);
@@ -331,6 +336,7 @@ export class SessionContractStore {
       const older = (kind: string, keep: number, phases: string[]) => this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=? AND phase IN (${phases.map(() => '?').join(',')}) AND rowid NOT IN (SELECT rowid FROM entities WHERE session_key=? AND kind=? ORDER BY rowid DESC LIMIT ?)`)
         .run(key, kind, ...phases, key, kind, keep);
       older('execution', retention.executions, ['succeeded', 'failed', 'cancelled']);
+      older('continuation_failure_delivery', retention.executions, ['delivered']);
       older('operation', retention.operations, ['confirmed', 'failed_before_effect', 'rejected']);
       this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind='execution_observer'
         AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.session_key=entities.session_key AND x.kind='execution'
@@ -430,7 +436,7 @@ export class SessionContractStore {
     if (!plan || plan.status === 'rejected' || !target || !sameWorker(plan.worker, worker)
       || this.entity(ref, 'execution_continuation', bindingId)) return;
     const execution = this.execution(ref, plan.execution.executionId);
-    if (plan.status === 'approved' && execution?.phase !== 'accepted') return;
+    if (plan.status === 'approved' && (plan.consumed || execution?.phase !== 'accepted')) return;
     const rejected = target.identity?.nativeSessionId !== plan.nativeSessionId || !!execution?.terminal || !!execution?.cancelRequested;
     this.saveExecutionContinuation(ref, bindingId, {
       ...plan, ...(plan.status === 'planned' ? { target: target.ref } : {}), status: rejected ? 'rejected' : plan.status,
@@ -440,9 +446,58 @@ export class SessionContractStore {
     this.transaction(() => {
       const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
       const execution = plan && this.execution(ref, plan.execution.executionId);
-      if (!plan || plan.status === 'rejected' || (plan.status === 'approved' && execution?.phase !== 'accepted')) return;
+      if (!plan || plan.status === 'rejected' || (plan.status === 'approved' && execution?.phase !== 'accepted' && !execution?.terminal)) return;
       this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'rejected' });
     });
+  }
+  consumeExecutionContinuation(ref: ContractSessionRef, worker: WorkerRef, execution: ExecutionRef, runtime: RuntimeRef): void {
+    this.transaction(() => {
+      const rows = this.db.prepare("SELECT id,value FROM entities WHERE session_key=? AND kind='execution_continuation' AND phase='approved' AND json_extract(value,'$.execution.executionId')=?")
+        .all(sessionKey(ref), execution.executionId) as Array<{ id: string; value: string }>;
+      for (const row of rows) {
+        const plan = JSON.parse(row.value) as PlannedExecutionContinuation;
+        if (plan.consumed || !sameWorker(plan.worker, worker) || !sameExecution(plan.execution, execution)
+          || !sameRuntime(plan.target, runtime)) continue;
+        this.saveExecutionContinuation(ref, row.id, { ...plan, consumed: true });
+      }
+    });
+  }
+  executionContinuationFailureRuntime(ref: ContractSessionRef, worker: WorkerRef,
+    failure: RuntimeExecutionContinuationFailure, origin: RuntimeRef, errorCode: string): RuntimeRef | undefined {
+    const request = failure?.continuation;
+    if (typeof failure?.bindingId !== 'string' || !failure.bindingId || request?.reason !== 'traex-auto-model'
+      || !request.execution?.executionId || request.execution.dispatchAttempt !== undefined || !request.from?.runtimeId) return;
+    const state = this.read(ref);
+    const source = this.runtime(ref, request.from.runtimeId);
+    const execution = this.execution(ref, request.execution.executionId);
+    if (!sameWorker(state?.worker, worker) || !source || !sameWorker(source.worker, worker)
+      || !sameRuntime(source.ref, request.from) || source.identity?.proof !== 'process_start'
+      || !request.nativeSessionId || source.identity.nativeSessionId !== request.nativeSessionId
+      || !execution?.runtime || !sameExecution(execution.ref, request.execution)
+      || !this.authorizedProducer(ref, origin, worker)
+      || (execution.terminal && (execution.phase !== 'failed' || execution.terminal.errorCode !== errorCode))) return;
+    const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', failure.bindingId);
+    if (plan) {
+      if (plan.consumed || !this.bindingProducer(ref, failure.bindingId, worker) || !sameWorker(plan.worker, worker)
+        || !sameRuntime(plan.from, request.from) || !sameExecution(plan.execution, request.execution)
+        || plan.nativeSessionId !== request.nativeSessionId || !sameRuntime(origin, plan.executionRuntime)) return;
+      if (!sameRuntime(execution.runtime, plan.executionRuntime)
+        && (!sameRuntime(execution.runtime, plan.target)
+          || (!execution.terminal && (plan.status !== 'approved' || execution.phase !== 'accepted')))) return;
+    } else if (this.binding(ref, failure.bindingId) || !sameRuntime(execution.runtime, origin)
+      || (!sameRuntime(origin, request.from) && !this.continuedExecution(ref, origin, worker, execution.ref))) return;
+    return execution.runtime;
+  }
+  continuationFailureDelivered(ref: ContractSessionRef, execution: ExecutionRef, errorCode: string): boolean {
+    const receipt = this.entity<{ execution: ExecutionRef; errorCode: string }>(ref, 'continuation_failure_delivery', execution.executionId);
+    return !!receipt && sameExecution(receipt.execution, execution) && receipt.errorCode === errorCode;
+  }
+  confirmContinuationFailureDelivery(ref: ContractSessionRef, execution: ExecutionRef, errorCode: string): void {
+    const current = this.execution(ref, execution.executionId);
+    if (!sameExecution(current?.ref, execution) || current?.terminal?.status !== 'failed' || current.terminal.errorCode !== errorCode) {
+      throw new Error('execution_continuation_failure_unproven');
+    }
+    this.saveVersionedEntity(ref, 'continuation_failure_delivery', execution.executionId, 'delivered', { execution, errorCode });
   }
   executionContinuation(ref: ContractSessionRef, bindingId: string): RuntimeExecutionContinuationResult | undefined {
     const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
@@ -488,10 +543,15 @@ export class SessionContractStore {
         const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as RuntimeContract);
         const executions = this.executions(ref);
         if (executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref))) {
-          throw new Error('runtime_recovery_has_active_execution');
+          // Work still open on the selected bare observation keeps the older
+          // runtime out of reach. The complete identity is that same live
+          // process, so it completes the selected runtime: refusing the binding
+          // would leave a re-attached worker, and that work, with no runtime.
+          if (['retiring', 'stopped'].includes(previous.phase)) throw new Error('runtime_recovery_has_active_execution');
+          reuse = previous;
         }
         const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
-        const candidates = history.filter(runtime => runtime.phase === 'unresolved'
+        const candidates = reuse ? [] : history.filter(runtime => runtime.phase === 'unresolved'
           && runtime.ref.epoch < previous.ref.epoch && reusableRuntimeIdentity(runtime.identity, identity));
         if (candidates.length === 1) {
           const candidate = candidates[0];

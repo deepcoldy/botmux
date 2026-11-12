@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { sendCompletionHintKey } from './services/send-completion-hint.js';
 import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -171,6 +172,7 @@ import {
 import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
 import { createDispatchLaunchSourceCoordinator } from './core/dispatch-launch-source.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
+import { deferredSuspendNote, DRY_RUN_DEFER_NOTE } from './cli/suspend-output.js';
 import {
   computeSessionPickerLayout,
   type SessionPickerColumnKey,
@@ -192,7 +194,7 @@ import {
 import {
   FLEET_DAEMON_EXIT_WAIT_MS,
 } from './core/shutdown-budgets.js';
-import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, primaryCardBodyMissing, sendBodyRequiredMessage, sendFileAttachments, sendVideoAttachments, shouldSendAsPureFile, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
 import { assertCardPatchChat, buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
@@ -344,6 +346,7 @@ import {
   type ManagedOriginAttestationContext,
 } from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
+import { classifySendStdin, describeEmptySendStdin, readSendStdin, sendStdinPolicy } from './cli/send-stdin.js';
 import {
   collaborationHelp,
   formatBotInfoEntriesForCli,
@@ -6032,7 +6035,7 @@ async function cmdSuspend(): Promise<void> {
       }
       const predicted = predictSuspend(await lookupRow(s.sessionId, s.larkAppId));
       switch (predicted) {
-        case 'defer': console.log(`· 将排队（正在回复，完成后自动挂起）: ${label}`); deferred++; break;
+        case 'defer': console.log(`· 将排队，${DRY_RUN_DEFER_NOTE}: ${label}`); deferred++; break;
         case 'suspend': console.log(`· 将挂起: ${label}`); break;
         case 'no_worker': console.log(`· 将跳过（本就无存活 CLI）: ${label}`); skipped++; break;
         case 'refuse': console.log(`· 将拒绝（adopt / 不可挂起 backend）: ${label}`); failed++; break;
@@ -6066,7 +6069,7 @@ async function cmdSuspend(): Promise<void> {
       if (res.ok && body?.ok) {
         if (body.suspended) { console.log(`✓ 已挂起: ${label}`); suspended++; }
         else if (body.reason === 'deferred') {
-          console.log(`⏳ 已排队（正在回复，完成后自动挂起）: ${label}`);
+          console.log(`⏳ 已排队，${deferredSuspendNote(body)}: ${label}`);
           deferred++;
         }
         else { console.log(`· 本就无存活 CLI（目标态已达成）: ${label}`); skipped++; }
@@ -6239,6 +6242,23 @@ async function cmdMaintenance(args: string[]): Promise<void> {
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
+/** A final that left as its own message in this turn's conversation (for
+ * notifications, a quote, attachments…) closes the turn there, so a completed
+ * native-CoT reply card needs no answerless summary. Finals sent elsewhere (top
+ * level, another topic or chat) do not, and keep that summary. Persistence only:
+ * failure restores the summary card and never affects the delivered final. */
+async function noteTurnFinalOutsideReplyCard(
+  key: { larkAppId: string; sessionId: string; turnId: string; dispatchAttempt?: number },
+  chatId: string, offThread: boolean,
+): Promise<void> {
+  if (offThread) return;
+  try {
+    await new TurnReplyCardStore(resolveDataDir()).noteExternalFinal(key, chatId);
+  } catch (error) {
+    console.error(`botmux send: 未能标记本轮答复卡（最终答复已送达）：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
@@ -7933,7 +7953,8 @@ const SEND_HELP_BODY = [
   '       --images <path>                 内联图片（可重复）',
   '       --image-mode <mode>             独立单图：fit_horizontal（默认）|medium|small|tiny',
   '                                      medium/small/tiny 等比占宽 1/2、1/3、1/4，完整显示不裁剪',
-  '       --files <path>                  附件（可重复）',
+  '       --files <path>                  附件（可重复）。只发一个文件且不 @ 人时可以不写正文；',
+  '                                      多个附件或带 @ 时需要正文（位置参数 / --content-file / stdin）',
   '       --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）',
   '       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）',
   '       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON',
@@ -9569,6 +9590,18 @@ async function assertListenerCardDestination(session: SessionData, appId: string
   }
 }
 
+/** BOTMUX_CHAT_ID for the caller's own session, preferred over an old session
+ *  record whose chatType/chatId may predate a DM→group handoff (the worker
+ *  refreshes it for the current managed session). Never applied to an explicit
+ *  different sid. A virtual (headless/HTTP) value is skipped: it is a spawn-time
+ *  snapshot that cannot name a Feishu chat, and a session later bound to a real
+ *  chat keeps it in its env — only the record knows the bound chat. */
+function currentSessionEnvChatId(sid: string): string | undefined {
+  if (sid !== process.env.BOTMUX_SESSION_ID) return undefined;
+  const chatId = process.env.BOTMUX_CHAT_ID?.trim();
+  return chatId && !isHttpVirtualSession(chatId) ? chatId : undefined;
+}
+
 async function cmdTabs(rest: string[]): Promise<void> {
   const {
     CHAT_TABS_CLI_USAGE,
@@ -9594,12 +9627,7 @@ async function cmdTabs(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'tabs');
-  // The worker refreshes BOTMUX_CHAT_ID for the current managed session. Prefer
-  // that turn-bound value over an old session record whose chatType/chatId may
-  // predate a DM→group handoff. Never apply it to an explicit different sid.
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -9647,9 +9675,7 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'top-notice');
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux top-notice: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -10616,7 +10642,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
   // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
   // can only ever answer "no bots at all". Letting that stand would silently turn
   // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
-  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // it exists to catch — and resolveManagedOriginTransport() (which advertises
   // itself as tamper-resistant) delegates its verdict here.
   //
   // The worker already hands this bot its OWN config through the designed private
@@ -10672,35 +10698,98 @@ function currentTurnHasNoTransport(): boolean {
   return !!appId && currentBotIsApiOnly(appId);
 }
 
-/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
- *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
- *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+interface ManagedOriginTransportVerdict {
+  noTransport: boolean;
+  chatId: string | undefined;
+  /** A visible ancestor marker and BOTMUX_SESSION_ID name different sessions. */
+  sessionConflict?: { ancestorSessionId: string; envSessionId: string };
+}
+
+let managedOriginTransportVerdict: ManagedOriginTransportVerdict | undefined;
+
+/** Tamper-resistant managed-origin transport verdict, plus the chatId it was
+ *  judged from.
+ *
+ *  Checks the pid-marker ANCESTRY (process.ppid walk) before the general routing
+ *  resolver; a conflicting BOTMUX_SESSION_ID is refused. Then loads the record and
  *  judges transport from its chatId + its bot's apiOnly config. So `env -u
  *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
- *  managed no-transport identity. Returns false (not gated) when no managed
- *  origin resolves — a bare host-operator shell keeps full access. Total; on any
- *  resolution error falls back to the env-based check (never throws). */
-function managedOriginHasNoTransport(): boolean {
+ *  managed no-transport identity. Returns `noTransport: false` (not gated) when
+ *  no managed origin resolves — a bare host-operator shell keeps full access.
+ *  Total; on any resolution error falls back to the env-based check (never
+ *  throws).
+ *
+ *  The record is the routing truth, not the env: BOTMUX_CHAT_ID is a spawn-time
+ *  snapshot, so a session that was headless when its CLI was spawned and was
+ *  later bound/transferred to a real chat keeps that very process (the tmux
+ *  backend re-attaches to the surviving `bmx-<sessionId>` rather than
+ *  respawning), and its env never learns about the move. `chatId` is returned so
+ *  the refusal message can name the reason the same snapshot was judged from.
+ *
+ *  Judged once per process: the root-dispatch gate and the command's own early
+ *  gate ask the same question moments apart, and the record lookup loads every
+ *  bot's session store (hundreds of ms on a large fleet). */
+function resolveManagedOriginTransport(): ManagedOriginTransportVerdict {
+  managedOriginTransportVerdict ??= judgeManagedOriginTransport();
+  return managedOriginTransportVerdict;
+}
+
+function judgeManagedOriginTransport(): ManagedOriginTransportVerdict {
+  const envVerdict = (requireEnvSession: boolean) => ({
+    noTransport: (!requireEnvSession || !!process.env.BOTMUX_SESSION_ID)
+      && currentTurnHasNoTransport(),
+    chatId: process.env.BOTMUX_CHAT_ID,
+  });
   try {
-    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    const dataDir = resolveDataDir();
+    const envSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+    // The general routing resolver treats envSessionId as ground truth and
+    // skips conflicting markers. A transport gate must observe the ancestor
+    // before that filter, or a changed env could select another real session.
+    // Reject the conflict rather than routing through either identity; legacy
+    // markers without a birth stamp may be stale, not just a changed env.
+    const ancestor = findLiveAncestorSessionContext(dataDir);
+    if (ancestor?.sessionId && envSessionId && ancestor.sessionId !== envSessionId) {
+      return {
+        noTransport: true,
+        chatId: undefined,
+        sessionConflict: { ancestorSessionId: ancestor.sessionId, envSessionId },
+      };
+    }
+    const ctx = ancestor?.sessionId ? ancestor : resolveSessionContext(dataDir, envSessionId);
     if (!ctx?.sessionId) {
       // No managed origin at all (bare operator). Still honor an explicit env
       // signal if present (daemon-spawned turn whose marker was pruned), but a
       // truly bare shell has neither → not gated.
-      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+      return envVerdict(true);
     }
     const s = loadSessions().get(ctx.sessionId);
     if (!s) {
       // Marker resolved a session id but no record on disk (riff sandbox etc.) —
       // fall back to the env view for that same managed turn.
-      return currentTurnHasNoTransport();
+      return envVerdict(false);
     }
     const chatId = s.chatId ?? '';
-    if (isHttpVirtualSession(chatId)) return true;
-    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+    return {
+      noTransport: isHttpVirtualSession(chatId)
+        || (!!s.larkAppId && currentBotIsApiOnly(s.larkAppId)),
+      chatId,
+    };
   } catch {
-    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    return envVerdict(true);
   }
+}
+
+/** Refusal text for a marker/env session conflict. Naming both ids keeps the
+ *  real reason visible instead of the generic no-transport causes. */
+function managedOriginConflictMessage(
+  op: string,
+  conflict: NonNullable<ManagedOriginTransportVerdict['sessionConflict']>,
+): string {
+  return `botmux ${op} is unavailable: an ancestor process marker names session ` +
+    `${conflict.ancestorSessionId}, but BOTMUX_SESSION_ID names ${conflict.envSessionId}.\n` +
+    `Feishu read/write is refused rather than routed through either session. Run it\n` +
+    `from the session's own CLI without overriding BOTMUX_SESSION_ID.`;
 }
 
 /** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
@@ -10709,8 +10798,17 @@ function managedOriginHasNoTransport(): boolean {
  *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
  *  for type-flow clarity; execution never continues past the exit. */
 function assertTurnTransportOrExit(op: string): void {
-  if (!currentTurnHasNoTransport()) return;
-  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  // Judge with the SAME managed-origin verdict the root-dispatch gate applies to
+  // every Lark-facing command. Judging by the env alone permanently refused
+  // `send` (and every sibling verb) in a session that was spawned headless and
+  // later bound to a real chat — see resolveManagedOriginTransport.
+  const verdict = resolveManagedOriginTransport();
+  if (!verdict.noTransport) return;
+  if (verdict.sessionConflict) {
+    console.error(managedOriginConflictMessage(op, verdict.sessionConflict));
+    process.exit(2);
+  }
+  const chatId = verdict.chatId ?? '';
   const headless = chatId.startsWith('headless_');
   const why = headless
     ? 'this turn runs in a headless automation session (no Feishu chat)'
@@ -11001,27 +11099,57 @@ async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
     return { kind: 'error', message: t('xpi.send.as_usage') };
   }
 
-  // Read stdin before session/ledger/marker resolution. This is the same read
-  // the command used to perform later, but doing it here keeps a rejected body
-  // from advancing a queued turn or copying an open socket into a transport.
-  // Trade-off: this read also precedes the workflow/transport/capability gates
-  // inside cmdSend, so a non-TTY stdin that never reaches EOF blocks before
-  // those gates can refuse. That fd shape is not reachable in production (the
-  // worker hands the CLI a TTY; remote-runner uses --content-file with
-  // stdio:'ignore'), and the queued-turn ordering win is worth it.
-  const stdinContent = await readStdin();
+  // Read stdin before session/ledger/marker resolution, so a rejected body can
+  // neither advance a queued turn nor copy an open socket into a transport.
+  // How long to wait depends on what fd 0 is (src/cli/send-stdin.ts): a
+  // terminal or /dev/null never carries a body, and an attachment send only
+  // takes a piped body that is already flowing. A caller can hand the CLI a
+  // pipe that never reaches EOF — Claude Code's Bash tool does for a command
+  // that contains a heredoc — and waiting on it wedged attachment-only sends.
+  // A body-only send (or an explicit lone '-') still waits for EOF, so
+  // `slow-producer | botmux send` keeps working; it also still precedes the
+  // workflow/transport/capability gates inside cmdSend.
+  const flags = plan.invocation.flags;
   const loneDash = plan.invocation.positionals.length === 1 && plan.invocation.positionals[0] === '-';
+  const { images, files, videos, videoCovers } = plan.attachments;
+  const hasAttachments = images.length + files.length + videos.length + videoCovers.length > 0;
+  const stdinShape = classifySendStdin();
+  const stdinRead = await readSendStdin(sendStdinPolicy(stdinShape, { explicitDash: loneDash, hasAttachments }));
+  const stdinContent = decodeStdinBytes(stdinRead.bytes);
   if (loneDash && !stdinContent.trim()) {
     return {
       kind: 'error',
       message: "botmux send: 位置参数 '-' 表示从 stdin 读正文，但 stdin 没有内容；多行正文请直接用 botmux send <<'EOF' … EOF。",
     };
   }
-  const hasAttachments = plan.attachments.images.length + plan.attachments.files.length
-    + plan.attachments.videos.length + plan.attachments.videoCovers.length > 0;
-  if (!loneDash && !stdinContent.trim() && !hasAttachments
-    && !Object.hasOwn(plan.invocation.flags, '--diff') && !asChoice) {
-    return { kind: 'error', message: 'botmux send: 正文为空（stdin 没有内容）。' };
+  if (!loneDash && !stdinContent.trim()) {
+    const emptyReason = describeEmptySendStdin(stdinShape, stdinRead.outcome);
+    if (!hasAttachments && !Object.hasOwn(flags, '--diff') && !asChoice) {
+      return {
+        kind: 'error',
+        message: `botmux send: 正文为空（${emptyReason}）。请把正文写成位置参数，或用 --content-file <文件>；多行正文用 botmux send <<'EOF' … EOF。`,
+      };
+    }
+    // Same shape test cmdSend applies to the final rendered body; failing here
+    // keeps the refusal ahead of any session or transport resolution. Voice,
+    // slash and --diff primaries are not the reply card and report their own
+    // body errors; --as synthesizes its body.
+    const replyCardPrimary = !asChoice && !Object.hasOwn(flags, '--diff')
+      && !Object.hasOwn(flags, '--voice') && !Object.hasOwn(flags, '--slash');
+    if (hasAttachments && replyCardPrimary && primaryCardBodyMissing({
+      hasBodyText: false,
+      imageCount: images.length,
+      fileCount: files.length,
+      videoCount: videos.length,
+      mentionCount: (flags['--mention']?.length ?? 0) + (Object.hasOwn(flags, '--mention-back') ? 1 : 0),
+    })) {
+      return { kind: 'error', message: sendBodyRequiredMessage(emptyReason) };
+    }
+    if (stdinRead.outcome === 'no-input') {
+      // The only case where a body could still have been on its way: say so,
+      // rather than drop a slow producer's text without a trace.
+      console.error(`botmux send: ${emptyReason}，按不带正文发送附件；正文由较慢的管道产生时请加 '-'。`);
+    }
   }
   return { kind: 'plan', plan: { ...plan, stdinContent } };
 }
@@ -12583,14 +12711,16 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
   }
   if (!customCard && preparedText !== undefined) expectedLinkRenderedContent = preparedText;
-  const fileOnlyPrimaryRequested = !customCard
-    && !expectedLinkRenderedContent.trim()
-    && !asChoice
-    && images.length === 0
-    && files.length === 1
-    && videoAttachments.length === 0
-    && mentionArgs.length === 0
-    && !mentionBack;
+  // Requested mentions, not resolved ones: a mention that resolves to nobody
+  // must not silently turn an addressed send into a bare media message.
+  const primaryShape = {
+    hasBodyText: !!expectedLinkRenderedContent.trim(),
+    imageCount: images.length,
+    fileCount: files.length,
+    videoCount: videoAttachments.length,
+    mentionCount: mentionArgs.length + (mentionBack ? 1 : 0),
+  };
+  const fileOnlyPrimaryRequested = !customCard && !asChoice && shouldSendAsPureFile(primaryShape);
   // A file-only final intentionally has no card body. Its attachment is the
   // user-visible primary content, so inspect it only when link validation or a
   // durable final-answer fingerprint needs the bytes. The bounded streaming
@@ -12644,6 +12774,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file "${TMPDIR:-/tmp}/msg.md" --images "${TMPDIR:-/tmp}/chart.png"\n  botmux send --videos "${TMPDIR:-/tmp}/replay.mp4" --video-covers "${TMPDIR:-/tmp}/cover.png" --no-mention "视频预览"');
     process.exit(1);
+  }
+  // Every body source converges here before any upload or provider write: an
+  // empty --content-file, a blank positional, a relay's prepared copy. (A
+  // stdin body was already refused in preflight with its stdin-specific
+  // reason.) The pure file / pure video shapes are the only media primaries;
+  // anything else would publish a reply card with nothing in its body.
+  if (!customCard && !asChoice && !asVoice && !isSlashSend && primaryCardBodyMissing(primaryShape)) {
+    console.error(sendBodyRequiredMessage(contentFile ? '--content-file 的内容为空' : '正文为空'));
+    process.exit(2);
   }
 
   // --attention guard: only valid replying into the current session with a text
@@ -12800,6 +12939,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    // A retry after a lost reply-card mark completes it; a final already on
+    // the card is left alone by the store.
+    if (effectiveResponseKind === 'final' && currentTurnId) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+        overrideChatId ?? s.chatId, sendTopLevel || !!sendInto || !!overrideChatId);
+    }
     await removeScheduleSelfAfterFinal();
     if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
       advanceAncestorSessionTurn(
@@ -14320,9 +14465,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
       // can't embed `<at>`), so it falls through to the card branch which renders
-      // the @ on the footer and sends the video as a follow-up attachment — same
-      // shape as an attachment-only `--files … --mention …` send, whose card body
-      // is likewise empty. See shouldSendAsPureVideo.
+      // the @ on the footer and sends the video as a follow-up attachment. That
+      // card needs a body: a mentioned media send without text or an image was
+      // already refused (primaryCardBodyMissing), never sent as an empty card.
+      // See shouldSendAsPureVideo.
       // No card/text primary here, so the FIRST media message must carry the
       // quote chain itself (dispatchPrimary applies the chat-scope quoteTargetId
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
@@ -14514,6 +14660,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
+        let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
@@ -14527,7 +14674,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
                 expectedTurnId: currentTurnId, dispatchAttempt: originDispatchAttempt,
               });
               if (!ready.ok) throw new Error('Native thinking publication is not ready; answer send deferred');
+              // Only an explicit confirmation lets native thinking carry
+              // progress; an older daemon or failed display keeps the card.
+              const readiness = await ready.json().catch(() => undefined) as { nativeThinkingVisible?: unknown } | undefined;
               await revalidateIsolatedOriginBeforeEffect();
+              return readiness?.nativeThinkingVisible === true;
             },
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
@@ -14552,12 +14703,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
+            // Progress is expected here; asking for a final would push the
+            // model to lock the turn early with an interim note.
+            undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
+          }
           return delivered.messageId ?? '';
         });
         turnPrimaryReplayed ||= replyDelivery.replayed;
         unifiedReplyUsed = true;
         if (!replyDelivery.messageId) {
-          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+          console.error(undeliveredProgressHint);
           console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
           return;
         }
@@ -14595,6 +14751,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     if (turnPrimaryReplayed) {
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
+      // The first sender may have lost the reply-card mark; it is idempotent.
+      if (effectiveResponseKind === 'final' && currentTurnId) {
+        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+          targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
+      }
       await removeScheduleSelfAfterFinal();
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -14613,6 +14774,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
       return;
+    }
+
+    if (effectiveResponseKind === 'final' && messageId && currentTurnId && !unifiedReplyUsed) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+        targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
     }
 
     if (oncallGroupCard && messageId) {
@@ -14806,17 +14972,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
     // Sentinel guidance is surfaced HERE — in the send-success output the model
     // reads back — rather than only in the injected system prompt. A model only
-    // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
-    // cannot use the sentinel to end a turn where it did work but forgot to send
+    // gets completion guidance only after a final has actually been sent, so a
+    // progress receipt cannot invite it to end before delivering the answer
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
-    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
-      ? t('ai.send.after_success_unified', undefined, sendLocale)
-      : advancedNextTurnId
-        ? t('ai.send.after_success_steer_advanced', undefined, sendLocale)
-        : t('ai.send.after_success_hint', undefined, sendLocale));
+    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId), undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -21007,10 +21169,9 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // ─── Central root-dispatch transport gate ──────────────────────────────────
 // A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
 // or a virtual/headless session) must not run ANY Lark-facing command. The managed
-// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
-// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
-// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
-// managed identity. We then load THAT session's record and gate on its chatId +
+// gate observes the pid-marker ancestry before env-based routing and refuses a
+// conflicting env session, so changing or removing BOTMUX_SESSION_ID cannot
+// discard a visible ancestor origin. We load that session's record and gate on its chatId +
 // its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
 // also can't flip the verdict. Covers every Feishu-facing verb by construction.
 // A BARE host-operator shell (no ancestry marker, no env session) resolves no
@@ -21021,13 +21182,16 @@ const LARK_FACING_COMMANDS = new Set([
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
-if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
-  console.error(
-    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
-    `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
-    `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
-    `through the current session result channel.`,
-  );
+const managedOriginVerdict = LARK_FACING_COMMANDS.has(command)
+  ? resolveManagedOriginTransport()
+  : undefined;
+if (managedOriginVerdict?.noTransport) {
+  console.error(managedOriginVerdict.sessionConflict
+    ? managedOriginConflictMessage(command, managedOriginVerdict.sessionConflict)
+    : `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+      `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
+      `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
+      `through the current session result channel.`);
   process.exit(2);
 }
 
