@@ -105,6 +105,8 @@ function runWorkerWiring(late: boolean, options: {
   scopePayloadAfterProbe?: number;
   /** Children of pids other than the pane (100); a synthetic launch chain. */
   children?: Record<number, number[]>;
+  /** A TRAE child first becomes visible after this much launcher time. */
+  traexChildAfterMs?: number;
   /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
    *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
   aliasedChildPid?: boolean;
@@ -177,7 +179,10 @@ function runWorkerWiring(late: boolean, options: {
         return options.paneCmdline ?? ['launcher'];
       };
     })(),
-    getChildPids: (pid: number) => (pid === 100 ? (options.relayChildren ?? [150]) : (options.children?.[pid] ?? [])),
+    getChildPids: vi.fn((pid: number) => {
+      if (options.traexChildAfterMs !== undefined && scheduler.now() < options.traexChildAfterMs) return [];
+      return pid === 100 ? (options.relayChildren ?? [150]) : (options.children?.[pid] ?? []);
+    }),
     readComm: (pid: number) => (pid === 100 ? (options.comm ?? 'node') : (options.childComms?.[pid] ?? 'claude')),
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
@@ -214,6 +219,58 @@ function runWorkerWiring(late: boolean, options: {
 }
 
 describe('worker wrapper PID wiring', () => {
+  it.each([false, true])('binds the native TRAE child of an ordinary Node launcher (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false,
+      relayChildren: [200], childComms: { 200: 'traex' },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('discovers a delayed TRAE child without a sandbox or wrapperCli setting (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false,
+      relayChildren: [200], childComms: { 200: 'traex' }, traexChildAfterMs: 12_000,
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(12_000);
+  });
+
+  it.each([false, true])('publishes the TRAE child when the backend aliases its child accessor to the bound PID (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false, aliasedChildPid: true,
+      relayChildren: [200], childComms: { 200: 'traex' },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('keeps a directly launched TRAE root rather than its TRAE subagent (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false, comm: 'traex',
+      relayChildren: [200], childComms: { 200: 'traex' },
+    });
+    expect(result.backend.cliPid).toBe(100);
+    // Initial marker/attestation publication is outside this sliced wiring.
+    // The behaviour under test is not descending into this root's subagent.
+    expect(result.getChildPids).not.toHaveBeenCalled();
+  });
+
+  it('does not let delayed TRAE discovery overwrite a newer spawn generation', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false,
+      relayChildren: [200], childComms: { 200: 'traex' }, traexChildAfterMs: 12_000,
+      beforeTimers: scope => { scope.cliSpawnGeneration++; },
+    });
+    expect(result.backend.cliPid).toBe(100);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+  });
+
   it.each([false, true])('binds and attests an owned-scope payload rather than its pane supervisor (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
