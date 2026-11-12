@@ -112,7 +112,7 @@ import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { refundRetryAttempt } from '../services/failed-turn-retry.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
-import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
+import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
 import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
 import { hasUnprovenContainment } from './mojo-containment.js';
@@ -1001,7 +1001,7 @@ import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit, resolveProseBotMentions, unboundInputCommitLogLevel } from './dispatch.js';
 import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
-import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
+import { cleanupExplicitSessionBacking, proveRiffThreadStopped } from './explicit-session-backing-cleanup.js';
 import {
   activeIdentityTurns,
   clearActiveIdentityTurns,
@@ -8311,6 +8311,13 @@ type RemoteClosePreparation =
         | 'riff_row_inconsistent'
         | 'riff_durable_close_failed'
         | 'riff_close_reconciliation_required'
+        /** The old worker died only moments ago; a request it had sent may
+         *  still create a task. Retry the close in about a minute. */
+        | 'riff_close_reconcile_wait'
+        /** The bot's Riff endpoint/identity changed since this session's worker
+         *  ran: a thread listing could no longer prove anything. Restore the
+         *  original configuration (or reconcile by hand) and retry. */
+        | 'riff_config_changed'
         | 'remote_runner_worker_close_failed'
         | 'remote_runner_row_inconsistent'
         | 'remote_runner_worker_missing'
@@ -8352,35 +8359,24 @@ type RemoteClosePreparation =
       taskId?: string;
     };
 
-async function abortLiveRemoteWorkerClose(
-  ds: DaemonSession,
-  requestId: string,
-  opts: { allowAbsentAfterProvenRestore?: boolean } = {},
-): Promise<boolean> {
-  if (ds.remoteCloseState?.requestId !== requestId) return false;
-  const worker = ds.worker;
-  if (!worker || worker.killed) {
-    if (opts.allowAbsentAfterProvenRestore) {
-      ds.remoteCloseState = undefined;
-      return true;
-    }
-    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
-    return false;
-  }
+type RemoteWorkerCloseAbortAck = {
+  ok: boolean;
+  admissionRestored?: boolean;
+  fenceReason?: string;
+  error?: string;
+};
 
-  const restored = await new Promise<{
-    ok: boolean;
-    admissionRestored?: boolean;
-    fenceReason?: string;
-    error?: string;
-  }>(resolve => {
+/** Ask the exact worker generation to roll back close request `requestId` and
+ * report what it did. Pure IPC: the caller decides what the answer means for
+ * the daemon-side fence. */
+function requestRemoteWorkerCloseAbort(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  requestId: string,
+): Promise<RemoteWorkerCloseAbortAck> {
+  return new Promise<RemoteWorkerCloseAbortAck>(resolve => {
     let settled = false;
-    const finish = (result: {
-      ok: boolean;
-      admissionRestored?: boolean;
-      fenceReason?: string;
-      error?: string;
-    }): void => {
+    const finish = (result: RemoteWorkerCloseAbortAck): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -8424,6 +8420,25 @@ async function abortLiveRemoteWorkerClose(
       finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
   });
+}
+
+async function abortLiveRemoteWorkerClose(
+  ds: DaemonSession,
+  requestId: string,
+  opts: { allowAbsentAfterProvenRestore?: boolean } = {},
+): Promise<boolean> {
+  if (ds.remoteCloseState?.requestId !== requestId) return false;
+  const worker = ds.worker;
+  if (!worker || worker.killed) {
+    if (opts.allowAbsentAfterProvenRestore) {
+      ds.remoteCloseState = undefined;
+      return true;
+    }
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
+    return false;
+  }
+
+  const restored = await requestRemoteWorkerCloseAbort(ds, worker, requestId);
 
   // A handled-but-REFUSED abort must not clear the fence. `ok` alone did, which
   // is the same laundering as before, one path over.
@@ -8454,6 +8469,17 @@ async function abortLiveRemoteWorkerClose(
 async function prepareLiveRemoteWorkerClose(
   ds: DaemonSession,
   backendType: 'riff' | 'mojo' | 'remote-runner',
+  opts: {
+    /**
+     * Riff only: this attempt reconciles an earlier close whose outcome is
+     * unknown. The caller has already released that request in the worker and
+     * holds the fence as `preparing` under its id; this attempt takes the fence
+     * over synchronously (no admission gap), and a failure leaves it
+     * `uncertain` instead of rolling admission back -- only a successful cancel
+     * proves the remote stopped.
+     */
+    reconcileFenceRequestId?: string;
+  } = {},
 ): Promise<RemoteClosePreparation> {
   const worker = ds.worker;
   if (!worker || worker.killed) {
@@ -8537,7 +8563,13 @@ async function prepareLiveRemoteWorkerClose(
     };
   }
   let takenOverRuntimeState: DaemonSession['remoteCloseState'];
-  if (ds.remoteCloseState) {
+  // Checked synchronously right before `preparing` overwrites the fence below,
+  // so no turn can be admitted between the two (Riff has no journal write here).
+  const reconcilingRiffFence = backendType === 'riff'
+    && opts.reconcileFenceRequestId !== undefined
+    && ds.remoteCloseState?.phase === 'preparing'
+    && ds.remoteCloseState.requestId === opts.reconcileFenceRequestId;
+  if (ds.remoteCloseState && !reconcilingRiffFence) {
     if (backendType === 'remote-runner' && ds.remoteCloseState.phase === 'prepared') {
       return { ok: true };
     }
@@ -8654,6 +8686,9 @@ async function prepareLiveRemoteWorkerClose(
     requestId,
     ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
   };
+  // A live worker is preparing now: any earlier worker loss is history, and a
+  // later one starts its own window.
+  riffWorkerGoneSince.delete(ds);
   let matchedCloseResult = false;
   const result = await new Promise<RemoteWorkerCloseResult>((resolve) => {
     let settled = false;
@@ -8947,6 +8982,23 @@ async function prepareLiveRemoteWorkerClose(
     try {
       sessionStore.updateSession(ds.session);
     } catch (err) {
+      if (reconcilingRiffFence && !result.ok) {
+        // Rolling back here would reopen admission with no cancellation proof.
+        if (ds.remoteCloseState?.requestId === requestId) {
+          ds.remoteCloseState = { phase: 'uncertain', requestId, taskId: result.taskId };
+        }
+        logger.error(
+          `[${tag(ds)}] riff close reconciliation could not persist lineage ${result.taskId}; `
+          + `admission stays fenced: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          error: 'riff_close_reconciliation_required',
+          retryable: true,
+          ...(result.recovery ? { recovery: result.recovery } : {}),
+          taskId: result.taskId,
+        };
+      }
       await abortLiveRemoteWorkerClose(ds, requestId);
       logger.error(
         `[${tag(ds)}] ${backendType} close lineage persistence failed; close aborted: `
@@ -8962,6 +9014,28 @@ async function prepareLiveRemoteWorkerClose(
   }
 
   if (!result.ok) {
+    if (reconcilingRiffFence) {
+      // This attempt exists to PROVE the remote stopped after an earlier
+      // unknown outcome. A failure proves nothing, so the fence must not be
+      // rolled back the way a first-attempt failure is: that would admit
+      // messages into a remote task that may still be running. Name this
+      // request in the fence so the next close releases exactly it.
+      if (ds.remoteCloseState?.requestId === requestId) {
+        ds.remoteCloseState = { phase: 'uncertain', requestId, ...(taskId ? { taskId } : {}) };
+      }
+      logger.warn(
+        `[${tag(ds)}] riff close reconciliation failed: ${result.error ?? 'unknown'}; `
+        + `admission stays fenced until a later close proves the remote stopped`
+        + `${taskId ? ` (task ${taskId})` : ''}`,
+      );
+      return {
+        ok: false,
+        error: 'riff_close_reconciliation_required',
+        retryable: true,
+        ...(result.recovery ? { recovery: result.recovery } : {}),
+        ...(taskId ? { taskId } : {}),
+      };
+    }
     const mayRestore = mayRestoreWriteAdmission({
       ok: false,
       ...(result.recovery ? { recovery: result.recovery } : {}),
@@ -8976,7 +9050,13 @@ async function prepareLiveRemoteWorkerClose(
       // process-local fence so a fresh control provider can reconcile from the
       // durable backend state. Do not let this stale prepare continuation put
       // the fence back after that authoritative retirement.
-      ds.remoteCloseState = { phase: 'uncertain', requestId };
+      ds.remoteCloseState = {
+        phase: 'uncertain',
+        requestId,
+        // Riff only (remote-runner never carries a task id here): lets the
+        // reconciliation report which task it is still trying to stop.
+        ...(backendType === 'riff' && taskId ? { taskId } : {}),
+      };
     }
     logger.warn(
       `[${tag(ds)}] ${backendType} worker close prepare failed: ${result.error ?? 'unknown'}; `
@@ -9219,7 +9299,9 @@ async function prepareRemoteRunnerExplicitClose(
 
 /** Await remote cancellation for any Riff owner before its durable row is
  * closed. Live workers use prepare/commit; worker-less rows cancel their exact
- * persisted task through current authoritative bot config. */
+ * persisted task through current authoritative bot config. A fence left
+ * `uncertain` by an earlier attempt is reconciled rather than refused (see
+ * reconcileUncertainRiffClose). */
 async function prepareRiffExplicitClose(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
@@ -9240,6 +9322,18 @@ async function prepareRiffExplicitClose(
     };
   }
   if (ds?.remoteCloseState) {
+    // `uncertain` is not a close in flight: it is a FINISHED attempt whose
+    // outcome nobody knows. Refusing it here as well left the session fenced
+    // for the rest of the daemon's life -- every message bounced off the gate,
+    // every close bounced off this branch, and nothing in the process could
+    // ever clear the fence (only a restart, which drops it, recovered).
+    if (ds.remoteCloseState.phase === 'uncertain'
+        && backendType === 'riff'
+        && !riffCloseReconcileInFlight.has(ds)
+        && !isSharedAdoptSession(ds)
+        && !isSharedAdoptPersistedSession(session)) {
+      return reconcileUncertainRiffClose(ds, stored);
+    }
     return {
       ok: false,
       error: 'riff_close_reconciliation_required',
@@ -9265,6 +9359,17 @@ async function prepareRiffExplicitClose(
     return prepareLiveRemoteWorkerClose(ds, 'riff');
   }
 
+  return cancelWorkerlessRiffLineage(ds, session, backendType);
+}
+
+/** Cancel a worker-less Riff row's exact persisted task (idempotent HTTP
+ * cancel) and re-check that the lineage did not move underneath it. */
+async function cancelWorkerlessRiffLineage(
+  ds: DaemonSession | undefined,
+  session: Session,
+  backendType: BackendType | undefined,
+): Promise<RemoteClosePreparation> {
+  const taskId = session.riffParentTaskId;
   const durableBefore = sessionStore.getSession(session.sessionId);
   if (ds && durableBefore
       && ds.session.riffParentTaskId !== durableBefore.riffParentTaskId) {
@@ -9282,14 +9387,11 @@ async function prepareRiffExplicitClose(
   }
   if (!taskId) return { ok: true };
 
-  let riffConfig;
-  const larkAppId = ds?.larkAppId ?? session.larkAppId;
-  try { if (larkAppId) riffConfig = getBot(larkAppId).config.riff; } catch { /* bot removed */ }
   const cleanup = await cleanupExplicitSessionBacking({
     sessionId: session.sessionId,
     backendType,
     riffParentTaskId: taskId,
-    riffConfig,
+    riffConfig: riffConfigForSession(ds, session),
   });
   const closeLabel = ds ? tag(ds) : session.sessionId.slice(0, 8);
   if (!cleanup.ok) {
@@ -9326,6 +9428,429 @@ async function prepareRiffExplicitClose(
 
   logger.info(`[${closeLabel}] Riff task ${cleanup.taskId} cancellation prepared for explicit close`);
   return { ok: true, taskId: cleanup.taskId };
+}
+
+/** A Riff session whose `uncertain` close fence is being reconciled right now
+ * (by an explicit close or by a late close_result). Keeps a second close or a
+ * late result out even while the fence briefly reads `uncertain` again. */
+const riffCloseReconcileInFlight = new WeakSet<DaemonSession>();
+
+/** When the last worker process of a fenced Riff session was seen gone. A
+ * request that worker had already sent can still create a task after this, so
+ * the thread is only trusted once that window has passed
+ * (proveRiffThreadStopped `quietSinceMs`). Kept across reconcile retries so a
+ * retry never waits the window out again; reset when a live worker prepares. */
+const riffWorkerGoneSince = new WeakMap<DaemonSession, { atMs: number }>();
+
+/** Start (or, on an observed exit, restart) the window for a fenced Riff
+ * session that just lost a worker process. Called as soon as the loss is seen
+ * (the exit handler, or a reconcile that finds none), so a close made long
+ * after a crash need not wait at all. */
+function noteRiffCloseWorkerGone(ds: DaemonSession, opts: { exited?: boolean } = {}): void {
+  if ((ds.initConfig?.backendType ?? ds.session.backendType) !== 'riff') return;
+  // An observed exit is the definitive moment the process could no longer
+  // send anything; any other sighting only starts the clock once.
+  if (!opts.exited && riffWorkerGoneSince.has(ds)) return;
+  riffWorkerGoneSince.set(ds, { atMs: Date.now() });
+}
+
+/** Worker processes of this session that are no longer usable but have not
+ * exited: a retained killed pointer, or a retiring generation. Until they are
+ * gone a request one of them sent is not even bounded yet. */
+function lingeringSessionWorkers(ds: DaemonSession): ChildProcess[] {
+  const alive = (w: ChildProcess | null | undefined): w is ChildProcess => !!w
+    && w.exitCode === null && w.signalCode === null;
+  const found = new Set<ChildProcess>();
+  if (alive(ds.worker)) found.add(ds.worker);
+  for (const w of retiringWorkersForSession(ds.session.sessionId)) if (alive(w)) found.add(w);
+  return [...found];
+}
+
+/** How long one explicit close may wait for that window before it refuses and
+ * asks for a retry, so a fresh crash is reconciled in one close when it can
+ * but an /close never hangs for a minute. */
+const RIFF_RECONCILE_MAX_QUIET_WAIT_MS = 20_000;
+
+/** Must outlast the kill backstop retireWorkerProcessOnly arms (SIGTERM, then
+ * SIGKILL at WORKER_SIGKILL_BACKSTOP_MS), so a hung worker is gone in time. */
+const RIFF_RECONCILE_WORKER_EXIT_TIMEOUT_MS = WORKER_SIGKILL_BACKSTOP_MS + 3_000;
+
+function waitForWorkerExit(worker: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (worker.exitCode !== null || worker.signalCode !== null) return Promise.resolve(true);
+  return new Promise<boolean>(resolve => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      worker.removeListener?.('exit', onExit);
+      resolve(false);
+    }, timeoutMs);
+    timer.unref?.();
+    worker.once('exit', onExit);
+  });
+}
+
+function riffConfigForSession(ds: DaemonSession | undefined, session: Session): RiffBackendConfig | undefined {
+  const larkAppId = ds?.larkAppId ?? session.larkAppId;
+  try { return larkAppId ? getBot(larkAppId).config.riff : undefined; } catch { return undefined; /* bot removed */ }
+}
+
+/** The environment-sourced inputs a Riff call takes its identity and lane
+ * from (the config fields cover the rest), as THIS process sees them and as a
+ * worker forked for the bot sees them. */
+function riffEnvIdentity(cfg: RiffBackendConfig, env: NodeJS.ProcessEnv): string {
+  return JSON.stringify([
+    env.BOTMUX_RIFF_EXTRA_HEADERS ?? '',
+    env[cfg.jwtEnv ?? 'RIFF_JWT'] ?? '',
+  ]);
+}
+
+/** Endpoint + identity fields that decide whose tasks a Riff call sees. */
+function sameRiffIdentity(a: RiffBackendConfig, b: RiffBackendConfig | undefined): boolean {
+  if (!b) return false;
+  const norm = (h: Record<string, string> | undefined) => JSON.stringify(
+    Object.entries(h ?? {}).sort(([x], [y]) => x.localeCompare(y)),
+  );
+  return a.baseUrl === b.baseUrl
+    && (a.jwt ?? '') === (b.jwt ?? '')
+    && (a.jwtEnv ?? '') === (b.jwtEnv ?? '')
+    && (a.jwtHome ?? '') === (b.jwtHome ?? '')
+    && norm(a.extraHeaders) === norm(b.extraHeaders);
+}
+
+/** The Riff endpoint and identity the session's worker actually ran with,
+ * frozen at fork. Riff's thread listing is owner-scoped, so a proof that the
+ * thread is empty is only a proof under this identity: asked under a bot
+ * config edited since, it reads as empty. Undefined when no worker was ever
+ * forked in this daemon (then the thread proof refuses). */
+function riffConfigFrozenAtFork(ds: DaemonSession): RiffBackendConfig | undefined {
+  const frozen = ds.initConfig?.backendType === 'riff'
+    ? ds.initConfig.backendConfig as RiffBackendConfig | undefined
+    : undefined;
+  return frozen?.baseUrl ? frozen : undefined;
+}
+
+/**
+ * Explicit close of a Riff session whose previous close attempt ended
+ * `uncertain` (its close_result timed out, or the worker died mid-prepare).
+ *
+ * The fence may come down ONLY on fresh proof that the remote stopped. A
+ * failure keeps the fence `uncertain` and refuses with a retryable error; it
+ * never rolls admission back, because that would hand the next message to a
+ * remote task that may still be running.
+ *
+ * Live worker: it refuses a new close while it still holds the old request (in
+ * flight or prepared), so that exact request is released first. The release
+ * proves nothing remote -- it only frees the worker -- and a fresh prepare then
+ * re-runs destroySession (drain in-flight writes, cancel the settled current
+ * task); its success is the proof. A worker that does not answer the release
+ * is retired (for Riff that only detaches the stream) and the close continues
+ * worker-less.
+ *
+ * No worker: the worker that knew about in-flight requests is gone, so the
+ * persisted lineage alone is not enough -- its last create/follow-up may have
+ * made a task the session never recorded. Cancel the lineage, then prove the
+ * whole thread has nothing left running (proveRiffThreadStopped).
+ *
+ * Throughout, the fence is held under the old request id, so a concurrent close
+ * or a late close_result for that request stays out.
+ */
+async function reconcileUncertainRiffClose(
+  ds: DaemonSession,
+  stored: Session | undefined,
+): Promise<RemoteClosePreparation> {
+  const requestId = ds.remoteCloseState!.requestId;
+  const fenceTaskId = ds.remoteCloseState!.taskId ?? ds.session.riffParentTaskId;
+  // `uncertain` under the same id is still this reconciliation's fence: the
+  // exit of a worker that dies meanwhile turns `preparing` back into it.
+  const holdsFence = (): boolean => (ds.remoteCloseState?.phase === 'preparing'
+      || ds.remoteCloseState?.phase === 'uncertain')
+    && ds.remoteCloseState.requestId === requestId;
+  const holdFence = (phase: 'preparing' | 'uncertain'): void => {
+    ds.remoteCloseState = {
+      phase,
+      requestId,
+      ...(fenceTaskId ? { taskId: fenceTaskId } : {}),
+    };
+  };
+  const keepUncertain = (): void => {
+    if (holdsFence()) holdFence('uncertain');
+  };
+  const refuse = (reason: string): RemoteClosePreparation => {
+    logger.warn(
+      `[${tag(ds)}] riff close reconciliation could not prove the remote stopped (${reason}); `
+      + 'admission stays fenced',
+    );
+    return {
+      ok: false,
+      error: 'riff_close_reconciliation_required',
+      retryable: true,
+      ...(fenceTaskId ? { taskId: fenceTaskId } : {}),
+    };
+  };
+
+  riffCloseReconcileInFlight.add(ds);
+  try {
+    const worker = ds.worker;
+    if (worker && !worker.killed) {
+      if (!stored || stored.status !== 'active') {
+        return {
+          ok: false,
+          error: 'riff_row_inconsistent',
+          retryable: true,
+          ...(fenceTaskId ? { taskId: fenceTaskId } : {}),
+        };
+      }
+      holdFence('preparing');
+      logger.warn(`[${tag(ds)}] explicit close reconciles uncertain Riff close ${requestId}`);
+      const ack = await requestRemoteWorkerCloseAbort(ds, worker, requestId);
+      // `close_abort_not_active`: this worker no longer holds the request at all
+      // (it already finished and rolled itself back), so it is free as well.
+      const released = (ack.ok && ack.admissionRestored !== false)
+        || ack.error === 'close_abort_not_active';
+      if (released) {
+        if (ds.remoteCloseState?.phase !== 'preparing' || ds.remoteCloseState.requestId !== requestId
+            || ds.worker !== worker || worker.killed) {
+          keepUncertain();
+          return refuse('worker_or_fence_changed');
+        }
+        const prepared = await prepareLiveRemoteWorkerClose(ds, 'riff', {
+          reconcileFenceRequestId: requestId,
+        });
+        // Only reached with the old id still in place when prepare returned
+        // before taking the fence over.
+        keepUncertain();
+        return prepared;
+      }
+      if (ack.error === 'close_abort_result_timeout' && ds.worker === worker && !worker.killed) {
+        // Alive but not answering IPC: re-asking it can never succeed. Retire
+        // the process (Riff's kill only detaches its stream, nothing remote
+        // changes) and prove the thread worker-less below.
+        logger.warn(
+          `[${tag(ds)}] Riff worker did not answer the release of ${requestId}; `
+          + 'retiring it and reconciling without a worker',
+        );
+        retireWorkerProcessOnly(ds, 'riff_close_reconcile_unresponsive');
+      } else if (ack.error !== 'worker_exited_before_close_abort_result') {
+        keepUncertain();
+        return refuse(ack.fenceReason ?? ack.error ?? 'close_abort_refused');
+      }
+      if (!holdsFence() || (ds.worker && !ds.worker.killed)) {
+        keepUncertain();
+        return refuse('worker_or_fence_changed');
+      }
+    }
+
+    holdFence('preparing');
+    // Worker-less means no process of this session is left: wait the old ones
+    // out (SIGTERM, then SIGKILL) so their in-flight requests become bounded.
+    const lingering = lingeringSessionWorkers(ds);
+    if (lingering.length > 0) {
+      for (const w of lingering) {
+        armWorkerKillBackstop(w, tag(ds), 0);
+        // Stamp the real exit even if it comes after this close gave up
+        // waiting: the exit handler does not see a worker that is no longer
+        // `ds.worker`, and the next close must not restart the window.
+        w.once('exit', () => {
+          if (ds.remoteCloseState) noteRiffCloseWorkerGone(ds, { exited: true });
+        });
+      }
+      const exited = await Promise.all(
+        lingering.map(w => waitForWorkerExit(w, RIFF_RECONCILE_WORKER_EXIT_TIMEOUT_MS)),
+      );
+      if (exited.includes(false)) {
+        keepUncertain();
+        return refuse('previous_worker_did_not_exit');
+      }
+      if (!holdsFence()) return refuse('fence_changed_while_waiting_for_worker_exit');
+    } else {
+      // Lost before anything recorded it: start the window now.
+      noteRiffCloseWorkerGone(ds);
+    }
+    holdFence('preparing');
+    logger.warn(`[${tag(ds)}] explicit close reconciles uncertain Riff close ${requestId} without a worker`);
+    const prepared = await cancelWorkerlessRiffLineage(ds, ds.session, 'riff');
+    if (!holdsFence()) return refuse('fence_changed_during_cancel');
+    if (!prepared.ok) {
+      keepUncertain();
+      return prepared;
+    }
+    // Riff's listing is owner-scoped, so an empty answer under a different
+    // identity reads exactly like "nothing running". With a recorded lineage
+    // that is checked directly (the listing must contain it, and the cancel
+    // above just reached it). Without one, the only anchor is that the bot's
+    // endpoint and identity are still the ones this session's worker ran with.
+    const frozenRiffConfig = riffConfigFrozenAtFork(ds);
+    const liveRiffConfig = riffConfigForSession(ds, ds.session);
+    const identityAnchoredByLineage = !!prepared.taskId;
+    const proofConfig = identityAnchoredByLineage ? liveRiffConfig : frozenRiffConfig;
+    // The daemon calls Riff with its own process env, while the worker ran
+    // with the bot's filtered one (a strict envPolicy drops e.g. the lane
+    // header variable). Without a lineage anchor they must agree as well.
+    const botEnvPolicy = (() => {
+      try { return getBot(ds.larkAppId).config.envPolicy; } catch { return undefined; }
+    })();
+    const envIdentityMatches = (cfg: RiffBackendConfig): boolean =>
+      riffEnvIdentity(cfg, process.env) === riffEnvIdentity(cfg, sessionEnvWorkerBase(botEnvPolicy));
+    if (!proofConfig
+        || (!identityAnchoredByLineage
+          && (!sameRiffIdentity(frozenRiffConfig!, liveRiffConfig) || !envIdentityMatches(frozenRiffConfig!)))) {
+      keepUncertain();
+      logger.warn(
+        `[${tag(ds)}] Riff thread proof refused: the bot's Riff endpoint or identity is not the one `
+        + `this session's worker ran with${frozenRiffConfig ? '' : ' (no frozen config in this daemon)'}`,
+      );
+      return {
+        ok: false,
+        error: 'riff_config_changed',
+        retryable: true,
+        ...(fenceTaskId ? { taskId: fenceTaskId } : {}),
+      };
+    }
+    const proof = await proveRiffThreadStopped({
+      threadId: ds.session.sessionId,
+      riffConfig: proofConfig,
+      ...(prepared.taskId ? { knownTaskIds: [prepared.taskId] } : {}),
+      quietSinceMs: riffWorkerGoneSince.get(ds)!.atMs,
+      maxWaitMs: RIFF_RECONCILE_MAX_QUIET_WAIT_MS,
+    });
+    if (!holdsFence()) return refuse('fence_changed_during_thread_check');
+    if (!proof.ok) {
+      keepUncertain();
+      logger.warn(
+        `[${tag(ds)}] Riff thread not proven stopped: ${proof.kind}`
+        + `${proof.taskId ? ` (task ${proof.taskId})` : ''}${proof.error ? `: ${proof.error}` : ''}`,
+      );
+      return {
+        ok: false,
+        error: proof.kind === 'riff_config_missing'
+          ? 'riff_config_missing'
+          : proof.kind === 'riff_cancel_failed'
+            ? 'riff_cancel_failed'
+            : proof.kind === 'riff_thread_quiet_period_pending'
+              ? 'riff_close_reconcile_wait'
+              : 'riff_close_reconciliation_required',
+        retryable: true,
+        ...((proof.taskId ?? fenceTaskId) ? { taskId: (proof.taskId ?? fenceTaskId)! } : {}),
+      };
+    }
+    if (ds.session.riffParentTaskId !== prepared.taskId) {
+      keepUncertain();
+      return {
+        ok: false,
+        error: 'riff_task_changed',
+        retryable: true,
+        ...((ds.session.riffParentTaskId ?? prepared.taskId)
+          ? { taskId: (ds.session.riffParentTaskId ?? prepared.taskId)! }
+          : {}),
+      };
+    }
+    if (proof.cancelledTaskIds.length > 0) {
+      logger.warn(
+        `[${tag(ds)}] Riff thread still had running task(s) the session never recorded; `
+        + `cancelled ${proof.cancelledTaskIds.join(', ')}`,
+      );
+    }
+    // Proof. Hold the fence as `prepared` until the durable close commits
+    // (killWorker releases it with this request id); a failed commit turns it
+    // back into `uncertain` for the next close. The worker-gone time is kept:
+    // that retry must not wait the window out again.
+    ds.remoteCloseState = {
+      phase: 'prepared',
+      requestId,
+      ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+    };
+    return prepared;
+  } catch (err) {
+    // Never leave this reconciliation's `preparing` behind: nothing would ever
+    // move it again (it is not `uncertain`, so no close reconciles it).
+    keepUncertain();
+    logger.error(
+      `[${tag(ds)}] riff close reconciliation threw: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return refuse('reconciliation_threw');
+  } finally {
+    riffCloseReconcileInFlight.delete(ds);
+  }
+}
+
+/**
+ * A Riff close_result that arrives after its prepare already timed out.
+ *
+ * The timeout left the fence `uncertain` and dropped the pending entry, so this
+ * result used to be discarded as stale even when it was the very proof the
+ * fence was waiting for. An `ok:true` for the exact fenced request, from the
+ * same worker generation, about the lineage the daemon still holds, proves the
+ * cancel landed. The worker is now sitting on a prepared close nobody will
+ * commit (it refuses every later close until released), so roll that request
+ * back first and lift the fence only once the worker confirms its own write
+ * admission is back, then tell the topic: the user last saw this close fail.
+ * Anything less -- ok:false, another lineage, a refused or lost rollback --
+ * keeps the fence for the next explicit close to reconcile.
+ */
+async function adoptLateRiffCloseResult(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  msg: { requestId: string; ok: boolean; taskId?: string | null },
+): Promise<void> {
+  const requestId = msg.requestId;
+  const runtimeTaskId = ds.session.riffParentTaskId;
+  if (!msg.ok) {
+    logger.warn(
+      `[${tag(ds)}] Late Riff close result ${requestId} is not a cancellation proof; `
+      + 'admission stays fenced until an explicit close reconciles it',
+    );
+    return;
+  }
+  if ((msg.taskId ?? undefined) !== runtimeTaskId) {
+    logger.warn(
+      `[${tag(ds)}] Late Riff close result ${requestId} names lineage ${msg.taskId ?? 'none'}, `
+      + `but the session now holds ${runtimeTaskId ?? 'none'}; admission stays fenced`,
+    );
+    return;
+  }
+  ds.remoteCloseState = {
+    phase: 'preparing',
+    requestId,
+    ...(runtimeTaskId ? { taskId: runtimeTaskId } : {}),
+  };
+  riffCloseReconcileInFlight.add(ds);
+  let ack: RemoteWorkerCloseAbortAck;
+  try {
+    ack = await requestRemoteWorkerCloseAbort(ds, worker, requestId);
+  } finally {
+    riffCloseReconcileInFlight.delete(ds);
+  }
+  if (ds.remoteCloseState?.phase !== 'preparing' || ds.remoteCloseState.requestId !== requestId) {
+    return;
+  }
+  if (ds.worker === worker && !worker.killed && ack.ok && ack.admissionRestored !== false) {
+    ds.remoteCloseState = undefined;
+    logger.info(
+      `[${tag(ds)}] Late Riff close result ${requestId} proved cancellation`
+      + `${runtimeTaskId ? ` of task ${runtimeTaskId}` : ''}; worker rolled back and admission restored`,
+    );
+    void callbacks?.sessionReply(
+      sessionAnchorId(ds),
+      tr('worker.remote_close_late_cancel_restored', { backend: 'Riff' }, localeForBot(ds.larkAppId)),
+      'text',
+      ds.larkAppId,
+    ).catch(err => logger.warn(
+      `[${tag(ds)}] Failed to announce the restored Riff session: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    ));
+    return;
+  }
+  ds.remoteCloseState = {
+    phase: 'uncertain',
+    requestId,
+    ...(runtimeTaskId ? { taskId: runtimeTaskId } : {}),
+  };
+  logger.warn(
+    `[${tag(ds)}] Late Riff close result ${requestId} proved cancellation, but the worker did not `
+    + `confirm the rollback (${ack.fenceReason ?? ack.error ?? 'unknown'}); admission stays fenced`,
+  );
 }
 
 /**
@@ -14917,15 +15442,21 @@ export function sendWorkerInput(
   if (feedbackMaintenanceActive(config.session.dataDir)) return false;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
-    const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
+    const fencedBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    const remoteBackend = fencedBackendType === 'mojo'
       ? 'Mojo'
       : 'Riff';
+    // A Riff `uncertain` fence is not "closing, please wait": nothing is in
+    // flight and waiting changes nothing. Name the action that clears it.
+    const noticeKey = fencedBackendType === 'riff' && remoteRetirementPhase === 'close-uncertain'
+      ? 'worker.remote_close_uncertain'
+      : 'worker.remote_close_in_progress';
     logger.warn(
       `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
     );
     if (opts.notifyRejection !== false) void callbacks?.sessionReply(
       sessionAnchorId(ds),
-      tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
+      tr(noticeKey, { backend: remoteBackend }, localeForBot(ds.larkAppId)),
       'text',
       ds.larkAppId,
       turnId,
@@ -21807,6 +22338,21 @@ function setupWorkerHandlers(
           || pending.worker !== worker
           || pending.sessionId !== ds.session.sessionId
           || ds.worker !== worker) {
+          // The prepare this answers already timed out and left the fence
+          // `uncertain` under this exact request id: the result is late, not
+          // stale, and may be the proof that fence is waiting for.
+          if (!pending
+              && ds.worker === worker
+              && !riffCloseReconcileInFlight.has(ds)
+              && (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff'
+              && ds.remoteCloseState?.phase === 'uncertain'
+              && ds.remoteCloseState.requestId === msg.requestId) {
+            void adoptLateRiffCloseResult(ds, worker, msg).catch(err => logger.warn(
+              `[${t}] Late Riff close result handling failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            ));
+            break;
+          }
           logger.warn(`[${t}] Ignored stale/unmatched remote close result ${msg.requestId}`);
           break;
         }
@@ -23580,6 +24126,7 @@ function setupWorkerHandlers(
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
+        noteRiffCloseWorkerGone(ds, { exited: true });
       }
       // Do not clear remoteShutdownState here. Only the shutdown coordinator can
       // release a generation after lineage persistence or admission restore.
