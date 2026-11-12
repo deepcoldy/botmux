@@ -954,6 +954,80 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
 }
 
+/** Pages {@link findCurrentChatUserMembers} reads before giving up (100/page). */
+export const CURRENT_CHAT_USER_MEMBER_PAGE_CAP = 100;
+
+/** The member list was still `has_more` at the page cap with someone unconfirmed. */
+export class ChatMemberListTooLargeError extends Error {
+  constructor(chatId: string) {
+    super(
+      `Chat ${chatId} has more than ${CURRENT_CHAT_USER_MEMBER_PAGE_CAP * 100} members; `
+      + 'could not read the member list to the end to rule anyone out',
+    );
+    this.name = 'ChatMemberListTooLargeError';
+  }
+}
+
+/**
+ * Authorization-grade: which of `openIds` are current human members of the
+ * chat, per `larkAppId`'s live `/members` list (app-scoped open_ids; the list
+ * never contains bots). Stops paging as soon as everyone is found — a row in
+ * any live page proves membership — but only rules someone out after reading
+ * the list to the end. Anything that would make the list look shorter than it
+ * is throws instead: an API error, a page without an `items` array, a
+ * non-boolean `has_more`, `has_more` without a fresh page token (missing or
+ * already used), or hitting the page cap ({@link ChatMemberListTooLargeError}).
+ * Unlike {@link listChatUserMembers} it never returns a silently partial list.
+ */
+export async function findCurrentChatUserMembers(
+  larkAppId: string,
+  chatId: string,
+  openIds: readonly string[],
+): Promise<Set<string>> {
+  if (openIds.length === 0) return new Set();
+  const c = getBotClient(larkAppId);
+  return scanChatMemberPages(chatId, openIds, pageToken => larkGet(
+    c,
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`,
+    { member_id_type: 'open_id', page_size: '100', ...(pageToken ? { page_token: pageToken } : {}) },
+  ));
+}
+
+/** The paging rules of {@link findCurrentChatUserMembers}, over any page source. */
+export async function scanChatMemberPages(
+  chatId: string,
+  openIds: readonly string[],
+  fetchPage: (pageToken: string | undefined) => Promise<any>,
+): Promise<Set<string>> {
+  const wanted = new Set(openIds);
+  const found = new Set<string>();
+  if (wanted.size === 0) return found;
+  const usedTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < CURRENT_CHAT_USER_MEMBER_PAGE_CAP; page++) {
+    const res = await fetchPage(pageToken);
+    if (res?.code !== 0) throw larkApiError('list chat members', res);
+    const items = res.data?.items;
+    if (!Array.isArray(items)) throw new Error(`list chat members: page ${page + 1} has no items array`);
+    for (const it of items) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && wanted.has(id)) found.add(id);
+    }
+    if (found.size === wanted.size) return found;
+    const hasMore = res.data?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error(`list chat members: page ${page + 1} has no boolean has_more`);
+    if (!hasMore) return found;
+    const next = res.data?.page_token;
+    if (typeof next !== 'string' || !next) {
+      throw new Error(`list chat members: page ${page + 1} has more members but no page_token`);
+    }
+    if (usedTokens.has(next)) throw new Error(`list chat members: page ${page + 1} repeats an earlier page_token`);
+    usedTokens.add(next);
+    pageToken = next;
+  }
+  throw new ChatMemberListTooLargeError(chatId);
+}
+
 /**
  * Resolve a chat's display name (the user-facing group title). Returns `null`
  * on any failure (chatId is unknown to this bot, network error, bot not in

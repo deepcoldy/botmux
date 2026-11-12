@@ -8,6 +8,7 @@ type Tr = (key: string, values?: Record<string, string | number>) => string;
 
 const MAX_SUBJECTS = 50;
 const READBACK_BATCH = 50;
+const NAMES_IN_TOAST = 3;
 
 const QUOTA_OPTIONS = ['1', '3', '5', '10', '20', '50', '100', '1000', 'unlimited'] as const;
 
@@ -97,8 +98,16 @@ export function MemberAccessSection(props: {
     };
   }, [displays, search]);
 
+  // 机器人视角下的 bot 自身：后端拒绝给自己授权（receiver_cannot_be_subject），
+  // 所以这一行不可勾选。
+  const selfOpenIds = useMemo(
+    () => new Set((displays ?? []).filter(member => member.self === true).map(member => member.openId)),
+    [displays],
+  );
+
   function toggleMember(openId: string, checked: boolean): void {
     if (disabled || busy) return;
+    if (checked && selfOpenIds.has(openId)) return;
     setSelected(cur => {
       const next = new Set(cur);
       if (checked) next.add(openId);
@@ -137,11 +146,37 @@ export function MemberAccessSection(props: {
         toast(tr('grantAdmin.grantOk', { count: subjectIds.length || ids.length }), { kind: 'success' });
         return;
       }
-      // 成员已离群（receiver 视角 live membership 不含）：明确语义提示，
-      // 不是网络错误。
-      if (r.status === 409 && body.error === 'subject_not_current_chat_bot') {
-        const count = Array.isArray(body.invalidSubjectOpenIds) ? body.invalidSubjectOpenIds.length : ids.length;
-        toast(tr('grantAdmin.notInChat', { count }), { kind: 'warning' });
+      // 整批先按同一份 live 成员快照校验，任何一人不通过就整批不写；
+      // 把被拒的人点名并取消勾选，剩下的人可以直接再点一次授权。
+      const invalid: string[] = Array.isArray(body.invalidSubjectOpenIds)
+        ? body.invalidSubjectOpenIds.map((id: unknown) => String(id))
+        : [];
+      const rejected = invalid.length > 0 ? invalid : ids;
+      // 旧 daemon 只查机器人名单，真人必然被它判成「不在群」：这时说「已离群」
+      // 就是误报，改为提示 daemon 版本过旧。被拒的全是机器人时仍按离群处理。
+      if (r.status === 409 && body.error === 'subject_not_current_chat_bot' && rejected.some(id => !isBotRow(id))) {
+        toast(tr('grantAdmin.daemonTooOld'), { kind: 'warning' });
+        return;
+      }
+      // 成员确实已离群（receiver 视角的 live 群成员 / 机器人名单都不含）。
+      if (r.status === 409 && (body.error === 'subject_not_current_chat_member' || body.error === 'subject_not_current_chat_bot')) {
+        unselect(rejected);
+        toast(tr('grantAdmin.notInChat', { count: rejected.length, names: memberNames(rejected) }), { kind: 'warning' });
+        return;
+      }
+      if (body.error === 'receiver_cannot_be_subject') {
+        unselect(invalid);
+        toast(tr('grantAdmin.selfNotGrantable'), { kind: 'warning' });
+        return;
+      }
+      // 飞书成员接口暂不可用：无法确认是否在群，按 fail-closed 不授权，不是「不在群」。
+      if (body.error === 'live_membership_unavailable') {
+        toast(tr('grantAdmin.membershipUnavailable'), { kind: 'error' });
+        return;
+      }
+      // 群太大、成员名单读不到底：无法排除任何人，重试也不会变，不说「稍后重试」。
+      if (body.error === 'live_membership_too_large') {
+        toast(tr('grantAdmin.membershipTooLarge'), { kind: 'error' });
         return;
       }
       toast(`${tr('grantAdmin.grantFailed')}: ${body.error ?? r.status}`, { kind: 'error' });
@@ -150,6 +185,21 @@ export function MemberAccessSection(props: {
     } finally {
       setBusy(false);
     }
+  }
+
+  function unselect(openIds: string[]): void {
+    if (openIds.length === 0) return;
+    setSelected(cur => new Set([...cur].filter(id => !openIds.includes(id))));
+  }
+
+  function isBotRow(openId: string): boolean {
+    return (displays ?? []).some(member => member.openId === openId && member.memberType === 'bot');
+  }
+
+  function memberNames(openIds: string[]): string {
+    const byId = new Map((displays ?? []).map(member => [member.openId, member.name || member.openId]));
+    const names = openIds.slice(0, NAMES_IN_TOAST).map(id => byId.get(id) ?? id);
+    return openIds.length > NAMES_IN_TOAST ? `${names.join('、')}…` : names.join('、');
   }
 
   async function setWholeGroup(grant: boolean): Promise<void> {
@@ -361,19 +411,24 @@ function MemberRow(props: {
   onSetBlocked(openId: string, block: boolean): void;
 }) {
   const { member, tr } = props;
+  const isSelf = member.self === true;
+  // 群管理抽屉把 .checkbox-row 里的原生复选框隐藏且不接收点击（整颗胶囊才是点击
+  // 目标），所以这一行必须是 <label>，点胶囊才会勾选；行内的封禁按钮属于交互
+  // 子元素，点它不会连带勾选。
   return (
-    <div className="checkbox-row" data-member-row={member.openId}>
+    <label className="checkbox-row" data-member-row={member.openId}>
       <input
         type="checkbox"
         data-action="member-select"
         value={member.openId}
         checked={props.checked}
-        disabled={props.disabled}
+        disabled={props.disabled || isSelf}
         onChange={ev => props.onToggle(member.openId, ev.currentTarget.checked)}
       />
       <span className="checkbox-row-main">
         <strong>{member.name || member.openId}</strong>
         {member.name ? <small>({member.openId})</small> : null}
+        {isSelf ? <small> · {tr('grantAdmin.selfTag')}</small> : null}
         {props.granted ? <small className="hint-ok"> · {tr('grantAdmin.grantedTag')}</small> : null}
         {props.blocked ? <small className="hint-warn-inline"> · {tr('blocked.rowBlockedTag')}</small> : null}
       </span>
@@ -392,7 +447,7 @@ function MemberRow(props: {
           onClick={() => void props.onSetBlocked(member.openId, true)}
         >{tr('blocked.rowBlock')}</button>
       )}
-    </div>
+    </label>
   );
 }
 

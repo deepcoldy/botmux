@@ -1,14 +1,18 @@
 /**
- * Scriptable, least-privilege bot-to-bot grants.
+ * Scriptable, least-privilege exact chat grants (talk-only).
  *
  * This service intentionally writes only `chatGrants[chatId]`. It never writes
  * `allowedUsers`, `allowedChatGroups`, global grants, team trust, or any
- * operate-capable identity store. Membership checks use Feishu's live
- * `/members/bots` result and fail closed; the long-lived observed-bot fallback
- * is suitable for discovery, not authorization.
+ * operate-capable identity store. A subject must currently be in the chat as
+ * seen by the receiver app: bots per Feishu's live `/members/bots` result,
+ * people per the live chat member list (`/members`, which never lists bots).
+ * Every lookup a subject depends on fails closed; the long-lived observed-bot
+ * fallback is suitable for discovery, not authorization.
  */
 import { getBot, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
 import {
+  ChatMemberListTooLargeError,
+  findCurrentChatUserMembers,
   listCurrentChatBotMembers,
   resolveCurrentChatBotOpenIdsByLarkAppIds,
   type CurrentChatBotAppMapping,
@@ -89,6 +93,14 @@ export interface ExactChatGrantDeps {
   getOwnerOpenId(larkAppId: string): string | undefined;
   getReceiverBotOpenId(larkAppId: string): string | undefined;
   listCurrentChatBotMembers(larkAppId: string, chatId: string): Promise<CurrentChatBotMember[]>;
+  /**
+   * Which of `openIds` are current human members per the receiver's live chat
+   * member list. Must throw instead of answering from an incomplete list — a
+   * partial list would make a member look absent (a wrong "not in chat");
+   * throw {@link ChatMemberListTooLargeError} when the list is too long to
+   * read to the end.
+   */
+  findCurrentChatUserMembers(larkAppId: string, chatId: string, openIds: string[]): Promise<Iterable<string>>;
   resolveCurrentChatBotOpenIdsByLarkAppIds(
     receiverLarkAppId: string,
     chatId: string,
@@ -109,6 +121,9 @@ const defaultDeps: ExactChatGrantDeps = {
   getOwnerOpenId,
   getReceiverBotOpenId: getBotOpenId,
   listCurrentChatBotMembers,
+  // Resolved at call time: a grant may never touch the member list (bot-only
+  // batches), so loading this module must not depend on that export.
+  findCurrentChatUserMembers: (larkAppId, chatId, openIds) => findCurrentChatUserMembers(larkAppId, chatId, openIds),
   resolveCurrentChatBotOpenIdsByLarkAppIds,
   addChatGrant,
   removeChatGrant,
@@ -175,6 +190,81 @@ function normalizeSubjects(raw: unknown): { ok: true; value: string[] } | ExactC
   return { ok: true, value: [...new Set(trimmed)] };
 }
 
+/** `bots`: the caller already knows every subject is a bot (stable app ids). */
+type SubjectScope = 'any' | 'bots';
+
+/**
+ * Check every subject against the receiver app's live view of the chat.
+ * Returns undefined when all subjects are current members, else the failure.
+ *
+ * open_ids carry no bot/person marker, so a subject counts as a member when it
+ * is in the live bot list or in the live human member list. Bots are checked
+ * first, and subjects already known to be bots (scope `bots`, the scripted
+ * bot-to-bot path) are checked against the bot list only — exactly as before
+ * people could be granted. A failed bot lookup is not final by itself — people
+ * confirmed by the member list still pass — but any subject that neither list
+ * confirms is then unknown, not absent, and the batch fails closed as
+ * unavailable rather than reporting a false "not in chat".
+ */
+async function verifyCurrentChatMembership(
+  receiverLarkAppId: string,
+  chatId: string,
+  subjectOpenIds: string[],
+  scope: SubjectScope,
+  deps: ExactChatGrantDeps,
+): Promise<ExactChatGrantFailure | undefined> {
+  let unconfirmed = subjectOpenIds;
+  let botLookupError: string | undefined;
+  try {
+    const bots = new Set(
+      (await deps.listCurrentChatBotMembers(receiverLarkAppId, chatId)).map(member => member.openId),
+    );
+    unconfirmed = unconfirmed.filter(openId => !bots.has(openId));
+  } catch (err: any) {
+    botLookupError = err?.message ?? 'Feishu live bot membership lookup failed';
+  }
+  if (scope === 'bots') {
+    if (botLookupError !== undefined) return failure(502, 'live_membership_unavailable', botLookupError);
+    if (unconfirmed.length === 0) return undefined;
+    return failure(
+      409,
+      'subject_not_current_chat_bot',
+      'Every subject must appear in the receiver-scoped live /members/bots result',
+      { invalidSubjectOpenIds: unconfirmed },
+    );
+  }
+  if (unconfirmed.length === 0) return undefined;
+
+  let people: Set<string>;
+  try {
+    people = new Set(await deps.findCurrentChatUserMembers(receiverLarkAppId, chatId, unconfirmed));
+  } catch (err: any) {
+    // A failed bot lookup sent bots here too, and the member list never lists
+    // bots: "too large" would then hide the real, retryable cause.
+    if (err instanceof ChatMemberListTooLargeError && botLookupError === undefined) {
+      return failure(422, 'live_membership_too_large', err.message);
+    }
+    if (botLookupError !== undefined) return failure(502, 'live_membership_unavailable', botLookupError);
+    return failure(
+      502,
+      'live_membership_unavailable',
+      err?.message ?? 'Feishu live chat member lookup failed',
+    );
+  }
+  const missing = unconfirmed.filter(openId => !people.has(openId));
+  if (missing.length === 0) return undefined;
+  if (botLookupError !== undefined) {
+    return failure(502, 'live_membership_unavailable', botLookupError);
+  }
+  return failure(
+    409,
+    'subject_not_current_chat_member',
+    'Every subject must currently be in the chat (bots per the receiver-scoped live /members/bots '
+      + 'result, people per the live chat member list)',
+    { invalidSubjectOpenIds: missing },
+  );
+}
+
 /**
  * Validate and apply one exact chat-grant batch. For grants, every target is
  * validated against one live membership snapshot before the first mutation,
@@ -183,6 +273,14 @@ function normalizeSubjects(raw: unknown): { ok: true; value: string[] } | ExactC
 export async function applyExactChatGrant(
   input: ExactChatGrantInput,
   deps: ExactChatGrantDeps = defaultDeps,
+): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
+  return applyExactChatGrantInScope(input, 'any', deps);
+}
+
+async function applyExactChatGrantInScope(
+  input: ExactChatGrantInput,
+  scope: SubjectScope,
+  deps: ExactChatGrantDeps,
 ): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
   if (input.operation !== 'grant' && input.operation !== 'revoke' && input.operation !== 'readback') {
     return failure(400, 'invalid_operation', 'operation must be grant, revoke, or readback');
@@ -216,26 +314,8 @@ export async function applyExactChatGrant(
   // chat. Readback returns only explicitly requested ids and does not enumerate
   // the grant table.
   if (operation === 'grant') {
-    let members: CurrentChatBotMember[];
-    try {
-      members = await deps.listCurrentChatBotMembers(input.receiverLarkAppId, chatId);
-    } catch (err: any) {
-      return failure(
-        502,
-        'live_membership_unavailable',
-        err?.message ?? 'Feishu live bot membership lookup failed',
-      );
-    }
-    const currentOpenIds = new Set(members.map(member => member.openId));
-    const missing = subjectOpenIds.filter(openId => !currentOpenIds.has(openId));
-    if (missing.length > 0) {
-      return failure(
-        409,
-        'subject_not_current_chat_bot',
-        'Every subject must appear in the receiver-scoped live /members/bots result',
-        { invalidSubjectOpenIds: missing },
-      );
-    }
+    const membership = await verifyCurrentChatMembership(input.receiverLarkAppId, chatId, subjectOpenIds, scope, deps);
+    if (membership) return membership;
   }
 
   if (operation === 'readback') {
@@ -410,14 +490,14 @@ export async function applyExactChatGrantByLarkAppIds(
       subjectMappings: completeMappings,
     };
   }
-  const result = await applyExactChatGrant({
+  const result = await applyExactChatGrantInScope({
     operation: 'grant',
     receiverLarkAppId: input.receiverLarkAppId,
     chatId: input.chatId,
     subjectOpenIds: completeMappings.map(mapping => mapping.subjectOpenId),
     quota: input.quota,
     durationMs: input.durationMs,
-  }, deps);
+  }, 'bots', deps);
   if (!result.ok) return result;
   return { ...result, subjectMappings: completeMappings };
 }
