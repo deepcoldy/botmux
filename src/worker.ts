@@ -2062,7 +2062,10 @@ function observeContractNativeSession(nativeSessionId: string): void {
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
-  const captured = origin ?? workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined) ?? operationOrigin;
+  // Runtime identity follows the physical observer's binding. A submitted
+  // turn may still name the previous runtime after an in-process rebind.
+  const captured = origin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
+    : workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined)) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
@@ -2076,7 +2079,9 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   }
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
-  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
+  // The native conversation ID is also learned before the first input runs;
+  // its turnId is display context, not proof that this attempt was accepted.
+  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation' || msg.type === 'cli_session_id') delete context.scope.execution;
   // Queue observations belong to this worker process, not to a turn or a
   // runtime: they span turns (including admissions not yet bound to the
   // runtime) and runtimes too. Whatever callback publishes one, it reports the
