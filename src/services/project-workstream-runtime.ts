@@ -215,15 +215,6 @@ export async function localProjectAttachmentSource(appId: string, sessionId: str
   };
 }
 
-function resolveSourceBotDisplayName(appId: string): string {
-  try {
-    const local = getBot(appId)?.botName?.trim();
-    if (local) return local;
-  } catch { /* bot not registered in this daemon */ }
-  const peer = findOnlineDaemon(appId)?.botName?.trim();
-  return peer || appId;
-}
-
 export async function getProjectAttachmentSource(appId: string, sessionId: string): Promise<ProjectAttachmentSource | undefined> {
   const local = await localProjectAttachmentSource(appId, sessionId);
   if (local) return local;
