@@ -2053,7 +2053,10 @@ function observeContractNativeSession(nativeSessionId: string): void {
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
-  const captured = origin ?? workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined) ?? operationOrigin;
+  const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
+    ? pendingManagedTurnOriginScope
+    : undefined);
+  const captured = explicitOrigin ?? workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
@@ -6945,6 +6948,8 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     const explicitOrigin = binding?.runtime
       ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
       : undefined;
+    pendingManagedTurnOriginScope = explicitOrigin;
+    try {
     send({
       type: 'managed_turn_origin',
       sessionId,
@@ -6962,7 +6967,10 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
         ? { dispatchAttempt: capability.dispatchAttempt }
         : {}),
       ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
-    }, explicitOrigin);
+    });
+    } finally {
+      pendingManagedTurnOriginScope = undefined;
+    }
   }
   return true;
 }
@@ -6984,6 +6992,7 @@ function unlinkManagedOriginCapabilityFiles(): void {
 }
 
 let publishedOriginContractScope: { bindingId: string; executionId: string } | undefined;
+let pendingManagedTurnOriginScope: CapturedSessionOrigin | undefined;
 
 function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
@@ -12928,7 +12937,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
             });
           }
           log(`Structured bridge baseline-existing recovered: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
-          refreshActiveRuntimeContract();
+          if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         } catch (error) {
           skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -13265,7 +13274,7 @@ function currentCodexObservedPid(): number | undefined {
       // The next observation retries that publication before the native fast path.
       codexOwnershipAttestationPending = true;
       log(`Codex ownership pid refreshed ${wired ?? '?'} → ${pid}`);
-      refreshActiveRuntimeContract();
+      if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     }
     return withAttestation(pid);
   }
@@ -29059,7 +29068,7 @@ async function spawnCliBody(
     // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
-    refreshActiveRuntimeContract();
+    if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     publishLocalProcessAttestation(realPid);
   };
   // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
@@ -29183,7 +29192,7 @@ async function spawnCliBody(
         // Same pair applyResolvedCliPid keeps in step: a launch-payload binding
         // may already have pointed the bridge pid at a layer above this leaf.
         bridgeCliPid = realPid;
-        refreshActiveRuntimeContract();
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -29218,7 +29227,7 @@ async function spawnCliBody(
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         bridgeCliPid = realPid;
-        refreshActiveRuntimeContract();
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         codexOwnershipAttestationPending = !publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -29313,7 +29322,7 @@ async function spawnCliBody(
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
           if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }
-        refreshActiveRuntimeContract();
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
         // pid too (mirrors the synchronous path above). No-op for non-wrapperCli.
