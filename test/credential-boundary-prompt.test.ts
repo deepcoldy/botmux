@@ -254,7 +254,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
       config: {
         larkAppId: appId,
         larkToolBinding: true,
-        triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
       },
     });
     try {
@@ -297,7 +297,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
         larkAppId: APP,
         larkToolBinding,
         ...(enabled
-          ? { triggerUserAuth: { enabled: true, tools, fallback: 'bot-identity' } }
+          ? { triggerUserAuth: { enabled: true, tools } }
           : {}),
       },
     });

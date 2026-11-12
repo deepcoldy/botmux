@@ -185,7 +185,7 @@ it('authorizes the real bound auth-request route from the human origin produced 
   expect(h.ds.managedTurnOrigin?.callerOpenId).toBe('ou_human');
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's1' ? h.ds : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: h.ds.larkAppId, larkAppSecret: 'test-secret',
-    triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_human', type: 'user', source: 'sender', updatedAt: 0 });
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
   const oauth = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://accounts.feishu.cn/oauth/device?user_code=test',

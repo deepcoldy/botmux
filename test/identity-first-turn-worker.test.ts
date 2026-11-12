@@ -131,7 +131,7 @@ function spawnIdentityWorker(opts: { apiOnly: boolean }): WorkerHandle {
     larkAppId: 'app_first_turn',
     larkAppSecret: 'secret',
     apiOnly: opts.apiOnly,
-    triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' },
+    triggerUserAuth: { enabled: true, tools: ['bytedcli'] },
   } satisfies DaemonToWorker);
 
   return { child, logs, messages, root, sessionId, fakeBin };

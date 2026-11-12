@@ -198,7 +198,7 @@ describe('local authorization (this machine mints from the sender\'s login)', ()
     await publishFor('local', ALICE, 'om_turn_1');
     await publishFor('local', BOB, 'om_turn_2');
     expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '本机为发起人签票');
-    expect(bytedcli()).toMatchObject({ status: 0, jwt: jwt('cn', 'bob') });
+    expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'bob') });
   });
 });
 
@@ -233,8 +233,11 @@ describe('platform grant', () => {
     platform = { upToDate: false, partitions: {} };
     await publishFor('platform', ALICE);
     const site = { BYTEDCLI_CLOUD_SITE: 'i18n-tt' };
-    for (const args of [['codebase', 'mr', 'list'], ['-j', 'meego', 'workitem', 'list'], ['--version'], ['aa', 'query', '--help'], []]) {
+    for (const args of [['codebase', 'mr', 'list'], ['-j', 'meego', 'workitem', 'list'], ['aa', 'query', '--help']]) {
       expect(bytedcliWithEnv(site, ...args)).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    }
+    for (const args of [['--version'], []]) {
+      expect(bytedcliWithEnv(site, ...args)).toMatchObject({ status: 0, jwt: '' });
     }
     expectRefused(bytedcliWithEnv(site, 'aa', 'query'), 'i18n', '升级平台');
   });
@@ -249,7 +252,7 @@ describe('platform grant', () => {
     platform = { upToDate: true, partitions: { on_alice: ['i18n'] }, expired: true };
     await publishFor('platform', ALICE);
     expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '平台为发起人签票');
-    expect(bytedcli()).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   });
 
   it('loses only the partition whose ticket arrived malformed, not the default ticket', async () => {
@@ -257,7 +260,7 @@ describe('platform grant', () => {
     await publishFor('platform', ALICE);
     expect(bytedcli('--site', 'i18n-tt')).toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
     expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query'), 'tx', '平台为发起人签票');
-    expect(bytedcli()).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   });
 
   it('gives each turn the partition tokens granted for that turn\'s sender', async () => {

@@ -38,6 +38,9 @@ export interface ProviderAuthDeps {
    *  meanwhile); 'unknown' when the provider cannot be asked. */
   bytedcliAuthorized: (openId: string) => Promise<boolean | 'unknown'>;
   beginBytedcliLogin: (openId: string) => Promise<{ authUrl: string } | null>;
+  /** Hands a finished ByteCloud login to the running turn; true when the turn
+   *  can use it now. */
+  adoptBytedcliForTurn: (openId: string) => Promise<'adopted' | 'already' | 'none'>;
   /** {@link deliverAuthLink} bound to this conversation and person. */
   deliver: (text: string, privateCommand: string) => Promise<AuthLinkDelivery>;
   now?: () => number;
@@ -74,7 +77,9 @@ export async function requestProviderAuth(
     };
   } else {
     if (await deps.bytedcliAuthorized(openId) === true) {
-      return { status: 'ready', message: t('provider_auth.ready_bytedcli', undefined, locale) };
+      const adopted = await deps.adoptBytedcliForTurn(openId);
+      const key = { adopted: 'provider_auth.ready_bytedcli_now', already: 'provider_auth.ready_bytedcli_already', none: 'provider_auth.ready_bytedcli' }[adopted];
+      return { status: 'ready', message: t(key, undefined, locale) };
     }
     const started = await deps.beginBytedcliLogin(openId);
     if (!started) {

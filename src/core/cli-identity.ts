@@ -41,11 +41,12 @@ import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
-import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { capabilitiesOf, type TriggerUserAuthCapability as Capability, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome, ensureMeegoStore, MEEGO_ENV_CREDENTIALS, MEEGO_STORE_DIR } from '../services/bytedcli-home.js';
+import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
@@ -172,14 +173,16 @@ function dropMatchingEnvFiles(dir: string, openId: string): number {
     } catch { /* best-effort */ }
   }
   for (const parent of bytedcliRemoved) {
-    const companion = join(parent, `${CODEBASE_COMPANION_TOOL}.env`);
-    try {
-      const text = readFileSync(companion, 'utf8');
-      const stamped = stampedOpenId(text);
-      if (stamped !== undefined && stamped !== openId) continue;
-      rmSync(companion, { force: true });
-      dropped += 1;
-    } catch { /* already removed, or it names someone else and we kept it */ }
+    for (const name of COMPANION_TOOLS) {
+      const companion = join(parent, `${name}.env`);
+      try {
+        const text = readFileSync(companion, 'utf8');
+        const stamped = stampedOpenId(text);
+        if (stamped !== undefined && stamped !== openId) continue;
+        rmSync(companion, { force: true });
+        dropped += 1;
+      } catch { /* already removed, or it names someone else and we kept it */ }
+    }
   }
   return dropped;
 }
@@ -219,10 +222,12 @@ export function dropPublishedIdentitiesForOpenId(sessionDataDir: string, openId:
         dropped += 1;
         if (tool === 'bytedcli') removedBytedcli = true;
       }
-      if (removedBytedcli && typeof tools[CODEBASE_COMPANION_TOOL] === 'string') {
-        const stamped = stampedOpenId(tools[CODEBASE_COMPANION_TOOL]);
+      for (const name of COMPANION_TOOLS) {
+        const body = tools[name];
+        if (!removedBytedcli || typeof body !== 'string') continue;
+        const stamped = stampedOpenId(body);
         if (stamped === undefined || stamped === openId) {
-          delete tools[CODEBASE_COMPANION_TOOL];
+          delete tools[name];
           dropped += 1;
         }
       }
@@ -468,7 +473,12 @@ function assertSafeSegment(value: string): string {
  * scope or dashboard surface has to learn a third name.
  */
 export const CODEBASE_COMPANION_TOOL = 'codebase' as const;
-export type IdentityTool = TriggerUserAuthTool | typeof CODEBASE_COMPANION_TOOL;
+/** The Bits CLI is the second bytedcli companion: it reads the same ByteCloud
+ *  JWT, from its own variable. */
+export const BITSCLI_COMPANION_TOOL = 'bitscli' as const;
+export type CompanionTool = typeof CODEBASE_COMPANION_TOOL | typeof BITSCLI_COMPANION_TOOL;
+const COMPANION_TOOLS: readonly CompanionTool[] = [CODEBASE_COMPANION_TOOL, BITSCLI_COMPANION_TOOL];
+export type IdentityTool = TriggerUserAuthTool | CompanionTool;
 
 export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // APP_SECRET appears only in bot mode; in user mode it is absent from the
@@ -480,12 +490,27 @@ export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // The Codebase CLI reads the same Codebase JWT from its own variable
   // (`codebase auth login --help`: CI usage without persisting credentials).
   codebase: ['CODEBASE_CLI_USER_JWT'],
+  // bitscli dispatches to several packages with their own credential sources:
+  // devops reads AIME_USER_CLOUD_JWT, pipeline reads CLOUD_JWT, codebase reads
+  // CODEBASE_CLI_USER_JWT. All three are injected, and the exec runs under the
+  // person's scratch HOME so no machine config file can supply another one.
+  bitscli: ['AIME_USER_CLOUD_JWT', 'CLOUD_JWT', 'CODEBASE_CLI_USER_JWT', 'BYTEDCLI_USER_CLOUD_JWT'],
 };
 
-/** The identity tools a policy actually governs (policy tools + companions). */
-export function identityToolsFor(tools: readonly TriggerUserAuthTool[]): IdentityTool[] {
+/** Extra command names a tool's wrapper is also installed under (same package, second bin). */
+const IDENTITY_WRAPPER_ALIASES: Partial<Record<IdentityTool, readonly string[]>> = { bitscli: ['bits-cli'] };
+
+/** The identity tools a policy actually governs (policy tools + companions).
+ *  The companions follow the ByteCloud capability, not Meego. */
+export function identityToolsFor(
+  tools: readonly TriggerUserAuthTool[],
+  capabilities: ReadonlySet<Capability>,
+): IdentityTool[] {
   const out = new Set<IdentityTool>(tools);
-  if (out.has('bytedcli')) out.add(CODEBASE_COMPANION_TOOL);
+  if (out.has('bytedcli') && capabilities.has('bytecloud')) {
+    out.add(CODEBASE_COMPANION_TOOL);
+    out.add(BITSCLI_COMPANION_TOOL);
+  }
   return [...out];
 }
 
@@ -554,6 +579,9 @@ export interface BytedCliIdentity extends TurnBound {
    * {@link writeSessionIdentity} for an identity with an open_id.
    */
   meegoHome?: string;
+  /** ByteCloud is native for this bot and only Meego is the person's: `cloudJwt`
+   *  is empty and no companion identity is published. */
+  meegoOnly?: true;
 }
 
 /**
@@ -586,6 +614,8 @@ export interface DeniedIdentity extends TurnBound {
   tool: IdentityTool;
   mode: 'denied';
   message: string;
+  /** The person the refusal is for, when known: a later grant is only taken up for the same one. */
+  openId?: string;
 }
 
 /**
@@ -599,7 +629,20 @@ export interface CodebaseCliIdentity extends TurnBound {
   openId?: string;
 }
 
-export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | CodebaseCliIdentity | BotIdentity | DeniedIdentity;
+/** Bits CLI as a person: the ByteCloud JWT of the bytedcli identity. Never
+ *  resolved on its own — a companion like {@link CodebaseCliIdentity}. */
+export interface BitscliIdentity extends TurnBound {
+  tool: typeof BITSCLI_COMPANION_TOOL;
+  cloudJwt: string;
+  codeJwt?: string;
+  /** The bytedcli identity's per-person HOME: bitscli reads machine config
+   *  files from HOME, so it must see the same scratch directory. */
+  home?: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
+}
+
+export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | CodebaseCliIdentity | BitscliIdentity | BotIdentity | DeniedIdentity;
 
 /** Exit code for a command refused for want of authorization. Distinct from the
  *  tool's own failures so callers can tell "not allowed" from "did not work".
@@ -616,6 +659,10 @@ const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
 /** Open id these credentials act for. Compared with the worker's live-turn
  *  caller when the turn ids disagree: equal principals keep the credential. */
 const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
+/** Set for turns nobody is attending (see isUnattendedIdentityTurnId): the
+ *  wrapper never starts an authorization flow for them. */
+const UNATTENDED_VAR = 'BOTMUX_IDENTITY_UNATTENDED';
+
 /** Per-person HOME for the device-code lark-cli identity. Scoped to the child
  *  exec only — the wrapper sets it inline, never inheriting a parent value. */
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
@@ -877,8 +924,14 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     );
   } else if (identity.tool === CODEBASE_COMPANION_TOOL) {
     pairs.push([MODE_VAR, 'user'], ['CODEBASE_CLI_USER_JWT', identity.codeJwt]);
+  } else if (identity.tool === BITSCLI_COMPANION_TOOL) {
+    pairs.push([MODE_VAR, 'user'], ['AIME_USER_CLOUD_JWT', identity.cloudJwt], ['CLOUD_JWT', identity.cloudJwt],
+      ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+    if (identity.codeJwt) pairs.push(['CODEBASE_CLI_USER_JWT', identity.codeJwt]);
+    if (identity.home) pairs.push([HOME_VAR, identity.home]);
   } else {
-    pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+    pairs.push([MODE_VAR, 'user']);
+    if (identity.cloudJwt) pairs.push(['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
     for (const [region, jwt] of Object.entries(identity.regionalCloudJwts ?? {})) {
       const key = BYTEDCLI_REGIONAL_JWT_VARS[region as BytedcliRegion];
@@ -891,6 +944,7 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     if (identity.meegoHome) pairs.push([MEEGO_HOME_VAR, identity.meegoHome]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
+  if (isUnattendedIdentityTurnId(identity.turnId)) pairs.push([UNATTENDED_VAR, '1']);
   if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
   return header + pairs.map(([k, v]) => `${k}=${quoteFor(k, v)}`).join('\n') + '\n';
@@ -1014,19 +1068,18 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
 export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity) return identity;
-  const withMeego = identity.meegoHome ? identity : { ...identity, ...meegoStoreShape(identity.openId) };
-  if (withMeego.home) return withMeego;
+  if (identity.home) return identity;
   if (identity.turnId?.startsWith('background:')) {
-    return { ...withMeego, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
+    return { ...identity, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
   }
   const base = bytedcliHomeRoot(sessionDataDir, sessionId);
-  return { ...withMeego, home: bytedcliHomeFromBase(base, sessionId, identity) };
+  return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
 }
 
 /** Created here, on the host, so a session that can see the directory can use
  *  it and one that cannot (a sandbox masks it) is told so by its absence. A
  *  failure only costs this turn the shared Meego login, never the identity. */
-function meegoStoreShape(openId: string | undefined): Pick<BytedCliIdentity, 'meegoHome'> {
+export function meegoStoreShape(openId: string | undefined): Pick<BytedCliIdentity, 'meegoHome'> {
   if (!isUsableOpenId(openId)) return {};
   try {
     return { meegoHome: ensureMeegoStore(openId) };
@@ -1062,31 +1115,33 @@ export function writeSessionIdentity(
   if (model === 'proven') {
     if (!identity.turnId) throw new Error('[cli-identity] proven identity requires a turn id');
     rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, identity.tool, body);
-    // Companion mirror for the Codebase CLI: keep memory and disk branches in
-    // agreement whenever bytedcli publishes, so the two never disagree.
+    // Companion mirror for the Codebase and Bits CLIs: keep memory and disk
+    // branches in agreement whenever bytedcli publishes, so they never disagree.
     if (identity.tool === 'bytedcli') {
-      const companion = codebaseCompanionOf(identity);
-      rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, companion.tool,
-        renderIdentityEnv(companion));
+      for (const companion of companionsOf(identity)) {
+        rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, companion.tool,
+          renderIdentityEnv(companion));
+      }
     }
     return path;
   }
   const singlePath = join(sessionIdentityDataDir(sessionDataDir, sessionId), `${identity.tool}.env`);
   mkdirSync(dirname(singlePath), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(singlePath, body, { mode: 0o600 });
-  // Companion: every bytedcli publication (grant OR refusal) is mirrored for
-  // the Codebase CLI, so the two can never disagree about whose turn it is.
-  // Two files cannot be committed atomically; if the mirror fails, take the
+  // Companions: every bytedcli publication (grant OR refusal) is mirrored for
+  // the Codebase and Bits CLIs, so they can never disagree about whose turn it
+  // is. Files cannot be committed atomically; if a mirror fails, take the
   // bytedcli file down with it rather than leave a granted bytedcli next to a
-  // stale codebase identity (an absent file is a refusal for both wrappers).
+  // stale companion identity (an absent file is a refusal for every wrapper).
   if (identity.tool === 'bytedcli') {
-    const companion = codebaseCompanionOf(identity);
     try {
-      atomicWriteFileSync(
-        sessionIdentityPath(sessionDataDir, sessionId, companion.tool),
-        renderIdentityEnv(companion),
-        { mode: 0o600 },
-      );
+      for (const companion of companionsOf(identity)) {
+        atomicWriteFileSync(
+          sessionIdentityPath(sessionDataDir, sessionId, companion.tool),
+          renderIdentityEnv(companion),
+          { mode: 0o600 },
+        );
+      }
     } catch (e) {
       try { rmSync(singlePath, { force: true }); } catch { /* best-effort */ }
       throw e;
@@ -1119,7 +1174,7 @@ function isDeniedIdentity(identity: CliIdentity): identity is DeniedIdentity {
 export function codebaseCompanionOf(identity: BytedCliIdentity | DeniedIdentity): CodebaseCliIdentity | DeniedIdentity {
   const turn = identity.turnId ? { turnId: identity.turnId } : {};
   if (isDeniedIdentity(identity)) {
-    return { tool: CODEBASE_COMPANION_TOOL, mode: 'denied', message: identity.message, ...turn };
+    return { tool: CODEBASE_COMPANION_TOOL, mode: 'denied', message: identity.message, ...(identity.openId ? { openId: identity.openId } : {}), ...turn };
   }
   if (!identity.codeJwt) {
     return {
@@ -1135,6 +1190,27 @@ export function codebaseCompanionOf(identity: BytedCliIdentity | DeniedIdentity)
     ...turn,
     ...(identity.openId ? { openId: identity.openId } : {}),
   };
+}
+
+/** Bits CLI identity implied by a bytedcli one: the same ByteCloud JWT. */
+export function bitscliCompanionOf(identity: BytedCliIdentity | DeniedIdentity): BitscliIdentity | DeniedIdentity {
+  const turn = identity.turnId ? { turnId: identity.turnId } : {};
+  if (isDeniedIdentity(identity)) {
+    return { tool: BITSCLI_COMPANION_TOOL, mode: 'denied', message: identity.message, ...(identity.openId ? { openId: identity.openId } : {}), ...turn };
+  }
+  return {
+    tool: BITSCLI_COMPANION_TOOL,
+    cloudJwt: identity.cloudJwt,
+    ...(identity.codeJwt ? { codeJwt: identity.codeJwt } : {}),
+    ...(identity.home ? { home: identity.home } : {}),
+    ...turn,
+    ...(identity.openId ? { openId: identity.openId } : {}),
+  };
+}
+
+function companionsOf(identity: BytedCliIdentity | DeniedIdentity) {
+  if (!isDeniedIdentity(identity) && identity.meegoOnly) return [];
+  return [codebaseCompanionOf(identity), bitscliCompanionOf(identity)];
 }
 
 export function refreshSessionIdentity(
@@ -1190,14 +1266,20 @@ export function clearSessionIdentity(
 ): void {
   if (model === 'proven') {
     forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, tool);
-    // The companion lives and dies with bytedcli's in-memory identity.
-    if (tool === 'bytedcli') forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, CODEBASE_COMPANION_TOOL);
+    // The companions live and die with bytedcli's in-memory identity.
+    if (tool === 'bytedcli') {
+      forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, CODEBASE_COMPANION_TOOL);
+      forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, BITSCLI_COMPANION_TOOL);
+    }
     return;
   }
   try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
-  // The companion lives and dies with bytedcli's on-disk identity.
-  if (tool === 'bytedcli') clearSessionIdentity(sessionDataDir, sessionId, CODEBASE_COMPANION_TOOL, turnId, model);
+  // The companions live and die with bytedcli's on-disk identity.
+  if (tool === 'bytedcli') {
+    clearSessionIdentity(sessionDataDir, sessionId, CODEBASE_COMPANION_TOOL, turnId, model);
+    clearSessionIdentity(sessionDataDir, sessionId, BITSCLI_COMPANION_TOOL, turnId, model);
+  }
   if (turnId) return;
   const turnsDir = join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns');
   try {
@@ -1283,50 +1365,64 @@ const ALL_IDENTITY_TOOLS = Object.keys(IDENTITY_ENV_KEYS) as IdentityTool[];
  *    turn marker used for the tail-of-turn mismatch refusal.
  */
 /**
- * `bytedcli auth login` writes its login store under the XDG data dir. Inside a
- * session sandbox the MACHINE HOME's data dir is read-only, so without a
- * writable target the tool dies with a bare "read-only file system"; say what
- * to do instead.
- *
- * The check runs AFTER identity resolution, not before, and probes the HOME the
- * exec is actually about to use: a trigger-user bytedcli identity carries a
- * per-person HOME under the writable session scratch (#2550,
- * BOTMUX_IDENTITY_HOME), so probing the machine HOME there both blocks a login
- * that would succeed AND names the wrong directory. No identity means the
- * wrapper refuses at the mode dispatch anyway (exit 77, points at /login), so
- * the guard never needs to run for that case. Other commands exec unchanged.
+ * The one scan of the wrapped CLI's argv, run once at the top of the wrapper.
+ * Sets __botmux_sc_w1 / _w2 (first two operands), _login (a `login` operand that
+ * is the first operand or comes right after an `auth` or `meego` operand,
+ * whatever options sit between them), _help (a help/version flag outside option
+ * values) and _unknown (an option whose arity is not known: whether the next
+ * word is its value cannot be told, so callers treat the call as governed, and
+ * a following `login` still counts as an operand). An unknown option only
+ * matters for routing while the first operand is unresolved. The option lists
+ * are bytedcli's global options (`bytedcli --help --debug`) plus `--tenant`
+ * (meego) and bitscli's `--session-id`; after `--` every word is an operand.
  */
-const BYTEDCLI_LOGIN_GUARD_FN: readonly string[] = [
-  // Returns 0 (blocked) only when argv is a login form AND the login store's
-  // nearest existing ancestor under the target HOME is not writable.
-  // $1 = HOME the upcoming exec will use; remaining args = bytedcli argv.
-  '__botmux_bd_login_blocked() {',
-  '  __botmux_bd_target=$1; shift',
-  // Detect the login subcommand PAST GLOBAL FLAGS. Looking only at $1/$2 let
-  // `bytedcli -j auth login` through (the repo itself emits leading -j — see
-  // renderGitAskpassScript), and a value-taking global flag
-  // (`--profile name auth login`) would hide it as well. Skip every option
-  // token to find the leading operands, and fail closed on any bare
-  // auth→login operand pair, so no supported flag layout bypasses the check.
-  '  __botmux_bd_w1=; __botmux_bd_w2=; __botmux_bd_prev=; __botmux_bd_hit=',
-  '  for __botmux_bd_a in "$@"; do',
-  '    case "$__botmux_bd_a" in',
-  '      -*) ;;',
-  '      *)',
-  '        [ "$__botmux_bd_prev" = auth ] && [ "$__botmux_bd_a" = login ] && __botmux_bd_hit=1',
-  '        if [ -z "$__botmux_bd_w1" ]; then __botmux_bd_w1=$__botmux_bd_a; elif [ -z "$__botmux_bd_w2" ]; then __botmux_bd_w2=$__botmux_bd_a; fi',
-  '        __botmux_bd_prev=$__botmux_bd_a',
-  '        ;;',
-  '    esac',
+const BYTEDCLI_SCAN_FN: readonly string[] = [
+  '__botmux_scan() {',
+  '  __botmux_sc_w1=; __botmux_sc_w2=; __botmux_sc_skip=; __botmux_sc_login=; __botmux_sc_websess=; __botmux_sc_help=; __botmux_sc_unknown=; __botmux_sc_end=; __botmux_sc_prev=',
+  '  for __botmux_sc_a in "$@"; do',
+  '    if [ -n "$__botmux_sc_skip" ]; then __botmux_sc_skip=; continue; fi',
+  '    if [ -z "$__botmux_sc_end" ]; then',
+  '      case "$__botmux_sc_a" in',
+  '        --) __botmux_sc_end=1; continue ;;',
+  '        --jq|--site|--auth-site|--as|--bytecloud-user-jwt-file|--profile|--vregion|--vdc|--socks5-proxy|--http-proxy|--http-header|--http-print|--http-trace-file|--http-body-limit|--http-timeout-ms|--http-retry-count|--http-retry-base-delay-ms|--http-retry-max-delay-ms|--tenant|--session-id) __botmux_sc_skip=1; continue ;;',
+  '        -h|--help|-V|--version) __botmux_sc_help=1; continue ;;',
+  '        -d|--debug|-j|--json|--nomask|--yes|--color|--no-color|--tls1.2|--http-debug|--no-auto-upgrade|--all-help) continue ;;',
+  '        -[dhjV][dhjV]*) case "$__botmux_sc_a" in *[hV]*) __botmux_sc_help=1 ;; esac; continue ;;',
+  // `--session[=…]` / `--session-method[=…]` make `auth login` the browser-session login, not the ByteCloud one (`--session-id` is another option).
+  '        --session-method) __botmux_sc_websess=1; __botmux_sc_skip=1; continue ;;',
+  '        --session|--session=*|--session-method=*) __botmux_sc_websess=1; continue ;;',
+  '        --*=*) continue ;;',
+  '        -?*) [ -n "$__botmux_sc_w1" ] || __botmux_sc_unknown=1; continue ;;',
+  '      esac',
+  '    fi',
+  '    if [ "$__botmux_sc_a" = login ] && { [ -z "$__botmux_sc_prev" ] || [ "$__botmux_sc_prev" = auth ] || [ "$__botmux_sc_prev" = meego ]; }; then __botmux_sc_login=1; fi',
+  '    __botmux_sc_prev=$__botmux_sc_a',
+  '    if [ -z "$__botmux_sc_w1" ]; then __botmux_sc_w1=$__botmux_sc_a; elif [ -z "$__botmux_sc_w2" ]; then __botmux_sc_w2=$__botmux_sc_a; fi',
   '  done',
-  '  [ -n "$__botmux_bd_hit" ] || [ "$__botmux_bd_w1" = login ] || { [ "$__botmux_bd_w1" = auth ] && [ "$__botmux_bd_w2" = login ]; } || return 1',
-  '  __botmux_bd_dir="${XDG_DATA_HOME:-$__botmux_bd_target/.local/share}/bytedcli"',
-  // Nearest existing ancestor decides: login creates the store on first use.
-  '  __botmux_bd_probe=$__botmux_bd_dir',
-  '  while [ ! -e "$__botmux_bd_probe" ] && [ "$__botmux_bd_probe" != / ]; do __botmux_bd_probe=$(dirname "$__botmux_bd_probe"); done',
-  '  if [ -w "$__botmux_bd_probe" ]; then return 1; fi',
-  `    printf '%s\n' "botmux: bytedcli 登录需要写入 $__botmux_bd_dir，但这里不可写（会话沙盒内该目录只读）。沙盒内不能本地登录：请在会话里发送 /login 用授权链接完成授权，或在宿主终端执行 bytedcli auth login。" >&2`,
-  '  return 0',
+  '}',
+];
+
+/**
+ * Runs a command with an empty environment plus an allowlist: the non-credential
+ * variables a CLI needs to function, a private HOME with the XDG directories
+ * under it, and the named injected identity variables. Nothing ambient that
+ * could be a credential (or select one) is passed on, whichever name it has.
+ * $1 = HOME, $2 = names of the injected variables, $3 = exec | run, rest = command.
+ */
+// USER / USERNAME: `bitscli pipeline <read command>` takes its Username header from them (it fails with "Missing username" otherwise).
+const BYTECLOUD_CLEAN_RUN_FN: readonly string[] = [
+  '__botmux_run_clean() {',
+  '  __bc_home=$1; __bc_names=$2; __bc_mode=$3; shift 3',
+  '  __bc_n=$#',
+  '  for __bc_v in PATH LANG LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE LC_NUMERIC LC_TIME LC_MONETARY TERM TZ TMPDIR COLUMNS LINES USER USERNAME NO_COLOR FORCE_COLOR http_proxy https_proxy no_proxy all_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR $__bc_names; do',
+  '    eval "__bc_set=\\${$__bc_v+x}"',
+  '    if [ -n "$__bc_set" ]; then eval "set -- \\"\\$@\\" \\"$__bc_v=\\${$__bc_v}\\""; fi',
+  '  done',
+  '  set -- "$@" "HOME=$__bc_home" "XDG_CONFIG_HOME=$__bc_home/.config" "XDG_DATA_HOME=$__bc_home/.local/share" "XDG_CACHE_HOME=$__bc_home/.cache" "XDG_STATE_HOME=$__bc_home/.local/state"',
+  // The command words were first; move them behind the assignments.
+  '  while [ "$__bc_n" -gt 0 ]; do set -- "$@" "$1"; shift; __bc_n=$((__bc_n - 1)); done',
+  '  if [ "$__bc_mode" = exec ]; then exec env -i "$@"; fi',
+  '  env -i "$@"',
   '}',
 ];
 
@@ -1341,29 +1437,15 @@ const BYTEDCLI_LOGIN_GUARD_FN: readonly string[] = [
  * The device link never reaches the agent, so it cannot end up in a group.
  */
 const BYTEDCLI_MEEGO_FN: readonly string[] = [
-  // Prints the Meego subcommand that needs a login (`login` when argv holds a
-  // meego→login operand pair anywhere, like the login guard above); fails for
-  // every other call and for help/status/logout/config, which never need one.
+  // Prints the Meego subcommand that needs a login (`login` for a meego→login
+  // pair), from the argv scan; fails for every other call and for
+  // help/status/logout/config, which never need one.
   '__botmux_meego_sub() {',
-  '  __botmux_mg_w1=; __botmux_mg_w2=; __botmux_mg_prev=; __botmux_mg_skip=; __botmux_mg_login=; __botmux_mg_help=',
-  '  for __botmux_mg_a in "$@"; do',
-  '    if [ -n "$__botmux_mg_skip" ]; then __botmux_mg_skip=; continue; fi',
-  '    case "$__botmux_mg_a" in',
-  '      --jq|--site|--auth-site|--as|--profile|--vregion|--vdc|--tenant) __botmux_mg_skip=1 ;;',
-  '      -h|--help) __botmux_mg_help=1 ;;',
-  '      -*) ;;',
-  '      *)',
-  '        [ "$__botmux_mg_prev" = meego ] && [ "$__botmux_mg_a" = login ] && __botmux_mg_login=1',
-  '        if [ -z "$__botmux_mg_w1" ]; then __botmux_mg_w1=$__botmux_mg_a; elif [ -z "$__botmux_mg_w2" ]; then __botmux_mg_w2=$__botmux_mg_a; fi',
-  '        __botmux_mg_prev=$__botmux_mg_a',
-  '        ;;',
-  '    esac',
-  '  done',
-  '  [ -z "$__botmux_mg_help" ] || return 1',
-  `  if [ -n "$__botmux_mg_login" ]; then printf '%s' login; return 0; fi`,
-  '  [ "$__botmux_mg_w1" = meego ] || return 1',
-  '  case "$__botmux_mg_w2" in ""|status|logout|config|help) return 1 ;; esac',
-  `  printf '%s' "$__botmux_mg_w2"`,
+  '  [ -z "$__botmux_sc_help" ] || return 1',
+  '  [ "$__botmux_sc_w1" = meego ] || return 1',
+  `  if [ -n "$__botmux_sc_login" ]; then printf '%s' login; return 0; fi`,
+  '  case "$__botmux_sc_w2" in ""|status|logout|config|help) return 1 ;; esac',
+  `  printf '%s' "$__botmux_sc_w2"`,
   '}',
   // The Meego tenant this call runs under, in bytedcli's order: the
   // `--tenant` flag, BYTEDCLI_MEEGO_TENANT, the tenant saved in this HOME ($1).
@@ -1387,6 +1469,10 @@ const BYTEDCLI_MEEGO_FN: readonly string[] = [
   '    "$__botmux_mg_thome/.local/share/bytedcli/data/meego_config.json"; then __botmux_mg_tenant=dcar; fi',
   '  return 0',
   '}',
+];
+
+/** Asks botmux to authorize the person, for the ByteCloud refusal and the Meego login alike. */
+const BYTEDCLI_AUTH_REQUEST_FN: readonly string[] = [
   // Asks the daemon to authorize the person this turn acts for. Exit status is
   // botmux's: 0 authorized now, 3 not yet (the link went to the person, or
   // could not), 4 provider unavailable, anything else botmux unreachable. Its
@@ -1396,8 +1482,23 @@ const BYTEDCLI_MEEGO_FN: readonly string[] = [
   '  command -v botmux >/dev/null 2>&1 || return 1',
   '  __botmux_ar_out=$(botmux auth request "$@" 2>/dev/null)',
   '}',
+  // The one refusal of a governed command in a run nobody attends: botmux is
+  // asked to send the one private notice (its answer never reaches the agent),
+  // then the command does not run. $1 = provider, $2 = message, $3 = Meego
+  // tenant, $4 = message when botmux answers that the credential is valid.
+  '__botmux_unattended_refuse() {',
+  '  __botmux_auth_request --provider "$1" --unattended ${3:+--tenant "$3"}',
+  `  if [ $? -eq 0 ] && [ -n "$4" ]; then printf '%s\\n' "$4" >&2; else printf '%s\\n' "$2" >&2; fi`,
+  `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
+  '}',
 ];
 
+const UNATTENDED_LOGIN_MSG = 'botmux: 无人值守的运行不会发起 ByteCloud 登录；任务执行人对 ByteCloud 的授权缺失时，命令未执行，任务会在重新授权后再次运行。';
+const UNATTENDED_WEBSESSION_MSG = 'botmux: 无人值守的运行无法完成浏览器会话登录（auth login --session）；命令未执行，请在有人值守的对话里由本人执行。';
+const UNATTENDED_MEEGO_MSG = 'botmux: 无人值守的运行不会发起 Meego 登录；任务执行人的 Meego 登录缺失时，命令未执行，任务会在重新登录后再次运行。';
+const UNATTENDED_LOGIN_READY_MSG = 'botmux: 无人值守的运行不会登录；任务执行人的 ByteCloud 凭据有效，请直接运行要执行的命令，不需要登录。';
+const UNATTENDED_MEEGO_READY_MSG = 'botmux: 无人值守的运行不会登录；任务执行人的 Meego 登录有效，请直接运行要执行的命令，不需要登录。';
+const BYTECLOUD_LOGIN_UNREACHABLE_MSG = 'botmux: ByteCloud 登录由 botmux 发起，授权链接只私下发给你本人；但现在联系不上 botmux，命令未执行。请稍后重试。';
 const MEEGO_LOGIN_UNREACHABLE_MSG = 'botmux: Meego 登录由 botmux 发起，授权链接只私下发给你本人；但现在联系不上 botmux，命令未执行。请稍后重试。';
 const MEEGO_SANDBOX_LOGIN_MSG = 'botmux: 这个会话在沙盒里，看不到你在本机器人里的 Meego 登录，也不能在这里登录（授权链接不会经过会话转发）。请在和我的私聊里完成 Meego 操作。';
 
@@ -1411,7 +1512,7 @@ function bytedcliMeegoBlock(realBinaryPath: string): string[] {
     // and bytedcli would use them ahead of this person's login.
     `    unset ${MEEGO_ENV_CREDENTIALS.join(' ')}`,
     `    __botmux_mg_store="$${MEEGO_HOME_VAR}/${MEEGO_STORE_DIR}"`,
-    '    __botmux_mg_sub=$(__botmux_meego_sub "$@") || __botmux_mg_sub=',
+    '    __botmux_mg_sub=$(__botmux_meego_sub) || __botmux_mg_sub=',
     // A sandbox masks the store, so `-d` is also the "can this session use
     // it" check. Linking replaces a session-local store (a login made here
     // before this existed) and a link into a revoked epoch. `-n` matters when
@@ -1433,6 +1534,7 @@ function bytedcliMeegoBlock(realBinaryPath: string): string[] {
     `          printf '%s\\n' ${shellSingleQuote(MEEGO_TENANT_INVALID_MSG)} >&2`,
     '          exit 2',
     '        fi',
+    `        if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse meego ${shellSingleQuote(UNATTENDED_MEEGO_MSG)} "$__botmux_mg_tenant" ${shellSingleQuote(UNATTENDED_MEEGO_READY_MSG)}; fi`,
     '        if [ -n "$__botmux_mg_tset" ]; then',
     `          HOME="$__botmux_home" ${shellSingleQuote(realBinaryPath)} meego config --tenant "$__botmux_mg_tenant" >/dev/null 2>&1 || true`,
     '        fi',
@@ -1453,6 +1555,7 @@ function bytedcliMeegoBlock(realBinaryPath: string): string[] {
     '        if [ -s "$__botmux_mg_f" ]; then __botmux_mg_has=1; fi',
     '      done',
     '      if [ -n "$__botmux_mg_sub" ] && [ -n "$__botmux_mg_tok" ] && [ -z "$__botmux_mg_has" ]; then',
+    `        if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse meego ${shellSingleQuote(UNATTENDED_MEEGO_MSG)} "$__botmux_mg_tenant"; fi`,
     '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
     `        if [ $? -eq 3 ]; then printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
     '      fi',
@@ -1467,27 +1570,51 @@ function bytedcliMeegoBlock(realBinaryPath: string): string[] {
   ];
 }
 
+/**
+ * Native capabilities of the bytedcli wrapper. `bytedcli meego ...` and every
+ * other bytedcli command are separate switches: a native one execs the real
+ * binary untouched (machine HOME, no injected JWT, no Meego link, no login
+ * interception) before any identity is resolved.
+ */
+export interface NativeBytedcliCapabilities {
+  /** Meego calls run natively. */
+  meego?: boolean;
+  /** Everything except Meego runs natively. */
+  bytecloud?: boolean;
+}
+
+function bytedcliNativePassthrough(realBinaryPath: string, native: NativeBytedcliCapabilities): string[] {
+  if (!native.meego && !native.bytecloud) return [];
+  // An option of unknown arity makes the first operand uncertain: the call
+  // stays governed rather than running natively on a guess.
+  const condition = `[ -z "$__botmux_sc_unknown" ] && [ "$__botmux_sc_w1" ${native.meego ? '=' : '!='} meego ]`;
+  return [`if ${condition}; then exec ${shellSingleQuote(realBinaryPath)} "$@"; fi`];
+}
+
 export function renderIdentityWrapper(
   tool: IdentityTool,
   realBinaryPath: string,
   model: IdentityStorageModel,
   identityResolver?: readonly string[],
+  nativeCapabilities: NativeBytedcliCapabilities = {},
 ): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
+  const governsByteCloud = !(tool === 'bytedcli' && nativeCapabilities.bytecloud);
+  const isBytecloudFamily = tool === 'bytedcli' || tool === CODEBASE_COMPANION_TOOL || tool === BITSCLI_COMPANION_TOOL;
   const resolveBlock = model === 'proven' ? [
     // The runner proves this process tree over the daemon loopback channel and
     // prints the identity env ASSIGNMENTS, never a path. eval consumes that
     // body straight from the pipe: nothing in the session directory can select
     // or alter the identity, and no token rests on disk to be read.
-    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
     // An empty body is a missing/empty response (no mode assignment below),
     // never silent permission to run: deny it like a failed proof.
-    `[ -n "$__botmux_cred_body" ] || exit ${IDENTITY_DENIED_EXIT_CODE}`,
-    `eval "$__botmux_cred_body" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    `[ -n "$__botmux_cred_body" ] || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    `eval "$__botmux_cred_body" || return ${IDENTITY_DENIED_EXIT_CODE}`,
     // Defense in depth: the served body must name the mode we know how to
     // dispatch. The daemon already whitelists these keys, but a wrapper must
     // not eval a body that hands it an unrecognized mode either.
-    `case "$BOTMUX_IDENTITY_MODE" in user|bot|user-home|turn-mismatch|denied) ;; *) exit ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
+    `case "$BOTMUX_IDENTITY_MODE" in user|bot|user-home|turn-mismatch|denied) ;; *) return ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
     'unset __botmux_cred_body',
   ] : [
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
@@ -1529,29 +1656,108 @@ export function renderIdentityWrapper(
     '#',
     '# No usable identity => the command does not run. Exec\'ing the tool bare',
     '# would hand it the machine account\'s login, not the bot\'s.',
-    `${MODE_VAR}=`,
-    `${DENY_MSG_VAR}=`,
+    // Definitions only. The scan, the auth request and the Meego helpers run at
+    // the exec site below, after identity resolution where it applies.
+    ...BYTEDCLI_AUTH_REQUEST_FN,
+    ...(isBytecloudFamily ? [...BYTEDCLI_SCAN_FN, ...BYTECLOUD_CLEAN_RUN_FN] : []),
+    ...(tool === 'bytedcli' ? BYTEDCLI_REGION_FREE_FN : []),
+    ...(tool === 'bytedcli' && !nativeCapabilities.meego ? BYTEDCLI_MEEGO_FN : []),
+    '__botmux_resolve() {',
+    `  ${MODE_VAR}=`,
+    `  ${DENY_MSG_VAR}=`,
     // Clear inherited copies before loading: a parent process that exports a
     // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
     // the same-principal allowance. The values are re-set below from the
     // daemon-provided identity when it carries them.
-    `${TURN_VAR}=`,
-    `${OPEN_ID_VAR}=`,
+    `  ${TURN_VAR}=`,
+    `  ${OPEN_ID_VAR}=`,
+    `  ${UNATTENDED_VAR}=`,
     ...(tool === 'bytedcli'
-      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), BYTEDCLI_REGIONAL_SOURCE_VAR].map(key => `${key}=`)
+      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), BYTEDCLI_REGIONAL_SOURCE_VAR].map(key => `  ${key}=`)
       : []),
     // Same for the per-exec HOME: an inherited value must not redirect an
     // identity that does not carry one.
-    `${HOME_VAR}=`,
-    ...(tool === 'bytedcli' ? [`${MEEGO_HOME_VAR}=`] : []),
-    '__botmux_live=',
-    '__botmux_live_caller=',
-    // Function only; it runs AFTER identity resolution at each exec site, with
-    // the HOME that exec will use (per-person scratch HOME or machine HOME).
-    ...(tool === 'bytedcli' ? BYTEDCLI_LOGIN_GUARD_FN : []),
-    ...(tool === 'bytedcli' ? BYTEDCLI_REGION_FREE_FN : []),
-    ...(tool === 'bytedcli' ? BYTEDCLI_MEEGO_FN : []),
-    ...resolveBlock,
+    `  ${HOME_VAR}=`,
+    ...(tool === 'bytedcli' ? [`  ${MEEGO_HOME_VAR}=`] : []),
+    ...(tool === BITSCLI_COMPANION_TOOL ? [`  unset ${IDENTITY_ENV_KEYS.bitscli.join(' ')}`] : []),
+    '  __botmux_live=',
+    '  __botmux_live_caller=',
+    ...resolveBlock.map(line => `  ${line}`),
+    '}',
+    ...(isBytecloudFamily ? [
+      '__botmux_scan "$@"',
+      ...(tool === 'bytedcli' ? bytedcliNativePassthrough(realBinaryPath, nativeCapabilities) : []),
+      // Bare invocation or exactly one help/version flag needs no credential:
+      // it runs in a private throwaway HOME with a clean environment. Any other
+      // use of those flags goes the normal way, so a help flag cannot hide a login.
+      ...(governsByteCloud ? [
+        '__botmux_hp=',
+        'case "$#:$1" in 0:|1:-h|1:--help|1:-V|1:--version) __botmux_hp=1 ;; esac',
+        // `auth login --help` only prints help too; a Meego login with a help flag is the Meego block's.
+        '[ -z "$__botmux_sc_login" ] || [ -z "$__botmux_sc_help" ] || [ "$__botmux_sc_w1" = meego ] || __botmux_hp=1',
+        'if [ -n "$__botmux_hp" ]; then',
+        '  __botmux_h=$(mktemp -d 2>/dev/null) || { printf \'%s\\n\' \'botmux: 无法创建临时目录，命令未执行。\' >&2; exit 77; }',
+        '  trap \'rm -rf "${__botmux_h:?}"\' EXIT',
+        `  __botmux_run_clean "$__botmux_h" "" run ${shellSingleQuote(realBinaryPath)} "$@"`,
+        '  exit $?',
+        'fi',
+        // The browser-session login (the Feishu web session Meego GoAPI needs) is no
+        // ByteCloud login: attended, the real command runs below under the person's
+        // HOME as upstream does; unattended, nobody can complete it, so it is refused.
+        'if [ -n "$__botmux_sc_login" ] && [ -n "$__botmux_sc_websess" ] && [ "$__botmux_sc_w1" != meego ]; then',
+        '  __botmux_resolve || :',
+        `  if [ -n "$${UNATTENDED_VAR}" ]; then printf '%s\\n' ${shellSingleQuote(UNATTENDED_WEBSESSION_MSG)} >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
+        'fi',
+        // A login would print a device link to the agent. botmux sends it to the
+        // person privately instead, so the real login never runs. (`meego login`
+        // belongs to the Meego block.)
+        'if [ -n "$__botmux_sc_login" ] && [ -z "$__botmux_sc_websess" ] && { [ "$__botmux_sc_w1" != meego ] || [ -n "$__botmux_sc_unknown" ]; }; then',
+        // Whether anyone is attending is a property of the turn: resolve it first.
+        // An identity that cannot be resolved is not needed to ask botmux, which
+        // then reports itself unreachable if it is.
+        '  __botmux_resolve || :',
+        `  if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse bytedcli ${shellSingleQuote(UNATTENDED_LOGIN_MSG)} "" ${shellSingleQuote(UNATTENDED_LOGIN_READY_MSG)}; fi`,
+        '  __botmux_auth_request --provider bytedcli',
+        '  case $? in',
+        `    0) printf '%s\\n' "$__botmux_ar_out" >&2; exit 0 ;;`,
+        `    3|4) printf '%s\\n' "$__botmux_ar_out" >&2 ;;`,
+        `    *) printf '%s\\n' ${shellSingleQuote(BYTECLOUD_LOGIN_UNREACHABLE_MSG)} >&2 ;;`,
+        '  esac',
+        `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        'fi',
+      ] : []),
+    ] : []),
+    `__botmux_resolve || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // A refusal of an unattended run (published for exactly the lapse of a
+    // credential): the single place that asks botmux for the private notice.
+    `if [ "$${MODE_VAR}" = denied ]; then`,
+    `  case "$${DENY_MSG_VAR}" in *'[reason=unattended]'*) __botmux_unattended_refuse ${tool === 'lark-cli' ? 'lark-cli' : 'bytedcli'} "$${DENY_MSG_VAR}" ;; esac`,
+    'fi',
+    // Not authorized yet: botmux hands the link to the person privately. If
+    // the person has meanwhile authorized (answer 0), the identity is resolved
+    // once more and the original command goes on, instead of making the agent
+    // repeat it.
+    ...(isBytecloudFamily ? [
+      `if [ "$${MODE_VAR}" = denied ]; then`,
+      `  case "$${DENY_MSG_VAR}" in *'[reason=not_authorized]'*)`,
+      '    __botmux_t0=$' + TURN_VAR + '; __botmux_o0=$' + OPEN_ID_VAR,
+      '    __botmux_auth_request --provider bytedcli',
+      '    __botmux_rc=$?',
+      '    if [ "$__botmux_rc" -eq 0 ]; then',
+      `      __botmux_resolve || { printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; }`,
+      // Only the same turn and the same person may pick up the new identity;
+      // an identity that names neither is never taken for the same one.
+      `      if [ "$${MODE_VAR}" != user ] || [ -z "$__botmux_t0" ] || [ -z "$__botmux_o0" ] || [ "$${TURN_VAR}" != "$__botmux_t0" ] || [ "$${OPEN_ID_VAR}" != "$__botmux_o0" ]; then`,
+      `        printf '%s\\n' "$__botmux_ar_out" >&2`,
+      `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+      '      fi',
+      '    elif [ "$__botmux_rc" -eq 3 ] || [ "$__botmux_rc" -eq 4 ]; then',
+      `      printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}`,
+      '    fi',
+      '    ;;',
+      '  esac',
+      'fi',
+    ] : []),
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
@@ -1568,7 +1774,7 @@ export function renderIdentityWrapper(
     `      printf '%s\\n' 'botmux: ${tool} 的按人身份目录缺失，命令未执行。请重新发送 /login 完成授权后重试。' >&2`,
     `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    fi',
-    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR}`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${UNATTENDED_VAR}`,
     `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '    ;;',
     '  turn-mismatch)',
@@ -1581,13 +1787,6 @@ export function renderIdentityWrapper(
     `    if [ -n "$${DENY_MSG_VAR}" ]; then`,
     // Not logged in yet: botmux hands the link to the person privately and
     // says so; the published text stays the fallback when it cannot be asked.
-    ...(tool === 'bytedcli' ? [
-      `      case "$${DENY_MSG_VAR}" in *'[reason=not_authorized]'*)`,
-      '        __botmux_auth_request --provider bytedcli',
-      `        case $? in 0|3|4) printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
-      '        ;;',
-      '      esac',
-    ] : []),
     `      printf '%s\\n' "$${DENY_MSG_VAR}" >&2`,
     '    else',
     // Nothing was published for this call (no refusal text either): the turn's
@@ -1600,11 +1799,7 @@ export function renderIdentityWrapper(
     '    ;;',
     'esac',
     // user|bot only past this point. HOME_VAR set (#2550 per-person scratch
-    // HOME on a bytedcli user identity) is the exec's HOME; unset → machine
-    // HOME. Probe whichever one a login would actually write into.
-    ...(tool === 'bytedcli' ? [
-      `if __botmux_bd_login_blocked "\${${HOME_VAR}:-$HOME}" "$@"; then exit 1; fi`,
-    ] : []),
+    // HOME on a bytedcli user identity) is the exec's HOME; unset → machine HOME.
     // A person-scoped HOME published with a user identity (bytedcli): scoped to
     // this exec exactly like the user-home branch, so the parent shell and
     // every other tool keep the machine HOME. Created here, on first use: the
@@ -1624,11 +1819,14 @@ export function renderIdentityWrapper(
     `    printf '%s\\n' 'botmux: ${tool} 的按人目录无法创建，命令未执行。' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '  fi',
-    ...(tool === 'bytedcli' ? bytedcliMeegoBlock(realBinaryPath) : []),
-    `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
-    `  HOME="$__botmux_home" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    ...(tool === 'bytedcli' && !nativeCapabilities.meego ? bytedcliMeegoBlock(realBinaryPath) : []),
+    `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${UNATTENDED_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
+    tool === BITSCLI_COMPANION_TOOL
+      ? `  __botmux_run_clean "$__botmux_home" ${shellSingleQuote(IDENTITY_ENV_KEYS.bitscli.join(' '))} exec ${shellSingleQuote(realBinaryPath)} "$@"`
+      : `  HOME="$__botmux_home" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     'fi',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
+    ...(tool === BITSCLI_COMPANION_TOOL ? [`printf '%s\\n' 'botmux: bitscli 的按人目录缺失，命令未执行。' >&2`, `exit ${IDENTITY_DENIED_EXIT_CODE}`] : []),
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${UNATTENDED_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');
@@ -1697,6 +1895,23 @@ export function ensureSessionIdentityStorage(
   }
 }
 
+/** A bytedcli identity file left by a policy that still governed ByteCloud keeps its JWTs in
+ *  plaintext; with ByteCloud off, only what Meego needs may stay in it. */
+function stripByteCloudCredentials(sessionDataDir: string, sessionId: string): void {
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  const files = [join(dir, 'bytedcli.env')];
+  try {
+    for (const turn of readdirSync(join(dir, 'turns'))) files.push(join(dir, 'turns', turn, 'bytedcli.env'));
+  } catch { /* no per-turn snapshots */ }
+  for (const file of files) {
+    try {
+      const lines = readFileSync(file, 'utf8').split('\n');
+      const kept = lines.filter(line => !/^(BYTEDCLI_USER_CLOUD_JWT|BYTEDCLI_USER_CODE_JWT|BOTMUX_IDENTITY_CLOUD_JWT_[A-Z0-9]+)=/.test(line));
+      if (kept.length !== lines.length) atomicWriteFileSync(file, kept.join('\n'), { mode: 0o600 });
+    } catch { /* absent or unreadable: nothing of ours to strip */ }
+  }
+}
+
 /** Whether the wrapper for `tool` is currently installed in `binDir`. */
 export function identityWrapperInstalled(binDir: string, tool: IdentityTool): boolean {
   return existsSync(join(binDir, tool));
@@ -1726,21 +1941,25 @@ export function identityWrapperInstalled(binDir: string, tool: IdentityTool): bo
 export function removeUngovernedIdentityWrappers(
   sessionDataDir: string,
   sessionId: string,
-  policy: Pick<TriggerUserAuthConfig, 'enabled' | 'tools'> | null | undefined,
+  policy: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined,
 ): IdentityTool[] {
-  const governed = new Set(policy?.enabled ? identityToolsFor(policy.tools) : []);
+  const governed = new Set(policy?.enabled ? identityToolsFor(policy.tools, capabilitiesOf(policy)) : []);
   const binDir = sessionIdentityBinDir(sessionDataDir, sessionId);
   const removed: IdentityTool[] = [];
   for (const tool of ALL_IDENTITY_TOOLS) {
     if (governed.has(tool)) continue;
-    const path = join(binDir, tool);
-    try {
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.size > 64 * 1024) continue;
-      if (readFileSync(path, 'utf8').split('\n', 2)[1] !== IDENTITY_WRAPPER_MARKER) continue;
-      rmSync(path, { force: true });
-      removed.push(tool);
-    } catch { /* absent or unreadable: nothing of ours is in the way */ }
+    // Identity files a policy that was on left behind hold plaintext JWTs.
+    clearSessionIdentity(sessionDataDir, sessionId, tool, undefined, 'single');
+    for (const name of [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])]) {
+      const path = join(binDir, name);
+      try {
+        const stat = lstatSync(path);
+        if (!stat.isFile() || stat.size > 64 * 1024) continue;
+        if (readFileSync(path, 'utf8').split('\n', 2)[1] !== IDENTITY_WRAPPER_MARKER) continue;
+        rmSync(path, { force: true });
+        if (!removed.includes(tool)) removed.push(tool);
+      } catch { /* absent or unreadable: nothing of ours is in the way */ }
+    }
   }
   return removed;
 }
@@ -1835,11 +2054,14 @@ export function installIdentityWrapper(
   realBinaryPath: string | null | undefined,
   model: IdentityStorageModel,
   identityResolver?: readonly string[],
+  nativeCapabilities?: NativeBytedcliCapabilities,
+  /** Command name the wrapper is written under, when it differs from the tool's. */
+  commandName: string = tool,
 ): string | null {
   if (!realBinaryPath) return null;
   mkdirSync(binDir, { recursive: true });
-  const path = join(binDir, tool);
-  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath, model, identityResolver), { mode: 0o755 });
+  const path = join(binDir, commandName);
+  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath, model, identityResolver, nativeCapabilities), { mode: 0o755 });
   return path;
 }
 
@@ -2066,7 +2288,7 @@ export function prepareTurnGitConfigEnv(
  * excluding the wrapper dir keeps that impossible by construction.
  */
 export function findRealToolBinary(
-  tool: IdentityTool,
+  tool: string,
   pathValue: string | undefined,
   excludeDirs: readonly string[] = [],
 ): string | null {
@@ -2163,7 +2385,9 @@ export function prepareTriggerUserCliEnv(
   // directory survives the existence-filter and leftovers from the other model
   // (or an older layout) are cleared rather than reused. Expand the governed
   // tool list to include the Codebase companion exactly as publication does.
-  const identityTools = identityToolsFor(policy.tools);
+  const capabilities = capabilitiesOf(policy);
+  const identityTools = identityToolsFor(policy.tools, capabilities);
+  if (!capabilities.has('bytecloud')) stripByteCloudCredentials(sessionDataDir, sessionId);
   try {
     ensureSessionIdentityStorage(
       sessionDataDir,
@@ -2175,17 +2399,19 @@ export function prepareTriggerUserCliEnv(
     log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
   let installedAny = false;
-  for (const tool of identityTools) {
+  for (const [tool, commandName] of identityTools.flatMap(tool =>
+    [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])].map(name => [tool, name] as const))) {
     try {
-      const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
+      const real = findRealToolBinary(commandName, childEnv.PATH, [wrapperDir]);
       if (!real) {
-        log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+        log(`[trigger-user-auth] ${commandName} is not installed; no wrapper written`);
         continue;
       }
       const realInSession = sessionVisiblePath(real, canonicalPaths);
-      installIdentityWrapper(wrapperDir, tool, realInSession, model, identityResolver);
+      installIdentityWrapper(wrapperDir, tool, realInSession, model, identityResolver,
+        { meego: !capabilities.has('meego'), bytecloud: !capabilities.has('bytecloud') }, commandName);
       installedAny = true;
-      log(`[trigger-user-auth] wrapping ${tool} -> ${realInSession}`);
+      log(`[trigger-user-auth] wrapping ${commandName} -> ${realInSession}`);
     } catch (e) {
       // A missing wrapper means the tool keeps its previous behavior; it must
       // not stop the session from starting.
@@ -2227,7 +2453,7 @@ export function prepareTriggerUserCliEnv(
   // machine's identity — and "who opened this MR" is exactly what this feature
   // exists to fix. The helper asks the WRAPPED bytedcli, so it inherits the
   // per-turn identity with no second credential path to keep in sync.
-  if (policy.tools.includes('bytedcli')
+  if (capabilities.has('bytecloud')
       && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
     try {
       const askpass = installGitAskpass(

@@ -18,6 +18,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { bytedcliTurnHome, renderIdentityWrapper, writeSessionIdentity } from '../src/core/cli-identity.js';
+import { ensureMeegoStore } from '../src/services/bytedcli-home.js';
 import { ensureSessionTempDir } from '../src/core/session-temp.js';
 
 // Where the daemon keeps each person's login: fixed under the machine HOME,
@@ -101,12 +102,12 @@ function session(id: string, openId: string | undefined): string {
   ensureSessionTempDir(dataDir(), id);
   const wrapper = join(dir, `wrapper-${id}`);
   writeFileSync(wrapper, renderIdentityWrapper('bytedcli', realCli, 'single'));
-  writeSessionIdentity(dataDir(), id, { tool: 'bytedcli', cloudJwt: 'jwt', ...(openId ? { openId } : {}) }, 'single');
+  writeSessionIdentity(dataDir(), id, { tool: 'bytedcli', cloudJwt: 'jwt', ...(openId ? { openId, meegoHome: ensureMeegoStore(openId) } : {}) }, 'single');
   return wrapper;
 }
 
 function actAs(id: string, openId: string): void {
-  writeSessionIdentity(dataDir(), id, { tool: 'bytedcli', cloudJwt: 'jwt', openId }, 'single');
+  writeSessionIdentity(dataDir(), id, { tool: 'bytedcli', cloudJwt: 'jwt', openId, meegoHome: ensureMeegoStore(openId) }, 'single');
 }
 
 interface RunOpts {

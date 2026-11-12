@@ -1,6 +1,7 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
+import { IDENTITY_ROUTE_TOOLS } from '../services/trigger-user-auth.js';
 
 export const CURRENT_EXECUTION_SCHEMA = 'botmux.current-execution.v1' as const;
 export const CURRENT_EXECUTION_ROUTE = '/api/current-execution';
@@ -95,7 +96,7 @@ export async function resolveCurrentExecution(options: {
 export const CURRENT_EXECUTION_IDENTITY_SCHEMA = 'botmux.current-execution-identity.v1' as const;
 export const CURRENT_EXECUTION_IDENTITY_ROUTE = '/api/current-execution-identity';
 
-const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'codebase'] as const;
+const IDENTITY_TOOLS = IDENTITY_ROUTE_TOOLS;
 type IdentityToolName = typeof IDENTITY_TOOLS[number];
 const identityTool = (value: unknown): value is IdentityToolName =>
   typeof value === 'string' && (IDENTITY_TOOLS as readonly string[]).includes(value);

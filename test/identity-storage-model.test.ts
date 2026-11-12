@@ -167,7 +167,7 @@ describe('the two models are mutually exclusive per session', () => {
     writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
     writeSessionIdentity(dir, SESSION, aliceBy('turn-B'), 'single');
     const dataDir = sessionIdentityDataDir(dir, SESSION);
-    expect(readdirSync(dataDir).filter(name => name.endsWith('.env')).sort()).toEqual(['bytedcli.env', 'codebase.env']);
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.env')).sort()).toEqual(['bitscli.env', 'bytedcli.env', 'codebase.env']);
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     expect(readdirSync(dataDir).some(name => name.endsWith('.env'))).toBe(false);
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');

@@ -597,7 +597,7 @@ import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
-import { publishDelegationRefusal, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -4201,6 +4201,10 @@ async function handleProviderAuthRequest(
       return state === 'unknown' ? 'unknown' : state === 'authorized';
     },
     beginBytedcliLogin,
+    adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
+      sessionDataDir: config.session.dataDir, sessionId, turnId: origin.identityTurnId ?? origin.turnId!,
+      botConfig: cfg, senderOpenId: person,
+    }),
     deliver: (text, privateCommand) => deliverAuthLink({
       privateChat,
       openId,

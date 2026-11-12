@@ -122,6 +122,7 @@ export async function renewExpiringBytedcliIdentities(
         ...(entry.identity.regionalCloudJwtSource ? { regionalCloudJwtSource: entry.identity.regionalCloudJwtSource } : {}),
         turnId: entry.identity.turnId,
         ...(entry.identity.openId ? { openId: entry.identity.openId } : {}),
+        ...(entry.identity.meegoHome ? { meegoHome: entry.identity.meegoHome } : {}),
       };
       writeSessionIdentity(entry.sessionDataDir, entry.sessionId, identity, 'proven');
       entries.set(key, { ...entry, identity });
