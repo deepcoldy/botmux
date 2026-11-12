@@ -489,4 +489,21 @@ describe('unified replies with an independent native CoT channel', () => {
       rmSync(nextDir, { recursive: true, force: true });
     }
   });
+
+  it('drain waits for a tools flush already writing, so teardown cannot remove the dir under it', async () => {
+    bot.config.cotEnabled = true;
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    let releasePatch!: () => void;
+    vi.mocked(updateMessage).mockImplementationOnce(() => new Promise<void>(resolve => { releasePatch = resolve; }));
+    queueTurnReplyTools(ds, { turnId: 'om_turn', entries: [{ kind: 'thinking', text: 'in flight' }] }, send, () => true);
+    const flushing = flushTurnReplyTools(ds, 'om_turn');
+    await vi.waitFor(() => expect(releasePatch).toBeTypeOf('function'));
+    let drained = false;
+    const draining = __testOnlyDrainTurnReplyTools().then(() => { drained = true; });
+    await settle();
+    expect(drained).toBe(false);
+    releasePatch();
+    await Promise.all([flushing, draining]);
+    expect(drained).toBe(true);
+  });
 });
