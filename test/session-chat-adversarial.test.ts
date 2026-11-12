@@ -70,17 +70,24 @@ describe('session chat authorization and receipt recovery', () => {
   });
 
   it.each(['oc_source', 'oc_target'])('does not disclose members when %s permission is revoked during listing', async chatId => {
-    vi.useFakeTimers();
     const f = fixture();
-    f.deps.listMembers = vi.fn(() => delay([{ openId: 'ou_qa', name: 'QA' }]));
+    const listingStarted = Promise.withResolvers<void>();
+    const finishListing = Promise.withResolvers<void>();
+    f.deps.listMembers = vi.fn(async () => {
+      listingStarted.resolve();
+      await finishListing.promise;
+      return [{ openId: 'ou_qa', name: 'QA' }];
+    });
     const result = handleSessionChatTool(f.members, f.ctx, f.deps);
-    await vi.advanceTimersByTimeAsync(0);
+    // Gate on the provider call itself: advancing fake time does not guarantee
+    // the preceding async authorization has settled on both test runners.
+    await listingStarted.promise;
     expect(f.deps.listMembers).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(500);
     f.permission.set(chatId, false);
-    await vi.advanceTimersByTimeAsync(500);
+    finishListing.resolve();
     const returned = await result;
     expect(returned.status).toBe(403);
+    expect(returned.body.error).toBe('principal_not_authorized');
     expect(returned.body).not.toHaveProperty('members');
   });
 
