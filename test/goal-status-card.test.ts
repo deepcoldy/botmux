@@ -3,13 +3,14 @@ import { GoalStatusCardController, buildGoalStatusCard, goalElapsedSeconds, goal
 import type { NativeGoalState } from '../src/services/native-goal-state.js';
 
 const active: NativeGoalState = { objective: '修复登录并通过测试', status: 'active', createdAt: 1_700_000_000, updatedAt: 1_700_000_010, timeUsedSeconds: 10 };
-function fixture(initial?: GoalStatusCardRecord) {
-  let state = initial;
+function fixture(initial?: GoalStatusCardRecord, isTerminalError?: (error: unknown) => boolean) {
+  let state: GoalStatusCardRecord | undefined = initial;
   let owns = true;
   const post = vi.fn(async () => 'om_goal_card');
   const patch = vi.fn(async () => {});
   const save = (record: GoalStatusCardRecord) => { state = record; };
-  const deps = { read: () => state, save, post, patch, owns: () => owns, warn: vi.fn(), now: () => Date.now() };
+  const deps = { read: () => state, save, post, patch, owns: () => owns, warn: vi.fn(), now: () => Date.now(),
+    ...(isTerminalError ? { isTerminalError } : {}) };
   const controller = new GoalStatusCardController(deps);
   return { deps, controller, post, patch, state: () => state, retire: () => { owns = false; } };
 }
@@ -120,6 +121,62 @@ describe('native goal status card', () => {
     f.retire(); const count = f.patch.mock.calls.length;
     await vi.advanceTimersByTimeAsync(2000);
     expect(f.patch).toHaveBeenCalledTimes(count);
+    expect(vi.getTimerCount()).toBe(0);
+    f.controller.dispose();
+  });
+  it('reposts one replacement card when a PATCH hits a terminal error, then stops retrying the dead message', async () => {
+    class TerminalCardError extends Error {}
+    const f = fixture(undefined, (error: unknown) => error instanceof TerminalCardError);
+    f.controller.update(active); await f.controller.settled();
+    expect(f.post).toHaveBeenCalledTimes(1);
+    f.post.mockResolvedValueOnce('om_replacement');
+    f.patch.mockImplementationOnce(async () => { throw new TerminalCardError('withdrawn'); });
+    f.controller.update({ ...active, status: 'complete', updatedAt: active.updatedAt + 1, timeUsedSeconds: 11 });
+    await f.controller.settled();
+    // The replacement is driven by the next 2s refresh tick, not inline.
+    await vi.advanceTimersByTimeAsync(2000);
+    await f.controller.settled();
+    // The dead message id is abandoned and exactly one replacement card is posted.
+    expect(f.post).toHaveBeenCalledTimes(2);
+    expect(f.patch.mock.calls.at(-1)![0]).toBe('om_replacement');
+    const callsAfterRepost = f.patch.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(f.patch).toHaveBeenCalledTimes(callsAfterRepost);
+    expect(f.state()?.postState).toBe('sent');
+    expect(vi.getTimerCount()).toBe(0);
+    f.controller.dispose();
+  });
+  it('disarms the timer when both the terminal PATCH and its replacement POST fail', async () => {
+    class TerminalCardError extends Error {}
+    const f = fixture(undefined, (error: unknown) => error instanceof TerminalCardError);
+    f.controller.update(active); await f.controller.settled();
+    f.patch.mockImplementationOnce(async () => { throw new TerminalCardError('withdrawn'); });
+    f.post.mockRejectedValueOnce(new TerminalCardError('topic unavailable'));
+    f.controller.update({ ...active, status: 'complete', updatedAt: active.updatedAt + 1, timeUsedSeconds: 11 });
+    await f.controller.settled();
+    await vi.advanceTimersByTimeAsync(2000);
+    await f.controller.settled();
+    expect(f.state()?.postState).toBe('uncertain');
+    const posts = f.post.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(f.post).toHaveBeenCalledTimes(posts);
+    expect(vi.getTimerCount()).toBe(0);
+    f.controller.dispose();
+  });
+  it('reposts at most once: a second terminal failure disarms instead of alternating POST and PATCH forever', async () => {
+    class TerminalCardError extends Error {}
+    const f = fixture(undefined, (error: unknown) => error instanceof TerminalCardError);
+    let postSeq = 0;
+    f.post.mockImplementation(async () => postSeq++ === 0 ? 'om_goal_card' : 'om_replacement');
+    f.controller.update(active); await f.controller.settled();
+    f.patch.mockImplementation(async () => { throw new TerminalCardError('withdrawn'); });
+    f.controller.update({ ...active, status: 'complete', updatedAt: active.updatedAt + 1, timeUsedSeconds: 11 });
+    await f.controller.settled();
+    await vi.advanceTimersByTimeAsync(10000);
+    await f.controller.settled();
+    expect(f.post).toHaveBeenCalledTimes(2);
+    expect(f.state()?.postState).toBe('sent');
+    expect(f.state()?.pendingPatch).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
     f.controller.dispose();
   });

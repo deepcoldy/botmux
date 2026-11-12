@@ -20852,6 +20852,8 @@ function setupWorkerHandlers(
           },
           owns: goalCardOwns,
           canDisplay: goalCardCanDisplay,
+          isTerminalError: error => error instanceof MessageWithdrawnError
+            || error instanceof MessageUpdateExpiredError || error instanceof TopicSendError,
           locale: localeForBot(ds.larkAppId) === 'en' ? 'en' : 'zh',
           warn: error => logger.warn(`[${t}] Goal status card update failed: ${error instanceof Error ? error.message : String(error)}`),
           post: (card, uuid, turnId) => scopedReply(card, 'interactive', turnId, {

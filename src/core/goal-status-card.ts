@@ -10,6 +10,10 @@ export interface GoalStatusCardRecord {
   postState: 'prepared' | 'sending' | 'sent' | 'uncertain';
   pendingPatch: boolean;
   sequence?: number;
+  /** A replacement card has already been posted after a terminal PATCH
+   *  failure. Cleared by the next successful write, so a persistently broken
+   *  write surface cannot alternate POST/PATCH forever. */
+  reposted?: boolean;
 }
 
 export interface GoalStatusCardOrigin {
@@ -70,6 +74,10 @@ export interface GoalStatusCardDeps {
   patch(messageId: string, card: string, sequence: number, uuid: string): Promise<unknown>;
   owns(): boolean;
   canDisplay?(): boolean;
+  /** Errors that can never succeed on retry (message withdrawn, edit window
+   *  expired, topic unavailable). They force a replacement POST instead of
+   *  an endless PATCH loop. */
+  isTerminalError?(error: unknown): boolean;
   warn(error: unknown): void;
   locale?: 'zh' | 'en';
   now?: () => number;
@@ -162,7 +170,7 @@ export class GoalStatusCardController {
     if (this.deps.canDisplay?.() === false) { this.suspend(); return; }
     const card = buildGoalStatusCard(state.goal, this.deps.now?.(), this.deps.locale);
     if (card === this.rendered) {
-      if (state.pendingPatch) this.deps.save({ ...state, pendingPatch: false });
+      if (state.pendingPatch || state.reposted) this.deps.save({ ...state, pendingPatch: false, reposted: false });
       this.arm(); return;
     }
     const sequence = (state.sequence ?? 0) + 1;
@@ -172,8 +180,25 @@ export class GoalStatusCardController {
       await this.deps.patch(state.messageId!, card, sequence, `${state.uuid}-${sequence}`);
       this.rendered = card;
       const latest = this.deps.read();
-      if (latest === sentState) this.deps.save({ ...latest, pendingPatch: false });
-    } catch (error) { this.deps.warn(error); }
+      if (latest === sentState) this.deps.save({ ...latest, pendingPatch: false, reposted: false });
+    } catch (error) {
+      this.deps.warn(error);
+      // A withdrawn/expired/blocked message can never accept another PATCH:
+      // drop the dead message id and re-enter the POST path once. If the
+      // conversation itself is unavailable the replacement POST fails too and
+      // lands in 'uncertain', which disarms the timer instead of looping.
+      if (this.deps.isTerminalError?.(error)) {
+        const latest = this.deps.read();
+        if (latest?.uuid !== state.uuid) { this.arm(); return; }
+        if (latest.reposted) {
+          // The replacement card already carries the latest full card content
+          // from its POST, so leaving it un-patched loses nothing.
+          this.deps.save({ ...latest, pendingPatch: false });
+        } else {
+          this.deps.save({ ...latest, messageId: undefined, postState: 'prepared', reposted: true });
+        }
+      }
+    }
     this.arm();
   }
 }
