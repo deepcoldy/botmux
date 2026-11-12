@@ -680,6 +680,7 @@ import {
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
+import { programStatusBlockHoldsTypeAhead, programStatusEnabledForLaunch, startupIdleReportScreenAdmits } from './core/program-status-gate.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
 import {
@@ -3132,17 +3133,23 @@ let spawnArgvSubmissionEvidence: {
 let idleDetector: IdleDetector | null = null;
 let programStatusStream: ProgramStatusFramingStream | null = null;
 
-function shouldEnableProgramStatus(cliId: string | undefined, adapter?: CliAdapter | null): boolean {
-  if (adapter?.supportsProgramStatus !== undefined) {
-    return adapter.supportsProgramStatus;
+function shouldEnableProgramStatus(
+  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
+  adapter?: CliAdapter | null,
+  opts: { quiet?: boolean } = {},
+): boolean {
+  let declared = adapter?.supportsProgramStatus !== undefined ? adapter : undefined;
+  if (!declared && cfg.cliId) {
+    try { declared = createCliAdapterSync(cfg.cliId as CliId); } catch { return false; }
   }
-  if (!cliId) return false;
-  try {
-    const probe = createCliAdapterSync(cliId as CliId);
-    return probe.supportsProgramStatus === true;
-  } catch {
-    return false;
+  const launch = { cliVersion: cfg.cliVersion, adoptMode: cfg.adoptMode === true, remoteViewer: !!remoteWsUrl };
+  const enabled = programStatusEnabledForLaunch(declared, launch);
+  if (!enabled && !opts.quiet && declared?.supportsProgramStatus === true && declared.programStatusMinVersion) {
+    const why = launch.adoptMode ? 'adopted pane' : launch.remoteViewer ? 'RPC viewer'
+      : `version ${JSON.stringify(cfg.cliVersion?.split('\n')[0] ?? 'unknown')} < ${declared.programStatusMinVersion}`;
+    log(`[program-status] ${declared.id} reports not parsed (${why}); idle stays on screen heuristics`);
   }
+  return enabled;
 }
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
@@ -4125,6 +4132,8 @@ let lastWebTerminalInputAtMs = 0;
 let webTerminalInputGeneration = 0;
 /** webTerminalInputGeneration at the latest SessionStart boundary. */
 let webTerminalInputGenerationAtBoundary = 0;
+/** webTerminalInputGeneration when this CLI generation's IdleDetector was built. */
+let webTerminalInputGenerationAtSpawn = 0;
 /** The forwards among those that submitted the CLI's input box
  *  (terminalInputSubmits). ESC, Ctrl-C, arrow keys and characters still being
  *  typed are terminal activity, not new model input. */
@@ -5674,7 +5683,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       hasFollowUp: !!onFollowUp,
       onAccepted: () => {
         isPromptReady = false;
-        idleDetector?.reset();
+        idleDetector?.reset({ inputCycle: true });
         log(`Passthrough slash command: ${msg.content}`);
       },
       // Non-adopt follows the normal busy queue. Adopt keeps the complete
@@ -8776,7 +8785,9 @@ function settleBackgroundTasksFromSiblings(): void {
   for (const taskId of backgroundTaskStopsInSiblingTranscripts(
     bridgeJsonlDir, bridgeJsonlPath, backgroundStopScanSinceMs, backgroundStopScanOffsets,
   )) {
-    backgroundTaskTracker.settle(taskId);
+    // Read now, written no later: a resume a re-drain reads again (older) must
+    // not bring the task back.
+    backgroundTaskTracker.settle(taskId, Date.now());
   }
 }
 
@@ -15290,11 +15301,32 @@ function traexFirstPromptViewportRejects(): boolean {
   if (lastInitConfig?.cliId !== 'traex' || !awaitingFirstPrompt
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
   if (!idleDetector?.isReadyEvidenceWeak()) return false;
+  // TraeX itself last reported idle over OSC 7501 (0.214.1+, parsed only on
+  // a version-gated launch). The predicate below only knows the footer shapes
+  // seen so far; an unknown one must not send the first prompt back to the
+  // hard timeout (#3307 / #3338). Timing still comes from screen quiescence.
+  // The report alone is not enough: the screen must still show a prompt row
+  // and no blocking page (see traexIdleReportScreenShowsComposer). A draft can
+  // only come from web-terminal input, which keeps the predicate.
+  const reported = idleDetector.lastProgramStatusReport();
+  if (programStatusStream && (reported === 'idle' || reported === 'done')
+    && webTerminalInputGeneration === webTerminalInputGenerationAtSpawn
+    && traexIdleReportScreenShowsComposer()) return false;
   const predicate = cliAdapter?.startupReadyFromHistory;
   if (!predicate) return false;
   let screen = '';
   try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   return !!screen && !predicate(screen);
+}
+
+/** The rendered screen still shows a TraeX prompt row and no blocking page,
+ *  so an `idle` report sent before the first write may stand for the unknown
+ *  footer. A hold raised from an earlier frame (lock page) also refuses. */
+function traexIdleReportScreenShowsComposer(): boolean {
+  if (hookReviewInputHold || heldStuckPage()) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  return startupIdleReportScreenAdmits(screen, cliAdapter?.readyPattern);
 }
 
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
@@ -15530,7 +15562,7 @@ function beginCliWriteCycle(): void {
   idleTranscriptSettle?.cancel();
   beginRuntimeWriteCycle({
     setPromptReady: ready => { isPromptReady = ready; },
-    resetIdleDetector: () => { idleDetector?.reset(); },
+    resetIdleDetector: () => { idleDetector?.reset({ inputCycle: true }); },
   });
   // Input is about to reach the CLI: the main agent's turn starts here, before
   // its transcript record lands (a turn terminal record ends it again).
@@ -21094,6 +21126,17 @@ function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
     : policy;
 }
 
+/** The CLI reports over OSC 7501 that a dialog waits on the human (an
+ *  approval). Text typed ahead now would land in it, where Enter picks the
+ *  default answer (TraeX/Codex: "Yes, proceed"). Queued input waits for the
+ *  turn's terminal report instead. Opt-in per adapter; a question block is
+ *  answered by the next message, so it is not held (see
+ *  programStatusBlockHoldsTypeAhead). */
+function programStatusBlockedHoldsTypeAhead(): boolean {
+  return cliAdapter?.programStatusBlockedHoldsInput === true
+    && programStatusBlockHoldsTypeAhead(idleDetector?.programStatusBlock() ?? null);
+}
+
 /** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
  *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
  *  must stop while the exact native turn is awaiting activation, active, or
@@ -21261,7 +21304,7 @@ async function flushPending(): Promise<void> {
     runtimeSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
-    directRpcTurnBlocksTypeAhead(),
+    directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(pendingMessages[0] ?? {});
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
@@ -22504,7 +22547,7 @@ function sendToPty(
     runtimePtyInputPolicy().supportsTypeAhead,
     durableTurnInFlight,
     next,
-    directRpcTurnBlocksTypeAhead(),
+    directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(next);
   const shouldMergeQueued = !traexAutoModelRuntimeEligible()
     && opts.dispatchAttempt === undefined && !durableTurnInFlight
@@ -23649,7 +23692,7 @@ async function spawnCliBody(
   forceClearSessionRenameInFlight();
   // Early mount based on cfg.cliId before cliAdapter is instantiated for this generation
   // (necessary for adopt mode which wires onPtyData before the normal spawn sequence).
-  programStatusStream = shouldEnableProgramStatus(cfg.cliId, cliAdapter) ? new ProgramStatusFramingStream() : null;
+  programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter, { quiet: true }) ? new ProgramStatusFramingStream() : null;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
@@ -23948,7 +23991,12 @@ async function spawnCliBody(
     };
   }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
-  if (cliAdapter.supportsProgramStatus && !programStatusStream) {
+  // A version-gated adapter (codex / traex) is decided per launch either way.
+  if (cliAdapter.programStatusMinVersion !== undefined) {
+    programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter)
+      ? programStatusStream ?? new ProgramStatusFramingStream()
+      : null;
+  } else if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
   }
   const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
@@ -29311,6 +29359,7 @@ async function spawnCliBody(
       if (backend !== observedBackend || !backendScreenEvidenceIsAuthoritativeForMutation()) return '';
       return stripAnsiScreenText(captureBackendScreen(observedBackend));
     });
+    webTerminalInputGenerationAtSpawn = webTerminalInputGeneration;
     // A new CLI process starts with no closed turn of its own.
     claudeTranscriptTurnEnd.reset();
     wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);

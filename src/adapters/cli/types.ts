@@ -896,6 +896,44 @@ export interface CliAdapter {
    *  with program status off. Later reports are authoritative as usual. */
   readonly programStatusStartupIdleUntrusted?: boolean;
 
+  /** Lowest CLI release whose OSC 7501 reports were verified for this adapter.
+   *  The worker parses reports only for a spawn whose probed version
+   *  (`SpawnContext.cliVersion`) is at least this. An older, unknown or
+   *  unparsable version, an adopted pane (its process version is not the
+   *  probed install) and an RPC viewer keep the screen heuristics, exactly as
+   *  without OSC 7501. Undefined = no version gate. */
+  readonly programStatusMinVersion?: string;
+
+  /** OSC 7501 reports describe this CLI's input cycles, not its composer:
+   *  - before the first botmux write cycle (`IdleDetector.reset({ inputCycle })`)
+   *    every report is ignored and startup readiness stays on the adapter's
+   *    screen gates (only the latest root report is remembered, see
+   *    `IdleDetector.lastProgramStatusReport`);
+   *  - after each write cycle the screen decides idle until the CLI reports
+   *    busy (`working` / `blocked`); terminal reports in between are ignored;
+   *  - from that busy report on the reports are authoritative as usual.
+   *  A cycle re-armed while a busy report is held keeps authority. For CLIs
+   *  that acknowledge a retained `done` with `idle` on the first keystroke,
+   *  report nothing for commands that start no work (`/status`, `/clear`),
+   *  and whose startup reports do not track composer readiness. Do not
+   *  combine with `programStatusSubmitAwaitsBusy`. */
+  readonly programStatusFollowsInputCycle?: boolean;
+
+  /** While OSC 7501 reports `blocked` (an approval dialog owns the input),
+   *  queued input is not typed ahead into the running turn: Enter would pick
+   *  the dialog's default answer. It goes in after the turn's terminal report,
+   *  like any input queued while not type-ahead capable. A `kind=question`
+   *  block is not held: the next message is its answer. */
+  readonly programStatusBlockedHoldsInput?: boolean;
+
+  /** The transcript's own turn terminal (`assistant_final`, fed through
+   *  `IdleDetector.fireIdle`) ends the turn even while OSC 7501 still holds
+   *  `working`; authority is dropped and the screen decides until the next
+   *  report. `blocked` still vetoes it. For CLIs whose `working` also covers
+   *  work beyond the botmux turn (Codex keeps active goals and pending
+   *  follow-ups `working`) and that have an exact transcript terminal. */
+  readonly programStatusYieldsToTranscriptTerminal?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back

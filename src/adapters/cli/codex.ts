@@ -24,6 +24,9 @@ import { delay, scaleMs } from '../../utils/timing.js';
 import { codexTranscriptCloseable, prepareCodexTranscriptInput, settleCodexInputBox } from '../../services/codex-transcript-input.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
+/** First codex-cli release that emits OSC 7501 program status (see the
+ *  adapter's supportsProgramStatus note). */
+export const CODEX_PROGRAM_STATUS_MIN_VERSION = '0.163.0';
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
 
 /**
@@ -635,6 +638,30 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // submit immediately and never spuriously reports a mid-turn send failure.
     supportsTypeAhead: true,
     reliableTurnTerminal: true,
+    // OSC 7501 (`ESC]7501;state=…:app=codex ESC\`), sent unprompted on any
+    // TTY incl. tmux (no `7501;?` probe, so no relay). First in 0.163.0
+    // (openai/codex#52725: idle/working/blocked; 0.162.0 sends none); 0.164.0
+    // adds done/error and kind=permission|question|auth (#54114). Recorded on
+    // 0.163.0 / 0.164.0 / 0.167.0, tmux and PTY:
+    //   startup  idle on the provisional composer → working → idle; with a
+    //            slow MCP server `working` lasts until it is up, although
+    //            the composer already accepts and runs input (that first
+    //            turn then reports only its done).
+    //   turn     [idle on the first keystroke, acknowledging the last done]
+    //            → working → done (0.163: idle); an approval reports
+    //            blocked kind=permission, then working once answered.
+    //   /status, /clear, /rename: no report at all.
+    // So startup stays on the composer gates (#3289), a write hands idle to
+    // the screen until codex reports busy, and from there working → blocked →
+    // done is authoritative (an approval no longer reads as a finished turn,
+    // and nothing is typed ahead into it while it is blocked).
+    // The rollout's assistant_final still ends a turn whose `working` lingers
+    // (active goal, lost report). Older/unknown versions keep the screen path.
+    supportsProgramStatus: true,
+    programStatusMinVersion: CODEX_PROGRAM_STATUS_MIN_VERSION,
+    programStatusFollowsInputCycle: true,
+    programStatusYieldsToTranscriptTerminal: true,
+    programStatusBlockedHoldsInput: true,
     // Worker's maybeEmitCodexStructuredRateLimit reads the rollout's
     // `codex_rate_limited` terminal (isCodexRateLimitEvent) and emits a
     // structured `limited` state — so codex is the rate-limit authority and the

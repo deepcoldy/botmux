@@ -357,7 +357,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['antigravity'],
     /** Discover account-visible models without starting a conversation. */
     async detectModels(options) {
-      return detectModelsViaExec(this.resolvedBin, ['models'], parseAntigravityModels, options?.env);
+      return detectModelsViaExec(this.resolvedBin, ['models'], parseAntigravityModels, {
+        ...(options?.env ?? process.env), AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      });
     },
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
