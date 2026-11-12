@@ -312,6 +312,33 @@ describe('traex runtime registry', () => {
     expect(readTraexRuntimeOccupants(adoptedDomain)?.map(o => o.occupantId)).toContain('adopted');
   });
 
+  it('releases an opaque new-exec orphan after the release-dir grace and keeps it inside it', async () => {
+    const expiredDomain = domainFor(traeHome());
+    const deadPid = 2_000_000_000;
+    const expiredRelease = tempDir('botmux-traex-opaque-');
+    // wrapperCli / forge-traex: a NEW exec with no snapshot and no content key.
+    await acquireTraexRuntimeStart(expiredDomain, {
+      occupantId: 'opaque-orphan', comboKey: '', traexPath: expiredRelease,
+      workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 31 * 60_000,
+    });
+    const freed = await acquireTraexRuntimeStart(expiredDomain, {
+      occupantId: 'live', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(freed.decision).toBe('start');
+    expect(readTraexRuntimeOccupants(expiredDomain)?.map(o => o.occupantId)).toEqual(['live']);
+
+    const pendingDomain = domainFor(traeHome());
+    const pendingRelease = tempDir('botmux-traex-opaque-');
+    await acquireTraexRuntimeStart(pendingDomain, {
+      occupantId: 'opaque-orphan', comboKey: '', traexPath: pendingRelease,
+      workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 20 * 60_000,
+    });
+    const blocked = await acquireTraexRuntimeStart(pendingDomain, {
+      occupantId: 'live', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(blocked.decision).toBe('blocked');
+  });
+
   it('keeps a record whose process birth cannot be proven', async () => {
     const domain = domainFor(traeHome());
     const occupant: TraexRuntimeOccupant = {

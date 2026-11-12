@@ -298,11 +298,14 @@ function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number
       next.push(occupant);
       continue;
     }
-    const scanPath = occupant.snapshotDir
-      ?? (occupant.occupancyOnly === true ? occupant.traexPath : undefined);
-    const grace = occupant.occupancyOnly === true
-      ? TRAEX_OCCUPANCY_ORPHAN_GRACE_MS
-      : TRAEX_STARTING_ORPHAN_GRACE_MS;
+    // A release-dir proof (no private snapshot) is shared by unrelated TRAE
+    // processes, so it only ever proves "do not clean" and gets the longer
+    // grace. This covers occupancy-only AND opaque new execs (wrapper/forge),
+    // which also have no snapshotDir but must not become permanent orphans.
+    const scanPath = occupant.snapshotDir ?? occupant.traexPath;
+    const grace = occupant.snapshotDir
+      ? TRAEX_STARTING_ORPHAN_GRACE_MS
+      : TRAEX_OCCUPANCY_ORPHAN_GRACE_MS;
     if (!scanPath || now - occupant.createdAt < grace) {
       next.push(occupant);
       continue;
