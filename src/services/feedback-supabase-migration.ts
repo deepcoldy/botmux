@@ -4,12 +4,12 @@ import { chmod, mkdir, open, readdir, realpath, symlink } from 'node:fs/promises
 import { join } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 import { atomicWriteFile } from '../utils/atomic-write.js';
-import { withFileLock } from '../utils/file-lock.js';
+import { withFileLock, FileLockTimeoutError } from '../utils/file-lock.js';
 import type { FeedbackStorageConfig, FeedbackStorageTarget, SupabaseTarget } from './feedback-storage-types.js';
 import { readFeedbackStorageConfig, readFeedbackStorageSecret, readPostgresCredential } from './feedback-storage-config.js';
 import { FEEDBACK_TABLES } from './feedback-tables.js';
 import { beginFeedbackMaintenance, currentFeedbackMaintenance, inspectFeedbackMaintenance, freezeFeedbackSource,
-  retireFeedbackSource, restoreFeedbackSource, releaseFeedbackMaintenance } from './feedback-maintenance.js';
+  retireFeedbackSource, restoreFeedbackSource, releaseFeedbackMaintenance, cancelFeedbackMaintenance } from './feedback-maintenance.js';
 import { canonicalFeedbackRow, createFeedbackSnapshot, feedbackRows, workingFeedbackSnapshot } from './feedback-snapshot.js';
 import { validateRecoveryDecision, recoveryAcknowledged, webhookRecoveryFingerprint, type RecoveryDecision } from './feedback-recovery.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
@@ -119,8 +119,13 @@ async function locked<Result>(dataDir: string, operation: () => Promise<Result>)
   const legacy = join(await realpath(dataDir), 'feedback-migrations');
   await mkdir(legacy, { recursive: true, mode: 0o700 });
   if (await realpath(legacy) !== legacy) throw new Error('feedback_migration_directory_invalid');
-  return withFileLock(join(legacy, 'operation'), () => withFileLock(join(legacy, 'runner'),
-    () => withFileLock(join(root, 'operation'), operation, { maxWaitMs: 1000 }), { maxWaitMs: 1000 }), { maxWaitMs: 1000 });
+  try {
+    return await withFileLock(join(legacy, 'operation'), () => withFileLock(join(legacy, 'runner'),
+      () => withFileLock(join(root, 'operation'), operation, { maxWaitMs: 1000 }), { maxWaitMs: 1000 }), { maxWaitMs: 1000 });
+  } catch (error) {
+    if (error instanceof FileLockTimeoutError) throw new Error('feedback_migration_busy_retry');
+    throw error;
+  }
 }
 async function overlap(dataDir: string, identity?: string): Promise<void> {
   const { listFeedbackMigrations } = await import('./feedback-migration.js');
@@ -340,7 +345,8 @@ async function makeSnapshot(dataDir: string, job: SupabaseFeedbackMigration, cli
       for (const table of sqliteOptional(database)) tables[table] = (database.prepare(`SELECT * FROM ${table}`).all() as Row[]).map(normalize);
       if (tables.feedback_event_stream && !tables.feedback_event_stream_counter) {
         const sequence = database.prepare("SELECT seq FROM sqlite_sequence WHERE name='feedback_event_stream'").get() as { seq: number } | undefined;
-        tables.feedback_event_stream_counter = [{ singleton: 1, value: Math.max(Number(sequence?.seq ?? 0), ...tables.feedback_event_stream.map(row => Number(row.sequence))) }];
+        const maximum = tables.feedback_event_stream.reduce((value, row) => Math.max(value, Number(row.sequence)), Number(sequence?.seq ?? 0));
+        tables.feedback_event_stream_counter = [{ singleton: 1, value: maximum }];
       }
       sourceMeta = { version: 1, instance_id: job.sourceInstanceId, backend: 'sqlite', user_version: 8, source_freeze_id: job.sourceFreezeId };
     } finally { database.close(); }
@@ -395,7 +401,8 @@ async function reconcile(dataDir: string, job: SupabaseFeedbackMigration, snapsh
   const meta = await target.call<Row>('migration_status', [], job.sourceInstanceId);
   assertTarget(job, meta, pending.operation === 'prepare');
   if (pending.operation === 'prepare' && meta.state === 'empty') throw new Error('feedback_supabase_prepare_outcome_unknown');
-  if (pending.operation === 'activate' && (meta.state !== 'active' || Number(meta.verified) !== 1)) throw new Error('feedback_supabase_activation_outcome_unknown');
+  if (pending.operation === 'activate' && (meta.state !== 'active' || Number(meta.verified) !== 1)
+    && !(meta.state === 'migrating' && job.verified && job.sourceRetired)) throw new Error('feedback_supabase_activation_outcome_unknown');
   if (pending.operation === 'import') {
     const table = pending.table!;
     const expected = snapshot.tables[table]!.slice(pending.offset, pending.offset! + pending.count!);
@@ -451,7 +458,13 @@ export async function resumeSupabaseFeedbackMigration(dataDir: string, identity:
       if (config.generation === job.expectedGeneration) {
         await phase('draining');
         await beginFeedbackMaintenance(dataDir, job.sourceFreezeId);
-        const report = await inspectFeedbackMaintenance(dataDir, job.sourceFreezeId);
+        let report = await inspectFeedbackMaintenance(dataDir, job.sourceFreezeId);
+        const deadline = Date.now() + 45000;
+        while (report.blockers.length && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 250));
+          await boundConfig(dataDir, job);
+          report = await inspectFeedbackMaintenance(dataDir, job.sourceFreezeId);
+        }
         if (report.blockers.length) throw new Error(`feedback_maintenance_blocked:${report.blockers.join(',')}`);
         const { closeFeedbackStorage } = await import('./feedback-storage.js');
         await closeFeedbackStorage(dataDir);
@@ -526,7 +539,15 @@ export async function resumeSupabaseFeedbackMigration(dataDir: string, identity:
       }
       job.targetGeneration = await activateConfig(dataDir, job);
       await save(dataDir, job);
-      await releaseFeedbackMaintenance(dataDir, job.sourceFreezeId, job.targetGeneration);
+      const deadline = Date.now() + 15000;
+      for (;;) {
+        try { await releaseFeedbackMaintenance(dataDir, job.sourceFreezeId, job.targetGeneration); break; }
+        catch (error) {
+          if (!(error instanceof Error) || error.message !== 'feedback_maintenance_generation_pending' || Date.now() >= deadline) throw error;
+          await new Promise(resolve => setTimeout(resolve, 250));
+          await boundConfig(dataDir, job, true);
+        }
+      }
       await phase('complete');
     } catch (error) {
       job.phase = 'blocked';
@@ -570,7 +591,7 @@ async function finishCancellation(dataDir: string, job: SupabaseFeedbackMigratio
         await source.query('COMMIT');
       } catch (error) { await source.query('ROLLBACK').catch(() => {}); throw error; }
       const control = currentFeedbackMaintenance(dataDir);
-      if (control?.migrationId === job.sourceFreezeId) await releaseFeedbackMaintenance(dataDir, job.sourceFreezeId, job.expectedGeneration);
+      if (control?.migrationId === job.sourceFreezeId) cancelFeedbackMaintenance(dataDir, job.sourceFreezeId, job.expectedGeneration);
     } else {
       const guard = await sqliteGuard(dataDir, job, true);
       if (guard?.state === 'retired') throw new Error('feedback_source_retired');

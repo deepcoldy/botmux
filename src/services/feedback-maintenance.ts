@@ -264,3 +264,11 @@ export async function releaseFeedbackMaintenance(dataDir: string, migrationId: s
   }
   withFileLockSync(controlPath(dataDir), () => writeControl(dataDir, { ...report, generation, state: 'complete' }));
 }
+
+export function cancelFeedbackMaintenance(dataDir: string, migrationId: string, generation: number): void {
+  withFileLockSync(controlPath(dataDir), () => {
+    const control = readControl(dataDir);
+    if (!control || control.migrationId !== migrationId || control.generation !== generation) throw new Error('feedback_migration_identity_conflict');
+    writeControl(dataDir, { ...control, state: 'complete' });
+  });
+}

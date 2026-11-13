@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { once } from 'node:events';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { withFileLock } from '../src/utils/file-lock.js';
 
 const directories: string[] = [];
 const instanceId = '3b5530dc-c5a8-421e-a236-9963f9934534';
@@ -31,6 +32,26 @@ afterEach(async () => {
 });
 
 describe('Supabase migration preparation safety', () => {
+  it('reports a bounded busy error when another migration owns the shared operation lock', async () => {
+    const migration = await service();
+    const directory = await fixture();
+    await mkdir(join(directory, 'feedback-migrations'));
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const lock = withFileLock(join(directory, 'feedback-migrations', 'operation'), async () => {
+      acquired();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await ready;
+    try {
+      await expect(migration!.prepareSupabaseFeedbackMigration(directory, {
+        requestId: 'busy', expectedGeneration: 4, maintenanceConfirmed: true,
+      })).rejects.toThrow('feedback_migration_busy_retry');
+      const { saveFeedbackStorageCandidate } = await import('../src/services/feedback-storage-config.js');
+      await expect(saveFeedbackStorageCandidate(directory, 4, { backend: 'sqlite' })).rejects.toThrow('feedback_migration_busy_retry');
+    } finally { release(); await lock; }
+  });
   it('prevents the legacy PostgreSQL preparer from occupying a Supabase migration slot after configuration drift', async () => {
     const migration = await service();
     const directory = await fixture();

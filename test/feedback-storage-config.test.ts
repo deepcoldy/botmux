@@ -93,6 +93,7 @@ describe('feedback storage configuration', () => {
     expect(await readFeedbackStorageConfig(path)).toEqual(saved);
   });
   it.each([
+    { url: 'not-a-url', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
     { url: 'http://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
     { url: 'https://user:password@example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
     { url: 'https://example.supabase.co', keyRef: 'exposed-key', schema: 'feedback', requestTimeoutMs: 5000 },

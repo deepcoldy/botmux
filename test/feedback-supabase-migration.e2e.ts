@@ -11,16 +11,18 @@ import { openPostgresFeedbackStore } from '../src/services/feedback-postgres-sto
 import { feedbackSupabaseSchemaSql } from '../src/services/feedback-supabase-schema.js';
 import type { PostgresTarget } from '../src/services/feedback-storage-types.js';
 import { webhookRecoveryFingerprint } from '../src/services/feedback-recovery.js';
+import { currentFeedbackMaintenance, startFeedbackMaintenanceParticipant, writeFeedbackParticipant, assertFeedbackAdmission } from '../src/services/feedback-maintenance.js';
 
 type Row = Record<string, unknown>;
 
-function rpcBoundary(mode: 'normal' | 'import-committed' | 'import-uncommitted' | 'corrupt' | 'activate-committed', instanceId: string) {
+function rpcBoundary(mode: 'normal' | 'import-committed' | 'import-uncommitted' | 'corrupt' | 'activate-committed' | 'activate-uncommitted', instanceId: string) {
   const allowed = ['interactions', 'skill_runs', 'responses', 'deliveries', 'feedback_revisions', 'turn_terminals',
     'turn_completion_events', 'feedback_events', 'feedback_outbox', 'feedback_event_stream', 'feedback_event_stream_counter'];
   const tables = new Map<string, Row[]>([['feedback_event_stream_counter', [{ singleton: 1, value: 0 }]]]);
   let meta: Row = { singleton: 1, version: 1, state: 'empty', instance_id: instanceId, migration_id: null, source_fingerprint: null, verified: 0 };
   let interrupted = false;
   let imports = 0;
+  let activations = 0;
   const transport: typeof fetch = async (_input, init) => {
     const body = JSON.parse(String(init?.body));
     if (Object.keys(body).sort().join(',') !== 'p_args,p_instance_id,p_operation') throw new Error('invalid RPC wire contract');
@@ -71,6 +73,11 @@ function rpcBoundary(mode: 'normal' | 'import-committed' | 'import-uncommitted' 
       }
       case 'migration_activate':
         if (args.length !== 2 || args[0] !== meta.migration_id || args[1] !== meta.source_fingerprint) throw new Error('invalid activate contract');
+        activations++;
+        if (mode === 'activate-uncommitted' && !interrupted) {
+          interrupted = true;
+          throw new Error('activation did not reach target');
+        }
         meta = { ...meta, state: 'active', verified: 1 };
         if (mode === 'activate-committed' && !interrupted) {
           interrupted = true;
@@ -83,7 +90,7 @@ function rpcBoundary(mode: 'normal' | 'import-committed' | 'import-uncommitted' 
     }
     return new Response(JSON.stringify({ version: 1, result }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
-  return { transport, tables, get imports() { return imports; }, get meta() { return meta; } };
+  return { transport, tables, get imports() { return imports; }, get activations() { return activations; }, get meta() { return meta; } };
 }
 
 const directories: string[] = [];
@@ -96,7 +103,7 @@ afterEach(async () => {
 });
 
 const postgresAddress = process.env.BOTMUX_TEST_POSTGRES_URL;
-async function postgresFixture(mode: 'normal' | 'import-committed' | 'import-uncommitted' | 'activate-committed' | 'corrupt' = 'normal') {
+async function postgresFixture(mode: 'normal' | 'import-committed' | 'import-uncommitted' | 'activate-committed' | 'activate-uncommitted' | 'corrupt' = 'normal') {
   const url = new URL(postgresAddress!);
   if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || !url.port || url.port === '5432') {
     throw new Error('disposable loopback PostgreSQL required');
@@ -150,6 +157,10 @@ async function postgresFixture(mode: 'normal' | 'import-committed' | 'import-unc
       importCount++;
       if (mode === 'import-uncommitted' && !interrupted) { interrupted = true; throw new Error('network lost before commit'); }
     }
+    if (mode === 'activate-uncommitted' && body.p_operation === 'migration_activate' && !interrupted) {
+      interrupted = true;
+      throw new Error('activation request did not reach SQL');
+    }
     let envelope;
     try {
       envelope = (await admin.query(`SELECT "${targetSchema}".botmux_feedback($1,$2,$3::jsonb) envelope`,
@@ -176,7 +187,20 @@ async function postgresFixture(mode: 'normal' | 'import-committed' | 'import-unc
 }
 
 describe.skipIf(!postgresAddress)('PostgreSQL source with actual SQL RPC target', () => {
-  it.each(['normal', 'import-committed', 'activate-committed'] as const)('preserves prior identity and resumes exact SQL markers: %s', async mode => {
+  it('cancels PostgreSQL maintenance with an active participant without requiring drain', async () => {
+    const { directory, migration, prepared, config } = await postgresFixture('import-uncommitted');
+    expect((await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId)).phase).toBe('blocked');
+    writeFeedbackParticipant(directory, {
+      generation: config.generation, migrationId: prepared.migrationId, ready: false, blockers: ['active_turns'],
+    });
+    const cancelled = await migration.cancelSupabaseFeedbackMigration(directory, prepared.migrationId, {
+      confirmed: true, actor: 'operator', reason: 'cancel while active work continues', evidence: 'test:participant',
+    });
+    expect(cancelled.phase).toBe('cancelled');
+    expect(currentFeedbackMaintenance(directory)?.state).toBe('complete');
+    expect(() => assertFeedbackAdmission(directory)).not.toThrow();
+  });
+  it.each(['normal', 'import-committed', 'activate-committed', 'activate-uncommitted'] as const)('preserves prior identity and resumes exact SQL markers: %s', async mode => {
     const context = await postgresFixture(mode);
     const { directory, admin, stale, sourceSchema, targetSchema, events, response, migration, prepared } = context;
     let result = await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId);
@@ -315,6 +339,49 @@ async function fixture(mode: Parameters<typeof rpcBoundary>[0]) {
 }
 
 describe('SQLite to Supabase with real SDK and disposable source', () => {
+  it('drains and acknowledges a real maintenance participant in one resume', async () => {
+    const { directory, migration, prepared } = await fixture('normal');
+    const { getFeedbackStorage } = await import('../src/services/feedback-storage.js');
+    const config = await readFeedbackStorageConfig(directory);
+    writeFeedbackParticipant(directory, { generation: config.generation, ready: false, blockers: [] });
+    const stop = startFeedbackMaintenanceParticipant(directory, () => ({ busy: false, failed: 0, pending: 0 }), async () => {}, async () => {});
+    cleanups.push(async () => { stop(); await getFeedbackStorage(directory).then(storage => storage.store.close()).catch(() => {}); });
+    const result = await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId);
+    expect(result.phase, JSON.stringify(result.blockers)).toBe('complete');
+    expect(currentFeedbackMaintenance(directory)).toMatchObject({ state: 'complete', generation: config.generation + 1 });
+    expect(() => assertFeedbackAdmission(directory)).not.toThrow();
+  });
+  it('resumes an uncommitted activation only after matching locked target state while retaining source retirement', async () => {
+    const { directory, boundary, migration, prepared } = await fixture('activate-uncommitted');
+    const first = await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId);
+    expect(first).toMatchObject({ phase: 'blocked', sourceRetired: true, verified: true });
+    expect(boundary.meta.state).toBe('migrating');
+    await expect(migration.cancelSupabaseFeedbackMigration(directory, prepared.migrationId, {
+      confirmed: true, actor: 'operator', reason: 'must not restore retired source', evidence: 'test:retired',
+    })).rejects.toThrow('feedback_source_retired');
+    const imports = boundary.imports;
+    const resumed = await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId);
+    expect(resumed.phase, JSON.stringify(resumed.blockers)).toBe('complete');
+    expect(boundary.activations).toBe(2);
+    expect(boundary.imports).toBe(imports);
+    expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('supabase');
+  });
+  it('snapshots a large SQLite event stream without spreading rows onto the call stack', async () => {
+    const { directory, boundary, migration, prepared } = await fixture('import-uncommitted');
+    const seed = await openDatabaseSync(join(directory, 'botmux-feedback.sqlite'));
+    seed.exec(`BEGIN;
+      WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM numbers WHERE value<130000)
+      INSERT INTO feedback_events(event_id,event_type,version,aggregate_id,payload_json,created_at)
+      SELECT 'large_'||value,'feedback.revised',1,'large','{}','2026-11-13' FROM numbers;
+      COMMIT;`);
+    seed.close();
+    const result = await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId);
+    expect(result.snapshotPath, JSON.stringify(result.blockers)).toBeDefined();
+    const snapshot = JSON.parse(await readFile(result.snapshotPath!, 'utf8'));
+    expect(snapshot.tables.feedback_event_stream_counter).toEqual([{ singleton: 1, value: 130037 }]);
+    expect(snapshot.tables.feedback_event_stream).toHaveLength(130002);
+    expect(boundary.imports).toBe(1);
+  });
   it('preserves revisions, event sequences and the allocation counter before activation', async () => {
     const { directory, boundary, migration, prepared, events, response } = await fixture('normal');
     const result = await migration.resumeSupabaseFeedbackMigration(directory, prepared.migrationId);

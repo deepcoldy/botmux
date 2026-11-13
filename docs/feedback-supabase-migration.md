@@ -62,6 +62,10 @@ The generated SQL must be reviewed and installed before testing. The migration
 command requires a separately authorized maintenance window; these examples are
 not instructions to execute a production cutover automatically.
 
+Selecting Supabase during first interactive startup, or supplying a Supabase
+`BOTMUX_FEEDBACK_CONFIG_FILE`, saves only the candidate. Bootstrap instructions
+are printed without automatically freezing the fresh SQLite installation.
+
 ![Supabase candidate settings](assets/feedback-storage/supabase.png)
 
 Run migration from an **independent maintenance host/process**, not an active
@@ -104,6 +108,10 @@ plus its own operation lock, so independent processes cannot interleave runs.
 The sequence is maintenance/drain → source freeze → durable snapshot → chunked
 import → verification → source retirement → target activation → configuration
 cutover → maintenance generation acknowledgment.
+
+Drain waits up to 45 seconds for live participants and release waits up to 15
+seconds for the new configuration generation. Persistent blockers remain
+visible; waiting does not bypass active work or unknown sends.
 
 SQLite reuses the native source freeze, backup, integrity checks, and working
 snapshot upgrade. Its staging directory is nested below
@@ -185,7 +193,10 @@ original source/target markers.
 - Unknown retirement: original source guard must already say retired. A frozen
   marker is not proof of retirement and does not authorize retry.
 - Unknown activation: original target must say active, verified, with the
-  exact migration ID/fingerprint. A migrating marker remains unknown.
+  exact migration ID/fingerprint. If a metadata row-lock read confirms the
+  same target is still migrating, the source is retired and the snapshot was
+  already verified, resume may re-enter the idempotent activation transaction.
+  No retired-source cancellation or uncertain import replay is enabled.
 - Configuration acknowledgment loss: exact full active configuration at
   `expectedGeneration + 1`, verified target and original retired source marker
   allow completing maintenance without repeating import or activation.
@@ -198,6 +209,10 @@ target schema; a new operation requires an independently reviewed fresh target.
 Cancellation resumes safely after a crash between unfreeze and journal update.
 After retirement or target activation, cancellation is refused; resume the
 original operation rather than attempting rollback.
+Before retirement, PostgreSQL-source cancellation restores admission even if
+participants remain busy; source unfreeze and original control identity are
+checked before releasing maintenance. File-lock contention reports
+`feedback_migration_busy_retry` rather than a generic operation failure.
 
 ## Local verification only
 
