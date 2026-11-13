@@ -662,6 +662,7 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
             <span className="dboard-seq">#{item.seq}</span>
             <strong>{item.title}</strong>
           </span>
+          {item.state === 'closed' ? <span className="dboard-row-ask">{tr('decisionBoard.closeInChatDone')}</span> : null}
           {asking && (question || item.recommend) ? (
             <span className="dboard-row-ask">
               {question ? <>{tr('decisionBoard.askShort')}{question}</> : null}
@@ -1417,6 +1418,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       <p className="dboard-detail-meta">{meta}</p>
       <CloseInChatButton appId={appId} item={item} disabled={uploads.length > 0}
         beforeClose={() => editor.flush()} onChanged={() => { editor.reset(null); void load({ resetDraft: true }); }} />
+      {item.state === 'closed' ? <p className="dboard-detail-meta" role="status">{tr('decisionBoard.closeInChatDone')}</p> : null}
       <HintBanner hint={item.hint} />
       <TaskHintChip hint={detail.taskHint} banner />
       <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />

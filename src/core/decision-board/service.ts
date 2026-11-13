@@ -908,7 +908,7 @@ export class DecisionBoardService {
   /** Owner-only UI action; never calls submit, submitCard, deliverBatch or deliver. */
   closeInChat(seq: number, baseRev: number, actorRef: string) {
     this.requireSteward();
-    const result = this.store().closeInChat(this.appId, seq, baseRev, actorRef);
+    const result = this.store().closeInChat(this.appId, seq, baseRev, actorRef, undefined, this.deps.locale());
     this.syncCard(seq);
     return result;
   }
@@ -1247,7 +1247,7 @@ export class DecisionBoardService {
       if (v.ask !== decisionAskKey(item) || Number(v.rev) !== item.rev) return refreshed(T.stale);
       this.closeInChat(seq, item.rev, click.operatorUnionId && /^[A-Za-z0-9_-]{1,128}$/.test(click.operatorUnionId)
         ? `u:${click.operatorUnionId}` : 'owner');
-      return refreshed(this.deps.locale() === 'en' ? 'Closed only; nothing sent to the session' : '已处理；未向会话投递', 'info');
+      return refreshed(this.deps.locale() === 'en' ? 'Closed; no further decision needed' : '已关闭，无需再拍板', 'info');
     }
     const choice = v.action === DECISION_CARD_ACTION_PICK && typeof v.key === 'string' && v.key ? v.key : undefined;
     if (v.action !== DECISION_CARD_ACTION_PICK && v.action !== DECISION_CARD_ACTION_NOTE) return { toast: { type: 'warning', content: T.unavailable } };

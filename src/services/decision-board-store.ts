@@ -895,8 +895,8 @@ export class DecisionBoardStore {
     });
   }
 
-  /** Owner closes an already-decided item. No batch/decision/outbox is created. */
-  closeInChat(appId: string, seq: number, baseRev: number, actorRef: string, now = Date.now()) {
+  /** Owner closes an item that no longer needs a decision. No batch/decision/outbox is created. */
+  closeInChat(appId: string, seq: number, baseRev: number, actorRef: string, now = Date.now(), locale: Locale = 'zh') {
     return this.tx(() => {
       const row = this.itemRow(appId, seq);
       if (!row) throw new BoardError('item_not_found', `没有 #${seq}`);
@@ -914,7 +914,8 @@ export class DecisionBoardStore {
         WHERE app_id = ? AND seq = ?`).run(now, now, appId, seq);
       // Remove only this item's drafts so a later bulk submission cannot send its old option.
       this.stmt('DELETE FROM board_drafts WHERE app_id = ? AND seq = ?').run(appId, seq);
-      this.insertEvent(appId, seq, now, 'owner', actorRef, 'state', '本人标记已在会话里决定');
+      this.insertEvent(appId, seq, now, 'owner', actorRef, 'state', locale === 'en'
+        ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）');
       return { item: rowToItem(this.itemRow(appId, seq)!), duplicate: false };
     });
   }

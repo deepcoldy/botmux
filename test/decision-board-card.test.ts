@@ -36,12 +36,12 @@ let updateImpl: (messageId: string) => Promise<void>;
 let service: DecisionBoardService;
 let owner: string | undefined;
 
-function makeService(): DecisionBoardService {
+function makeService(locale: 'zh' | 'en' = 'zh'): DecisionBoardService {
   return new DecisionBoardService({
     dataDir: dir,
     larkAppId: () => APP,
     steward: () => steward,
-    locale: () => 'zh',
+    locale: () => locale,
     brand: () => 'feishu',
     dashboardOrigin: () => 'https://dash.example',
     ownerOpenId: () => owner,
@@ -137,12 +137,15 @@ async function webSubmit(seq: number, choice: string, text: string, nonce: strin
 
 describe('仅关闭，不投递', () => {
   const closeValue = (card: any) => callbackButtons(card).find(b => b.behaviors[0].value.action === DECISION_CARD_ACTION_CLOSE).behaviors[0].value;
-  it('按钮不在表单内、含确认；真实回调关闭、记 owner 历史、原地换卡，无 afterAck 或批次', async () => {
+  it.each(['zh', 'en'] as const)('通用关闭文案（%s）：真实回调、owner历史和原地换卡不产生afterAck或批次', async locale => {
+    service.close();
+    service = makeService(locale);
+    const historyText = locale === 'en' ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）';
     const seq = await addDecide();
     const card = currentCard();
     const button = card.body.elements.find((e: any) => e.behaviors?.[0]?.value?.action === DECISION_CARD_ACTION_CLOSE);
-    expect(button.text.content).toBe('已在会话里定了');
-    expect(button.confirm.text.content).toContain('不向会话');
+    expect(button.text.content).toBe(locale === 'en' ? 'Close item' : '关闭此项');
+    expect(button.confirm.text.content).toContain(locale === 'en' ? 'needs no decision, or will not be done' : '不再需要决策或不做了');
     expect(button.form_action_type).toBeUndefined();
     const item = service.store().getItem(APP, seq)!;
     service.putDraft(seq, 'owner', { choice: 'B', text: '不要投递的旧草稿', baseRev: item.rev });
@@ -151,6 +154,7 @@ describe('仅关闭，不投递', () => {
       action: { value: { ...closeValue(card), key: 'A' }, form_value: { [DECISION_CARD_NOTE_FIELD]: '也不能投递' } },
       context: { open_message_id: sent[0]!.messageId } } as any, APP);
     expect(out.afterAck).toBeUndefined();
+    expect(out.toast?.content).toBe(locale === 'en' ? 'Closed; no further decision needed' : '已关闭，无需再拍板');
     expect(out.card.type).toBe('raw');
     expect(out.card.data.header.template).toBe('grey');
     expect(callbackButtons(out.card.data)).toHaveLength(0);
@@ -161,14 +165,14 @@ describe('仅关闭，不投递', () => {
     const detail = service.detail(seq, 'owner');
     expect(detail.item).toMatchObject({ state: 'closed', rev: item.rev + 1 });
     expect(detail.draft).toBeUndefined();
-    expect(detail.events.filter(e => e.text === '本人标记已在会话里决定')).toMatchObject([{ actor: 'owner', kind: 'state' }]);
+    expect(detail.events.filter(e => e.text === historyText)).toMatchObject([{ actor: 'owner', kind: 'state' }]);
     expect(service.store().listBatches(APP)).toEqual([]);
     expect(service.store().latestDecision(APP, seq)).toBeUndefined();
     await service.redeliverUndelivered();
     expect(delivered).toEqual([]);
     const again = service.cardClick({ operatorOpenId: OWNER, value: closeValue(card), messageId: sent[0]!.messageId });
     expect(again.deliver).toBeUndefined();
-    expect(service.detail(seq, 'owner').events.filter(e => e.text === '本人标记已在会话里决定')).toHaveLength(1);
+    expect(service.detail(seq, 'owner').events.filter(e => e.text === historyText)).toHaveLength(1);
     // Old option callback and late autosave cannot turn closure into delivery.
     expect(click(card).deliver).toBeUndefined();
     expect(() => service.putDraft(seq, 'owner', { choice: 'A', baseRev: item.rev })).toThrow(BoardError);

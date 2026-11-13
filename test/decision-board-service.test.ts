@@ -67,7 +67,9 @@ async function addDecideItem(title = 'PR #1 合不合') {
 }
 
 describe('close in chat', () => {
-  it('仅关闭：事务记录状态/历史、清掉本项草稿和提示，重复请求和重启不重复记账，不投递', async () => {
+  it.each(['zh', 'en'] as const)('仅关闭（%s）：记录本地化历史、清本项草稿和提示，重复请求与重启不重复记账，不投递', async language => {
+    locale = language;
+    const historyText = language === 'en' ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）';
     const item = await addDecideItem();
     const other = await addDecideItem('other');
     const draft = service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev }).draft!;
@@ -84,7 +86,7 @@ describe('close in chat', () => {
     expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
     expect(service.detail(other.seq, 'owner').draft).toBeDefined();
     expect(service.closeInChat(item.seq, item.rev, 'local').duplicate).toBe(true);
-    expect(store.detail(APP, item.seq)?.events.filter(e => e.text === '本人标记已在会话里决定')).toHaveLength(1);
+    expect(store.detail(APP, item.seq)?.events.filter(e => e.text === historyText)).toHaveLength(1);
     await expect(service.submit({ author: 'owner', nonce: 'late', items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
       .rejects.toMatchObject({ code: 'draft_missing' });
     expect(() => service.putDraft(item.seq, 'owner', { text: 'late save', baseRev: item.rev })).toThrow();

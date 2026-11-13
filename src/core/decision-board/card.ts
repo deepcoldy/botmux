@@ -84,6 +84,7 @@ const EN_VIA: Record<BatchSource, string> = { web: ' on the web', card: '', loca
 const TEXT = {
   zh: {
     decide: '待拍板',
+    closed: '已关闭，无需再拍板',
     summary: '现状',
     question: '要你定',
     recommend: '推荐',
@@ -114,6 +115,7 @@ const TEXT = {
   },
   en: {
     decide: 'Decision needed',
+    closed: 'Closed; no further decision needed',
     summary: 'Status',
     question: 'Question',
     recommend: 'recommended',
@@ -213,12 +215,12 @@ function closeButton(input: DecisionCardInput): Record<string, unknown> {
   const ask = decisionAskKey(item);
   return {
     tag: 'button', type: 'default', width: 'fill',
-    text: { tag: 'plain_text', content: en ? 'Already decided in chat' : '已在会话里定了' },
+    text: { tag: 'plain_text', content: en ? 'Close item' : '关闭此项' },
     confirm: {
-      title: { tag: 'plain_text', content: en ? 'Close this item only?' : '只关闭这一项？' },
+      title: { tag: 'plain_text', content: en ? 'Close this item?' : '关闭此项？' },
       text: { tag: 'plain_text', content: en
-        ? 'Marks this item as handled and clears its drafts. No option or note is sent to the session; earlier submissions are not recalled.'
-        : '只标记已处理并清空这一项的草稿，不向会话发送任何选项或说明；此前的提交不会撤回。' },
+        ? 'Closing removes this item from pending decisions and clears its draft, without sending any option or note to the session. Use it when it was decided elsewhere, needs no decision, or will not be done. Earlier submissions are not recalled.'
+        : '关闭后此项不再待拍板并清空草稿，不会向会话发送任何选项或说明。适用于已在别处定了、不再需要决策或不做了；此前的提交不会撤回。' },
     },
     behaviors: [{ type: 'callback', value: {
       action: DECISION_CARD_ACTION_CLOSE, app: input.appId, seq: String(item.seq), ask, rev: String(item.rev),
@@ -320,7 +322,7 @@ export function buildDecisionCard(input: DecisionCardInput): Record<string, unkn
   if (input.retired) return linkOnlyCard(input, 'grey', L[input.retired]);
   const mode = cardMode(input.item);
   const stateLabel = BOARD_STATE_LABELS[input.locale === 'en' ? 'en' : 'zh'][input.item.state];
-  if (mode === 'ended') return linkOnlyCard(input, 'grey', L.notDeciding(stateLabel));
+  if (mode === 'ended') return linkOnlyCard(input, 'grey', input.item.state === 'closed' ? L.closed : L.notDeciding(stateLabel));
   if (mode === 'not_deciding') return linkOnlyCard(input, 'blue', L.notDeciding(stateLabel));
   if (mode === 'too_many') return linkOnlyCard(input, 'orange', L.tooMany(input.item.options.length));
   const card = openCard(input);
