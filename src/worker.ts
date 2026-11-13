@@ -2143,31 +2143,37 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
         && proof.nativeSessionId === (lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId)) {
         nativeSessionId = proof.nativeSessionId;
       }
-    } else if (!nativeSessionId && lastInitConfig?.cliId === 'codex' && !lastInitConfig.existingAppServerEndpoint) {
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'codex'
+      && (typeof codexRpcEngine === 'undefined' || !codexRpcEngine)
+      && !lastInitConfig.existingAppServerEndpoint) {
       // A busy re-attached Codex pane may stay silent until the running turn
       // completes, and can hold internal/subagent rollouts open alongside the
       // user's top-level rollout. Prefer header-verified top-level fd discovery,
-      // falling back to an active owned bridge journal turn when fd headers are
-      // unavailable in unit harnesses.
+      // falling back to an active owned bridge journal turn or a daemon-frozen
+      // resume id only when this exact PID holds that rollout open; a configured
+      // id never proves ownership by itself.
       const liveSid = typeof readCodexLiveSessionId === 'function' ? readCodexLiveSessionId(childPid) : undefined;
       const ownedRollouts = typeof findCodexRolloutSetByPid === 'function' ? findCodexRolloutSetByPid(childPid) : undefined;
-      if (liveSid && (!ownedRollouts || (typeof codexHistorySidIsOwned === 'function'
-        ? codexHistorySidIsOwned(liveSid, ownedRollouts)
-        : ownedRollouts.has(liveSid.toLowerCase())))) {
+      const isOwnedSid = (sid: string): boolean => !ownedRollouts || (typeof codexHistorySidIsOwned === 'function'
+        ? codexHistorySidIsOwned(sid, ownedRollouts)
+        : ownedRollouts.has(sid.toLowerCase()));
+      if (liveSid && isOwnedSid(liveSid)) {
         nativeSessionId = liveSid;
-      } else if (ownedRollouts?.size === 1 && typeof findCodexRolloutByPid === 'function') {
+      } else if ((!ownedRollouts || ownedRollouts.size === 1) && typeof findCodexRolloutByPid === 'function') {
         const observed = findCodexRolloutByPid(childPid);
-        const isOwned = observed && (typeof codexHistorySidIsOwned === 'function'
-          ? codexHistorySidIsOwned(observed.cliSessionId, ownedRollouts)
-          : ownedRollouts.has(observed.cliSessionId));
-        if (observed && isOwned) nativeSessionId = observed.cliSessionId;
-      } else if (ownedRollouts && ownedRollouts.size > 1
-        && typeof codexBridgeRolloutPath === 'string'
-        && typeof codexBridgeQueue !== 'undefined' && codexBridgeQueue.peek().length > 0
-        && typeof codexGenerationSessionIdFromRolloutPath === 'function'
-        && typeof codexHistorySidIsOwned === 'function') {
-        const bridgeSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
-        if (bridgeSid && codexHistorySidIsOwned(bridgeSid, ownedRollouts)) nativeSessionId = bridgeSid;
+        if (observed && isOwnedSid(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+      } else if (ownedRollouts && ownedRollouts.size > 1) {
+        if (typeof codexBridgeRolloutPath === 'string'
+          && typeof codexBridgeQueue !== 'undefined' && codexBridgeQueue.peek().length > 0
+          && typeof codexGenerationSessionIdFromRolloutPath === 'function'
+          && typeof codexHistorySidIsOwned === 'function') {
+          const bridgeSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
+          if (bridgeSid && codexHistorySidIsOwned(bridgeSid, ownedRollouts)) nativeSessionId = bridgeSid;
+        }
+        const pinned = lastInitConfig.cliSessionId?.toLowerCase();
+        if (!nativeSessionId && pinned && isOwnedSid(pinned)) {
+          nativeSessionId = pinned;
+        }
       }
     } else if (!nativeSessionId && lastInitConfig?.cliId === 'grok' && typeof findGrokSessionByPid === 'function') {
       nativeSessionId = findGrokSessionByPid(childPid)?.sessionId;
@@ -7126,6 +7132,14 @@ function completeManagedTurnOriginRevocation(
   if (opts.revokePolicy) sandboxPolicyCapability = null;
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
+    const scope = typeof workerSessionEventScope !== 'undefined' ? workerSessionEventScope : undefined;
+    const binding = scope?.contextBinding() ?? scope?.currentBinding();
+    const execution = turnId
+      ? scope?.executionForTurn(turnId, dispatchAttempt)
+      : undefined;
+    const explicitOrigin = binding?.runtime
+      ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
+      : undefined;
     send({
       type: 'managed_turn_origin_revoked',
       sessionId,
@@ -7136,7 +7150,7 @@ function completeManagedTurnOriginRevocation(
         : {}),
       ...(turnId ? { turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    });
+    }, explicitOrigin);
   }
   unlinkManagedOriginCapabilityFiles();
 }
