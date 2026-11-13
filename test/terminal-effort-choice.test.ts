@@ -36,7 +36,9 @@ describe('confirmed terminal effort intent', () => {
   });
 
   it('disabled or unready input never supplies a choice, including after enabling', () => {
-    for (const options of [{ enabled: false, ready: true }, { enabled: true, ready: false }]) {
+    // readPreference is available, so only the enabled/ready gates can stop the intent.
+    const readPreference = () => '["high",null,null,null]';
+    for (const options of [{ enabled: false, ready: true, readPreference }, { enabled: true, ready: false, readPreference }]) {
       const { tracker, binding, client } = fixture();
       tracker.input(client, '/effort medium\r', binding, options);
       expect(tracker.observe({ binding, effort: 'medium', atMs: NOW }, true, 'native-settings')).toBeUndefined();

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Session } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, hasConfirmedNativeGrokEffort } from '../src/core/terminal-effort-writeback.js';
+import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../src/core/terminal-effort-writeback.js';
 import { terminalEffortPreferenceKey, type TerminalEffortChoice } from '../src/services/terminal-effort-choice.js';
 import { resolveSessionLaunchEffort } from '../src/core/session-model.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
@@ -81,6 +81,9 @@ describe('terminal effort persistence', () => {
     expect(hasConfirmedNativeGrokEffort(restored, restored.model)).toBe(true);
     expect(hasConfirmedNativeGrokEffort(restored, 'grok-other')).toBe(false);
     expect(hasConfirmedNativeGrokEffort({ ...restored, cliSessionId: 'other' }, restored.model)).toBe(false);
+    // A later /cli selection changes the launch snapshot the receipt was bound to.
+    const reselected = { ...restored, cliLaunchSnapshot: { cliId: 'grok', state: 'resolved', reasoningEffort: 'xhigh', startupCommands: ['echo changed'] } as any };
+    expect(hasConfirmedNativeGrokEffort(reselected, restored.model)).toBe(false);
   });
 
   it.each([false, true])('fences newly confirmed Grok xhigh at the actual cold launch, snapshot=%s', snapshot => {
@@ -182,6 +185,52 @@ describe('terminal effort persistence', () => {
     f.state.session.reasoningEffort = 'low';
     expect(() => persistTerminalEffortChoice(f.state, f.observation, f.source, f.options)).toThrow('terminal_effort_selection_stale');
     expect(store.getSession(f.row.sessionId)!.reasoningEffort).toBe('low');
+  });
+
+  it('a card/API edit made after the terminal request wins even when it rewrites the same value', () => {
+    // Same-value edits leave the CAS fingerprint unchanged; only the edit time can tell.
+    const f = fixture(); const mutate = vi.fn(f.options.mutate);
+    noteExplicitEffortPreferenceEdit(f.state, f.selection.requestedAtMs + 1);
+    expect(persistTerminalEffortChoice(f.state, f.observation, f.source, { ...f.options, mutate })).toBe(false);
+    expect(mutate).not.toHaveBeenCalled();
+    expect(store.getSession(f.row.sessionId)!.reasoningEffort).toBe('high');
+    const g = fixture();
+    noteExplicitEffortPreferenceEdit(g.state, g.selection.requestedAtMs - 1);
+    expect(persistTerminalEffortChoice(g.state, g.observation, g.source, g.options)).toBe(true);
+  });
+
+  it('a choice older than a native reading the daemon already applied is not saved', () => {
+    const at = NOW - 5;
+    const choose = (appliedAt: number) => {
+      const f = fixture('codex');
+      f.state.nativeReasoningObservation = { cliId: 'codex', nativeSessionId: 'native', reasoningEffort: 'low',
+        source: 'native-footer', observedAtMs: appliedAt, workerGeneration: 4 };
+      const selection = { ...f.selection, confirmedAtMs: at };
+      return { f, saved: persistTerminalEffortChoice(f.state, { ...f.observation, observedAtMs: at, userSelection: selection }, f.source, f.options) };
+    };
+    const newer = choose(at + 1);
+    expect(newer.saved).toBe(false);
+    expect(store.getSession(newer.f.row.sessionId)!.reasoningEffort).toBe('high');
+    expect(choose(at).saved).toBe(true);
+  });
+
+  it('orders two terminal choices by request time when the earlier one commits first', () => {
+    const f = fixture('codex');
+    const observe = (effort: 'low' | 'medium', selection: TerminalEffortChoice) =>
+      ({ ...f.observation, reasoningEffort: effort, observedAtMs: selection.confirmedAtMs, userSelection: selection });
+    // Both were requested before either committed, so both captured the same preference.
+    const earlier = { ...f.selection, nonce: 'earlier', requestedEffort: 'low' as const, requestedAtMs: NOW - 20, confirmedAtMs: NOW - 15 };
+    const later = { ...f.selection, nonce: 'later', requestedEffort: 'medium' as const, requestedAtMs: NOW - 10, confirmedAtMs: NOW };
+    expect(persistTerminalEffortChoice(f.state, observe('low', earlier), f.source, f.options)).toBe(true);
+    expect(persistTerminalEffortChoice(f.state, observe('medium', later), f.source, f.options)).toBe(true);
+    expect(store.getSession(f.row.sessionId)!.reasoningEffort).toBe('medium');
+    // The reverse order: the older request must not overwrite the newer one.
+    const g = fixture('codex');
+    const late = { ...later, expectedPreference: terminalEffortPreferenceKey(g.row) };
+    const early = { ...earlier, nonce: 'early', expectedPreference: terminalEffortPreferenceKey(g.row) };
+    expect(persistTerminalEffortChoice(g.state, { ...observe('medium', late) }, g.source, g.options)).toBe(true);
+    expect(() => persistTerminalEffortChoice(g.state, { ...observe('low', early) }, g.source, g.options)).toThrow('terminal_effort_selection_stale');
+    expect(store.getSession(g.row.sessionId)!.reasoningEffort).toBe('medium');
   });
 
   it('a replacement worker can save its first choice even when its local nonce repeats', () => {
@@ -345,6 +394,19 @@ describe('actual worker confirmation, transaction and ACK pipeline', () => {
   it('an environment override or failed command never supplies a successful user choice', () => {
     const p = pipeline({ override: 'medium' }); p.command(NOW, false); p.snapshot('medium'); p.poll();
     expect(p.mutate).not.toHaveBeenCalled();
+    // Even a native success record does not count while the environment pins the level.
+    const q = pipeline({ override: 'medium' }); q.command(NOW, true); q.snapshot('medium'); q.poll();
+    expect(q.mutate).not.toHaveBeenCalled();
+    expect(q.scope.terminalEffortPendingChoice).toBeUndefined();
+  });
+
+  it('an ACK for another choice does not retire the pending one', async () => {
+    const p = pipeline({ failAck: true }); p.command(); p.snapshot('medium'); p.poll();
+    const pending = p.scope.terminalEffortPendingChoice;
+    expect(pending).toBeDefined();
+    await loadWorkerMessageHandler('terminal_effort_writeback_ack', p.scope)({ type: 'terminal_effort_writeback_ack', nonce: 'another-choice', preference: '' });
+    expect(p.scope.terminalEffortPendingChoice).toBe(pending);
+    expect(p.scope.terminalEffortSavedNonce).toBeUndefined();
   });
 
   it('retains browser CAS evidence if statusline arrives before the native success record', () => {
