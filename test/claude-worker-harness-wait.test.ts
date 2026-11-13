@@ -1,12 +1,13 @@
 /**
- * Unit tests for the harness event-driven `waitFor` (issue #3455).
+ * Unit tests for the harness message-aware `waitFor` (related to #3455).
  *
- * The integration wait must resolve when the worker's IPC report arrives, not
- * when a fixed polling tick happens to run inside a time window — on a saturated
- * CI runner the timer stretches and the report's arrival can outlast the tick
- * budget even though IPC delivered it. These tests pin that message-event
- * wake-up with fake timers, so removing the event subscription fails
- * deterministically without needing a loaded runner.
+ * The waiter re-runs the condition as soon as a worker IPC message arrives
+ * instead of only on a 50 ms polling tick. This is a latency refinement, not a
+ * change in satisfiability: the predicate, deadline and exit guard decide the
+ * outcome, and a report the worker never sends still fails. The fake-timer tests
+ * pin the message wake-up, the polling fallback, the deadline/exit guards and the
+ * timer-ownership edge cases, so removing any piece fails deterministically
+ * without needing a loaded runner.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createMessageAwareWaiter, fakeMessageChild } from './helpers/claude-worker-harness.js';
@@ -73,10 +74,61 @@ describe('createMessageAwareWaiter', () => {
     expect(child.messageListenerCount()).toBe(0);
   });
 
-  it('fails immediately when the worker child has already exited', async () => {
+  it('rejects on the child-exit guard without advancing any timer to the deadline', async () => {
+    vi.useFakeTimers();
     const child = fakeMessageChild(1);
     const waitFor = createMessageAwareWaiter(child, () => 'snapshot');
-    await expect(waitFor(() => false, 'an exit that never clears', 5_000)).rejects.toThrow();
+    // A 60 s deadline that is never advanced. With the exitCode guard removed the
+    // waiter would park on its 50 ms timer indefinitely, so settling here proves
+    // the guard — not the deadline — rejected it.
+    const pending = waitFor(() => false, 'an exit that never clears', 60_000);
+    await Promise.resolve();
+    await expect(pending).rejects.toThrow('an exit that never clears');
+    expect(child.messageListenerCount()).toBe(0);
+  });
+
+  it('keeps waking immediately on a later message after an unrelated message reset the round', async () => {
+    vi.useFakeTimers();
+    const t0 = Date.now();
+    const child = fakeMessageChild();
+    const waitFor = createMessageAwareWaiter(child, () => 'snapshot');
+    let satisfied = false;
+    const settledAt: number[] = [];
+    const wait = waitFor(() => satisfied, 'the reported identity', 10_000);
+    const pending = wait.then(() => settledAt.push(Date.now() - t0));
+    await Promise.resolve();
+    // t=20: an unrelated report wakes one check and arms a fresh round. The
+    // previous round's 50 ms timer (due t=50) must be cleared so it cannot null
+    // the new round's wake.
+    setTimeout(() => child.emitMessage({ type: 'screen_update' }), 20);
+    // t=55: the decisive report arrives before the t=70 poll. It must resolve at
+    // 55 on the message, not wait for the timer.
+    setTimeout(() => { satisfied = true; child.emitMessage({ type: 'runtime_binding' }); }, 55);
+    await vi.advanceTimersByTimeAsync(55);
+    await Promise.resolve();
+    await Promise.resolve();
+    await expect(wait).resolves.toBeUndefined();
+    await pending;
+    expect(settledAt[0]).toBe(55);
+  });
+
+  it('fails fast when a message wakes the check after the deadline has passed', async () => {
+    vi.useFakeTimers();
+    const child = fakeMessageChild();
+    const waitFor = createMessageAwareWaiter(child, () => 'snapshot');
+    let satisfied = false;
+    // 990 ms deadline: the last pre-deadline poll is t=950, the next tick t=1000.
+    const pending = waitFor(() => satisfied, 'a late report', 990);
+    const outcome = pending.then(() => 'resolved', () => 'rejected');
+    await Promise.resolve();
+    // An unrelated message at t=995 (past the deadline) forces an immediate
+    // re-check; the predicate only flips true at t=997, which pure polling would
+    // not observe until its t=1000 tick. The event-driven waiter fails fast.
+    setTimeout(() => child.emitMessage({ type: 'screen_update' }), 995);
+    setTimeout(() => { satisfied = true; }, 997);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await outcome).toBe('rejected');
+    expect(child.messageListenerCount()).toBe(0);
   });
 
   it('still resolves a condition backed by no message through the polling fallback', async () => {

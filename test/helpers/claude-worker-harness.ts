@@ -321,18 +321,25 @@ export interface MessageWaiterChild {
 }
 
 /**
- * Build a `waitFor` that resolves on a CONDITION, woken immediately when the
- * worker emits a message rather than only on a fixed timer tick.
+ * Build a `waitFor` that re-checks a CONDITION as soon as the worker emits a
+ * message, instead of only when the 50 ms polling timer fires.
  *
- * Why event-driven: a condition satisfied by an IPC report (a `runtime_binding`
- * carrying the native session id) must resolve the moment that report arrives.
- * A 50 ms polling loop inside a fixed window loses on a saturated CI runner,
- * where the event loop stalls and the timer tick stretches, so the report can
- * land after the budget of ticks is exhausted even though IPC delivered it.
- * Subscribing to the message makes the wait track delivery order, not tick
- * count. The 50 ms timer remains as a fallback for conditions backed by logs or
- * files (no message wakes them), and the deadline / child-exit guards still fail
- * fast when a worker genuinely never reports.
+ * Scope: a latency refinement of the test harness, NOT a change to what a wait
+ * can satisfy. The condition predicate stays the single source of truth and the
+ * deadline / child-exit guards are unchanged, so a report the worker never sends
+ * still fails the wait — the subscription only re-runs the predicate up to one
+ * 50 ms poll earlier. Two semantics that follow:
+ *  - The 50 ms timer remains as the fallback for conditions backed by logs or
+ *    files, which no message wakes.
+ *  - A message arriving after the deadline fails on the next predicate check
+ *    rather than on the next tick. This is therefore not a strict superset of
+ *    pure polling (which evaluates the predicate before the deadline and could
+ *    still pass on a tick just past it); the gap is bounded by one 50 ms
+ *    interval and the earlier fail-fast is intended.
+ *
+ * Timer ownership: a message wake clears the pending 50 ms timer. Otherwise a
+ * timer left over from the previous round fires later and nulls the NEXT round's
+ * `wake`, delaying a message that should have resolved the wait immediately.
  */
 export function createMessageAwareWaiter(
   child: MessageWaiterChild,
@@ -341,7 +348,11 @@ export function createMessageAwareWaiter(
   return async function waitFor(cond, what, timeoutMs = 45_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let wake: (() => void) | undefined;
-    const onMessage = () => { wake?.(); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onMessage = () => {
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+      wake?.();
+    };
     child.on('message', onMessage);
     try {
       while (!cond()) {
@@ -350,11 +361,12 @@ export function createMessageAwareWaiter(
         }
         await new Promise<void>(done => {
           wake = done;
-          const timer = setTimeout(() => { wake = undefined; done(); }, 50);
+          timer = setTimeout(() => { timer = undefined; wake = undefined; done(); }, 50);
           timer.unref?.();
         });
       }
     } finally {
+      if (timer !== undefined) clearTimeout(timer);
       child.off('message', onMessage);
     }
   };
