@@ -565,6 +565,42 @@ describe('contract gateway and real worker boundaries', () => {
     env.readClaudeLiveSessionId = () => { throw new Error('read for a non-Claude CLI'); };
     expect(identity(scope.beginRuntime())).toEqual({ backend: 'tmux', physicalId: '111:start1', proof: 'process_start' });
   });
+  it.each(['exact', 'missing', 'different-pid', 'different-start', 'different-native'])('keeps a proven Doubao live reattach on its original execution (%s)', condition => {
+    const s = fixture();
+    const execution = s.controller.admitInput('running');
+    s.controller.ingest({ type: 'turn_execution_started', turnId: 'running',
+      sessionContract: s.context(1, { runtime: s.runtime, execution }) }, s.worker);
+    const replacement = s.controller.bindWorker(2).worker;
+    const scope = new WorkerSessionEventScope(s.ref, replacement);
+    scope.noteAdmission({ ref: execution, runtime: s.runtime, phase: 'running' });
+    const binding = scope.beginRuntime();
+    const env: any = { backend: { cliPid: 111 }, effectiveBackendType: 'tmux',
+      workerSessionEventScope: scope, lastInitConfig: { cliId: 'doubao', cliSessionId: 'native1' },
+      readProcessStartIdentity: () => 'start1',
+      doubaoRestoredRuntimeIdentity: condition === 'missing' ? undefined : {
+        pid: condition === 'different-pid' ? 222 : 111,
+        procStart: condition === 'different-start' ? 'start2' : 'start1',
+        nativeSessionId: condition === 'different-native' ? 'foreign-native' : 'native1',
+      },
+    };
+    const identity = loadWorkerFunction<(binding: any) => any>('runtimeIdentityForContract', env);
+    s.controller.reserveBinding(binding.bindingId, replacement);
+    const runtime = s.controller.bindRuntime(binding.bindingId, replacement, identity(binding));
+    scope.assign(binding.bindingId, runtime.ref); scope.enterTurn('running');
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    const progress = metadata({ type: 'thinking_update', turnId: 'running', entries: [{ kind: 'tool_call', id: 'read', name: 'Read', args: '{}' }] });
+    const final = metadata({ type: 'final_output', turnId: 'running', content: 'Recovered answer' });
+    if (condition === 'exact') {
+      expect(runtime.ref).toEqual(s.runtime);
+      expect(s.controller.ingest(progress, replacement)).toMatchObject({ kind: 'current' });
+      expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'current' });
+    } else {
+      expect(identity(binding).nativeSessionId).toBeUndefined();
+      expect(runtime.ref).not.toEqual(s.runtime);
+      expect(s.controller.ingest(progress, replacement)).toMatchObject({ kind: 'reject' });
+      expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'reject' });
+    }
+  });
   it('uses fresh unambiguous PID-owned native identity on a busy reattach before granting the binding', () => {
     const s = fixture(); const old = s.store.runtime(s.ref)!;
     const replacementWorker = s.controller.bindWorker(2).worker;

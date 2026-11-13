@@ -2106,6 +2106,16 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'doubao') {
+      // A configured --resume target alone is not proof of the running CLI.
+      // The reattach path corroborates its PID marker and exact native user
+      // journal before saving this process-bound identity. Publish it on the
+      // first runtime binding so the host can reuse the existing execution.
+      const proof = doubaoRestoredRuntimeIdentity;
+      if (proof?.pid === childPid && proof.procStart === start
+        && proof.nativeSessionId === (lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId)) {
+        nativeSessionId = proof.nativeSessionId;
+      }
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -9301,6 +9311,7 @@ function resetThinkingChannel(): void {
 let codexBridgeRolloutPath: string | undefined;
 /** Same-process marker evidence; never populated by a cold --resume spawn. */
 let doubaoRestoredExecution: { turnId: string; dispatchAttempt?: number } | undefined;
+let doubaoRestoredRuntimeIdentity: { pid: number; procStart: string; nativeSessionId: string } | undefined;
 let codexBridgeOffset = 0;
 /** Driver-owned incremental state of the active transcript driver (codex drain
  *  state, OMP / ebsd / antigravity provisional-terminal state). Opaque to the
@@ -12828,6 +12839,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           if (restoredLiveOwner) {
             recoveredOffset = proof!.trajectoryOffset;
             recoveredAssignmentOffset = user.assignmentOffset;
+            const nativeSessionId = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+            const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
+            const procStart = pid ? readProcessStartIdentity(pid) : undefined;
+            if (pid && procStart && nativeSessionId && doubaoTrajectoryPathForSession(nativeSessionId) === rolloutPath) {
+              doubaoRestoredRuntimeIdentity = { pid, procStart, nativeSessionId };
+            }
           }
           if (restoredLiveOwner) log(`Doubao live execution restored (turn=${restored.turnId}, attempt=${restored.dispatchAttempt ?? 'none'})`);
           else log('Doubao bridge recovery skipped (native user did not establish queue owner)');
@@ -23777,6 +23794,7 @@ async function spawnCliBody(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: Parameters<typeof spawnCli>[1] = {},
 ): Promise<void> {
+  doubaoRestoredRuntimeIdentity = undefined;
   followBotTraeHome(cfg);
   const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
   if (protectedCliError) throw new Error(protectedCliError + FROZEN_NETWORK_POLICY_HINT);
@@ -30466,6 +30484,7 @@ function killCli(opts: {
     cliPidMarker = null;
   }
   doubaoRestoredExecution = undefined;
+  doubaoRestoredRuntimeIdentity = undefined;
   cliOutlivesWorker = false;
   completeManagedTurnOriginRevocation(
     sandboxRelayCapability,
