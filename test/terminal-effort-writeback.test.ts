@@ -69,7 +69,9 @@ describe('terminal effort persistence', () => {
 
   it('remembers native Grok xhigh for the exact resumed model even before the static table knows it', () => {
     const f = fixture('grok');
-    f.state.activeModel = 'grok-4.7-build-fast'; f.row.model = f.state.activeModel; f.state.session.model = f.row.model;
+    const uncatalogedGrokModel = 'grok-99.0-preview';
+    expect(cliModelSupportsReasoningEffort('grok', uncatalogedGrokModel, 'xhigh')).toBe(false);
+    f.state.activeModel = uncatalogedGrokModel; f.row.model = f.state.activeModel; f.state.session.model = f.row.model;
     store.updateSession(f.row);
     const selection = { ...f.selection, requestedEffort: 'xhigh' as const, model: f.row.model,
       expectedPreference: terminalEffortPreferenceKey(f.row) };
@@ -83,7 +85,9 @@ describe('terminal effort persistence', () => {
 
   it.each([false, true])('fences newly confirmed Grok xhigh at the actual cold launch, snapshot=%s', snapshot => {
     const f = fixture('grok');
-    Object.assign(f.row, { model: 'grok-4.7-build-fast', cliRuntime: snapshotCliRuntime(resolveCliRuntime({ cliId: 'grok' })) });
+    const uncatalogedGrokModel = 'grok-99.0-preview';
+    expect(cliModelSupportsReasoningEffort('grok', uncatalogedGrokModel, 'xhigh')).toBe(false);
+    Object.assign(f.row, { model: uncatalogedGrokModel, cliRuntime: snapshotCliRuntime(resolveCliRuntime({ cliId: 'grok' })) });
     if (snapshot) f.row.cliLaunchSnapshot = { cliId: 'grok', cliRuntime: f.row.cliRuntime, state: 'resolved', reasoningEffort: 'high', startupCommands: [] } as any;
     store.updateSession(f.row); f.state.session = structuredClone(f.row); f.state.activeModel = f.row.model;
     const choice = { ...f.selection, model: f.row.model, requestedEffort: 'xhigh' as const, expectedPreference: terminalEffortPreferenceKey(f.row) };

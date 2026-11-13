@@ -50,6 +50,8 @@ describe('four CLI reasoning observations', () => {
       lastInitConfig: { cliId }, codexBridgeRolloutPath: path, nativeReasoningNotBeforeMs: NOW - 1,
       codexGenerationSessionIdFromRolloutPath, traexSessionIdFromRolloutPath,
       publishNativeReasoningObservation: wire.publish, structuredBridgeDriverState: undefined,
+      nativeGoalSourcePath: undefined, nativeGoalGeneration: undefined, cliSpawnGeneration: 1,
+      nativeGoalCardEnabled: () => false,
       bridgeSpecFor: () => ({ stateCommit: 'ingest', drain: (p: string, offset: number) =>
         cliId === 'codex' ? drainCodexRollout(p, offset) : drainTraexRollout(p, offset) }),
       structuredBridgeIs: (id: string) => id === cliId,

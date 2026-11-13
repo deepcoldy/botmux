@@ -27,6 +27,8 @@ import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
+import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
+import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
@@ -87,6 +89,16 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
+    if (key === 'noteTerminalEffortInput') return () => {};
+    if (key === 'claudeEffortObserver') {
+      if (!dependencies.has(key)) dependencies.set(key, new ClaudeEffortObserver());
+      return dependencies.get(key);
+    }
+    if (key === 'terminalEffortTracker') {
+      if (!dependencies.has(key)) dependencies.set(key, new TerminalEffortChoiceTracker());
+      return dependencies.get(key);
+    }
+    if (key === 'config') return { terminalEffortWriteback: false };
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
     if (key === 'executionObserverSupported') return executionObserverSupported;
     if (key === 'isNativeReasoningEffort') return isNativeReasoningEffort;
