@@ -95,6 +95,17 @@ describe('native completion independent review', () => {
     vi.spyOn(OncallFormStore.prototype, 'pendingNativeSubmissions').mockReturnValueOnce(prior);
     await reconcileNativeOncallSubmissions('app'); expect(fetcher).not.toHaveBeenCalled(); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
   });
+  it('completes a draft closed between its two persistence writes without re-querying the platform', async () => {
+    const d = draft();
+    new OncallGroupStore(dir).adoptNativeGroup(source, 'ou_actor', { flowId: '1234', openChatId: 'oc_destination' },
+      { messageIds: ['om_q1', 'om_a1'], cutoffMs: now + 1000, forwardMode: 'merge' });
+    await new OncallFormStore(dir).use('app', d.id, 'ou_actor', async (value, persist) => {
+      value.closed = true; persist(); // interrupted here: closure durable, completed flag not yet
+    }, { allowClosed: true });
+    await reconcileNativeOncallSubmissions('app');
+    expect(fetcher.mock.calls.filter(([url]) => String(url).includes('oncall_flow/list'))).toHaveLength(0);
+    expect((await current(d)).nativeSubmission?.completed).toBe(true);
+  });
   it('preserves an uncertain ordinary request that takes ownership while the native lookup waits', async () => {
     draft(); let release!: () => void; const pending = new Promise<void>(resolve => { release = resolve; });
     fetcher.mockImplementationOnce(async () => { await pending; return json(rows); });

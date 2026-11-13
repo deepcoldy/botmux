@@ -16,6 +16,7 @@ import { handleOncallGroupAction, handleOncallFormAction, retryPendingOncallHand
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { createNativeOncallLink, readNativeOncallResult } from '../src/services/oncall-platform.js';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 const target = { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, emailDomain: 'example.test' };
 const category = { id: 34, tenant_id: 12, name: 'custom', type_action: 'create_chat', workflow_id: 10 };
 const source: OncallGroupSource = { appId: 'app', sessionId: 'session', chatId: 'oc_source', rootId: 'om_q1',
@@ -122,6 +123,12 @@ describe('native submission completion', () => {
       action: { value: { action: 'oncall_group_form_cancel', draftId: d.id, version: d.version } } } as any, 'app');
     await retryPendingOncallHandoffs('app'); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
+  it.each(['stale', 'future'])('rejects a %s platform ticket outside the preparation window without adoption', async kind => {
+    const d = await open(); submitted(d);
+    rows[0].create_time = new Date(kind === 'stale' ? started - 60_000 : started + 500_000).toISOString();
+    await retryPendingOncallHandoffs('app');
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
+  });
 });
 
 describe('platform completion protocol', () => {
@@ -161,5 +168,24 @@ describe('platform completion protocol', () => {
       { field: 'create_time', value: '2026-01-01 08:00:00', operator: 'greater_or_equals' },
       { field: 'originator_user', value: 'actor', operator: 'equals' },
     ]) });
+  });
+  it('parses unqualified platform timestamps as China Standard Time even on a UTC host', () => {
+    // A UTC daemon must read Beijing wall-clock time the same as a UTC+8 daemon.
+    // Run the real function in a TZ=UTC child: a bare Date.parse would shift it.
+    const source = `
+      import { readNativeOncallResult } from './src/services/oncall-platform.js';
+      const rows = [{ id: 1234, tenant_id: 12, source_location: 'https://oncall.example.test/chat?bm_form=tz-form',
+        originator_user: 'actor', oncall_question_type_id: 34, region: 'cn', stage: 'launch_oncall',
+        chat_id: '123456789', create_time: '2026-01-01 08:00:02' }];
+      const fetcher = async url => new Response(JSON.stringify({ code: 0,
+        data: url.includes('chat_id_to_open_chat_id') ? 'oc_destination' : rows }));
+      const result = await readNativeOncallResult(
+        { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, emailDomain: 'example.test' },
+        'secret', { sourceLocation: 'https://oncall.example.test/chat?bm_form=tz-form', username: 'actor', typeId: 34, region: 'cn' }, fetcher);
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const run = spawnSyncTsEvalWithRepoImports(source, { cwd: process.cwd(), env: { ...process.env, TZ: 'UTC' }, encoding: 'utf8', timeout: 30_000 });
+    expect(run.status, String(run.stderr)).toBe(0);
+    expect(JSON.parse(String(run.stdout)).createdAtMs).toBe(Date.parse('2026-01-01T00:00:02.000Z'));
   });
 });

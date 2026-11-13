@@ -190,8 +190,13 @@ export async function readNativeOncallResult(target: OncallGroupTarget, secret: 
     || row.region !== expected.region || row.stage !== 'launch_oncall'
     || !Number.isSafeInteger(row.id) || row.id <= 0) throw new Error('Oncall 提单结果与原表单不匹配');
   const timestamp = String(row.create_time ?? '');
-  // This platform's unqualified timestamps are China Standard Time.
-  const createdAtMs = Date.parse(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$/.test(timestamp) ? `${timestamp}+08:00` : timestamp);
+  // This platform's unqualified timestamps are China Standard Time, in both
+  // T- and space-separated forms. Qualify them explicitly: an unqualified
+  // string passed to Date.parse is interpreted in the daemon's local timezone,
+  // which silently shifts the result on a host outside UTC+8.
+  const qualified = /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(\.\d+)?$/.test(timestamp)
+    ? `${timestamp.replace(' ', 'T')}+08:00` : timestamp;
+  const createdAtMs = Date.parse(qualified);
   if (!Number.isFinite(createdAtMs)) throw new Error('Oncall 提单时间无效');
   if (!row.chat_id) return; // The ticket may exist before its group is ready.
   const openChatId = await get(target, secret, '', 'platform/chat_id_to_open_chat_id', { chat_id: String(row.chat_id) }, fetcher);
