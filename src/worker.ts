@@ -3568,6 +3568,14 @@ function supportsPostSubmitRenameSessionTitle(cliId: string | undefined): boolea
   return cliId === 'traex';
 }
 let isPromptReady = false;
+/** Monotonic invalidation clock: a queued admission may restore only the
+ * readiness it cleared itself, never a later write, busy event or control. */
+let promptReadinessRevision = 0;
+
+function revokePromptReadiness(): void {
+  promptReadinessRevision++;
+  isPromptReady = false;
+}
 /** Prompt-ready edges published by markPromptReady(). A backend compares it with
  *  its spawn-time value to tell whether its CLI has shown a confirmed prompt yet. */
 let promptReadyEdges = 0;
@@ -5320,7 +5328,7 @@ async function runStartupCommands(): Promise<boolean> {
     startupCommandsInProgress = false;
   }
   // Commands consumed turns and reset idle; treat the first user prompt fresh.
-  isPromptReady = false;
+  revokePromptReadiness();
   idleDetector?.reset();
   return true;
 }
@@ -5871,7 +5879,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       acknowledgeActivation: !!msg.queuedActivationToken,
       hasFollowUp: !!onFollowUp,
       onAccepted: () => {
-        isPromptReady = false;
+        revokePromptReadiness();
         idleDetector?.reset({ inputCycle: true });
         log(`Passthrough slash command: ${msg.content}`);
       },
@@ -5885,7 +5893,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         activationToken: msg.queuedActivationToken!,
       }),
       onDurableFailure: () => {
-        isPromptReady = false;
+        revokePromptReadiness();
         log('Durable raw activation write rejected; retiring worker generation');
         void sendFatalWorkerErrorAndExit(
           new Error('durable raw activation was not accepted by the backend'),
@@ -7732,7 +7740,7 @@ async function waitForCodexAppEngineRoot(
   codexAppSignedStateObserved = false;
   codexAppInputReady = false;
   codexAppReadyAuthority.beginWork();
-  isPromptReady = false;
+  revokePromptReadiness();
   idleDetector?.reset();
   if (!codexAppProofDeadline.armed) {
     codexAppProofDeadline.arm(() => {
@@ -16008,7 +16016,7 @@ function beginCliWriteCycle(): void {
   // terminal still settles it from the per-read drain.
   idleTranscriptSettle?.cancel();
   beginRuntimeWriteCycle({
-    setPromptReady: ready => { isPromptReady = ready; },
+    setPromptReady: ready => { if (ready) isPromptReady = true; else revokePromptReadiness(); },
     resetIdleDetector: () => { idleDetector?.reset({ inputCycle: true }); },
   });
   // Input is about to reach the CLI: the main agent's turn starts here, before
@@ -17368,7 +17376,7 @@ function preemptActiveTurnForNewMessage(
       if (pendingMessages[i].turnId === activeTurnId) pendingMessages.splice(i, 1);
     }
     emitTurnTerminal(activeTurnId, 'cancelled', 'preempted_by_user_message', dispatchAttempt);
-    isPromptReady = false;
+    revokePromptReadiness();
     idleDetector?.reset();
     tuiPromptBlocking = false;
   })();
@@ -17407,7 +17415,7 @@ async function handleTuiKeysDirect(
   if (isFinal) {
     tuiPromptBlocking = false;
     if (isPromptReady) {
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
     }
   }
@@ -17495,7 +17503,7 @@ async function flushPendingInjections(): Promise<void> {
       if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
@@ -17581,7 +17589,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
   // Clear blocking only after navigation and adapter submission both succeed.
   tuiPromptBlocking = false;
   if (isPromptReady) {
-    isPromptReady = false;
+    revokePromptReadiness();
     idleDetector?.reset();
   }
   return true;
@@ -18998,7 +19006,7 @@ async function handleTrustedCodexAppMarker(
       codexAppSignedStateObserved = false;
       codexAppInputReady = false;
       codexAppReadyAuthority.beginWork();
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       if (!codexAppProofDeadline.armed) {
         codexAppProofDeadline.arm(() => {
@@ -19034,7 +19042,7 @@ async function handleTrustedCodexAppMarker(
       renderer?.markNewTurn();
     }
     if (state.busy) {
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       if (codexAppInputReady) queueMicrotask(() => { void flushPending(); });
     } else {
@@ -19108,7 +19116,7 @@ async function handleTrustedCodexAppMarker(
         return false;
       }
       codexAppReadyAuthority.beginWork();
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
     }
     return true;
@@ -19647,7 +19655,7 @@ function armPostTerminalInputFence(): void {
     || currentPostTerminalInputFence()) return;
   postTerminalInputFence = { backend, generation: cliSpawnGeneration };
   const revokedPublishedReady = isPromptReady;
-  isPromptReady = false;
+  revokePromptReadiness();
   // The composer can redraw and go quiet BEFORE the terminal reaches the
   // rollout: screen-idle already published readiness, so the detector is idle
   // and the transcript's fireIdle() is a no-op, while the bridge poller only
@@ -21082,7 +21090,7 @@ function markPromptReady(): void {
       spawnArgvInitialPromptBusy = false;
       spawnArgvNeedsWorkingSeed = false;
       // Stay non-ready so the next genuine end-of-turn idle is a real edge.
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       // force: rate-limit banner must not rewrite synthetic working → limited
       publishScreenStatus('working', { force: true });
@@ -21107,7 +21115,7 @@ function markPromptReady(): void {
       // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
       // spawn-argv branch above) so the genuine end-of-turn idle after the
       // background work settles is still a real, re-fireable edge.
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       publishScreenStatus('working');
       log(`Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`);
@@ -21788,7 +21796,7 @@ async function detectBareShellLaunch(): Promise<boolean> {
   // Injection-first flushes can enter while isPromptReady is still true. Make
   // this a real busy/blocked transition so a later PTY-ready event re-enters
   // markPromptReady instead of being swallowed by its duplicate-ready guard.
-  isPromptReady = false;
+  revokePromptReadiness();
   idleDetector?.reset();
   log(trampolined
     ? `Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
@@ -21971,7 +21979,11 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
   const targetRenderer = renderer;
   const revision = backendScreenRevision;
   const gridRevision = observedPaneGridRevision;
+  const readinessRevision = promptReadinessRevision;
+  const webInputGeneration = webTerminalInputGeneration;
   const current = () => backend === target && cliSpawnGeneration === generation
+    && promptReadinessRevision === readinessRevision
+    && webTerminalInputGeneration === webInputGeneration
     && traexAutoModelController === controller && controller?.currentTurnId() === poolTurnId
     && controller?.currentModel() === poolModel && controller?.awaitingModelActivity() === awaitingActivity
     && currentBotmuxTurnId === turnId && pendingMessages[0] === item
@@ -22457,6 +22469,8 @@ async function flushPending(): Promise<void> {
       const admissionHead = pendingMessages[0]!;
       const admissionBackend = backend;
       const admissionGeneration = cliSpawnGeneration;
+      const admissionReadinessRevision = promptReadinessRevision;
+      const admissionWebInputGeneration = webTerminalInputGeneration;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(admissionHead))) {
         // No input was written by this refusal. Restore the readiness that
@@ -22464,8 +22478,10 @@ async function flushPending(): Promise<void> {
         // otherwise the retry stops at the independent-turn reset gate and a
         // static composer never produces the new idle edge it waits for. The
         // retry still rechecks admission; never carry readiness to a replacement
-        // backend or generation while the asynchronous capture was in flight.
+        // backend, generation, or a later input/busy cycle while capture was in flight.
         if (backend === admissionBackend && cliSpawnGeneration === admissionGeneration
+          && promptReadinessRevision === admissionReadinessRevision
+          && webTerminalInputGeneration === admissionWebInputGeneration
           && !cliRestartInProgress) keepPromptReadyAfterHold();
         break;
       }
@@ -23971,7 +23987,7 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
     // The CLI went back to work while an idle edge was still settling.
     idleTranscriptSettle?.cancel();
     if (!isPromptReady) return;
-    isPromptReady = false;
+    revokePromptReadiness();
     log(`Explicit busy marker detected — ${label}`);
     noteClaudeBridgeTurnStarted();
     publishScreenStatus('working', { force: true });
@@ -24780,7 +24796,7 @@ async function spawnCliBody(
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     }));
@@ -24841,7 +24857,7 @@ async function spawnCliBody(
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     }));
@@ -24905,7 +24921,7 @@ async function spawnCliBody(
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     }));
@@ -30476,7 +30492,7 @@ async function spawnCliBody(
         });
       } else if (status === 'working') {
         transcriptSettle.cancel();
-        isPromptReady = false;
+        revokePromptReadiness();
         idleDetector?.reset();
       }
     }));
@@ -30701,7 +30717,7 @@ async function spawnCliBody(
     });
     if (codexAutoUpgrade) {
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       if (codexAutoUpgrade.stage === 'restoring') {
         codexAutoUpgrade.reject?.(new Error(`Replacement Codex exited before readiness (${code ?? signal})`));
       }
@@ -30872,7 +30888,7 @@ async function spawnCliBody(
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
     }
     backend = null;
-    isPromptReady = false;
+    revokePromptReadiness();
     setCaptureIdentity(undefined, undefined);
     currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
@@ -31314,7 +31330,7 @@ function killCli(opts: {
     sandboxCleanup = null;
   }
   sandboxTreeOutlivesWorker = false;
-  isPromptReady = false;
+  revokePromptReadiness();
   forceClearSessionRenameInFlight();
   if (!opts.preservePending) {
     pendingMessages.length = 0;
@@ -37212,7 +37228,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'prompt_submitted': {
       if (isPromptReady) {
-        isPromptReady = false;
+        revokePromptReadiness();
         idleDetector?.reset();
         log('User prompt submitted via hook — publishing working state');
         // Web 终端/沙箱 hook 直提路径无 managed turn；显式 clearTurnId 避免携带
@@ -37696,7 +37712,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       } catch { /* best-effort */ }
       stopOwnedSessionScope('suspend');
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
       // outbox + pre-created deny-mask mountpoints) intact across the suspension
       // (on resume, prepareDirectSandbox re-binds over the SAME tree). So we stop
