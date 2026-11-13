@@ -59,6 +59,7 @@ function jwt(region: string, who: string, exp = EXP): string {
 
 const REGIONAL_VARIABLES: Record<string, string> = {
   i18n: 'BYTEDCLI_USER_CLOUD_JWT_I18N', i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD', tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
+  cn: 'BYTEDCLI_USER_CLOUD_JWT_CN',
 };
 
 /**
@@ -68,6 +69,7 @@ const REGIONAL_VARIABLES: Record<string, string> = {
  */
 let platform: {
   upToDate: boolean; partitions: Record<string, string[]>;
+  defaultRegion?: string;
   /** Issue tickets claiming the wrong partition / already expired. */
   wrongClaim?: boolean; expired?: boolean;
   /** This partition's ticket arrives unusable (a value with a line break). */
@@ -95,7 +97,7 @@ beforeEach(() => {
           const b = body as Record<string, unknown>;
           grantBodies.push(b);
           const who = String(b.unionId);
-          const variables: Record<string, string> = { BYTEDCLI_USER_CLOUD_JWT: jwt('cn', who) };
+          const variables: Record<string, string> = { BYTEDCLI_USER_CLOUD_JWT: jwt(platform.defaultRegion ?? 'cn', who) };
           const asked = platform.upToDate && Array.isArray(b.cloudJwtRegions) ? b.cloudJwtRegions as string[] : undefined;
           for (const region of asked ?? []) {
             if (!(platform.partitions[who] ?? []).includes(region)) continue;
@@ -176,6 +178,20 @@ describe.each(['single', 'proven'] as const)('%s identity storage', model => {
 beforeEach(() => { storageModel = model; });
 
 describe('local authorization (this machine mints from the sender\'s login)', () => {
+  it('uses the sender\'s CN token for Oncall while ROW remains the default', async () => {
+    const row = jwt('i18n', 'alice');
+    const rowEnv = { BYTEDCLI_CLOUD_SITE: 'i18n-tt' };
+    const cn = jwt('cn', 'alice');
+    localJwts.set(ALICE, { cloudJwt: row, regionalCloudJwts: { i18n: row, cn } });
+    await publishFor('local', ALICE);
+    expect(bytedcliWithEnv(rowEnv, '--site', 'cn', 'oncall', 'tenant', 'get')).toMatchObject({ status: 0, jwt: cn });
+    expect(bytedcliWithEnv(rowEnv, 'aa', 'query')).toMatchObject({ status: 0, jwt: row });
+
+    localJwts.set(BOB, { cloudJwt: jwt('i18n', 'bob'), regionalCloudJwts: { i18n: jwt('i18n', 'bob') } });
+    await publishFor('local', BOB, 'om_turn_2');
+    expectRefused(bytedcliWithEnv(rowEnv, '--site', 'cn', 'oncall', 'tenant', 'get'), 'cn', '本机为发起人签票');
+  });
+
   it('uses the sender\'s token for a partition they have one for', async () => {
     localJwts.set(ALICE, { cloudJwt: jwt('cn', 'alice'), regionalCloudJwts: { i18n: jwt('i18n', 'alice') } });
     await publishFor('local', ALICE);
@@ -204,12 +220,14 @@ describe('local authorization (this machine mints from the sender\'s login)', ()
 
 describe('platform grant', () => {
   it('asks for every partition and uses the sender\'s token the platform issued', async () => {
-    platform.partitions.on_alice = ['i18n'];
+    platform.defaultRegion = 'i18n';
+    platform.partitions.on_alice = ['i18n', 'cn'];
     await publishFor('platform', ALICE);
     expect(grantBodies).toHaveLength(1);
-    expect(grantBodies[0]).toMatchObject({ unionId: 'on_alice', tool: 'bytedcli', cloudJwtRegions: ['i18n', 'i18nbd', 'tx'] });
+    expect(grantBodies[0]).toMatchObject({ unionId: 'on_alice', tool: 'bytedcli', cloudJwtRegions: ['i18n', 'i18nbd', 'tx', 'cn'] });
     expect(bytedcli('--site', 'i18n-tt', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
-    expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(bytedcli('--site', 'cn', 'oncall', 'tenant', 'get')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
     expectRefused(bytedcli('--site', 'i18n-bd', 'aa', 'query'), 'i18nbd', '平台为发起人签票');
   });
 
@@ -224,6 +242,7 @@ describe('platform grant', () => {
     platform = { upToDate: false, partitions: { on_alice: ['i18n', 'i18nbd', 'tx'] } };
     await publishFor('platform', ALICE);
     expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '升级平台');
+    expect(bytedcli('--site', 'cn', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
     expect(bytedcli('aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   });
 

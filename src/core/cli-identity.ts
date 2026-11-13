@@ -37,6 +37,7 @@ import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
@@ -529,9 +530,8 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
-  /** Partition-scoped ByteCloud JWTs; the wrapper swaps one in by `--site`.
-   *  A call whose site needs a region missing here is refused, never sent
-   *  with the default token (see {@link bytedcliRegionalSelection}). */
+  /** Partition-scoped ByteCloud JWTs selected by `--site`. The default JWT
+   *  also serves `cn` when it claims the CN partition. */
   regionalCloudJwts?: Partial<Record<BytedcliRegion, string>>;
   /** Who was asked for {@link regionalCloudJwts}; only shapes the refusal
    *  text for a missing region. See {@link BytedcliRegionalJwtSource}. */
@@ -623,16 +623,16 @@ const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
 const MEEGO_HOME_VAR = 'BOTMUX_MEEGO_HOME';
 
 /**
- * ByteCloud JWTs are partition-scoped: a cn token is refused by i18n services
- * (`invalid jwt token ... partition i18n`). The daemon mints one per region and
+ * ByteCloud JWTs are partition-scoped. The daemon mints one per region and
  * the bytedcli wrapper picks the one matching the call's `--site` (or
  * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
  */
-export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx';
+export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx' | 'cn';
 const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
   i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
   i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
   tx: 'BOTMUX_IDENTITY_CLOUD_JWT_TX',
+  cn: 'BOTMUX_IDENTITY_CLOUD_JWT_CN',
 };
 /** `--site` values (bytedcli 0.178) grouped by the JWT region each one uses,
  *  measured by minting with every site. Sites not listed keep the default. */
@@ -643,6 +643,7 @@ const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
   // bmq / apm argos log / cloud-ticket, which all request an i18n-bd JWT.
   i18nbd: ['i18n', 'i18n-bd', 'us-ttpbd'],
   tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts'],
+  cn: ['cn'],
 };
 /** bytedcli's CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187). Aliases of a
  *  site without a regional token need no entry in the case below. */
@@ -669,8 +670,8 @@ const BYTEDCLI_REGIONAL_SOURCE_VAR = 'BOTMUX_IDENTITY_REGIONAL_SOURCE';
 // A turn's tickets are fixed when the turn is prepared, so a retry inside the
 // same turn gets the same answer: the hints say to send a new message.
 const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
-  local: '本机为发起人签票时没有签到这个分区的票：bytedcli 的登录按站点分开保存，本机的按人授权只登录了默认站点，发起人没在该站点另外登录过就签不出；也可能发起人没有该分区权限，或这次签票失败。可让 bot 改用平台授权（平台凭据页可为海外站点单独授权）。本轮内重试拿不到新票，处理后发一条新消息再试。',
-  platform: '平台为发起人签票时没有签出这个分区的票：海外站点要在平台凭据页单独授权，发起人可能还没授权该站点，或该站点授权已失效；也可能这次签票失败。本轮内重试拿不到新票；授权该站点后发一条新消息再试。',
+  local: '本机为发起人签票时需要对应站点的有效登录和权限。请检查该站点的授权和签票状态，再发一条新消息重试。',
+  platform: '平台为发起人签票时需要对应站点的有效授权。请在平台凭据页检查该站点的授权和签票状态，再发一条新消息重试。',
   'platform-legacy': '本机绑定的平台还不签发分区票（需要升级平台），海外分区的 bytedcli 命令暂时无法以发起人身份执行。请联系平台管理员；平台升级后发一条新消息再试。',
 };
 const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后，发一条新消息再试。';
@@ -753,13 +754,9 @@ function bytedcliSiteTrim(siteVar: string): string[] {
 /**
  * Shell lines selecting the regional ByteCloud JWT for this call's site.
  *
- * A call whose GLOBAL site is in a region the identity holds no token for is
- * REFUSED. Sending the default (cn) token there cannot work — the partition
- * rejects it (HTTP 401, read by the person as "not logged in") or bytedcli
- * skips it for the other site's login, which a per-person scratch HOME does not
- * have — and it would hide which ticket is actually missing. Commands that
- * never use that partition's token run as before (see
- * {@link BYTEDCLI_REGION_FREE_FN}).
+ * A call whose global site requires a missing partition token reports that
+ * partition before invoking bytedcli. Help and commands with their own
+ * credentials can still run (see {@link BYTEDCLI_REGION_FREE_FN}).
  *
  * The global site is read the way bytedcli 0.191 reads it: from the root
  * options only — it enables positional options, so a `--site` after the
@@ -807,11 +804,10 @@ function bytedcliRegionalSelection(): string[] {
     `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
     '    esac',
     // printf's format carries no prose: the site is the caller's argument.
-    "    printf '%s%s%s%s%s%s%s\\n' "
+    "    printf '%s%s%s%s%s\\n' "
       + `${shellSingleQuote('botmux: bytedcli 这次调用的站点 ')} "$__botmux_gsite" `
       + `${shellSingleQuote(' 属于 ')} "$__botmux_region" `
-      + `${shellSingleQuote(' 分区，需要发起人在该分区的 ByteCloud JWT，但本轮发起人身份里没有这张票，命令未执行。botmux 不会拿默认分区的票去请求 ')} "$__botmux_region" `
-      + `${shellSingleQuote(' 分区（那只会被对方以 401 / 未登录拒绝）。')} >&2`,
+      + `${shellSingleQuote(' 分区，需要发起人的该分区 ByteCloud JWT。')} >&2`,
     `    printf '%s\\n' "$__botmux_hint" '[reason=regional_jwt_missing]' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '  fi',
@@ -880,6 +876,9 @@ export function renderIdentityEnv(identity: CliIdentity): string {
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    if (!identity.regionalCloudJwts?.cn && jwtClaims(identity.cloudJwt)?.region === 'cn') {
+      pairs.push([BYTEDCLI_REGIONAL_JWT_VARS.cn, identity.cloudJwt]);
+    }
     for (const [region, jwt] of Object.entries(identity.regionalCloudJwts ?? {})) {
       const key = BYTEDCLI_REGIONAL_JWT_VARS[region as BytedcliRegion];
       if (key && jwt) pairs.push([key, jwt]);
