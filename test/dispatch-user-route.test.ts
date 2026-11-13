@@ -199,6 +199,38 @@ describe('dispatch user IPC end-to-end identity binding', () => {
         turnId: 'om_kickoff', waitMs: 0 });
       expect(signed).toBeUndefined();
     });
+  describe('a dispatch-only forward versus an automatic host bot grant', () => {
+    const forwardingBotTurn = (h: ReturnType<typeof harness>, upstreamTools: string[]) => {
+      h.ds.chatId = 'oc_target';
+      h.scope.getBot = () => ({ config: { triggerUserAuth: { enabled: true, tools: [], dispatchOnly } } });
+      h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+      h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+        appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: upstreamTools,
+      } }));
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+        botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+          chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } });
+      h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_alice' }));
+    };
+    it('forwards a signed dispatch-only tool instead of attaching the host grant', async () => {
+      const h = harness();
+      forwardingBotTurn(h, ['bytedcli']);
+      expect((await h.run()).status).toBe(200);
+      const payload = await read();
+      expect(payload?.authority).toMatchObject({ unionId: 'on_alice', tools: ['bytedcli'] });
+      expect(scheduleCreateCapabilities(payload!.authority)).toEqual([]);
+    });
+    it('still attaches the host grant when the signed grant has no tool dispatchOnly can forward', async () => {
+      const h = harness();
+      forwardingBotTurn(h, ['lark-cli']);
+      expect((await h.run()).status).toBe(200);
+      const payload = await read();
+      expect(payload?.authority).toMatchObject({ unionId: 'on_sponsor', tools: [] });
+      expect(scheduleCreateCapabilities(payload!.authority)).toEqual([
+        expect.objectContaining({ botGrantId: 'team' }),
+      ]);
+    });
+  });
   it.each(['bot sender', 'synthetic turn', 'failed recovery', 'active bot'])
     ('does not restore dispatch-only tools from an ineligible recorded %s', async scenario => {
       const h = harness();

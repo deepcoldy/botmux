@@ -31,9 +31,9 @@
 
 `dispatchOnly` 不改变来源 Bot 自己的 CLI 身份或定时任务的运行 scope；带有效签名委托的机器人回合只能转派上游已签的工具，普通机器人回合和无委托的自动回合不能借用会话中先前的真人。自动附加的定时授权不得覆盖这份真人即时委派；显式请求定时授权仍遵循原授权规则。目标 Bot 仍逐项验证签名、真人访问权限、群成员关系，并按目标 Bot 自己的 `triggerUserAuth` 获取该人的凭据。部署新配置前须确认 Botmux 的 `capabilities --json` 包含 `dispatch_only_user_auth_v1`；旧版本不会执行这条派发规则。
 
-白名单只约束来源 Bot 自己发出的第一跳。目标 Bot 在后续机器人回合里把这份委托再转给第三方时，走的是既有「继承只能收窄」规则：按目标 Bot 自己的 `tools` 过滤，不再回头校验来源 Bot 的 `targetAppIds` / `chatIds`。因此「未列入白名单的目标不能获得额外权限」只对第一跳成立；第二跳及以后，第三方拿到的只是上游已签、并经每一跳收窄后的工具集，不会比本改动之前更宽。
+白名单只约束来源 Bot 自己发出的第一跳。目标 Bot 在后续机器人回合里把这份委托再转给第三方时，走的是既有「继承只能收窄」规则：按目标 Bot 自己的 `tools`，以及它自己的 `dispatchOnly` 对当前群和目标命中时的 `dispatchOnly.tools` 过滤，不再回头校验来源 Bot 的 `targetAppIds` / `chatIds`。因此「未列入白名单的目标不能获得额外权限」只对第一跳成立；第二跳及以后，第三方拿到的只是上游已签、并经每一跳收窄后的工具集，不会比本改动之前更宽。
 
-与定时授权的边界：自动附加的 `schedule:create` 不得覆盖非管理员真人的这份即时委派，管理员本人的定时权限可与其共存。但定时运行 scope 的可用性校验只看来源 Bot 的基础 `tools`、不看 `dispatchOnly.tools`；所以按推荐的 `tools: []` 配置、又同时命中宿主 `runScopes`（如 bytedcli）与默认定时授权时，管理员派发会收到 `schedule_delegation_source_run_scope_unavailable`，需要带 `--no-delegate schedule:create` 才能派发——这种情况下 dispatchOnly 工具仍照常签名。
+与定时授权的边界：自动附加的 `schedule:create` 不得覆盖非管理员真人的这份即时委派，管理员本人的定时权限可与其共存。带签名委托的机器人回合经 `dispatchOnly` 转派工具时同样不附加自动定时授权；上游委托里没有可经 `dispatchOnly` 转派的工具时，照旧按原规则附加。但定时运行 scope 的可用性校验只看来源 Bot 的基础 `tools`、不看 `dispatchOnly.tools`；所以按推荐的 `tools: []` 配置、又同时命中宿主 `runScopes`（如 bytedcli）与默认定时授权时，管理员派发会收到 `schedule_delegation_source_run_scope_unavailable`，需要带 `--no-delegate schedule:create` 才能派发——这种情况下 dispatchOnly 工具仍照常签名。
 
 ## 边界与取舍
 

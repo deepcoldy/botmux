@@ -9227,13 +9227,16 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // dispatchOnly. Read that grant before deciding whether to sign at all.
     const inheritedLookedUp = inheritedForwardTools.length > 0;
     const earlyInherited = inheritedLookedUp ? await dispatchUserForTurn(ds, turnId!) : undefined;
+    // A forward passes on only tools the upstream grant already carries. A
+    // listed tool it cannot pass on is no immediate delegation: counting it
+    // would suppress the automatic schedule grant below and sign nothing.
     const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
       sourceChatId: ds.chatId,
       targetChatId: chatId,
       targetAppIds,
       directHuman: directHumanTurn,
       inherited: !!earlyInherited,
-    });
+    }).filter(tool => directHumanTurn || earlyInherited?.authority.tools.includes(tool));
     const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
     // A host bot grant stands in only for turns that no human administrator
     // drives. An administrator's own dispatch (live, or restored from the reply
