@@ -15,6 +15,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -311,6 +312,69 @@ export interface Harness {
   restoreCli: () => void;
 }
 
+/** The subset of a worker child the event-driven wait needs. A real ChildProcess
+ *  satisfies it; a plain EventEmitter stands in for the unit test. */
+export interface MessageWaiterChild {
+  on(event: 'message', listener: (message: unknown) => void): unknown;
+  off(event: 'message', listener: (message: unknown) => void): unknown;
+  readonly exitCode: number | null;
+}
+
+/**
+ * Build a `waitFor` that resolves on a CONDITION, woken immediately when the
+ * worker emits a message rather than only on a fixed timer tick.
+ *
+ * Why event-driven: a condition satisfied by an IPC report (a `runtime_binding`
+ * carrying the native session id) must resolve the moment that report arrives.
+ * A 50 ms polling loop inside a fixed window loses on a saturated CI runner,
+ * where the event loop stalls and the timer tick stretches, so the report can
+ * land after the budget of ticks is exhausted even though IPC delivered it.
+ * Subscribing to the message makes the wait track delivery order, not tick
+ * count. The 50 ms timer remains as a fallback for conditions backed by logs or
+ * files (no message wakes them), and the deadline / child-exit guards still fail
+ * fast when a worker genuinely never reports.
+ */
+export function createMessageAwareWaiter(
+  child: MessageWaiterChild,
+  timeoutSnapshot: () => string,
+): (cond: () => boolean, what: string, timeoutMs?: number) => Promise<void> {
+  return async function waitFor(cond, what, timeoutMs = 45_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let wake: (() => void) | undefined;
+    const onMessage = () => { wake?.(); };
+    child.on('message', onMessage);
+    try {
+      while (!cond()) {
+        if (Date.now() >= deadline || child.exitCode !== null) {
+          throw new Error(`timed out waiting for ${what}\n${timeoutSnapshot()}`);
+        }
+        await new Promise<void>(done => {
+          wake = done;
+          const timer = setTimeout(() => { wake = undefined; done(); }, 50);
+          timer.unref?.();
+        });
+      }
+    } finally {
+      child.off('message', onMessage);
+    }
+  };
+}
+
+/** Test seam: a minimal child emitting in-memory messages like an IPC channel. */
+export function fakeMessageChild(exitCode: number | null = null): MessageWaiterChild & {
+  emitMessage(m: unknown): void;
+  messageListenerCount(): number;
+} {
+  const emitter = new EventEmitter();
+  return {
+    exitCode,
+    on: (event, listener) => emitter.on(event, listener),
+    off: (event, listener) => emitter.off(event, listener),
+    emitMessage: (m: unknown) => emitter.emit('message', m),
+    messageListenerCount: () => emitter.listenerCount('message'),
+  };
+}
+
 export interface Generation {
   child: ChildProcess;
   messages: WorkerToDaemon[];
@@ -521,15 +585,8 @@ child.on('exit', code => process.exit(code ?? 1));
         child, messages, logs, readyAt, kill,
         finals: () => messages.flatMap(m => (m.type === 'final_output' ? [m.content] : [])),
         notices: () => messages.filter((m): m is Extract<WorkerToDaemon, { type: 'user_notify' }> => m.type === 'user_notify'),
-        waitFor: async (cond, what, timeoutMs = 45_000) => {
-          const deadline = Date.now() + timeoutMs;
-          while (!cond()) {
-            if (Date.now() >= deadline || child.exitCode !== null) {
-              throw new Error(`timed out waiting for ${what}\n${logs.join('')}\n${JSON.stringify(messages.filter(m => m.type !== 'screen_update'))}`);
-            }
-            await new Promise(done => setTimeout(done, 50));
-          }
-        },
+        waitFor: createMessageAwareWaiter(child, () =>
+          `${logs.join('')}\n${JSON.stringify(messages.filter(m => m.type !== 'screen_update'))}`),
       };
       return generation;
     },
