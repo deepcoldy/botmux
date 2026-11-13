@@ -85,11 +85,13 @@ Supabase migrations, or another maintenance marker. The unified CLI/API router
 uses the exact original journal ID on resume/cancel; never guess which backend
 owns an operation from the current candidate alone.
 
-Saving a new candidate is refused while either migration backend owns an
+Saving a new candidate is refused while a Supabase migration owns an
 unfinished job, including the preflight and irreversible cutover stages.
 Cancel or finish the original operation before changing connection settings.
-Candidate saves and both migration preparers share the same operation lock,
-so a configuration change cannot create a second cross-backend migration slot.
+Candidate saves and both migration preparers share the same operation lock;
+both preparers check the journals so a configuration change cannot create a
+second cross-backend migration slot. The existing legacy pre-freeze cancellation
+workflow remains available.
 
 Listing/reading missing journals is read-only. Writes are durable, atomic and
 private: migration directories are `0700`, journals/snapshots are `0600`.

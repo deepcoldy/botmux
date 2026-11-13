@@ -118,7 +118,7 @@ export async function saveFeedbackStorageCandidate(
   await mkdir(migrations, { recursive: true, mode: 0o700 });
   if (await realpath(migrations) !== migrations) throw new Error('feedback_migration_directory_invalid');
   return withFileLock(join(migrations, 'operation'), () => withFileLock(path, async () => {
-    await assertFeedbackMigrationSlotAvailable(dataDir);
+    await assertFeedbackMigrationSlotAvailable(dataDir, undefined, true);
     const current = await readConfig(path);
     if (!current || current.generation !== expectedGeneration) {
       throw new Error('feedback_storage_generation_conflict');

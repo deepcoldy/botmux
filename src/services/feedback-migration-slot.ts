@@ -2,9 +2,9 @@ import { constants } from 'node:fs';
 import { open, readdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 
-export async function assertFeedbackMigrationSlotAvailable(dataDir: string, except?: string): Promise<void> {
+export async function assertFeedbackMigrationSlotAvailable(dataDir: string, except?: string, supabaseOnly = false): Promise<void> {
   const root = await realpath(dataDir);
-  for (const name of ['feedback-migrations', 'feedback-supabase-migrations']) {
+  for (const name of supabaseOnly ? ['feedback-supabase-migrations'] : ['feedback-migrations', 'feedback-supabase-migrations']) {
     const directory = join(root, name);
     let files: string[];
     try {
