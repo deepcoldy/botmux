@@ -99,6 +99,27 @@ export function publishReplyPolicyChanged(chatId?: string): void {
   dashboardEventBus.publish({ type: 'groups.reply-policy.changed', body: chatId ? { chatId } : {} });
 }
 
+export type GroupMentionModeConfig = {
+  chatMentionModes?: Record<string, GroupMentionMode>;
+  signedChatDefaults?: boolean;
+  regularGroupMentionMode?: GroupMentionMode;
+};
+
+/** `signedDefault`: whether the chat's signed default verified as 'ambient' for this bot. */
+function resolveGroupMentionModeForConfig(
+  cfg: GroupMentionModeConfig,
+  chatId: string | undefined,
+  signedDefault: () => boolean,
+): GroupMentionMode {
+  const perChat = chatId ? cfg.chatMentionModes?.[chatId] : undefined;
+  if (perChat === 'always' || perChat === 'topic' || perChat === 'never' || perChat === 'ambient') {
+    return perChat;
+  }
+  if (cfg.signedChatDefaults === true && signedDefault()) return 'ambient';
+  const m = cfg.regularGroupMentionMode;
+  return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
+}
+
 /**
  * Per-bot (bot-global) @-requirement policy for regular groups, default 'always'.
  *   • always  — @ required everywhere (incl. inside shared topics).
@@ -111,31 +132,35 @@ export function publishReplyPolicyChanged(chatId?: string): void {
  * wins when present; otherwise an opted-in signed chat default, then the
  * per-bot `regularGroupMentionMode` default.
  */
-export function resolveGroupMentionModeForConfig(
-  cfg: {
-    chatMentionModes?: Record<string, GroupMentionMode>;
-    signedChatDefaults?: boolean;
-    regularGroupMentionMode?: GroupMentionMode;
-  } | undefined,
-  larkAppId: string,
-  chatId?: string,
-): GroupMentionMode {
-  if (!cfg) return 'always';
-  const perChat = chatId ? cfg.chatMentionModes?.[chatId] : undefined;
-  if (perChat === 'always' || perChat === 'topic' || perChat === 'never' || perChat === 'ambient') {
-    return perChat;
-  }
-  if (cfg.signedChatDefaults === true && signedChatMentionDefault(larkAppId, chatId)) return 'ambient';
-  const m = cfg.regularGroupMentionMode;
-  return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
-}
-
 export function resolveGroupMentionMode(larkAppId: string, chatId?: string): GroupMentionMode {
   try {
-    return resolveGroupMentionModeForConfig(getBot(larkAppId).config, larkAppId, chatId);
+    return resolveGroupMentionModeForConfig(
+      getBot(larkAppId).config,
+      chatId,
+      () => !!signedChatMentionDefault(larkAppId, chatId),
+    );
   } catch {
     return 'always';
   }
+}
+
+/**
+ * Whether ANOTHER bot (its bots.json entry) answers un-@ replies inside a topic
+ * it owns in `chatId`, i.e. its effective mention mode is not 'always'.
+ *
+ * The signed chat default is verified and cached only inside the owning bot's
+ * own daemon (warmed by its own inbound traffic), so another process cannot
+ * read it. When that bit alone decides the answer, this returns 'unknown' and
+ * callers must not act on either guess. A missing config is 'unknown' too.
+ */
+export function peerAnswersTopicWithoutMention(
+  cfg: GroupMentionModeConfig | undefined,
+  chatId: string,
+): boolean | 'unknown' {
+  if (!cfg) return 'unknown';
+  const unsigned = resolveGroupMentionModeForConfig(cfg, chatId, () => false) !== 'always';
+  const signed = resolveGroupMentionModeForConfig(cfg, chatId, () => true) !== 'always';
+  return unsigned === signed ? unsigned : 'unknown';
 }
 
 /** Only controls the solo-group exception; explicit mention policies/triggers still apply. */

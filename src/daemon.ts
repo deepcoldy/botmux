@@ -170,7 +170,8 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
-import { resolveGroupMentionModeForConfig, resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { resolveImportedTopicHandoff } from './services/imported-topic-handoff.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -4197,59 +4198,9 @@ function scheduleDeferredScheduleSettlement(
   });
 }
 
-function doesBotAnswerTopicWithoutMention(targetAppId: string, chatId: string): boolean {
-  let cfg: BotConfig | undefined;
-  try {
-    cfg = getBot(targetAppId).config;
-  } catch {
-    try {
-      cfg = loadBotConfigsCached().find(b => b.larkAppId === targetAppId);
-    } catch {
-      cfg = undefined;
-    }
-  }
-  if (!cfg) return false;
-  return resolveGroupMentionModeForConfig(cfg, targetAppId, chatId) !== 'always';
-}
-
-function findActiveImportedThreadSessionAtRoot(
-  rootId: string,
-  chatId: string,
-  excludeAppId?: string,
-): Session | undefined {
-  for (const ds of activeSessions.values()) {
-    if (excludeAppId && ds.larkAppId === excludeAppId) continue;
-    if (ds.session.status === 'active'
-      && ds.chatId === chatId
-      && (ds.scope ?? ds.session.scope) === 'thread'
-      && ds.session.rootMessageId === rootId
-      && !!ds.session.projectImportSource
-      && !!ds.larkAppId) {
-      return ds.session;
-    }
-  }
-  return sessionStore.findActiveSessionsByRoot(rootId).find(s =>
-    s.status === 'active'
-    && s.chatId === chatId
-    && s.scope === 'thread'
-    && s.rootMessageId === rootId
-    && !!s.projectImportSource
-    && !!s.larkAppId
-    && (!excludeAppId || s.larkAppId !== excludeAppId));
-}
-
 function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
   // A real thread-scope session at this root wins over any historical alias.
   if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
-  const diskSessions = sessionStore.listSessions();
-  // When another bot's active imported (`/relay` / `/adopt` / etc.) thread-scope
-  // session in this chat has免@ enabled (`topic` / `ambient` / `never`), it owns
-  // un-@ replies inside its topic even if a coordinator previously answered an
-  // explicit `@coordinator` message inside the same topic.
-  const imported = findActiveImportedThreadSessionAtRoot(rootId, chatId, larkAppId);
-  if (imported?.larkAppId && doesBotAnswerTopicWithoutMention(imported.larkAppId, chatId)) {
-    return null;
-  }
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
     const deferredRoot = reconcileDeferredTopicBinding(ds);
@@ -4257,6 +4208,7 @@ function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): 
       return { chatId: ds.chatId, sessionId: ds.session.sessionId, anchor: sessionAnchorId(ds) };
     }
   }
+  const diskSessions = sessionStore.listSessions();
   if (diskSessions.some(s => s.status === 'active' && s.larkAppId === larkAppId && s.scope !== 'chat' && s.rootMessageId === rootId)) {
     return null;
   }
@@ -35072,18 +35024,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
-      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => {
-        const imported = findActiveImportedThreadSessionAtRoot(rootId, chatId, appId);
-        if (!imported?.larkAppId) return null;
-        const groupMode = readGroupCollaborationMode(config.session.dataDir, chatId);
-        const hasProjectCoordinator = groupMode?.mode === 'project' && !!groupMode.coordinatorAppId;
-        return {
-          sourceLarkAppId: imported.larkAppId,
-          sourceAnswersWithoutMention: doesBotAnswerTopicWithoutMention(imported.larkAppId, chatId),
-          hasProjectCoordinator,
-          isProjectCoordinator: hasProjectCoordinator && groupMode!.coordinatorAppId === appId,
-        };
-      },
+      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => resolveImportedTopicHandoff({
+        rootId,
+        chatId,
+        larkAppId: appId,
+        // One cross-bot lookup (this bot's own sessions are excluded inside).
+        sessionsAtRoot: sessionStore.findActiveSessionsByRoot(rootId),
+        chatScopeSessions: () => sessionStore.findActiveChatScopeSessionsByChat(chatId),
+        // One bot per daemon: a peer is not registered here, read bots.json.
+        peerConfig: peerAppId => {
+          try { return getBot(peerAppId).config; } catch { /* not this daemon's bot */ }
+          return loadBotConfigsCached().find(b => b.larkAppId === peerAppId);
+        },
+        groupMode: () => readGroupCollaborationMode(config.session.dataDir, chatId),
+      }),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,

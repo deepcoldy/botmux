@@ -16340,8 +16340,7 @@ describe('migrated topic un-@ human reply routing', () => {
     const handoffFor = (appId: string) => appId === MIGRATED_APP_ID ? null : ({
       sourceLarkAppId: MIGRATED_APP_ID,
       sourceAnswersWithoutMention: false,
-      hasProjectCoordinator: true,
-      isProjectCoordinator: appId === COORD_APP_ID,
+      coordinatorMayFold: appId === COORD_APP_ID,
     });
 
     const coordHandlers = {
@@ -16449,7 +16448,7 @@ describe('migrated topic un-@ human reply routing', () => {
       resolveReplyThreadAlias: vi.fn(() => ({ chatId, sessionId: 'coord-session', anchor: chatId })),
       resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
         (r === rootId && c === chatId && appId !== MIGRATED_APP_ID)
-          ? { sourceLarkAppId: MIGRATED_APP_ID, sourceAnswersWithoutMention: true, hasProjectCoordinator: true, isProjectCoordinator: true }
+          ? { sourceLarkAppId: MIGRATED_APP_ID, sourceAnswersWithoutMention: true, coordinatorMayFold: false }
           : null,
     };
     startLarkEventDispatcher(COORD_APP_ID, 'secret', coordHandlers);
@@ -16549,5 +16548,249 @@ describe('migrated topic un-@ human reply routing', () => {
       scope: 'chat',
       anchor: chatId,
     });
+  });
+});
+
+// Daemon-side facts (which session counts, the importing bot's mention mode,
+// whether the coordinator may fold) are covered in imported-topic-handoff.test.ts;
+// here each bot's hook returns what its daemon would, and the cases pin how the
+// dispatcher acts on it.
+describe('migrated topic un-@ handoff — mention-policy gates', () => {
+  const COORD = 'cli_handoff_coord';
+  const SOURCE = 'cli_handoff_source';
+  const PEER = 'cli_handoff_peer';
+  const chatId = 'chat-handoff';
+  const rootId = 'om_handoff_root';
+  const threadId = 'omt_handoff_thread';
+  type Handoff = NonNullable<Awaited<ReturnType<NonNullable<EventHandlers['resolveImportedTopicMentionlessHandoff']>>>>;
+  const handoff = (over: Partial<Handoff> = {}): Handoff => ({
+    sourceLarkAppId: SOURCE, sourceAnswersWithoutMention: false, coordinatorMayFold: false, ...over,
+  });
+  let msgSeq = 0;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    _resetSeenMessagesForTest();
+    _resetTriggeredMessagesForTest();
+    _resetReverifyForTest();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
+    mockGetCachedChatModeStrict.mockReturnValue('group');
+  });
+
+  function startBots(specs: Array<{ appId: string; config: Record<string, unknown>; handlers: Partial<EventHandlers> }>) {
+    const botStates = new Map<string, any>(specs.map(spec => [spec.appId, {
+      config: { larkAppId: spec.appId, larkAppSecret: 's', cliId: 'codex', allowedUsers: [USER_OPEN_ID], ...spec.config },
+      botOpenId: `ou_${spec.appId}`,
+      resolvedAllowedUsers: [USER_OPEN_ID],
+      resolvedBlockedUsers: [],
+    }]));
+    mockGetBot.mockImplementation((id: string) => botStates.get(id));
+    mockGetAllBots.mockImplementation(() => [...botStates.values()]);
+    const bots = new Map<string, { handlers: ReturnType<typeof makeHandlers> & EventHandlers; receive: (data: any) => Promise<any> }>();
+    for (const spec of specs) {
+      capturedHandlers = {};
+      const handlers = { ...makeHandlers(), resolveImportedTopicMentionlessHandoff: vi.fn(() => null), ...spec.handlers };
+      startLarkEventDispatcher(spec.appId, 'secret', handlers);
+      bots.set(spec.appId, { handlers: handlers as any, receive: capturedHandlers['im.message.receive_v1'] });
+    }
+    return bots;
+  }
+
+  async function deliver(bots: ReturnType<typeof startBots>, event: ReturnType<typeof makeUserMessageEvent>) {
+    await Promise.all([...bots.values()].map(bot => bot.receive(event)));
+    await flushEventWork();
+  }
+
+  function inTopic(text: string, over: { senderOpenId?: string; mentions?: TestMention[] } = {}) {
+    msgSeq += 1;
+    return makeUserMessageEvent({
+      senderOpenId: over.senderOpenId ?? USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId: `om_handoff_msg_${msgSeq}`,
+      chatId,
+      chatType: 'group',
+      rootId,
+      threadId,
+      mentions: over.mentions ?? [],
+    });
+  }
+
+  const replies = (h: ReturnType<typeof makeHandlers>) => h.handleNewTopic.mock.calls.length + h.handleThreadReply.mock.calls.length;
+  const sourceSpec = { appId: SOURCE, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'always' }, handlers: {
+    isSessionOwner: vi.fn((anchor: string) => anchor === rootId),
+  } };
+
+  it('default mention mode (always): the project coordinator stays quiet in another bot\'s imported topic and never runs the lookup', async () => {
+    const coordHook = vi.fn(() => handoff({ coordinatorMayFold: true }));
+    const bots = startBots([
+      { appId: COORD, config: { regularGroupReplyMode: 'shared' }, handlers: {
+        isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+        resolveImportedTopicMentionlessHandoff: coordHook,
+      } },
+      sourceSpec,
+    ]);
+
+    await deliver(bots, inTopic('我们俩先对一下时间'));
+
+    expect(replies(bots.get(COORD)!.handlers)).toBe(0);
+    expect(replies(bots.get(SOURCE)!.handlers)).toBe(0);
+    expect(coordHook).not.toHaveBeenCalled();
+  });
+
+  it('a third bot continuing the topic through its shared-topic alias keeps the un-@ follow-up (importing bot requires @)', async () => {
+    const bots = startBots([
+      { appId: PEER, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
+        isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+        resolveReplyThreadAlias: vi.fn((r: string) => r === rootId ? { chatId, sessionId: 'peer-chat-session', anchor: chatId } : null),
+        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff()),
+      } },
+      // The daemon reports coordinatorMayFold=false here because PEER continues the root.
+      { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
+        isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ coordinatorMayFold: false })),
+      } },
+      sourceSpec,
+    ]);
+
+    await deliver(bots, inTopic('那第二个问题呢'));
+
+    const peer = bots.get(PEER)!.handlers;
+    expect(peer.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(peer.handleThreadReply.mock.calls[0]![1]).toMatchObject({ larkAppId: PEER, scope: 'chat', anchor: chatId, replyRootId: rootId });
+    expect(replies(bots.get(COORD)!.handlers)).toBe(0);
+    expect(replies(bots.get(SOURCE)!.handlers)).toBe(0);
+  });
+
+  it('a third bot with its own thread session at the root keeps the un-@ follow-up (importing bot requires @ or is undecidable)', async () => {
+    for (const sourceAnswersWithoutMention of [false, 'unknown'] as const) {
+      const bots = startBots([
+        { appId: PEER, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'topic' }, handlers: {
+          isSessionOwner: vi.fn((anchor: string) => anchor === rootId),
+          resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ sourceAnswersWithoutMention })),
+        } },
+        sourceSpec,
+      ]);
+
+      await deliver(bots, inTopic('继续刚才那个'));
+
+      const peer = bots.get(PEER)!.handlers;
+      expect(peer.handleThreadReply, String(sourceAnswersWithoutMention)).toHaveBeenCalledTimes(1);
+      expect(peer.handleThreadReply.mock.calls[0]![1]).toMatchObject({ larkAppId: PEER, scope: 'thread', anchor: rootId });
+      expect(replies(bots.get(SOURCE)!.handlers)).toBe(0);
+    }
+  });
+
+  it('the chat manager of a non-project group does not take over the imported topic, but still answers top-level un-@ messages', async () => {
+    mockIsChatManager.mockResolvedValue(true);
+    const bots = startBots([
+      { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic', chatManagerEnabled: true }, handlers: {
+        isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+        resolveImportedTopicMentionlessHandoff: vi.fn((r: string) => r === rootId ? handoff() : null),
+      } },
+      sourceSpec,
+    ]);
+    const manager = bots.get(COORD)!.handlers;
+
+    await deliver(bots, inTopic('这个话题里没人 @ 的一句'));
+    expect(replies(manager)).toBe(0);
+    expect(replies(bots.get(SOURCE)!.handlers)).toBe(0);
+
+    await bots.get(COORD)!.receive(makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '管家帮我看个新问题' }),
+      messageId: 'om_handoff_top_level',
+      chatId,
+      chatType: 'group',
+      mentions: [],
+    }));
+    await flushEventWork();
+    expect(manager.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(manager.handleThreadReply.mock.calls[0]![1]).toMatchObject({ larkAppId: COORD, scope: 'chat', anchor: chatId });
+  });
+
+  it('a project coordinator in topic mode folds an un-@ reply in, but not one that @mentions someone else', async () => {
+    const coordHook = vi.fn(() => handoff({ coordinatorMayFold: true }));
+    const bots = startBots([
+      { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
+        isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+        resolveImportedTopicMentionlessHandoff: coordHook,
+      } },
+      sourceSpec,
+    ]);
+    const coord = bots.get(COORD)!.handlers;
+
+    await deliver(bots, inTopic('@张三 你看下这个', { mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhang_san' } }] }));
+    expect(replies(coord)).toBe(0);
+
+    await deliver(bots, inTopic('这个怎么处理'));
+    expect(coord.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(coord.handleThreadReply.mock.calls[0]![1]).toMatchObject({ larkAppId: COORD, scope: 'chat', anchor: chatId, replyRootId: rootId });
+    expect(replies(bots.get(SOURCE)!.handlers)).toBe(0);
+  });
+
+  it('in a 话题群 the coordinator has no chat-scope session to fold into and keeps its regular thread routing', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatModeStrict.mockResolvedValue('topic');
+    mockGetCachedChatModeStrict.mockReturnValue('topic');
+    const bots = startBots([
+      { appId: COORD, config: { regularGroupMentionMode: 'topic' }, handlers: {
+        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ coordinatorMayFold: true })),
+      } },
+      sourceSpec,
+    ]);
+
+    await deliver(bots, inTopic('这个怎么处理'));
+
+    // topic mode answers un-@ only inside a topic it owns; it owns none here.
+    expect(replies(bots.get(COORD)!.handlers)).toBe(0);
+    expect(replies(bots.get(SOURCE)!.handlers)).toBe(0);
+  });
+
+  it('an unauthorized sender\'s un-@ reply is not folded and does not trigger the cross-bot lookup', async () => {
+    const coordHook = vi.fn(() => handoff({ coordinatorMayFold: true }));
+    const bots = startBots([
+      { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
+        isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
+        resolveImportedTopicMentionlessHandoff: coordHook,
+      } },
+      sourceSpec,
+    ]);
+
+    await deliver(bots, inTopic('我也想问一下', { senderOpenId: 'ou_stranger' }));
+
+    expect(replies(bots.get(COORD)!.handlers)).toBe(0);
+    expect(coordHook).not.toHaveBeenCalled();
+  });
+
+  it('a bot yielding the imported topic still answers built-in un-@ commands such as /dash', async () => {
+    const bots = startBots([
+      { appId: PEER, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'ambient' }, handlers: {
+        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ sourceAnswersWithoutMention: true })),
+      } },
+    ]);
+    const peer = bots.get(PEER)!.handlers;
+
+    await deliver(bots, inTopic('随口一句'));
+    expect(replies(peer)).toBe(0);
+
+    await deliver(bots, inTopic('/dash'));
+    expect(replies(peer)).toBe(1);
+  });
+
+  it('a failing lookup keeps the regular routing instead of dropping the message', async () => {
+    const bots = startBots([
+      { appId: PEER, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'ambient' }, handlers: {
+        resolveImportedTopicMentionlessHandoff: vi.fn(() => { throw new Error('group-collaboration-modes.json: Unexpected token'); }),
+      } },
+    ]);
+
+    await deliver(bots, inTopic('有人在吗'));
+
+    expect(replies(bots.get(PEER)!.handlers)).toBe(1);
   });
 });
