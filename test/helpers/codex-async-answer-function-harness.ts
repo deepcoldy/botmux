@@ -57,18 +57,7 @@ export function deliveryIsCurrent(scope: Record<string, any>): any {
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
   let expression: ts.Expression | undefined;
   function visit(node: ts.Node): void {
-    if (ts.isCallExpression(node) && node.expression.getText(file) === 'deliverCodexAsyncAnswer') {
-      let parent: ts.Node | undefined = node.parent;
-      while (parent && !ts.isBlock(parent)) parent = parent.parent;
-      if (parent && ts.isBlock(parent)) {
-        for (const statement of parent.statements) {
-          if (!ts.isVariableStatement(statement)) continue;
-          for (const declaration of statement.declarationList.declarations) {
-            if (declaration.name.getText(file) === 'isCurrent') expression = declaration.initializer;
-          }
-        }
-      }
-    }
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'isAsyncAskCurrent') expression = node.initializer;
     ts.forEachChild(node, visit);
   }
   visit(file);

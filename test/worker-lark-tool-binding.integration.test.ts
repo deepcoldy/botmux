@@ -10,6 +10,8 @@ import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
 const headlessChat = `headless_${headlessId}`;
 
+// The parent polls for the result path. Each fixture renames the completed JSON
+// into place so the parent cannot observe an empty or partially written file.
 it('a real direct Trae worker pins managed tool PATH after the CLI launcher resets its environment', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'worker-trae-tool-path-')));
   const dataDir = join(root, 'data'); mkdirSync(dataDir);
@@ -27,7 +29,8 @@ it('a real direct Trae worker pins managed tool PATH after the CLI launcher rese
     // Native tool runners may rebuild inherited PATH; explicit policy survives.
     'const env = {...process.env, PATH:"/usr/bin:/bin", ...explicit};',
     'const result = spawnSync("lark-cli", ["--version"], {env,encoding:"utf8"});',
-    'fs.writeFileSync(' + JSON.stringify(output) + ',JSON.stringify({status:result.status,out:result.stdout,err:result.stderr,path:env.PATH}));',
+    `fs.writeFileSync(${JSON.stringify(output + '.tmp')}, JSON.stringify({status:result.status,out:result.stdout,err:result.stderr,path:env.PATH}));`,
+    `fs.renameSync(${JSON.stringify(output + '.tmp')}, ${JSON.stringify(output)});`,
     'process.stdout.write("Ready\\n");setInterval(()=>{},1000);',
   ].join('\n');
   writeFileSync(fakeCli, fixture, { mode: 0o755 });
@@ -82,7 +85,8 @@ it.each([
 const fs = require('node:fs');
 const {spawnSync} = require('node:child_process');
 const result = spawnSync('lark-cli', ['--version'], {encoding:'utf8'});
-fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({status:result.status,out:result.stdout,err:result.stderr,path:process.env.PATH,hasAppSecret:!!process.env.BOTMUX_LARK_APP_SECRET,hasUserToken:!!process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN}));
+fs.writeFileSync(${JSON.stringify(output + '.tmp')}, JSON.stringify({status:result.status,out:result.stdout,err:result.stderr,path:process.env.PATH,hasAppSecret:!!process.env.BOTMUX_LARK_APP_SECRET,hasUserToken:!!process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN}));
+fs.renameSync(${JSON.stringify(output + '.tmp')}, ${JSON.stringify(output)});
 process.stdout.write('Ready\\n');
 setInterval(()=>{},1000);
 `, { mode: 0o755 });
@@ -130,7 +134,8 @@ it.each([false, true])('aligns a real worker system prompt with the managed bot-
   writeFileSync(join(botBin, 'lark-cli'), '#!/usr/bin/env node\n' + fakeLarkHelpScript(), { mode: 0o755 });
   writeFileSync(fakeCli, `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({prompt:process.env.BOTMUX_APPEND_SYSTEM_PROMPT}));
+fs.writeFileSync(${JSON.stringify(output + '.tmp')}, JSON.stringify({prompt:process.env.BOTMUX_APPEND_SYSTEM_PROMPT}));
+fs.renameSync(${JSON.stringify(output + '.tmp')}, ${JSON.stringify(output)});
 process.stdout.write('Ready\\n');
 setInterval(()=>{},1000);
 `, { mode: 0o755 });
@@ -193,12 +198,13 @@ it.skipIf(!canSandbox).each([
   writeFileSync(fakeCli, `#!${node}
 const fs = require('node:fs'), {spawnSync} = require('node:child_process');
 const run = (bin, args) => { const r = spawnSync(bin, args, {encoding:'utf8'}); return {status:r.status,out:r.stdout,err:r.stderr}; };
-fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({
+fs.writeFileSync(${JSON.stringify(output + '.tmp')}, JSON.stringify({
   direct: run('lark-cli', ['--version']),
   sh: run('/bin/sh', ['-c', 'lark-cli --version']),
   bash: run('/bin/bash', ['-c', 'lark-cli --version']),
   path: process.env.PATH, binding: process.env.BOTMUX_LARK_TOOL_BINDING,
 }));
+fs.renameSync(${JSON.stringify(output + '.tmp')}, ${JSON.stringify(output)});
 process.stdout.write('Ready\\n'); setInterval(()=>{},1000);
 `, { mode: 0o755 });
   const env = { ...process.env, HOME: join(root, 'home'), USERPROFILE: join(root, 'home'),

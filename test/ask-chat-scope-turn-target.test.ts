@@ -19,6 +19,10 @@ import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
+import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
+import * as sessionControllers from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 // 执行 daemon.ts 里真实的 handleAskRequest，配真实 broker / 显式 ask 回执 / 飞书发卡器，
 // 只把飞书发送接口换成记录器：断言卡片实际发到哪、文字答复能否结算。
@@ -69,7 +73,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     rmSync(dir, { recursive: true, force: true });
   });
 
-  function post(ds: Ds, body: Record<string, unknown>) {
+  function post(ds: Ds, body: Record<string, unknown>, dependencies: Record<string, unknown> = {}) {
     const responses: Array<{ status: number; payload: any }> = [];
     const handler = productionConst('src/daemon.ts', 'handleAskRequest', {
       readJsonBody: async () => body,
@@ -97,10 +101,189 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       frozenReplyContextForTurn,
       activeSessions: new Map([['k', ds]]),
       logger: { info: () => {}, warn: () => {}, debug: () => {} },
+      ...dependencies,
     });
     const done: Promise<void> = handler({}, { destroyed: false, once: () => {}, off: () => {} });
     return { done, responses };
   }
+
+  it.each(['none', 'document lookup', 'before registration', 'waiting for answer', 'pending reservation'])(
+    'routes a native question with no legacy thread mirror; replaces runtime during %s', async replace => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      const { worker } = controller.bindWorker(1);
+      const bind = (binding: string, physicalId: string) => {
+        controller.reserveBinding(binding, worker);
+        return controller.bindRuntime(binding, worker, { backend: 'tmux', physicalId,
+          proof: 'process_start', nativeSessionId: 'thread-current' });
+      };
+      bind('current', '10:100');
+      const deliveryChecks: boolean[] = [];
+      const { done, responses } = post(ds, askBody(TURN, {
+        originKind: 'native-user-input-async', requestId: 'question-item',
+        asyncUserInput: { threadId: 'thread-current', nativeTurnId: 'native-turn', itemId: 'question-item' },
+      }), {
+        isCodexAppCliId: (id: string) => id === 'codex-app', captureCodexAsyncAskOrigin,
+        asyncAskAudience: () => ({ kind: 'human', answererOpenId: 'ou_user' }),
+        localeForBot: () => 'zh', tr: (key: string) => key, notifyAsyncAsk: vi.fn(),
+        resolveDocumentAskDelivery: async () => {
+          if (replace === 'document lookup') bind('replacement', '11:101');
+          // 替代运行时只预留（starting、无 identity）：activeRuntime 仍是旧的，
+          // 只有 hasPendingRuntimeReplacement 能识别这个换代窗口。
+          if (replace === 'pending reservation') controller.reserveBinding('replacement', worker);
+          return undefined;
+        },
+        verifiedAskMention: async () => {
+          if (replace === 'before registration') bind('replacement', '11:101');
+          return undefined;
+        },
+        deliverCodexAsyncAnswer: async (_identity: unknown, _questions: unknown, _result: unknown, deps: { isCurrent(): boolean }) => {
+          deliveryChecks.push(deps.isCurrent()); return deps.isCurrent();
+        },
+      });
+      if (replace === 'document lookup' || replace === 'before registration' || replace === 'pending reservation') {
+        await done;
+        expect(sent).toHaveLength(0);
+        expect(responses.at(-1)).toMatchObject({ status: 409 });
+        return;
+      }
+      await vi.waitFor(() => expect(sent).toEqual([{ via: 'send', target: CHAT }]));
+      expect(ds.session.cliSessionId).toBeUndefined();
+      if (replace === 'waiting for answer') bind('replacement', '11:101');
+      const [pending] = listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT });
+      expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
+      await done;
+      expect(deliveryChecks).toEqual([replace === 'none']);
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
+
+  it('rejects a native question whose threadId does not match the live runtime', async () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      const { worker } = controller.bindWorker(1);
+      controller.reserveBinding('current', worker);
+      controller.bindRuntime('current', worker, { backend: 'tmux', physicalId: '10:100',
+        proof: 'process_start', nativeSessionId: 'thread-current' });
+      const { done, responses } = post(ds, askBody(TURN, {
+        originKind: 'native-user-input-async', requestId: 'question-item',
+        asyncUserInput: { threadId: 'thread-other', nativeTurnId: 'native-turn', itemId: 'question-item' },
+      }), {
+        isCodexAppCliId: (id: string) => id === 'codex-app', captureCodexAsyncAskOrigin,
+        asyncAskAudience: () => ({ kind: 'human', answererOpenId: 'ou_user' }),
+        localeForBot: () => 'zh', tr: (key: string) => key, notifyAsyncAsk: vi.fn(),
+      });
+      await done;
+      expect(sent).toHaveLength(0);
+      expect(responses.at(-1)).toMatchObject({ status: 409 });
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
+
+  // daemon 重启后 worker 热重连仍在 tmux 里的 runner：同一个进程（pid + 启动时间）换了新 worker、
+  // 新运行时，但 runner 已确认过的 thread 标记不会重发，新运行时没有 native id。
+  // 先认运行时自己的 native id，再认同一进程更早记下的，都没有才看会话记录的 cliSessionId。
+  const warmReattachCases: Array<{ title: string; previous?: { physicalId: string; native?: string };
+    switched?: string; current?: string; mirror?: string; routes: boolean }> = [
+    { title: 'routes a warm-reattached runner by the thread its process recorded before the restart, even with no session mirror',
+      previous: { physicalId: '10:100', native: 'thread-current' }, routes: true },
+    { title: 'routes a warm-reattached runner by its recorded thread over a stale session mirror',
+      previous: { physicalId: '10:100', native: 'thread-current' }, mirror: 'thread-old', routes: true },
+    { title: 'rejects a warm-reattached runner whose process recorded another thread, even if the session mirror matches',
+      previous: { physicalId: '10:100', native: 'thread-old' }, mirror: 'thread-current', routes: false },
+    { title: 'routes by the latest thread its process recorded when it recorded more than one',
+      previous: { physicalId: '10:100', native: 'thread-old' }, switched: 'thread-current', routes: true },
+    { title: 'falls back to the session mirror when only another process recorded a native thread',
+      previous: { physicalId: '9:90', native: 'thread-old' }, mirror: 'thread-current', routes: true },
+    { title: 'falls back to the session mirror for a runtime whose process never recorded a native thread',
+      mirror: 'thread-current', routes: true },
+    { title: 'rejects a runtime with no recorded native thread when the session mirror differs',
+      mirror: 'thread-old', routes: false },
+    { title: "rejects when the runtime's own native id differs even though the session mirror matches",
+      current: 'thread-new', mirror: 'thread-current', routes: false },
+  ];
+  for (const c of warmReattachCases) it(c.title, async () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app', cliSessionId: c.mirror });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      let { worker } = controller.bindWorker(1);
+      if (c.previous) {
+        controller.reserveBinding('before-restart', worker);
+        controller.bindRuntime('before-restart', worker, { backend: 'tmux', physicalId: c.previous.physicalId, proof: 'process_start',
+          ...(c.previous.native ? { nativeSessionId: c.previous.native } : {}) });
+        if (c.switched) {
+          // 同一进程里换了 thread：worker 为新 native id 起新绑定。
+          controller.reserveBinding('switched-thread', worker);
+          controller.bindRuntime('switched-thread', worker, { backend: 'tmux', physicalId: c.previous.physicalId,
+            proof: 'process_start', nativeSessionId: c.switched });
+        }
+        controller.workerLost(worker);
+        worker = controller.bindWorker(2).worker;
+        Object.assign(ds, { worker: { killed: false }, workerGeneration: 2 });
+        ds.session.workerGeneration = 2;
+      }
+      controller.reserveBinding('current', worker);
+      controller.bindRuntime('current', worker, { backend: 'tmux', physicalId: '10:100', proof: 'process_start',
+        ...(c.current ? { nativeSessionId: c.current } : {}) });
+      const deliveryChecks: boolean[] = [];
+      const { done, responses } = post(ds, askBody(TURN, {
+        originKind: 'native-user-input-async', requestId: 'question-item',
+        asyncUserInput: { threadId: 'thread-current', nativeTurnId: 'native-turn', itemId: 'question-item' },
+      }), {
+        isCodexAppCliId: (id: string) => id === 'codex-app', captureCodexAsyncAskOrigin,
+        asyncAskAudience: () => ({ kind: 'human', answererOpenId: 'ou_user' }),
+        localeForBot: () => 'zh', tr: (key: string) => key, notifyAsyncAsk: vi.fn(),
+        deliverCodexAsyncAnswer: async (_identity: unknown, _questions: unknown, _result: unknown, deps: { isCurrent(): boolean }) => {
+          deliveryChecks.push(deps.isCurrent()); return deps.isCurrent();
+        },
+      });
+      if (!c.routes) {
+        await vi.waitFor(() => expect(responses.at(-1)).toMatchObject({ status: 409 }), { timeout: 5_000 });
+        expect(sent).toHaveLength(0);
+        await done;
+        return;
+      }
+      await vi.waitFor(() => expect(sent).toEqual([{ via: 'send', target: CHAT }]), { timeout: 5_000 });
+      const [pending] = listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT });
+      expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
+      await done;
+      expect(deliveryChecks).toEqual([true]);
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
+
+  it('freezes the worker generation: a later rotation invalidates the captured origin', () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      const { worker } = controller.bindWorker(1);
+      controller.reserveBinding('current', worker);
+      controller.bindRuntime('current', worker, { backend: 'tmux', physicalId: '10:100',
+        proof: 'process_start', nativeSessionId: 'thread-current' });
+      const isCurrent = captureCodexAsyncAskOrigin(ds, 'thread-current');
+      expect(typeof isCurrent).toBe('function');
+      expect(isCurrent!()).toBe(true);
+      // reserveWorkerGeneration 在新 worker 的 contract bindWorker 之前就推进 ds 代次。
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
+      expect(isCurrent!()).toBe(false);
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
 
   /** 等卡片发出，再用 chat-scope 折叠路径的锚点（chatId）以文字作答。 */
   async function cardThenTextAnswer(ds: Ds, body: Record<string, unknown>) {

@@ -14,6 +14,7 @@ import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
 
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   mintBytedcliJwts: vi.fn(async (openId: string) => {
@@ -280,8 +281,8 @@ describe('correlated async answer adversarial production probes', () => {
       const res = new ServerResponse(new IncomingMessage(new Socket()));
       const worker = { killed: false };
       Object.assign(scope.askSession, { worker });
-      Object.assign(scope.askSession.session, { workerGeneration: 7, cliSessionId: 'thread' });
-      Object.assign(scope, { res, asyncWorker: worker, asyncGeneration: 7,
+      Object.assign(scope.askSession.session, { status: 'active', workerGeneration: 7, cliSessionId: 'thread' });
+      Object.assign(scope, { res, asyncAskOriginIsCurrent: captureCodexAsyncAskOrigin(scope.askSession, 'thread'),
         findActiveBySessionId: () => scope.askSession });
       scope.isCurrent = deliveryIsCurrent(scope);
       const pause = async (value: any) => new Promise(resolve => setTimeout(() => {
@@ -308,8 +309,8 @@ describe('correlated async answer adversarial production probes', () => {
     const res = new ServerResponse(new IncomingMessage(new Socket()));
     const worker = { killed: false };
     Object.assign(scope.askSession, { worker });
-    Object.assign(scope.askSession.session, { workerGeneration: 7, cliSessionId: 'thread' });
-    Object.assign(scope, { res, asyncWorker: worker, asyncGeneration: 7,
+    Object.assign(scope.askSession.session, { status: 'active', workerGeneration: 7, cliSessionId: 'thread' });
+    Object.assign(scope, { res, asyncAskOriginIsCurrent: captureCodexAsyncAskOrigin(scope.askSession, 'thread'),
       findActiveBySessionId: () => scope.askSession });
     scope.isCurrent = deliveryIsCurrent(scope);
     // Natural completion leaves the same worker/native thread alive and the
