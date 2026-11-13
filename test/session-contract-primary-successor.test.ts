@@ -90,6 +90,7 @@ function controllerFor(ds: DaemonSession): SessionController {
 
 function closeContract(controller: SessionController): void {
   const { operation } = controller.beginControl('close');
+  controller.controlStarted(operation.operationId);
   controller.controlResult(operation.operationId, 'confirmed');
 }
 
@@ -136,7 +137,8 @@ async function closedPredecessor(scope: Scope) {
  * message, so the durable lane is not touched here. */
 function repoSwitch(ds: DaemonSession) {
   ds.session = { ...makeSession('session-b', ds.scope as Scope),
-    durablePrimaryPredecessorSessionId: ds.session.sessionId };
+    durablePrimaryPredecessor: { sessionId: ds.session.sessionId,
+      contractRevision: ds.session.sessionRuntimeContract?.session.revision ?? 0 } };
   return controllerFor(ds);
 }
 
@@ -249,7 +251,7 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
   it('requires a recorded predecessor instead of claiming any closed row', async () => {
     const { ds, before } = await closedPredecessor('thread');
     const replacement = repoSwitch(ds);
-    delete ds.session.durablePrimaryPredecessorSessionId;
+    delete ds.session.durablePrimaryPredecessor;
     replacement.bindWorker(2);
 
     await expect(replacement.flushPrimary()).rejects.toThrow('canonical_contract_session_changed');
@@ -273,8 +275,8 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
     expect((await lane(restored.session)).session.sessionId).toBe('session-b');
   });
 
-  it('fences a delayed first checkpoint after another replica replaces and closes its predecessor', async () => {
-    const { ds } = await closedPredecessor('thread');
+  it.each([false, true])('fences a delayed first checkpoint after another replica closes a later lifecycle (same sessionId: %s)', async resumePredecessor => {
+    const { ds, before } = await closedPredecessor('thread');
     const replacement = repoSwitch(ds);
     replacement.bindWorker(2);
     let enter!: () => void;
@@ -296,10 +298,18 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
       await entered;
       now += LEASE_MS + 1;
       const other = { larkAppId: app, scope: 'thread', chatId: CHAT_ID,
-        session: makeSession('session-c', 'thread'), initConfig: {} } as DaemonSession;
-      await admitDurableLarkSession({ facade: otherFacade, message: message('om_later'), session: other.session });
+        session: resumePredecessor ? structuredClone(before.session) : makeSession('session-c', 'thread'),
+        initConfig: {} } as DaemonSession;
+      if (!resumePredecessor) {
+        await admitDurableLarkSession({ facade: otherFacade, message: message('om_later'), session: other.session });
+      }
       registerSessionContractPrimary(app, otherFacade, id => { fences.push(id); });
       const later = controllerFor(other);
+      if (resumePredecessor) {
+        const { operation } = later.beginControl('resume');
+        later.controlStarted(operation.operationId);
+        later.controlResult(operation.operationId, 'confirmed');
+      }
       later.bindWorker(3);
       await later.flushPrimary();
       const { operation } = later.beginControl('close');
@@ -308,7 +318,15 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
       later.controlResult(operation.operationId, 'confirmed');
       await later.flushPrimary();
       const closed = await lane(other.session);
-      expect(closed.session).toMatchObject({ sessionId: 'session-c', status: 'closed' });
+      expect(closed.session).toMatchObject({ sessionId: resumePredecessor ? 'session-a' : 'session-c', status: 'closed' });
+      if (resumePredecessor) {
+        expect(closed.session.sessionRuntimeContract!.session.revision)
+          .toBeGreaterThan(before.session.sessionRuntimeContract!.session.revision);
+      } else {
+        // Equal revisions across distinct sessions must still be fenced by id.
+        expect(closed.session.sessionRuntimeContract!.session.revision)
+          .toBe(before.session.sessionRuntimeContract!.session.revision);
+      }
       await otherFacade.releaseLease(laneKey(other.session));
 
       release();
@@ -329,7 +347,8 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
   it('refuses to write a successor row under another anchor', async () => {
     const { before } = await closedPredecessor('thread');
     const elsewhere = { ...makeSession('session-b', 'thread'), rootMessageId: 'om_other_root',
-      durablePrimaryPredecessorSessionId: 'session-a' };
+      durablePrimaryPredecessor: { sessionId: 'session-a',
+        contractRevision: before.session.sessionRuntimeContract!.session.revision } };
 
     expect(() => successorPrimarySessionValue(before.record, elsewhere)).toThrow('does not belong');
   });

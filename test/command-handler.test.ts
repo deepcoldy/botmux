@@ -6249,22 +6249,23 @@ describe('handleCommand', () => {
       );
       expect(newSessionUpdate, 'updateSession was never called with the new session').toBeDefined();
       expect(newSessionUpdate![0].workingDir).toBe('/home/testuser/project-a');
-      expect(newSessionUpdate![0].durablePrimaryPredecessorSessionId).toBeUndefined();
+      expect(newSessionUpdate![0].durablePrimaryPredecessor).toBeUndefined();
     });
 
     it('persists the primary predecessor before starting the replacement worker', async () => {
       const registration = vi.spyOn(primaryContracts, 'sessionContractPrimary').mockReturnValue({} as never);
       try {
         const ds = makeDaemonSession({ pendingRepo: false });
-        const predecessorId = ds.session.sessionId;
+        const predecessor = { sessionId: ds.session.sessionId, contractRevision: 7 };
+        ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision } } as never;
         const deps = makeDeps(ds);
         deps.lastRepoScan.set(CHAT_ID, [
           { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
         ]);
-        let persisted: string | undefined;
-        const observedAtFork: Array<string | undefined> = [];
+        let persisted: typeof ds.session.durablePrimaryPredecessor;
+        const observedAtFork: Array<typeof persisted> = [];
         vi.mocked(sessionStore.updateSession).mockImplementationOnce(session => {
-          persisted = session.durablePrimaryPredecessorSessionId;
+          persisted = session.durablePrimaryPredecessor;
         });
         vi.mocked(forkWorker).mockImplementationOnce(() => {
           observedAtFork.push(persisted);
@@ -6273,8 +6274,8 @@ describe('handleCommand', () => {
         await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
 
         expect(forkWorker).toHaveBeenCalledOnce();
-        expect(observedAtFork).toEqual([predecessorId]);
-        expect(ds.session.durablePrimaryPredecessorSessionId).toBe(predecessorId);
+        expect(observedAtFork).toEqual([predecessor]);
+        expect(ds.session.durablePrimaryPredecessor).toEqual(predecessor);
       } finally { registration.mockRestore(); }
     });
 

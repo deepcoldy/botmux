@@ -1046,7 +1046,7 @@ describe('repo select card — plain switch', () => {
     expect(ds.session.sessionId).toMatch(/^uuid-new-/);
     expect(ds.workingDir).toBe('/repos/beta');
     expect(ds.session.workingDir).toBe('/repos/beta');
-    expect(ds.session.durablePrimaryPredecessorSessionId).toBeUndefined();
+    expect(ds.session.durablePrimaryPredecessor).toBeUndefined();
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('');
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已切换');
@@ -1067,12 +1067,13 @@ describe('repo select card — plain switch', () => {
     const registration = vi.spyOn(primaryContracts, 'sessionContractPrimary').mockReturnValue({} as never);
     try {
       const ds = makeDs();
-      const predecessorId = ds.session.sessionId;
+      const predecessor = { sessionId: ds.session.sessionId, contractRevision: 7 };
+      ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision } } as never;
       const { deps } = makeDeps(ds);
-      let persisted: string | undefined;
-      const observedAtFork: Array<string | undefined> = [];
+      let persisted: typeof ds.session.durablePrimaryPredecessor;
+      const observedAtFork: Array<typeof persisted> = [];
       vi.mocked(updateSession).mockImplementationOnce(session => {
-        persisted = session.durablePrimaryPredecessorSessionId;
+        persisted = session.durablePrimaryPredecessor;
       });
       vi.mocked(forkWorker).mockImplementationOnce(() => {
         observedAtFork.push(persisted);
@@ -1081,8 +1082,8 @@ describe('repo select card — plain switch', () => {
       await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
 
       expect(forkWorker).toHaveBeenCalledOnce();
-      expect(observedAtFork).toEqual([predecessorId]);
-      expect(ds.session.durablePrimaryPredecessorSessionId).toBe(predecessorId);
+      expect(observedAtFork).toEqual([predecessor]);
+      expect(ds.session.durablePrimaryPredecessor).toEqual(predecessor);
     } finally { registration.mockRestore(); }
   });
 

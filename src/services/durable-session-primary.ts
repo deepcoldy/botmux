@@ -393,18 +393,23 @@ export function successorPrimarySessionValue(
 ): DurableJson | undefined {
   const value = object(current?.value);
   const predecessor = object(value?.session);
+  const proof = successor.durablePrimaryPredecessor;
   // Screen before the strict parse: a row that is not a closed predecessor is
   // rejected by the caller exactly as before, whatever else is wrong with it.
   if (!current
       || value?.type !== 'botmux.session.primary'
       || predecessor?.status !== 'closed'
-      || !successor.durablePrimaryPredecessorSessionId
-      || predecessor.sessionId !== successor.durablePrimaryPredecessorSessionId
+      || !proof
+      || predecessor.sessionId !== proof.sessionId
+      || !Number.isSafeInteger(proof.contractRevision) || proof.contractRevision < 0
       || predecessor.sessionId === successor.sessionId
       || successor.status !== 'active') {
     return undefined;
   }
   const parsed = parseDurablePrimarySessionRecord(current);
+  // A resumed and closed-again predecessor has the same id but belongs to a
+  // later lifecycle; an old candidate must not inherit that new close.
+  if ((parsed.session.sessionRuntimeContract?.session.revision ?? 0) !== proof.contractRevision) return undefined;
   if (primarySessionIdentity(successor, parsed.session.larkAppId).sessionKey !== current.sessionKey) {
     throw new Error(`durable primary successor Session does not belong to ${current.sessionKey}`);
   }

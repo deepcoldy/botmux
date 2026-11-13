@@ -3527,6 +3527,7 @@ export async function handleCommand(
                 markRepoCardConsumed(current, cardToWithdraw);
                 current.repoCardMessageId = undefined;
 
+                const predecessorRevision = current.session.sessionRuntimeContract?.session.revision ?? 0;
                 const session = sessionStore.createSession(
                   current.chatId,
                   current.scope === 'chat' ? oldSession.rootMessageId : rootId,
@@ -3543,7 +3544,9 @@ export async function handleCommand(
                 session.workingDir = selectedPath;
                 session.larkAppId = current.larkAppId;
                 if (sessionContractPrimary(current.larkAppId)) {
-                  session.durablePrimaryPredecessorSessionId = oldSession.sessionId;
+                  session.durablePrimaryPredecessor = {
+                    sessionId: oldSession.sessionId, contractRevision: predecessorRevision,
+                  };
                 }
                 session.chatDisplayName = oldSession.chatDisplayName;
                 session.ownerOpenId = oldSession.ownerOpenId;
