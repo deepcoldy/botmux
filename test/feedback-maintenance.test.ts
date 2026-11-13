@@ -25,6 +25,19 @@ async function fixture() {
   return { directory, store };
 }
 describe('feedback maintenance', () => {
+  it('preserves an optional stream allocation counter while freezing and restoring', async () => {
+    const { directory, store } = await fixture();
+    const { openDatabaseSync } = await import('../src/services/sqlite-compat.js');
+    const database = await openDatabaseSync(join(directory, 'botmux-feedback.sqlite'));
+    database.exec('CREATE TABLE feedback_event_stream_counter(singleton INTEGER PRIMARY KEY,value INTEGER NOT NULL); INSERT INTO feedback_event_stream_counter VALUES(1,37)');
+    await beginFeedbackMaintenance(directory, 'counter-migration');
+    await freezeFeedbackSource(directory, 'counter-migration');
+    expect(() => store.createResponse({ interactionId: 'blocked-counter', content: 'blocked' })).toThrow('feedback_source_frozen');
+    expect(database.prepare('SELECT value FROM feedback_event_stream_counter').get()).toEqual({ value: 37 });
+    await restoreFeedbackSource(directory, 'counter-migration');
+    expect(store.createResponse({ interactionId: 'restored-counter', content: 'retained' })).toHaveProperty('responseId');
+    database.close();
+  });
   it('freezes and restores a source with an installed feedback stream without losing sequence state', async () => {
     const { directory, store } = await fixture();
     store.readFeedbackEventsAfter({ after: 0, limit: 10 });

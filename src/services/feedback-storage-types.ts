@@ -10,9 +10,17 @@ export interface PostgresTarget {
   connectTimeoutMs: number;
 }
 
+export interface SupabaseTarget {
+  url: string;
+  keyRef: string;
+  schema: string;
+  requestTimeoutMs: number;
+}
+
 export type FeedbackStorageTarget =
   | { backend: 'sqlite' }
-  | { backend: 'postgresql'; postgres: PostgresTarget };
+  | { backend: 'postgresql'; postgres: PostgresTarget }
+  | { backend: 'supabase'; supabase: SupabaseTarget };
 
 export interface FeedbackStorageConfig {
   version: 1;
