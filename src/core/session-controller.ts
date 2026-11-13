@@ -125,11 +125,15 @@ export class SessionController {
       // id a resumed Claude first shows at its first write, after the resume
       // was confirmed at the prompt.
       const live = this.store.binding(this.ref, bindingId);
-      const enrichesActive = state?.lifecycle === 'active' && !!live?.identity && sameRuntime(live.ref, state.activeRuntime);
+      const enrichesActive = !!state && (state.lifecycle === 'active' || (state.lifecycle === 'suspending' && !!state.activeOperationId))
+        && !!live?.identity && sameRuntime(live.ref, state.activeRuntime)
+        && sameWorker(live.worker, worker) && ['starting', 'ready'].includes(live.phase);
       // The operation that spawned the live CLI may already be confirmed;
       // continuing or enriching that CLI is not part of it.
-      const operation = (continued || enrichesActive) && !state?.activeOperationId ? undefined : operationId;
-      const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
+      // Identity changes still go through bindRuntime's physical/native checks.
+      const operation = enrichesActive ? state?.activeOperationId
+        : continued && !state?.activeOperationId ? undefined : operationId;
+      const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation, continued);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
         this.store.inheritExecutionContinuation(this.ref, continuesBindingId!, bindingId, worker);
@@ -249,8 +253,16 @@ export class SessionController {
     if (active.kind !== 'current' && active.kind !== 'worker') return false;
     const state = this.store.read(this.ref)!;
     const runtime = active.context.scope.runtime;
+    const execution = active.context.scope.execution;
+    const attempt = execution ? this.store.execution(this.ref, execution.executionId) : undefined;
+    const continuedRuntime = !!runtime && !!state.activeRuntime
+      && this.store.runtimeContinues(this.ref, runtime, state.activeRuntime, active.context.producer)
+      && (!execution || (!!attempt && sameExecution(attempt.ref, execution) && (!attempt.runtime
+        || (this.store.runtimeContinues(this.ref, runtime, attempt.runtime, active.context.producer)
+          && this.store.runtimeContinues(this.ref, attempt.runtime, state.activeRuntime, active.context.producer)))));
     return sameWorker(state.worker, active.context.producer) && (!runtime || sameRuntime(state.activeRuntime, runtime)
-      || this.store.continuedExecution(this.ref, runtime, active.context.producer, active.context.scope.execution)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
+      || continuedRuntime
+      || this.store.continuedExecution(this.ref, runtime, active.context.producer, execution)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
   }
   run<T>(admission: SessionEventAdmission, work: () => T): T { return eventScope.run(admission, work); }
   admittedExecution(): ExecutionRef | undefined {
@@ -267,9 +279,22 @@ export class SessionController {
       && !(value.bindingId && this.store.bindingProducer(this.ref, value.bindingId, value.producer)))) return undefined;
     if (value.scope.execution) {
       const execution = this.store.execution(this.ref, value.scope.execution.executionId);
-      if (!execution || (execution.runtime && !sameRuntime(execution.runtime, runtime))) return undefined;
+      if (!execution) return undefined;
+      if (execution.runtime && !sameRuntime(execution.runtime, runtime)) {
+        if (!this.store.runtimeContinues(this.ref, execution.runtime, runtime, value.producer)
+          && !this.store.runtimeContinues(this.ref, runtime, execution.runtime, value.producer)) return undefined;
+        value.scope.runtime = execution.runtime;
+      }
     }
     return value;
+  }
+  private sameOrContinuedRuntime(left: RuntimeRef | undefined, right: RuntimeRef | undefined, channel: WorkerRef): boolean {
+    if (!left || !right) return false;
+    if (sameRuntime(left, right)) return true;
+    const owner = this.store.read(this.ref)?.worker;
+    return !!owner && sameWorker(owner, channel)
+      && (this.store.runtimeContinues(this.ref, left, right, channel)
+        || this.store.runtimeContinues(this.ref, right, left, channel));
   }
   /** The active runtime when `channel` continued `runtime` into it in process
    *  (same physical CLI), else `runtime` itself. */
@@ -296,7 +321,7 @@ export class SessionController {
       const proven = this.outputOrigin(sidecar);
       const binding = context.bindingId && this.store.bindingProducer(this.ref, context.bindingId, channel) ? this.store.binding(this.ref, context.bindingId) : undefined;
       const scopedRuntime = context.scope.runtime ?? binding?.ref;
-      if (!proven || (scopedRuntime && !sameRuntime(scopedRuntime, proven.scope.runtime))) return { kind: 'reject', reason: 'output_origin_conflict' };
+      if (!proven || (scopedRuntime && !this.sameOrContinuedRuntime(scopedRuntime, proven.scope.runtime, channel))) return { kind: 'reject', reason: 'output_origin_conflict' };
     }
     if (message.type === 'restart_result' && context.scope.operationId !== message.attemptId) return { kind: 'reject', reason: 'restart_operation_mismatch' };
     // Turn authority must refer to an existing admission. Origin publication
@@ -331,12 +356,22 @@ export class SessionController {
         if (runtime.identity) context.scope.runtime = runtime.ref;
       }
     }
+    if (!recoveredOrigin && context.scope.execution && context.scope.runtime) {
+      const stored = this.store.execution(this.ref, context.scope.execution.executionId);
+      if (stored?.runtime && !sameRuntime(stored.runtime, context.scope.runtime)
+        && this.sameOrContinuedRuntime(stored.runtime, context.scope.runtime, channel)) {
+        context.scope.runtime = stored.runtime;
+      }
+    }
     if (sidecar) {
       const proven = this.outputOrigin(sidecar);
       if (!proven || (context.scope.runtime && !sameRuntime(context.scope.runtime, proven.scope.runtime))
         || (context.scope.execution && proven.scope.execution && context.scope.execution.executionId !== proven.scope.execution.executionId)) return { kind: 'reject', reason: 'output_origin_conflict' };
     }
-    if (!context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
+    // A native conversation ID observes the runtime even when its opening
+    // input is still queued. Do not reconstruct execution authority from the
+    // notification's display-only turnId (or create an input admission for it).
+    if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
       const preliminary = this.gateway.admit(message.type, context, channel);
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
@@ -438,12 +473,23 @@ export class SessionController {
     return admission;
   }
   workerLost(worker: WorkerRef): void {
-    this.store.apply(this.ref, { type: 'worker_lost', worker });
-    const runtime = this.store.runtime(this.ref);
-    if (runtime && sameWorker(runtime.worker, worker)) {
+    this.store.atomic(() => {
+      this.store.apply(this.ref, { type: 'worker_lost', worker });
+      const runtime = this.store.runtime(this.ref);
+      if (!runtime || !sameWorker(runtime.worker, worker)) return;
       this.store.apply(this.ref, { type: 'runtime_lost', runtime: runtime.ref, confirmed: false, reason: 'worker_disconnected' });
-      this.store.markUnresolvedExecutions(this.ref, runtime.ref);
-    }
+      // Unsettled attempts on any runtime this worker continued into the lost
+      // one ran in the same CLI. Mark each such runtime once, not per attempt.
+      const sources = new Map<string, RuntimeRef>();
+      for (const execution of this.store.executions(this.ref)) {
+        if (execution.runtime && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)) {
+          sources.set(JSON.stringify([execution.runtime.runtimeId, execution.runtime.epoch]), execution.runtime);
+        }
+      }
+      for (const source of sources.values()) {
+        if (this.store.runtimeContinues(this.ref, source, runtime.ref, worker)) this.store.markUnresolvedExecutions(this.ref, source);
+      }
+    });
     this.refresh();
   }
 }

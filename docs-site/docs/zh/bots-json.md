@@ -523,6 +523,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |
 | `askOptionLayout` | `botmux ask` 选项按钮的排布：`compact`（默认，自动换行）或 `vertical`（每行一个，长选项更好读） |
 | `writableTerminalLinkInCard` | `true` 时卡片里直接放可写终端链接（看得到卡片的人都能操作终端）。默认藏在「获取写权限」按钮后面，只私发给点击的人 |
+| `goalStatusCard` | `true` 时，Codex / TRAE 会话设定原生目标后发一张目标状态卡，原地更新状态和 CLI 累计时长；默认关闭。静默、私有回复、文档、会议等会话不显示 |
 | `privateCard` | `true` 时 `/card` 只发给管理员可见的私有卡片，只在普通群有效，且不会实时刷新 |
 | `silentTurnReactions` | `true` 时，关了实时卡的会话不再给消息贴「冲!」/ ✅ 表情 |
 | `receivedReactionEmoji` / `doneReactionEmoji` | 换掉「已收到」/「已完成」表情（飞书 emoji_type），默认 `GoGoGo` / `DONE`。把两者设成一样，可以避免 CLI 提前判定空闲时过早出现 ✅ |

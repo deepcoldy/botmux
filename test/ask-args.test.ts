@@ -15,7 +15,17 @@ import {
   parseAskMention,
   parseAskOptions,
   parseAskTimeoutSeconds,
+  parseAskRequestId,
 } from '../src/core/ask-args.js';
+
+describe('explicit Ask invocation identity', () => {
+  it('accepts an opt-in stable request id and rejects empty or oversized ids', () => {
+    expect(parseAskRequestId(undefined)).toBeUndefined();
+    expect(parseAskRequestId('mr-42-round-1')).toBe('mr-42-round-1');
+    expect(() => parseAskRequestId('')).toThrow();
+    expect(() => parseAskRequestId('x'.repeat(257))).toThrow();
+  });
+});
 
 describe('parseAskOptions', () => {
   it('parses bare keys with key==label', () => {

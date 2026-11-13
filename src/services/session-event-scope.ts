@@ -47,6 +47,7 @@ export class WorkerSessionEventScope {
     binding.runtime = runtime; return true;
   }
   currentBinding(): RuntimeEventBinding | undefined { return this.current; }
+  bindingById(bindingId: string): RuntimeEventBinding | undefined { return this.bindings.get(bindingId); }
   bindingSharesCurrentProcess(bindingId: string): boolean {
     const binding = this.bindings.get(bindingId);
     return !!binding && !!this.current && binding.physicalId === this.current.physicalId;
@@ -204,6 +205,31 @@ export class WorkerSessionEventScope {
     }
     return this.isCurrentContext();
   }
+  /**
+   * Strict ownership proof used by the Codex restored-turn bridge to decide
+   * whether a predecessor turn already has an observer grant. Unlike
+   * ownsExecutionEvent (relaxed so the host decides on predecessor attempts
+   * re-attached to the live CLI), this returns true only when a binding of
+   * THIS worker actually ran the execution, or an observer-created binding for
+   * it exists. Turns that fail this stay queued until the host grants
+   * observation; without the grant they fall back to ordinary admission where
+   * the host visibly rejects cross-runtime terminals.
+   */
+  provesExecutionEvent(turnId: string, dispatchAttempt?: number): boolean {
+    const origin = this.storage.getStore()?.binding;
+    if (!origin) return true;
+    const submission = this.submissions.get(this.turnKey(turnId, dispatchAttempt));
+    if (submission) return submission === origin || sameRuntime(submission.runtime, origin.runtime) || submission.physicalId === origin.physicalId;
+    const execution = this.executionForTurn(turnId, dispatchAttempt);
+    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
+    if (state?.runtime) return sameRuntime(state.runtime, origin.runtime) || this.bindingForRuntime(state.runtime)?.physicalId === origin.physicalId;
+    return this.isCurrentContext();
+  }
+  isExecutionSettled(turnId: string, dispatchAttempt?: number): boolean {
+    const execution = this.executionForTurn(turnId, dispatchAttempt);
+    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
+    return !!state && ['succeeded', 'failed', 'cancelled'].includes(state.phase);
+  }
   bindingForRuntime(runtime: RuntimeRef): RuntimeEventBinding | undefined {
     return [...this.bindings.values()].find(binding => binding.runtime?.runtimeId === runtime.runtimeId && binding.runtime.epoch === runtime.epoch);
   }
@@ -302,12 +328,26 @@ export class WorkerSessionEventScope {
       const execution = this.executionForTurn(turnId, dispatchAttempt);
       if (execution) return this.snapshot(submission, execution);
     }
+    if (turnId && active?.binding) {
+      const execution = this.executionForTurn(turnId, dispatchAttempt);
+      const runtime = execution ? this.admissionStates.get(execution.executionId)?.runtime : undefined;
+      const binding = runtime ? this.bindingForRuntime(runtime) : undefined;
+      // Observer grants retain the original runtime even if a successor has
+      // already entered this physical CLI before the restored terminal drains.
+      if (binding && binding.physicalId === active.binding.physicalId) return this.snapshot(binding, execution);
+    }
     if (active?.binding && active.execution && (!turnId || active.execution.turnId === turnId)) return this.snapshot(active.binding, active.execution);
     if (turnId) {
       const values = this.origins.get(this.turnKey(turnId, dispatchAttempt)) ?? [];
       const inBinding = active?.binding ? values.filter(value => value.binding === active.binding) : values;
       if (inBinding.length === 1) return this.snapshot(inBinding[0].binding, inBinding[0].execution);
-      if (inBinding.length > 1) return undefined;
+      if (inBinding.length > 1) {
+        const sameExecutionAndProcess = new Set(inBinding.map(value => value.execution.executionId)).size === 1
+          && new Set(inBinding.map(value => value.binding.physicalId)).size === 1;
+        if (!sameExecutionAndProcess) return undefined;
+        const picked = (this.current && inBinding.find(value => value.binding === this.current)) ?? inBinding[inBinding.length - 1];
+        return this.snapshot(picked.binding, picked.execution);
+      }
     }
     return active?.binding ? this.snapshot(active.binding) : undefined;
   }

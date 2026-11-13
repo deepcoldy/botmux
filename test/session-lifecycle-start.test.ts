@@ -5586,6 +5586,51 @@ describe('hideLocalAddresses rides the worker init for the system prompt', () =>
   });
 });
 
+// The native goal status card is opt-in per bot; only a worker forked while it
+// is on reads the CLI goal store.
+describe('goalStatusCard rides the worker init', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent for a bot with the default (off)', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().goalStatusCard).toBeUndefined();
+  });
+
+  it('is set for a bot that turned it on', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ goalStatusCard: true }));
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().goalStatusCard).toBe(true);
+  });
+});
+
+// 缓存过期自动压缩 is a per-session setting on the session row: a forked
+// worker (new topic, restore, cold resume) reads it from init.
+describe('kimiCacheExpiryAutoCompact rides the worker init from the session row', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent while the session has not opted in', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().kimiCacheExpiryAutoCompact).toBeUndefined();
+    const off = makeDs();
+    off.session.kimiCacheExpiryAutoCompact = { enabled: false };
+    forkWorker(off, 'hello', false);
+    expect(readInit().kimiCacheExpiryAutoCompact).toBeUndefined();
+  });
+
+  it('is set for a session that turned it on', () => {
+    const ds = makeDs();
+    ds.session.kimiCacheExpiryAutoCompact = { enabled: true };
+    forkWorker(ds, 'hello', false);
+    expect(readInit().kimiCacheExpiryAutoCompact).toBe(true);
+  });
+});
+
 describe('no-transport read isolation follows local sandbox config (not forced)', () => {
   // Behavioral lock for the 2026-08 change: a no-transport session (apiOnly bot
   // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in

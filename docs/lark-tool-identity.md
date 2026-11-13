@@ -32,7 +32,7 @@ Botmux 提供的短期 bot token。
 
 要点：
 - **用谁的授权由 botmux 决定，模型只能在角色内选择。** daemon 从飞书事件的发送人解析 union_id 后向平台请求，CLI 侧没有任何参数能改变它；模型只能用 `--as user` / `--as bot` 这类角色开关切换，不能指名任何人。委派与定时任务用已验签的原请求人（定时任务若经认领卡片认领，则用认领人，见 execution-identity.md）。
-- 平台只返回短期变量（lark 为 user_access_token + app id，bytedcli 为 cloud JWT + code JWT），**永不返回刷新凭据**；返回的变量键按工具白名单校验，多余键一律拒绝。
+- 平台只返回短期变量（lark 为 user_access_token + app id，bytedcli 为 cloud JWT + code JWT，以及请求里声明过的海外分区 cloud JWT，见 bytedcli-jwt-lifecycle.md「平台供票」），**永不返回刷新凭据**；返回的变量键按工具白名单校验，多余键一律拒绝。
 - 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
 - **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。

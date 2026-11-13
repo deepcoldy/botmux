@@ -450,6 +450,44 @@ describe('session reasoning selector', () => {
   });
 });
 
+describe('buildStreamingCard: Kimi auto-compact on cache expiry toggle (toggle_kimi_expiry_compact)', () => {
+  const usageWith = (enabled: boolean) => ({ context: null, tokens: null, kimiCacheExpiryAutoCompact: { enabled } });
+  const button = (card: any, desired: 'on' | 'off') => {
+    const panel = card.elements.find((e: any) => e.tag === 'collapsible_panel');
+    const walk = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
+      n,
+      ...(Array.isArray(n.columns) ? walk(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
+      ...(Array.isArray(n.elements) ? walk(n.elements) : []),
+    ]);
+    return walk(panel?.elements ?? [])
+      .find((n: any) => n?.tag === 'button' && n.value?.action === 'toggle_kimi_expiry_compact' && n.value.desired === desired);
+  };
+
+  it('renders in the more-actions panel with the current state and the target state', () => {
+    const off = button(build({ status: 'idle', cliId: 'kimi', usage: usageWith(false) }), 'on');
+    expect(off.text.content).toContain('关');
+    expect(off.value.session_id).toBe(SID);
+    const on = button(build({ status: 'idle', cliId: 'kimi', usage: usageWith(true), locale: 'en' }), 'off');
+    expect(on.text.content).toMatch(/cache expiry: on/);
+  });
+
+  it('is not rendered without its snapshot state (non-Kimi or unsupported backend)', () => {
+    const card = build({ status: 'idle', cliId: 'claude-code', usage: { context: null, tokens: null, idleAutoCompact: { enabled: false, minutes: 55 } } });
+    expect(button(card, 'on')).toBeFalsy();
+    expect(button(card, 'off')).toBeFalsy();
+  });
+
+  it('follows the compact button\'s hidden-button setting', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle' as any, 'kimi' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
+    ));
+    expect(button(card, 'on')).toBeFalsy();
+    expect(button(card, 'off')).toBeFalsy();
+  });
+});
+
 describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', () => {
   const usageWith = (enabled: boolean) => ({ context: null, tokens: null, idleAutoCompact: { enabled, minutes: 55 } });
 

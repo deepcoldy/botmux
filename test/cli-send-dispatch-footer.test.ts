@@ -26,7 +26,7 @@ const ROOT = 'om_dispatch_root';
 const DISPATCHER = 'ou_dispatcher_bot';
 const HUMAN = 'ou_human_reviewer';
 
-interface FooterRun { card: any; raw: string }
+interface FooterRun { card: any; raw: string; stderr: string }
 
 function runSend(input: {
   args: string[];
@@ -118,7 +118,7 @@ function runSend(input: {
     expect(captured, String(result.stdout) + String(result.stderr)).toBeDefined();
     const body = JSON.parse(captured!.slice('CAPTURE_REPLY='.length)).body;
     const raw = typeof body.content === 'string' ? body.content : JSON.stringify(body.content);
-    return { card: JSON.parse(raw), raw };
+    return { card: JSON.parse(raw), raw, stderr: String(result.stderr) };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -137,9 +137,12 @@ describe('a dispatched sub-topic must not @-address the dispatcher bot', () => {
     expect(raw).not.toContain(`<at id=${DISPATCHER}>`);
   });
 
-  it('keeps the dispatcher out of the footer for an explicit --mention', () => {
-    const { raw } = runSend({ args: ['--mention', `${DISPATCHER}:Dispatcher`, '结果已交回原会话。'], binding: 'verified' });
+  it('keeps the dispatcher out of the footer for an explicit --mention and instructs foreground botmux report', () => {
+    const { raw, stderr } = runSend({ args: ['--mention', `${DISPATCHER}:Dispatcher`, '结果已交回原会话。'], binding: 'verified' });
     expect(raw).not.toContain(`<at id=${DISPATCHER}>`);
+    expect(stderr).not.toContain('结果已由 botmux report 交回原会话');
+    expect(stderr).toContain('botmux send 不会自动向主控交回结果');
+    expect(stderr).toContain('botmux report --status in_progress|completed "<正文>"');
   });
 
   it('still addresses a human sender in a dispatched topic', () => {

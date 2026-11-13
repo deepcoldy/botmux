@@ -99,6 +99,25 @@ export interface WriteInputContext {
   trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
+  /** Asked right before each submit key: has the CLI's input surface been
+   *  taken over meanwhile — TRAE's question page popping up between the paste
+   *  and its Enter — so the key would answer that page instead of submitting?
+   *  See TraeX's writeInput for how an adapter honours it. */
+  submitGuard?: SubmitGuard;
+}
+
+export interface SubmitGuard {
+  /** A reason (shown to the user) while the surface is taken, else undefined.
+   *  `draft` = the message was pasted and its first Enter is pending (it sits
+   *  in the composer under the page); `retry` = a resend of an Enter that
+   *  may already have submitted. */
+  blocked(phase: 'draft' | 'retry'): Promise<string | undefined>;
+  /** False once the CLI this write started on is gone: stop waiting. */
+  current(): boolean;
+  /** How long a pasted draft may wait for the surface to come back. */
+  maxWaitMs: number;
+  /** Re-check cadence while waiting. */
+  pollMs: number;
 }
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
@@ -647,6 +666,14 @@ export interface CliAdapter {
    *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
 
+  /** The CLI's own native question page that the worker bridges to a Lark
+   *  question card on the terminal path (no RPC input): `traex` = TRAE CLI's
+   *  `AskUserQuestion` "Questions" panel (utils/traex-question-page.ts). While
+   *  it is on screen queued input is held off it, the quiet screen does not
+   *  end the turn, and the card's answer is entered as verified keys
+   *  (core/traex-question-bridge.ts). Undefined = no such page. */
+  readonly nativeQuestionPage?: 'traex';
+
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
    *  （CoCo 需要 `coco plugin install`）。声明式写文件的 CLI 用 `hookInstall`；本方法
    *  与 `hookInstall` 互斥。每个 daemon 生命周期由 ensureCliSkills 调用一次。
@@ -923,7 +950,9 @@ export interface CliAdapter {
    *  queued input is not typed ahead into the running turn: Enter would pick
    *  the dialog's default answer. It goes in after the turn's terminal report,
    *  like any input queued while not type-ahead capable. A `kind=question`
-   *  block is not held: the next message is its answer. */
+   *  block is not held here: the next message is its answer (an adapter whose
+   *  question page would only take it as a note declares `nativeQuestionPage`
+   *  instead). */
   readonly programStatusBlockedHoldsInput?: boolean;
 
   /** The transcript's own turn terminal (`assistant_final`, fed through
@@ -949,12 +978,15 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
-  /** This CLI renders the codex_core hook-review / migration pages recognised
-   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
-   *  the "CLI is stuck" card: queued input is held off any of those pages and
-   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
-   *  Undefined = only the legacy hook-review input hold, never a card. */
-  readonly stuckPageFamily?: 'codex-family';
+  /** Which blocking pages this CLI renders, as recognised by
+   *  `classifyStuckPage(screen, family)` (utils/stuck-detector.ts):
+   *  `codex-family` = the codex_core hook-review / migration / session-lock
+   *  pages; `kimi` = Kimi Code's cache-expiry menu. Opts the session into the
+   *  "CLI is stuck" card: queued input is held off any of those pages and the
+   *  card offers the page's safe keys (core/stuck-page-catalog.ts). Pages are
+   *  read as this family's only. Undefined = only the legacy hook-review input
+   *  hold, never a card. */
+  readonly stuckPageFamily?: import('../../utils/stuck-detector.js').StuckPageFamily;
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
@@ -1217,6 +1249,7 @@ export type StructuredBridgeAttachMode =
 
 /** One incremental drain of a path-addressed transcript. */
 export interface StructuredBridgeDrainResult {
+  latestGoal?: import('../../services/native-goal-state.js').NativeGoalState | null;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully parsed line; hand it back as the next `offset`. */
   newOffset: number;

@@ -493,6 +493,7 @@ function sendCardForAsk(ask: InternalPending): void {
         const cur = pending.get(ask.askId);
         if (cur) {
           cur.cardMessageId = messageId;
+          cur.cardDeliveredAt ??= Date.now();
           // The caller can disconnect while send is in flight. The earlier
           // standalone-card notification had no messageId to patch; update it
           // now. Reply-card settlement does not need that id and is idempotent.
@@ -628,6 +629,7 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     timeoutStartsAfterDelivery: ask.timeoutStartsAfterDelivery,
     timeoutStartedAt: ask.timeoutStartedAt,
     cardMessageId: ask.cardMessageId,
+    cardDeliveredAt: ask.cardDeliveredAt,
     replyCardTarget: ask.replyCardTarget,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
@@ -1089,6 +1091,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
       timeoutStartedAt: p.timeoutStartedAt,
       cardMessageId: p.cardMessageId,
+      cardDeliveredAt: p.cardDeliveredAt,
       replyCardTarget: p.replyCardTarget,
       // A stashed-answer restore is terminal-but-unclaimed: settled=true so
       // gcSettled/other paths treat it as done, dormant=true so a hook re-POST
@@ -1325,6 +1328,24 @@ export function invalidateExplicitAsk(input: CreateAskInput, reason: string): vo
   if (ask?.originKind === 'host_explicit' && sameIdentity(ask, input)) {
     settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
   }
+}
+
+export function explicitAskSnapshot(input: CreateAskInput): PendingAsk | undefined {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  return ask?.originKind === 'host_explicit' && sameIdentity(ask, input) ? snapshot(ask) : undefined;
+}
+
+export function retireExplicitAsk(input: CreateAskInput, reason: string): AskResult | undefined {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  if (!ask || ask.originKind !== 'host_explicit' || ask.timeoutMs !== 0 || !sameIdentity(ask, input)) return undefined;
+  if (ask.terminalResult) return ask.terminalResult;
+  if (!persistStore) throw new Error('explicit Ask retirement requires durable storage');
+  const result: AskResult = { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false };
+  persistFromInternal({ ...ask, answeredResult: result, settledAt: Date.now() }, true);
+  settle(ask.askId, result);
+  return ask.terminalResult;
 }
 
 export function releaseExplicitAskHandoff(input: CreateAskInput): void {

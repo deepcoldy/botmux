@@ -161,7 +161,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'cards',
     titleKey: 'botDefaults.sectionCard',
     fieldKeys: [
-      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.pinStreamingCard',
+      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
       'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
@@ -482,6 +482,7 @@ export type BotDefaultsRow = {
   codexBrowser?: boolean;
   codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
+  goalStatusCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
@@ -557,6 +558,7 @@ export type BotDefaultsRow = {
   } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
+  defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;

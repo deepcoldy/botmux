@@ -6661,8 +6661,33 @@ async function cmdPreview(rest: string[]): Promise<void> {
 
 async function cmdChat(argv: string[]): Promise<void> {
   const sub = argv[0] ?? '';
+  if (sub === 'create' || sub === 'members') {
+    const { parseSessionChatArgs, SESSION_CHAT_HELP } = await import('./cli/session-chat.js');
+    if (argv.includes('--help') || argv.includes('-h')) {
+      console.log(SESSION_CHAT_HELP);
+      return;
+    }
+    const input = parseSessionChatArgs(argv);
+    assertTurnTransportOrExit('chat');
+    const { sid, larkAppId, session } = await resolveSessionAppId(undefined);
+    assertSessionTransportOrExit(session, 'chat');
+    const turnId = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+      && isTrustedVcMeetingHostRelayParent(true, session.pid, process.ppid)
+      ? process.env.BOTMUX_TURN_ID
+      : resolveSessionContext(resolveDataDir(), sid)?.turnId;
+    if (!turnId) throw new Error('chat_turn_unavailable');
+    const { SESSION_CHAT_TOOLS_ROUTE } = await import('./core/session-chat-tools.js');
+    const response = await postCurrentSessionDaemonRoute({
+      path: SESSION_CHAT_TOOLS_ROUTE, sessionId: sid, larkAppId,
+      body: { ...input, turnId }, signal: AbortSignal.timeout(60_000),
+    });
+    const body = await response.json() as { ok?: boolean; error?: string };
+    console.log(JSON.stringify(body));
+    if (!response.ok || !body.ok) process.exitCode = 1;
+    return;
+  }
   if (sub !== 'rename') {
-    console.error('用法: botmux chat rename <新群名称> [--proactive]');
+    console.error('用法: botmux chat rename <新群名称> [--proactive] | create --name <群名> [--member <open_id|邮箱>] | members [--chat-id <群>]');
     process.exitCode = 2;
     return;
   }
@@ -8054,8 +8079,11 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               用 resolve --outcome delivered|not-delivered --yes 恢复后续重试
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
-  observe [--session <id>] [--lark-app <appId>] [--include-raw]
+  observe [--session <id>] [--lark-app <appId>] [--include-raw] [--include-task] [--active|--since <时长>]
               通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
+              --include-task 附任务状态；--active / --since 只列没关闭且在跑或窗口内有消息的会话
+  owner-board boards|list|show|decide --bot <appId> …
+              本机外部客户端读管家的决策看板、提交决定（JSON，宿主机 host HMAC；见 botmux owner-board --help）
   interaction-context --bot <appId> --session <id> [--actor <openId>]
               宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -8149,6 +8177,8 @@ ${SEND_HELP_BODY}
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
   ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
+  ask buttons --request-id <id>        显式稳定调用身份，重连同参数不创建第二张卡
+  ask control describe|inspect|retire|release --control-file <file>   宿主受管控制，精确绑定原请求/轮/代次
   ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
                                        否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
@@ -14338,7 +14368,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       });
       if (addressedMentions.length !== mentions.length) {
         mentions = mentions.filter(mention => addressedMentions.includes(mention.open_id));
-        console.error('botmux send: 本话题是派单话题，结果已由 botmux report 交回原会话；已去掉对派单 Bot 的 @。');
+        console.error(
+          'botmux send: 本话题是派单话题，已去掉对派单 Bot 的 @（避免群内循环触发）；botmux send 不会自动向主控交回结果：本轮还没回报的，请在前台执行 `botmux report --status in_progress|completed "<正文>"` 回报原会话；本轮已经回报过的不要重复执行。',
+        );
       }
     }
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
@@ -18110,6 +18142,50 @@ const CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS = 3_000;
 const CLI_RESOLVED_UNKNOWN_ASK_POLL_MS = 200;
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
+  if (sub === 'control') {
+    const action = rest[0];
+    const controlFile = argValue(rest, '--control-file');
+    if (!['describe', 'inspect', 'retire', 'release'].includes(action ?? '') || !controlFile) {
+      console.error('botmux ask control: use describe|inspect|retire|release --control-file <JSON>');
+      process.exit(2);
+    }
+    const { readFileSync } = await import('node:fs');
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(controlFile, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('control file must be a JSON object');
+      body = parsed as Record<string, unknown>;
+    } catch (error) {
+      console.error(`botmux ask control: cannot read --control-file: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+    if (typeof body.larkAppId !== 'string') {
+      console.error('botmux ask control: larkAppId required');
+      process.exit(2);
+    }
+    const daemon = findDaemon(body.larkAppId);
+    if (!daemon) {
+      console.error('botmux ask control: daemon unavailable');
+      process.exit(3);
+    }
+    // A lost or timed-out response leaves the outcome unknown: report it and
+    // let the caller inspect the original operation instead of retrying blind.
+    let response: Response;
+    let result: unknown;
+    try {
+      response = await fetchDaemonIpc(daemon.ipcPort, `/api/asks/managed/${action}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      }, loadDaemonIpcSecret());
+      result = await response.json();
+    } catch (error) {
+      console.error(`botmux ask control: outcome unknown, inspect before retrying: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(3);
+    }
+    await writeAndFlush(process.stdout, JSON.stringify(result) + '\n');
+    if (!response.ok) process.exit(3);
+    return;
+  }
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
   // approvals belong in humanGate / decision nodes so the choice is part of
@@ -18136,7 +18212,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, parseAskRequestId, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -18164,6 +18240,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let questions;
   let timeoutMs;
   let mentionedOpenId;
+  let requestId;
   try {
     if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
       && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
@@ -18181,6 +18258,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
     mentionedOpenId = parseAskMention(mentionRaw);
+    requestId = parseAskRequestId(argValue(rest, '--request-id'));
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -18221,7 +18299,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     // Stable invocation identity: reconnect without posting a second card.
     originKind: 'explicit',
     ...(answererOpenId ? { answererOpenId } : {}),
-    requestId: randomUUID(),
+    requestId: requestId ?? randomUUID(),
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
@@ -21816,6 +21894,11 @@ switch (command) {
   case 'manager':  await cmdChatManager(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'board':    await cmdBoard(process.argv.slice(3)); break;
+  case 'owner-board': {
+    const { runOwnerBoardCommand } = await import('./cli/owner-board-command.js');
+    process.exitCode = await runOwnerBoardCommand(process.argv.slice(3));
+    break;
+  }
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;

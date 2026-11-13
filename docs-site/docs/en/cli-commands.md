@@ -267,7 +267,7 @@ These commands only read state; they change nothing.
 
 | Command | Description |
 |------|------|
-| `botmux observe [--session <id>] [--lark-app <appId>]` | Query session and worker state live through the daemon (JSON). If it can't get an answer it shows unknown and never reads a cache |
+| `botmux observe [--session <id>] [--lark-app <appId>] [--include-task] [--active\|--since <duration>]` | Query session and worker state live through the daemon (JSON). If it can't get an answer it shows unknown and never reads a cache. `--include-task` adds each session's task status (needs you / working / delivered / unfinished / idle / closed, the same judgement as the Dashboard board); `--active` lists only sessions that are not closed and are running or had a message in the last 24 hours, `--since 6h` changes the window to 6 hours |
 | `botmux execution current --json` | Check which bot, session, turn, and worker the current process belongs to |
 | `botmux actor current --json` | Return the daemon-verified enterprise email of this turn's sender, plus the current group ID and turn ID (no open_id). Refused when not run inside a session process |
 
@@ -282,6 +282,7 @@ These commands only read state; they change nothing.
 | `botmux goal run <goal>` | Run one goal headless from the command line; `--json` prints the result | [Workflow](/en/workflow) |
 | `botmux create-group --bot <name> [--bot ...]` | Create a Lark group with one or more bots | [Multi-bot](/en/multi-bot) |
 | `botmux board ...` | Decision board (steward bot sessions only) | [Decision Board](/en/decision-board) |
+| `botmux owner-board boards\|list\|show\|decide --bot <appId>` | Let other local tools read a steward's decision board and submit decisions for you (JSON) | [Decision Board](/en/decision-board) |
 | `botmux whiteboard ...` | Local project whiteboard | [Whiteboard](/en/whiteboard) |
 
 For how the AI discovers and uses these commands, see [Skill + CLI](/en/skill-cli).

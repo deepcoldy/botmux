@@ -267,7 +267,7 @@ botmux autostart status   # 查看状态
 
 | 命令 | 说明 |
 |------|------|
-| `botmux observe [--session <id>] [--lark-app <appId>]` | 通过 daemon 实时查询会话和 worker 状态（JSON）。查不到就显示 unknown，不读缓存 |
+| `botmux observe [--session <id>] [--lark-app <appId>] [--include-task] [--active\|--since <时长>]` | 通过 daemon 实时查询会话和 worker 状态（JSON）。查不到就显示 unknown，不读缓存。`--include-task` 给每个会话加上任务状态（需要你 / 进行中 / 本轮已交付 / 没做完 / 空闲 / 已关闭，与 Dashboard 看板同一套判断）；`--active` 只列没关闭、并且在跑或 24 小时内有消息的会话，`--since 6h` 把窗口改成 6 小时 |
 | `botmux execution current --json` | 核对当前进程属于哪个机器人、会话、轮次和 worker |
 | `botmux actor current --json` | 返回经 daemon 验证的本轮发起人企业邮箱，以及当前群 ID 和轮次 ID（不含 open_id）。不在会话进程里运行时会拒绝 |
 
@@ -282,6 +282,7 @@ botmux autostart status   # 查看状态
 | `botmux goal run <目标>` | 在命令行无头跑一个目标，`--json` 输出结果 | [Workflow](/workflow) |
 | `botmux create-group --bot <名称> [--bot ...]` | 用一个或多个机器人新建飞书群 | [多机器人](/multi-bot) |
 | `botmux board ...` | 决策看板（只有管家机器人的会话可用） | [决策看板](/decision-board) |
+| `botmux owner-board boards\|list\|show\|decide --bot <appId>` | 本机其他工具读管家的决策看板、替你提交决定（JSON） | [决策看板](/decision-board) |
 | `botmux whiteboard ...` | 本地项目白板 | [白板](/whiteboard) |
 
 AI 怎么发现和使用这些命令，见 [Skill + CLI 交互](/skill-cli)。

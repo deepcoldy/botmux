@@ -20,8 +20,21 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
-import { contractTerminalStatus } from '../../src/services/session-contract.js';
+import { contractTerminalStatus, executionObserverSupported } from '../../src/services/session-contract.js';
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
+import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
+import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+
+/** TraeX question-page wiring the hold / idle paths call into (see
+ *  src/worker.ts "TraeX native question page"): loaded as the real functions,
+ *  so a fixture without a question page keeps its old behaviour. */
+const TRAEX_QUESTION_FUNCTIONS = [
+  'traexQuestionBridgeActive', 'traexQuestionBlockReported', 'traexQuestionHoldBlocks',
+  'traexQuestionHoldsHeldInput', 'notifyTraexQuestionInputHeld', 'traexQuestionHoldsIdle',
+];
+/** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
+ *  a function); a caller that observes it passes its own in `scope`. */
+const INERT_TRAEX_QUESTION_BRIDGE = { kick() {}, reset() {}, hasOpenCard: () => false, dispose() {} };
 
 let parsed: ts.SourceFile | undefined;
 
@@ -71,8 +84,12 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
+    if (key === 'executionObserverSupported') return executionObserverSupported;
     if (typeof key === 'string' && Object.hasOwn(runtimeReservation, key)) return (runtimeReservation as Record<string, unknown>)[key];
-    if (typeof key === 'string' && ['codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity'].includes(key)) {
+    if (key === 'isRemoteBackendType') return isRemoteBackendType;
+    if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
+    if (typeof key === 'string' && ['codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

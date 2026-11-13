@@ -40,6 +40,7 @@ export interface ProjectAttachmentSource {
   ordinary: boolean;
   reportCapability: DispatchReportAttachment['reportCapability'];
   title?: string;
+  botName?: string;
 }
 
 /** Identity is constructed by the authenticated host route, not request JSON. */
@@ -385,17 +386,27 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
   }
 
   async function updateProjectAttachment(
-    record: ProjectAttachmentRecord, rebindCoordinator = false, beforeApply?: () => void,
+    record: ProjectAttachmentRecord,
+    rebindCoordinator = false,
+    beforeApply?: () => void,
+    resolvedOwnerName?: string,
   ): Promise<ProjectGroupState | undefined> {
+    const nextOwnerName = cleanText(resolvedOwnerName, 80);
     return mutateProjectGroup(deps.dataDir, record.chatId, project => {
       beforeApply?.();
       if (!project || project.createdAt !== record.projectGeneration
         || project.larkAppId !== record.coordinatorLarkAppId) fail('project_generation_changed');
       const item = project.workstreams.find(item => item.dispatchRoot === record.rootMessageId);
       if (!item) fail('workstream_not_found');
+      const shouldUpgradeOwner = !!nextOwnerName
+        && nextOwnerName !== record.source.larkAppId
+        && item.owners.length === 1
+        && item.owners[0] === record.source.larkAppId;
       if (JSON.stringify((item as { attachment?: ProjectAttachmentView }).attachment) === JSON.stringify(view(record))
-        && (!rebindCoordinator || project.coordinatorSessionId === record.coordinatorSessionId)) return project;
+        && (!rebindCoordinator || project.coordinatorSessionId === record.coordinatorSessionId)
+        && !shouldUpgradeOwner) return project;
       Object.assign(item, { attachment: view(record) });
+      if (shouldUpgradeOwner) item.owners = [nextOwnerName];
       if (rebindCoordinator) project.coordinatorSessionId = record.coordinatorSessionId;
       project.revision += 1;
       project.updatedAt = now();
@@ -455,7 +466,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           rootMessageId: request.rootMessageId,
           coordinatorSessionId: actor.sessionId, coordinatorLarkAppId: actor.larkAppId,
           coordinatorOwnerKey: actor.ownerKey!,
-          source: { ...source, title: undefined }, revision: old ? old.revision + (changed ? 1 : 0) : 1,
+          source: { ...source, title: undefined, botName: undefined }, revision: old ? old.revision + (changed ? 1 : 0) : 1,
           state: 'pending', phase: 'pending', title,
           purpose: cleanText(request.purpose ?? old?.purpose ?? existingItem?.purpose, 300),
           createdAt: old?.createdAt ?? stamp, updatedAt: stamp,
@@ -468,14 +479,19 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           if (sourceIdentity(fresh.source) !== sourceIdentity(record.source)) fail('source_changed');
           saveRecord(path, record);
         });
+        const sourceOwnerLabel = cleanText(source.botName, 80) || source.larkAppId;
         let publishError: string | undefined;
         try {
           await authorizeSource(actor, request);
           await deps.projectRun(context(actor, deps.dataDir), {
             action: 'dispatch', dispatchRoot: request.rootMessageId, title: record.title,
             purpose: record.purpose,
-            // Preserve business status/progress for every existing row.
-            ...(!existingItem ? { status: 'pending' as const, progress: 0, owners: [source.larkAppId] } : {}),
+            // Preserve business status/progress for every existing row; upgrade raw appId owner if botName is known.
+            ...(!existingItem
+              ? { status: 'pending' as const, progress: 0, owners: [sourceOwnerLabel] }
+              : (existingItem.owners.length === 1 && existingItem.owners[0] === source.larkAppId && sourceOwnerLabel !== source.larkAppId
+                ? { owners: [sourceOwnerLabel] }
+                : {})),
           }, actorCommitGuard(actor, record.projectGeneration));
         } catch (error) {
           const after = deps.getProject(actor.chatId);
@@ -491,7 +507,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
         record.phase = 'active';
         record.state = 'active';
         record.updatedAt = now();
-        await updateProjectAttachment(record, true, actorCommitGuard(actor, record.projectGeneration));
+        await updateProjectAttachment(record, true, actorCommitGuard(actor, record.projectGeneration), cleanText(latest.source.botName, 80) || sourceOwnerLabel);
         saveRecord(path, record);
         await writeRegistry(record, async () => {
           const fresh = await authorizeSource(actor, request);
@@ -507,7 +523,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
     async update(actor: ProjectAttachmentActor, request: {
       rootMessageId: string; status: ProjectWorkstreamStatus; content?: string;
       progress?: number; remaining?: string; milestone?: string; expectedRevision?: number;
-    }): Promise<ProjectAttachmentResult> {
+    }): Promise<ProjectAttachmentResult | { registered: true; cardSynced: boolean; project?: ProjectGroupState; error?: string }> {
       authorizeActor(actor);
       if (!['pending', 'in_progress', 'blocked', 'completed', 'failed'].includes(request.status)) {
         fail('invalid_workstream_status');
@@ -518,7 +534,60 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
       return withRecordLock(projectAttachmentRecordPath(deps.dataDir, request.rootMessageId), async path => {
         const project = authorizeActor(actor);
         const record = readRecord(path);
-        if (!record || record.phase !== 'active' || record.chatId !== actor.chatId
+        if (!record) {
+          // Ordinary non-imported dispatch workstream owned by this project coordinator.
+          if (!id(request.rootMessageId, 'om_') || request.expectedRevision !== undefined) {
+            fail('workstream_not_found');
+          }
+          const existingItem = project.workstreams.find(item => item.dispatchRoot === request.rootMessageId);
+          if (!existingItem || existingItem.attachment) {
+            fail('workstream_not_found');
+          }
+          const secret = deps.reportSecret();
+          const reportAt = now();
+          const content = cleanText(request.content, 1000) || '主控手工更新';
+          const remaining = cleanText(request.remaining, 300) || undefined;
+          const milestone = cleanText(request.milestone, 300) || undefined;
+          await updateDispatchRegistry(registryPath, registry => {
+            const current = authorizeActor(actor);
+            if (current.createdAt !== project.createdAt) fail('project_generation_changed');
+            const raw = registry[request.rootMessageId];
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('workstream_not_found');
+            const entry = raw as Record<string, unknown>;
+            if (entry.projectAttachmentOperationId !== undefined) fail('workstream_root_already_registered');
+            const binding = verifyDispatchReportBinding(secret, request.rootMessageId, entry.reportBinding);
+            if (!binding || binding.attachment || binding.targetLarkAppId !== actor.larkAppId || binding.targetChatId !== actor.chatId) {
+              fail('workstream_not_found');
+            }
+          });
+          let updated: ProjectGroupState | undefined;
+          let cardError: string | undefined;
+          try {
+            updated = await deps.projectRun(context(actor, deps.dataDir), {
+              action: 'report', dispatchRoot: request.rootMessageId,
+              content, status: request.status, progress: request.progress, remaining, milestone,
+            }, actorCommitGuard(actor, project.createdAt));
+          } catch (error) {
+            updated = deps.getProject(actor.chatId);
+            const item = updated?.workstreams.find(item => item.dispatchRoot === request.rootMessageId);
+            if (item?.status !== request.status || item.lastReport !== content
+              || (request.progress !== undefined && item.progress !== request.progress)
+              || item.remaining !== remaining) {
+              throw error;
+            }
+            cardError = error instanceof Error ? error.message : String(error);
+          }
+          await updateDispatchRegistry(registryPath, registry => {
+            authorizeActor(actor);
+            const raw = registry[request.rootMessageId];
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+            recordDispatchLastReport(registry, request.rootMessageId, {
+              status: request.status, content, at: reportAt,
+            });
+          });
+          return { registered: true, cardSynced: !cardError, project: updated, ...(cardError ? { error: cardError } : {}) };
+        }
+        if (record.phase !== 'active' || record.chatId !== actor.chatId
           || record.coordinatorLarkAppId !== actor.larkAppId
           || record.coordinatorOwnerKey !== actor.ownerKey || record.projectGeneration !== project.createdAt) {
           fail('workstream_not_found');
@@ -731,7 +800,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
             saveRecord(path, record);
           }
           if (deps.getProject(actor.chatId)?.workstreams.some(item => item.dispatchRoot === root)) {
-            await updateProjectAttachment(record, true, beforeApply);
+            await updateProjectAttachment(record, true, beforeApply, source?.botName);
           } else if (record.phase === 'active') {
             fail('workstream_not_found');
           }
@@ -782,7 +851,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           if (!project || project.createdAt !== record.projectGeneration
             || project.larkAppId !== record.coordinatorLarkAppId) return;
           if (project.workstreams.some(item => item.dispatchRoot === record.rootMessageId)) {
-            await updateProjectAttachment(record);
+            await updateProjectAttachment(record, false, undefined, current.botName);
           } else if (record.phase === 'active') {
             fail('workstream_not_found');
           }

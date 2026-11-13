@@ -48,8 +48,14 @@ describe('postJson IP 协议族', () => {
     const srv = await listen('127.0.0.1');
     expect(srv).not.toBeNull();
     servers.push(srv!.server);
-    // localhost 的 IPv6 解析结果是 ::1（或解析失败），都到不了 127.0.0.1 上的服务
-    await expect(postJson(`http://localhost:${srv!.port}/api/bind`, {}, { family: 6 })).rejects.toThrow();
+    let reachedV4 = 0;
+    srv!.server.on('request', () => { reachedV4++; });
+    // localhost 的 IPv6 解析结果是 ::1（或解析失败），都到不了 127.0.0.1 上的服务。
+    // 断言的是「没连到 IPv4 服务」，不是「请求失败」：端口号按协议族各自分配，并行的
+    // 别的进程可能恰好在 ::1 上持有同一个端口号，请求会被它应答。不钉 family 时会先试
+    // ::1、被拒后回落 127.0.0.1，reachedV4 变成 1。
+    await postJson(`http://localhost:${srv!.port}/api/bind`, {}, { family: 6 }).catch(() => undefined);
+    expect(reachedV4).toBe(0);
   });
 
   it.skipIf(!canV6)('family: 6 能连到仅监听 ::1 的服务（IPv4 服务不存在时的兜底路径）', async () => {

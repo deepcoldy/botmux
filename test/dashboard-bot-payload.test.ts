@@ -59,7 +59,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -356,6 +356,12 @@ describe('dashboard bot payload helpers', () => {
       customPassthroughCommands: '',
       canTalkDaemonCommands: '',
     });
+  });
+
+  it('projects daemon-provided default CLI command names without inventing them for old daemons', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { defaultPassthroughCommands: ['/goal', '/model', 3, 'invalid'] }))
+      .toMatchObject({ defaultPassthroughCommands: ['/goal', '/model'] });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).defaultPassthroughCommands).toBeUndefined();
   });
 
   it('projects launchShell so the dashboard preserves it after refresh', () => {

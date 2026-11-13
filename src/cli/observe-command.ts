@@ -2,6 +2,7 @@
 //
 // Shape (v1):
 //   botmux observe [--session <id>] [--lark-app <appId>] [--include-raw]
+//                  [--include-task] [--active | --since <duration>]
 //
 // The command shells out to `fetchObserveSnapshot` / `fetchObserveSession`,
 // which reuse the daemon HMAC loopback IPC. It never talks to backends, tmux,
@@ -19,20 +20,37 @@ import {
   fetchObserveSnapshot,
 } from '../services/session-observe-command-fetch.js';
 import type { ObserveProbeStatus } from '../services/session-observe.js';
+import { parseIdleDurationMs } from './idle-suspend-command.js';
+
+const ACTIVE_DEFAULT_WINDOW_MS = 24 * 60 * 60_000;
 
 interface ParsedArgs {
   sessionId?: string;
   larkAppId?: string;
   includeRaw: boolean;
+  includeTask: boolean;
+  activeWithinMs?: number;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): { ok: true; args: ParsedArgs } | { ok: false; error: string } {
-  const args: ParsedArgs = { includeRaw: false, help: false };
+  const args: ParsedArgs = { includeRaw: false, includeTask: false, help: false };
+  let since: number | undefined;
+  let active = false;
   for (let i = 0; i < argv.length; i++) {
     const raw = argv[i];
     if (raw === '--help' || raw === '-h') { args.help = true; continue; }
     if (raw === '--include-raw') { args.includeRaw = true; continue; }
+    if (raw === '--include-task') { args.includeTask = true; continue; }
+    if (raw === '--active') { active = true; continue; }
+    if (raw === '--since' || raw?.startsWith('--since=')) {
+      const v = raw === '--since' ? argv[++i] : raw.slice('--since='.length);
+      if (!v) return { ok: false, error: '--since 需要一个时长，如 6h、30m、2d' };
+      const ms = parseIdleDurationMs(v);
+      if (ms === undefined) return { ok: false, error: `--since 时长无效：${v}（写成 6h、30m、2d 这样）` };
+      since = ms;
+      continue;
+    }
     if (raw === '--session') {
       const v = argv[++i];
       if (!v) return { ok: false, error: `${raw} 需要一个值` };
@@ -49,6 +67,10 @@ function parseArgs(argv: string[]): { ok: true; args: ParsedArgs } | { ok: false
     if (raw?.startsWith('--lark-app=')) { args.larkAppId = raw.slice('--lark-app='.length); continue; }
     return { ok: false, error: `未知参数：${raw}` };
   }
+  if (active || since !== undefined) {
+    if (args.sessionId) return { ok: false, error: '--active / --since 只用于列表，不能和 --session 一起用' };
+    args.activeWithinMs = since ?? ACTIVE_DEFAULT_WINDOW_MS;
+  }
   return { ok: true, args };
 }
 
@@ -59,6 +81,9 @@ const HELP_TEXT = `botmux observe — 读取 daemon 实时 SessionRow 投影（v
   botmux observe --session <id>        # 单个会话
   botmux observe --lark-app <appId>    # 仅指定 daemon
   botmux observe --include-raw         # 附加原始 SessionRow 供诊断
+  botmux observe --include-task        # 每个会话附加 task（任务状态，见下）
+  botmux observe --active              # 只列没关闭、且在跑或 24 小时内有消息的会话
+  botmux observe --since 6h            # 同 --active，窗口改成 6 小时（支持 ms/s/m/h/d/w）
 
 字段（v1 canonical）：
   identity/cli/backend, liveness (alive|not_running|closed|unknown),
@@ -78,6 +103,20 @@ context（上下文占用，仅 --session 单会话查询；Claude Code / Codex�
   拿不到（别的 CLI、无 transcript、尚无用量、transcript 过大）时整块缺省——
   不会填 0 或猜测值。列表模式为避免批量扫 transcript 不带 context，要读请用 --session。
 
+task（任务状态，仅 --include-task；与 Dashboard 看板 / 决策看板同一套推导）：
+  { kind, reason?, detail?, at?, busySinceAt?, summary?, remaining? }
+  kind          needs_you | working | delivered | unfinished | idle | closed。
+  reason        仅 needs_you：attention | tui_prompt | pending_repo | limited | stalled | interrupted。
+  detail        仅 needs_you：举手原因原文或中断错误码（有才给）。
+  at            needs_you：举手 / 中断时刻；delivered：本轮结果时刻；closed：关闭时刻（epoch ms）。
+  busySinceAt   仅 working：这一段忙碌的开始时刻（有才给）。
+  summary       仅 delivered：最终回复第一行（有才给）。
+  remaining     仅 unfinished：还剩几项 TODO。
+  daemon 没给出已知运行态时不带 task；读不到本轮结果的会话按空闲 / 没做完给，不推成已交付。
+
+--active / --since 只作用于列表：保留没关闭、并且在跑（liveness=alive）或
+  lastActivityAt 落在窗口内的会话；不传时输出与以前一致。
+
 Probe 失败不回退旧缓存；phase 目前只报 unknown。
 `;
 
@@ -95,14 +134,14 @@ export async function runObserveCommand(argv: string[]): Promise<number> {
     process.stdout.write(HELP_TEXT);
     return 0;
   }
-  const { sessionId, larkAppId, includeRaw } = parsed.args;
+  const { sessionId, larkAppId, includeRaw, includeTask, activeWithinMs } = parsed.args;
   try {
     if (sessionId) {
-      const session = await fetchObserveSession(sessionId, { larkAppId, includeRaw });
+      const session = await fetchObserveSession(sessionId, { larkAppId, includeRaw, includeTask });
       process.stdout.write(`${JSON.stringify(session, null, 2)}\n`);
       return isFailureProbe(session.probe.status) ? 1 : 0;
     }
-    const snapshot = await fetchObserveSnapshot({ larkAppId, includeRaw });
+    const snapshot = await fetchObserveSnapshot({ larkAppId, includeRaw, includeTask, activeWithinMs });
     process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
     const anyFailure = snapshot.daemons.some(d => isFailureProbe(d.probe.status));
     return anyFailure ? 1 : 0;

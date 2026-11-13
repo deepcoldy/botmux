@@ -26,6 +26,7 @@ import {
   saveGroupCollaborationMode,
   setGroupPinStreamingCard,
   type ProjectGroupRuntimeSummary,
+  type ProjectProgressCardCompletedDisplay,
   type ProjectProgressCardConfig,
   type ProjectProgressCardSectionId,
   type ProjectProgressCardTemplateId,
@@ -1054,7 +1055,15 @@ function collaborationModeSignature(
     coordinatorAppId: mode === 'project' ? coordinatorAppId : '',
     workerAppIds: mode === 'project' ? [...workerAppIds].sort() : [],
     autoEnrollWorkers: mode === 'project' ? autoEnrollWorkers : false,
-    progressCard: mode === 'project' ? progressCard : null,
+    progressCard: mode === 'project'
+      ? {
+          schemaVersion: progressCard.schemaVersion,
+          templateId: progressCard.templateId,
+          sections: progressCard.sections,
+          milestonesExpanded: progressCard.milestonesExpanded,
+          completedDisplay: progressCard.completedDisplay ?? 'all',
+        }
+      : null,
   });
 }
 
@@ -1130,6 +1139,17 @@ export function ProjectGroupModeSection(props: {
         ? current.sections.includes(section) ? current.sections : [...current.sections, section]
         : current.sections.filter(currentSection => currentSection !== section),
     }));
+    setStatus(null);
+  }
+
+  function selectCompletedDisplay(completedDisplay: ProjectProgressCardCompletedDisplay): void {
+    setProgressCard(current => {
+      if (completedDisplay === 'all') {
+        const { completedDisplay: _omit, ...rest } = current;
+        return rest;
+      }
+      return { ...current, completedDisplay };
+    });
     setStatus(null);
   }
 
@@ -1324,6 +1344,19 @@ export function ProjectGroupModeSection(props: {
                 ))}
               </div>
             </div>
+            <label className="g-card-completed-display">
+              <span>{tr('groups.projectCardCompletedDisplay')}</span>
+              <select
+                data-project-completed-display={chat.chatId}
+                value={progressCard.completedDisplay ?? 'all'}
+                disabled={props.disabled || saving || !progressCard.sections.includes('workstreams')}
+                onChange={event => selectCompletedDisplay(event.currentTarget.value as ProjectProgressCardCompletedDisplay)}
+              >
+                <option value="all">{tr('groups.projectCardCompletedDisplayAll')}</option>
+                <option value="collapsed">{tr('groups.projectCardCompletedDisplayCollapsed')}</option>
+                <option value="recent">{tr('groups.projectCardCompletedDisplayRecent')}</option>
+              </select>
+            </label>
             <label className="checkbox-row g-card-milestone-default">
               <input
                 type="checkbox"

@@ -4,6 +4,12 @@ export const SESSION_EVENT_PROTOCOL_VERSION = 2 as const;
 /** New worker boots always negotiate this contract. Legacy output recovery is
  * independent of executor admission; it cannot disable the state authority. */
 export function sessionContractsEnabled(): boolean { return true; }
+/** The host computes historical execution observer grants only for a persistent
+ * Codex tmux CLI. The worker may wait for such a grant only under the same
+ * predicate; every other CLI/backend keeps the ordinary admission path. */
+export function executionObserverSupported(cliId: unknown, backend: unknown): boolean {
+  return cliId === 'codex' && backend === 'tmux';
+}
 export function contractTerminalStatus(status: unknown, errorCode: unknown): 'succeeded' | 'failed' | 'cancelled' | 'reconciling' {
   if (typeof errorCode === 'string' && (errorCode === 'rpc_turn_aborted'
     || errorCode === 'codex_turn_aborted' || errorCode.startsWith('codex_turn_aborted_')
@@ -186,7 +192,24 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       session.runtimeEpoch = event.epoch; return finish('applied');
     case 'runtime_bound': {
       if (!sameWorker(session.worker, event.runtime.worker)) return finish('stale');
-      if (session.lifecycle === 'closed' || session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      if (session.lifecycle === 'closed') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      const current = state.runtime;
+      const identity = current?.identity;
+      const nextIdentity = event.runtime.identity;
+      // A late native identity describes the selected executor; it does not
+      // repeat the control operation that originally started that executor.
+      if (current && ['active', 'suspending', 'closing'].includes(session.lifecycle)
+        && ['starting', 'ready'].includes(current.phase) && sameRuntime(session.activeRuntime, current.ref)
+        && sameRuntime(current.ref, event.runtime.ref) && sameWorker(current.worker, event.runtime.worker)
+        && identity && nextIdentity && identity.proof !== 'opaque'
+        && !reusableRuntimeIdentity(identity, nextIdentity)
+        && samePhysicalRuntimeIdentity(identity, nextIdentity)
+        && (identity.nativeSessionId === undefined || identity.nativeSessionId === nextIdentity.nativeSessionId)
+        && (identity.nativeGeneration === undefined || identity.nativeGeneration === nextIdentity.nativeGeneration)) {
+        state.runtime = { ...current, identity: nextIdentity };
+        return finish('applied');
+      }
+      if (session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (event.operationId && session.activeOperationId !== event.operationId) { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (!event.operationId && session.activeOperationId) return finish('conflict', 'runtime_transition_in_progress');
       session.runtimeEpoch = Math.max(session.runtimeEpoch, event.runtime.ref.epoch);

@@ -15,7 +15,7 @@ import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
-import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
+import { beginBytedcliLogin, mintBytedcliJwts, type BytedcliJwts } from '../services/bytedcli-auth.js';
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import type { BotConfig } from '../bot-registry.js';
@@ -41,6 +41,7 @@ import {
   writeSessionIdentity,
   clearSessionIdentity,
   recallProvenIdentityContent,
+  type BytedCliIdentity,
   type CliIdentity,
 } from './cli-identity.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
@@ -310,7 +311,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     // Keep the issuer-scoped credential key; do not copy a source open_id into
     // the target app or duplicate/extend the lifetime of the user's login.
     const jwt = await mintBytedcliJwts(user.credentialOpenId);
-    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}), ...(jwt.regionalCloudJwts ? { regionalCloudJwts: jwt.regionalCloudJwts } : {}) };
+    if (jwt) identity = locallyMintedBytedcliIdentity(jwt);
     localMint = !!jwt;
   } else if (!identity && tool === 'lark-cli') {
     const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
@@ -903,10 +904,16 @@ async function resolveIdentityFor(
   // falling back to the machine's own SSO session.
   const jwts = await mintBytedcliJwts(senderOpenId);
   if (!jwts) return null;
+  return locallyMintedBytedcliIdentity(jwts);
+}
+
+/** The bytedcli identity for JWTs this machine minted from the person's login. */
+function locallyMintedBytedcliIdentity(jwts: BytedcliJwts): BytedCliIdentity {
   return {
     tool: 'bytedcli',
     cloudJwt: jwts.cloudJwt,
     ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}),
     ...(jwts.regionalCloudJwts ? { regionalCloudJwts: jwts.regionalCloudJwts } : {}),
+    regionalCloudJwtSource: 'local',
   };
 }
