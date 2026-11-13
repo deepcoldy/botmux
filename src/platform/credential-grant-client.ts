@@ -74,9 +74,8 @@ export interface CredentialGrantClientOptions {
 }
 
 /**
- * ByteCloud JWTs are partition-scoped: the default (cn) one is refused by the
- * overseas partitions. A bytedcli grant asks for one per partition by naming
- * them in the request ({@link CLOUD_JWT_REGIONS_FIELD}), and the platform
+ * A bytedcli grant names the requested ByteCloud partitions in
+ * {@link CLOUD_JWT_REGIONS_FIELD}, and the platform
  * returns each one it minted under these variable names.
  *
  * Asked for, not just accepted: a daemon from before these names rejects the
@@ -87,6 +86,7 @@ export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
   i18n: 'BYTEDCLI_USER_CLOUD_JWT_I18N',
   i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD',
   tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
+  cn: 'BYTEDCLI_USER_CLOUD_JWT_CN',
 } as const;
 export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
 const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];

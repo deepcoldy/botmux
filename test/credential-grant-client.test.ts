@@ -102,7 +102,7 @@ describe('requestCredentialGrant', () => {
     ]);
     await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
     await requestCredentialGrant(REQ, { binding: BINDING, http });
-    expect((calls[0]!.body as Record<string, unknown>).cloudJwtRegions).toEqual(['i18n', 'i18nbd', 'tx']);
+    expect((calls[0]!.body as Record<string, unknown>).cloudJwtRegions).toEqual(['i18n', 'i18nbd', 'tx', 'cn']);
     expect(calls[1]!.body).not.toHaveProperty('cloudJwtRegions');
   });
 
@@ -110,14 +110,15 @@ describe('requestCredentialGrant', () => {
     const variables = {
       BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CODE_JWT: 'code',
       BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n', BYTEDCLI_USER_CLOUD_JWT_I18NBD: 'bd', BYTEDCLI_USER_CLOUD_JWT_TX: 'tx',
+      BYTEDCLI_USER_CLOUD_JWT_CN: 'cn',
     };
     const { http } = fakeHttp([{ status: 200, json: {
-      ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables, cloudJwtRegions: ['tx', 'i18n', 'cn', 7],
+      ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables, cloudJwtRegions: ['tx', 'i18n', 'cn', 'unknown', 7],
     } }]);
     const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
     expect(r.ok && r.value.variables).toEqual(variables);
     // Only partitions this daemon asked for are read back.
-    expect(r.ok && r.value.cloudJwtRegions).toEqual(['i18n', 'tx']);
+    expect(r.ok && r.value.cloudJwtRegions).toEqual(['i18n', 'tx', 'cn']);
   });
 
   it('reads no tried partitions from a platform that predates them', async () => {

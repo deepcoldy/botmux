@@ -30,7 +30,7 @@ vi.mock('node:child_process', () => ({
     const isComplete = args.includes('--complete');
     const isRegional = args[0] === '--site';
     const isDefault = args[0] === 'auth' && args[1] === 'get-bytecloud-jwt-token';
-    const region = args[1] === 'i18n-tt' ? 'i18n' : args[1] === 'i18n-bd' ? 'i18nbd' : 'tx';
+    const region = args[1] === 'i18n-tt' ? 'i18n' : args[1] === 'i18n-bd' ? 'i18nbd' : args[1] === 'cn' ? 'cn' : 'tx';
     const output = isStatus ? JSON.stringify({ status: 'success', data: { authenticated: wasAuthorized } })
       : isBegin ? JSON.stringify({ status: 'success', data: { verification_uri_complete: 'https://example.test/login', complete_token: `challenge-${++beginCount}` } })
       : isComplete ? JSON.stringify({ status: 'success', data: { login_status: completeSuccess ? 'success' : 'pending' } })
