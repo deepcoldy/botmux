@@ -5,6 +5,7 @@ export function runnerFinalOutcome(cliId: string | undefined, errorCode: unknown
   status: 'completed' | 'failed' | 'cancelled';
   errorCode?: string;
 } {
+  if (cliId === 'codex-app' && errorCode === 'cancelled') return { status: 'cancelled', errorCode };
   if (cliId === 'codex-app' && errorCode !== undefined) {
     return { status: 'failed', errorCode: errorCode === CODEX_CAPACITY_ERROR_CODE
       ? CODEX_CAPACITY_ERROR_CODE : 'codex_app_turn_failed' };
@@ -19,11 +20,11 @@ export function runnerFinalOutcome(cliId: string | undefined, errorCode: unknown
   };
 }
 
-/** The durable receipt and later worker terminal must agree on failure. */
-export function codexAppSettlementOutcome(message: { turnFailed?: boolean; turnFailureCode?: string }): {
-  status: 'completed' | 'failed'; errorCode?: string;
-} {
+/** The durable receipt and later worker terminal must agree. */
+export function codexAppSettlementOutcome(message: {
+  turnFailed?: boolean; turnFailureCode?: string; codexAppCancelled?: true;
+}): ReturnType<typeof runnerFinalOutcome> {
+  if (message.codexAppCancelled) return { status: 'cancelled', errorCode: 'cancelled' };
   if (!message.turnFailed) return { status: 'completed' };
-  const outcome = runnerFinalOutcome('codex-app', message.turnFailureCode ?? 'codex_app_turn_failed');
-  return { status: 'failed', errorCode: outcome.errorCode };
+  return runnerFinalOutcome('codex-app', message.turnFailureCode ?? 'codex_app_turn_failed');
 }

@@ -1162,6 +1162,7 @@ export function buildStreamingCard(
   /** Terminal-key grid expanded state, owned by the daemon session and carried
    *  through every PATCH so streaming refreshes don't snap the grid shut. */
   keysPanelOpen = false,
+  codexAppStopTarget?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1215,10 +1216,13 @@ export function buildStreamingCard(
   }
   // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
   // starting CLI 未起，limited turn 已失败，只剩后台子任务时 ^C 也停不了后台任务。
-  // remote CLI 无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
+  // Codex App needs the native turn identity captured when this card was rendered.
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && (effectiveCliId !== 'codex-app' || codexAppStopTarget) && !backgroundWait
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
+    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', {
+      action: 'stop_turn', ...actionBase,
+      ...(codexAppStopTarget ? { codex_app_stop_target: codexAppStopTarget } : {}),
+    }));
   }
   if (adoptMode) {
     if (showTakeover) {

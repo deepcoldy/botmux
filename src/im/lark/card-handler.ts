@@ -103,7 +103,7 @@ import { resumeSuccessMessage } from '../../core/resume-result-message.js';
 import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, sessionSupportsKimiCacheExpiryAutoCompact, sendKimiCacheExpiryAutoCompactSetting, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, sessionSupportsKimiCacheExpiryAutoCompact, sendKimiCacheExpiryAutoCompactSetting, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, interruptCodexAppTurn, codexAppStopCardTarget, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -4258,6 +4258,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -4955,6 +4956,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           unavailable,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         return { cardJson, unavailable };
       };
@@ -5189,6 +5191,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -5200,12 +5203,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return;
     }
 
-    // 「⏹ 停止」：中断当前 turn 但保留会话（不是 /close——turn 跑飞时折叠态用户此前
-    // 唯一手段是杀整个会话丢上下文）。走已有的 term_action ctrlc IPC 链路
-    // （sendWorkerSessionInput → worker.handleTermAction → sendCriticalControlKey
-    // 带重试注入 ^C），与展开态 ^C 快捷键完全同款。中断后把卡片重渲染为 transient
-    // 'interrupted' 状态（橙色 header + 已中断文案），~2s 后被下一次 screen_update
-    // patch 覆盖为真实 idle 态。
+    // Stop preserves the session. App Runner requires a captured native turn;
+    // terminal adapters keep their existing Ctrl+C path.
     if (actionType === 'stop_turn') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
@@ -5217,22 +5216,39 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (isSessionTransferring(ds)) {
         return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
       }
-      // RPC 输入模式下 ^C 到不了 app-server（pane 只是 viewer）；codex-app（App Runner）
-      // 无 PTY 输入通道。两者都降级为明确拒绝，提示用 /close。
-      if (ds.initConfig?.codexRpcInput === true || sessionCliId(ds) === 'codex-app') {
+      // The experimental RPC input mode still has no card interrupt path.
+      if (sessionCliId(ds) !== 'codex-app' && ds.initConfig?.codexRpcInput === true) {
         return { toast: { type: 'warning', content: t('card.action.stop_unsupported', undefined, locDs) } };
       }
       if (!ds.worker || ds.worker.killed) {
         return { toast: { type: 'warning', content: t('card.action.stop_no_worker', undefined, locDs) } };
       }
-      if (typeof value.reply_card_turn_id === 'string') {
-        const key = replyCardKey(ds, value.reply_card_turn_id,
-          typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined);
-        const record = new TurnReplyCardStore(config.session.dataDir).read(key);
-        if (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered
-          || ds.replyCardRunningTurnId !== key.turnId) {
-          return { toast: { type: 'warning', content: locDs === 'en' ? 'This turn is no longer running.' : '这一轮已不在执行，停止操作未发送。' } };
-        }
+      const replyKey = typeof value.reply_card_turn_id === 'string' ? replyCardKey(ds, value.reply_card_turn_id,
+        typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined) : undefined;
+      const record = replyKey && new TurnReplyCardStore(config.session.dataDir).read(replyKey);
+      const staleTurn = () => ({ toast: { type: 'warning', content: t('cmd.stop.app_stale_turn', undefined, locDs) } });
+      if (replyKey && (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered)) {
+        return staleTurn();
+      }
+      if (sessionCliId(ds) === 'codex-app') {
+        const target = ds.codexAppInterruptTarget;
+        const streamTarget = codexAppStopCardTarget(ds);
+        if (!target || (replyKey
+          ? target.replyTurnId !== replyKey.turnId || target.dispatchAttempt !== replyKey.dispatchAttempt
+          : !cardMessageId || cardMessageId !== ds.streamCardId || value.card_nonce !== ds.streamCardNonce
+            || !streamTarget || value.codex_app_stop_target !== streamTarget)) return staleTurn();
+        const status = await interruptCodexAppTurn(ds, target);
+        const content = t(`cmd.stop.app_${status}`, undefined, locDs);
+        return {
+          toast: { type: status === 'delivered' ? 'success' : 'warning', content },
+          afterAck: async (timedOut?: boolean) => {
+            if (timedOut && operatorOpenId) await sendUserMessage(ds.larkAppId, operatorOpenId, content, 'text');
+          },
+        };
+      }
+      if (replyKey) {
+        const key = replyKey;
+        if (ds.replyCardRunningTurnId !== key.turnId) return staleTurn();
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
         void updateTurnReplyCard(ds, key.turnId, { kind: 'phase', phase: 'stopping' },
           (body, type, uuid, beforeWrite) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid, beforeWrite }),
@@ -5273,6 +5289,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5580,6 +5597,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

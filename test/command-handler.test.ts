@@ -454,6 +454,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   isSessionTransferring: vi.fn(() => false),
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
+  interruptCodexAppTurn: vi.fn(async () => 'delivered'),
   updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
@@ -5207,7 +5208,8 @@ describe('handleCommand', () => {
       );
     });
 
-    it('refuses CLI modes without a local PTY input channel', async () => {
+    it('interrupts Codex App through its runner and leaves the session open', async () => {
+      const { interruptCodexAppTurn } = await import('../src/core/worker-pool.js');
       const ds = makeDaemonSession({
         worker: { killed: false, send: vi.fn() } as any,
         session: makeSession({ cliId: 'codex-app' as any }),
@@ -5216,10 +5218,13 @@ describe('handleCommand', () => {
 
       await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
 
+      expect(interruptCodexAppTurn).toHaveBeenCalledWith(ds);
       expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(requestSessionRestart).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('不支持 /stop'),
+        expect.stringContaining('会话保留'),
         undefined,
         LARK_APP_ID,
         'msg_001',

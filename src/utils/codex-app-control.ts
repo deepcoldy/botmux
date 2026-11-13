@@ -2623,6 +2623,7 @@ export interface CodexAppControlAccepted {
   generation: string;
   challenge: string;
   endpointEpoch?: string;
+  turnInterrupt?: true;
 }
 
 export interface CodexAppControlAck {
@@ -2632,6 +2633,16 @@ export interface CodexAppControlAck {
   generation: string;
   challenge: string;
   seq: number;
+}
+
+export interface CodexAppControlInterrupt {
+  version: typeof CONTROL_WIRE_VERSION;
+  type: 'interrupt';
+  sessionId: string;
+  generation: string;
+  challenge: string;
+  requestId: string;
+  turnEpoch: number;
 }
 
 export interface CodexAppSignedControlMarker {
@@ -2651,7 +2662,12 @@ export type CodexAppControlWireRecord =
   | CodexAppControlAuth
   | CodexAppControlAccepted
   | CodexAppControlAck
+  | CodexAppControlInterrupt
   | CodexAppSignedControlMarker;
+
+export function encodeCodexAppControlInterrupt(input: Omit<CodexAppControlInterrupt, 'version' | 'type'>): string {
+  return JSON.stringify({ version: CONTROL_WIRE_VERSION, type: 'interrupt', ...input });
+}
 
 export function encodeCodexAppControlChallenge(sessionId: string, challenge: string): string {
   if (!sessionId || !isValidChallenge(challenge)) throw new Error('Codex App control challenge is invalid');
@@ -2663,6 +2679,7 @@ export function encodeCodexAppControlAccepted(
   generation: string,
   challenge: string,
   endpointEpoch?: string,
+  turnInterrupt?: true,
 ): string {
   if (!sessionId || !isValidGeneration(generation) || !isValidChallenge(challenge)) {
     throw new Error('Codex App control acceptance metadata is invalid');
@@ -2677,6 +2694,7 @@ export function encodeCodexAppControlAccepted(
     generation,
     challenge,
     ...(endpointEpoch ? { endpointEpoch } : {}),
+    ...(turnInterrupt ? { turnInterrupt } : {}),
   });
 }
 
@@ -2777,6 +2795,12 @@ export function parseCodexAppControlWireRecord(line: string): CodexAppControlWir
         && Number.isSafeInteger(value.seq) && Number(value.seq) > 0) {
       return value as unknown as CodexAppControlAck;
     }
+    if (value.type === 'interrupt' && isValidGeneration(value.generation)
+        && isValidChallenge(value.challenge)
+        && typeof value.requestId === 'string' && value.requestId.length > 0 && value.requestId.length <= 128
+        && Number.isSafeInteger(value.turnEpoch) && Number(value.turnEpoch) > 0) {
+      return value as unknown as CodexAppControlInterrupt;
+    }
     if (value.type === 'marker' && isValidGeneration(value.generation)
         && isValidChallenge(value.challenge)
         && Number.isSafeInteger(value.seq) && Number(value.seq) > 0
@@ -2793,8 +2817,9 @@ export function parseCodexAppControlWireRecord(line: string): CodexAppControlWir
 
 export type CodexAppControlRunnerHandshakeAction =
   | { type: 'authenticate'; challenge: string }
-  | { type: 'accepted'; challenge: string }
+  | { type: 'accepted'; challenge: string; turnInterrupt?: true }
   | { type: 'ack'; seq: number }
+  | { type: 'interrupt'; requestId: string; turnEpoch: number }
   | { type: 'reject' };
 
 /**
@@ -2829,7 +2854,7 @@ export class CodexAppControlRunnerHandshake {
         && (this.expectedEndpointEpoch === undefined
           || record.endpointEpoch === this.expectedEndpointEpoch)) {
       this.phase = 'active';
-      return { type: 'accepted', challenge: record.challenge };
+      return { type: 'accepted', challenge: record.challenge, ...(record.turnInterrupt === true ? { turnInterrupt: true } : {}) };
     }
     if (this.phase === 'active'
         && record.type === 'ack'
@@ -2838,6 +2863,10 @@ export class CodexAppControlRunnerHandshake {
         && record.seq > 0
         && record.seq <= sentThrough) {
       return { type: 'ack', seq: record.seq };
+    }
+    if (this.phase === 'active' && record.type === 'interrupt'
+        && record.generation === this.expectedGeneration && record.challenge === this.challengeValue) {
+      return { type: 'interrupt', requestId: record.requestId, turnEpoch: record.turnEpoch };
     }
     return { type: 'reject' };
   }

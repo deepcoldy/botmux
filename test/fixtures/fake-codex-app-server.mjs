@@ -615,6 +615,21 @@ function handle(request) {
     else respond(request.id, {});
     return;
   }
+  if (request.method === 'turn/interrupt' && behavior.startsWith('operator-interrupt')) {
+    if (!activeTurn || request.params.threadId !== activeTurn.threadId || request.params.turnId !== activeTurn.turnId) {
+      reject(request.id, -32600, 'turn no longer active');
+      return;
+    }
+    if (behavior === 'operator-interrupt-reject') {
+      reject(request.id, -32000, 'interrupt unavailable');
+      return;
+    }
+    const { threadId, turnId } = activeTurn;
+    activeTurn = undefined;
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
+    respond(request.id, {});
+    return;
+  }
   if (request.method === 'turn/interrupt' || request.method === 'thread/unsubscribe') {
     respond(request.id, {});
     return;
@@ -933,6 +948,15 @@ function handle(request) {
   }
 
   turnAttempt += 1;
+  if (behavior.startsWith('operator-interrupt')) {
+    const { threadId } = request.params;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId };
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    notify('item/agentMessage/delta', { threadId, turnId, itemId: 'partial-answer', delta: 'partial response' });
+    return;
+  }
   if (behavior === 'capability-error' && turnAttempt === 1) {
     reject(request.id, -32602, 'unknown field additionalContext; experimentalApi unsupported');
     return;
