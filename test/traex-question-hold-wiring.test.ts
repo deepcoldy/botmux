@@ -8,13 +8,18 @@
  *    or its `--remote` viewer, not an adopted pane, not a remote backend, not
  *    a non-authoritative screen, not any other CLI;
  *  - queued input is held off the page — also while OSC 7501 already reports
- *    the question but the page is not on the cached screen yet;
+ *    the question but the page is not on the cached screen yet, and when the
+ *    page is on the pane before the worker has read it from the stream;
  *  - the held message gets the question notice, not the hook-review one;
+ *  - flushPending's drain (the real one, test/helpers/worker-submit-harness)
+ *    looks right before a message is written, and what changes while it looks
+ *    is honoured;
  *  - the quiet page is never taken for a finished turn.
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 import { classifyStuckPage, shouldHoldInputForHookReview, shouldHoldInputForStuckPage } from '../src/utils/stuck-detector.js';
@@ -42,6 +47,11 @@ const WORKER_FUNCTIONS = [
   'cancelHookReviewReleaseProbe',
   'scheduleHookReviewReleaseProbe',
   'traexQuestionSubmitGuard',
+  'traexQuestionHoldsQueuedWrite',
+  'hookReviewHoldsQueuedWrite',
+  'hookReviewAdmissionScreen',
+  'hookReviewAdmissionCapture',
+  'hookReviewAdmissionShowsPage',
 ] as const;
 
 function harness(cliId: CliId, opts: {
@@ -70,6 +80,7 @@ function harness(cliId: CliId, opts: {
     lastAnalyzerSnapshot: '',
     renderer: { rawSnapshot: () => scope.screen },
     hookReviewInputHold: false,
+    hookReviewInputHoldRevision: 0,
     hookReviewInputHoldNotified: false,
     hookReviewInputHoldSnapshot: '',
     hookReviewReleaseProbeTimer: null,
@@ -174,6 +185,163 @@ describe('holding input off the question page', () => {
       dispatchAttempt: 1,
       message: t('worker.traex_question.input_held', { cliName: 'TRAE CLI' }),
     }]);
+  });
+});
+
+describe('the last look before a message is pasted', () => {
+  /** The worker's screens follow the CLI's output stream; `pane` is what a
+   *  fresh capture shows right now. */
+  function staleStream(cliId: CliId, pane: string | undefined, opts: Parameters<typeof harness>[1] = {}) {
+    const h = harness(cliId, opts);
+    let captures = 0;
+    h.scope.cliLifetimeNonce = 'cli-1';
+    h.scope.traexQuestionCapture = async () => { captures += 1; return pane; };
+    h.scope.renderer = { rawSnapshot: () => COMPOSER };
+    h.scope.lastAnalyzerSnapshot = COMPOSER;
+    return { ...h, captures: () => captures };
+  }
+
+  it('reads a fresh screen, so a page the stream has not delivered yet holds the message', async () => {
+    // On tmux the stream reaches the worker through the pipe-pane relay; the
+    // page (and its OSC 7501 report) can be on the pane before it arrives.
+    const h = staleStream('traex', QUESTION);
+    expect(await h.fn('traexQuestionHoldsQueuedWrite')()).toBe(true);
+    expect(h.captures()).toBe(1);
+    expect(h.scope.hookReviewInputHold).toBe(true);
+    expect(h.kicks()).toBeGreaterThan(0);
+    expect(h.sent).toEqual([{
+      type: 'user_notify',
+      turnId: 'om_held',
+      dispatchAttempt: 1,
+      message: t('worker.traex_question.input_held', { cliName: 'TRAE CLI' }),
+    }]);
+  });
+
+  it('lets the message go when the fresh screen shows no page', async () => {
+    const h = staleStream('traex', COMPOSER);
+    expect(await h.fn('traexQuestionHoldsQueuedWrite')()).toBe(false);
+    expect(h.scope.hookReviewInputHold).toBe(false);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('without a usable capture decides on the cached screens', async () => {
+    const quiet = staleStream('traex', undefined);
+    expect(await quiet.fn('traexQuestionHoldsQueuedWrite')()).toBe(false);
+    const cached = staleStream('traex', undefined);
+    cached.scope.lastAnalyzerSnapshot = QUESTION;
+    expect(await cached.fn('traexQuestionHoldsQueuedWrite')()).toBe(true);
+    const reported = staleStream('traex', undefined, { block: { kind: 'question' } });
+    expect(await reported.fn('traexQuestionHoldsQueuedWrite')()).toBe(true);
+  });
+
+  it('is void, leaving the hold alone, when the CLI was replaced during the capture', async () => {
+    const h = staleStream('traex', QUESTION);
+    const capture = h.scope.traexQuestionCapture;
+    h.scope.traexQuestionCapture = async () => {
+      const screen = await capture();
+      h.scope.cliLifetimeNonce = 'cli-2';
+      return screen;
+    };
+    expect(await h.fn('traexQuestionHoldsQueuedWrite')()).toBeUndefined();
+    expect(h.scope.hookReviewInputHold).toBe(false);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('is void when the page was released while the screen was read: the capture predates the release', async () => {
+    const h = staleStream('traex', QUESTION);
+    h.fn('refreshHookReviewInputHold')(QUESTION);
+    h.fn('notifyHookReviewInputHold')(QUESTION);
+    expect(h.sent).toHaveLength(1);
+    const capture = h.scope.traexQuestionCapture;
+    h.scope.traexQuestionCapture = async () => {
+      const screen = await capture();
+      // Answered on the card meanwhile: a settled capture let the hold go.
+      h.fn('refreshHookReviewInputHold')(COMPOSER, { settled: true });
+      return screen;
+    };
+    expect(await h.fn('traexQuestionHoldsQueuedWrite')()).toBeUndefined();
+    expect(h.scope.hookReviewInputHold).toBe(false);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('costs nothing outside a TraeX terminal session', async () => {
+    for (const h of [
+      staleStream('traex', QUESTION, { remoteWsUrl: 'ws://x' }),
+      staleStream('traex', QUESTION, { init: { adoptMode: true } }),
+      staleStream('codex', QUESTION),
+    ]) {
+      expect(await h.fn('traexQuestionHoldsQueuedWrite')()).toBe(false);
+      expect(h.captures()).toBe(0);
+      expect(h.sent).toEqual([]);
+    }
+  });
+});
+
+describe('the drain around the last look', () => {
+  /** Queued messages in a TraeX terminal session; `look` stands in for the
+   *  fresh screen and can change the worker's state while it is read. */
+  function drain(look: (scope: Record<string, any>) => boolean | undefined, queued = ['first']) {
+    const h = workerSubmitHarness();
+    const { scope } = h;
+    scope.pendingMessages.splice(0, scope.pendingMessages.length,
+      ...queued.map(content => ({ turnId: `om_${content}`, dispatchAttempt: 1, content })));
+    scope.traexQuestionBridgeActive = () => true;
+    scope.traexQuestionSubmitGuard = () => ({});
+    scope.traexQuestionDraftWaiting = false;
+    const looks: string[] = [];
+    scope.traexQuestionHoldsQueuedWrite = async () => {
+      looks.push(scope.pendingMessages[0]?.turnId);
+      await Promise.resolve();
+      return look(scope);
+    };
+    const written = () => scope.cliAdapter.writeInput.mock.calls.map((call: any[]) => call[1]);
+    return { ...h, looks, written };
+  }
+
+  it('writes the head once the look finds no page', async () => {
+    const h = drain(() => false);
+    await h.flush();
+    expect(h.written()).toEqual(['first']);
+    expect(h.looks[0]).toBe('om_first');
+  });
+
+  it('writes nothing while the page holds it, and keeps the prompt ready', async () => {
+    const h = drain(() => true);
+    await h.flush();
+    expect(h.written()).toEqual([]);
+    expect(h.scope.pendingMessages.map((m: any) => m.turnId)).toEqual(['om_first']);
+    expect(h.scope.isPromptReady).toBe(true);
+  });
+
+  it('writes nothing when a restart began while it looked', async () => {
+    const h = drain(scope => { scope.cliRestartInProgress = true; return false; });
+    await h.flush();
+    expect(h.written()).toEqual([]);
+    expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
+  it('puts the head that took over during the look through its gates before writing it', async () => {
+    // The second message must wait (say, behind another sender's turn).
+    let firstLook = true;
+    const h = drain(scope => {
+      // An IPC handler (an interrupt, an expired durable turn) dropped the head.
+      if (firstLook) scope.pendingMessages.shift();
+      firstLook = false;
+      return false;
+    }, ['first', 'second']);
+    const asked: string[] = [];
+    h.scope.activeTurnBlocks = (item: any) => { asked.push(item?.turnId); return item?.turnId === 'om_second'; };
+    await h.flush();
+    expect(h.written()).toEqual([]);
+    expect(asked).toContain('om_second');
+  });
+
+  it('looks again when its look was void', async () => {
+    let calls = 0;
+    const h = drain(() => (calls++ === 0 ? undefined : false));
+    await h.flush();
+    expect(h.looks).toEqual(['om_first', 'om_first']);
+    expect(h.written()).toEqual(['first']);
   });
 });
 
