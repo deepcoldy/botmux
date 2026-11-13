@@ -9216,13 +9216,23 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const directHumanTurn = directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+      session: ds.session, activeTurn: active });
+    const inheritedForwardTools = !directHumanTurn && turnId && targetAppIds.length
+      ? dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+        sourceChatId: ds.chatId, targetChatId: chatId, targetAppIds,
+        directHuman: false, inherited: true,
+      }) : [];
+    // With tools: [] a bot can still forward an already signed grant through
+    // dispatchOnly. Read that grant before deciding whether to sign at all.
+    const inheritedLookedUp = inheritedForwardTools.length > 0;
+    const earlyInherited = inheritedLookedUp ? await dispatchUserForTurn(ds, turnId!) : undefined;
     const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
       sourceChatId: ds.chatId,
       targetChatId: chatId,
       targetAppIds,
-      directHuman: directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
-        session: ds.session, activeTurn: active }),
-      inherited: false,
+      directHuman: directHumanTurn,
+      inherited: !!earlyInherited,
     });
     const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
     // A host bot grant stands in only for turns that no human administrator
@@ -9271,7 +9281,8 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // immediate tool delegation.
     const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
     let inherited = needsDelegation && turnId && !serviceGrant
-      ? await dispatchUserForTurn(ds, turnId) : undefined;
+      ? inheritedLookedUp ? earlyInherited : await dispatchUserForTurn(ds, turnId)
+      : undefined;
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // A workflow node's delegation goes on only within its run (approved
@@ -9290,7 +9301,10 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       sourceAppId: ds.larkAppId,
       caller: dispatchCaller,
       inherited: inherited?.authority,
-      tools: inherited ? tools : dispatchTools,
+      // authorityForDispatch intersects this list with a verified inherited
+      // grant. dispatchOnly can permit forwarding without enabling the tool
+      // in this bot's own CLI policy.
+      tools: dispatchTools,
       ...(scheduleCreateRequested ? {
         scheduleCreate: {
           targetAppIds,

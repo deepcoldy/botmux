@@ -98,8 +98,9 @@ export interface TriggerUserAuthConfig {
    * key live on this machine).
    */
   delegateOnMention?: boolean;
-  /** Extra tools signed only for a direct human's dispatch into the exact
-   * listed chat and target apps. They never govern this bot's own CLI calls. */
+  /** Extra tools signed for a direct human's dispatch, or allowed to pass
+   * through from an already verified delegation, into the exact listed chat
+   * and target apps. They never govern this bot's own CLI calls. */
   dispatchOnly?: {
     tools: TriggerUserAuthTool[];
     targetAppIds: string[];
@@ -300,8 +301,9 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   };
 }
 
-/** Restrict dispatch-only credentials to the active direct human turn. A
- * delegated/bot turn can only forward its existing signed tool set. */
+/** Restrict dispatch-only credentials to a direct human or an already verified
+ * delegation. Inherited authority is intersected with these tools by
+ * authorityForDispatch, so a bot turn cannot mint a new human credential. */
 export function dispatchOnlyToolsForTurn(
   config: TriggerUserAuthConfig | null | undefined,
   request: {
@@ -313,7 +315,7 @@ export function dispatchOnlyToolsForTurn(
   },
 ): TriggerUserAuthTool[] {
   const policy = config?.enabled ? config.dispatchOnly : undefined;
-  if (!policy || !request.directHuman || request.inherited
+  if (!policy || (!request.directHuman && !request.inherited)
     || request.sourceChatId !== request.targetChatId
     || !policy.chatIds.includes(request.targetChatId)
     || request.targetAppIds.length === 0

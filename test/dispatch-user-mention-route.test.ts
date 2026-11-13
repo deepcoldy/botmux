@@ -181,6 +181,17 @@ describe('mention handoff: prepare', () => {
           .toEqual(['lark-cli']);
       }
     });
+  it('forwards a signed bytedcli grant through a bot with empty own tools', async () => {
+    const h = harness({ triggerUserAuth: { enabled: true, tools: [], dispatchOnly: scoped.dispatchOnly } });
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+    h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+      appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+    } }));
+    const prepared = await h.prepare();
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['bytedcli']);
+  });
   it('signs the direct human of this turn for the local target bot', async () => {
     const h = harness();
     const prepared = await h.prepare();

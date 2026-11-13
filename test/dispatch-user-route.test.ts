@@ -161,6 +161,44 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect((await read())?.authority).toMatchObject({ openId: 'ou_alice',
       tools: ['lark-cli', 'bytedcli'] });
   });
+  it('forwards an already signed bytedcli grant through a bot with no own tools', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: true, tools: [], dispatchOnly,
+    } } });
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+    h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+      appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+    } }));
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority).toMatchObject({
+      appId: 'cli_upstream', openId: 'ou_alice', tools: ['bytedcli'],
+    });
+  });
+  it.each(['no signed grant', 'different signed tool', 'outside target allowlist'])(
+    'does not invent bytedcli for an automatic turn with %s', async scenario => {
+      const h = harness();
+      h.ds.chatId = 'oc_target';
+      h.scope.getBot = () => ({ config: { triggerUserAuth: {
+        enabled: true, tools: [], dispatchOnly,
+      } } });
+      h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+      if (scenario === 'different signed tool') h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+        appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli'],
+      } }));
+      if (scenario === 'outside target allowlist') {
+        h.body.targetAppIds = ['cli_other'];
+        h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+          appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+        } }));
+      }
+      expect((await h.run()).status).toBe(200);
+      const signed = await resolveDispatchUser({ dataDir, secret,
+        appId: h.body.targetAppIds[0], chatId: 'oc_target', rootId: 'om_root',
+        turnId: 'om_kickoff', waitMs: 0 });
+      expect(signed).toBeUndefined();
+    });
   it.each(['bot sender', 'synthetic turn', 'failed recovery', 'active bot'])
     ('does not restore dispatch-only tools from an ineligible recorded %s', async scenario => {
       const h = harness();
