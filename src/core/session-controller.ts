@@ -32,6 +32,7 @@ export class SessionController {
   readonly gateway: SessionEventGateway;
   private primaryRevision = 0;
   private primaryQueue = Promise.resolve();
+  private detached = false;
   private readonly abortedBindings = new Set<string>();
   private readonly continuationFailureEffects = new Map<string, Promise<void>>();
   private readonly appliedContinuationFailureEffects = new Set<string>();
@@ -48,20 +49,43 @@ export class SessionController {
       Object.defineProperty(ds, key, { enumerable: true, configurable: true, get: () => contractReadiness(this.store.read(this.ref)!, this.store.runtime(this.ref))[key], set: () => {} });
     }
   }
+  /** The owner still points at the session this controller was pinned to.
+   * A /repo switch reuses the DaemonSession object for a replacement session;
+   * once that happens this controller must stop projecting its (closed)
+   * predecessor contract onto the owner object the replacement now owns. */
+  private ownerMatchesRef(): boolean {
+    return !this.detached
+      && this.ds.larkAppId === this.ref.appId
+      && this.ds.session.sessionId === this.ref.sessionId;
+  }
+  /** Detach after the owner object is reused for another session. The
+   * controller keeps serving reads for its own contract via the store, but
+   * late IPC callbacks can no longer write through onto the replacement. */
+  detach(): void { this.detached = true; }
   refresh(): void {
+    if (!this.ownerMatchesRef()) return;
     const state = this.store.read(this.ref)!;
     this.ds.session.sessionLifecycle = state.lifecycle;
     this.ds.session.sessionContractRevision = state.revision;
     this.ds.session.status = state.lifecycle === 'closed' ? 'closed' : 'active';
   }
   flushPrimary(): Promise<void> {
-    if (!sessionContractPrimary(this.ref.appId)) return Promise.resolve();
+    if (!sessionContractPrimary(this.ref.appId) || !this.ownerMatchesRef()) return Promise.resolve();
     const snapshot = this.store.snapshot(this.ref);
     const pending = this.primaryQueue.catch(() => {}).then(async () => {
       if (snapshot.session.revision <= this.primaryRevision) return;
-      await commitPrimarySessionContract(this.ds.session, snapshot, this.primaryRevision);
+      // The owner may have been reused for another session while this flush
+      // was queued; never checkpoint the old contract onto the new lane.
+      if (!this.ownerMatchesRef()) return;
+      // Pin the lane record before the await: a detach during the durable
+      // write must not make the follow-up write land on the replacement.
+      const ownerSession = this.ds.session;
+      await commitPrimarySessionContract(ownerSession, snapshot, this.primaryRevision);
       this.primaryRevision = snapshot.session.revision;
-      this.ds.session.sessionRuntimeContract = snapshot;
+      // Re-check after the await — the owner can be swapped while the write
+      // was in flight. A detached controller must stop mutating session
+      // objects entirely, even the predecessor record it pinned earlier.
+      if (this.ownerMatchesRef()) ownerSession.sessionRuntimeContract = snapshot;
     });
     this.primaryQueue = pending; return pending;
   }
@@ -497,6 +521,15 @@ export function controllerForSession(ds: DaemonSession, bootstrap = false): Sess
   if (!sessionContractsEnabled() || !isOutputJournalAppId(ds.larkAppId)) return undefined;
   if (!bootstrap && !ds.initConfig?.sessionContract && ds.session.sessionContractRevision === undefined) return undefined;
   let controller = controllers.get(ds);
+  if (controller && (controller.ref.appId !== ds.larkAppId || controller.ref.sessionId !== ds.session.sessionId)) {
+    // The DaemonSession object outlives its session: the /repo switch paths
+    // close the old session and swap a replacement into the same object
+    // before forking a new worker. The cached controller is pinned to the
+    // closed predecessor's (appId, sessionId); detach it so late callbacks
+    // cannot touch the replacement, then bind a fresh controller.
+    controller.detach();
+    controller = undefined;
+  }
   if (!controller) { controller = new SessionController(ds); controllers.set(ds, controller); }
   return controller;
 }
