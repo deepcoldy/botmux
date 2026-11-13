@@ -1,8 +1,8 @@
 import { mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { queryUsageLedger, validateUsageQuery } from '../src/services/usage-analytics.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createUsageAnalytics, queryUsageLedger, validateUsageQuery } from '../src/services/usage-analytics.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-usage-test-')); });
@@ -26,6 +26,8 @@ describe('usage ledger analytics', () => {
     expect(result.summary).toEqual({ inputTokens: 25, outputTokens: 60, cacheReadTokens: 90,
       cacheCreateTokens: 120, totalTokens: 295, records: 3, costCny: 0, pricedRecords: 1 });
     expect(result.coverage.duplicateRecords).toBe(1);
+    // Ownership markers are expected bookkeeping, not "incomplete" records.
+    expect(result.coverage.invalidRecords).toBe(0);
     expect(result.sessions).toHaveLength(2);
     expect(result.bots.map(r => [r.id, r.totalTokens])).toEqual([['bot-a', 195], ['bot-b', 100]]);
     expect(readFileSync(join(dir, 'usage-2026-11-10.jsonl'), 'utf8')).toBe(before);
@@ -55,11 +57,12 @@ describe('usage ledger analytics', () => {
 
   it('labels malformed, future-schema and inconsistent records without treating them as valid zeros', async () => {
     ledger('2026-11-10', [record(), record({ v: 3, recordId: 'future' }), record({ recordId: 'negative', outputTokens: -1 }),
-      record({ recordId: 'fraction', inputTokens: 1.5 }), record({ v: 1, inputTokenSemantics: 'includes_cache', inputTokens: 1 })]);
+      record({ recordId: 'fraction', inputTokens: 1.5 }), record({ v: 1, inputTokenSemantics: 'includes_cache', inputTokens: 1 }),
+      record({ recordId: 'v2-cache-inclusive', inputTokenSemantics: 'includes_cache', inputTokens: 100 })]);
     const path = join(dir, 'usage-2026-11-10.jsonl'); writeFileSync(path, readFileSync(path, 'utf8') + '{"partial":');
     const result = await queryUsageLedger(query, { ledgerDir: dir });
     expect(result.summary.records).toBe(1);
-    expect(result.coverage.invalidRecords).toBe(5);
+    expect(result.coverage.invalidRecords).toBe(6);
   });
 
   it('keeps a 25-hour daylight-saving day in one local trend bucket', async () => {
@@ -86,6 +89,27 @@ describe('usage ledger analytics', () => {
     writeFileSync(join(dir, 'usage-2026-11-10.jsonl'), '');
     truncateSync(join(dir, 'usage-2026-11-10.jsonl'), 64 * 1024 * 1024 + 1);
     await expect(queryUsageLedger(query, { ledgerDir: dir })).rejects.toMatchObject({ code: 'usage_ledger_too_large' });
+  });
+
+  it('reuses an identical query for five seconds without caching failures', async () => {
+    let now = Date.parse('2026-11-13T00:00:00Z');
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const usage = createUsageAnalytics(dir);
+      ledger('2026-11-10', [record()]);
+      expect((await usage(query)).summary.records).toBe(1);
+      ledger('2026-11-10', [record(), record({ recordId: 'r2' })]);
+      expect((await usage(query)).summary.records).toBe(1);
+      expect((await usage({ ...query, bot: 'bot-a' })).summary.records).toBe(2);
+      now += 5001;
+      expect((await usage(query)).summary.records).toBe(2);
+
+      const path = join(dir, 'usage-2026-11-10.jsonl');
+      rmSync(path); mkdirSync(path); now += 5001;
+      await expect(usage(query)).rejects.toMatchObject({ status: 503 });
+      rmSync(path, { recursive: true }); ledger('2026-11-10', [record()]);
+      expect((await usage(query)).summary.records).toBe(1);
+    } finally { clock.mockRestore(); }
   });
 
   it('rejects ambiguous dates, impossible dates, reversed ranges and invalid zones', () => {
