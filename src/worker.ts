@@ -555,6 +555,11 @@ import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid,
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
+import { ClaudeEffortObserver } from './services/claude-effort-observer.js';
+import { TerminalEffortChoiceTracker, terminalEffortPreferenceKey, readClaudeEffortCommandReceipt, type TerminalEffortBinding, type TerminalEffortChoice } from './services/terminal-effort-choice.js';
+import { isNativeReasoningEffort, type NativeReasoningObservation, type AppliedReasoningSelection } from './services/native-reasoning-observation.js';
+import { readGrokRuntimeObservation } from './services/grok-runtime-observer.js';
+import { readNativeReasoningFooter } from './utils/native-reasoning-footer.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
 import { readySignalLogDir, readySignalLogPath } from './services/ready-signal-log.js';
@@ -9308,6 +9313,171 @@ const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
  *  reaches it through observeModelFallbackEvents. The worker reports
  *  observations only — the daemon owns the state and decides. */
 const modelFallbackTracker = new ClaudeModelFallbackTracker();
+const claudeEffortObserver = new ClaudeEffortObserver();
+const terminalEffortTracker = new TerminalEffortChoiceTracker();
+let terminalEffortPendingChoice: TerminalEffortChoice | undefined;
+let terminalEffortAwaitingClaudeChoice: TerminalEffortChoice | undefined;
+let terminalEffortSavedNonce: string | undefined;
+let terminalEffortEnabledSinceMs: number | undefined;
+let terminalEffortEnableEpoch: number | undefined;
+function readTerminalEffortPreference(notAfter?: number): string | undefined {
+  if (!lastInitConfig?.sessionId || !lastInitConfig.larkAppId) return;
+  const row = sessionStore.readSessionRowFromDisk(lastInitConfig.sessionId, lastInitConfig.larkAppId);
+  if (!row || notAfter !== undefined && (row.terminalEffortPreferenceEdit?.atMs ?? 0) >= notAfter) return;
+  return terminalEffortPreferenceKey(row);
+}
+function terminalEffortWritebackEnabled(): boolean {
+  if (!config.terminalEffortWriteback) {
+    terminalEffortEnabledSinceMs = undefined;
+    terminalEffortEnableEpoch = undefined;
+    terminalEffortPendingChoice = undefined;
+    terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.reset();
+    return false;
+  }
+  if (terminalEffortEnableEpoch !== config.terminalEffortWritebackEpoch) {
+    terminalEffortEnabledSinceMs = config.terminalEffortWritebackEnabledAtMs || Date.now();
+    terminalEffortPendingChoice = undefined;
+    terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.reset();
+    terminalEffortEnableEpoch = config.terminalEffortWritebackEpoch;
+  }
+  terminalEffortEnabledSinceMs ??= Date.now();
+  return true;
+}
+
+function noteTerminalEffortInput(client: object, data: string): void {
+  // Observation only: a failing preference read or tracker must never swallow
+  // the authenticated keystroke that runs immediately after this hook.
+  try {
+    const cliId = lastInitConfig?.cliId;
+    const nativeSessionId = cliId === 'claude-code'
+      ? (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined) ?? bridgeObservedCliSessionId ?? lastInitConfig?.cliSessionId
+      : lastInitConfig?.cliSessionId;
+    if (!cliId || !nativeSessionId) return;
+    if (data.includes('\x03') || data === '\x1b') terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.input(client, data, { cliId, nativeSessionId, cliSpawnGeneration }, {
+      enabled: terminalEffortWritebackEnabled(), ready: isPromptReady && !cliRestartInProgress,
+      screen: lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
+      enableEpoch: config.terminalEffortWritebackEpoch, readPreference: readTerminalEffortPreference,
+    });
+  } catch { /* observer failure must not block input delivery */ }
+}
+function confirmedTerminalEffortChoice(binding: TerminalEffortBinding, effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null,
+  atMs: number | undefined, evidence: 'native-settings' | 'native-footer' | 'native-summary' | 'statusline', model?: string,
+): TerminalEffortChoice | undefined {
+  const enabled = terminalEffortWritebackEnabled();
+  const environmentOverride = binding.cliId === 'claude-code'
+    && (lastInitConfig?.env?.CLAUDE_CODE_EFFORT_LEVEL || process.env.CLAUDE_CODE_EFFORT_LEVEL);
+  if (environmentOverride) { terminalEffortPendingChoice = undefined; terminalEffortAwaitingClaudeChoice = undefined; terminalEffortTracker.reset(); return; }
+  if (atMs === undefined) return;
+  model ??= terminalEffortTracker.model(binding) ?? lastInitConfig?.model;
+  const confirmed = terminalEffortTracker.observe({ binding, effort, model, atMs }, enabled, evidence, config.terminalEffortWritebackEpoch);
+  if (!enabled) return;
+  if (confirmed && binding.cliId === 'claude-code') terminalEffortAwaitingClaudeChoice = confirmed;
+  if (confirmed && binding.cliId !== 'claude-code') terminalEffortPendingChoice = { ...confirmed, nonce: `${cliLifetimeNonce}:${confirmed.nonce}` };
+  const pending = terminalEffortPendingChoice;
+  if (pending && pending.nativeSessionId === binding.nativeSessionId && pending.cliId === binding.cliId
+    && pending.cliSpawnGeneration === binding.cliSpawnGeneration && pending.requestedEffort === effort
+    && atMs >= pending.confirmedAtMs && Date.now() - pending.requestedAtMs <= 60_000) {
+    terminalEffortPendingChoice = { ...pending, confirmedAtMs: atMs };
+    return terminalEffortPendingChoice;
+  }
+  if (pending) terminalEffortPendingChoice = undefined;
+  if (binding.cliId !== 'claude-code' || !bridgeJsonlPath || effort === null
+    || lastInitConfig?.env?.CLAUDE_CODE_EFFORT_LEVEL || process.env.CLAUDE_CODE_EFFORT_LEVEL) return;
+  const receipt = readClaudeEffortCommandReceipt(bridgeJsonlPath, binding.nativeSessionId,
+    Math.max(claudeEffortNotBeforeMs, terminalEffortEnabledSinceMs ?? Date.now()));
+  const nonce = receipt ? `${cliLifetimeNonce}:${receipt.nonce}` : undefined;
+  if (!receipt || nonce === terminalEffortSavedNonce || receipt.effort !== effort || receipt.atMs > atMs || Date.now() - receipt.atMs > 60_000) return;
+  if (terminalEffortAwaitingClaudeChoice && (terminalEffortAwaitingClaudeChoice.nativeSessionId !== binding.nativeSessionId
+    || terminalEffortAwaitingClaudeChoice.cliSpawnGeneration !== binding.cliSpawnGeneration
+    || terminalEffortAwaitingClaudeChoice.enableEpoch !== config.terminalEffortWritebackEpoch
+    || terminalEffortAwaitingClaudeChoice.requestedEffort !== effort
+    || Date.now() - terminalEffortAwaitingClaudeChoice.requestedAtMs > 60_000)) terminalEffortAwaitingClaudeChoice = undefined;
+  const awaiting = terminalEffortAwaitingClaudeChoice;
+  const expectedPreference = confirmed?.expectedPreference ?? awaiting?.expectedPreference ?? readTerminalEffortPreference(receipt.atMs);
+  if (!expectedPreference) return;
+  terminalEffortPendingChoice = { nonce: nonce!, ...binding, cliId: 'claude-code', requestedEffort: effort,
+    requestedAtMs: confirmed?.requestedAtMs ?? awaiting?.requestedAtMs ?? receipt.atMs, confirmedAtMs: atMs, ...(model ? { model } : {}), source: 'claude-command',
+    enableEpoch: config.terminalEffortWritebackEpoch, expectedPreference };
+  return terminalEffortPendingChoice;
+}
+
+let claudeEffortNotBeforeMs = 0;
+let nativeReasoningNotBeforeMs = 0;
+let lastNativeReasoningKey: string | undefined;
+let nativeReasoningClock: { owner: string; atMs: number } | undefined;
+
+function publishNativeReasoningObservation(observed: NativeReasoningObservation): void {
+  if (closeRequested || !backend || observed.cliId !== lastInitConfig?.cliId) return;
+  const binding = workerSessionEventScope?.currentBinding();
+  const owner = JSON.stringify([cliLifetimeNonce, binding?.runtime?.runtimeId, observed.cliId, observed.nativeSessionId]);
+  if (observed.observedAtMs !== undefined) {
+    if (nativeReasoningClock?.owner === owner && observed.observedAtMs < nativeReasoningClock.atMs) return;
+    nativeReasoningClock = { owner, atMs: observed.observedAtMs };
+  }
+  const userSelection = confirmedTerminalEffortChoice({ cliId: observed.cliId, nativeSessionId: observed.nativeSessionId, cliSpawnGeneration },
+    observed.reasoningEffort, observed.observedAtMs, observed.source as 'native-settings' | 'native-footer' | 'native-summary', observed.model);
+  if (userSelection) observed = { ...observed, userSelection };
+  const { observedAtMs: _time, ...value } = observed;
+  const key = JSON.stringify([owner, value]);
+  if (key === lastNativeReasoningKey && !observed.userSelection) return;
+  lastNativeReasoningKey = key;
+  const publish = () => send({ type: 'native_reasoning', ...observed,
+    ...(typeof cliSpawnGeneration === 'number' ? { cliSpawnGeneration } : {}) });
+  if (workerSessionEventScope && binding) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
+
+function publishAppliedReasoningSelection(path: string, selected?: AppliedReasoningSelection): void {
+  const cliId = lastInitConfig?.cliId;
+  if (!selected || path !== codexBridgeRolloutPath || (cliId !== 'codex' && cliId !== 'traex')
+    || selected.atMs < nativeReasoningNotBeforeMs || selected.atMs > Date.now()) return;
+  const nativeSessionId = cliId === 'codex' ? codexGenerationSessionIdFromRolloutPath(path) : traexSessionIdFromRolloutPath(path);
+  if (!nativeSessionId || (selected.nativeSessionId && selected.nativeSessionId !== nativeSessionId)) return;
+  publishNativeReasoningObservation({ cliId, nativeSessionId, reasoningEffort: selected.reasoningEffort,
+    source: 'native-settings', observedAtMs: selected.atMs, ...(selected.model ? { model: selected.model } : {}) });
+}
+
+function publishNativeReasoningFooter(screen: string, observedAtMs = Date.now()): void {
+  const cliId = lastInitConfig?.cliId;
+  const nativeSessionId = lastInitConfig?.cliSessionId;
+  if ((cliId !== 'codex' && cliId !== 'traex') || !nativeSessionId) return;
+  const reasoningEffort = readNativeReasoningFooter(cliId, screen);
+  if (reasoningEffort !== undefined && (reasoningEffort === null || isNativeReasoningEffort(reasoningEffort))) {
+    publishNativeReasoningObservation({ cliId, nativeSessionId, reasoningEffort, source: 'native-footer', observedAtMs });
+  }
+}
+
+function publishGrokRuntimeObservation(): void {
+  if (!backend || closeRequested || lastInitConfig?.cliId !== 'grok' || !codexBridgeRolloutPath) return;
+  const sessionDir = dirname(codexBridgeRolloutPath);
+  const nativeSessionId = lastInitConfig.cliSessionId;
+  if (!nativeSessionId) return;
+  publishNativeReasoningObservation(readGrokRuntimeObservation(sessionDir, nativeSessionId, Date.now(), nativeReasoningNotBeforeMs));
+}
+
+/** Statusline is emitted on native effort changes (Claude 2.1.322's effortValue
+ * dependency), even without an assistant turn. Do not infer from argv/settings. */
+function publishClaudeEffortObservation(): void {
+  if (!backend || closeRequested || lastInitConfig?.cliId !== 'claude-code') return;
+  // The primary transcript follows in-pane /clear and /resume; pid-state can
+  // continue naming the session that existed when the process was launched.
+  const claudeSessionId = (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined)
+    ?? bridgeObservedCliSessionId
+    ?? lastInitConfig.cliSessionId ?? lastInitConfig.sessionId;
+  const observed = claudeEffortObserver.observe(config.session.dataDir, lastInitConfig.sessionId, {
+    claudeSessionId, notBefore: claudeEffortNotBeforeMs,
+  }) ?? (terminalEffortPendingChoice || terminalEffortAwaitingClaudeChoice ? claudeEffortObserver.lastObservation : undefined);
+  if (!observed) return;
+  const userSelection = confirmedTerminalEffortChoice({ cliId: 'claude-code', nativeSessionId: claudeSessionId, cliSpawnGeneration },
+    observed.reasoningEffort, claudeEffortObserver.lastObservedAtMs, 'statusline', claudeEffortObserver.lastModel);
+  const publish = () => send({ type: 'claude_effort', ...observed, ...(userSelection ? { userSelection } : {}) });
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && binding) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -12586,6 +12756,9 @@ function structuredBridgeIngestPath(
       publishNativeGoal(result.latestGoal);
     }
     if (nativeGoalSourcePath === path) observeNativeGoal();
+    if ((result as CodexDrainResult).latestReasoningSelection) {
+      publishAppliedReasoningSelection(path, (result as CodexDrainResult).latestReasoningSelection);
+    }
     if (structuredBridgeIs('codex')) {
       // Codex resume can copy the whole conversation into a new generation
       // file; content-addressed ids let the queue dedup copied history across
@@ -18794,6 +18967,13 @@ async function handleTrustedCodexAppMarker(
   payload: Record<string, unknown>,
   control?: { generation: string; seq: number; socket?: Socket; channelId?: number; epoch?: string },
 ): Promise<boolean> {
+  if (kind === 'reasoning_observed' && lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) {
+    if (typeof payload.nativeSessionId !== 'string'
+      || (payload.reasoningEffort !== null && !isNativeReasoningEffort(payload.reasoningEffort))) return false;
+    publishNativeReasoningObservation({ cliId: 'antigravity', nativeSessionId: payload.nativeSessionId,
+      reasoningEffort: payload.reasoningEffort, source: 'acp-config' });
+    return true;
+  }
   if (kind === 'effort_result' && isCodexAppCliId(lastInitConfig?.cliId)) {
     if (typeof payload.requestId !== 'string'
       || !['applied', 'future_only', 'invalid', 'unavailable', 'error'].includes(String(payload.status))
@@ -23660,6 +23840,9 @@ function startScreenUpdates(): void {
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {
         let content = lastContent;
         let changed = false;
+        let refreshed = false;
+        let nativeScreen: string | undefined;
+        const observedAtMs = Date.now();
 
         // Capture only when the pane has emitted output since our last snapshot.
         // During idle (the steady state for a parked session) this skips a tmux
@@ -23675,6 +23858,7 @@ function startScreenUpdates(): void {
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
         })) {
+          refreshed = true;
           lastSnapshotPtyActivity = ptyActivity;
           lastSnapshotGridRevision = gridRevision;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
@@ -23694,17 +23878,19 @@ function startScreenUpdates(): void {
               const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
               if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
             }
+            nativeScreen = lastAnalyzerSnapshot;
           } else if (renderer) {
             const snap = renderer.snapshot();
             content = snap.content;
             changed = snap.changed;
+            nativeScreen = renderer.rawSnapshot();
           } else {
             return null;
           }
           lastContent = content;
         }
 
-        return { content, changed };
+        return { content, changed, refreshed, nativeScreen, observedAtMs };
       }, projectedRuntimeScreenStatus);
       if (!snapshot) return;
       // TRAE's question page sits still once drawn: the tick's screen catches
@@ -23717,6 +23903,9 @@ function startScreenUpdates(): void {
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        if (snapshot.refreshed && status === 'idle' && snapshot.nativeScreen) {
+          publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+        }
       }
       // Kimi paints its cache-expiry menu once and then sits still: the
       // per-chunk hold check can miss it while the renderer is still parsing
@@ -24616,6 +24805,17 @@ async function spawnCliBody(
   const spawnGeneration = ++cliSpawnGeneration;
   localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
+  claudeEffortNotBeforeMs = spawnStartedAtMs;
+  claudeEffortObserver.reset();
+  terminalEffortTracker.reset();
+  terminalEffortPendingChoice = undefined;
+  terminalEffortAwaitingClaudeChoice = undefined;
+  terminalEffortSavedNonce = undefined;
+  terminalEffortEnabledSinceMs = config.terminalEffortWriteback ? spawnStartedAtMs : undefined;
+  terminalEffortEnableEpoch = config.terminalEffortWriteback ? config.terminalEffortWritebackEpoch : undefined;
+  nativeReasoningNotBeforeMs = spawnStartedAtMs;
+  lastNativeReasoningKey = undefined;
+  nativeReasoningClock = undefined;
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -31208,6 +31408,10 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  claudeEffortObserver.reset();
+  terminalEffortTracker.reset();
+  lastNativeReasoningKey = undefined;
+  nativeReasoningClock = undefined;
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
   if (backend) previousCliEndedAtMs = Date.now();
@@ -31990,6 +32194,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
+              noteTerminalEffortInput(ws, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -32078,6 +32283,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
+              noteTerminalEffortInput(ws, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -32192,6 +32398,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
+              noteTerminalEffortInput(ws, msg.data);
               noteWebTerminalInput(msg.data);
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
@@ -36550,6 +36757,15 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
 
+    case 'terminal_effort_writeback_ack': {
+      if (terminalEffortPendingChoice?.nonce === msg.nonce) {
+        terminalEffortSavedNonce = msg.nonce;
+        terminalEffortPendingChoice = undefined;
+        terminalEffortAwaitingClaudeChoice = undefined;
+      }
+      break;
+    }
+
     case 'raw_input': {
       const unattendedRefusal = unattendedRawInputRefusal(msg);
       if (unattendedRefusal) {
@@ -37734,12 +37950,19 @@ process.on('message', (raw: unknown, handle: unknown) => {
 // The daemon starts every worker with an empty backlog.
 publishedCliInputBacklog = cliInputBacklogKey({ pending: false });
 setInterval(publishCliInputBacklog, 1_000).unref?.();
+// Runtime effort reporting cannot depend on a PTY redraw or a new model turn.
+const claudeEffortPollTimer = setInterval(publishClaudeEffortObservation, 1_000);
+claudeEffortPollTimer.unref?.();
+const grokRuntimePollTimer = setInterval(publishGrokRuntimeObservation, 1_000);
+grokRuntimePollTimer.unref?.();
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。
 (process as NodeJS.EventEmitter).emit(WORKER_IPC_HANDLER_READY_EVENT);
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  clearInterval(claudeEffortPollTimer);
+  clearInterval(grokRuntimePollTimer);
   workerFinalOutputHandoff?.stop();
   if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
   codexUpgradeTimer = undefined;

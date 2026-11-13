@@ -225,6 +225,10 @@ import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/re
 import { buildReplyConsoleUrl } from './dashboard-url.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
+import { applyClaudeEffortObservation } from './claude-effort-observation.js';
+import { applyNativeReasoningObservation } from './native-reasoning-observation.js';
+import { terminalEffortPreferenceKey } from '../services/terminal-effort-choice.js';
+import { persistTerminalEffortChoice, terminalEffortChoiceWasSaved, noteExplicitEffortPreferenceEdit, hasConfirmedNativeGrokEffort } from './terminal-effort-writeback.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
@@ -3746,7 +3750,7 @@ function sessionAgentConfig(
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
     const cliLaunchMode = selected.cliLaunchMode ?? undefined;
-    const reasoningEffort = selected.reasoningEffort ?? groupEffort;
+    let reasoningEffort = selected.reasoningEffort ?? groupEffort;
     const modelBackendVariant = isBackendVariantCliId(selected.cliId)
       ? selected.modelBackendVariant ?? undefined
       : undefined;
@@ -3774,6 +3778,18 @@ function sessionAgentConfig(
     const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
     const model = modelChoice.model;
     recordLaunchModel(ds, model);
+    // Newly saved native-catalog receipts have the same cold-launch fence on
+    // both storage paths. Keep legacy /cli snapshots unchanged when there is
+    // no writeback receipt, and leave modelPin's existing authority intact.
+    if (selected.cliId === 'grok' && reasoningEffort === 'xhigh'
+        && ds.session.terminalEffortPreferenceEdit?.nativeEffort === 'xhigh'
+        && !cliModelSupportsReasoningEffort(selected.cliId, model, reasoningEffort)
+        && !(config.terminalEffortWriteback && hasConfirmedNativeGrokEffort(ds.session, model))) {
+      ds.session.reasoningEffort = undefined;
+      selected.reasoningEffort = null;
+      reasoningEffort = undefined;
+      sessionStore.updateSession(ds.session);
+    }
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.
@@ -3885,7 +3901,8 @@ function sessionAgentConfig(
   // TraeX efforts are syntax-checked at load time; its live catalog owns capability.
   if (ds.session.reasoningEffort && !modelChoice.traexAutoModel
       && ds.session.cliId !== 'traex'
-      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)) {
+      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)
+      && !(config.terminalEffortWriteback && hasConfirmedNativeGrokEffort(ds.session, model))) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
   }
@@ -10447,12 +10464,15 @@ function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['
   const beforeTopic = ds.session.topicReasoningEffort;
   const snapshot = ds.session.cliLaunchSnapshot;
   const beforeSnapshot = snapshot?.reasoningEffort ?? null;
+  const beforePreferenceEdit = ds.session.terminalEffortPreferenceEdit;
+  const preferenceEdit = config.terminalEffortWriteback ? { atMs: Date.now(), source: 'explicit' as const } : undefined;
   const matched = !!beforePin && samePinModel(beforePin.model, model);
   if (matched) {
     // Read and compare inside the write transaction. A detached/stale session
     // must never resurrect a cleared pin or replace a newer explicit choice.
     const { rows } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
       const row = fresh.get(ds.session.sessionId)!;
+      if (preferenceEdit) row.terminalEffortPreferenceEdit = preferenceEdit;
       if (JSON.stringify(row.modelPin) !== JSON.stringify(beforePin)) throw new Error('model_pin_changed');
       row.modelPin = { ...row.modelPin!, effort, ...actor, setAt: new Date().toISOString() };
       if (topic && model) row.topicReasoningEffort = { model, effort };
@@ -10468,15 +10488,18 @@ function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['
       ds.session.reasoningEffort = effort;
       if (snapshot) snapshot.reasoningEffort = effort;
     }
+    if (preferenceEdit) ds.session.terminalEffortPreferenceEdit = preferenceEdit;
     try { sessionStore.updateSession(ds.session); }
     catch (error) {
       ds.session.modelPin = beforePin;
+      ds.session.terminalEffortPreferenceEdit = beforePreferenceEdit;
       ds.session.reasoningEffort = beforeEffort;
       ds.session.topicReasoningEffort = beforeTopic;
       if (ds.session.cliLaunchSnapshot) ds.session.cliLaunchSnapshot.reasoningEffort = beforeSnapshot;
       throw error;
     }
   }
+  noteExplicitEffortPreferenceEdit(ds);
   if (matched) {
     dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId, patch: { modelPin: sessionModelPinView(ds) } } });
     try { scheduleActiveRuntimePatch(ds); } catch { /* saved selection remains authoritative */ }
@@ -18731,6 +18754,7 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
+  ds.nativeReasoningObservation = undefined;
   ds.activeModelBackendVariant = undefined;
   // The model-fallback notice is the ONE runtime fact a worker generation does
   // NOT own: it must survive every respawn and stay visible each round until
@@ -20031,6 +20055,14 @@ function setupWorkerHandlers(
             ? { workerGeneration: ds.workerGeneration }
             : {}),
         };
+        if (msg.cliSpawnGeneration !== undefined && msg.cliSpawnGeneration !== previousSpawnGeneration
+          && ds.nativeReasoningObservation) {
+          if (ds.nativeReasoningObservation.cliSpawnGeneration !== msg.cliSpawnGeneration) {
+            ds.nativeReasoningObservation = undefined;
+            if (effectiveCliId === 'grok') ds.activeReasoningEffort = undefined;
+          }
+          scheduleActiveRuntimePatch(ds);
+        }
         break;
       }
       case 'queued_activation_submitted': {
@@ -20937,6 +20969,46 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'native_reasoning': {
+        if (config.terminalEffortWriteback && msg.userSelection) {
+          try {
+            const saved = persistTerminalEffortChoice(ds, msg, { worker, workerGeneration, cliId: effectiveCliId }, {
+              enabled: config.terminalEffortWriteback, enableEpoch: config.terminalEffortWritebackEpoch, mutate: sessionStore.mutateOwnedSessionsAtomically,
+              supportsEffort: cliModelSupportsReasoningEffort,
+            });
+            if (saved || terminalEffortChoiceWasSaved(ds, msg.userSelection.nonce)) {
+              worker.send({ type: 'terminal_effort_writeback_ack', nonce: msg.userSelection.nonce, preference: terminalEffortPreferenceKey(ds.session) } satisfies DaemonToWorker);
+            }
+          } catch (error) {
+            logger.warn(`[${t}] Terminal effort preference was not saved: ${(error as Error).message}`);
+          }
+        }
+        if (applyNativeReasoningObservation(ds, msg, { worker, workerGeneration, cliId: effectiveCliId })) {
+          scheduleActiveRuntimePatch(ds);
+        }
+        break;
+      }
+
+      case 'claude_effort': {
+        if (config.terminalEffortWriteback && msg.userSelection) {
+          try {
+            const saved = persistTerminalEffortChoice(ds, msg, { worker, workerGeneration, cliId: effectiveCliId }, {
+              enabled: config.terminalEffortWriteback, enableEpoch: config.terminalEffortWritebackEpoch, mutate: sessionStore.mutateOwnedSessionsAtomically,
+              supportsEffort: cliModelSupportsReasoningEffort,
+            });
+            if (saved || terminalEffortChoiceWasSaved(ds, msg.userSelection.nonce)) {
+              worker.send({ type: 'terminal_effort_writeback_ack', nonce: msg.userSelection.nonce, preference: terminalEffortPreferenceKey(ds.session) } satisfies DaemonToWorker);
+            }
+          } catch (error) {
+            logger.warn(`[${t}] Terminal effort preference was not saved: ${(error as Error).message}`);
+          }
+        }
+        if (applyClaudeEffortObservation(ds, msg, { worker, workerGeneration, cliId: effectiveCliId })) {
+          scheduleActiveRuntimePatch(ds);
+        }
+        break;
+      }
+
       case 'model_fallback': {
         if (
           ds.worker !== worker
@@ -20960,8 +21032,8 @@ function setupWorkerHandlers(
         // has the session answering on something else. The serving model is a
         // per-reply observation of the real thing, so it is the runtime model:
         // same "only write when it changed, then patch" semantics as the
-        // active_runtime handler. Effort is untouched — Claude reports none,
-        // and a blank one would erase what another channel wrote.
+        // active_runtime handler. Effort is observed separately from statusline;
+        // this model-only channel must not erase it.
         let runtimeChanged = false;
         const servingModel = normalizeClaudeModelId(msg.servingModel);
         if (servingModel && ds.activeModel !== servingModel) {

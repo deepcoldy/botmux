@@ -1083,7 +1083,7 @@ function pushStreamBody(
   const usageSeg = usage
     ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
     : null;
-  const runtimeSeg = usage ? cardUsageRuntimeSegment(usage) : null;
+  const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, locale) : null;
   if (usageSeg || runtimeSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This

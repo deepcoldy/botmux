@@ -1251,6 +1251,7 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   /** Experimental, default OFF: reap tmux servers orphaned by a previous
    *  daemon generation at daemon startup (automatic process kill). */
   reapOrphanTmuxServers: boolean;
@@ -1936,6 +1937,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    terminalEffortWriteback: dashboard.terminalEffortWriteback === true,
     reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     tmuxOrphanSessionSweep: dashboard.tmuxOrphanSessionSweep !== false, // default ON report-only; explicit false disables
     tmuxOrphanSessionBareWrapperKill: dashboard.tmuxOrphanSessionBareWrapperKill === true, // default OFF narrow kill

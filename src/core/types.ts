@@ -715,6 +715,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */

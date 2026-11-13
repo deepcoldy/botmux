@@ -30,6 +30,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       'settings.herdrTraexPlugin',
       'settings.codexRpcInput',
       'settings.autoUpgradeCodexSessions',
+      'settings.terminalEffortWriteback',
       'settings.bypassCodexHookTrust',
       'settings.hideCodexRateLimitModelNudge',
       'settings.codexNotifier',
