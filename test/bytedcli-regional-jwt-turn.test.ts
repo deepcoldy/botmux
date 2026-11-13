@@ -25,8 +25,11 @@ vi.mock('../src/utils/user-token.js', () => ({
 }));
 type LocalJwts = { cloudJwt: string; codeJwt?: string; regionalCloudJwts?: Record<string, string> };
 const localJwts = new Map<string, LocalJwts>();
+/** What a mid-turn renewal of this person's local login returns. */
+const renewedJwts = new Map<string, LocalJwts>();
+const renewCalls: string[] = [];
 vi.mock('../src/services/bytedcli-auth.js', () => ({
-  renewBytedcliJwts: vi.fn(async () => null),
+  renewBytedcliJwts: vi.fn(async (openId: string) => { renewCalls.push(openId); return renewedJwts.get(openId) ?? null; }),
   mintBytedcliJwts: vi.fn(async (openId: string) => localJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://cloud.example.test/local-bytedcli', completeToken: 'tok' })),
 }));
@@ -41,6 +44,7 @@ const {
   renderIdentityWrapper, IDENTITY_DENIED_EXIT_CODE, recallProvenIdentityContent, forgetProvenIdentityContent,
 } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+const { renewExpiringBytedcliIdentities, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
 const { requestCredentialGrant } = await import('../src/platform/credential-grant-client.js');
 
@@ -85,6 +89,9 @@ let lastTurn: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-regional-jwt-turn-'));
   localJwts.clear();
+  renewedJwts.clear();
+  renewCalls.length = 0;
+  forgetBytedcliIdentityRenewals();
   grantBodies = [];
   platform = { upToDate: true, partitions: {} };
   __setPlatformCredentialDepsForTest({
@@ -292,4 +299,43 @@ describe('platform grant', () => {
     expectRefused(bytedcli('--site', 'i18n-tt', 'aa', 'query'), 'i18n', '平台为发起人签票');
   });
 });
+});
+
+// Only a locally minted identity held by the daemon (proven) is renewed mid-turn.
+describe('mid-turn renewal of a local identity', () => {
+  beforeEach(() => { storageModel = 'proven'; });
+
+  it('serves --site cn with the renewed default once that claims CN, not with a CN token from before', async () => {
+    const soon = Math.floor(Date.now() / 1000) + 20 * 60;
+    const earlierCn = jwt('cn', 'alice', soon);
+    localJwts.set(ALICE, { cloudJwt: jwt('i18n', 'alice', soon), regionalCloudJwts: { i18n: jwt('i18n', 'alice', soon), cn: earlierCn } });
+    await publishFor('local', ALICE);
+    expect(bytedcli('--site', 'cn', 'oncall', 'tenant', 'get')).toMatchObject({ status: 0, jwt: earlierCn });
+
+    // The renewed default claims CN, so the renewal mints no separate CN token.
+    const renewedDefault = jwt('cn', 'alice-renewed');
+    renewedJwts.set(ALICE, { cloudJwt: renewedDefault, regionalCloudJwts: { i18n: jwt('i18n', 'alice-renewed') } });
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(bytedcli('--site', 'cn', 'oncall', 'tenant', 'get')).toMatchObject({ status: 0, jwt: renewedDefault });
+    expect(bytedcli('--site', 'i18n-tt', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('i18n', 'alice-renewed') });
+    // Nothing published is close to expiry any more, so the next sweep leaves the turn alone.
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renewCalls).toEqual([ALICE]);
+  });
+
+  it('keeps a CN token serving --site cn while the renewed default stays outside CN', async () => {
+    const soon = Math.floor(Date.now() / 1000) + 20 * 60;
+    const earlierCn = jwt('cn', 'alice', soon);
+    localJwts.set(ALICE, { cloudJwt: jwt('i18n', 'alice', soon), regionalCloudJwts: { i18n: jwt('i18n', 'alice', soon), cn: earlierCn } });
+    await publishFor('local', ALICE);
+
+    // The CN refresh failed this time: the earlier CN token is kept until a later sweep refreshes it.
+    renewedJwts.set(ALICE, { cloudJwt: jwt('i18n', 'alice-1'), regionalCloudJwts: { i18n: jwt('i18n', 'alice-1') } });
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(bytedcli('--site', 'cn', 'oncall', 'tenant', 'get')).toMatchObject({ status: 0, jwt: earlierCn });
+
+    renewedJwts.set(ALICE, { cloudJwt: jwt('i18n', 'alice-2'), regionalCloudJwts: { i18n: jwt('i18n', 'alice-2'), cn: jwt('cn', 'alice-2') } });
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(bytedcli('--site', 'cn', 'oncall', 'tenant', 'get')).toMatchObject({ status: 0, jwt: jwt('cn', 'alice-2') });
+  });
 });

@@ -483,6 +483,24 @@ describe('mintBytedcliJwts — partition-scoped regional tokens', () => {
     expect(calls.every(c => c.home === mod.bytedcliHomeFor(ALICE))).toBe(true);
   });
 
+  // The wrapper serves `--site cn` with such a default token (renderIdentityEnv),
+  // so a separate CN mint would only cost a CLI run per turn and per renewal.
+  it('lets a default token that claims CN serve CN: no separate --site cn mint, on a turn or on renewal', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    const cnDefault = jwtFor('cn', 7200, 'default');
+    const separateCn = jwtFor('cn', 7200, 'separate');
+    const regionalMisses = [{ code: 1 }, { code: 1 }, { code: 1 }];
+    replies = [{ code: 0, stdout: `${cnDefault}\n` }, { code: 0, stdout: 'k1\n' }, ...regionalMisses, { code: 0, stdout: `${separateCn}\n` }];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: cnDefault, codeJwt: 'k1' });
+    const renewedDefault = jwtFor('cn', 7200, 'renewed');
+    replies = [{ code: 0, stdout: `${renewedDefault}\n` }, { code: 0, stdout: 'k2\n' }, ...regionalMisses, { code: 0, stdout: `${separateCn}\n` }];
+    expect(await mod.renewBytedcliJwts(ALICE)).toEqual({ cloudJwt: renewedDefault, codeJwt: 'k2' });
+    expect(calls.filter(c => c.args[0] === '--site').map(c => c.args[1])).toEqual([
+      'i18n-tt', 'i18n-bd', 'us-ttp', 'i18n-tt', 'i18n-bd', 'us-ttp',
+    ]);
+  });
+
   it('renewal returns null when the default token cannot be refreshed', async () => {
     const mod = await fresh();
     authorize(mod, ALICE);

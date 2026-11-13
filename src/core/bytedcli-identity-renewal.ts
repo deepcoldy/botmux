@@ -13,6 +13,7 @@
  * other than what this module last wrote.
  */
 import { logger } from '../utils/logger.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { renewBytedcliJwts } from '../services/bytedcli-auth.js';
 import {
   recallProvenIdentityContent,
@@ -111,14 +112,16 @@ export async function renewExpiringBytedcliIdentities(
       // The turn may have ended or been republished while the CLI ran.
       if (entries.get(key) !== entry) continue;
       if (!stillPublished(entry)) { entries.delete(key); continue; }
+      // A default token that claims CN serves CN itself, and renewal then
+      // mints no separate CN token: an earlier one must not stay in its place.
+      const regionalCloudJwts = { ...entry.identity.regionalCloudJwts, ...jwts.regionalCloudJwts };
+      if (jwtClaims(jwts.cloudJwt)?.region === 'cn') delete regionalCloudJwts.cn;
       const identity: BytedCliIdentity & { turnId: string } = {
         tool: 'bytedcli',
         cloudJwt: jwts.cloudJwt,
         // Keep material the renewal could not refresh rather than drop it.
         ...(jwts.codeJwt ?? entry.identity.codeJwt ? { codeJwt: jwts.codeJwt ?? entry.identity.codeJwt } : {}),
-        ...(jwts.regionalCloudJwts || entry.identity.regionalCloudJwts
-          ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, ...jwts.regionalCloudJwts } }
-          : {}),
+        ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
         ...(entry.identity.regionalCloudJwtSource ? { regionalCloudJwtSource: entry.identity.regionalCloudJwtSource } : {}),
         turnId: entry.identity.turnId,
         ...(entry.identity.openId ? { openId: entry.identity.openId } : {}),
