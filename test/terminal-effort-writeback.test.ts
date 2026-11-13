@@ -438,3 +438,35 @@ describe('actual worker confirmation, transaction and ACK pipeline', () => {
     expect(p.mutate).not.toHaveBeenCalled(); expect(p.f.state.session.reasoningEffort).toBe('low');
   });
 });
+
+describe('terminal input observation never blocks keystroke delivery', () => {
+  function hook(trackerInput: ReturnType<typeof vi.fn>) {
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'codex', cliSessionId: 'native' },
+      terminalEffortAwaitingClaudeChoice: undefined,
+      terminalEffortTracker: { input: trackerInput, reset: vi.fn() },
+      cliSpawnGeneration: 3,
+      terminalEffortWritebackEnabled: () => true,
+      isPromptReady: true,
+      cliRestartInProgress: false,
+      lastAnalyzerSnapshot: '',
+      renderer: undefined,
+      config: { terminalEffortWritebackEpoch: 7 },
+      readTerminalEffortPreference: () => '["high",null,null,null]',
+    };
+    return loadWorkerFunction<(client: object, data: string) => void>('noteTerminalEffortInput', scope);
+  }
+
+  it('swallows an observer failure so the authenticated keystroke still reaches the PTY write after it', () => {
+    const note = hook(vi.fn(() => { throw new Error('sqlite engine unavailable'); }));
+    expect(() => note({}, '/effort medium\r')).not.toThrow();
+  });
+
+  it('still forwards a normal keystroke with the current process binding', () => {
+    const input = vi.fn();
+    const note = hook(input);
+    note({}, '/effort medium\r');
+    expect(input).toHaveBeenCalledTimes(1);
+    expect(input.mock.calls[0]![2]).toMatchObject({ cliId: 'codex', nativeSessionId: 'native', cliSpawnGeneration: 3 });
+  });
+});

@@ -9314,17 +9314,21 @@ function terminalEffortWritebackEnabled(): boolean {
 }
 
 function noteTerminalEffortInput(client: object, data: string): void {
-  const cliId = lastInitConfig?.cliId;
-  const nativeSessionId = cliId === 'claude-code'
-    ? (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined) ?? bridgeObservedCliSessionId ?? lastInitConfig?.cliSessionId
-    : lastInitConfig?.cliSessionId;
-  if (!cliId || !nativeSessionId) return;
-  if (data.includes('\x03') || data === '\x1b') terminalEffortAwaitingClaudeChoice = undefined;
-  terminalEffortTracker.input(client, data, { cliId, nativeSessionId, cliSpawnGeneration }, {
-    enabled: terminalEffortWritebackEnabled(), ready: isPromptReady && !cliRestartInProgress,
-    screen: lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
-    enableEpoch: config.terminalEffortWritebackEpoch, readPreference: readTerminalEffortPreference,
-  });
+  // Observation only: a failing preference read or tracker must never swallow
+  // the authenticated keystroke that runs immediately after this hook.
+  try {
+    const cliId = lastInitConfig?.cliId;
+    const nativeSessionId = cliId === 'claude-code'
+      ? (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined) ?? bridgeObservedCliSessionId ?? lastInitConfig?.cliSessionId
+      : lastInitConfig?.cliSessionId;
+    if (!cliId || !nativeSessionId) return;
+    if (data.includes('\x03') || data === '\x1b') terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.input(client, data, { cliId, nativeSessionId, cliSpawnGeneration }, {
+      enabled: terminalEffortWritebackEnabled(), ready: isPromptReady && !cliRestartInProgress,
+      screen: lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
+      enableEpoch: config.terminalEffortWritebackEpoch, readPreference: readTerminalEffortPreference,
+    });
+  } catch { /* observer failure must not block input delivery */ }
 }
 function confirmedTerminalEffortChoice(binding: TerminalEffortBinding, effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null,
   atMs: number | undefined, evidence: 'native-settings' | 'native-footer' | 'native-summary' | 'statusline', model?: string,
