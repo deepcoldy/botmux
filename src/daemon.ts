@@ -171,6 +171,7 @@ import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.j
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { resolveImportedTopicHandoff } from './services/imported-topic-handoff.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -35023,6 +35024,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
+      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => resolveImportedTopicHandoff({
+        rootId,
+        chatId,
+        larkAppId: appId,
+        // One cross-bot lookup (this bot's own sessions are excluded inside).
+        sessionsAtRoot: sessionStore.findActiveSessionsByRoot(rootId),
+        chatScopeSessions: () => sessionStore.findActiveChatScopeSessionsByChat(chatId),
+        // One bot per daemon: a peer is not registered here, read bots.json.
+        peerConfig: peerAppId => {
+          try { return getBot(peerAppId).config; } catch { /* not this daemon's bot */ }
+          return loadBotConfigsCached().find(b => b.larkAppId === peerAppId);
+        },
+        groupMode: () => readGroupCollaborationMode(config.session.dataDir, chatId),
+      }),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,
