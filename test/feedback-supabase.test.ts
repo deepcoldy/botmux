@@ -42,6 +42,18 @@ describe('Supabase feedback storage', () => {
     expect(fixtureData.requests.map(request => request.body.p_operation)).toEqual(['migration_status', 'getResponse']);
     await storage.store.close();
   });
+  it.each([
+    { meta: { version: 1, instance_id: 'installation-id', state: 'empty' }, label: 'a target that was never activated' },
+    { meta: { version: 1, instance_id: 'installation-id', state: 'migrating' }, label: 'a target still in migration' },
+    { meta: { version: 1, instance_id: 'other-installation', state: 'active' }, label: 'a foreign installation identity' },
+    { meta: { version: 2, instance_id: 'installation-id', state: 'active' }, label: 'an unsupported meta version' },
+  ])('refuses to open storage against $label and stops before any data operation', async ({ meta }) => {
+    const fixtureData = await fixture(operation => new Response(JSON.stringify({ version: 1, result: operation === 'migration_status' ? meta : null }), { headers: { 'content-type': 'application/json' } }));
+    const { openSupabaseFeedbackStorage } = await import('../src/services/feedback-supabase-store.js');
+    await expect(openSupabaseFeedbackStorage(fixtureData.dataDir, fixtureData.target, 'installation-id', fixtureData.fetcher))
+      .rejects.toThrow('feedback_storage_target_not_active');
+    expect(fixtureData.requests.map(request => request.body.p_operation)).toEqual(['migration_status']);
+  });
   it('does not replay a mutation when transport outcome is unknown and redacts upstream content', async () => {
     const fixtureData = await fixture(() => { throw new Error('network failed: sb_secret_private_test_key'); });
     const { openSupabaseFeedbackClient } = await import('../src/services/feedback-supabase-store.js');
