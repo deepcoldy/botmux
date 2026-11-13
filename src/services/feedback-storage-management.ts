@@ -30,7 +30,11 @@ export function feedbackStorageView(config: FeedbackStorageConfig) {
 export async function feedbackStorageStatus(dataDir: string) {
   const config = await readFeedbackStorageConfig(dataDir);
   const { listFeedbackMigrations } = await import('./feedback-migration.js');
-  const jobs = await listFeedbackMigrations(dataDir);
+  const jobs: Array<{ migrationId: string; phase: string; blockers: string[] }> = await listFeedbackMigrations(dataDir);
+  if (existsSync(join(dataDir, 'feedback-supabase-migrations'))) {
+    const { listSupabaseFeedbackMigrations } = await import('./feedback-supabase-migration.js');
+    jobs.push(...await listSupabaseFeedbackMigrations(dataDir));
+  }
   return { ...feedbackStorageView(config), maintenance: currentFeedbackMaintenance(dataDir),
     migrations: jobs.map(job => ({ migrationId: job.migrationId, phase: job.phase, blockers: job.blockers })) };
 }
@@ -44,6 +48,7 @@ export async function configureFeedbackStorageCandidate(dataDir: string, request
   if (candidate.backend === 'supabase') {
     if (!candidate.supabase || request.password || request.token || request.ca) throw new Error('feedback_storage_auth_invalid');
     const previous = current.candidate?.backend === 'supabase' ? current.candidate.supabase : current.active.backend === 'supabase' ? current.active.supabase : undefined;
+    if (!request.supabaseKey && !candidate.supabase.keyRef && previous?.url !== candidate.supabase.url) throw new Error('feedback_supabase_key_required');
     candidate.supabase.keyRef = request.supabaseKey
       ? await putFeedbackStorageSecret(dataDir, request.supabaseKey)
       : candidate.supabase.keyRef || previous?.keyRef || '';
@@ -84,6 +89,8 @@ export async function testFeedbackStorageConnection(dataDir: string): Promise<{ 
     try {
       const meta = await client.call<{ version: number; instance_id: string }>('migration_status', [], config.instanceId);
       if (meta.version !== 1 || meta.instance_id !== config.instanceId) throw new Error('feedback_storage_target_identity_conflict');
+      const after = await readFeedbackStorageConfig(dataDir);
+      if (JSON.stringify(after) !== JSON.stringify(config)) throw new Error('feedback_storage_generation_conflict');
       return { ok: true, backend: 'supabase' };
     } finally { await client.close(); }
   }
@@ -118,13 +125,14 @@ export async function initializeFeedbackStorage(dataDir: string, expectedGenerat
       }
     } finally { database.close(); }
   }
-  if (config.candidate.backend === 'postgresql') {
+  if (config.candidate.backend === 'postgresql' || config.candidate.backend === 'supabase') {
     const source = await SkillFeedbackStore.open(dataDir);
     source.close();
-    const { startFeedbackMigration } = await import('./feedback-migration.js');
-    const job = await startFeedbackMigration(dataDir, {
+    const { prepareStorageMigration, resumeStorageMigration } = await import('./feedback-migration-router.js');
+    const prepared = await prepareStorageMigration(dataDir, {
       requestId: `initialize-${randomUUID()}`, expectedGeneration, maintenanceConfirmed: true,
     });
+    const job = await resumeStorageMigration(dataDir, prepared.migrationId);
     if (job.phase !== 'complete') throw new Error(job.blockers[0] ?? 'feedback_storage_initialization_blocked');
     return readFeedbackStorageConfig(dataDir);
   }

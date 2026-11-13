@@ -25,6 +25,25 @@ describe('feedback storage CLI', () => {
       expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('sqlite');
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
+  it('resumes and cancels the original Supabase migration through the shared CLI', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'feedback-cli-supabase-migration-'));
+    const { prepareSupabaseFeedbackMigration } = await import('../src/services/feedback-supabase-migration.js');
+    let output = '';
+    const io = { input: Readable.from([]), output: new Writable({ write(chunk, _encoding, done) { output += String(chunk); done(); } }), error: new Writable({ write(_chunk, _encoding, done) { done(); } }) };
+    try {
+      const config = await readFeedbackStorageConfig(directory);
+      const saved = await saveFeedbackStorageCandidate(directory, config.generation, { backend: 'supabase', supabase: {
+        url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'botmux_feedback', requestTimeoutMs: 5000,
+      } });
+      const job = await prepareSupabaseFeedbackMigration(directory, { requestId: 'original', expectedGeneration: saved.generation, maintenanceConfirmed: true });
+      expect(await runFeedbackStorageCommand(['cancel', job.migrationId, '--yes', '--reason', 'withdrawn', '--evidence', 'test:original'], io, directory)).toBe(0);
+      expect(JSON.parse(output.trim()).phase).toBe('cancelled');
+      output = '';
+      expect(await runFeedbackStorageCommand(['resume', job.migrationId], io, directory)).toBe(1);
+      expect(JSON.parse(output.trim()).phase).toBe('cancelled');
+      expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('sqlite');
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('requires evidence for cancellation and exposes pre-freeze recovery without a database', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-cli-cancel-'));
     const output: string[] = [];

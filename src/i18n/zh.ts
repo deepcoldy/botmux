@@ -16,7 +16,7 @@ export const messages: Record<string, string> = {
   'worker.purge_images_partial': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），CLI 已以 --resume 重启。但会话记录里还有无法确认尺寸或没能处理的图片，已原样保留；为免再撞同一个错误，这次没有自动续跑。发送任意消息即可继续；如果仍报同样的错误，请用 /clear 或开新话题恢复。',
   'worker.purge_images_restart_failed': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），但 CLI 重启失败，这次没有自动续跑。请按随后的错误提示恢复 CLI，再发送消息继续。',
   'worker.purge_images_superseded': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），但这次重启被另一次重启取代，没有自动续跑。等 CLI 恢复后发送任意消息即可继续。',
-  'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL (sqlite/postgresql)：',
+  'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL / Supabase (sqlite/postgresql/supabase)：',
   'feedback.storage.configPath': 'PostgreSQL 配置 JSON 路径（仅凭据引用，不填明文密码）：',
   'cmd.cli.usage': '用法：/cli <CLI ID 或简写>，在会话启动前给本话题选 CLI，不区分大小写。\n简写和程序名：\n{aliases}\n全部 CLI ID：{ids}',
   'cmd.cli.unknown': '未知 CLI：{input}',

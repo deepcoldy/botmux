@@ -78,4 +78,40 @@ describe('Supabase feedback storage', () => {
     await expect(client.call('recordFeedback', [{ callbackKey: 'original-key' }], 'installation-id')).rejects.toThrow('feedback_supabase_outcome_unknown');
     expect(fixtureData.requests).toHaveLength(1);
   });
+  it('keeps timeout and close active while an RPC response body is incomplete', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let signal!: AbortSignal;
+    const fixtureData = await fixture(() => new Response('{}'));
+    const transport: typeof fetch = async (_input, init) => {
+      signal = init!.signal!;
+      return new Response(new ReadableStream({
+        start(streamController) {
+          controller = streamController;
+          streamController.enqueue(new TextEncoder().encode('{"version":1,"result":'));
+          signal.addEventListener('abort', () => streamController.error(new Error('aborted')), { once: true });
+        },
+      }), { headers: { 'content-type': 'application/json' } });
+    };
+    const { openSupabaseFeedbackClient } = await import('../src/services/feedback-supabase-store.js');
+    const client = await openSupabaseFeedbackClient(fixtureData.dataDir, { ...fixtureData.target, requestTimeoutMs: 30 }, transport);
+    const pending = client.call('recordFeedback', [{}], 'installation-id').then(() => 'success', error => error.message);
+    await new Promise(resolve => setTimeout(resolve, 70));
+    expect(signal.aborted).toBe(true);
+    expect(await pending).toBe('feedback_supabase_outcome_unknown');
+    await client.close();
+    void controller;
+  });
+  it('forces authenticated SDK requests to reject redirects and preserves established conflict errors', async () => {
+    const fixtureData = await fixture(() => new Response(JSON.stringify({ code: 'P0001', message: 'turn_delivery_correlation_rebind', details: null, hint: null }), { status: 400, headers: { 'content-type': 'application/json' } }));
+    let redirect: RequestRedirect | undefined;
+    const transport: typeof fetch = async (input, init) => {
+      redirect = init?.redirect;
+      return fixtureData.fetcher(input, init);
+    };
+    const { openSupabaseFeedbackClient } = await import('../src/services/feedback-supabase-store.js');
+    const client = await openSupabaseFeedbackClient(fixtureData.dataDir, fixtureData.target, transport);
+    await expect(client.call('recordTurnDelivery', [{}], 'installation-id')).rejects.toThrow('turn_delivery_correlation_rebind');
+    expect(redirect).toBe('error');
+    await client.close();
+  });
 });

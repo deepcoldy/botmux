@@ -43,6 +43,44 @@ describe('feedback storage configuration', () => {
     expect(saved.candidate).toEqual(candidate);
     expect((await getFeedbackStorage(path)).store).toBeDefined();
   });
+  it('does not reuse a saved Supabase key when the target origin changes', async () => {
+    const path = await directory();
+    const { configureFeedbackStorageCandidate } = await import('../src/services/feedback-storage-management.js');
+    const candidate = { backend: 'supabase' as const, supabase: {
+      url: 'https://first.supabase.co', keyRef: '', schema: 'feedback', requestTimeoutMs: 5000,
+    } };
+    const current = await readFeedbackStorageConfig(path);
+    const saved = await configureFeedbackStorageCandidate(path, { expectedGeneration: current.generation, candidate, supabaseKey: 'sb_secret_first' });
+    await expect(configureFeedbackStorageCandidate(path, {
+      expectedGeneration: saved.generation, candidate: { ...candidate, supabase: { ...candidate.supabase, url: 'https://second.supabase.co' } },
+    })).rejects.toThrow('feedback_supabase_key_required');
+    expect(await readFeedbackStorageConfig(path)).toEqual(saved);
+  });
+  it('does not report a stale Supabase connection test as success after configuration changes', async () => {
+    const path = await directory();
+    const { configureFeedbackStorageCandidate, testFeedbackStorageConnection } = await import('../src/services/feedback-storage-management.js');
+    const current = await readFeedbackStorageConfig(path);
+    const saved = await configureFeedbackStorageCandidate(path, {
+      expectedGeneration: current.generation, supabaseKey: 'sb_secret_test_key',
+      candidate: { backend: 'supabase', supabase: { url: 'https://example.supabase.co', schema: 'feedback', keyRef: '', requestTimeoutMs: 5000 } },
+    });
+    const originalFetch = globalThis.fetch;
+    let release!: () => void;
+    let entered!: () => void;
+    const requested = new Promise<void>(resolve => { entered = resolve; });
+    globalThis.fetch = async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      return new Response(JSON.stringify({ version: 1, result: { version: 1, instance_id: current.instanceId, state: 'empty' } }), { headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const pending = testFeedbackStorageConnection(path).then(() => 'success', error => error.message);
+      await requested;
+      await saveFeedbackStorageCandidate(path, saved.generation, { backend: 'sqlite' });
+      release();
+      expect(await pending).toBe('feedback_storage_generation_conflict');
+    } finally { globalThis.fetch = originalFetch; }
+  });
   it.each([
     { url: 'http://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
     { url: 'https://user:password@example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },

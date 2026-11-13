@@ -13,7 +13,7 @@ export const messages: Record<string, string> = {
   'worker.purge_images_partial': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside) and restarted the CLI with --resume. Some images in the transcript could not be measured or processed and were left as they are, so the conversation was not continued automatically, to avoid hitting the same error again. Send any message to continue; if the same error comes back, recover with /clear or start a new topic.',
   'worker.purge_images_restart_failed': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside), but the CLI failed to restart, so the conversation was not continued. Recover the CLI as the following error message suggests, then send a message to continue.',
   'worker.purge_images_superseded': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside), but another restart replaced this one, so the conversation was not continued. Send any message once the CLI is back.',
-  'feedback.storage.choose': 'Feedback storage: SQLite [default] / PostgreSQL (sqlite/postgresql): ',
+  'feedback.storage.choose': 'Feedback storage: SQLite [default] / PostgreSQL / Supabase (sqlite/postgresql/supabase): ',
   'feedback.storage.configPath': 'PostgreSQL config JSON path (credential reference only, no plaintext password): ',
   'cmd.cli.usage': 'Usage: /cli <cliId or alias> picks the CLI for this topic before its session starts; case-insensitive.\nAliases and program names:\n{aliases}\nAll CLI ids: {ids}',
   'cmd.cli.unknown': 'Unknown CLI: {input}',

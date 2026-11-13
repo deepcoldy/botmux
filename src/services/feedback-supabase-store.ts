@@ -44,7 +44,11 @@ export async function openSupabaseFeedbackClient(
     requests.add(controller);
     const timer = setTimeout(() => controller.abort(), target.requestTimeoutMs);
     timer.unref();
-    try { return await transport(input, { ...init, signal: controller.signal }); }
+    try {
+      const response = await transport(input, { ...init, signal: controller.signal, redirect: 'error' });
+      const body = await response.text();
+      return new Response(body || null, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
     finally { clearTimeout(timer); requests.delete(controller); }
   };
   const sdk = createClient(target.url, key, {
@@ -69,7 +73,8 @@ export async function openSupabaseFeedbackClient(
           throw new Error('feedback_supabase_outcome_unknown');
         }
         const message = response.error.message;
-        throw new Error(/^feedback_[a-z_]+$/.test(message) ? message : 'feedback_supabase_operation_failed');
+        const knownConflict = ['turn_delivery_platform_message_rebind', 'turn_delivery_correlation_rebind', 'turn_terminal_status_conflict'].includes(message);
+        throw new Error(/^feedback_[a-z_]+$/.test(message) || knownConflict ? message : 'feedback_supabase_operation_failed');
       }
       if (!response.data || response.data.version !== 1 || !Object.hasOwn(response.data, 'result')) {
         throw new Error(mutationOperations.has(operation) ? 'feedback_supabase_outcome_unknown' : 'feedback_supabase_response_invalid');

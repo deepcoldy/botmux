@@ -18,6 +18,7 @@ let directory: string;
 let pool: Pool;
 let started = false;
 const schemas: string[] = [];
+const roles: string[] = [];
 
 beforeAll(async () => {
   if (!available) return;
@@ -37,6 +38,7 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   for (const schema of schemas) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+  for (const role of roles) await pool.query(`DROP ROLE "${role}"`);
   await pool?.end();
   if (started) execFileSync(join(binaries, 'pg_ctl'), ['-D', join(directory, 'data'), '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' });
   if (directory) await rm(directory, { recursive: true, force: true });
@@ -59,6 +61,31 @@ async function fixture(active = true) {
   return { schema, instanceId, call };
 }
 
+async function serviceConnection(schema: string) {
+  const role = `feedback_service_${randomUUID().replaceAll('-', '')}`;
+  roles.push(role);
+  await pool.query(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`);
+  await pool.query(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}";
+    GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}";
+    GRANT USAGE,SELECT,UPDATE ON ALL SEQUENCES IN SCHEMA "${schema}" TO "${role}";
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA "${schema}" TO "${role}"`);
+  const client = await pool.connect();
+  await client.query(`SET ROLE "${role}"`);
+  expect((await client.query('SELECT rolsuper FROM pg_roles WHERE rolname=current_user')).rows[0].rolsuper).toBe(false);
+  const emit = async (instance: string, envelope: unknown, destinations: unknown[] = [destination]) => {
+    return client.query(`SELECT "${schema}".feedback_emit_event($1,$2::jsonb,$3,$4::jsonb)`, [instance, JSON.stringify(envelope), 'external', JSON.stringify(destinations)]);
+  };
+  const reconcile = async (instance: string, deliveryId: string) => {
+    return client.query(`SELECT "${schema}".feedback_reconcile($1,$2) payload`, [instance, deliveryId]);
+  };
+  const close = async () => {
+    await client.query('ROLLBACK');
+    await client.query('RESET ROLE');
+    client.release();
+  };
+  return { client, emit, reconcile, close };
+}
+
 const destination = { id: 'test', enabled: true, url: 'https://example.test/webhook', secretRef: 'env:TEST', eventTypes: ['turn.completed', 'feedback.revised'] };
 const turn = {
   botAppId: 'app', sessionId: 'session', turnId: 'turn', platform: 'lark', platformAppId: 'app',
@@ -69,6 +96,89 @@ const turn = {
 const vote = { platform: 'lark', platformAppId: 'app', platformMessageId: 'message', operatorSubjectId: 'first', callbackKey: 'first', result: 'helpful', semantic: 'positive' };
 
 describe.skipIf(!available)('Supabase SQL RPC on disposable PostgreSQL', () => {
+  it('rejects direct mutating helper calls outside active installation identity as a non-superuser', async () => {
+    const { schema, instanceId, call } = await fixture(false);
+    await call('migration_prepare', ['guard', 'sha256:guard']);
+    const service = await serviceConnection(schema);
+    const envelope = { eventId: 'helper-bypass', type: 'feedback.revised', version: 1, time: '2026-11-01', data: {} };
+    try {
+      for (const state of ['migrating', 'retired', 'empty']) {
+        await pool.query(`UPDATE "${schema}".feedback_storage_meta SET state=$1`, [state]);
+        await expect(service.emit(instanceId, envelope)).rejects.toThrow('feedback_storage_target_not_active');
+        await expect(service.reconcile(instanceId, 'missing')).rejects.toThrow('feedback_storage_target_not_active');
+      }
+      await pool.query(`UPDATE "${schema}".feedback_storage_meta SET state='active'`);
+      await expect(service.emit(randomUUID(), envelope)).rejects.toThrow('feedback_storage_target_identity_conflict');
+      await expect(service.reconcile(randomUUID(), 'missing')).rejects.toThrow('feedback_storage_target_identity_conflict');
+      await pool.query(`UPDATE "${schema}".feedback_storage_meta SET version=2`);
+      await expect(service.emit(instanceId, envelope)).rejects.toThrow('feedback_storage_target_identity_conflict');
+      await expect(service.reconcile(instanceId, 'missing')).rejects.toThrow('feedback_storage_target_identity_conflict');
+      expect((await pool.query(`SELECT COUNT(*) count FROM "${schema}".feedback_events`)).rows[0].count).toBe('0');
+      expect((await pool.query(`SELECT COUNT(*) count FROM "${schema}".feedback_outbox`)).rows[0].count).toBe('0');
+      expect((await pool.query(`SELECT COUNT(*) count FROM "${schema}".feedback_event_stream`)).rows[0].count).toBe('0');
+    } finally { await service.close(); }
+  });
+
+  it('removes callable legacy helper signatures when reinstalling the same schema', async () => {
+    const { schema, instanceId, call } = await fixture();
+    await pool.query(`CREATE OR REPLACE FUNCTION "${schema}".feedback_emit_event(envelope jsonb,aggregate text,destinations jsonb) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+      CREATE OR REPLACE FUNCTION "${schema}".feedback_reconcile(delivery_key text) RETURNS jsonb LANGUAGE plpgsql AS $$ BEGIN RETURN '{}'; END $$`);
+    const service = await serviceConnection(schema);
+    try {
+      await pool.query(feedbackSupabaseSchemaSql(schema, instanceId));
+      await expect(service.client.query(`SELECT "${schema}".feedback_emit_event('{}'::jsonb,'external','[]'::jsonb)`)).rejects.toMatchObject({ code: '42883' });
+      await expect(service.client.query(`SELECT "${schema}".feedback_reconcile('missing'::text)`)).rejects.toMatchObject({ code: '42883' });
+      expect(await call('migration_status')).toMatchObject({ state: 'active', instance_id: instanceId });
+    } finally { await service.close(); }
+  });
+
+  it('serializes valid direct helpers with runtime writes and rolls back event/outbox failure as a non-superuser', async () => {
+    const { schema, instanceId, call } = await fixture();
+    const delivery = await call('recordTurnDelivery', [turn]);
+    const service = await serviceConnection(schema);
+    const envelope = (eventId: string) => ({ eventId, type: 'feedback.revised', version: 1, time: '2026-11-01', data: {} });
+    try {
+      await expect(service.emit(instanceId, envelope('invalid'), [{ ...destination, id: null }])).rejects.toThrow();
+      expect(await call('listFeedbackEvents')).toEqual([]);
+      expect(await call('listFeedbackOutbox')).toEqual([]);
+      expect(await call('readFeedbackEventsAfter', [{ after: 0, limit: 10 }])).toEqual([]);
+      await service.client.query('BEGIN');
+      await service.emit(instanceId, envelope('direct'));
+      const lock = (await service.client.query(`SELECT COUNT(*) count FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted`)).rows[0].count;
+      expect(lock).toBe('1');
+      const sharedLock = (await pool.query(`SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) acquired`, [`${schema}:feedback-write-order`])).rows[0].acquired;
+      expect(sharedLock).toBe(false);
+      const transition = await pool.connect();
+      try {
+        await transition.query('BEGIN');
+        await expect(transition.query(`SELECT 1 FROM "${schema}".feedback_storage_meta WHERE singleton=1 FOR UPDATE NOWAIT`)).rejects.toMatchObject({ code: '55P03' });
+      } finally {
+        await transition.query('ROLLBACK');
+        transition.release();
+      }
+      const runtimeWrite = call('recordFeedback', [vote]);
+      expect(await call('readFeedbackEventsAfter', [{ after: 0, limit: 10 }])).toEqual([]);
+      await service.client.query('COMMIT');
+      const runtime = await runtimeWrite;
+      expect((await call('readFeedbackEventsAfter', [{ after: 0, limit: 10 }])).map((row: any) => [row.sequence, row.event.eventId])).toEqual([
+        [1, 'direct'], [2, expect.any(String)],
+      ]);
+      expect(runtime.status).toBe('accepted');
+      await pool.query(`INSERT INTO "${schema}".turn_terminals(bot_app_id,session_id,turn_id,status,completed_at) VALUES('app','session','turn','completed','2026-11-01')`);
+      await pool.query(`UPDATE "${schema}".deliveries SET webhook_destinations_json=$1 WHERE delivery_id=$2`, [JSON.stringify([{ ...destination, id: null }]), delivery.deliveryId]);
+      await expect(service.reconcile(instanceId, delivery.deliveryId)).rejects.toThrow();
+      expect(await call('findDeliveryById', [delivery.deliveryId])).toMatchObject({ status: 'delivered' });
+      expect(await call('listTurnCompletionEvents')).toEqual([]);
+      expect(await call('readFeedbackEventsAfter', [{ after: 2, limit: 10 }])).toEqual([]);
+      await pool.query(`UPDATE "${schema}".deliveries SET webhook_destinations_json=$1 WHERE delivery_id=$2`, [JSON.stringify([destination]), delivery.deliveryId]);
+      expect((await service.reconcile(instanceId, delivery.deliveryId)).rows[0].payload).toMatchObject({ deliveryId: delivery.deliveryId, status: 'completed' });
+      expect((await call('readFeedbackEventsAfter', [{ after: 2, limit: 10 }]))[0]).toMatchObject({ sequence: 3, event: { type: 'turn.completed' } });
+      expect(await call('listFeedbackOutbox')).toHaveLength(3);
+      await pool.query(`UPDATE "${schema}".feedback_storage_meta SET state='retired'`);
+      await expect(service.reconcile(instanceId, delivery.deliveryId)).rejects.toThrow('feedback_storage_target_not_active');
+    } finally { await service.close(); }
+  });
+
   it('installs exact existing table columns and constraints, with a restricted invoker RPC', async () => {
     const { schema, call } = await fixture();
     const client = await pool.connect();
@@ -190,6 +300,8 @@ describe.skipIf(!available)('Supabase SQL RPC on disposable PostgreSQL', () => {
     expect(await call('migration_status')).toMatchObject({ version: 1, state: 'empty', verified: 0 });
     await expect(call('getResponse', ['x'])).rejects.toThrow('feedback_storage_target_not_active');
     await call('migration_prepare', ['migration', 'sha256:test']);
+    await call('migration_import', ['migration', 'feedback_event_stream_counter', [{ singleton: 1, value: 0 }]]);
+    await expect(call('migration_import', ['migration', 'feedback_event_stream_counter', [{ singleton: 1, value: 1 }]])).rejects.toThrow('feedback_migration_row_conflict');
     const rows = [{ interaction_id: 'b', context_json: '{"b":2,"a":1}', created_at: '2026-11-01' }, { interaction_id: 'a', context_json: null, created_at: '2026-11-01' }];
     await call('migration_import', ['migration', 'interactions', rows]);
     await call('migration_import', ['migration', 'interactions', rows]);

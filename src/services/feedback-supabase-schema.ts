@@ -61,7 +61,7 @@ CREATE INDEX IF NOT EXISTS feedback_outbox_due ON feedback_outbox(status,next_at
 CREATE TABLE IF NOT EXISTS feedback_event_stream_counter(singleton INTEGER PRIMARY KEY CHECK(singleton=1),value BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS feedback_event_stream(sequence BIGINT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE REFERENCES feedback_events(event_id));
 INSERT INTO feedback_storage_meta(singleton,version,instance_id,state) VALUES(1,1,'${instanceId}','empty') ON CONFLICT DO NOTHING;
-INSERT INTO feedback_event_stream_counter VALUES(1,0) ON CONFLICT DO NOTHING;
+INSERT INTO feedback_event_stream_counter SELECT 1,0 WHERE (SELECT state FROM feedback_storage_meta WHERE singleton=1)<>'migrating' ON CONFLICT DO NOTHING;
 
 CREATE OR REPLACE FUNCTION feedback_safe_integer(value jsonb,error_code text DEFAULT 'feedback_supabase_integer_invalid') RETURNS bigint
 LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path TO "${schema}",pg_catalog AS $fn$
@@ -104,19 +104,51 @@ $fn$;
 
 CREATE OR REPLACE FUNCTION feedback_policy_result(policy jsonb) RETURNS jsonb
 LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path TO "${schema}",pg_catalog AS $fn$
-DECLARE result jsonb; buttons jsonb;
+DECLARE result jsonb; buttons jsonb; item jsonb; followup jsonb; comment_data jsonb; reviewers jsonb; semantics jsonb; reasons jsonb; max_length bigint;
 BEGIN
   IF policy IS NULL OR policy='null'::jsonb THEN RETURN NULL; END IF;
   IF jsonb_typeof(policy)<>'object' OR policy->'enabled' IS DISTINCT FROM 'true'::jsonb THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
-  result := '${defaults}'::jsonb || policy;
-  result := jsonb_set(result,'{negativeFollowup}', '${defaults}'::jsonb->'negativeFollowup' || COALESCE(policy->'negativeFollowup','{}'));
-  result := jsonb_set(result,'{negativeFollowup,comment}', '${defaults}'::jsonb#>'{negativeFollowup,comment}' || COALESCE(policy#>'{negativeFollowup,comment}','{}'));
-  IF result->>'buttonAlign'='left' THEN result:=result-'buttonAlign'; END IF;
-  IF result->>'audience' NOT IN ('requester','reviewers','everyone') OR
-    (result->>'audience'<>'reviewers' AND jsonb_array_length(result->'reviewers')>0) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  IF policy ? 'audience' AND COALESCE(policy->>'audience','') NOT IN ('requester','reviewers','everyone') THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  IF policy ? 'buttonAlign' AND COALESCE(policy->>'buttonAlign','') NOT IN ('left','right') THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  reviewers:=COALESCE(policy->'reviewers','[]');
+  IF jsonb_typeof(reviewers)<>'array' OR jsonb_array_length(reviewers)>50 THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  FOR item IN SELECT value FROM jsonb_array_elements(reviewers) LOOP
+    IF jsonb_typeof(item)<>'string' OR (btrim(item#>>'{}')!~'^(ou_|on_).+' AND btrim(item#>>'{}')!~'^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$') THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  END LOOP;
+  SELECT COALESCE(jsonb_agg(btrim(value#>>'{}') ORDER BY ordinal),'[]') INTO reviewers FROM jsonb_array_elements(reviewers) WITH ORDINALITY entries(value,ordinal);
+  IF (SELECT COUNT(*)<>COUNT(DISTINCT value) FROM jsonb_array_elements(reviewers)) OR (COALESCE(policy->>'audience','requester')<>'reviewers' AND jsonb_array_length(reviewers)>0) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  semantics:=COALESCE(policy->'visibleSemantics','["positive","progress","negative"]');
+  IF jsonb_typeof(semantics)<>'array' OR jsonb_array_length(semantics) NOT BETWEEN 1 AND 3 THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  IF EXISTS(SELECT 1 FROM jsonb_array_elements(semantics) WHERE jsonb_typeof(value)<>'string' OR value#>>'{}' NOT IN ('positive','progress','negative')) OR (SELECT COUNT(*)<>COUNT(DISTINCT value) FROM jsonb_array_elements(semantics)) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  buttons:=COALESCE(policy->'buttons','${defaults}'::jsonb->'buttons');
+  IF jsonb_typeof(buttons)<>'array' OR jsonb_array_length(buttons) NOT BETWEEN 2 AND 4 THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  FOR item IN SELECT value FROM jsonb_array_elements(buttons) LOOP
+    IF jsonb_typeof(item)<>'object' OR jsonb_typeof(item->'key') IS DISTINCT FROM 'string' OR (item->>'key')!~'^[a-z0-9_-]+$' OR
+      jsonb_typeof(item->'label') IS DISTINCT FROM 'string' OR length(item->>'label') NOT BETWEEN 1 AND 24 OR
+      COALESCE(item->>'semantic',item->>'sentiment','') NOT IN ('positive','progress','negative') OR
+      (item ? 'style' AND COALESCE(item->>'style','') NOT IN ('primary','default','danger')) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  END LOOP;
   SELECT jsonb_agg(jsonb_build_object('key',value->>'key','label',value->>'label','semantic',COALESCE(value->>'semantic',value->>'sentiment'),'style',COALESCE(value->>'style',CASE WHEN COALESCE(value->>'semantic',value->>'sentiment')='positive' THEN 'primary' ELSE 'default' END)) ORDER BY ordinal)
-    INTO buttons FROM jsonb_array_elements(result->'buttons') WITH ORDINALITY AS items(value,ordinal);
-  RETURN jsonb_set(result,'{buttons}',buttons);
+    INTO buttons FROM jsonb_array_elements(buttons) WITH ORDINALITY AS items(value,ordinal);
+  IF (SELECT COUNT(*)<>COUNT(DISTINCT value->>'key') FROM jsonb_array_elements(buttons)) OR EXISTS(SELECT 1 FROM jsonb_array_elements(buttons) WHERE NOT semantics ? (value->>'semantic')) OR
+    EXISTS(SELECT 1 FROM jsonb_array_elements(semantics) semantic_item WHERE NOT EXISTS(SELECT 1 FROM jsonb_array_elements(buttons) button_item WHERE button_item->'semantic'=semantic_item)) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  followup:=COALESCE(policy->'negativeFollowup','{}');
+  IF jsonb_typeof(followup)<>'object' THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  reasons:=COALESCE(followup->'reasons','[]');
+  IF jsonb_typeof(reasons)<>'array' OR jsonb_array_length(reasons)>6 THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  FOR item IN SELECT value FROM jsonb_array_elements(reasons) LOOP
+    IF jsonb_typeof(item)<>'object' OR jsonb_typeof(item->'key') IS DISTINCT FROM 'string' OR (item->>'key')!~'^[a-z0-9_-]+$' OR jsonb_typeof(item->'label') IS DISTINCT FROM 'string' OR length(item->>'label') NOT BETWEEN 1 AND 32 THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  END LOOP;
+  IF (SELECT COUNT(*)<>COUNT(DISTINCT value->>'key') FROM jsonb_array_elements(reasons)) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('key',value->>'key','label',value->>'label') ORDER BY ordinal),'[]') INTO reasons FROM jsonb_array_elements(reasons) WITH ORDINALITY entries(value,ordinal);
+  comment_data:=COALESCE(followup->'comment','{}');
+  IF jsonb_typeof(comment_data)<>'object' THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  max_length:=COALESCE(feedback_safe_integer(comment_data->'maxLength','feedback_policy_invalid'),1000);
+  IF max_length NOT BETWEEN 1 AND 2000 OR (comment_data ? 'placeholder' AND (jsonb_typeof(comment_data->'placeholder') IS DISTINCT FROM 'string' OR length(comment_data->>'placeholder') NOT BETWEEN 1 AND 100)) THEN RAISE EXCEPTION 'feedback_policy_invalid'; END IF;
+  result:=jsonb_build_object('enabled',true,'audience',COALESCE(policy->>'audience','requester'),'reviewers',reviewers,'allowReselect',COALESCE(policy->'allowReselect'='true'::jsonb,false),'visibleSemantics',semantics,'buttons',buttons,
+    'negativeFollowup',jsonb_build_object('reasons',reasons,'comment',jsonb_build_object('enabled',comment_data->'enabled' IS DISTINCT FROM 'false'::jsonb,'required',COALESCE(comment_data->'required'='true'::jsonb,false),'placeholder',COALESCE(comment_data->>'placeholder','${JSON.stringify(normalizeFeedbackPolicy({ enabled: true }).negativeFollowup.comment.placeholder).slice(1, -1).replaceAll("'", "''")}'),'maxLength',max_length)));
+  IF policy->>'buttonAlign'='right' THEN result:=result||jsonb_build_object('buttonAlign','right'); END IF;
+  RETURN result;
 END
 $fn$;
 
@@ -163,10 +195,24 @@ $fn$;
 DROP TRIGGER IF EXISTS feedback_event_stream_insert ON feedback_events;
 CREATE TRIGGER feedback_event_stream_insert AFTER INSERT ON feedback_events FOR EACH ROW EXECUTE FUNCTION append_feedback_event_stream();
 
-CREATE OR REPLACE FUNCTION feedback_emit_event(envelope jsonb,aggregate text,destinations jsonb) RETURNS void
+CREATE OR REPLACE FUNCTION feedback_require_active(p_instance_id text) RETURNS void
+LANGUAGE plpgsql SECURITY INVOKER SET search_path TO "${schema}",pg_catalog AS $fn$
+DECLARE meta feedback_storage_meta;
+BEGIN
+  SELECT * INTO meta FROM feedback_storage_meta WHERE singleton=1 FOR SHARE;
+  IF meta.instance_id IS DISTINCT FROM p_instance_id OR meta.version IS DISTINCT FROM 1 THEN
+    RAISE EXCEPTION 'feedback_storage_target_identity_conflict';
+  END IF;
+  IF meta.state IS DISTINCT FROM 'active' THEN RAISE EXCEPTION 'feedback_storage_target_not_active'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('${schema}:feedback-write-order',0));
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION feedback_emit_event(p_instance_id text,envelope jsonb,aggregate text,destinations jsonb) RETURNS void
 LANGUAGE plpgsql SECURITY INVOKER SET search_path TO "${schema}",pg_catalog AS $fn$
 DECLARE destination jsonb; frozen jsonb; scheduled bigint;
 BEGIN
+  PERFORM feedback_require_active(p_instance_id);
   INSERT INTO feedback_events VALUES(envelope->>'eventId',envelope->>'type',1,aggregate,envelope::text,envelope->>'time') ON CONFLICT DO NOTHING;
   scheduled:=(extract(epoch FROM (envelope->>'time')::timestamptz)*1000)::bigint;
   FOR destination IN
@@ -180,10 +226,11 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION feedback_reconcile(delivery_key text) RETURNS jsonb
+CREATE OR REPLACE FUNCTION feedback_reconcile(p_instance_id text,delivery_key text) RETURNS jsonb
 LANGUAGE plpgsql SECURITY INVOKER SET search_path TO "${schema}",pg_catalog AS $fn$
 DECLARE delivery deliveries; terminal turn_terminals; content responses; payload jsonb; previous text; field text; envelope jsonb;
 BEGIN
+  PERFORM feedback_require_active(p_instance_id);
   SELECT * INTO delivery FROM deliveries WHERE delivery_id=delivery_key;
   SELECT * INTO terminal FROM turn_terminals WHERE bot_app_id=delivery.bot_app_id AND session_id=delivery.session_id AND turn_id=delivery.turn_id AND dispatch_attempt=COALESCE(delivery.dispatch_attempt,0);
   IF NOT FOUND THEN RETURN NULL; END IF;
@@ -205,7 +252,7 @@ BEGIN
   UPDATE deliveries SET status=terminal.status,duration_ms=COALESCE(terminal.duration_ms,duration_ms),usage_json=COALESCE(terminal.usage_json,usage_json),completed_at=terminal.completed_at WHERE delivery_id=delivery_key;
   INSERT INTO turn_completion_events VALUES(payload->>'eventId',delivery_key,'turn.completed',1,payload::text,payload->>'time') ON CONFLICT DO NOTHING;
   envelope:=jsonb_build_object('eventId',payload->>'eventId','type','turn.completed','version',1,'time',payload->>'time','data',payload-ARRAY['eventId','type','version','time']);
-  PERFORM feedback_emit_event(envelope,delivery_key,delivery.webhook_destinations_json::jsonb);
+  PERFORM feedback_emit_event(p_instance_id,envelope,delivery_key,delivery.webhook_destinations_json::jsonb);
   RETURN payload;
 END
 $fn$;
@@ -260,6 +307,8 @@ BEGIN
       IF NULLIF(p_args->>1,'') IS NULL THEN RAISE EXCEPTION 'feedback_migration_identity_conflict'; END IF;
       IF meta.state='empty' THEN
         ${tables.filter(table => table !== 'feedback_event_stream_counter').map(table => `IF EXISTS(SELECT 1 FROM ${table}) THEN RAISE EXCEPTION 'feedback_storage_target_not_empty'; END IF;`).join('\n        ')}
+        IF EXISTS(SELECT 1 FROM feedback_event_stream_counter WHERE value<>0) THEN RAISE EXCEPTION 'feedback_storage_target_not_empty'; END IF;
+        DELETE FROM feedback_event_stream_counter;
         UPDATE feedback_storage_meta SET state='migrating',migration_id=p_args->>0,source_fingerprint=p_args->>1,verified=0 WHERE singleton=1;
       ELSIF meta.state<>'migrating' OR meta.migration_id IS DISTINCT FROM p_args->>0 OR meta.source_fingerprint IS DISTINCT FROM p_args->>1 THEN
         RAISE EXCEPTION 'feedback_migration_identity_conflict';
@@ -269,6 +318,7 @@ BEGIN
       IF p_operation='migration_activate' THEN
         IF meta.source_fingerprint IS DISTINCT FROM p_args->>1 THEN RAISE EXCEPTION 'feedback_migration_identity_conflict'; END IF;
         IF meta.state NOT IN ('migrating','active') THEN RAISE EXCEPTION 'feedback_storage_target_not_migrating'; END IF;
+        INSERT INTO feedback_event_stream_counter VALUES(1,0) ON CONFLICT DO NOTHING;
         IF EXISTS(SELECT 1 FROM feedback_event_stream WHERE sequence<1 OR sequence>9007199254740991) THEN RAISE EXCEPTION 'feedback_event_sequence_overflow'; END IF;
         UPDATE feedback_event_stream_counter SET value=GREATEST(value,COALESCE((SELECT MAX(sequence) FROM feedback_event_stream),0)) WHERE singleton=1;
         INSERT INTO feedback_event_stream(sequence,event_id)
@@ -305,10 +355,6 @@ BEGIN
             IF field IN ('duration_ms','next_attempt_at','claimed_at','feedback_order','sequence','value') THEN PERFORM feedback_safe_integer(incoming->field); END IF;
           END LOOP;
           EXECUTE format('SELECT to_jsonb(target) FROM %I target CROSS JOIN jsonb_populate_record(NULL::%I,$1) source WHERE %s',table_name,table_name,predicate) INTO existing USING incoming;
-          IF existing IS NOT NULL AND table_name='feedback_event_stream_counter' AND existing->>'value'='0' THEN
-            UPDATE feedback_event_stream_counter SET value=feedback_safe_integer(incoming->'value') WHERE singleton=1;
-            existing:=NULL;
-          END IF;
           IF existing IS NULL THEN
             SELECT string_agg(quote_ident(key),',' ORDER BY key),string_agg(format('source.%I',key),',' ORDER BY key) INTO insert_columns,select_columns FROM jsonb_object_keys(incoming) key;
             EXECUTE format('INSERT INTO %I(%s) SELECT %s FROM jsonb_populate_record(NULL::%I,$1) source ON CONFLICT DO NOTHING',table_name,insert_columns,select_columns,table_name) USING incoming;
@@ -325,7 +371,7 @@ BEGIN
     RETURN jsonb_build_object('version',1,'result',result);
   END IF;
 
-  IF meta.state<>'active' THEN RAISE EXCEPTION 'feedback_storage_target_not_active'; END IF;
+  IF meta.state IS DISTINCT FROM 'active' THEN RAISE EXCEPTION 'feedback_storage_target_not_active'; END IF;
   IF p_operation IN ('createResponse','createDelivery','recordTurnDelivery','recordTurnTerminal','recordFeedback') THEN
     PERFORM pg_advisory_xact_lock(hashtextextended('${schema}:feedback-write-order',0));
   END IF;
@@ -373,7 +419,7 @@ BEGIN
       END LOOP;
       PERFORM feedback_safe_integer(row_data->'duration_ms');
       INSERT INTO deliveries SELECT (jsonb_populate_record(NULL::deliveries,row_data)).* ON CONFLICT DO NOTHING;
-      PERFORM feedback_reconcile(delivery_key);
+      PERFORM feedback_reconcile(p_instance_id,delivery_key);
       SELECT * INTO delivery FROM deliveries WHERE delivery_id=delivery_key;
     END IF;
     IF delivery.response_id<>response_key THEN DELETE FROM responses WHERE response_id=response_key AND NOT EXISTS(SELECT 1 FROM deliveries WHERE response_id=response_key); END IF;
@@ -384,7 +430,7 @@ BEGIN
     IF previous IS NOT NULL AND previous->>'status'<>input->>'status' THEN RAISE EXCEPTION 'turn_terminal_status_conflict'; END IF;
     INSERT INTO turn_terminals VALUES(input->>'botAppId',input->>'sessionId',input->>'turnId',attempt,input->>'status',COALESCE(input->>'completedAt',created_time),feedback_safe_integer(input->'durationMs'),NULLIF(input->'usage','null'::jsonb)::text,CASE WHEN input->>'completedAt' IS NULL THEN 1 ELSE 0 END) ON CONFLICT DO NOTHING;
     FOR delivery_key IN SELECT delivery_id FROM deliveries WHERE bot_app_id=input->>'botAppId' AND session_id=input->>'sessionId' AND turn_id=input->>'turnId' AND COALESCE(dispatch_attempt,0)=attempt ORDER BY created_at,delivery_id LOOP
-      result:=COALESCE(feedback_reconcile(delivery_key),result);
+      result:=COALESCE(feedback_reconcile(p_instance_id,delivery_key),result);
     END LOOP;
   WHEN 'findDeliveryByPlatformMessage' THEN
     SELECT feedback_delivery_result(to_jsonb(d)) INTO result FROM deliveries d WHERE platform=p_args->>0 AND platform_app_id=p_args->>1 AND platform_message_id=p_args->>2;
@@ -414,7 +460,7 @@ BEGIN
         PERFORM feedback_safe_integer(to_jsonb(revision.feedback_order));
         payload:=jsonb_strip_nulls(jsonb_build_object('feedbackId',revision.feedback_id,'deliveryId',revision.delivery_id,'revision',revision.revision,'verdictKey',revision.result,'operatorSubjectId',revision.operator_subject_id,'supersedesFeedbackId',NULLIF(revision.supersedes_feedback_id,''),'semantic',NULLIF(revision.semantic,''),'reasonKey',NULLIF(revision.reason_key,''),'comment',NULLIF(revision.comment_text,'')));
         envelope:=jsonb_build_object('eventId',feedback_stable_id('evt',jsonb_build_array('feedback.revised',revision.feedback_id)),'type','feedback.revised','version',1,'time',created_time,'data',payload);
-        PERFORM feedback_emit_event(envelope,revision.feedback_id,COALESCE(NULLIF(input->'webhookDestinations','null'::jsonb),delivery.webhook_destinations_json::jsonb,'[]'));
+        PERFORM feedback_emit_event(p_instance_id,envelope,revision.feedback_id,COALESCE(NULLIF(input->'webhookDestinations','null'::jsonb),delivery.webhook_destinations_json::jsonb,'[]'));
         result:=jsonb_build_object('status',CASE WHEN previous IS NULL THEN 'accepted' ELSE 'revised' END,'feedback',feedback_revision_result(to_jsonb(revision)));
       END IF;
     END IF;
@@ -515,6 +561,9 @@ BEGIN
   RETURN jsonb_build_object('version',1,'result',result);
 END
 $rpc$;
+
+DROP FUNCTION IF EXISTS "${schema}".feedback_reconcile(text) RESTRICT;
+DROP FUNCTION IF EXISTS "${schema}".feedback_emit_event(jsonb,text,jsonb) RESTRICT;
 
 REVOKE ALL ON SCHEMA "${schema}" FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA "${schema}" FROM PUBLIC;

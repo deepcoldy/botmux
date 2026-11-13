@@ -16,8 +16,8 @@ export async function configureFeedbackStorage(dataDir: string): Promise<void> {
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const choice = (await prompt.question(t('feedback.storage.choose'))).trim().toLowerCase();
-    if (choice && choice !== 'sqlite' && choice !== 'postgresql') throw new Error('feedback_storage_target_invalid');
-    if (choice === 'postgresql') {
+    if (choice && !['sqlite', 'postgresql', 'supabase'].includes(choice)) throw new Error('feedback_storage_target_invalid');
+    if (choice === 'postgresql' || choice === 'supabase') {
       const file = (await prompt.question(t('feedback.storage.configPath'))).trim();
       const config = await configureFeedbackStorageFile(dataDir, file);
       await initializeFeedbackStorage(dataDir, config.generation);
