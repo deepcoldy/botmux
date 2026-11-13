@@ -16,6 +16,7 @@ import { isCriticalInterruptKey, sendCriticalControlKey } from '../src/adapters/
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { cursorStopLeftParkedFollowUp } from '../src/adapters/cli/cursor.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const start = source.indexOf('// Quick-action key → real key event for the CLI');
@@ -78,7 +79,9 @@ function harness(
     commandLineWritesPending: 0,
     sessionRenameInFlight: () => false,
     cursorStopLeftParkedFollowUp,
+    promptReadinessRevision: 0,
   };
+  state.invalidatePromptReadinessEvidence = loadWorkerFunction('invalidatePromptReadinessEvidence', state);
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };
   return {
