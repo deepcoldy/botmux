@@ -85,6 +85,7 @@ const transferState = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   // Faithful union: any isolation source (live bot flag or the session's frozen

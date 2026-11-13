@@ -28,7 +28,7 @@ vi.mock('node:child_process', () => ({
   execFile: vi.fn((_bin, _args, _opts, cb) => { cb(null, '{}'); }),
 }));
 
-import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { createCliAdapterSync, resolveEffectiveCliId } from '../src/adapters/cli/registry.js';
 import { t } from '../src/i18n/index.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
@@ -1586,15 +1586,48 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args.some(a => /runner\.js$/.test(a))).toBe(false);
   });
 
-  it('passes --resume for session resume', () => {
+  it('passes --resume <native id> for a precise session resume', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
-    expect(args).toContain('--resume');
-    expect(args).toContain('abc-123');
+    // Behaviour, not an argv snapshot: the id follows --resume, and nothing else
+    // (no bare --patch split, no stray resume flag) is added.
+    const resumeAt = args.indexOf('--resume');
+    expect(resumeAt).toBeGreaterThanOrEqual(0);
+    expect(args[resumeAt + 1]).toBe('abc-123');
+    expect(args.filter(arg => arg === '--resume')).toHaveLength(1);
   });
 
-  it('passes bare --resume (no session id) to read resume.txt', () => {
-    const args = adapter.buildArgs({ sessionId: 's', resume: true });
-    expect(args).toEqual(['--resume']);
+  // Regression: the launcher's bare `--resume` does NOT mean "this session" —
+  // it reads ~/.dsh-tui/resume.txt, the machine-wide pointer to whatever
+  // conversation any process touched last (possibly a sibling bot's). Without a
+  // native id the only safe launch is a fresh one: a bare --resume would
+  // silently resume somebody else's history.
+  it('never emits a bare --resume: a resume without a native id starts fresh', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: undefined });
+    expect(args).not.toContain('--resume');
+    expect(args.filter(arg => arg.startsWith('--resume'))).toEqual([]);
+  });
+
+  // The adapter capability behind the worker's Tier-0 fresh demotion: without
+  // it the launch stays `resume: true` in every upper layer (closed card,
+  // resume receipt) even though the CLI starts blank.
+  it('declares resumeRequiresCliSessionId (an id is required to restore history)', () => {
+    expect(adapter.resumeRequiresCliSessionId).toBe(true);
+  });
+
+  // The worker never constructs the adapter from the raw bot `cliId`: a dsh
+  // bot with dshRuntime='tui' resolves through `resolveEffectiveCliId`. Pin the
+  // behaviour on THAT path, so a regression in the mapping (not just in the
+  // adapter literal) is caught.
+  it('the worker-resolved dsh-tui adapter cannot emit a bare --resume', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.resumeRequiresCliSessionId).toBe(true);
+    expect(resolved.buildArgs({ sessionId: 's', resume: true })).not.toContain('--resume');
+    expect(resolved.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'native-9' }))
+      .toContain('native-9');
+    // Headless dsh is a different adapter and keeps its own behaviour.
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).id).toBe('dsh');
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', undefined)).id).toBe('dsh');
   });
 
   it('omits --resume on fresh spawn when the question bridge is disabled', () => {
@@ -1624,6 +1657,11 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
       expect(args).not.toContain('--patch');
       expect(args).toContain('--resume');
       expect(args).toContain('abc-123');
+      // A resume intent WITHOUT the native id demotes to a fresh launch, but
+      // the question-bridge overlay must still ride along.
+      const demoted = bridgeAdapter.buildArgs({ sessionId: 's', resume: true });
+      expect(demoted).not.toContain('--resume');
+      expect(demoted.some(arg => arg.startsWith('--patch='))).toBe(true);
       const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
       expect(readonly?.length).toBe(1);
       expect(patchArg).toContain(readonly![0]);

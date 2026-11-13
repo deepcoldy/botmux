@@ -2,6 +2,7 @@ import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, executionObserverSupported } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
+import { handleResumeFallbackReport } from '../services/resume-fallback-notice.js';
 import {
   compareLaunchedInstall,
   readRunningExeIdentity,
@@ -22821,6 +22822,31 @@ function setupWorkerHandlers(
       }
 
       case 'user_notify': {
+        if (msg.kind === 'resume_fallback') {
+          // The worker reports the demotion FACT on every occurrence; the
+          // delivery policy (persisted-evidence gate, per-session latch, copy)
+          // lives in services/resume-fallback-notice.ts so it is testable
+          // without booting a daemon. `/restart` refork means a worker-level
+          // latch would re-post on every restart, and only the daemon can see
+          // the persisted history evidence.
+          await handleResumeFallbackReport({
+            ds,
+            report: {
+              tier: msg.resumeTier ?? 'probe-missing',
+              reason: msg.resumeReason,
+              turnId: msg.turnId,
+              lost: msg.resumeLost,
+            },
+            send: notice => sendTurnNotice(ds, {
+              kind: 'user_notify',
+              turnId: fallbackTurnId(ds, msg.turnId),
+              msgType: 'text',
+              content: notice,
+            }),
+            log: line => logger.warn(`[${t}] ${line}`),
+          });
+          break;
+        }
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'user_notify',

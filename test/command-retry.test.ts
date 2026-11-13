@@ -137,6 +137,7 @@ const { sendWorkerInput, forkWorker, rememberLastCliInput } = vi.hoisted(() => (
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   sendWorkerInput,
   forkWorker,
   killWorker: vi.fn(),

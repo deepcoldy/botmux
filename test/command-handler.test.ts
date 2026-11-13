@@ -488,6 +488,11 @@ vi.mock('../src/core/worker-pool.js', () => ({
   postPrivateSnapshotCard: vi.fn(async () => ({ notReady: false, sent: 1, total: 1 })),
   resolvePrivateCardAudience: vi.fn(() => ['ou_owner']),
   reconcileBotStreamingCardPins: vi.fn(),
+  // The resume receipt / closed card ask for the LIVE `dshRuntime` toggle so a
+  // `dsh` session can be described as the PTY-driven dsh-tui adapter. The
+  // factory mock must export it or the call is `undefined` at runtime and the
+  // resume reply dies inside handleCommand's catch. Default = headless.
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -747,7 +752,7 @@ import { withBotTurnMutation } from '../src/core/bot-turn-mutation-gate.js';
 import { setProjectAssociationConsumer } from '../src/core/project-session-association-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins, dshRuntimeForSession } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -8881,6 +8886,73 @@ describe('handleCommand', () => {
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(reply).toContain('新起干净会话');
       expect(reply).toContain('旧上下文不会带回');
+    });
+
+    // Regression: the worker spawns the dsh-tui adapter for a bot with
+    // `cliId='dsh' + dshRuntime='tui'`, but the persisted session row only
+    // records cliId='dsh'. The receipt must resolve the LIVE runtime, or it
+    // describes the headless dsh adapter and claims a restored history the TUI
+    // can never deliver (it records no native id).
+    it('says a configured dsh-tui bot will resume as a fresh CLI session', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'dsh-tui-without-native-id',
+        status: 'closed',
+        cliId: 'dsh',
+        cliSessionId: undefined,
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      // The live per-bot toggle (worker-pool's dshRuntimeForSession).
+      vi.mocked(dshRuntimeForSession).mockReturnValueOnce('tui');
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt dsh-tui-without-native-id'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).toHaveBeenCalledWith(closed.sessionId, deps.activeSessions);
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('新起干净会话');
+      expect(reply).not.toContain('会话已恢复');
+    });
+
+    it('keeps the restored wording for headless dsh (dshRuntime official / unset)', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'dsh-headless-without-native-id',
+        status: 'closed',
+        cliId: 'dsh',
+        cliSessionId: undefined,
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      // Default mock = undefined (official / unconfigured runtime).
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt dsh-headless-without-native-id'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('会话已恢复');
+      expect(reply).not.toContain('新起干净会话');
     });
 
     it('passes the bot current custom Codex executable into live adopt discovery', async () => {

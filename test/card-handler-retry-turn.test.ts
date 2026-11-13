@@ -83,6 +83,7 @@ const isSessionTransferringMock = vi.fn(() => false);
 const hasProtectedOwnershipMock = vi.fn(() => false);
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
   sendWorkerSessionInput: vi.fn(),

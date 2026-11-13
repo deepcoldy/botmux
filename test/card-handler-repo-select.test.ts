@@ -85,6 +85,7 @@ vi.mock('../src/core/worker-pool.js', () => {
     }
   });
   return {
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(),
   recordTurnExplicitMention: vi.fn(),
   killWorker: vi.fn(),

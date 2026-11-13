@@ -42,6 +42,7 @@ vi.mock('../src/services/session-store.js', () => ({
 
 // Keep the runtime side empty so the store read is the only source of truth.
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   // `killWorker` MUST be listed even though no assertion touches it: the module
   // under test (`device-isolation-daemon.ts`) does
   // `import { killWorker, listActiveSessions } from './worker-pool.js'`, and bun

@@ -4061,7 +4061,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           // the adapter can only resume a precise cliSessionId and none was
           // persisted, the next spawn starts a FRESH session — say so instead
           // of claiming history is back.
-          const resumeMsg = resumeSuccessMessage(result, cliName, localeForBot(result.ds.larkAppId));
+          const resumeMsg = resumeSuccessMessage(result, cliName, localeForBot(result.ds.larkAppId), dshRuntimeForSession(result.ds));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
           // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
           // cards are enabled. Card-off bots only withdraw the stale closed card

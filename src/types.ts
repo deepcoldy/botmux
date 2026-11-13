@@ -2760,11 +2760,23 @@ export type WorkerToDaemonBase =
         | 'structured_turn_not_collected'
         /** Claude's own permission dialog seen on screen (claudeActionPrompt). The
          *  daemon drops it while the PermissionRequest hook's card is pending. */
-        | 'claude_permission_prompt';
+        | 'claude_permission_prompt'
+        /** The CLI's resume was demoted to a fresh session. The worker reports
+         *  the FACT on every demotion; the daemon decides whether to speak
+         *  (per-session latch + history gate) and composes the copy. A worker
+         *  is reforked on every `/restart`, so it cannot own that latch. */
+        | 'resume_fallback';
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */
-      screenTail?: string }
+      screenTail?: string
+      /** `kind='resume_fallback'`: which tier demoted the launch. */
+      resumeTier?: import('./services/resume-fallback-notice.js').ResumeFallbackTier
+      /** `kind='resume_fallback'`: the worker's demotion reason (log only). */
+      resumeReason?: string
+      /** `kind='resume_fallback'`: false when nothing user-visible was lost
+       *  (claude-family first-turn launch recovery with no transcript ever). */
+      resumeLost?: boolean }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
