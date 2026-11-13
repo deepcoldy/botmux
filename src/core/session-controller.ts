@@ -77,15 +77,14 @@ export class SessionController {
       // The owner may have been reused for another session while this flush
       // was queued; never checkpoint the old contract onto the new lane.
       if (!this.ownerMatchesRef()) return;
-      // Pin the lane record before the await: a detach during the durable
-      // write must not make the follow-up write land on the replacement.
-      const ownerSession = this.ds.session;
-      await commitPrimarySessionContract(ownerSession, snapshot, this.primaryRevision);
+      await commitPrimarySessionContract(this.ds.session, snapshot, this.primaryRevision);
       this.primaryRevision = snapshot.session.revision;
-      // Re-check after the await — the owner can be swapped while the write
-      // was in flight. A detached controller must stop mutating session
-      // objects entirely, even the predecessor record it pinned earlier.
-      if (this.ownerMatchesRef()) ownerSession.sessionRuntimeContract = snapshot;
+      // Re-check after the await: a detach while the write was in flight
+      // must leave every session object untouched. Mirror onto the *current*
+      // record, not one captured before the await — principal-lane source
+      // hydration swaps in a fresh object with the same sessionId, and that
+      // live record must still receive the committed checkpoint.
+      if (this.ownerMatchesRef()) this.ds.session.sessionRuntimeContract = snapshot;
     });
     this.primaryQueue = pending; return pending;
   }
