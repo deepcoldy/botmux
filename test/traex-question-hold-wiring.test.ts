@@ -288,6 +288,9 @@ describe('the drain around the last look', () => {
     scope.traexQuestionBridgeActive = () => true;
     scope.traexQuestionSubmitGuard = () => ({});
     scope.traexQuestionDraftWaiting = false;
+    // A write cycle clears readiness, as the worker's does: readiness after
+    // a held drain is then the drain's own doing.
+    scope.beginCliWriteCycle = () => { scope.isPromptReady = false; };
     const looks: string[] = [];
     scope.traexQuestionHoldsQueuedWrite = async () => {
       looks.push(scope.pendingMessages[0]?.turnId);
@@ -311,6 +314,16 @@ describe('the drain around the last look', () => {
     expect(h.written()).toEqual([]);
     expect(h.scope.pendingMessages.map((m: any) => m.turnId)).toEqual(['om_first']);
     expect(h.scope.isPromptReady).toBe(true);
+  });
+
+  it('does not look while a gate before it keeps the message back', async () => {
+    // Gates such as Auto-model capacity queueing retry every few hundred ms:
+    // a retry they refuse costs no capture.
+    const h = drain(() => false);
+    h.scope.activeTurnBlocks = () => true;
+    await h.flush();
+    expect(h.written()).toEqual([]);
+    expect(h.looks).toEqual([]);
   });
 
   it('writes nothing when a restart began while it looked', async () => {
