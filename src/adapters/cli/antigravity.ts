@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { delay } from '../../utils/timing.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
@@ -343,6 +343,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   let sessionLog: AntigravitySessionLog | undefined;
   let awaitNativeStreamLog = false;
   let bracketedPasteSupported = false;
+  let knownCliSessionId: string | undefined;
+  let lastConfirmedSubmitAtMs = 0;
+  let preSubmitTranscriptSize: number | null = null;
+  let submittedCliSessionId: string | undefined;
   const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
     const fromLog = sessionLog?.read().currentId;
     if (fromLog) return fromLog;
@@ -358,6 +362,14 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     const cwd = sessionLog ? undefined : pty.cliCwd;
     if (!pty.cliPid && !cwd) return undefined;
     return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+  };
+  const recordConfirmedSubmit = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>, preSize: number | null): string | undefined => {
+    const cliSessionId = activeSessionId(pty);
+    lastConfirmedSubmitAtMs = Date.now();
+    preSubmitTranscriptSize = preSize;
+    submittedCliSessionId = cliSessionId ?? knownCliSessionId;
+    if (cliSessionId) knownCliSessionId = cliSessionId;
+    return cliSessionId;
   };
   return {
     id: 'antigravity',
@@ -389,7 +401,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // start fresh; do NOT use `-c/--continue` because "most recent" is
       // racy when multiple botmux sessions run in parallel.
       if (resume && resumeSessionId) {
+        knownCliSessionId = resumeSessionId;
         args.push('--conversation', resumeSessionId);
+      } else {
+        knownCliSessionId = undefined;
       }
       if (model && typeof model === 'string' && model.trim()) {
         args.push('--model', model.trim());
@@ -445,6 +460,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // post-write history delta and never replay an unconfirmed input.
       const baseByte = currentFileSize(HISTORY_PATH);
       const marker = historyMarker(content);
+      const initialCid = activeSessionId(pty) ?? knownCliSessionId;
+      const initialTranscriptPath = initialCid ? resolveAntigravityTranscriptPath(initialCid) : null;
+      const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
 
       const trySendEnter = (): boolean => {
         try {
@@ -512,7 +530,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // genuinely dropped Enter is recovered by the worker's deferred
       // recheck, not by a second Enter (same pattern as the grok adapter).
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
-        const cliSessionId = activeSessionId(pty);
+        const cliSessionId = recordConfirmedSubmit(pty, preSize);
         return cliSessionId ? { submitted: true, cliSessionId } : undefined;
       }
 
@@ -521,7 +539,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // can still resolve the warning before user-facing Lark notify.
       const recheck = (): SubmitRecheckResult => {
         if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
-        const cliSessionId = activeSessionId(pty);
+        const cliSessionId = recordConfirmedSubmit(pty, preSize);
         return cliSessionId ? { submitted: true, cliSessionId } : true;
       };
       return { submitted: false, recheck };
@@ -545,6 +563,38 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // alongside hookReviewInputHold.
     supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
+      if (cliSessionId) knownCliSessionId = cliSessionId;
+      if (lastConfirmedSubmitAtMs > 0) {
+        const elapsed = Date.now() - lastConfirmedSubmitAtMs;
+        const effectiveCid = cliSessionId ?? submittedCliSessionId ?? knownCliSessionId;
+        const graceTranscriptPath = effectiveCid ? resolveAntigravityTranscriptPath(effectiveCid) : null;
+        if (graceTranscriptPath && preSubmitTranscriptSize === null) {
+          if (isAntigravityTranscriptBusy(graceTranscriptPath)) {
+            lastConfirmedSubmitAtMs = 0;
+          } else {
+            preSubmitTranscriptSize = currentFileSize(graceTranscriptPath);
+          }
+        }
+        if (lastConfirmedSubmitAtMs > 0) {
+          if (graceTranscriptPath && preSubmitTranscriptSize !== null && currentFileSize(graceTranscriptPath) > preSubmitTranscriptSize) {
+            lastConfirmedSubmitAtMs = 0;
+          } else if (elapsed >= scaleMs(10_000)) {
+            lastConfirmedSubmitAtMs = 0;
+          } else {
+            try {
+              const screen = getCurrentScreen?.();
+              if (screen) {
+                const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+                if (isAntigravityInterruptedScreen(screen) || ERROR_COMPOSER_PATTERN.test(plain)) {
+                  lastConfirmedSubmitAtMs = 0;
+                  return false;
+                }
+              }
+            } catch { /* Missing viewport is not evidence of cancellation. */ }
+            return true;
+          }
+        }
+      }
       if (!cliSessionId) return false;
       const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
       if (!transcriptPath || !isAntigravityTranscriptBusy(transcriptPath)) return false;

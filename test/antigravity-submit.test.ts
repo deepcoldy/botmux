@@ -297,4 +297,53 @@ describe('antigravity writeInput — single-Enter submit', () => {
     await selected.writeInput(fake.pty, content);
     expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
   });
+
+  it('holds post-submit startup grace against premature +1s idle until transcript grows, screen interrupts, or grace expires', async () => {
+    resetHistory();
+    const convId = '11111111-2222-3333-4444-555555555555';
+    const logsDir = join(home, '.gemini', 'antigravity-cli', 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    const transcriptPath = join(logsDir, 'transcript_full.jsonl');
+    writeFileSync(transcriptPath, '{"type":"USER_INPUT","status":"DONE"}\n{"type":"PLANNER_RESPONSE","status":"DONE","content":"ready"}\n');
+
+    const selected = adapterForVersion('1.5.4');
+    const content = 'run long deployment task';
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = text => {
+      mkdirSync(join(home, '.gemini', 'antigravity-cli'), { recursive: true });
+      appendFileSync(
+        HISTORY_PATH,
+        `{"display":${encodeDisplay(text)},"timestamp":${Date.now()},"workspace":"/x","conversationId":"${convId}"}\n`,
+      );
+      return true;
+    };
+    await selected.writeInput(fake.pty, content);
+
+    const idleComposerScreen = [
+      '────────────────────────',
+      '>',
+      '────────────────────────',
+      '? for shortcuts                                          accept-edits · Gemini 3.8 Flash · high',
+    ].join('\n');
+
+    // Immediately after submit (simulating the worker's +1.0s post-submit probe before agy flushes
+    // USER_INPUT to transcript_full.jsonl or before cliSessionId is bound), session must stay busy.
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => idleComposerScreen })).toBe(true);
+    expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleComposerScreen })).toBe(true);
+
+    // Once transcript_full.jsonl grows with a completed turn and the composer is idle, grace clears immediately.
+    appendFileSync(transcriptPath, '{"type":"USER_INPUT","status":"DONE"}\n{"type":"PLANNER_RESPONSE","status":"DONE","content":"done"}\n');
+    expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleComposerScreen })).toBe(false);
+
+    // Re-submit and verify an explicit native error / interrupted screen releases grace immediately.
+    await selected.writeInput(fake.pty, 'second submit hitting immediate error');
+    const errorScreen = '⚠ Request failed. Please try again.\nError ID: err-grace\n────────────────────────\n>\n────────────────────────\n';
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => errorScreen })).toBe(false);
+
+    // Re-submit and verify grace expires cleanly after scaled 10s (10_000 * 0.05 = 500ms).
+    await selected.writeInput(fake.pty, 'third submit timing out grace');
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => idleComposerScreen })).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 560));
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => idleComposerScreen })).toBe(false);
+  });
 });
