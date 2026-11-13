@@ -183,8 +183,16 @@ const patches = () => updateMessageMock.mock.calls.map(call => ({
 }));
 const titleOf = (card: any): string => card.header.title.content;
 const statusOf = (card: any): string => titleOf(card).slice(titleOf(card).lastIndexOf(' — ') + ' — '.length);
+// 主控制区按钮一般在顶层 action 模块里；压缩+停止同时出现时改走顶层 column_set
+// 双列行，两类容器都要遍历（「更多操作」面板内嵌的 column_set 不在顶层，不会混入）。
 const buttonsOf = (card: any): any[] =>
-  card.elements.filter((el: any) => el.tag === 'action').flatMap((el: any) => el.actions);
+  card.elements
+    .filter((el: any) => el.tag === 'action' || el.tag === 'column_set')
+    .flatMap((el: any) =>
+      el.tag === 'action'
+        ? el.actions
+        : (el.columns ?? []).flatMap((c: any) => c.elements ?? []),
+    );
 const hasStopButton = (card: any): boolean =>
   buttonsOf(card).some(b => b.value?.action === 'stop_turn' || b.text?.content === STOP);
 const markdownOf = (card: any): string[] =>

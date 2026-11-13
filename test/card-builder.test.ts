@@ -1535,10 +1535,11 @@ describe('buildStreamingCard', () => {
       });
 
       it('offers no stop button: the turn it would interrupt is over', () => {
-        const actions = findActions(build('working', { backgroundTasks: 1 }));
-        expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(false);
-        expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
-        expect(findActions(build('working', undefined)).some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+        // stop_turn 可能落在主 action 模块或压缩+停止的 column_set 双列行里，
+        // 用全量按钮遍历判断；close 在无停止的单模块结构里，findActions 仍可达。
+        expect(allButtons(build('working', { backgroundTasks: 1 })).some((a: any) => a.value?.action === 'stop_turn')).toBe(false);
+        expect(findActions(build('working', { backgroundTasks: 1 })).some((a: any) => a.value?.action === 'close')).toBe(true);
+        expect(allButtons(build('working', undefined)).some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
       });
 
       it('is inert for other statuses and for a zero count', () => {
