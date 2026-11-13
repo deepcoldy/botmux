@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
-import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
+import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { fallbackTurnId, frozenReplyContextForTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
@@ -66,7 +66,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
     fallbackTurnId, frozenReplyContextForTurn,
-    authorityForDispatch, scheduleCreateCapabilities, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
+    authorityForDispatch, scheduleCreateCapabilities, directHumanForDispatchOnly, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
     pickTurnReplyTarget: () => undefined,
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
@@ -149,6 +149,43 @@ describe('dispatch user IPC end-to-end identity binding', () => {
       appId: 'cli_source', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli', 'bytedcli'],
     });
   });
+  it('signs dispatch-only tools for the exact recorded human turn after the active turn was cleared', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    restrictSource(h);
+    h.ds.activeInteractiveTurn = undefined;
+    h.ds.session.replyTargets = { om_human: { senderOpenId: 'ou_alice',
+      participants: [{ openId: 'ou_alice', isBot: false }] } };
+    h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority).toMatchObject({ openId: 'ou_alice',
+      tools: ['lark-cli', 'bytedcli'] });
+  });
+  it.each(['bot sender', 'synthetic turn', 'failed recovery', 'active bot'])
+    ('does not restore dispatch-only tools from an ineligible recorded %s', async scenario => {
+      const h = harness();
+      h.ds.chatId = 'oc_target';
+      restrictSource(h);
+      h.ds.activeInteractiveTurn = scenario === 'active bot'
+        ? { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } }
+        : undefined;
+      if (scenario === 'synthetic turn') {
+        h.ds.managedTurnOrigin.turnId = 'trg_synthetic';
+        h.body.originTurnId = 'trg_synthetic';
+      }
+      if (scenario === 'failed recovery') h.ds.session.failedTurnRecovery = {
+        turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' },
+      };
+      h.ds.session.replyTargets = { [h.ds.managedTurnOrigin.turnId]: {
+        senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: scenario === 'bot sender' }],
+      } };
+      h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+      expect((await h.run()).status).toBe(200);
+      const authority = (await read())?.authority;
+      if (scenario === 'bot sender' || scenario === 'failed recovery' || scenario === 'active bot')
+        expect(authority).toBeUndefined();
+      else expect(authority?.tools).toEqual(['lark-cli']);
+    });
   it('keeps the human tool grant when an automatic schedule grant also matches', async () => {
     const h = harness();
     h.ds.chatId = 'oc_target';

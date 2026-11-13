@@ -651,7 +651,7 @@ import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -9220,11 +9220,8 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       sourceChatId: ds.chatId,
       targetChatId: chatId,
       targetAppIds,
-      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
-        && !!active && active.turnId === turnId
-        && active.caller.senderType === 'user' && !active.caller.source
-        && active.caller.requestLarkAppId === ds.larkAppId
-        && !!active.caller.requestUserOpenId,
+      directHuman: directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+        session: ds.session, activeTurn: active }),
       inherited: false,
     });
     const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
@@ -9434,11 +9431,8 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
-    const directHumanTurn = ds.session.failedTurnRecovery?.turnId !== turnId
-      && !!active && active.turnId === turnId
-      && active.caller.senderType === 'user' && !active.caller.source
-      && active.caller.requestLarkAppId === ds.larkAppId
-      && !!active.caller.requestUserOpenId;
+    const directHumanTurn = directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+      session: ds.session, activeTurn: active });
     // Scope the dispatch-only check to `targets` — the local bots that actually
     // receive a signed record. The raw targetAppIds may name a bot that is not
     // configured on this machine; it is filtered out above, so letting it veto
