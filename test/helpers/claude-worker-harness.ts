@@ -15,6 +15,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -311,6 +312,81 @@ export interface Harness {
   restoreCli: () => void;
 }
 
+/** The subset of a worker child the event-driven wait needs. A real ChildProcess
+ *  satisfies it; a plain EventEmitter stands in for the unit test. */
+export interface MessageWaiterChild {
+  on(event: 'message', listener: (message: unknown) => void): unknown;
+  off(event: 'message', listener: (message: unknown) => void): unknown;
+  readonly exitCode: number | null;
+}
+
+/**
+ * Build a `waitFor` that re-checks a CONDITION as soon as the worker emits a
+ * message, instead of only when the 50 ms polling timer fires.
+ *
+ * Scope: a latency refinement of the test harness, NOT a change to what a wait
+ * can satisfy. The condition predicate stays the single source of truth and the
+ * deadline / child-exit guards are unchanged, so a report the worker never sends
+ * still fails the wait — the subscription only re-runs the predicate up to one
+ * 50 ms poll earlier. Two semantics that follow:
+ *  - The 50 ms timer remains as the fallback for conditions backed by logs or
+ *    files, which no message wakes.
+ *  - A message arriving after the deadline fails on the next predicate check
+ *    rather than on the next tick. This is therefore not a strict superset of
+ *    pure polling (which evaluates the predicate before the deadline and could
+ *    still pass on a tick just past it); the gap is bounded by one 50 ms
+ *    interval and the earlier fail-fast is intended.
+ *
+ * Timer ownership: a message wake clears the pending 50 ms timer. Otherwise a
+ * timer left over from the previous round fires later and nulls the NEXT round's
+ * `wake`, delaying a message that should have resolved the wait immediately.
+ */
+export function createMessageAwareWaiter(
+  child: MessageWaiterChild,
+  timeoutSnapshot: () => string,
+): (cond: () => boolean, what: string, timeoutMs?: number) => Promise<void> {
+  return async function waitFor(cond, what, timeoutMs = 45_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let wake: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onMessage = () => {
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+      wake?.();
+    };
+    child.on('message', onMessage);
+    try {
+      while (!cond()) {
+        if (Date.now() >= deadline || child.exitCode !== null) {
+          throw new Error(`timed out waiting for ${what}\n${timeoutSnapshot()}`);
+        }
+        await new Promise<void>(done => {
+          wake = done;
+          timer = setTimeout(() => { timer = undefined; wake = undefined; done(); }, 50);
+          timer.unref?.();
+        });
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      child.off('message', onMessage);
+    }
+  };
+}
+
+/** Test seam: a minimal child emitting in-memory messages like an IPC channel. */
+export function fakeMessageChild(exitCode: number | null = null): MessageWaiterChild & {
+  emitMessage(m: unknown): void;
+  messageListenerCount(): number;
+} {
+  const emitter = new EventEmitter();
+  return {
+    exitCode,
+    on: (event, listener) => emitter.on(event, listener),
+    off: (event, listener) => emitter.off(event, listener),
+    emitMessage: (m: unknown) => emitter.emit('message', m),
+    messageListenerCount: () => emitter.listenerCount('message'),
+  };
+}
+
 export interface Generation {
   child: ChildProcess;
   messages: WorkerToDaemon[];
@@ -521,15 +597,8 @@ child.on('exit', code => process.exit(code ?? 1));
         child, messages, logs, readyAt, kill,
         finals: () => messages.flatMap(m => (m.type === 'final_output' ? [m.content] : [])),
         notices: () => messages.filter((m): m is Extract<WorkerToDaemon, { type: 'user_notify' }> => m.type === 'user_notify'),
-        waitFor: async (cond, what, timeoutMs = 45_000) => {
-          const deadline = Date.now() + timeoutMs;
-          while (!cond()) {
-            if (Date.now() >= deadline || child.exitCode !== null) {
-              throw new Error(`timed out waiting for ${what}\n${logs.join('')}\n${JSON.stringify(messages.filter(m => m.type !== 'screen_update'))}`);
-            }
-            await new Promise(done => setTimeout(done, 50));
-          }
-        },
+        waitFor: createMessageAwareWaiter(child, () =>
+          `${logs.join('')}\n${JSON.stringify(messages.filter(m => m.type !== 'screen_update'))}`),
       };
       return generation;
     },
