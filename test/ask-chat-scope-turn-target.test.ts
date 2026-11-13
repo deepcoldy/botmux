@@ -107,7 +107,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     return { done, responses };
   }
 
-  it.each(['none', 'document lookup', 'before registration', 'waiting for answer'])(
+  it.each(['none', 'document lookup', 'before registration', 'waiting for answer', 'pending reservation'])(
     'routes a native question with no legacy thread mirror; replaces runtime during %s', async replace => {
     const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
     const store = new SessionContractStore(dir, APP);
@@ -131,6 +131,9 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
         localeForBot: () => 'zh', tr: (key: string) => key, notifyAsyncAsk: vi.fn(),
         resolveDocumentAskDelivery: async () => {
           if (replace === 'document lookup') bind('replacement', '11:101');
+          // 替代运行时只预留（starting、无 identity）：activeRuntime 仍是旧的，
+          // 只有 hasPendingRuntimeReplacement 能识别这个换代窗口。
+          if (replace === 'pending reservation') controller.reserveBinding('replacement', worker);
           return undefined;
         },
         verifiedAskMention: async () => {
@@ -141,7 +144,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
           deliveryChecks.push(deps.isCurrent()); return deps.isCurrent();
         },
       });
-      if (replace === 'document lookup' || replace === 'before registration') {
+      if (replace === 'document lookup' || replace === 'before registration' || replace === 'pending reservation') {
         await done;
         expect(sent).toHaveLength(0);
         expect(responses.at(-1)).toMatchObject({ status: 409 });
@@ -154,6 +157,54 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
       await done;
       expect(deliveryChecks).toEqual([replace === 'none']);
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
+
+  it('rejects a native question whose threadId does not match the live runtime', async () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      const { worker } = controller.bindWorker(1);
+      controller.reserveBinding('current', worker);
+      controller.bindRuntime('current', worker, { backend: 'tmux', physicalId: '10:100',
+        proof: 'process_start', nativeSessionId: 'thread-current' });
+      const { done, responses } = post(ds, askBody(TURN, {
+        originKind: 'native-user-input-async', requestId: 'question-item',
+        asyncUserInput: { threadId: 'thread-other', nativeTurnId: 'native-turn', itemId: 'question-item' },
+      }), {
+        isCodexAppCliId: (id: string) => id === 'codex-app', captureCodexAsyncAskOrigin,
+        asyncAskAudience: () => ({ kind: 'human', answererOpenId: 'ou_user' }),
+        localeForBot: () => 'zh', tr: (key: string) => key, notifyAsyncAsk: vi.fn(),
+      });
+      await done;
+      expect(sent).toHaveLength(0);
+      expect(responses.at(-1)).toMatchObject({ status: 409 });
+    } finally {
+      lookup.mockRestore(); store.close();
+    }
+  });
+
+  it('freezes the worker generation: a later rotation invalidates the captured origin', () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'codex-app' });
+    const store = new SessionContractStore(dir, APP);
+    const controller = new sessionControllers.SessionController(ds as unknown as DaemonSession, store);
+    const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+    try {
+      const { worker } = controller.bindWorker(1);
+      controller.reserveBinding('current', worker);
+      controller.bindRuntime('current', worker, { backend: 'tmux', physicalId: '10:100',
+        proof: 'process_start', nativeSessionId: 'thread-current' });
+      const isCurrent = captureCodexAsyncAskOrigin(ds, 'thread-current');
+      expect(typeof isCurrent).toBe('function');
+      expect(isCurrent!()).toBe(true);
+      // reserveWorkerGeneration 在新 worker 的 contract bindWorker 之前就推进 ds 代次。
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
+      expect(isCurrent!()).toBe(false);
     } finally {
       lookup.mockRestore(); store.close();
     }
