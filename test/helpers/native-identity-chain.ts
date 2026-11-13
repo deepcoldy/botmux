@@ -25,12 +25,12 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Minimal shape of the worker→daemon messages this inspection needs; callers
- *  pass the harness's full `WorkerToDaemon[]`, which is assignable to this. */
+ *  pass the harness's full `WorkerToDaemon[]`, which is assignable to this.
+ *  No index signature: `WorkerToDaemon` members are interfaces and would not be. */
 export interface NativeIdentityChainMessage {
   type: string;
-  identity?: { nativeSessionId?: unknown; [key: string]: unknown };
+  identity?: unknown;
   cliSessionId?: unknown;
-  [key: string]: unknown;
 }
 
 export interface NativeIdentityChainInput {
@@ -61,6 +61,8 @@ function describePidStateRecords(claudeDir: string): string {
   if (!existsSync(sessionsDir)) return `  sessions/ dir: MISSING (${sessionsDir})`;
   let names: string[];
   try {
+    // Node's readdirSync comes back sorted (libuv scandir), Bun's in the
+    // filesystem's own order: only this sort keeps the snapshot deterministic.
     names = readdirSync(sessionsDir).filter(n => n.endsWith('.json')).sort();
   } catch (error) {
     return `  sessions/ dir: UNREADABLE (${error instanceof Error ? error.message : String(error)})`;
@@ -88,7 +90,7 @@ export function describeNativeIdentityChain(input: NativeIdentityChainInput): st
   const gateExists = existsSync(input.pidStateGate);
   const cliSessionIdMessages = input.messages.filter(m => m.type === 'cli_session_id');
   const nativeBindings = input.messages.filter(
-    m => m.type === 'runtime_binding' && typeof m.identity?.nativeSessionId === 'string',
+    m => m.type === 'runtime_binding' && typeof (m.identity as { nativeSessionId?: unknown } | undefined)?.nativeSessionId === 'string',
   );
   const identity = (input.runtimeIdentity ?? null) as { nativeSessionId?: unknown; proof?: unknown; [k: string]: unknown } | null;
   const storeNativeId = identity && typeof identity.nativeSessionId === 'string' ? identity.nativeSessionId : undefined;

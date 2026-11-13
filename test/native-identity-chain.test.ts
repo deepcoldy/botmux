@@ -12,7 +12,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describeNativeIdentityChain, type NativeIdentityChainMessage } from './helpers/native-identity-chain.js';
 
-let dir: string;
 const dirs: string[] = [];
 
 function makeLayout(): { root: string; claudeDir: string; sessionsDir: string; gate: string } {
@@ -101,15 +100,19 @@ describe('describeNativeIdentityChain', () => {
     expect(out2).toContain('10.json: UNPARSEABLE');
   });
 
-  it('sorts multiple pid-state records for deterministic output', () => {
+  it('lists only pid-state records, sorted, with the fields each one has', () => {
+    // Node's readdirSync already sorts; Bun's returns the filesystem's order
+    // (ext4 htree hash, tmpfs insertion). Six records created shuffled leave
+    // that order sorted only by a 1-in-720 chance, so the Bun leg catches a
+    // missing sort.
     const { claudeDir, sessionsDir, gate } = makeLayout();
-    writePidRecord(sessionsDir, 300, { pid: 300, sessionId: 's-b' });
-    writePidRecord(sessionsDir, 100, { pid: 100, sessionId: 's-a' });
+    for (const pid of [300, 100, 600, 200, 500, 400]) writePidRecord(sessionsDir, pid, { pid, sessionId: `s-${pid}` });
+    writeFileSync(join(sessionsDir, '150.json.tmp'), '{');
     const out = describeNativeIdentityChain(baseInput({ gate, claudeDir }));
-    const i100 = out.indexOf('100.json');
-    const i300 = out.indexOf('300.json');
-    expect(i100).toBeGreaterThan(-1);
-    expect(i300).toBeGreaterThan(i100);
+    const listed = out.split('\n').flatMap(line => /^ {2}(\S+): /.exec(line)?.[1] ?? []);
+    expect(listed).toEqual(['100.json', '200.json', '300.json', '400.json', '500.json', '600.json']);
+    expect(out).toContain('100.json: pid=100 sessionId="s-100"\n');
+    expect(out).not.toContain('cwd=');
   });
 
   it('distinguishes a worker produce-side break (no IPC) from a daemon break', () => {
