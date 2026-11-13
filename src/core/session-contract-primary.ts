@@ -27,8 +27,8 @@ export async function commitPrimarySessionContract(session: Session, snapshot: S
         // replacement on the same anchor without admitting any message, so the
         // lane still holds the closed predecessor when the replacement's first
         // checkpoint arrives. Only that first checkpoint (nothing committed yet)
-        // of a live session may take the closed row over; every other mismatch,
-        // including an active predecessor, still fences this session.
+        // of a live session may take its recorded predecessor's closed row over;
+        // every other mismatch, including an active predecessor, still fences.
         const successor = expectedRevision === 0
           ? successorPrimarySessionValue(current, { ...session, ...checkpoint })
           : undefined;

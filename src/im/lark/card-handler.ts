@@ -1,5 +1,6 @@
 import { modelPinText } from '../../core/model-pin.js';
 import { resolveSessionModelPinView } from '../../core/session-model.js';
+import { sessionContractPrimary } from '../../core/session-contract-primary.js';
 import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
@@ -1109,6 +1110,9 @@ export async function commitRepoSelection(
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
+        if (sessionContractPrimary(current.larkAppId)) {
+          session.durablePrimaryPredecessorSessionId = oldSession.sessionId;
+        }
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;
         session.creatorOpenId = oldSession.creatorOpenId;

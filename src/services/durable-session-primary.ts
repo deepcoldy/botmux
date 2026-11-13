@@ -377,8 +377,9 @@ function mergePrimaryProjection(
  * and forks the replacement from a command or card path that never admits a
  * message, so the replacement's first contract checkpoint is the earliest
  * write that can claim the row. Returns undefined, so the caller keeps failing
- * closed, unless the current row is a closed primary Session with another id
- * and the successor itself is active; an active predecessor is never replaced.
+ * closed, unless the current row is the exact closed predecessor recorded at
+ * creation and the successor itself is active. Acquiring a new lease after a
+ * pause does not authorize replacing a later session, even if it is now closed.
  *
  * The predecessor's control history is bound to its sessionId and is dropped.
  * The envelope requires an admission, so the predecessor's latest one stays as
@@ -397,6 +398,8 @@ export function successorPrimarySessionValue(
   if (!current
       || value?.type !== 'botmux.session.primary'
       || predecessor?.status !== 'closed'
+      || !successor.durablePrimaryPredecessorSessionId
+      || predecessor.sessionId !== successor.durablePrimaryPredecessorSessionId
       || predecessor.sessionId === successor.sessionId
       || successor.status !== 'active') {
     return undefined;

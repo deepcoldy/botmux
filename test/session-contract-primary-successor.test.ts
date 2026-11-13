@@ -3,7 +3,7 @@ import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { sessionKey, storedSessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import { controllerForSession, type SessionController } from '../src/core/session-controller.js';
@@ -30,6 +30,7 @@ type Scope = 'chat' | 'thread';
 const SCOPES: Scope[] = ['chat', 'thread'];
 const CHAT_ID = 'oc_primary_successor';
 const ROOT_ID = 'om_primary_successor_root';
+const LEASE_MS = 1_000;
 
 // Primary registrations are process-global per app and cannot be removed, so
 // every test registers a fresh app id against its own SQLite store.
@@ -42,6 +43,7 @@ let store: SqliteDurableCoordinationStore;
 let facade: DurableSessionFacade;
 let fences: string[];
 let opened: SessionController[];
+let now: number;
 
 function makeSession(sessionId: string, scope: Scope): Session {
   return {
@@ -133,7 +135,8 @@ async function closedPredecessor(scope: Scope) {
  * swap a brand-new record on the same anchor in. Nothing in that path admits a
  * message, so the durable lane is not touched here. */
 function repoSwitch(ds: DaemonSession) {
-  ds.session = makeSession('session-b', ds.scope as Scope);
+  ds.session = { ...makeSession('session-b', ds.scope as Scope),
+    durablePrimaryPredecessorSessionId: ds.session.sessionId };
   return controllerFor(ds);
 }
 
@@ -144,8 +147,9 @@ beforeEach(() => {
   previousDataDir = config.session.dataDir;
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-primary-successor-'));
   config.session.dataDir = dataDir;
-  store = new SqliteDurableCoordinationStore(join(root, 'coordination.db'));
-  facade = createDurableSessionFacade({ store, ownerId: `owner-${app}` });
+  now = 1_000_000;
+  store = new SqliteDurableCoordinationStore(join(root, 'coordination.db'), { now: () => now });
+  facade = createDurableSessionFacade({ store, ownerId: `owner-${app}`, leaseDurationMs: LEASE_MS });
   fences = [];
   registerSessionContractPrimary(app, facade, sessionId => { fences.push(sessionId); });
   opened = [];
@@ -242,9 +246,90 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
     expect((await lane(ds.session)).record).toEqual(before.record);
   });
 
+  it('requires a recorded predecessor instead of claiming any closed row', async () => {
+    const { ds, before } = await closedPredecessor('thread');
+    const replacement = repoSwitch(ds);
+    delete ds.session.durablePrimaryPredecessorSessionId;
+    replacement.bindWorker(2);
+
+    await expect(replacement.flushPrimary()).rejects.toThrow('canonical_contract_session_changed');
+
+    expect(fences).toEqual(['session-b']);
+    expect((await lane(ds.session)).record).toEqual(before.record);
+  });
+
+  it('restores the recorded predecessor when a new controller retries before any checkpoint', async () => {
+    const { ds } = await closedPredecessor('thread');
+    repoSwitch(ds).bindWorker(2);
+    // A restart only has the serialized Session; no cached predecessor controller.
+    const restored = { larkAppId: app, scope: 'thread', chatId: CHAT_ID,
+      session: JSON.parse(JSON.stringify(ds.session)), initConfig: {} } as DaemonSession;
+    const replacement = controllerFor(restored);
+    replacement.bindWorker(3);
+
+    await replacement.flushPrimary();
+
+    expect(fences).toEqual([]);
+    expect((await lane(restored.session)).session.sessionId).toBe('session-b');
+  });
+
+  it('fences a delayed first checkpoint after another replica replaces and closes its predecessor', async () => {
+    const { ds } = await closedPredecessor('thread');
+    const replacement = repoSwitch(ds);
+    replacement.bindWorker(2);
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const acquire = store.acquireSessionLease.bind(store);
+    const paused = vi.spyOn(store, 'acquireSessionLease').mockImplementationOnce(async input => {
+      enter();
+      await held;
+      return acquire(input);
+    });
+    const initial = replacement.flushPrimary();
+    // Keep teardown safe even when a regression changes the rejection timing.
+    const settled = initial.catch(() => {});
+    const otherStore = new SqliteDurableCoordinationStore(join(root, 'coordination.db'), { now: () => now });
+    const otherFacade = createDurableSessionFacade({ store: otherStore, ownerId: 'other-replica', leaseDurationMs: LEASE_MS });
+    try {
+      await entered;
+      now += LEASE_MS + 1;
+      const other = { larkAppId: app, scope: 'thread', chatId: CHAT_ID,
+        session: makeSession('session-c', 'thread'), initConfig: {} } as DaemonSession;
+      await admitDurableLarkSession({ facade: otherFacade, message: message('om_later'), session: other.session });
+      registerSessionContractPrimary(app, otherFacade, id => { fences.push(id); });
+      const later = controllerFor(other);
+      later.bindWorker(3);
+      await later.flushPrimary();
+      const { operation } = later.beginControl('close');
+      later.controlStarted(operation.operationId);
+      await later.flushPrimary();
+      later.controlResult(operation.operationId, 'confirmed');
+      await later.flushPrimary();
+      const closed = await lane(other.session);
+      expect(closed.session).toMatchObject({ sessionId: 'session-c', status: 'closed' });
+      await otherFacade.releaseLease(laneKey(other.session));
+
+      release();
+      await expect(initial).rejects.toThrow('canonical_contract_session_changed');
+
+      expect(fences).toEqual(['session-b']);
+      expect((await lane(other.session)).record).toEqual(closed.record);
+    } finally {
+      release();
+      await settled;
+      paused.mockRestore();
+      registerSessionContractPrimary(app, facade, id => { fences.push(id); });
+      await otherFacade.stop();
+      await otherStore.close();
+    }
+  });
+
   it('refuses to write a successor row under another anchor', async () => {
     const { before } = await closedPredecessor('thread');
-    const elsewhere = { ...makeSession('session-b', 'thread'), rootMessageId: 'om_other_root' };
+    const elsewhere = { ...makeSession('session-b', 'thread'), rootMessageId: 'om_other_root',
+      durablePrimaryPredecessorSessionId: 'session-a' };
 
     expect(() => successorPrimarySessionValue(before.record, elsewhere)).toThrow('does not belong');
   });

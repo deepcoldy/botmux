@@ -752,6 +752,10 @@ export interface Session {
     committedAt: string;
     dispatchAttempt?: number;
   }>;
+  /** Exact closed Session displaced by a primary-mode /repo switch. Persisted
+   * before worker startup so a delayed or restored first checkpoint cannot
+   * claim a different successor's closed lane. Absent means no takeover proof. */
+  durablePrimaryPredecessorSessionId?: string;
   /** Confirmed settings for an exact durable Inbox task that may retry before
    * provider submission. Never itself authorizes a business-turn replay. */
   codexEffortTaskConfirmations?: import('./services/codex-effort-task-state.js').EffortTaskConfirmation[];

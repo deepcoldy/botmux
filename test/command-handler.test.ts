@@ -10,6 +10,7 @@
 // the data-dir fence instead of touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as primaryContracts from '../src/core/session-contract-primary.js';
 
 vi.mock('../src/services/feed-group-tagger.js', () => ({
   tagClosedSessionGroup: vi.fn(async () => ({ status: 'skipped' })),
@@ -6248,6 +6249,33 @@ describe('handleCommand', () => {
       );
       expect(newSessionUpdate, 'updateSession was never called with the new session').toBeDefined();
       expect(newSessionUpdate![0].workingDir).toBe('/home/testuser/project-a');
+      expect(newSessionUpdate![0].durablePrimaryPredecessorSessionId).toBeUndefined();
+    });
+
+    it('persists the primary predecessor before starting the replacement worker', async () => {
+      const registration = vi.spyOn(primaryContracts, 'sessionContractPrimary').mockReturnValue({} as never);
+      try {
+        const ds = makeDaemonSession({ pendingRepo: false });
+        const predecessorId = ds.session.sessionId;
+        const deps = makeDeps(ds);
+        deps.lastRepoScan.set(CHAT_ID, [
+          { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+        ]);
+        let persisted: string | undefined;
+        const observedAtFork: Array<string | undefined> = [];
+        vi.mocked(sessionStore.updateSession).mockImplementationOnce(session => {
+          persisted = session.durablePrimaryPredecessorSessionId;
+        });
+        vi.mocked(forkWorker).mockImplementationOnce(() => {
+          observedAtFork.push(persisted);
+        });
+
+        await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+        expect(forkWorker).toHaveBeenCalledOnce();
+        expect(observedAtFork).toEqual([predecessorId]);
+        expect(ds.session.durablePrimaryPredecessorSessionId).toBe(predecessorId);
+      } finally { registration.mockRestore(); }
     });
 
     it('mid-session switch empty-starts the replacement CLI and marks its first turn pending', async () => {
