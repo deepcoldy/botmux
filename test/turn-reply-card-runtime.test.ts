@@ -36,7 +36,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}), uploadFile: vi.fn(), replyMessage: vi.fn(), sendMessage: vi.fn(),
   MessageWithdrawnError: class extends Error {},
 }));
-vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh', t: (key: string) => key }));
+// Keys stay literal except the effort-source labels, whose effort argument is the
+// observed value under test.
+vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh',
+  t: (key: string, params?: Record<string, string | number>) => key === 'card.usage.effort_selected' ? `${params?.effort}（已选）`
+    : key === 'card.usage.effort_last_execution' ? `${params?.effort}（最近执行）` : key }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 vi.mock('../src/services/session-store.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/services/session-store.js')>();
