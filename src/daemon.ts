@@ -652,7 +652,7 @@ import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -9217,17 +9217,27 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const directHumanTurn = directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+      session: ds.session, activeTurn: active });
+    const inheritedForwardTools = !directHumanTurn && turnId && targetAppIds.length
+      ? dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+        sourceChatId: ds.chatId, targetChatId: chatId, targetAppIds,
+        directHuman: false, inherited: true,
+      }) : [];
+    // With tools: [] a bot can still forward an already signed grant through
+    // dispatchOnly. Read that grant before deciding whether to sign at all.
+    const inheritedLookedUp = inheritedForwardTools.length > 0;
+    const earlyInherited = inheritedLookedUp ? await dispatchUserForTurn(ds, turnId!) : undefined;
+    // A forward passes on only tools the upstream grant already carries. A
+    // listed tool it cannot pass on is no immediate delegation: counting it
+    // would suppress the automatic schedule grant below and sign nothing.
     const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
       sourceChatId: ds.chatId,
       targetChatId: chatId,
       targetAppIds,
-      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
-        && !!active && active.turnId === turnId
-        && active.caller.senderType === 'user' && !active.caller.source
-        && active.caller.requestLarkAppId === ds.larkAppId
-        && !!active.caller.requestUserOpenId,
-      inherited: false,
-    });
+      directHuman: directHumanTurn,
+      inherited: !!earlyInherited,
+    }).filter(tool => directHumanTurn || earlyInherited?.authority.tools.includes(tool));
     const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
     // A host bot grant stands in only for turns that no human administrator
     // drives. An administrator's own dispatch (live, or restored from the reply
@@ -9275,7 +9285,8 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // immediate tool delegation.
     const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
     let inherited = needsDelegation && turnId && !serviceGrant
-      ? await dispatchUserForTurn(ds, turnId) : undefined;
+      ? inheritedLookedUp ? earlyInherited : await dispatchUserForTurn(ds, turnId)
+      : undefined;
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // A workflow node's delegation goes on only within its run (approved
@@ -9294,7 +9305,10 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       sourceAppId: ds.larkAppId,
       caller: dispatchCaller,
       inherited: inherited?.authority,
-      tools: inherited ? tools : dispatchTools,
+      // authorityForDispatch intersects this list with a verified inherited
+      // grant. dispatchOnly can permit forwarding without enabling the tool
+      // in this bot's own CLI policy.
+      tools: dispatchTools,
       ...(scheduleCreateRequested ? {
         scheduleCreate: {
           targetAppIds,
@@ -9435,11 +9449,8 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
-    const directHumanTurn = ds.session.failedTurnRecovery?.turnId !== turnId
-      && !!active && active.turnId === turnId
-      && active.caller.senderType === 'user' && !active.caller.source
-      && active.caller.requestLarkAppId === ds.larkAppId
-      && !!active.caller.requestUserOpenId;
+    const directHumanTurn = directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+      session: ds.session, activeTurn: active });
     // Scope the dispatch-only check to `targets` — the local bots that actually
     // receive a signed record. The raw targetAppIds may name a bot that is not
     // configured on this machine; it is filtered out above, so letting it veto
