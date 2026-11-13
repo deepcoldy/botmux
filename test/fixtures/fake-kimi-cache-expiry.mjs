@@ -20,7 +20,10 @@
 //   FAKE_KIMI_IGNORE_ENTER=1  Enter on the menu does nothing
 //   FAKE_KIMI_WORKING_DELAY_MS  report `working` this long after the Enter
 //                        (default: at once, like the real binary)
-import { appendFileSync, readFileSync } from 'node:fs';
+//   FAKE_KIMI_START_FILE paint the first frame only once this file exists
+//                        (tmux backend: the test creates it when the worker's
+//                        pane is piped, see startWorker in the test)
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -165,11 +168,22 @@ function parse() {
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { buf += chunk; parse(); });
-out('\x1b[?2004h');
-draw(FRAMES.composer);
-osc('idle');
-record({ ev: 'started', scenario: SCENARIO, argv: process.argv.slice(2) });
-// Real 2.5.3 on resume: `idle` first, the replayed history, then the menu
-// ~0.22s after the `idle` report.
-if (SCENARIO === 'resume') setTimeout(showMenu, 220);
+
+const START_FILE = process.env.FAKE_KIMI_START_FILE;
+const bootedAt = Date.now();
+if (START_FILE) record({ ev: 'booted' });
+function start() {
+  if (START_FILE && !existsSync(START_FILE)) {
+    setTimeout(start, 10);
+    return;
+  }
+  out('\x1b[?2004h');
+  draw(FRAMES.composer);
+  osc('idle');
+  record({ ev: 'started', scenario: SCENARIO, argv: process.argv.slice(2), heldMs: Date.now() - bootedAt });
+  // Real 2.5.3 on resume: `idle` first, the replayed history, then the menu
+  // ~0.22s after the `idle` report.
+  if (SCENARIO === 'resume') setTimeout(showMenu, 220);
+}
+start();
 setInterval(() => {}, 60_000);
