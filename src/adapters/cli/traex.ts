@@ -613,7 +613,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         const owned = cliPid ? findTraexRolloutSetByPid(cliPid) : undefined;
         if (owned !== undefined) {
           const m = ownedMatch(owned);
-          if (m.found && m.cliSessionId) return { submitted: true as const, cliSessionId: m.cliSessionId };
+          if (m.found && m.cliSessionId) return {
+            submitted: true as const, cliSessionId: m.cliSessionId, ownershipProven: true as const,
+          };
           // Enumeration works but no owned line yet. Note submit evidence but
           // keep waiting for the owned id — unless the budget is spent.
           if (anyMatch().found) sawAnyText = true;
