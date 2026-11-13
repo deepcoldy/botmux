@@ -213,6 +213,8 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     // The npm launcher asks `Update now? [Y/N]` on an interactive start when a
     // newer version exists; botmux's first prompt would be eaten as the answer.
+    // Also listed in BOTMUX_INJECTED_ENV_KEYS: tmux/zellij/zmx panes only see
+    // adapter env that is on that allowlist.
     spawnEnv: { DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
     // Login state (`~/.doubao-cli`, Linux data root). Kept writable inside the
     // file sandbox so token refresh persists; not yet verified end-to-end there.
