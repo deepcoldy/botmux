@@ -13,9 +13,17 @@ export async function runFeedbackStorageCommand(args: string[], io: {
     return index < 0 ? undefined : args[index + 1];
   };
   try {
-    if (args.some(value => value === '--password' || value.startsWith('--password=') || value === '--token' || value.startsWith('--token='))) throw new Error('feedback_storage_use_secret_reference');
+    if (args.some(value => value === '--password' || value.startsWith('--password=') || value === '--token' || value.startsWith('--token=') || value === '--supabase-key' || value.startsWith('--supabase-key='))) throw new Error('feedback_storage_use_secret_reference');
     let result: unknown;
     switch (args[0] ?? 'status') {
+      case 'supabase-schema': {
+        const config = await readFeedbackStorageConfig(dataDir);
+        const target = config.candidate ?? config.active;
+        if (target.backend !== 'supabase') throw new Error('feedback_migration_target_required');
+        const { feedbackSupabaseSchemaSql } = await import('../services/feedback-supabase-schema.js');
+        io.output.write(feedbackSupabaseSchemaSql(target.supabase.schema, config.instanceId) + '\n');
+        return 0;
+      }
       case 'cancel': {
         if (!args[1]) throw new Error('feedback_migration_id_required');
         const job = await cancelFeedbackMigration(dataDir, args[1], {

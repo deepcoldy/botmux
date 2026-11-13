@@ -11,6 +11,20 @@ import { prepareFeedbackMigration, getFeedbackMigration } from '../src/services/
 import { beginFeedbackMaintenance, assertFeedbackAdmission } from '../src/services/feedback-maintenance.js';
 
 describe('feedback storage CLI', () => {
+  it('prints Supabase bootstrap SQL for the installation without changing the active backend', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'feedback-cli-supabase-'));
+    let output = '';
+    const io = { input: Readable.from([]), output: new Writable({ write(chunk, _encoding, done) { output += String(chunk); done(); } }), error: new Writable({ write(_chunk, _encoding, done) { done(); } }) };
+    try {
+      const config = await readFeedbackStorageConfig(directory);
+      await saveFeedbackStorageCandidate(directory, config.generation, { backend: 'supabase', supabase: {
+        url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'botmux_feedback', requestTimeoutMs: 5000,
+      } });
+      expect(await runFeedbackStorageCommand(['supabase-schema'], io, directory)).toBe(0);
+      expect(output.trimStart().startsWith('BEGIN;')).toBe(true);
+      expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('sqlite');
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('requires evidence for cancellation and exposes pre-freeze recovery without a database', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-cli-cancel-'));
     const output: string[] = [];

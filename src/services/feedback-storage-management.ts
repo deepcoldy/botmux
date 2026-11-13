@@ -14,7 +14,10 @@ import { randomUUID } from 'node:crypto';
 import { currentFeedbackMaintenance } from './feedback-maintenance.js';
 
 export function feedbackStorageView(config: FeedbackStorageConfig) {
-  const redact = (target: FeedbackStorageTarget) => target.backend === 'sqlite' ? target : {
+  const redact = (target: FeedbackStorageTarget) => target.backend === 'sqlite' ? target : target.backend === 'supabase' ? {
+    backend: 'supabase',
+    supabase: { url: target.supabase.url, schema: target.supabase.schema, requestTimeoutMs: target.supabase.requestTimeoutMs, hasKey: !!target.supabase.keyRef },
+  } : {
     backend: target.backend,
     postgres: { host: target.postgres.host, port: target.postgres.port, database: target.postgres.database,
       user: target.postgres.user, schema: target.postgres.schema, tls: { mode: target.postgres.tls.mode, hasCa: !!target.postgres.tls.caRef },
@@ -32,12 +35,19 @@ export async function feedbackStorageStatus(dataDir: string) {
     migrations: jobs.map(job => ({ migrationId: job.migrationId, phase: job.phase, blockers: job.blockers })) };
 }
 export async function configureFeedbackStorageCandidate(dataDir: string, request: {
-  expectedGeneration: number; candidate: FeedbackStorageTarget; password?: string; token?: string; ca?: string;
+  expectedGeneration: number; candidate: FeedbackStorageTarget; password?: string; token?: string; ca?: string; supabaseKey?: string;
 }): Promise<FeedbackStorageConfig> {
   const current = await readFeedbackStorageConfig(dataDir);
   if (current.generation !== request.expectedGeneration) throw new Error('feedback_storage_generation_conflict');
-  if (!request.candidate || !['sqlite', 'postgresql'].includes(request.candidate.backend)) throw new Error('feedback_storage_target_invalid');
+  if (!request.candidate || !['sqlite', 'postgresql', 'supabase'].includes(request.candidate.backend)) throw new Error('feedback_storage_target_invalid');
   const candidate = structuredClone(request.candidate);
+  if (candidate.backend === 'supabase') {
+    if (!candidate.supabase || request.password || request.token || request.ca) throw new Error('feedback_storage_auth_invalid');
+    const previous = current.candidate?.backend === 'supabase' ? current.candidate.supabase : current.active.backend === 'supabase' ? current.active.supabase : undefined;
+    candidate.supabase.keyRef = request.supabaseKey
+      ? await putFeedbackStorageSecret(dataDir, request.supabaseKey)
+      : candidate.supabase.keyRef || previous?.keyRef || '';
+  } else if (request.supabaseKey) throw new Error('feedback_storage_auth_invalid');
   if (candidate.backend === 'postgresql') {
     if (!candidate.postgres) throw new Error('feedback_storage_target_invalid');
     const previous = current.candidate?.backend === 'postgresql' ? current.candidate.postgres : current.active.backend === 'postgresql' ? current.active.postgres : undefined;
@@ -68,6 +78,15 @@ export async function testFeedbackStorageConnection(dataDir: string): Promise<{ 
   const config = await readFeedbackStorageConfig(dataDir);
   const selected = config.candidate ?? config.active;
   if (selected.backend === 'sqlite') return { ok: true, backend: 'sqlite' };
+  if (selected.backend === 'supabase') {
+    const { openSupabaseFeedbackClient } = await import('./feedback-supabase-store.js');
+    const client = await openSupabaseFeedbackClient(dataDir, selected.supabase);
+    try {
+      const meta = await client.call<{ version: number; instance_id: string }>('migration_status', [], config.instanceId);
+      if (meta.version !== 1 || meta.instance_id !== config.instanceId) throw new Error('feedback_storage_target_identity_conflict');
+      return { ok: true, backend: 'supabase' };
+    } finally { await client.close(); }
+  }
   const target = selected.postgres;
   const { feedbackPostgresPool } = await import('./feedback-postgres-schema.js');
   const pool = feedbackPostgresPool(target, await readPostgresCredential(dataDir, target), target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined);

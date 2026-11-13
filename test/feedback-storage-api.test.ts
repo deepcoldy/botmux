@@ -22,6 +22,22 @@ async function request(path: string, method = 'GET', body?: unknown, admin = tru
   return { status, result, directory };
 }
 describe('feedback storage administration', () => {
+  it('stores Supabase server keys privately and returns redacted connection status', async () => {
+    const response = await request('/api/feedback/storage/configure', 'POST', {
+      expectedGeneration: 0, supabaseKey: 'sb_secret_private_api_key',
+      candidate: { backend: 'supabase', supabase: {
+        url: 'https://example.supabase.co', schema: 'botmux_feedback', keyRef: '', requestTimeoutMs: 5000,
+      } },
+    });
+    expect(response.status).toBe(200);
+    expect(response.result.active.backend).toBe('sqlite');
+    expect(response.result.candidate.supabase).toEqual({
+      url: 'https://example.supabase.co', schema: 'botmux_feedback', requestTimeoutMs: 5000, hasKey: true,
+    });
+    expect(JSON.stringify(response.result)).not.toContain('sb_secret_private_api_key');
+    const stored = await readFeedbackStorageConfig(response.directory);
+    expect(stored.candidate?.backend).toBe('supabase');
+  });
   it('accepts structured doas identity without persisting a token or command string', async () => {
     const response = await request('/api/feedback/storage/configure', 'POST', {
       expectedGeneration: 0, candidate: { backend: 'postgresql', postgres: {

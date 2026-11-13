@@ -34,6 +34,15 @@ const postgresSchema = z.object({
 const targetSchema = z.discriminatedUnion('backend', [
   z.object({ backend: z.literal('sqlite') }).strict(),
   z.object({ backend: z.literal('postgresql'), postgres: postgresSchema }).strict(),
+  z.object({ backend: z.literal('supabase'), supabase: z.object({
+    url: z.string().url().max(2048).refine(value => {
+      const url = new URL(value);
+      return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/';
+    }),
+    keyRef: secretReference,
+    schema: z.string().regex(/^[a-z_][a-z0-9_]{0,62}$/).refine(value => !['public', 'auth', 'storage', 'pg_catalog', 'information_schema'].includes(value)),
+    requestTimeoutMs: z.number().int().min(100).max(60000),
+  }).strict() }).strict(),
 ]);
 const configSchema = z.object({
   version: z.literal(1),

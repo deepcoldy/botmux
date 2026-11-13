@@ -31,6 +31,29 @@ afterEach(async () => {
   delete process.env.BOTMUX_TEST_PG_PASSWORD;
 });
 describe('feedback storage configuration', () => {
+  it('saves a Supabase candidate with private key references without changing the active store', async () => {
+    const path = await directory();
+    const current = await readFeedbackStorageConfig(path);
+    const candidate = {
+      backend: 'supabase' as const,
+      supabase: { url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'botmux_feedback', requestTimeoutMs: 5000 },
+    };
+    const saved = await saveFeedbackStorageCandidate(path, current.generation, candidate);
+    expect(saved.active).toEqual({ backend: 'sqlite' });
+    expect(saved.candidate).toEqual(candidate);
+    expect((await getFeedbackStorage(path)).store).toBeDefined();
+  });
+  it.each([
+    { url: 'http://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'https://user:password@example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'https://example.supabase.co', keyRef: 'exposed-key', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'public', requestTimeoutMs: 5000 },
+  ])('rejects unsafe Supabase connection configuration without switching storage', async supabase => {
+    const path = await directory();
+    const current = await readFeedbackStorageConfig(path);
+    await expect(saveFeedbackStorageCandidate(path, current.generation, { backend: 'supabase', supabase })).rejects.toThrow('feedback_storage_target_invalid');
+    expect(await readFeedbackStorageConfig(path)).toEqual(current);
+  });
   it('keeps captured stores live when only the candidate configuration changes', async () => {
     const path = await directory();
     const first = await getFeedbackStorage(path);
