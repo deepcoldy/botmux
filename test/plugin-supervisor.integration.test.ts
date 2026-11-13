@@ -12,6 +12,7 @@ import { changePluginService, readPluginProcesses } from '../src/core/plugins/su
 import { readPluginSupervisorDesired, pluginSupervisorStatePath, pluginSupervisorResultPath } from '../src/core/plugins/supervisor-store.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
 import { pidAlive } from '../src/core/fleet-supervisor.js';
+import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, label: string, timeout = 12_000): Promise<void> {
@@ -27,6 +28,15 @@ describe('plugin services on the built-in supervisor', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'plugin-supervisor-'));
     vi.stubEnv('HOME', home);
+    // The supervisor launched below is the real entry. Started from inside a
+    // bot session it moves itself into a new scope over the host's user bus
+    // (core/fleet-scope.ts), and that busctl runs with a fixed PATH the systemd
+    // fence's shims never see. Declare no user bus, as scripts/fenced-run.ts
+    // does, and stop before launching anything if that stops hiding it.
+    vi.stubEnv('BOTMUX_FENCED_RUN', '1');
+    vi.stubEnv('XDG_RUNTIME_DIR', undefined);
+    vi.stubEnv('DBUS_SESSION_BUS_ADDRESS', undefined);
+    expect(userSystemdBusEnv()).toBeUndefined();
   });
   afterEach(async () => {
     const path = pluginSupervisorStatePath();
