@@ -79,6 +79,7 @@ export const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
+  { id: 'usage', href: '#/usage', labelKey: 'nav.usage', manage: true, aliases: ['token', '用量', '消耗', 'cost'], icon: <><path d="M2 13h12M4 10V6M8 10V2M12 10V4" /><circle cx="8" cy="13" r="1" /></> },
   { id: 'feedback', href: '#/feedback', labelKey: 'nav.feedback', manage: true, icon: <><path d="M2.2 3.2h11.6v8H8l-3.2 2.6v-2.6H2.2z" /><path d="M5 6.2h6M5 8.3h4" /></> },
   {
     id: 'workflows',
@@ -157,3 +158,6 @@ export const PALETTE_UNINDEXED_ROUTES: Readonly<Record<string, string>> = {
   'agent-workbench-dock': '桌面壳 / 沉浸式入口嵌入的驾驶舱界面，不是独立页面',
   'webhook-logs': '#/connectors/logs 的旧别名',
 };
+
+// Register Token usage in the analytics navigation group.
+NAV_GROUPS.find(group => group.id === 'analytics')?.items.push('usage');
