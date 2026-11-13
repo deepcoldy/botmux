@@ -1,4 +1,5 @@
 import { resolveSessionModelPinView } from './session-model.js';
+import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
@@ -3528,6 +3529,7 @@ export async function handleCommand(
                 markRepoCardConsumed(current, cardToWithdraw);
                 current.repoCardMessageId = undefined;
 
+                const predecessorRevision = current.session.sessionRuntimeContract?.session.revision ?? 0;
                 const session = sessionStore.createSession(
                   current.chatId,
                   current.scope === 'chat' ? oldSession.rootMessageId : rootId,
@@ -3543,6 +3545,11 @@ export async function handleCommand(
                 current.workingDir = selectedPath;
                 session.workingDir = selectedPath;
                 session.larkAppId = current.larkAppId;
+                if (sessionContractPrimary(current.larkAppId)) {
+                  session.durablePrimaryPredecessor = {
+                    sessionId: oldSession.sessionId, contractRevision: predecessorRevision,
+                  };
+                }
                 session.chatDisplayName = oldSession.chatDisplayName;
                 session.ownerOpenId = oldSession.ownerOpenId;
                 session.creatorOpenId = oldSession.creatorOpenId;

@@ -24,6 +24,7 @@ import {
   type CredentialGrantRequest,
 } from '../platform/credential-grant-client.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -181,16 +182,6 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
   return null;
 }
 
-/** The claims of a ByteCloud JWT (read, not verified). */
-function jwtClaims(jwt: string): { region?: unknown; exp?: unknown } {
-  try {
-    const claims = JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
-    return claims && typeof claims === 'object' ? claims : {};
-  } catch {
-    return {};
-  }
-}
-
 /**
  * Grant variables → identity. The client already enforces the per-tool
  * allow-list, but the identity file is the last stop before a wrapper execs a
@@ -229,7 +220,7 @@ function toIdentity(
     if (!nonEmpty(jwt)) continue;
     regionalIssued = true;
     const claims = jwtClaims(jwt);
-    if (claims.region !== region) {
+    if (claims?.region !== region) {
       logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
     } else if (typeof claims.exp === 'number' && claims.exp * 1_000 <= now) {
       logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} has already expired; dropped`);

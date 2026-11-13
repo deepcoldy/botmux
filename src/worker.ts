@@ -4296,6 +4296,9 @@ let postSessionStartPromptEvidenceInFlight = false;
  * input out of that menu so an automated submit cannot accidentally select
  * “Trust all” or get consumed as menu navigation. */
 let hookReviewInputHold = false;
+/** Bumped whenever hookReviewInputHold changes: a screen read across a change
+ *  (traexQuestionHoldsQueuedWrite) may show a page already released. */
+let hookReviewInputHoldRevision = 0;
 let hookReviewInputHoldNotified = false;
 /** Last snapshot that set or kept the hold — the page the held input is
  *  waiting behind, classified again when the hold is reported. */
@@ -4431,9 +4434,11 @@ function kimiResumeOpeningSettleHolds(): boolean {
   return true;
 }
 
-function hookReviewHoldsQueuedWrite(): boolean {
+/** `freshScreen`: a capture the caller just took (traexQuestionHoldsQueuedWrite)
+ *  — decided on instead of the admission screen. */
+function hookReviewHoldsQueuedWrite(freshScreen?: string): boolean {
   if (cliAdapter?.stuckPageFamily === 'kimi' && kimiResumeOpeningSettleHolds()) return true;
-  const screen = hookReviewAdmissionScreen();
+  const screen = freshScreen ?? hookReviewAdmissionScreen();
   refreshHookReviewInputHold(screen);
   if (!hookReviewInputHold) return false;
   if (hookReviewAdmissionShowsPage(screen)) notifyHookReviewInputHold(screen);
@@ -4523,6 +4528,7 @@ function refreshHookReviewInputHold(snapshot: string, opts: { settled?: boolean 
     return;
   }
   hookReviewInputHold = blocked;
+  hookReviewInputHoldRevision += 1;
   if (blocked) {
     log('Blocking page visible — holding queued input until it is resolved');
     // Kimi's cache-expiry menu: one menu event per appearance (the hold's
@@ -17751,6 +17757,29 @@ function traexQuestionHoldBlocks(snapshot: string): boolean {
   return traexQuestionBlockReported() || traexQuestionFlowVisible(snapshot);
 }
 
+/** The last look before a message is pasted into a TraeX terminal session
+ *  (flushPending's drain loop, once every gate has passed — once per message
+ *  written): is the question page up? Asked of a fresh screen
+ *  (traexQuestionCapture), not of the cached ones. Those follow the CLI's
+ *  output stream, which on tmux reaches the worker through the pipe-pane
+ *  relay — on a loaded host the page (and its OSC 7501 report) can be on the
+ *  pane well before the worker has read it — and on a PTY backend through the
+ *  renderer, which parses what the worker has read asynchronously. A message
+ *  arriving meanwhile was pasted into the page's notes field. Without a usable
+ *  capture it decides on the cached screens, as before.
+ *  `undefined`: the look is void and the caller starts over — another CLI by
+ *  now, or the hold changed while the screen was read (a capture taken just
+ *  before a release would put the hold back up). */
+async function traexQuestionHoldsQueuedWrite(): Promise<boolean | undefined> {
+  if (!traexQuestionBridgeActive()) return false;
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  const holdRevision = hookReviewInputHoldRevision;
+  const screen = await traexQuestionCapture();
+  if (backend !== target || cliLifetimeNonce !== lifetime || hookReviewInputHoldRevision !== holdRevision) return undefined;
+  return hookReviewHoldsQueuedWrite(screen);
+}
+
 /** The held input waits behind the question flow (rather than a hook page). */
 function traexQuestionHoldsHeldInput(freshScreen?: string): boolean {
   if (!traexQuestionBridgeActive()) return false;
@@ -22474,6 +22503,23 @@ async function flushPending(): Promise<void> {
         }
         openingInputBoxSettled = true;
       }
+      // Every gate has passed and this message is about to be pasted: one
+      // last look at the TraeX question page, on a fresh screen.
+      if (traexQuestionBridgeActive()) {
+        const target: SessionBackend = backend;
+        const generation = cliSpawnGeneration;
+        const head = pendingMessages[0];
+        const held = await traexQuestionHoldsQueuedWrite();
+        if (backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress) break;
+        if (held === true) {
+          keepPromptReadyAfterHold();
+          break;
+        }
+        // The look is void, or the queue moved while the screen was read (an
+        // IPC handler can drop the head): start over with the head there is
+        // now — through the gates above, then a fresh look.
+        if (held === undefined || pendingMessages[0] !== head) continue;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -26560,6 +26606,7 @@ async function spawnCliBody(
   bareShellChecked = false;
   bareShellCheckInProgress = false;
   hookReviewInputHold = false;
+  hookReviewInputHoldRevision += 1;
   hookReviewInputHoldNotified = false;
   hookReviewInputHoldSnapshot = '';
   cancelHookReviewReleaseProbe();

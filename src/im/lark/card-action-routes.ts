@@ -125,6 +125,15 @@ export const CARD_PREFIX_ROUTES: readonly CardPrefixRoute[] = [
       return handleDecisionCardAction(data, larkAppId);
     },
   },
+  // 项目群迁入会话确认登记卡片：只认项目主控会话的真人 owner（含无主会话跨应用 canOperate 校验），
+  // 权限门与审计在 handleProjectImportCardAction 内独立执行。
+  {
+    prefix: 'project_import_',
+    async handle(data, larkAppId) {
+      const { handleProjectImportCardAction } = await import('../../services/project-import-card-runtime.js');
+      return handleProjectImportCardAction(data, larkAppId);
+    },
+  },
 ];
 
 /** 命中前缀路由则返回它；`action` 非字符串或缺 `larkAppId` 一律不命中。 */

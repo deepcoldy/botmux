@@ -1,5 +1,6 @@
 import { modelPinText } from '../../core/model-pin.js';
 import { resolveSessionModelPinView } from '../../core/session-model.js';
+import { sessionContractPrimary } from '../../core/session-contract-primary.js';
 import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
@@ -1094,6 +1095,7 @@ export async function commitRepoSelection(
         markRepoCardConsumed(current, cardToWithdraw);
         current.repoCardMessageId = undefined;
 
+        const predecessorRevision = current.session.sessionRuntimeContract?.session.revision ?? 0;
         const session = sessionStore.createSession(
           current.chatId,
           current.scope === 'chat' ? oldSession.rootMessageId : rootId,
@@ -1109,6 +1111,11 @@ export async function commitRepoSelection(
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
+        if (sessionContractPrimary(current.larkAppId)) {
+          session.durablePrimaryPredecessor = {
+            sessionId: oldSession.sessionId, contractRevision: predecessorRevision,
+          };
+        }
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;
         session.creatorOpenId = oldSession.creatorOpenId;

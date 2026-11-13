@@ -782,7 +782,7 @@ describe('renderIdentityWrapper', () => {
     const wrapperPath = join(dir, 'bytedcli');
     writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
     writeSessionIdentity(dir, SESSION, {
-      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok', cn: 'cn-tok' },
     }, 'single');
     const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, [...args]);
     // The regional variables stay internal; the arguments reach the tool unchanged.
@@ -797,7 +797,7 @@ describe('renderIdentityWrapper', () => {
     writeFileSync(wrapper, renderIdentityWrapper('bytedcli', tool));
     writeSessionIdentity(dir, SESSION, {
       tool: 'bytedcli', cloudJwt: 'cn-tok',
-      regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+      regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok', cn: 'cn-tok' },
     }, 'single');
     // A bare invocation is the usage path and carries no identity; give the call an operand.
     return runWrapper(wrapper, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, args.length ? args : ['x']);
@@ -882,7 +882,7 @@ describe('renderIdentityWrapper', () => {
   });
 
   it('refuses only the partition without a token; the others and the default site still run', () => {
-    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', cn: 'cn-tok' } };
     expect(bytedcliRun(identity, ['--site', 'i18n-tt', 'aa'])).toMatchObject({ status: 0, stdout: 'i18n-tok' });
     expect(bytedcliRun(identity, ['aa'])).toMatchObject({ status: 0, stdout: 'cn-tok' });
     expect(bytedcliRun(identity, ['--site', 'cn', 'aa'])).toMatchObject({ status: 0, stdout: 'cn-tok' });
@@ -927,7 +927,7 @@ describe('renderIdentityWrapper', () => {
   });
 
   it('lets a non-empty --site override the variable, as bytedcli does', () => {
-    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    const identity = { cloudJwt: 'i18n-tok', regionalCloudJwts: { i18n: 'i18n-tok', cn: 'cn-tok' } };
     expect(bytedcliRun(identity, ['--site', 'cn', 'aa'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }))
       .toMatchObject({ status: 0, stdout: 'cn-tok' });
   });
@@ -980,7 +980,8 @@ describe('renderIdentityWrapper', () => {
     [['--profile', 'p', 'aa', '--cloud-site', 'us-ttp'], {}],
     [['--site', 'cn', 'aa', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }],
   ] as const)('does not refuse for a --site that belongs to the command: %j %j', (args, env) => {
-    expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], env)).toMatchObject({ status: 0, stdout: 'cn-tok' });
+    expect(bytedcliRun({ cloudJwt: 'cn-tok', regionalCloudJwts: { cn: 'cn-tok' } }, [...args], env))
+      .toMatchObject({ status: 0, stdout: 'cn-tok' });
   });
 
   // The global site — before the command, else the variable — is what bytedcli

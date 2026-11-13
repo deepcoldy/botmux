@@ -38,6 +38,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
@@ -496,8 +497,7 @@ export interface BytedcliJwts {
 }
 
 /**
- * ByteCloud JWTs are partition-scoped: the default (cn) token is rejected by
- * i18n services with `invalid jwt token ... partition i18n`. Each entry names
+ * ByteCloud JWTs are partition-scoped. Each entry names
  * the region and one `--site` that mints its token; the wrapper maps every
  * `--site` value onto these regions (see renderIdentityWrapper).
  */
@@ -506,6 +506,7 @@ export const BYTEDCLI_REGIONAL_SITES = [
   ['i18n', 'i18n-tt'],
   ['i18nbd', 'i18n-bd'],
   ['tx', 'us-ttp'],
+  ['cn', 'cn'],
 ] as const;
 export type BytedcliRegion = typeof BYTEDCLI_REGIONAL_SITES[number][0];
 export type BytedcliRegionalJwts = Partial<Record<BytedcliRegion, string>>;
@@ -559,14 +560,6 @@ function credentialEpochCurrent(openId: string, epoch: number, durableEpoch: num
  */
 const regionalJwtCache = new Map<string, { jwt: string; expiresAtMs: number; durableEpoch: number; fingerprint?: string }>();
 const REGIONAL_JWT_REUSE_MARGIN_MS = 30 * 60_000;
-
-function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
-  try {
-    return JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Regions this person's login could not mint a token for, and under which
@@ -715,6 +708,7 @@ async function renewJwts(openId: string, epoch: number, durableEpoch: number): P
   const codeJwt = code.ok ? code.stdout.trim() : '';
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    if (region === 'cn' && jwtClaims(cloudJwt)?.region === 'cn') continue;
     const jwt = await regionalCloudJwt(openId, region, site, true, epoch, durableEpoch, login.fingerprint);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;
@@ -776,6 +770,7 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   // mints against the same HOME were measured returning another region's token.
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    if (region === 'cn' && jwtClaims(cloudJwt)?.region === 'cn') continue;
     const jwt = await regionalCloudJwt(openId, region, site, false, epoch, durableEpoch, fingerprint);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;

@@ -73,6 +73,8 @@ describe('Dashboard project group mode section', () => {
     expect(requestBody).toEqual({
       mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
       autoEnrollWorkers: true,
+      // Import notifications are opt-in: a fresh project group saves them off.
+      importedSessionPolicy: 'ignore',
       progressCard: {
         schemaVersion: 1, templateId: 'compact-list',
         sections: ['goal', 'blockers', 'workstreams', 'milestones'], milestonesExpanded: false,
@@ -84,6 +86,59 @@ describe('Dashboard project group mode section', () => {
     expect(renderer.root.findAllByType('textarea')).toHaveLength(0);
     const roleLink = renderer.root.findAllByType('a').find(link => String(link.props.href).includes('botId=cli_coordinator'));
     expect(roleLink?.props.href).toContain('#/roles?chatId=oc_project');
+  });
+
+  it('exposes the per-group import notification switch, reflecting and saving importedSessionPolicy', async () => {
+    const progressCard = {
+      schemaVersion: 1 as const, templateId: 'status-dashboard' as const,
+      sections: ['goal', 'blockers', 'workstreams', 'milestones'] as const, milestonesExpanded: false,
+    };
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        config: {
+          chatId: 'oc_project', mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+          autoEnrollWorkers: false, importedSessionPolicy: JSON.parse(String(init?.body)).importedSessionPolicy, progressCard,
+        },
+        project: null,
+      }),
+    })) as any;
+    globalThis.fetch = fetchMock;
+    const projectChat: GroupChat = {
+      ...chat, collaborationMode: 'project', projectCoordinatorAppId: 'cli_coordinator',
+      projectWorkerAppIds: ['cli_worker'], projectAutoEnrollWorkers: false, projectImportNotify: false,
+      projectProgressCard: { ...progressCard, sections: [...progressCard.sections] },
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(ProjectGroupModeSection, {
+        chat: projectChat, members, tr, onSaved: vi.fn(async () => ({ chats: [], bots: [] })),
+      }));
+    });
+    const toggle = () => renderer.root.findByProps({ 'data-project-import-notify': 'oc_project' });
+    const save = () => renderer.root.findAllByType('button').find(button => button.children.join('') === 'groups.projectModeSave')!;
+    expect(toggle().props.checked).toBe(false);
+    expect(save().props.disabled).toBe(true);
+
+    act(() => toggle().props.onChange({ currentTarget: { checked: true } }));
+    expect(toggle().props.checked).toBe(true);
+    expect(save().props.disabled).toBe(false);
+    await act(async () => { save().props.onClick(); });
+    const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT');
+    expect(JSON.parse(String(put?.[1]?.body))).toMatchObject({ mode: 'project', importedSessionPolicy: 'notify' });
+    expect(toggle().props.checked).toBe(true);
+    expect(save().props.disabled).toBe(true);
+
+    // An already opted-in group renders the switch on.
+    await act(async () => {
+      renderer.update(React.createElement(ProjectGroupModeSection, {
+        key: 'opted-in', chat: { ...projectChat, projectImportNotify: true }, members, tr,
+        onSaved: vi.fn(async () => ({ chats: [], bots: [] })),
+      }));
+    });
+    expect(toggle().props.checked).toBe(true);
   });
 
   it('shows current project as a read-only runtime summary', async () => {

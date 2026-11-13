@@ -7079,6 +7079,7 @@ const server = createServer(async (req, res) => {
                     projectCoordinatorAppId: mode.coordinatorAppId,
                     projectWorkerAppIds: mode.workerAppIds ?? [],
                     projectAutoEnrollWorkers: mode.autoEnrollWorkers === true,
+                    projectImportNotify: mode.importedSessionPolicy === 'notify',
                     ...(!mode.progressCard
                       ? { projectProgressCard: resolveProjectProgressCardConfig(undefined) }
                       : {}),

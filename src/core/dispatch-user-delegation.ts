@@ -3,9 +3,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import type { TrustedCaller, TurnParticipant } from '../types.js';
+import type { Session, TrustedCaller, TurnParticipant } from '../types.js';
 import { updateDispatchRegistry } from './dispatch-registry.js';
-import { registryEntryProvesHumanSender } from './reply-target.js';
+import { pickTurnReplyTarget, registryEntryProvesHumanSender, registryTurnMayAuthenticateHuman } from './reply-target.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export const DISPATCH_USER_DELIVERY_ROUTE = '/api/dispatch-user/deliver';
@@ -144,6 +144,26 @@ export function dispatchCallerFromReply(appId: string, reply?: {
 }): TrustedCaller | undefined {
   if (!registryEntryProvesHumanSender(reply)) return;
   return { requestLarkAppId: appId, requestUserOpenId: reply.senderOpenId, senderType: 'user' };
+}
+
+/** A dispatch-only grant may use the exact inbound sender preserved in the
+ * reply registry when the in-memory interactive turn has already ended. A
+ * matching active bot/synthetic turn still vetoes that fallback. */
+export function directHumanForDispatchOnly(input: {
+  sourceAppId: string;
+  turnId?: string;
+  session: Session;
+  activeTurn?: { turnId: string; caller: TrustedCaller };
+}): boolean {
+  const { sourceAppId, turnId, session, activeTurn } = input;
+  if (!turnId) return false;
+  if (session.failedTurnRecovery?.turnId === turnId) return false;
+  const caller = activeTurn?.turnId === turnId ? activeTurn.caller
+    : registryTurnMayAuthenticateHuman(session, turnId)
+      ? dispatchCallerFromReply(sourceAppId, pickTurnReplyTarget(session, turnId))
+      : undefined;
+  return caller?.senderType === 'user' && !caller.source
+    && caller.requestLarkAppId === sourceAppId && !!caller.requestUserOpenId;
 }
 
 /** Only a daemon-authenticated, current human turn may originate a delegation. */
