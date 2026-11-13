@@ -77,10 +77,19 @@ describe('tryRegisterApp', () => {
   });
 
   it('maps SDK code=expired_token to expired (QR expired)', async () => {
-    mockedRegisterApp.mockRejectedValue(Object.assign(new Error('Polling timed out'), { code: 'expired_token' }));
+    mockedRegisterApp.mockRejectedValue({ code: 'expired_token', description: 'Device code expired' });
     const r = await tryRegisterApp({ onQRCodeReady: () => {}, onStatusChange: () => {} });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('expired');
+  });
+
+  it('treats the local polling deadline after issuing a link as an unknown result', async () => {
+    mockedRegisterApp.mockImplementation(async options => {
+      options.onQRCodeReady({ url: 'https://open.feishu.cn/page/launcher', expireIn: 600 });
+      throw { code: 'expired_token', description: 'Polling timed out' };
+    });
+    await expect(tryRegisterApp({ onQRCodeReady: () => {} }))
+      .resolves.toMatchObject({ ok: false, error: 'unconfirmed' });
   });
 
   it('maps SDK code=access_denied to denied (user rejected in browser)', async () => {

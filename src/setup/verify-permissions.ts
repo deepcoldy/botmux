@@ -87,16 +87,15 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'im:message.group_msg.include_bot:read', desc: '接收群聊中所有用户和其他机器人发送的消息（「其他机器人开的新话题也自动开工」需要）', critical: false },
   // Dashboard 建群/创建会话的原生飞书标签功能。标签 API 只接受用户身份，
   // 这里检测的是应用是否已经声明对应 user scope；真正使用时仍需用户做一次 OAuth。
-  // 标 non-critical：不用标签的部署不应因它阻塞 daemon 启动；有缓存的开放平台
-  // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
+  // 标 non-critical：只在启动自检发现关键权限缺失时一并提示。
   { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
   { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
   { name: 'im:chat.tabs:read', desc: '读取飞书群标签页（/tabs、botmux tabs）', critical: false },
   { name: 'im:chat.tabs:write_only', desc: '管理飞书群标签页（/tabs、botmux tabs）', critical: false },
   // `botmux send --urgent[=app|sms|phone]`. Keep these non-critical: ordinary
   // messaging must continue when a tenant declines disruptive/quota-bearing
-  // Buzz channels. New apps import them from the default manifest; existing
-  // apps are silently topped up from the cached Open Platform session.
+  // Buzz channels. New apps request them from the default manifest. Startup checks include
+  // them in the repair link only when a critical scope is also missing.
   { name: 'im:message.urgent', desc: '应用内加急消息', critical: false },
   { name: 'im:message.urgent:sms', desc: '短信加急消息（消耗租户额度）', critical: false },
   { name: 'im:message.urgent:phone', desc: '电话加急消息（消耗租户额度）', critical: false },

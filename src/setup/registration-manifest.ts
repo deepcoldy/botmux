@@ -201,6 +201,7 @@ export async function completeRegisteredApp(
       scopeManifest: { scopes: needsScopeFallback ? readback?.missing ?? wanted : { tenant: [], user: [] } },
       // 保留已发布版本，旧网页路径只有补配有变化时才发版。
       appJustCreated: !app?.online_version_id,
+      allowBlindRedirectWrite: false,
       redirectAlreadyConfigured: redirectConfigured,
     });
     const finalReadback = needsScopeFallback ? await readRegistrationScopes(identity, wanted) : readback;
@@ -233,8 +234,8 @@ export async function completeRegisteredApp(
     };
   }
   if (brand === 'feishu' && !redirectConfigured) {
-    // 核心事件已经生效。仅尝试复用登录态补 redirect，缺登录态时把白名单留作独立提示。
-    const redirect = await web({ ...options, appId, brand, redirectOnly: true, disableQrLogin: true });
+    // 完整补配使用任务会话。仅补 redirect 时只读取本机现有缓存，不发起登录。
+    const redirect = await web({ ...options, sessionFilePath: undefined, appId, brand, redirectOnly: true, disableQrLogin: true });
     redirectConfigured = redirect.redirectConfigured === true;
   }
   const appEvents = app?.event?.subscribed_events ?? [];

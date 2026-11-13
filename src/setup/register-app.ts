@@ -129,9 +129,13 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
       userOpenId,
     };
   } catch (err: unknown) {
-    const failure = err as { code?: string; message?: string } | undefined;
+    const failure = err as { code?: string; description?: string; message?: string } | undefined;
     if (failure?.code === 'abort') return { ok: false, error: 'aborted', message: '用户取消确认' };
-    if (failure?.code === 'expired_token') return { ok: false, error: 'expired', message: '确认链接已过期，请重试' };
+    // SDK uses the same code for a local polling deadline and a platform expiry.
+    const pollingTimedOut = (failure?.description ?? failure?.message) === 'Polling timed out';
+    if (failure?.code === 'expired_token' && !pollingTimedOut) {
+      return { ok: false, error: 'expired', message: '确认链接已过期，请重试' };
+    }
     if (failure?.code === 'access_denied') return { ok: false, error: 'denied', message: '用户在浏览器里拒绝授权' };
     if (linkShown) {
       return {

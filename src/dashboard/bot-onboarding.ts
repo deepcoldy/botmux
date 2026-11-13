@@ -435,13 +435,12 @@ export class BotOnboardingManager {
   // 避免在 owner 确认前就有一个空 allowlist 的可启动 bot 留在磁盘上（重启即 fail-open）。
   // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
   private readonly pendingBots = new Map<string, Record<string, any>>();
-  private readonly createApp?: CreateAppFn;
+  private readonly createApp: CreateAppFn;
   private readonly inspectSession: InspectSessionFn;
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
   private readonly completeRegisteredApp: typeof completeRegisteredApp;
-  private readonly defaultRegistrationMode: NonNullable<BotOnboardingInput['registrationMode']>;
   private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
   private readonly criticalScopeStableReads: number;
   private readonly criticalScopeMaxAttempts: number;
@@ -459,7 +458,6 @@ export class BotOnboardingManager {
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
     this.createApp = opts.createApp ?? createFeishuOpenPlatformApp;
-    this.defaultRegistrationMode = opts.createApp ? 'web' : 'sdk';
     this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
@@ -1673,7 +1671,7 @@ export class BotOnboardingManager {
           this.now(),
         )
       : resolveSetupAppName(input.appName, configuredBots.length);
-    const registrationMode = input.registrationMode ?? this.defaultRegistrationMode;
+    const registrationMode = input.registrationMode ?? 'web';
     this.patch(id, {
       registrationMode,
       ...(input.requireCriticalScopesBeforeActivation
@@ -1685,11 +1683,10 @@ export class BotOnboardingManager {
     });
 
     let result: RegisterAppResult;
-    // Web 主路径的登录身份邮箱。免扫码/单扫链路没有 device-flow 的 userOpenId,
-    // 自动确认 owner 只能靠它——正是表单顶部「将使用 …」展示并确认过的账号。
+    // 网页创建使用已验证的会话邮箱作为 owner 候选。
     let sessionEmail: string | undefined;
     const registration = registrationMode === 'sdk' ? createRegistrationOptions(appName) : undefined;
-    if (registrationMode !== 'web' || !this.createApp) {
+    if (registrationMode !== 'web') {
       result = await this.registerWithSdk(id, registration);
     } else {
       const created = await this.createApp({
@@ -2010,18 +2007,16 @@ export class BotOnboardingManager {
           callbacks,
           sessionFilePath,
           meta.requireVerifiedEvents,
-          // compat 路径同样是「刚注册出来的新应用」（registerWithSdk），白名单必然为空。
           true,
+          meta.registrationMode === 'sdk' ? false : undefined,
         );
       }
       const first = await this.automateOpenPlatform({
         appId,
         brand,
-        // The Feishu primary path must never surprise the user with a second
-        // QR. It reuses the session created moments earlier or falls back to
-        // manual recovery. Only explicit compatibility mode may scan again.
-        disableQrLogin: meta.registrationMode === 'web',
-        disableBytedcliFallback: meta.registrationMode === 'web',
+        // 网页创建已取得会话，补配直接复用。
+        disableQrLogin: true,
+        disableBytedcliFallback: true,
         requireVerifiedEvents: meta.requireVerifiedEvents,
         // 这条链路只在 run() 的建应用流程里被调到（应用几分钟前刚由本任务创建），
         // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
@@ -2125,6 +2120,7 @@ export class BotOnboardingManager {
     sessionFilePath: string,
     requireVerifiedEvents: boolean,
     appJustCreated = false,
+    allowBlindRedirectWrite?: false,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2136,6 +2132,7 @@ export class BotOnboardingManager {
         disableBytedcliFallback: true,
         requireVerifiedEvents,
         appJustCreated,
+        ...(allowBlindRedirectWrite === false ? { allowBlindRedirectWrite } : {}),
         ...callbacks,
       });
     } finally {

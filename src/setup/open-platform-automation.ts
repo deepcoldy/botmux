@@ -310,12 +310,12 @@ export interface OpenPlatformAutomationOptions {
    * 「这个 app 是本次流程刚刚创建出来的」。**只有** setup / onboarding 的建应用链路
    * 能传 true。
    *
-   * 唯一作用：允许 redirect 白名单在**读不到线上现值时**退化成覆盖写。刚建的应用
-   * 白名单必然为空，覆盖不掉任何用户条目；对存量应用盲写则会静默清掉用户手配的
-   * 回调地址（见 {@link WriteRedirectWhitelistOptions.allowBlindWrite}）。
+   * 用于首次发版。网页直接创建的新应用默认允许在白名单不可读时写入初始地址。
+   * 已经过官方确认页或 OpenAPI 写入的应用应禁用这项默认授权。
    * 权限自愈 / VC 事件补订阅 / 批量修复这些跑在存量应用上的链路一律不传。
    */
   appJustCreated?: boolean;
+  allowBlindRedirectWrite?: false;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   redirectAlreadyConfigured?: boolean;
@@ -1632,7 +1632,7 @@ export async function automateOpenPlatformSetup(
     wantedRedirectUrls = collectBotmuxRedirectUrls();
     const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
-      allowBlindWrite: options.appJustCreated === true,
+      allowBlindWrite: options.appJustCreated === true && options.allowBlindRedirectWrite !== false,
       timeoutMs: options.redirectWriteTimeoutMs,
     });
     // 写入 ACK 或结果未知都计作变更；只有未提交写请求的幂等/不可读短路不置位。

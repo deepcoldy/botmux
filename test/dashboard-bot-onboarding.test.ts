@@ -182,7 +182,7 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('publishes the official confirmation link and manifest by default', async () => {
+  it('publishes the official confirmation link and manifest in SDK mode', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const pending = deferred<RegisterAppResult>();
     const manager = new BotOnboardingManager({
@@ -198,7 +198,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: (url) => `data:image/svg+xml;base64,${Buffer.from(url).toString('base64')}`,
     });
 
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await Promise.resolve();
 
     const status = manager.get(job.id);
@@ -211,7 +211,7 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('uses one Feishu Web QR in explicit Web mode and carries the chosen app name through the job', async () => {
+  it('uses one Feishu Web QR when the caller omits the mode and carries the chosen name', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-web-'));
     const pending = deferred<any>();
     const registerApp = vi.fn(async () => ({ ok: false as const, error: 'unknown' as const, message: 'must not run' }));
@@ -237,6 +237,7 @@ describe('BotOnboardingManager', () => {
     await Promise.resolve();
     expect(manager.get(job.id)).toMatchObject({
       status: 'waiting_for_scan',
+      registrationMode: 'web',
       appName: '研发助手',
       qrDataUrl: expect.stringContaining('data:image/svg+xml;base64,'),
     });
@@ -490,7 +491,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
 
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
 
     const status = manager.get(job.id);
@@ -529,7 +530,7 @@ describe('BotOnboardingManager', () => {
       automateOpenPlatform: async () => autoOk(),
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
     expect(manager.get(job.id)?.status).toBe('needs_owner');
     // 提交前：磁盘上没有这个 bot。
@@ -571,7 +572,7 @@ describe('BotOnboardingManager', () => {
       automateOpenPlatform: async () => autoOk(),
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
     expect(manager.get(job.id)?.status).toBe('needs_owner');
 
@@ -610,7 +611,7 @@ describe('BotOnboardingManager', () => {
       automateOpenPlatform: async () => autoOk(),
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
-    const job = firstManager.start({ cliId: 'codex', workingDir: dir });
+    const job = firstManager.start({ registrationMode: 'sdk', cliId: 'codex', workingDir: dir });
     await job.done;
 
     expect(firstManager.get(job.id)?.status).toBe('needs_owner');
@@ -663,7 +664,7 @@ describe('BotOnboardingManager', () => {
       automateOpenPlatform: async () => autoOk(),
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
     expect(manager.get(job.id)?.status).toBe('needs_owner');
 
@@ -694,7 +695,7 @@ describe('BotOnboardingManager', () => {
       automateOpenPlatform: async () => autoOk(),
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
 
     const r = await manager.submitOwner(job.id, ['alice']);
@@ -730,7 +731,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
 
-    const job = manager.start({ cliId: 'traex', workingDir: dir });
+    const job = manager.start({ registrationMode: 'sdk', cliId: 'traex', workingDir: dir });
     await job.done;
 
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
@@ -759,7 +760,7 @@ describe('BotOnboardingManager', () => {
 
     // 工作目录用 tmp 目录的真实路径——manager 本身不校验存在性 (dashboard 层校验),
     // 但用真实目录更贴近实际写入的样子.
-    const job = manager.start({ cliId: 'codex', workingDir: dir, model: 'gpt-5' });
+    const job = manager.start({ registrationMode: 'sdk', cliId: 'codex', workingDir: dir, model: 'gpt-5' });
     await job.done;
 
     const status = manager.get(job.id);
@@ -798,7 +799,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
 
-    const job = manager.start({ cliId: 'codex', workingDir: dir });
+    const job = manager.start({ registrationMode: 'sdk', cliId: 'codex', workingDir: dir });
     await job.done;
     batchGetIdMock.mockResolvedValueOnce({
       code: 0,
@@ -823,7 +824,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
 
-    const job = manager.start({ cliId: 'codex', workingDir: dir, dirMode: 'fixed' });
+    const job = manager.start({ registrationMode: 'sdk', cliId: 'codex', workingDir: dir, dirMode: 'fixed' });
     await job.done;
 
     batchGetIdMock.mockResolvedValueOnce({
@@ -894,7 +895,7 @@ describe('BotOnboardingManager', () => {
       },
     });
 
-    const job = manager.start({ cliId: 'claude-code', workingDir: '~' });
+    const job = manager.start({ registrationMode: 'sdk', cliId: 'claude-code', workingDir: '~' });
     await job.done;
 
     // 建应用流程刚创建出这个 app，才允许白名单在读失败时覆盖写。
@@ -1350,7 +1351,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
     });
 
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
 
     const status = manager.get(job.id);
@@ -1380,11 +1381,13 @@ describe('BotOnboardingManager', () => {
       code: 0,
       data: { user: { union_id: 'on_scanner', name: 'Scanner' } },
     });
+    const completeRegisteredApp = vi.fn(async () => autoOk());
     const startBotLive = vi.fn(async () => ({ ok: true, message: 'exact bot online' }));
     let scopesReady = false;
     const manager = new BotOnboardingManager({
       botsJsonPath: join(dir, 'bots.json'),
       ...immediateCriticalScopePolling,
+      completeRegisteredApp,
       registerApp: async () => ({
         ok: true,
         appId: 'cli_mosa_pending',
@@ -1395,6 +1398,7 @@ describe('BotOnboardingManager', () => {
       validateCredentials: async () => ({ ok: true }),
       automateOpenPlatform: async opts => {
         expect(opts.requireVerifiedEvents).toBe(true);
+        expect(opts.forceQrLogin).toBe(true);
         await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
         return autoOk();
       },
@@ -1417,7 +1421,7 @@ describe('BotOnboardingManager', () => {
     });
 
     const job = manager.start({
-      registrationMode: 'compat',
+      registrationMode: 'sdk',
       cliId: 'traex',
       workingDir: dir,
       dirMode: 'fixed',
@@ -1425,6 +1429,7 @@ describe('BotOnboardingManager', () => {
     });
     await job.done;
 
+    expect(completeRegisteredApp).not.toHaveBeenCalled();
     expect(startBotLive).not.toHaveBeenCalled();
     expect(manager.get(job.id)).toMatchObject({
       status: 'completed',
@@ -2685,7 +2690,7 @@ describe('BotOnboardingManager', () => {
       startBotLive,
     });
 
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
 
     const status = manager.get(job.id);
@@ -2709,7 +2714,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
       startBotLive,
     });
-    const job = manager.start();
+    const job = manager.start({ registrationMode: 'sdk' });
     await job.done;
     expect(manager.get(job.id)?.status).toBe('needs_owner');
 

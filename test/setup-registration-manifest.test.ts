@@ -49,6 +49,17 @@ describe('官方注册链接', () => {
     expect(url.searchParams.has('clientID')).toBe(false);
   });
 
+  it('增量确认返回其他 App ID 时拒绝结果', async () => {
+    vi.spyOn(defaultHttpInstance, 'post')
+      .mockResolvedValueOnce({
+        verification_uri_complete: 'https://open.feishu.cn/page/launcher?user_code=TEST',
+        device_code: 'device-code',
+      })
+      .mockResolvedValueOnce({ client_id: 'cli_other', client_secret: randomUUID() });
+    await expect(tryRegisterApp({ appId: 'cli_expected', onQRCodeReady: vi.fn() }))
+      .resolves.toMatchObject({ ok: false });
+  });
+
   it('更新链接带 clientID，SDK 仍会切换到 Lark 轮询', async () => {
     const post = vi.spyOn(defaultHttpInstance, 'post')
       .mockResolvedValueOnce({
@@ -99,7 +110,7 @@ describe('注册授予结果', () => {
   });
 });
 
-function stubOpenApi(reads: unknown[], options: { redirectMissing?: boolean; webhook?: boolean } = {}) {
+function stubOpenApi(reads: unknown[], options: { redirectMissing?: boolean; redirectPatchDenied?: boolean; webhook?: boolean; unpublished?: boolean } = {}) {
   const redirects = collectBotmuxRedirectUrls();
   let redirectUrls = options.redirectMissing ? [] : redirects;
   let eventMode = options.webhook ? 'webhook' : 'websocket';
@@ -112,12 +123,15 @@ function stubOpenApi(reads: unknown[], options: { redirectMissing?: boolean; web
     }
     if (url.endsWith('/config') && init?.method === 'PATCH') {
       const patch = JSON.parse(String(init.body));
-      if (patch.security?.add) redirectUrls = patch.security.add.redirect_urls;
+      if (patch.security?.add) {
+        if (options.redirectPatchDenied) return Response.json({ code: 1 });
+        redirectUrls = patch.security.add.redirect_urls;
+      }
       if (patch.event) eventMode = patch.event.subscription_type;
       return Response.json({ code: 0 });
     }
     return Response.json({ code: 0, data: { app: {
-      online_version_id: 'published',
+      online_version_id: options.unpublished ? undefined : 'published',
       security: { redirect_urls: redirectUrls },
       event: { subscription_type: eventMode, subscribed_events: BOT_BASELINE_APP_EVENTS },
       callback_info: { callback_type: eventMode, subscribed_callbacks: BOT_BASELINE_CALLBACKS },
@@ -146,11 +160,12 @@ describe('注册后补配', () => {
   });
 
   it('部分授予保留缺失桶，线上配置齐全时不走网页权限导入', async () => {
-    stubOpenApi([scopeResponse(grantedRows.slice(0, -1))]);
+    const fetcher = stubOpenApi([scopeResponse(grantedRows.slice(0, -1))]);
     const web = vi.fn();
     const result = await completeRegisteredApp(identity, addons, web);
     expect(result).toMatchObject({ ok: true, scopeCount: 12, scopeWarning: expect.stringContaining('user: scope:0') });
     expect(web).not.toHaveBeenCalled();
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === 'PATCH')).toBe(false);
   });
 
   it('接近默认模板时在同一应用上仅补缺失桶，并再回读', async () => {
@@ -173,6 +188,26 @@ describe('注册后补配', () => {
     const result = await completeRegisteredApp(identity, addons, web);
     expect(result).toMatchObject({ ok: true, scopeCount: 13 });
     expect(web).not.toHaveBeenCalled();
+  });
+
+  it('只有 redirect 未生效时，仅复用 Web 会话补白名单', async () => {
+    stubOpenApi([scopeResponse(grantedRows)], { redirectMissing: true, redirectPatchDenied: true });
+    const web = vi.fn().mockResolvedValue({ ok: true, redirectConfigured: true });
+    const result = await completeRegisteredApp(identity, addons, web, { sessionFilePath: '/unused/onboarding-session.json' });
+    expect(web).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appId: identity.appId, redirectOnly: true, disableQrLogin: true, sessionFilePath: undefined,
+    }));
+    expect(result).toMatchObject({ ok: true, redirectConfigured: true, publishSkipped: true });
+  });
+
+  it('订阅字段齐全但无线上版本时走网页补配，并保留已确认的白名单', async () => {
+    stubOpenApi([scopeResponse(grantedRows)], { unpublished: true });
+    const web = vi.fn().mockResolvedValue({ ok: false, reason: 'invalid_session' });
+    await completeRegisteredApp(identity, addons, web);
+    expect(web).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appId: identity.appId, appJustCreated: true, redirectAlreadyConfigured: true, allowBlindRedirectWrite: false,
+      scopeManifest: { scopes: { tenant: [], user: [] } },
+    }));
   });
 
   it('网页补事件失败时保留已确认的 redirect 状态', async () => {

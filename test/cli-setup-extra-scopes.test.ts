@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   automateOpenPlatformSetup: vi.fn(),
   tryRegisterApp: vi.fn(),
+  completeRegisteredApp: vi.fn(),
   onReadDefaultScopeManifest: vi.fn(),
   startBotViaSupervisor: vi.fn(),
   validateCredentials: vi.fn(),
@@ -33,6 +34,11 @@ vi.mock('../src/setup/open-platform-automation.js', async importOriginal => {
 
 vi.mock('../src/setup/register-app.js', () => ({
   tryRegisterApp: mocks.tryRegisterApp,
+}));
+
+vi.mock('../src/setup/registration-manifest.js', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  completeRegisteredApp: mocks.completeRegisteredApp,
 }));
 
 vi.mock('../src/core/fleet-runtime.js', async importOriginal => ({
@@ -302,6 +308,38 @@ describe('setup add --extra-scopes-file', () => {
     expect(bots.map(b => b.larkAppId)).toEqual(['cli_a', 'cli_new']);
     expect(bots[1].extraScopesFile).toBe(extraFile);
     expect(lastJson()).toMatchObject({ ok: true, action: 'add', extraScopes: { file: extraFile, merged: true } });
+  });
+
+  it.each([false, true])('SDK 创建后按实际申请的 addons 决定是否回读（跳过自动配置：%s）', async skipAuto => {
+    writeBots([botEntry('cli_a')]);
+    mocks.tryRegisterApp.mockResolvedValue({
+      ok: true, appId: 'cli_registered', appSecret: crypto.randomUUID(), brand: 'feishu',
+    });
+    mocks.completeRegisteredApp.mockResolvedValue({
+      ok: true, scopeCount: 42, skippedScopeCount: 0, redirectConfigured: true, publishSkipped: true,
+    });
+
+    await cmdSetupScripted([
+      'add', '--create-app', '--allowed-users', 'a@b.com', '--working-dir', scratch,
+      '--json', ...(skipAuto ? ['--no-open-platform-auto'] : ['--extra-scopes-file', extraFile]),
+    ]);
+
+    expect(readBots()[1]).toMatchObject({ larkAppId: 'cli_registered' });
+    expect(mocks.automateOpenPlatformSetup).not.toHaveBeenCalled();
+    const registration = mocks.tryRegisterApp.mock.calls[0][0];
+    if (skipAuto) {
+      expect(registration.addons).toBeUndefined();
+      expect(mocks.completeRegisteredApp).not.toHaveBeenCalled();
+      expect(lastJson().openPlatform.status).toBe('skipped');
+    } else {
+      expect(registration.addons.scopes.tenant).toContain('spark:app:read');
+      expect(readBots()[1].extraScopesFile).toBe(extraFile);
+      expect(mocks.completeRegisteredApp).toHaveBeenCalledWith(
+        expect.objectContaining({ appId: 'cli_registered' }), registration.addons,
+        expect.any(Function), expect.objectContaining({ disableQrLogin: true }),
+      );
+      expect(lastJson().openPlatform).toMatchObject({ status: 'ready', scopeCount: 42 });
+    }
   });
 
   it('应用已创建、配置未写入时的 partial JSON 也带 extraScopes，续跑命令带上清单路径', async () => {

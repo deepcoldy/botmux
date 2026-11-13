@@ -39,7 +39,7 @@ const makeBot = (config: Record<string, unknown> = {}) => ({
 });
 
 /** Lark app-info stub: `granted` scopes in both token buckets, or an error `code`. */
-function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: string; approveRepair?: boolean; userOnly?: string }): void {
+function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: string; approveRepair?: boolean; userOnly?: string; legacy?: boolean }): void {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (String(url).includes('tenant_access_token')) return Response.json({ code: 0, tenant_access_token: 't' });
     if (String(url).endsWith('/v6/scopes')) {
@@ -51,7 +51,9 @@ function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: stri
     if (app.code !== undefined) return Response.json({ code: app.code, msg: 'denied' });
     return Response.json({ code: 0, data: { app: {
       unaudit_version_id: app.reviewVersion,
-      scopes: (app.granted ?? []).map(scope => ({ scope, token_types: app.userOnly === scope ? ['user'] : ['tenant', 'user'] })),
+      scopes: (app.granted ?? []).map(scope => app.legacy
+        ? { scope }
+        : { scope, token_types: app.userOnly === scope ? ['user'] : ['tenant', 'user'] }),
     } } });
   }));
 }
@@ -60,6 +62,7 @@ const manifest = readDefaultScopeManifest();
 const inManifest = (name: string) => manifest.scopes.tenant.includes(name) || manifest.scopes.user.includes(name);
 const critical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).map(s => s.name);
 const optional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical).map(s => s.name);
+const missingCriticalScope = 'im:resource';
 const requested = (): string[] => {
   const scopes = h.register.mock.lastCall![0].addons.scopes;
   return [...new Set<string>([...scopes.tenant, ...scopes.user])].sort();
@@ -88,29 +91,70 @@ describe('checkRequiredScopes — 官方增量确认', () => {
     expect(h.dm).not.toHaveBeenCalled();
   });
 
+  it.each(['feishu', 'lark'])('仅缺可选权限时重复自检不向 owner 发送链接（%s）', async brand => {
+    h.bot = makeBot({ brand });
+    stubLark({ granted: critical });
+    for (let check = 0; check < 3; check++) await checkRequiredScopes(APP);
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+  });
+
+  it('空权限数组无法核验，跳过启动补权', async () => {
+    stubLark({ granted: [] });
+    await checkRequiredScopes(APP);
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+  });
+
+  it('兼容只提供权限名称的旧响应，并只申请确实缺失的权限', async () => {
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope), legacy: true, approveRepair: true });
+    await checkRequiredScopes(APP);
+    expect(requested()).toEqual([missingCriticalScope]);
+  });
+
   it('只向 owner 申请缺失项，确认后回读再告知结果', async () => {
-    const missing = optional.find(inManifest)!;
-    const granted = [...critical, ...optional.filter(name => name !== missing)];
+    const missingOptional = optional.find(inManifest)!;
+    const granted = [...critical, ...optional].filter(name => name !== missingCriticalScope && name !== missingOptional);
     stubLark({ granted, approveRepair: true });
     await checkRequiredScopes(APP);
     expect(h.register).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP }));
-    expect(requested()).toEqual([missing]);
+    expect(requested()).toEqual([missingCriticalScope, missingOptional].sort());
     expect(h.automate).not.toHaveBeenCalled();
     expect(h.dm.mock.calls[0]?.slice(0, 4)).toEqual([APP, 'ou_admin', expect.stringContaining(link), 'text']);
     expect(h.dm.mock.calls[1]?.slice(0, 4)).toEqual([APP, 'ou_admin', expect.stringContaining('全部补齐'), 'text']);
   });
 
   it('确认后仍缺失时报告实际结果', async () => {
-    const missing = optional.find(inManifest)!;
-    stubLark({ granted: [...critical, ...optional.filter(name => name !== missing)] });
+    const missing = missingCriticalScope;
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missing) });
     await checkRequiredScopes(APP);
     expect(h.dm.mock.calls[1]![2]).toContain('仍缺失');
     expect(h.dm.mock.calls[1]![2]).toContain(missing);
   });
 
+  it('合并授权回读还在进行中的启动检查，避免用旧快照重新发起补权', async () => {
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope), approveRepair: true });
+    const fetcher = vi.mocked(fetch);
+    const respond = fetcher.getMockImplementation()!;
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    fetcher.mockImplementation(async (url, init) => {
+      if (String(url).includes('/v6/applications/')) await pending;
+      return respond(url, init);
+    });
+    const first = checkRequiredScopes(APP);
+    await vi.waitFor(() => expect(fetcher.mock.calls.filter(([url]) => String(url).includes('/v6/applications/'))).toHaveLength(1));
+    const second = checkRequiredScopes(APP);
+    release();
+    await Promise.all([first, second]);
+    expect(fetcher.mock.calls.filter(([url]) => String(url).includes('/v6/applications/'))).toHaveLength(1);
+    expect(h.register).toHaveBeenCalledTimes(1);
+    expect(h.dm).toHaveBeenCalledTimes(2);
+  });
+
   it('待确认时合并同一应用的重复检查', async () => {
-    const missing = optional.find(inManifest)!;
-    stubLark({ granted: [...critical, ...optional.filter(name => name !== missing)], approveRepair: true });
+    const missing = missingCriticalScope;
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missing), approveRepair: true });
     let resolve!: (value: unknown) => void;
     h.register.mockImplementationOnce(async (opts: RegisterAppOptions) => {
       opts.onQRCodeReady?.({ url: link, expireIn: 600 });
@@ -133,8 +177,8 @@ describe('checkRequiredScopes — 官方增量确认', () => {
   });
 
   it('生成链接期间更换 owner 时只向新 owner 发链接', async () => {
-    const missing = optional.find(inManifest)!;
-    stubLark({ granted: [...critical, ...optional.filter(name => name !== missing)], approveRepair: true });
+    const missing = missingCriticalScope;
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missing), approveRepair: true });
     let finishBegin!: () => void;
     h.register.mockImplementationOnce(async (opts: RegisterAppOptions) => {
       await new Promise<void>(done => { finishBegin = done; });

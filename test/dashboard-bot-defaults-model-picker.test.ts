@@ -264,7 +264,7 @@ describe('BotOnboardingDialog 模型选择器', () => {
         await Promise.resolve();
       });
       expect(startBodies).toHaveLength(1);
-      expect(startBodies[0]).toMatchObject({ cliId: 'codex' });
+      expect(startBodies[0]).toMatchObject({ cliId: 'codex', registrationMode: 'sdk' });
       expect(startBodies[0]).not.toHaveProperty('model');
     } finally {
       if (renderer) act(() => renderer.unmount());

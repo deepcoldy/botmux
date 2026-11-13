@@ -6365,8 +6365,9 @@ const server = createServer(async (req, res) => {
       if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web 或 compat' });
       }
-      const registrationMode = registrationModeRaw === 'web' || registrationModeRaw === 'compat'
-        ? registrationModeRaw : 'sdk';
+      // 缺省保留已有 API 调用方的网页会话流程。内置表单显式传 sdk。
+      const registrationMode = registrationModeRaw === 'sdk' || registrationModeRaw === 'compat'
+        ? registrationModeRaw : 'web';
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
       if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });

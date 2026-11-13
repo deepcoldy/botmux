@@ -13,7 +13,7 @@ import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadB
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
-import { classifyLarkError } from './error-classify.js';
+import { classifyLarkError, extractLarkErrorShape } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { messageListenerTaskAnchor } from '../../core/message-listener-silence.js';
 import { logger } from '../../utils/logger.js';
@@ -311,8 +311,16 @@ async function dmAdmin(
     else await sendUserMessage(larkAppId, adminOpenId, content, 'text');
     logger.info(`[${larkAppId}] notified admin ${adminOpenId.substring(0, 12)} about ${contextTag}`);
     return true;
-  } catch {
-    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}`);
+  } catch (error) {
+    const { larkCode, httpStatus } = extractLarkErrorShape(error);
+    const code = (error as { code?: unknown } | undefined)?.code;
+    const reason = [
+      larkCode !== undefined && `Lark code=${larkCode}`,
+      httpStatus !== undefined && `HTTP ${httpStatus}`,
+      typeof code === 'string' && /^E[A-Z0-9_]{1,19}$/.test(code) && code,
+      error instanceof Error && error.message === 'scope_repair_owner_changed' && error.message,
+    ].filter(Boolean).join(', ');
+    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${reason || 'message delivery failed'}`);
     return false;
   }
 }
@@ -328,7 +336,7 @@ async function tryAutoFixScopes(
 ): Promise<boolean> {
   const owner = getOwnerOpenId(larkAppId);
   const active = activeScopeRepairs.get(larkAppId);
-  if (active && active.owner === owner) return true;
+  if (active && active.owner === owner && !active.cancel.signal.aborted) return true;
   active?.cancel.abort();
   if (!owner) return false;
   const requested = registrationScopeBuckets(filterScopeManifest(readDefaultScopeManifest(), names));
@@ -393,13 +401,31 @@ async function tryAutoFixScopes(
   }
 }
 
+const activeScopeChecks = new Map<string, { owner: string | undefined }>();
+
 export async function checkRequiredScopes(larkAppId: string): Promise<void> {
+  const owner = getOwnerOpenId(larkAppId);
+  const active = activeScopeChecks.get(larkAppId);
+  if (active && active.owner === owner) return;
+  activeScopeRepairs.get(larkAppId)?.cancel.abort();
+  const check = { owner };
+  activeScopeChecks.set(larkAppId, check);
+  const isCurrent = () => activeScopeChecks.get(larkAppId) === check && getOwnerOpenId(larkAppId) === owner;
+  try {
+    await checkRequiredScopesOnce(larkAppId, isCurrent);
+  } finally {
+    if (activeScopeChecks.get(larkAppId) === check) activeScopeChecks.delete(larkAppId);
+  }
+}
+
+async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boolean): Promise<void> {
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
   const openApi = larkHosts(brand).openApi;
   try {
     const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
       method: 'POST',
+      signal: AbortSignal.timeout(10_000),
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
     });
@@ -410,9 +436,10 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     }
     const infoRes = await fetch(
       `${openApi}/open-apis/application/v6/applications/${bot.config.larkAppId}?lang=zh_cn`,
-      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` } },
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: AbortSignal.timeout(10_000) },
     );
     const infoData = await infoRes.json() as any;
+    if (!isCurrent()) return;
 
     // 99991672 = 应用身份缺权限。最常见就是 admin:app.info:readonly /
     // application:application:self_manage 都没拿到，导致根本查不到自己的
@@ -420,7 +447,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // self_manage 后下次重启就能自检了。
     if (infoData.code === LARK_CODE_APP_SCOPE_MISSING) {
       // 自查被拒时无法证明其他权限缺失，先只申请用于自查的权限。
-      if (await tryAutoFixScopes(larkAppId, bot, brand, [SELF_MANAGE_SCOPE])) return;
+      if (await tryAutoFixScopes(larkAppId, bot, brand, [SELF_MANAGE_SCOPE]) || !isCurrent()) return;
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
       logger.warn(
@@ -448,12 +475,12 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       return;
     }
     // Lark 文档示例把 scopes 放在 data.app.scopes；为防响应结构变化，
-    // 同时兜底 data.scopes / data.application.scopes，取到的第一个非空数组为准。
+    // 同时兼容 data.scopes / data.application.scopes。空数组视为无法核验。
     const scopesRaw: any[] =
       infoData.data?.app?.scopes
       ?? infoData.data?.application?.scopes
       ?? infoData.data?.scopes;
-    if (!Array.isArray(scopesRaw)) {
+    if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
       logger.debug(`[${larkAppId}] scope check inconclusive: scopes array unavailable — skipping`);
       return;
     }
@@ -564,6 +591,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       logger.debug(`[${larkAppId}] vc-meeting readiness check errored: ${err?.message ?? err}`);
     }
 
+    if (!isCurrent()) return;
     const required = registrationScopeBuckets(filterScopeManifest(
       readDefaultScopeManifest(), BOTMUX_REQUIRED_SCOPES.map(scope => scope.name),
     ));
@@ -579,12 +607,15 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 
     const reviewVersion = infoData.data?.app?.unaudit_version_id;
     const inReviewVersionId = typeof reviewVersion === 'string' && reviewVersion ? reviewVersion : undefined;
-    if (!inReviewVersionId && (missingCritical.length || missingOptional.length)) {
+    if (!inReviewVersionId && missingCritical.length > 0) {
       const confirmed = await tryAutoFixScopes(larkAppId, bot, brand,
         [...missingCritical, ...missingOptional].map(scope => scope.name), grantedScopeBuckets);
-      if (confirmed) return;
+      if (confirmed || !isCurrent()) return;
     }
     if (missingCritical.length === 0) {
+      if (missingOptional.length > 0) {
+        logger.debug(`[${larkAppId}] optional scopes missing: ${missingOptional.map(scope => scope.name).join(', ')}`);
+      }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
     }
