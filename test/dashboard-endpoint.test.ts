@@ -1150,17 +1150,45 @@ describe('discovery is bounded (real sockets)', () => {
   }, 40_000);
 
   it('returns the original unreachable within budget with one stall and the rest down', async () => {
-    const a = await stalledPort();
-    setPort(a + 5);                  // recorded port: nobody listening
+    // Same race class as the TOTAL-budget fixture: every port treated as "down"
+    // must be one THIS fixture held an instant ago, not an assumed-free neighbour
+    // a concurrent test could be serving HTTP on (that responder would make the
+    // probe return wrong-service/success instead of unreachable). Claim the whole
+    // span, keep one stall, release the rest — our own close makes them
+    // connection-refused, apart from the same sub-millisecond re-grab window that
+    // pickDeadRecordedPort already accepts for the recorded hop.
+    const probeSpan = 3;
+    const { base, servers } = await claimContiguousStallBlock(probeSpan + 1);
+    expect(base, 'fixture could not claim a contiguous stalled block').toBeGreaterThan(0);
+    expect(servers).toHaveLength(probeSpan + 1);
+    const released = servers.slice(1);
+    const releasedPorts = released.map(
+      s => (s.address() as import('node:net').AddressInfo).port,
+    );
+    for (const s of released) {
+      const idx = stalls.indexOf(s);
+      if (idx >= 0) stalls.splice(idx, 1);
+    }
+    await Promise.all(released.map(s => new Promise<void>(r => s.close(() => r()))));
+    // Pin the release: the "down" candidates must really be connection-refused.
+    expect(await Promise.all(releasedPorts.map(p => loopbackPortIsDead(p)))).toEqual([
+      true,
+      true,
+      true,
+    ]);
+
+    const deadRecorded = await pickDeadRecordedPort(base, probeSpan);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                  // recorded port: verified nobody listening
     const t0 = Date.now();
     const r = await callDashboard({
-      configDir: dir, defaultPort: a, probeSpan: 3, path: '/__cli/current',
+      configDir: dir, defaultPort: base, probeSpan, path: '/__cli/current',
       rescanWhenUnreachable: true, probeTimeoutMs: 300, discoveryBudgetMs: 2_000,
     });
     const elapsed = Date.now() - t0;
     expect(r).toEqual({ ok: false, reason: 'unreachable' });
     expect(elapsed).toBeLessThan(4_000);
     // fail-closed: a fruitless scan must not rewrite the port file.
-    expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe(String(a + 5));
+    expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe(String(deadRecorded));
   }, 30_000);
 });
