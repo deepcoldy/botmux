@@ -281,7 +281,7 @@ DECLARE
   table_name text; order_columns text; insert_columns text; select_columns text; predicate text; existing jsonb; incoming jsonb;
   offset_value bigint; limit_value bigint; filters jsonb; page jsonb; cursor_data jsonb; cursor_text text;
   cohort text; feedback_cohort text; query_text text; delivery_counts record; vote_counts record; outbox_count bigint;
-  rows_json jsonb; selected jsonb; last_row jsonb; filter_field text; filter_column text;
+  rows_json jsonb; selected jsonb; last_row jsonb; filter_field text; filter_column text; existing_canonical jsonb; incoming_canonical jsonb;
 BEGIN
   IF p_operation IS NULL OR p_operation <> ALL(ARRAY[
     'createResponse','getResponse','createDelivery','recordTurnDelivery','recordTurnTerminal',
@@ -361,8 +361,9 @@ BEGIN
             EXECUTE format('SELECT to_jsonb(target) FROM %I target CROSS JOIN jsonb_populate_record(NULL::%I,$1) source WHERE %s',table_name,table_name,predicate) INTO existing USING incoming;
           END IF;
           IF existing IS NULL THEN RAISE EXCEPTION 'feedback_migration_row_conflict'; END IF;
+          existing_canonical:=feedback_canonical_row(existing); incoming_canonical:=feedback_canonical_row(incoming);
           FOR field IN SELECT jsonb_object_keys(incoming) LOOP
-            IF feedback_canonical_row(existing)->field IS DISTINCT FROM feedback_canonical_row(incoming)->field THEN RAISE EXCEPTION 'feedback_migration_row_conflict'; END IF;
+            IF existing_canonical->field IS DISTINCT FROM incoming_canonical->field THEN RAISE EXCEPTION 'feedback_migration_row_conflict'; END IF;
           END LOOP;
         END LOOP;
       END IF;
