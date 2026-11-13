@@ -30,6 +30,8 @@ vi.mock('../src/utils/user-token.js', () => ({
   // rejects the module at link time. Any new user-token import from
   // cli-identity has to be added here too.
   isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
+  // capability-authorization 的 lark 本地登录态检查拉入此命名导出；vitest 容忍缺导出、bun link 期拒绝，本测试不走该路径。
+  userTokenAuthState: vi.fn(() => ({ state: 'unknown' })),
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
@@ -41,6 +43,11 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
     completeToken: 'tok-auto',
   })),
+  // capability-authorization 经 describeBytedcliAuth、meego-auth 经 parseEnvelope/runBytedcliInHome 拉入这些命名导出；
+  // vitest 容忍 mock 缺导出、bun 在 link 期拒绝（同上方 user-token 的处理），本测试不走这些路径。
+  describeBytedcliAuth: vi.fn(async () => ({ state: 'unknown' })),
+  parseEnvelope: vi.fn(() => null),
+  runBytedcliInHome: vi.fn(async () => ({ ok: false, stdout: '', stderr: 'runBytedcliInHome is not mocked in this test' })),
 }));
 
 // lark-cli per-person HOME (device-code). The turn resolver is scripted per
@@ -52,6 +59,8 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
   pendingLarkCliChallenge: vi.fn((openId: string) => pendingChallenges.has(openId) ? { deviceCode: 'dc' } : null),
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+  // capability-authorization 的本地登录态检查拉入此命名导出；vitest 容忍缺导出、bun link 期拒绝，本测试不走该路径。
+  describeLarkCliAuth: vi.fn(() => ({ state: 'unknown' })),
 }));
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
