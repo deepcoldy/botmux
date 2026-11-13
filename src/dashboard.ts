@@ -6365,7 +6365,7 @@ const server = createServer(async (req, res) => {
       if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web 或 compat' });
       }
-      // 缺省保留已有 API 调用方的网页会话流程。内置表单显式传 sdk。
+      // 缺省走网页会话流程（内置表单同样走网页流程）；sdk 只在调用方显式传入时使用。
       const registrationMode = registrationModeRaw === 'sdk' || registrationModeRaw === 'compat'
         ? registrationModeRaw : 'web';
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';

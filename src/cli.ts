@@ -1172,6 +1172,99 @@ export async function obtainCredentials(
     if (method === 0) {
       const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
       const appName = (await ask(rl, t('setup.credentials.bot_name_prompt', { name: suggestedName }))).trim() || suggestedName;
+      const {
+        createFeishuOpenPlatformApp,
+        inspectCachedFeishuOpenPlatformSession,
+        readStoredCookiesFromSessionFile,
+        botmuxFeishuSessionFilePath,
+      } = await import('./setup/open-platform-automation.js');
+      const inspected = await inspectCachedFeishuOpenPlatformSession();
+      let sessionMode: 'reuse' | 'qr' = 'qr';
+      let expectedIdentity: { userId: string; tenantId: string } | undefined;
+      if (inspected.ok) {
+        const accountChoice = await pickChoice(rl, {
+          title: `确认飞书账号：${inspected.identity.userName} · ${inspected.identity.tenantName}`,
+          items: [
+            { label: '确认并免扫码添加', hint: inspected.identity.email || '复用本机有效登录态' },
+            { label: '更换账号', hint: '重新扫码并覆盖本机登录态' },
+          ],
+          defaultIndex: 0,
+          footer: 'Esc 返回「飞书应用来源」',
+        });
+        if (accountChoice === null) continue;
+        sessionMode = accountChoice === 0 ? 'reuse' : 'qr';
+        if (sessionMode === 'reuse') {
+          expectedIdentity = {
+            userId: inspected.identity.userId,
+            tenantId: inspected.identity.tenantId,
+          };
+        }
+      } else if ((readStoredCookiesFromSessionFile(botmuxFeishuSessionFilePath())?.length ?? 0) > 0) {
+        const relogin = await pickChoice(rl, {
+          title: '上次飞书登录态已失效或无法确认账号',
+          items: [
+            { label: '重新扫码', hint: '确认后生成新二维码并覆盖旧登录态' },
+          ],
+          defaultIndex: 0,
+          footer: 'Esc 返回「飞书应用来源」',
+        });
+        if (relogin === null) continue;
+      }
+      console.log(sessionMode === 'reuse'
+        ? '\n正在复用已确认的飞书账号创建应用（无需扫码）…'
+        : '\n正在准备安全登录，请确认要创建应用的飞书账号与企业…');
+      const webResult = await createFeishuOpenPlatformApp({
+        name: appName,
+        ...(sessionMode === 'reuse'
+          ? { disableQrLogin: true, expectedIdentity }
+          : { forceQrLogin: true }),
+        disableBytedcliFallback: true,
+        onSessionReady: ({ identity, source }) => {
+          process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
+        },
+        onQrCode: info => {
+          process.stderr.write('\n请用飞书 App 扫码登录，botmux 将代你创建应用并完成配置：\n\n');
+          process.stderr.write(`${info.qrText}\n`);
+        },
+        onStatus: message => { process.stderr.write(`${message}\n`); },
+      });
+      if (webResult.ok) {
+        console.log('\n✅ 应用创建成功（登录态已缓存，后续添加可免扫码）');
+        console.log(`   应用名称: ${appName}`);
+        console.log(`   App ID: ${webResult.appId}`);
+        console.log('   租户类型: 飞书 (feishu.cn)');
+        return {
+          ok: true,
+          appId: webResult.appId,
+          appSecret: webResult.appSecret,
+          brand: 'feishu',
+          webSessionReady: true,
+          appJustCreated: true,
+        };
+      }
+
+      console.log(`\n⚠️  Web 自动创建失败 (${webResult.reason}): ${webResult.message}`);
+      if (webResult.appId) {
+        console.log(`   应用 ${webResult.appId} 已经创建，为避免重复建应用，不自动回退。`);
+        console.log('   请返回后选择「选择已有应用」重新读取凭证。\n');
+        if (interactive) continue;
+        return { ok: false, reason: 'cancelled' };
+      }
+
+      const compatibility = await pickChoice(rl, {
+        title: '是否改用飞书确认链接？',
+        items: [
+          { label: '使用飞书确认链接', hint: '在飞书确认页创建应用并申请权限、事件和回调' },
+          { label: '返回应用来源', hint: '保留当前配置输入，不会创建新应用' },
+        ],
+        defaultIndex: 1,
+      });
+      if (compatibility !== 0) {
+        if (interactive) continue;
+        return { ok: false, reason: 'cancelled' };
+      }
+
+      // 网页创建不可用时改走飞书官方注册接口，权限、事件和回调随确认页一起申请。
       const { tryRegisterApp } = await import('./setup/register-app.js');
       const { createRegistrationOptions } = await import('./setup/registration-manifest.js');
       const { parseSetupOpenPlatformAutoFlag } = await import('./setup/open-platform-automation.js');
@@ -2001,8 +2094,11 @@ export async function cmdSetupScripted(
         | { ok: false; message: string; appId?: string };
       let appliedAppName = false;
 
-      if (cmd.compatibilityMode && cmd.flags.appName?.trim()) {
-        failSetupScripted(cmd.json, 'SDK 兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
+      // 只有带权限清单的注册（Lark 默认）会带上应用名称；兼容模式和跳过自动配置的 Lark 都不带。
+      if ((cmd.compatibilityMode || (requestedBrand === 'lark' && !cmd.openPlatformAuto)) && cmd.flags.appName?.trim()) {
+        failSetupScripted(cmd.json, cmd.compatibilityMode
+          ? 'SDK 兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。'
+          : 'Lark 跳过开放平台自动配置时不支持 --app-name；请移除该参数，或去掉 --no-open-platform-auto。');
         return;
       }
       if (requestedBrand === 'lark' && cmd.switchAccount) {
@@ -2010,7 +2106,8 @@ export async function cmdSetupScripted(
         return;
       }
 
-      if (requestedBrand === 'lark' || cmd.compatibilityMode || (!cmd.switchAccount && !cmd.flags.appIcon?.trim())) {
+      // Feishu 默认沿用网页登录态创建（有效登录态下免扫码）；Lark 与显式兼容模式走飞书官方注册接口。
+      if (requestedBrand === 'lark' || cmd.compatibilityMode) {
         const { tryRegisterApp } = await import('./setup/register-app.js');
         const { createRegistrationOptions } = await import('./setup/registration-manifest.js');
         const useAddons = !cmd.compatibilityMode && cmd.openPlatformAuto;
@@ -2204,7 +2301,7 @@ export async function cmdSetupScripted(
       }
     }
 
-    // 已有凭证模式默认跳过。新应用先回读注册页授权，再补充开放平台配置。
+    // 已有凭证模式默认跳过；--create-app 默认开启：网页创建复用刚才的 Web session，确认链接创建先回读注册页授权。
     let openPlatform: SetupOpenPlatformOutcome = { status: 'skipped' };
     if (cmd.openPlatformAuto) {
       openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {

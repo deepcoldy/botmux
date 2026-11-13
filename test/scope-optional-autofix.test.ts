@@ -39,7 +39,7 @@ const makeBot = (config: Record<string, unknown> = {}) => ({
 });
 
 /** Lark app-info stub: `granted` scopes in both token buckets, or an error `code`. */
-function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: string; approveRepair?: boolean; userOnly?: string; legacy?: boolean }): void {
+function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: string; approveRepair?: boolean; userOnly?: string; tenantOnly?: boolean; legacy?: boolean }): void {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (String(url).includes('tenant_access_token')) return Response.json({ code: 0, tenant_access_token: 't' });
     if (String(url).endsWith('/v6/scopes')) {
@@ -53,7 +53,7 @@ function stubLark(app: { granted?: string[]; code?: number; reviewVersion?: stri
       unaudit_version_id: app.reviewVersion,
       scopes: (app.granted ?? []).map(scope => app.legacy
         ? { scope }
-        : { scope, token_types: app.userOnly === scope ? ['user'] : ['tenant', 'user'] }),
+        : { scope, token_types: app.userOnly === scope ? ['user'] : app.tenantOnly ? ['tenant'] : ['tenant', 'user'] }),
     } } });
   }));
 }
@@ -71,7 +71,8 @@ const link = 'https://open.feishu.cn/page/launcher?user_code=TEST';
 
 beforeEach(() => {
   h.bot = makeBot();
-  h.automate.mockReset();
+  // 默认没有可用的本机网页登录态：网页静默补齐快速失败，才轮到确认链接。
+  h.automate.mockReset().mockResolvedValue({ ok: false, reason: 'missing_session', message: 'no cached session' });
   h.register.mockReset().mockImplementation(async (opts: RegisterAppOptions) => {
     opts.onQRCodeReady?.({ url: link, expireIn: 600 });
     return { ok: true, appId: APP, appSecret: crypto.randomUUID(), brand: 'feishu' };
@@ -83,6 +84,64 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe('checkRequiredScopes — 官方增量确认', () => {
+  it('有有效网页登录态时缺关键权限静默补齐，不发确认链接', async () => {
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_fixed', approvalAutoPassed: true,
+    });
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope) });
+    await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP, disableQrLogin: true }));
+    const manifestArg = h.automate.mock.calls[0][0].scopeManifest;
+    expect([...manifestArg.scopes.tenant, ...manifestArg.scopes.user]).toContain(missingCriticalScope);
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).toHaveBeenCalledTimes(1);
+    expect(h.dm.mock.calls[0][2]).toContain('已自动');
+    expect(h.dm.mock.calls[0][2]).not.toContain(link);
+  });
+
+  it('有有效网页登录态时只缺可选权限静默补上，不打扰 owner', async () => {
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_optional', approvalAutoPassed: true,
+    });
+    stubLark({ granted: critical });
+    await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP, disableQrLogin: true }));
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+  });
+
+  it('权限名都已开通、只缺用户身份那一份时，重复重启也不静默发版、不打扰 owner', async () => {
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_user_bucket', approvalAutoPassed: true,
+    });
+    stubLark({ granted: [...critical, ...optional], tenantOnly: true });
+    for (let check = 0; check < 3; check++) await checkRequiredScopes(APP);
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+  });
+
+  it('网页补齐发现审核中时，同一待审版本多次重启只提醒一次', async () => {
+    h.automate.mockResolvedValue({ ok: false, reason: 'app_under_review', message: '审核中', inReviewVersionId: `ver_${crypto.randomUUID()}` });
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope) });
+    for (let check = 0; check < 3; check++) await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledTimes(3);
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).toHaveBeenCalledTimes(1);
+  });
+
+  it('网页补齐发现应用在审核中时只提醒一次审核问题，不发确认链接', async () => {
+    h.automate.mockResolvedValue({ ok: false, reason: 'app_under_review', message: '审核中', inReviewVersionId: 'ver_review' });
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope) });
+    await checkRequiredScopes(APP);
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).toHaveBeenCalledTimes(1);
+    expect(h.dm.mock.calls[0][2]).toContain('卡在飞书审核中');
+  });
+
   it('所有权限已授权时无需确认链接', async () => {
     stubLark({ granted: [...critical, ...optional] });
     await checkRequiredScopes(APP);
@@ -119,7 +178,8 @@ describe('checkRequiredScopes — 官方增量确认', () => {
     await checkRequiredScopes(APP);
     expect(h.register).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP }));
     expect(requested()).toEqual([missingCriticalScope, missingOptional].sort());
-    expect(h.automate).not.toHaveBeenCalled();
+    // 先试网页静默补齐（不弹码），没有登录态才发确认链接。
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP, disableQrLogin: true }));
     expect(h.dm.mock.calls[0]?.slice(0, 4)).toEqual([APP, 'ou_admin', expect.stringContaining(link), 'text']);
     expect(h.dm.mock.calls[1]?.slice(0, 4)).toEqual([APP, 'ou_admin', expect.stringContaining('全部补齐'), 'text']);
   });
@@ -193,6 +253,20 @@ describe('checkRequiredScopes — 官方增量确认', () => {
     await first;
     expect(h.register).toHaveBeenCalledTimes(2);
     expect(h.dm.mock.calls.map(call => call[1])).toEqual(['ou_new_owner', 'ou_new_owner']);
+  });
+
+  it('回读被拒且有有效网页登录态时静默补齐全部必需权限，不发确认链接', async () => {
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 3, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_self', approvalAutoPassed: true,
+    });
+    stubLark({ code: 99991672 });
+    await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ appId: APP, disableQrLogin: true }));
+    const manifestArg = h.automate.mock.calls[0][0].scopeManifest;
+    expect([...manifestArg.scopes.tenant, ...manifestArg.scopes.user]).toEqual(expect.arrayContaining(critical));
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm.mock.calls.every(call => !String(call[2]).includes(link))).toBe(true);
   });
 
   it('回读被拒时只申请 self_manage', async () => {

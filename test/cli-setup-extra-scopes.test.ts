@@ -13,6 +13,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   automateOpenPlatformSetup: vi.fn(),
+  createFeishuOpenPlatformApp: vi.fn(),
+  inspectCachedFeishuOpenPlatformSession: vi.fn(),
   tryRegisterApp: vi.fn(),
   completeRegisteredApp: vi.fn(),
   onReadDefaultScopeManifest: vi.fn(),
@@ -25,6 +27,9 @@ vi.mock('../src/setup/open-platform-automation.js', async importOriginal => {
   return {
     ...actual,
     automateOpenPlatformSetup: mocks.automateOpenPlatformSetup,
+    createFeishuOpenPlatformApp: mocks.createFeishuOpenPlatformApp,
+    inspectCachedFeishuOpenPlatformSession: mocks.inspectCachedFeishuOpenPlatformSession,
+    readStoredCookiesFromSessionFile: () => [],
     readDefaultScopeManifest: () => {
       mocks.onReadDefaultScopeManifest();
       return actual.readDefaultScopeManifest();
@@ -310,7 +315,7 @@ describe('setup add --extra-scopes-file', () => {
     expect(lastJson()).toMatchObject({ ok: true, action: 'add', extraScopes: { file: extraFile, merged: true } });
   });
 
-  it.each([false, true])('SDK 创建后按实际申请的 addons 决定是否回读（跳过自动配置：%s）', async skipAuto => {
+  it.each([false, true])('Lark 走官方注册时按实际申请的 addons 决定是否回读（跳过自动配置：%s）', async skipAuto => {
     writeBots([botEntry('cli_a')]);
     mocks.tryRegisterApp.mockResolvedValue({
       ok: true, appId: 'cli_registered', appSecret: crypto.randomUUID(), brand: 'feishu',
@@ -321,9 +326,10 @@ describe('setup add --extra-scopes-file', () => {
 
     await cmdSetupScripted([
       'add', '--create-app', '--allowed-users', 'a@b.com', '--working-dir', scratch,
-      '--json', ...(skipAuto ? ['--no-open-platform-auto'] : ['--extra-scopes-file', extraFile]),
+      '--brand', 'lark', '--json', ...(skipAuto ? ['--no-open-platform-auto'] : []),
     ]);
 
+    expect(mocks.createFeishuOpenPlatformApp).not.toHaveBeenCalled();
     expect(readBots()[1]).toMatchObject({ larkAppId: 'cli_registered' });
     expect(mocks.automateOpenPlatformSetup).not.toHaveBeenCalled();
     const registration = mocks.tryRegisterApp.mock.calls[0][0];
@@ -332,8 +338,7 @@ describe('setup add --extra-scopes-file', () => {
       expect(mocks.completeRegisteredApp).not.toHaveBeenCalled();
       expect(lastJson().openPlatform.status).toBe('skipped');
     } else {
-      expect(registration.addons.scopes.tenant).toContain('spark:app:read');
-      expect(readBots()[1].extraScopesFile).toBe(extraFile);
+      expect(registration.addons.scopes.tenant).toContain('im:message');
       expect(mocks.completeRegisteredApp).toHaveBeenCalledWith(
         expect.objectContaining({ appId: 'cli_registered' }), registration.addons,
         expect.any(Function), expect.objectContaining({ disableQrLogin: true }),
@@ -342,15 +347,25 @@ describe('setup add --extra-scopes-file', () => {
     }
   });
 
+  it('Lark 跳过自动配置时拒绝 --app-name，不建应用', async () => {
+    writeBots([botEntry('cli_a')]);
+    await cmdSetupScripted([
+      'add', '--create-app', '--brand', 'lark', '--app-name', 'my-bot', '--no-open-platform-auto',
+      '--allowed-users', 'a@b.com', '--working-dir', scratch, '--json',
+    ]);
+    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
+    expect(lastJson()).toMatchObject({ ok: false });
+    expect(readBots()).toHaveLength(1);
+  });
+
   it('应用已创建、配置未写入时的 partial JSON 也带 extraScopes，续跑命令带上清单路径', async () => {
     writeBots([botEntry('cli_a')]);
     const before = readFileSync(botsFile, 'utf8');
-    mocks.tryRegisterApp.mockResolvedValue({
+    mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({
       ok: true,
-      appId: 'cli_created',
-      appSecret: crypto.randomUUID(),
-      brand: 'feishu',
+      identity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
     });
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_created', appSecret: 'secret-created', brand: 'feishu' });
     mocks.validateCredentials.mockResolvedValue({ ok: false, error: 'invalid_secret', message: '凭证无效' });
 
     await cmdSetupScripted([
@@ -358,11 +373,11 @@ describe('setup add --extra-scopes-file', () => {
       '--extra-scopes-file', extraFile, '--json',
     ]);
 
-    expect(mocks.tryRegisterApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      addons: expect.objectContaining({
-        scopes: expect.objectContaining({ tenant: expect.arrayContaining(['spark:app:read']) }),
-      }),
-      linkOnly: true,
+    // 飞书默认沿用网页登录态创建：有效登录态下免扫码，不走确认链接。
+    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      disableQrLogin: true,
+      expectedIdentity: { userId: 'u_1', tenantId: 't_1' },
     }));
     const out = lastJson();
     expect(out).toMatchObject({ ok: false, partial: true, appId: 'cli_created', extraScopes: { file: extraFile, merged: true } });

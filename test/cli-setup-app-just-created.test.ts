@@ -69,7 +69,39 @@ beforeEach(() => {
 });
 
 describe('obtainCredentials 的 appJustCreated 信号', () => {
-  it('默认以官方清单创建新应用，并标记为待回读注册结果', async () => {
+  it('没有登录态时默认走网页扫码创建，不走确认链接 → appJustCreated=true', async () => {
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_web_new', appSecret: 'web-secret' });
+
+    const creds = await obtainCredentials(fakeRl(['', '']));
+
+    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ forceQrLogin: true }));
+    expect(creds.ok && creds.appJustCreated).toBe(true);
+  });
+
+  it('有效登录态下确认账号即免扫码创建，不弹码也不走确认链接', async () => {
+    mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({
+      ok: true,
+      identity: { userId: 'u_1', userName: '测试用户', tenantId: 't_1', tenantName: '测试企业' },
+    });
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_web_reuse', appSecret: 'web-secret' });
+
+    // 飞书应用来源默认项 → 名称默认 → 「确认并免扫码添加」默认项
+    const creds = await obtainCredentials(fakeRl(['', '', '']));
+
+    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      disableQrLogin: true,
+      expectedIdentity: { userId: 'u_1', tenantId: 't_1' },
+    }));
+    const options = mocks.createFeishuOpenPlatformApp.mock.calls[0][0];
+    expect(options.forceQrLogin).toBeUndefined();
+    expect(creds).toMatchObject({ ok: true, appId: 'cli_web_reuse', appJustCreated: true, webSessionReady: true });
+  });
+
+  it('网页创建失败后改用飞书确认链接 → 以官方清单注册，标记 appJustCreated 并待回读注册结果', async () => {
+    // Web console 建应用失败且没建出半成品（无 appId）→ 才会问是否改用确认链接。
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: false, reason: 'network', message: 'console 不可达' });
     mocks.tryRegisterApp.mockResolvedValue({
       ok: true,
       appId: 'cli_sdk_new',
@@ -78,9 +110,8 @@ describe('obtainCredentials 的 appJustCreated 信号', () => {
       userOpenId: 'ou_scanner',
     });
 
-    const creds = await obtainCredentials(fakeRl(['', '我的机器人']));
-    expect(mocks.createFeishuOpenPlatformApp).not.toHaveBeenCalled();
-    expect(mocks.inspectCachedFeishuOpenPlatformSession).not.toHaveBeenCalled();
+    const creds = await obtainCredentials(fakeRl(['', '我的机器人', '1']));
+
     expect(mocks.tryRegisterApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       appPreset: expect.objectContaining({ name: '我的机器人' }),
       addons: expect.objectContaining({ scopes: expect.objectContaining({ tenant: expect.any(Array), user: expect.any(Array) }) }),
