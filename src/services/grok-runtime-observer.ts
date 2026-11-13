@@ -5,9 +5,11 @@ import { isNativeReasoningEffort, type NativeReasoningObservation } from './nati
 function snapshot(path: string, now: number, notBefore: number): { data: Record<string, any>; mtimeMs: number } | undefined {
   try {
     const stat = statSync(path);
+    // Grok rewrites these files when its state changes, not on a timer, so an
+    // idle session's copy stays current for its own process however old it is.
+    // notBefore (the CLI spawn) is what excludes an earlier process's state.
     if (!stat.isFile() || stat.size > 1024 * 1024 || Math.floor(stat.mtimeMs) > now
-      || Math.floor(stat.mtimeMs) < notBefore
-      || stat.mtimeMs < now - 10 * 60_000) return;
+      || Math.floor(stat.mtimeMs) < notBefore) return;
     const data = JSON.parse(readFileSync(path, 'utf8'));
     if (data && typeof data === 'object' && !Array.isArray(data)) return { data, mtimeMs: stat.mtimeMs };
   } catch { /* missing/stale data means unknown runtime, never a guessed level */ }

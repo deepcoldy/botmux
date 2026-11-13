@@ -2390,6 +2390,8 @@ export const messages: Record<string, string> = {
   'card.usage.turn': 'This turn',
   'card.usage.total': 'Total',
   'card.usage.cache_hit': 'Cache hit',
+  'card.usage.effort_selected': '{effort} (selected)',
+  'card.usage.effort_last_execution': '{effort} (last run)',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 Last exchange before /adopt',

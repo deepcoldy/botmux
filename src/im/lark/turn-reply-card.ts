@@ -311,7 +311,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const usage = presentation.showLiveUsage && record.usage
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
   // Final cards already carry their frozen runtime identity in the footer.
-  const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage) : null;
+  const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage, presentation.locale) : null;
   const usageLine = [usage, runtime].filter(Boolean).join(' · ');
   if (usageLine && !compactRuntime && !simpleFinal) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
   if (!terminal && !record.finalCard && ['working', 'waiting'].includes(record.phase) && presentation.canStop) {

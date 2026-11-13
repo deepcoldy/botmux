@@ -149,7 +149,26 @@ describe('four CLI reasoning observations', () => {
     expect(wire.patched.at(-1)?.reasoningEffort).toBeUndefined();
   });
 
-  it.each(['codex', 'traex', 'grok', 'antigravity'] as const)('%s omits a launch effort when no observation exists', cliId => {
+  it('Antigravity terminal transport keeps its launch effort until an ACP reading exists', () => {
+    // The default terminal transport has no effort observation channel at all.
+    const state = ds('antigravity'); state.activeReasoningEffort = undefined;
+    const before = withCardRuntimeIdentity(state, { context: null, tokens: null });
+    expect(before.reasoningEffort).toBe('high');
+    expect(before.reasoningEffortSource).toBeUndefined();
+    const wire = wiring(state);
+    wire.publish({ cliId: 'antigravity', nativeSessionId: SID, reasoningEffort: 'medium', source: 'acp-config' });
+    expect(wire.patched.at(-1)).toMatchObject({ reasoningEffort: 'medium', reasoningEffortSource: 'selected' });
+  });
+
+  it('labels the effort source in the card locale', () => {
+    const usage = { context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'high' };
+    expect(cardUsageRuntimeSegment({ ...usage, reasoningEffortSource: 'selected' }, 'en')).toBe('**gpt-5.6-sol**\u00a0high (selected)');
+    expect(cardUsageRuntimeSegment({ ...usage, reasoningEffortSource: 'last-execution' }, 'en')).toBe('**gpt-5.6-sol**\u00a0high (last run)');
+    expect(cardUsageRuntimeSegment({ ...usage, reasoningEffortSource: 'selected' }, 'zh')).toBe('**gpt-5.6-sol**\u00a0high（已选）');
+    expect(cardUsageRuntimeSegment({ ...usage, reasoningEffortSource: 'last-execution' }, 'zh')).toBe('**gpt-5.6-sol**\u00a0high（最近执行）');
+  });
+
+  it.each(['codex', 'traex', 'grok'] as const)('%s omits a launch effort when no observation exists', cliId => {
     const state = ds(cliId); state.activeReasoningEffort = undefined;
     expect(withCardRuntimeIdentity(state, { context: null, tokens: null }).reasoningEffort).toBeUndefined();
     expect(state.activeModel).toBe('model-before');
@@ -191,6 +210,21 @@ describe('four CLI reasoning observations', () => {
     state.localProcessAttestation = { cliSpawnGeneration: 2 } as any;
     expect(applyNativeReasoningObservation(state, { ...reading, cliSpawnGeneration: 1 }, source)).toBe(false);
     expect(withCardRuntimeIdentity(state, { context: null, tokens: null }).reasoningEffort).toBeUndefined();
+  });
+
+  it('an idle Grok card keeps its effort long after the last turn rewrote summary.json', () => {
+    const session = join(dir, SID); mkdirSync(session);
+    const summary = join(session, 'summary.json');
+    writeFileSync(summary, JSON.stringify({ current_model_id: 'grok-4.7', reasoning_effort: 'xhigh' }));
+    utimesSync(summary, new Date(NOW - 1_000), new Date(NOW - 1_000));
+    const state = ds('grok'); const wire = wiring(state);
+    const spawnedAt = NOW - 60_000;
+    wire.publish({ ...readGrokRuntimeObservation(session, SID, Date.now(), spawnedAt), cliSpawnGeneration: 1 });
+    expect(wire.patched.at(-1)).toMatchObject({ model: 'grok-4.7', reasoningEffort: 'xhigh' });
+    // The worker keeps polling every second while the session sits idle.
+    vi.setSystemTime(NOW + 11 * 60_000);
+    wire.publish({ ...readGrokRuntimeObservation(session, SID, Date.now(), spawnedAt), cliSpawnGeneration: 1 });
+    expect(withCardRuntimeIdentity(state, { context: null, tokens: null })).toMatchObject({ model: 'grok-4.7', reasoningEffort: 'xhigh' });
   });
 
   it('a missing Grok file does not advance its evidence clock past a later file write', () => {

@@ -892,6 +892,7 @@ export function cardUsageFooterSegment(
  * within the label budget: CLIs such as Cursor encode effort in that ID. */
 export function cardUsageRuntimeSegment(
   usage: CardUsageSnapshot,
+  locale?: Locale,
 ): string | null {
   // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
   // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
@@ -906,9 +907,9 @@ export function cardUsageRuntimeSegment(
       : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
   const effortLabel = reasoningEffort && usage.reasoningEffortSource === 'selected'
-    ? `${reasoningEffort}（已选）`
+    ? t('card.usage.effort_selected', { effort: reasoningEffort }, locale)
     : reasoningEffort && usage.reasoningEffortSource === 'last-execution'
-      ? `${reasoningEffort}（最近执行）` : reasoningEffort;
+      ? t('card.usage.effort_last_execution', { effort: reasoningEffort }, locale) : reasoningEffort;
   const tail = [variant, effortLabel].filter(Boolean);
   return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
 }
@@ -1050,7 +1051,7 @@ export function buildReplyCardFooter(opts: {
   if (opts.usage) {
     const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
-    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage);
+    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage, opts.locale);
     if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
   const durationMs = opts.presentation?.timing?.executionDurationMs ?? opts.executionDurationMs;

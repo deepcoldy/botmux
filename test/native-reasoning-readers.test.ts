@@ -30,9 +30,16 @@ describe('Grok native runtime snapshots', () => {
     const dir = file('summary.json', { current_model_id: 'native-model', reasoning_effort: level });
     expect(readGrokRuntimeObservation(dir, 'native', NOW).reasoningEffort).toBeNull();
   });
-  it.each([NOW - 601_000, NOW + 10_000])('rejects stale/future metadata at %s', time => {
-    const dir = file('summary.json', { current_model_id: 'bad-model', reasoning_effort: 'high' }, time);
+  it('rejects future metadata', () => {
+    const dir = file('summary.json', { current_model_id: 'bad-model', reasoning_effort: 'high' }, NOW + 10_000);
     expect(readGrokRuntimeObservation(dir, 'native', NOW)).not.toHaveProperty('model');
+  });
+  it('keeps an idle session\'s own summary however long ago its last turn ended', () => {
+    // Grok does not refresh summary.json on a timer. An idle card must not lose
+    // the effort the same process reported an hour ago.
+    const dir = file('summary.json', { current_model_id: 'grok-4.7', reasoning_effort: 'xhigh' }, NOW - 3_600_000);
+    expect(readGrokRuntimeObservation(dir, 'native', NOW, NOW - 7_200_000))
+      .toMatchObject({ model: 'grok-4.7', reasoningEffort: 'xhigh', observedAtMs: NOW - 3_600_000 });
   });
   it('does not reuse an earlier native process snapshot', () => {
     const dir = file('summary.json', { reasoning_effort: 'high' }, NOW - 1000);

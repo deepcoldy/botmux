@@ -22,7 +22,11 @@ export function withCardRuntimeIdentity(
     && (ds.localProcessAttestation?.cliSpawnGeneration === undefined
       || candidate.cliSpawnGeneration === ds.localProcessAttestation.cliSpawnGeneration) ? candidate : undefined;
   const staleObservation = candidate && candidate.cliId === effectiveCliId && !observed;
-  const strictEffort = ['claude-code', 'codex', 'traex', 'grok', 'antigravity'].includes(effectiveCliId ?? '');
+  // Antigravity reports effort only over ACP. Its default terminal transport
+  // has no observation channel, so without an ACP reading it keeps showing the
+  // configured launch effort exactly as before.
+  const strictEffort = ['claude-code', 'codex', 'traex', 'grok'].includes(effectiveCliId ?? '')
+    || (effectiveCliId === 'antigravity' && candidate?.cliId === 'antigravity');
   // CLI-local settings can change independently of the frozen launch preference.
   // The explicitly observed CLIs never show an unlabelled launch effort.
   const reasoningEffort = (effectiveCliId !== 'grok' ? ds.activeReasoningEffort?.trim() : undefined)
