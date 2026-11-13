@@ -931,7 +931,12 @@ describe('discovery is bounded (real sockets)', () => {
     // CI port race would silently count this as green with zero behaviour checked.
     expect(realPort, 'fixture could not claim an adjacent port pair after 12 tries').toBeGreaterThan(0);
 
-    setPort(realPort + 1_000);                 // recorded port: nobody listening
+    // Recorded port must be PROVABLY dead, not an assumed-free `realPort+1000`: a
+    // concurrent test's server answering there (e.g. 403 HTML → http-error) ends
+    // the call on the first hop, before discovery ever runs.
+    const deadRecorded = await pickDeadRecordedPort(stalled, 1);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                     // recorded port: verified nobody listening
     const t0 = Date.now();
     const r = await callDashboard({
       configDir: dir, defaultPort: stalled, probeSpan: 1, path: '/__cli/current',
@@ -983,7 +988,10 @@ describe('discovery is bounded (real sockets)', () => {
     expect(realPort, 'fixture could not claim an adjacent port pair').toBeGreaterThan(0);
     expect(stalledPortNum).toBeLessThan(realPort);   // stall must be probed first
 
-    setPort(realPort + 1_000);                       // recorded port: nobody there
+    // Same first-hop race as above: the recorded port must be verified dead.
+    const deadRecorded = await pickDeadRecordedPort(stalledPortNum, 1);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                           // recorded port: verified nobody there
     const t0 = Date.now();
     const r = await callDashboard({
       configDir: dir, defaultPort: stalledPortNum, probeSpan: 1, path: '/__cli/current',
@@ -1001,9 +1009,13 @@ describe('discovery is bounded (real sockets)', () => {
     // "bounded command" must include this hop, not just the scan.
     const stalled = await stalledPort();
     setPort(stalled);                                // recorded port IS the stall
+    // The single scanned port must be verified dead too, not an assumed-free
+    // `stalled+500` a concurrent fake dashboard could answer `ok` on.
+    const deadScan = await pickDeadRecordedPort(stalled, 0);
+    expect(deadScan, 'fixture could not confirm a dead scan port').toBeGreaterThan(0);
     const t0 = Date.now();
     const r = await callDashboard({
-      configDir: dir, defaultPort: stalled + 500, probeSpan: 0, path: '/__cli/current',
+      configDir: dir, defaultPort: deadScan, probeSpan: 0, path: '/__cli/current',
       rescanWhenUnreachable: true, probeTimeoutMs: 300, discoveryBudgetMs: 1_000,
     });
     const elapsed = Date.now() - t0;
