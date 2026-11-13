@@ -54,7 +54,10 @@ export function startupIdleReportScreenAdmits(screen: string, readyPattern: RegE
  *  dialog — and an auth prompt or a block of unnamed kind — would take the
  *  text and its Enter as an answer. A question is the one block the user's
  *  next message is meant to answer; holding it until the turn ends would
- *  wait on itself, so it keeps the pre-OSC behaviour. */
+ *  wait on itself, so it keeps the pre-OSC behaviour. (TraeX's own question
+ *  page is the exception, handled apart: a message would only become a note
+ *  there, so its terminal sessions hold input and answer through a question
+ *  card instead — see CliAdapter.nativeQuestionPage.) */
 export function programStatusBlockHoldsTypeAhead(block: ProgramStatusBlock | null): boolean {
   return block !== null && block.kind !== 'question';
 }

@@ -229,6 +229,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     codexBrowserAutoApproveOrigins: j?.codexBrowserAutoApproveOrigins === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
+    goalStatusCard: j?.goalStatusCard === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),

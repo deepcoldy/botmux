@@ -50,6 +50,7 @@ import {
   type Dirent,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { nativeGoalFromEvent, type NativeGoalState } from './native-goal-state.js';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { codexHome, codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
@@ -58,6 +59,7 @@ import type { CodexThreadSettings } from './codex-service-tier.js';
 // cot-subject 与 process-open-files 只用语言/Node 内建，等价于内联，不违反本模块 dependency-free 口径。
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
+import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
 const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
@@ -178,6 +180,55 @@ export function codexHistorySidIsOwned(
 ): boolean {
   if (!ownedRollouts) return false;
   return ownedRollouts.has(cliSessionId.toLowerCase());
+}
+
+/** Select the sole top-level conversation id from the rollout files a live
+ *  Codex process holds open.
+ *
+ *  Codex keeps internal/subagent rollouts (`thread_source !== 'user'`,
+ *  `source.subagent`, `source.internal`) open alongside the user's top-level
+ *  rollout in the same process. Unlike `findCodexRolloutByPid`, which inspects
+ *  filenames alone and treats any multi-rollout fd table as ambiguous, this
+ *  helper verifies the first JSON record of every open rollout fd:
+ *   - Any unreadable, empty, partial-line, or invalid-JSON rollout fails closed
+ *     (`undefined`), because a newly opened file whose header is still being
+ *     flushed could be a `/new` top-level conversation.
+ *   - Verified `session_meta` rows flagged by `isInternalCodexSessionMeta` are
+ *     excluded as runtime helpers rather than top-level conversations.
+ *   - Every remaining rollout must agree on a single case-insensitive
+ *     `cliSessionId` (with `session_meta.payload.id`, when present, matching
+ *     the filename id); zero or multiple top-level ids return `undefined`. */
+export function selectCodexLiveSessionIdFromPaths(targets: Iterable<string>): string | undefined {
+  const byPath = new Map<string, CodexRolloutRef>();
+  for (const target of targets) {
+    const hit = matchCodexRolloutPath(target);
+    if (hit && !byPath.has(hit.path)) byPath.set(hit.path, hit);
+  }
+  if (byPath.size === 0) return undefined;
+  let topLevelId: string | undefined;
+  for (const hit of byPath.values()) {
+    const header = rolloutHeaderCheck(hit.path);
+    if (!header.verified) return undefined;
+    if (header.internal) continue;
+    if (header.sid && header.sid.toLowerCase() !== hit.cliSessionId.toLowerCase()) {
+      return undefined;
+    }
+    if (!topLevelId) {
+      topLevelId = hit.cliSessionId;
+    } else if (topLevelId.toLowerCase() !== hit.cliSessionId.toLowerCase()) {
+      return undefined;
+    }
+  }
+  return topLevelId;
+}
+
+/** Resolve the sole live top-level conversation id owned by `pid` from its
+ *  open rollout file descriptors, ignoring internal/subagent helper rollouts
+ *  while failing closed on unverified or multi-conversation fd tables. */
+export function readCodexLiveSessionId(pid: number): string | undefined {
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  return selectCodexLiveSessionIdFromPaths(targets);
 }
 
 function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | undefined {
@@ -907,6 +958,7 @@ export function splitCodexEventsByCutoff(
 }
 
 export interface CodexDrainResult {
+  latestGoal?: NativeGoalState | null;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully-parsed line + its trailing \n. The next
    *  drain should pass this back as fromOffset. */
@@ -1001,7 +1053,9 @@ const SESSION_META_HEADER_MAX_BYTES = 1024 * 1024;
  *  - unverified: no complete first line could be read (missing, being
  *    written, larger than the cap, symlink refusal, IO/parse error). Callers
  *    that need positive identification must treat unverified as untrusted. */
-type RolloutHeaderCheck = { verified: true; sid: string | null } | { verified: false };
+type RolloutHeaderCheck =
+  | { verified: true; sid: string | null; internal: boolean }
+  | { verified: false };
 
 function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
   let fd: number | undefined;
@@ -1031,11 +1085,16 @@ function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck 
     if (!complete) return { verified: false };
     let row: any;
     try { row = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return { verified: false }; }
+    const isMeta = row?.type === 'session_meta'
+      && !!row.payload
+      && typeof row.payload === 'object'
+      && !Array.isArray(row.payload);
     return {
       verified: true,
-      sid: row?.type === 'session_meta' && typeof row.payload?.id === 'string'
+      sid: isMeta && typeof row.payload.id === 'string'
         ? row.payload.id
         : null,
+      internal: isMeta && isInternalCodexSessionMeta(row.payload),
     };
   } catch { return { verified: false }; }
   finally { if (fd !== undefined) closeSync(fd); }
@@ -1715,6 +1774,7 @@ export function drainCodexRollout(
 
   const events: CodexBridgeEvent[] = [];
   const spawnedSubagents: CodexSpawnedSubagent[] = [];
+  let latestGoal: NativeGoalState | null | undefined;
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
@@ -1760,6 +1820,8 @@ export function drainCodexRollout(
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
     if (obj.type === 'session_meta' && typeof p.id === 'string' && p.id) sourceSessionId = p.id;
+    const goal = nativeGoalFromEvent(obj, sourceSessionId);
+    if (goal !== undefined) latestGoal = goal;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const lineId = codexRolloutLineId(line);
@@ -1976,6 +2038,7 @@ export function drainCodexRollout(
     latestThreadSettings,
     latestModel,
     latestReasoningEffort,
+    ...(latestGoal !== undefined ? { latestGoal } : {}),
     ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
       state: { nextOffset: newOffset, turnStartOffset,

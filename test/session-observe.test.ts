@@ -10,7 +10,7 @@ import type { ObserveFetchQuery } from '../src/services/session-observe-fetch-im
 expectTypeOf<ObserveSession['backend']['adopted']>().toEqualTypeOf<boolean | 'unknown'>();
 expectTypeOf<ObserveSession['parkedOrSuspended']>().toEqualTypeOf<boolean | 'unknown'>();
 expectTypeOf<ObserveSession['closed']>().toEqualTypeOf<boolean | 'unknown'>();
-expectTypeOf<keyof ObserveFetchQuery>().toEqualTypeOf<'larkAppId' | 'includeRaw'>();
+expectTypeOf<keyof ObserveFetchQuery>().toEqualTypeOf<'larkAppId' | 'includeRaw' | 'includeTask' | 'activeWithinMs'>();
 
 const OBSERVED_AT = 1_700_000_000_000;
 
@@ -352,5 +352,76 @@ describe('session-observe context block', () => {
       { observedAt: OBSERVED_AT, probe: { status: 'unreachable', source: 'daemon-ipc' } },
     );
     expect('context' in observe).toBe(false);
+  });
+});
+
+describe('session-observe task block', () => {
+  const task = (overrides: Partial<RawSessionRow>, opts: { includeTask?: boolean } = { includeTask: true }) =>
+    normalizeSessionRow(makeRow(overrides), { observedAt: OBSERVED_AT, ...opts }).task;
+
+  it('is absent unless requested, so the default output is unchanged', () => {
+    const row = makeRow({
+      lastTurn: { turnId: 't1', outcome: 'delivered', at: OBSERVED_AT - 1_000, summary: 'PR 已开' },
+      lastMessageAt: OBSERVED_AT - 2_000,
+    });
+    expect('task' in normalizeSessionRow(row, { observedAt: OBSERVED_AT })).toBe(false);
+    expect('task' in normalizeSessionRow(row, { observedAt: OBSERVED_AT, includeRaw: true })).toBe(false);
+  });
+
+  it('reports a delivered turn with its time and the first line of the final reply', () => {
+    expect(task({
+      status: 'idle',
+      lastMessageAt: OBSERVED_AT - 60_000,
+      lastTurn: { turnId: 't1', outcome: 'delivered', at: OBSERVED_AT - 30_000, summary: 'PR #12 已开，CI 全绿' },
+    })).toEqual({ kind: 'delivered', at: OBSERVED_AT - 30_000, summary: 'PR #12 已开，CI 全绿' });
+  });
+
+  it('does not keep a delivered result once a newer message arrived', () => {
+    expect(task({
+      status: 'idle',
+      lastMessageAt: OBSERVED_AT - 10_000,
+      lastTurn: { turnId: 't1', outcome: 'delivered', at: OBSERVED_AT - 30_000, summary: '旧结果' },
+    })).toEqual({ kind: 'idle' });
+  });
+
+  it('never infers delivered for a session without a recorded turn', () => {
+    expect(task({ status: 'idle' })).toEqual({ kind: 'idle' });
+    expect(task({ status: 'dormant', workerPid: undefined })).toEqual({ kind: 'idle' });
+  });
+
+  it('reports a running turn with busySinceAt', () => {
+    expect(task({ status: 'working', busySinceAt: OBSERVED_AT - 90_000 })).toEqual({
+      kind: 'working', busySinceAt: OBSERVED_AT - 90_000,
+    });
+    expect(task({ status: 'starting' })).toEqual({ kind: 'working' });
+  });
+
+  it('reports needs_you with the reason, the raise text and time', () => {
+    expect(task({
+      status: 'idle',
+      agentAttention: { kind: 'decision', reason: '要你定合不合', at: OBSERVED_AT - 5_000, source: 'agent' },
+    })).toEqual({ kind: 'needs_you', reason: 'attention', detail: '要你定合不合', at: OBSERVED_AT - 5_000 });
+    expect(task({ status: 'idle', tuiPromptActive: true })).toEqual({ kind: 'needs_you', reason: 'tui_prompt' });
+    expect(task({ status: 'idle', pendingRepo: true })).toEqual({ kind: 'needs_you', reason: 'pending_repo' });
+    expect(task({
+      status: 'idle',
+      lastMessageAt: OBSERVED_AT - 60_000,
+      lastTurn: { turnId: 't2', outcome: 'interrupted', at: OBSERVED_AT - 20_000, errorCode: 'turn_timeout' },
+    })).toEqual({ kind: 'needs_you', reason: 'interrupted', detail: 'turn_timeout', at: OBSERVED_AT - 20_000 });
+  });
+
+  it('reports unfinished TODOs and closed sessions', () => {
+    expect(task({ status: 'idle', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false, items: [] } }))
+      .toEqual({ kind: 'unfinished', remaining: 2 });
+    expect(task({ status: 'closed', closedAt: OBSERVED_AT - 1_000 })).toEqual({ kind: 'closed', at: OBSERVED_AT - 1_000 });
+  });
+
+  it('omits the block when the daemon status is unknown or the probe failed', () => {
+    expect(task({ status: 'mystery' })).toBeUndefined();
+    expect(normalizeSessionRow(makeRow({ status: 'idle' }), {
+      observedAt: OBSERVED_AT,
+      includeTask: true,
+      probe: { status: 'unreachable', source: 'daemon-ipc' },
+    }).task).toBeUndefined();
   });
 });

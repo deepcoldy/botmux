@@ -71,6 +71,21 @@ describe('handleDecisionBoardApi', () => {
     expect((await call('GET', '/api/sessions', deps().deps)).handled).toBe(false);
   });
 
+  it('本机外部客户端的 owner 路由不经 Dashboard 转发（管理身份和 H5 免登身份都一样）', async () => {
+    for (const over of [{}, { canManageHost: false, identity: H5 }]) {
+      const d = deps(over);
+      for (const [method, path] of [
+        ['GET', '/api/decision-board/cli_s/owner/items'],
+        ['GET', '/api/decision-board/cli_s/owner/items/3'],
+        ['POST', '/api/decision-board/cli_s/owner/items/3/decide'],
+      ] as const) {
+        const r = await call(method, path, d.deps, method === 'POST' ? { askKey: 'x', choice: 'A', requestId: 'req-00000001' } : undefined);
+        expect(r.out.status).toBe(404);
+      }
+      expect(d.calls).toEqual([]);
+    }
+  });
+
   it('既不是管理身份也不是 H5 免登身份：401，不转发', async () => {
     const d = deps({ canManageHost: false, identity: null });
     const r = await call('GET', '/api/decision-board/cli_s/items', d.deps);

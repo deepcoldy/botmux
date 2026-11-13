@@ -3,7 +3,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
-import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec } from './types.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
@@ -507,7 +507,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       });
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       // /model is a native menu, not a model turn. Pasting a question into it
       // loses the paste and its Enter only dismisses the picker; history never
       // receives the question and the worker quarantines all later input.
@@ -569,6 +569,15 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         traexHistoryMatchDelta(historyPath, baseByte, content, (sid) => traexHistorySidIsOwned(sid ?? '', owned));
       const anyMatch = () => traexHistoryMatchDelta(historyPath, baseByte, content);
 
+      // Every Enter first asks whether the input surface is still the
+      // composer: TRAE's question page can pop up in between (an agent asking
+      // mid-turn while this message is typed ahead), and an Enter there
+      // submits its highlighted option instead of this message.
+      const guard = context?.submitGuard;
+      const submitBlocked = async (phase: 'draft' | 'retry'): Promise<string | undefined> => {
+        try { return (await guard?.blocked(phase)) || undefined; } catch { return undefined; }
+      };
+
       try {
         if (pty.pasteText) pty.pasteText(content);
         else pty.write(wrapBracketedPaste(content));
@@ -576,6 +585,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         return { submitted: false };
       }
       await delay(200);
+      let blocked = await submitBlocked('draft');
+      if (blocked && guard) {
+        // The paste sits in the composer as a draft under the page. Wait for
+        // the page to go (answered on its card or in the terminal), then
+        // submit that same draft: pasting again would double it, and leaving
+        // it would prefix the next message.
+        const polls = Math.ceil(guard.maxWaitMs / guard.pollMs);
+        for (let poll = 0; blocked && poll < polls && guard.current(); poll++) {
+          await delay(guard.pollMs);
+          blocked = await submitBlocked('draft');
+        }
+        if (!guard.current()) return { submitted: false };
+        if (blocked) return { submitted: false, failureReason: blocked };
+      }
       if (!trySendEnter()) return { submitted: false };
 
       // `sawAnyText` remembers that the submit is proven (an any-text line
@@ -608,8 +631,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         await delay(800);
         // Only re-Enter while the submit is still unproven; once any-text is
         // seen the message is committed and we're merely waiting for the owned
-        // rollout fd, so another Enter would risk a duplicate submit.
-        if (!sawAnyText && !trySendEnter()) return { submitted: false };
+        // rollout fd, so another Enter would risk a duplicate submit. The
+        // receipt usually lands during the wait (TRAE writes it at submit
+        // time, just after the first look): look again before pressing — a
+        // blind second Enter lands on whatever the turn has drawn by now.
+        if (sawAnyText) continue;
+        const late = resolve(false);
+        if (late) return late;
+        if (sawAnyText) continue;
+        // The first Enter may still be on its way into the transcript: a page
+        // up now only means no further Enter, not a failed submit — the
+        // receipt (or the worker's later recheck) decides.
+        if (await submitBlocked('retry')) continue;
+        if (!trySendEnter()) return { submitted: false };
       }
       const finalConfirmed = resolve(true);
       if (finalConfirmed) return finalConfirmed;
@@ -747,9 +781,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
     // RPC mode bridges native AskUserQuestion directly. Keep the normal
     // botmux-ask skill available too: TraeX sessions can fail closed to a
-    // standard PTY when RPC is unavailable, where native questions cannot
-    // reach the card bridge.
+    // standard PTY when RPC is unavailable.
     asksViaHook: false,
+    // On that terminal path the native AskUserQuestion page itself is turned
+    // into the same Lark question card (worker + core/traex-question-bridge.ts).
+    nativeQuestionPage: 'traex',
   };
 }
 

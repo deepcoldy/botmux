@@ -336,6 +336,26 @@ describe('authenticated native proof recovery across a bare intermediate observa
       expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('reconciling');
       expect(h.wire.filter(m => m.type === 'runtime_binding')).toHaveLength(0);
     });
+  it('takes the header-verified top-level conversation while the engine also holds subagent rollouts', async () => {
+    vi.useFakeTimers(); const h = harness('native-recovery');
+    h.env.findCodexRolloutSetByPid.mockReturnValue(new Set(['native-conversation', 'subagent-conversation']));
+    h.env.findCodexRolloutByPid.mockReturnValue(undefined);
+    h.env.readCodexLiveSessionId = vi.fn(() => 'native-conversation');
+    h.restoreNative(); await h.drainBindings();
+    expect(h.env.readCodexLiveSessionId).toHaveBeenCalledWith(222);
+    expect(h.wire.filter(m => m.type === 'runtime_binding').map(m => m.identity?.nativeSessionId)).toEqual(['native-conversation']);
+    const pending = h.final(); await vi.advanceTimersByTimeAsync(0); await pending;
+    expect(h.wire.find(m => m.type === 'final_output')?.sessionContract).toMatchObject({ scope: { runtime: h.historicalRuntime, execution: h.execution } });
+    expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('succeeded');
+  });
+  it('does not adopt a header-verified id the engine does not hold among its rollouts', async () => {
+    vi.useFakeTimers(); const h = harness('native-recovery');
+    h.env.findCodexRolloutSetByPid.mockReturnValue(new Set(['native-conversation', 'subagent-conversation']));
+    h.env.readCodexLiveSessionId = vi.fn(() => 'unheld-conversation');
+    h.restoreNative(); await h.drainBindings();
+    expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('reconciling');
+    expect(h.wire.filter(m => m.type === 'runtime_binding')).toHaveLength(0);
+  });
 });
 
 describe('control stop during final persistence wait', () => {

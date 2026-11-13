@@ -155,8 +155,51 @@ describe('project group mode dashboard API', () => {
       progressCard: { schemaVersion: 1, templateId: 'raw-json', sections: [], milestonesExpanded: false },
     }, f)).toMatchObject({ status: 400, body: { error: 'invalid_progress_card_config' } });
     expect(await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+        completedDisplay: 'hidden',
+      },
+    }, f)).toMatchObject({ status: 400, body: { error: 'invalid_progress_card_config' } });
+    expect(await putProjectGroupMode('oc_project', {
       mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'], autoEnrollWorkers: 'yes',
     }, f)).toMatchObject({ status: 400, body: { error: 'invalid_auto_enroll_workers' } });
+  });
+
+  it('persists progressCard.completedDisplay across collapsed, recent, all, and omitted resets', async () => {
+    const f = fixture();
+    for (const completedDisplay of ['collapsed', 'recent', 'all'] as const) {
+      const result = await putProjectGroupMode('oc_project', {
+        mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+        progressCard: {
+          schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+          completedDisplay,
+        },
+      }, f);
+      expect(result.status).toBe(200);
+      expect(result.body.config).toMatchObject({
+        progressCard: { templateId: 'compact-list', completedDisplay },
+      });
+      expect(readGroupCollaborationMode(f.dataDir, 'oc_project')?.progressCard?.completedDisplay).toBe(completedDisplay);
+    }
+
+    await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+        completedDisplay: 'collapsed',
+      },
+    }, f);
+    const reset = await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+      },
+    }, f);
+    expect(reset.status).toBe(200);
+    expect(readGroupCollaborationMode(f.dataDir, 'oc_project')?.progressCard).toEqual({
+      schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+    });
   });
 
   it('refreshes an existing pinned card immediately after display configuration changes', async () => {

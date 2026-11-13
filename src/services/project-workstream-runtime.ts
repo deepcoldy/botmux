@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { getBot } from '../bot-registry.js';
 import type { DaemonSession } from '../core/types.js';
 import * as sessionStore from './session-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
@@ -32,6 +33,37 @@ function findActiveBySessionId(sessionId: string): DaemonSession | undefined {
   return workstreamPool?.findActiveBySessionId(sessionId);
 }
 
+/** Report-time runtime liveness for an attached source session.
+ *  During an active turn (`runtime_busy`), `SessionController` clears
+ *  `runtime.promptReady`, so `ds.cliReady` is legitimately `false` throughout
+ *  the turn that executes `botmux report`. Require a live worker generation
+ *  and bound native session instead of an idle prompt. */
+function isSourceSessionRuntimeLive(ds: DaemonSession | undefined): ds is DaemonSession {
+  if (!ds) return false;
+  const s = ds.session;
+  if (s.status !== 'active' || !s.cliSessionId || s.pendingForkSession || s.suspendedColdResume) {
+    return false;
+  }
+  if (s.sessionLifecycle && s.sessionLifecycle !== 'active') {
+    return false;
+  }
+  if (ds.worker !== undefined && (!ds.worker || ds.worker.killed)) {
+    return false;
+  }
+  if (ds.workerReady !== undefined) {
+    return ds.workerReady === true;
+  }
+  return ds.worker !== undefined ? true : ds.cliReady === true;
+}
+
+/** Only the display title may refresh mid-turn. Every other field stays in the
+ *  comparison, so a field later added to ProjectAttachmentSource is checked by
+ *  default instead of silently dropping out of the freshness proof. */
+function authoritativeSourceIdentity(source: ProjectAttachmentSource): string {
+  const { title: _displayOnly, ...authoritative } = source;
+  return JSON.stringify(authoritative);
+}
+
 /** Freshness is proved against the denied host journal, not the CLI-readable
  * registry. Replaying an old valid signature cannot revive a revoked source. */
 export async function validateProjectAttachmentReport(
@@ -43,8 +75,9 @@ export async function validateProjectAttachmentReport(
     const s = ds.session;
     return JSON.stringify([s.sessionId, s.larkAppId, s.chatId, s.rootMessageId, s.status,
       s.ownerOpenId, s.ownerUnionId, s.projectRouteRevision, s.cliSessionId, s.pendingForkSession,
+      !!s.suspendedColdResume, s.sessionLifecycle ?? 'active',
       !!s.workflowNode, !!s.vcMeetingReceiver, !!s.messageListenerRun, !!s.deferredScheduleRun,
-      !!s.adoptedFrom, ds.cliReady]);
+      !!s.adoptedFrom, ds.workerGeneration ?? null, isSourceSessionRuntimeLive(ds)]);
   };
   const identityBefore = localSourceIdentity();
   const entry = registry[root] as Record<string, unknown> | undefined;
@@ -83,7 +116,7 @@ export async function validateProjectAttachmentReport(
   const finalRecord = readProjectAttachmentRecord(config.session.dataDir, root);
   const finalMode = readGroupCollaborationMode(config.session.dataDir, record.chatId);
   const finalProject = readProjectGroup(config.session.dataDir, record.chatId);
-  if (!finalSource || JSON.stringify(finalSource) !== JSON.stringify(source)
+  if (!finalSource || authoritativeSourceIdentity(finalSource) !== authoritativeSourceIdentity(source)
     || JSON.stringify(finalRecord) !== JSON.stringify(record)
     || finalMode?.mode !== 'project' || finalMode.coordinatorAppId !== record.coordinatorLarkAppId
     || !finalMode.workerAppIds?.includes(appId)
@@ -100,7 +133,7 @@ export async function validateProjectAttachmentReport(
     || finalCoordinator.larkAppId !== record.coordinatorLarkAppId
     || finalCoordinator.chatId !== record.chatId || finalCoordinator.scope !== 'chat'
     || finalCoordinator.ownerKey !== record.coordinatorOwnerKey
-    || !currentSource || !currentSource.cliReady || currentSource.session.status !== 'active'
+    || !isSourceSessionRuntimeLive(currentSource)
     || currentSource.session.chatId !== record.chatId || currentSource.session.rootMessageId !== root
     || (currentSource.session.projectRouteRevision ?? 1) !== record.source.routeRevision
     || currentMode?.mode !== 'project' || currentMode.coordinatorAppId !== record.coordinatorLarkAppId
@@ -161,7 +194,17 @@ export async function localProjectAttachmentSource(appId: string, sessionId: str
     reportCapability: latest.adoptedFrom ? 'manual'
       : latest.pendingForkSession || !latest.cliSessionId || !latestLive ? 'unavailable' : 'verified',
     title: safeTextPreview(latest.title, 80)?.text,
+    botName: resolveSourceBotDisplayName(appId),
   };
+}
+
+function resolveSourceBotDisplayName(appId: string): string {
+  try {
+    const local = getBot(appId)?.botName?.trim();
+    if (local) return local;
+  } catch { /* bot not registered in this daemon */ }
+  const peer = findOnlineDaemon(appId)?.botName?.trim();
+  return peer || appId;
 }
 
 export async function getProjectAttachmentSource(appId: string, sessionId: string): Promise<ProjectAttachmentSource | undefined> {

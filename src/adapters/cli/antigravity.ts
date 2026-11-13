@@ -341,10 +341,24 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'agy';
   let cachedBin: string | undefined;
   let sessionLog: AntigravitySessionLog | undefined;
+  let awaitNativeStreamLog = false;
   let bracketedPasteSupported = false;
-  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
-    sessionLog?.read().currentId
-      ?? findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd }) ?? undefined;
+  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
+    const fromLog = sessionLog?.read().currentId;
+    if (fromLog) return fromLog;
+    // On a fresh launch (`!resume && !reattach`), agy creates no conversation
+    // until the first prompt is submitted, while startup `ListConversations`
+    // opens historical/sibling conversation `.db` files in parallel. Once agy
+    // is actively writing `--log-file`, wait for its authoritative
+    // `Streaming conversation <uuid>` line instead of probing transient startup fds.
+    if (awaitNativeStreamLog && sessionLog?.hasLogFile()) return undefined;
+    // Managed sessions (`buildArgs` wired `--log-file`) must never fall back to
+    // workspace summaries when `cliPid` is unset — that hijacks a concurrent or
+    // historical conversation sharing the same working directory.
+    const cwd = sessionLog ? undefined : pty.cliCwd;
+    if (!pty.cliPid && !cwd) return undefined;
+    return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+  };
   return {
     id: 'antigravity',
     bridgeSpec: antigravityBridgeSpec,
@@ -364,6 +378,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
+      awaitNativeStreamLog = !resume && !reattach;
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       sessionLog = new AntigravitySessionLog(sessionId);
       args.push('--log-file', sessionLog.path);

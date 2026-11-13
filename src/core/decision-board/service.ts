@@ -38,6 +38,18 @@ import {
 import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
 import { ChatTaskReader, type ChatTaskReaderDeps } from './chat-task-reader.js';
 import {
+  OWNER_BOARD_DECIDABLE_STATES,
+  OWNER_BOARD_EVENT_LIMIT,
+  OWNER_BOARD_REQUEST_ID_RE,
+  ownerBoardAskKey,
+  ownerBoardView,
+  type OwnerBoardDecideInput,
+  type OwnerBoardDecideResult,
+  type OwnerBoardItem,
+  type OwnerBoardItemDetail,
+  type OwnerBoardSteward,
+} from './owner-api.js';
+import {
   formatTaskNotice,
   formatTaskPrompt,
   itemChatIds,
@@ -87,6 +99,7 @@ import {
   type BoardItem,
   type BoardLink,
   type BoardOption,
+  type BoardState,
   type BoardUnlink,
   type BoardView,
   type StewardConfig,
@@ -1047,6 +1060,145 @@ export class DecisionBoardService {
     }
   }
 
+  // ─── 本机外部客户端（botmux owner-board，host HMAC）──────────────────────────
+
+  private ownerSteward(): OwnerBoardSteward {
+    const steward = this.deps.steward();
+    return { enabled: steward?.enabled === true, ready: stewardReady(steward), ...(steward?.chatId ? { chatId: steward.chatId } : {}) };
+  }
+
+  private ownerItem(item: BoardItem, links: BoardLink[], pendingDecisions: number): OwnerBoardItem {
+    const store = this.store();
+    const rendered = this.renderLinks(links, item.primaryChat);
+    const primary = effectivePrimaryChat(links, item.primaryChat);
+    const latest = store.latestDecision(this.appId, item.seq);
+    const latestBatch = latest ? store.getBatch(this.appId, latest.batchId) : undefined;
+    return {
+      seq: item.seq,
+      ...(item.key ? { key: item.key } : {}),
+      title: item.title,
+      state: item.state,
+      stateLabel: BOARD_STATE_LABELS[this.deps.locale()][item.state],
+      ...(item.stage ? { stage: item.stage } : {}),
+      ...(item.kind ? { kind: item.kind } : {}),
+      ...(item.repo ? { repo: item.repo } : {}),
+      ...(item.summary ? { summary: item.summary } : {}),
+      ...(item.question ? { question: item.question } : {}),
+      options: item.options.map(o => ({ key: o.key, label: o.label, ...(o.effect ? { effect: o.effect } : {}) })),
+      ...(item.recommend ? { recommend: item.recommend } : {}),
+      ...(item.recommendReason ? { recommendReason: item.recommendReason } : {}),
+      askKey: ownerBoardAskKey(item),
+      rev: item.rev,
+      ...(primary ? { primaryChatId: primary.ref } : {}),
+      links: rendered.map(l => ({ kind: l.kind, ref: l.ref, text: l.text, ...(l.url ? { url: l.url } : {}), ...(l.primary ? { primary: true as const } : {}) })),
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      stateAt: item.stateAt,
+      ...this.itemLinks(item.seq),
+      pendingDecisions,
+      ...(latest && latestBatch && latestBatch.createdAt >= item.stateAt ? {
+        lastDecision: {
+          batchId: latest.batchId,
+          ...(latest.choice ? { choice: latest.choice } : {}),
+          text: latest.text,
+          submittedAt: latestBatch.createdAt,
+          delivery: latestBatch.delivery,
+          handled: latest.handledAt !== undefined,
+        },
+      } : {}),
+    };
+  }
+
+  /** 列出事项（按状态筛）；只认开着管家的 bot，没开时不建库。 */
+  ownerList(states: readonly BoardState[], query?: string) {
+    this.requireSteward();
+    const store = this.store();
+    const wanted = new Set(states);
+    const items = store.listItems(this.appId, ownerBoardView(states), query ? { query } : {})
+      .filter(i => wanted.has(i.state))
+      .map(i => this.ownerItem(i, i.links, i.pendingDecisions));
+    return { larkAppId: this.appId, steward: this.ownerSteward(), counts: store.counts(this.appId), states: [...states], items };
+  }
+
+  ownerDetail(seq: number): { larkAppId: string; steward: OwnerBoardSteward; item: OwnerBoardItemDetail } {
+    this.requireSteward();
+    const store = this.store();
+    const detail = store.detail(this.appId, seq);
+    if (!detail) throw new BoardError('item_not_found', `没有 #${seq}`);
+    const item = this.withoutStaleReason(detail.item, detail.links);
+    return {
+      larkAppId: this.appId,
+      steward: this.ownerSteward(),
+      item: {
+        ...this.ownerItem(item, detail.links, detail.pendingDecisions.length),
+        ...(item.progress ? { progress: item.progress } : {}),
+        ...(item.noChatReason ? { noChatReason: item.noChatReason } : {}),
+        events: detail.events.slice(0, OWNER_BOARD_EVENT_LIMIT).map(e => ({
+          at: e.at, actor: e.actor, kind: e.kind, text: e.text, ...(e.batchId !== undefined ? { batchId: e.batchId } : {}),
+        })),
+      },
+    };
+  }
+
+  /**
+   * 提交一项决定：一项一批、不经草稿，之后与网页提交、卡片点击同一条 deliverBatch 投递。
+   * requestId 是幂等键：同一个 requestId 重试返回同一个批次，那一批没送达时顺带重投（同一个回合 id）。
+   */
+  async ownerDecide(input: OwnerBoardDecideInput): Promise<OwnerBoardDecideResult> {
+    if (!stewardReady(this.deps.steward())) throw new BoardError('not_steward', '本 Bot 未开启管家或没选管家群（Dashboard → Bot 配置 → 管家）');
+    if (typeof input.requestId !== 'string' || !OWNER_BOARD_REQUEST_ID_RE.test(input.requestId)) {
+      throw new BoardError('invalid_request_id', 'requestId 要 8～64 个字母、数字、_ 或 -');
+    }
+    if (typeof input.askKey !== 'string' || !input.askKey) throw new BoardError('ask_key_required', '要带上列表里这一项的 askKey');
+    if (input.choice !== undefined && typeof input.choice !== 'string') throw new BoardError('invalid_choice', 'choice 要是选项键');
+    if (input.text !== undefined && typeof input.text !== 'string') throw new BoardError('invalid_text', 'text 要是字符串');
+    const askKey = input.askKey;
+    const choice = input.choice?.trim() || undefined;
+    const text = (input.text ?? '').replace(/\r\n/g, '\n');
+    const store = this.store();
+    const res = store.submitLocal(this.appId, {
+      seq: input.seq,
+      ...(choice ? { choice } : {}),
+      text,
+      submitter: 'local',
+      nonce: `local:${input.requestId}`,
+      verify: current => {
+        if (!OWNER_BOARD_DECIDABLE_STATES.includes(current.state)) throw new BoardError('item_not_awaiting', `#${current.seq} 已经不在待拍板 / 待验收了`);
+        if (ownerBoardAskKey(current) !== askKey) throw new BoardError('ask_changed', `#${current.seq} 的问题、选项或状态刚改过，刷新后再提交`);
+      },
+    });
+    const decision = res.decision;
+    if (res.duplicate && (decision.seq !== input.seq || (decision.choice ?? undefined) !== choice || decision.text !== text)) {
+      throw new BoardError('request_id_reused', '这个 requestId 已经用来提交过别的决定了');
+    }
+    if (!res.duplicate) this.syncCard(input.seq);
+    // 已执行或已被后来的决定作废的不再投（投过去只会是一条「不用执行」）。
+    const settled = decision.handledAt !== undefined || decision.supersededBy !== undefined;
+    let batch = res.batch;
+    if (!settled && batch.delivery !== 'delivered') {
+      if (batch.delivery === 'dispatched' && this.delivering.has(batch.id)) {
+        // 本进程正在投这一批：不判死、不重投，等它自己收敛。
+      } else {
+        // 上一轮进程死在投递途中的 dispatched 先按现有规则收敛成 failed，再用同一个回合 id 投。
+        if (batch.delivery === 'dispatched') this.settleInterruptedBatch(store, batch);
+        batch = await this.deliverBatch(batch.id);
+      }
+    }
+    const after = store.batchDecisions(this.appId, batch.id).find(d => d.seq === input.seq) ?? decision;
+    return {
+      duplicate: res.duplicate,
+      decision: {
+        seq: after.seq,
+        ...(after.choice ? { choice: after.choice } : {}),
+        text: after.text,
+        handled: after.handledAt !== undefined,
+        ...(after.supersededBy !== undefined ? { supersededBy: after.supersededBy } : {}),
+      },
+      batch: { id: batch.id, delivery: batch.delivery, ...(batch.error ? { error: batch.error } : {}) },
+      supersedes: res.supersedes,
+    };
+  }
+
   // ─── 飞书拍板卡片 ─────────────────────────────────────────────────────────
 
   /**
@@ -1300,7 +1452,9 @@ export class DecisionBoardService {
     const dir = this.deps.batchAttachmentsDir(batchId);
     const entries = decisions.map(d => {
       const item = store.getItem(app, d.seq);
-      const option = item?.options.find(o => o.key === d.choice);
+      // 排队期间管家改了问题或选项：同一个选项键可能换了意思，不附现在的原文、不标推荐。
+      const optionsChanged = !!item && !!d.choice && !!d.askKey && d.askKey !== decisionAskKey(item);
+      const option = optionsChanged ? undefined : item?.options.find(o => o.key === d.choice);
       const chat = item ? this.chatState(item, store.links(app, d.seq)).mainChat : undefined;
       for (const fid of d.fileIds) {
         const found = store.getFile(app, fid);
@@ -1322,8 +1476,9 @@ export class DecisionBoardService {
         ...(item?.stage ? { stage: item.stage } : {}),
         ...(d.choice ? { choice: d.choice } : {}),
         ...(option ? { choiceLabel: option.label } : {}),
-        recommended: !!d.choice && item?.recommend === d.choice,
-        ...(batch.source === 'card' ? { source: 'card' as const } : {}),
+        recommended: !optionsChanged && !!d.choice && item?.recommend === d.choice,
+        ...(optionsChanged ? { optionsChanged: true } : {}),
+        ...(batch.source ? { source: batch.source } : {}),
         ...(() => {
           const detail = store.supersededDetail(app, batchId, d.seq);
           const settled = detail.filter(x => x.settled).map(x => x.batchId);
@@ -1399,7 +1554,8 @@ export function boardErrorStatus(error: unknown): { status: number; error: strin
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
           : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'
-            || error.code === 'item_ended' ? 409
+            || error.code === 'item_ended' || error.code === 'item_not_awaiting' || error.code === 'ask_changed'
+            || error.code === 'request_id_reused' ? 409
             : 400;
     return { status, error: error.code, message: error.message };
   }

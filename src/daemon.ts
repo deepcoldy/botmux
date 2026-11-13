@@ -10,6 +10,8 @@ import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
+import { buildSessionChatContext, handleSessionChatTool, SESSION_CHAT_TOOLS_ROUTE } from './core/session-chat-tools.js';
+import { sessionChatAuthority } from './core/session-chat-authority.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './core/decision-board/chat-task-reader.js';
@@ -169,6 +171,7 @@ import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.j
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
+import { resolveImportedTopicHandoff } from './services/imported-topic-handoff.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -541,7 +544,7 @@ import {
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
 import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftProjects, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, setProjectCardRuntimeObserver, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftProjects, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -584,7 +587,9 @@ import { recordDispatchRegistryEntry, updateDispatchRegistry } from './core/disp
 import { recordDispatchLastReport } from './core/dispatch-task-tree.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
-import { projectCoordinator } from './services/project-coordinator-runtime.js';
+import { projectCoordinator, resolveProjectGroupCardRuntime } from './services/project-coordinator-runtime.js';
+import { createProjectCardRuntimeSync } from './services/project-card-runtime-sync.js';
+import { listProjectGroups } from './services/project-group-store.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
@@ -9956,6 +9961,51 @@ ipcRoute('POST', SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE, async (req, res) => {
     audit: line => logger.info(`[sandbox-send-route] ${line}`),
   });
   return jsonRes(res, result.status, result.body);
+});
+
+ipcRoute('POST', SESSION_CHAT_TOOLS_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let body: any;
+  try { body = await readJsonBody(req, 16 * 1024); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const ds = typeof body?.sessionId === 'string' ? findActiveBySessionId(body.sessionId) : undefined;
+  const turnId = ds?.managedTurnOrigin?.turnId;
+  const caller = ds && turnId ? scheduleCallerForTurn(ds, turnId) : undefined;
+  const ctx = buildSessionChatContext(ds ? {
+    sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, turnId, caller,
+    liveTurnId: () => findActiveBySessionId(ds.session.sessionId) === ds ? ds.managedTurnOrigin?.turnId : undefined,
+    availability: () => ({
+      vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+      silentListener: isSilentMessageListenerSession(ds.session),
+      larkTransport: larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly }),
+    }),
+  } : undefined, selfDaemonLarkAppId);
+  const appId = ctx?.larkAppId;
+  const authority = ds && appId
+    ? sessionChatAuthority(appId, { chatId: ds.chatId, chatType: ds.chatType }, caller?.requestUserUnionId)
+    : undefined;
+  const { listChatUserMembers, resolveAllowedUsersWithMap } = await import('./im/lark/client.js');
+  const { createChat } = await import('./services/groups-store.js');
+  try {
+    const result = await handleSessionChatTool(body, ctx, {
+      route: {
+        lookupMessageChatId: id => lookupMessageChatId(appId!, id),
+        getChatInfo: id => getChatRoutingFacts(appId!, id),
+        isBotInChat: id => isCurrentBotInChat(appId!, id),
+        listMemberOpenIds: id => listChatMemberOpenIds(appId!, id),
+        canTalk: (id, openId) => authority!.canTalk(id, openId),
+      },
+      canCreateChat: openId => authority!.canCreateChat(openId),
+      canTalkInNewChat: openId => authority!.canTalkInNewChat(openId),
+      resolveMembers: async ids => (await resolveAllowedUsersWithMap(appId!, ids)).map,
+      listMembers: id => listChatUserMembers(appId!, id),
+      create: input => createChat(appId!, { ...input, botIds: [] }),
+      audit: line => logger.info(`[session-chat] ${line}`),
+    });
+    return jsonRes(res, result.status, result.body);
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
@@ -34974,6 +35024,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
+      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => resolveImportedTopicHandoff({
+        rootId,
+        chatId,
+        larkAppId: appId,
+        // One cross-bot lookup (this bot's own sessions are excluded inside).
+        sessionsAtRoot: sessionStore.findActiveSessionsByRoot(rootId),
+        chatScopeSessions: () => sessionStore.findActiveChatScopeSessionsByChat(chatId),
+        // One bot per daemon: a peer is not registered here, read bots.json.
+        peerConfig: peerAppId => {
+          try { return getBot(peerAppId).config; } catch { /* not this daemon's bot */ }
+          return loadBotConfigsCached().find(b => b.larkAppId === peerAppId);
+        },
+        groupMode: () => readGroupCollaborationMode(config.session.dataDir, chatId),
+      }),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,
@@ -36231,18 +36295,50 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
     },
   });
+  const projectCardRuntimeSync = createProjectCardRuntimeSync({
+    larkAppId: cfg.larkAppId,
+    listProjects: () => listProjectGroups(config.session.dataDir),
+    readMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
+    resolveRuntime: project => resolveProjectGroupCardRuntime(project, config.session.dataDir),
+    refresh: project => projectCoordinator.run({
+      dataDir: config.session.dataDir,
+      chatId: project.chatId,
+      larkAppId: cfg.larkAppId,
+      coordinatorSessionId: project.coordinatorSessionId,
+    }, { action: 'refresh' }),
+    forwardToCoordinator: (coordinatorAppId, chatId) => {
+      const peer = findOnlineDaemon(coordinatorAppId, config.session.dataDir);
+      if (!peer) return;
+      void fetchDaemonIpc(peer.ipcPort, '/api/project-card/task-event', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId }),
+        signal: AbortSignal.timeout(3_000),
+      }).then(r => r.body?.cancel()).catch(() => undefined);
+    },
+    onDeferred: (chatId, err: any) => logger.debug(`[project] card runtime refresh for ${chatId} deferred: ${err?.message ?? err}`),
+  });
+  setProjectCardRuntimeObserver(chatId => projectCardRuntimeSync.schedule(chatId, 1_000));
+  setTimeout(() => projectCardRuntimeSync.schedule(undefined, 0), 6_000).unref?.();
+  setTimeout(() => projectCardRuntimeSync.schedule(undefined, 0), 15_000).unref?.();
   const projectImportTick = setInterval(() => {
     void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+    projectCardRuntimeSync.schedule(undefined, 0);
   }, 30_000);
   projectImportTick.unref?.();
   setProjectAssociationConsumer(event => {
     void getProjectAttachmentSource(event.larkAppId, event.sessionId)
-      .then(source => source && projectWorkstreamAttachments.observe(source))
+      .then(async source => {
+        if (!source) return;
+        await projectWorkstreamAttachments.observe(source);
+        projectCardRuntimeSync.notify(source.chatId);
+      })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
   });
   // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
   // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
   onSessionTaskEvent(({ chatId }) => {
+    projectCardRuntimeSync.notify(chatId);
     let bots: readonly BotConfig[];
     try { bots = loadBotConfigsCached(); } catch { return; }
     for (const bot of bots) {

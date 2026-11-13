@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.214.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: [tui.keymap] in ~/.trae/traecli.toml lets you rebind supported shortcuts.
+
+
+▍ ask me
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Question 1/1 (1 unanswered)
+  Which database should the new service use?
+
+    1. PostgreSQL (Recommended)  Mature, strong consistency
+    2. MySQL                     Widely deployed
+  ❯ 3. SQLite                    Embedded, zero ops
+    4. None of the above         Optionally, add details in notes (tab).
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ❯ 用第二个方案吧，另外帮我看下日志
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  tab or esc clear notes  |  enter submit answer
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

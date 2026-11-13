@@ -1,0 +1,24 @@
+
+────────────────────────────────────────────────────────────────────────────────
+
+  Question 1/2 (2 unanswered)
+  The legacy billing tables still hold about 40 million rows and the new
+  schema splits invoices from payments; how should we migrate the existing
+  data before the cutover next week?
+
+  ❯ 1. Online dual-write backfill (Recommended)  Write to both schemas,
+                                                 backfill history in batches,
+                                                 then switch reads once
+                                                 checksums match
+    2. Offline dump and restore                  Stop writes for a maintenance
+                                                 window, dump, transform and
+                                                 restore in one go
+    3. Lazy migrate on read                      Convert rows the first time
+                                                 they are touched and leave
+                                                 cold data in the old tables
+    4. None of the above                         Optionally, add details in
+                                                 notes (tab).
+  ────────────────────────────────────────────────────────────────────────────
+  ────────────────────────────────────────────────────────────────────────────
+  tab or esc clear notes  |  enter submit answer
+

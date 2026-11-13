@@ -192,7 +192,24 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       session.runtimeEpoch = event.epoch; return finish('applied');
     case 'runtime_bound': {
       if (!sameWorker(session.worker, event.runtime.worker)) return finish('stale');
-      if (session.lifecycle === 'closed' || session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      if (session.lifecycle === 'closed') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      const current = state.runtime;
+      const identity = current?.identity;
+      const nextIdentity = event.runtime.identity;
+      // A late native identity describes the selected executor; it does not
+      // repeat the control operation that originally started that executor.
+      if (current && ['active', 'suspending', 'closing'].includes(session.lifecycle)
+        && ['starting', 'ready'].includes(current.phase) && sameRuntime(session.activeRuntime, current.ref)
+        && sameRuntime(current.ref, event.runtime.ref) && sameWorker(current.worker, event.runtime.worker)
+        && identity && nextIdentity && identity.proof !== 'opaque'
+        && !reusableRuntimeIdentity(identity, nextIdentity)
+        && samePhysicalRuntimeIdentity(identity, nextIdentity)
+        && (identity.nativeSessionId === undefined || identity.nativeSessionId === nextIdentity.nativeSessionId)
+        && (identity.nativeGeneration === undefined || identity.nativeGeneration === nextIdentity.nativeGeneration)) {
+        state.runtime = { ...current, identity: nextIdentity };
+        return finish('applied');
+      }
+      if (session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (event.operationId && session.activeOperationId !== event.operationId) { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (!event.operationId && session.activeOperationId) return finish('conflict', 'runtime_transition_in_progress');
       session.runtimeEpoch = Math.max(session.runtimeEpoch, event.runtime.ref.epoch);

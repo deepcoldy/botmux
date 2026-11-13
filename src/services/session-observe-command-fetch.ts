@@ -18,14 +18,14 @@ export type ObserveCommandFetchOptions = ObserveFetchQuery & ObserveFetchDepende
 export function fetchObserveSnapshot(
   options: ObserveCommandFetchOptions = {},
 ): Promise<ObserveSnapshot> {
-  const { larkAppId, includeRaw, ...dependencies } = options;
-  return fetchObserveSnapshotImplementation({ larkAppId, includeRaw }, dependencies);
+  const { larkAppId, includeRaw, includeTask, activeWithinMs, ...dependencies } = options;
+  return fetchObserveSnapshotImplementation({ larkAppId, includeRaw, includeTask, activeWithinMs }, dependencies);
 }
 
 export function fetchObserveSession(
   sessionId: string,
   options: ObserveCommandFetchOptions = {},
 ): Promise<ObserveSession> {
-  const { larkAppId, includeRaw, ...dependencies } = options;
-  return fetchObserveSessionImplementation(sessionId, { larkAppId, includeRaw }, dependencies);
+  const { larkAppId, includeRaw, includeTask, activeWithinMs: _listOnly, ...dependencies } = options;
+  return fetchObserveSessionImplementation(sessionId, { larkAppId, includeRaw, includeTask }, dependencies);
 }
