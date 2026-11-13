@@ -329,6 +329,23 @@ export class OncallGroupStore {
     });
   }
 
+  /** Adopt a proven platform-created group in one durable write, without a new ticket. */
+  adoptNativeGroup(source: OncallGroupSource, operatorOpenId: string, result: { flowId: string; openChatId: string },
+    snapshot: { messageIds: string[]; cutoffMs: number; forwardMode: OncallForwardMode }): boolean {
+    const file = this.requestPath(source);
+    mkdirSync(join(this.dataDir, 'oncall-groups', source.sessionId ? 'session-requests' : 'requests'), { recursive: true, mode: 0o700 });
+    return withFileLockSync(file, () => {
+      const previous = read<OncallGroupRequest>(file) ?? this.legacyRequest(source);
+      if (previous && previous.status !== 'failed') return previous.status === 'succeeded'
+        && previous.flowId === result.flowId && previous.openChatId === result.openChatId;
+      this.write(file, { status: 'succeeded', questionId: source.questionId, sourceMessageId: source.messageId,
+        attemptId: randomUUID(), operatorOpenId, submittedAtMs: snapshot.cutoffMs,
+        messageIdsSnapshot: snapshot.forwardMode === 'none' ? [] : snapshot.messageIds, forwardMode: snapshot.forwardMode,
+        ...result, cardRefreshPending: true });
+      return true;
+    });
+  }
+
   finish(source: OncallGroupSource, result: OncallGroupRequest, attemptId?: string): void {
     const file = this.requestStatePath(source);
     mkdirSync(join(this.dataDir, 'oncall-groups', source.sessionId ? 'session-requests' : 'requests'), { recursive: true, mode: 0o700 });
