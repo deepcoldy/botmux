@@ -1068,7 +1068,17 @@ describe('repo select card — plain switch', () => {
     try {
       const ds = makeDs();
       const predecessor = { sessionId: ds.session.sessionId, contractRevision: 7 };
-      ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision } } as never;
+      // Closing the contract is what produces the revision the replacement
+      // may take over; the open contract is still behind it.
+      ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision - 1 } } as never;
+      const close = vi.mocked(closeWorkerPoolSession).getMockImplementation()!;
+      vi.mocked(closeWorkerPoolSession).mockImplementationOnce(async (...args) => {
+        // The close's final checkpoint mirrors onto whichever record is
+        // current, which may be a same-id object swapped in while it ran.
+        ds.session = { ...ds.session,
+          sessionRuntimeContract: { session: { revision: predecessor.contractRevision } } as never };
+        return close(...args);
+      });
       const { deps } = makeDeps(ds);
       let persisted: typeof ds.session.durablePrimaryPredecessor;
       const observedAtFork: Array<typeof persisted> = [];

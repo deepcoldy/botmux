@@ -6257,7 +6257,17 @@ describe('handleCommand', () => {
       try {
         const ds = makeDaemonSession({ pendingRepo: false });
         const predecessor = { sessionId: ds.session.sessionId, contractRevision: 7 };
-        ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision } } as never;
+        // Closing the contract is what produces the revision the replacement
+        // may take over; the open contract is still behind it.
+        ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision - 1 } } as never;
+        const close = vi.mocked(closeWorkerPoolSession).getMockImplementation()!;
+        vi.mocked(closeWorkerPoolSession).mockImplementationOnce(async (...args) => {
+          // The close's final checkpoint mirrors onto whichever record is
+          // current, which may be a same-id object swapped in while it ran.
+          ds.session = { ...ds.session,
+            sessionRuntimeContract: { session: { revision: predecessor.contractRevision } } as never };
+          return close(...args);
+        });
         const deps = makeDeps(ds);
         deps.lastRepoScan.set(CHAT_ID, [
           { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },

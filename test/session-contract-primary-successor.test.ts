@@ -104,6 +104,7 @@ async function closedPredecessor(scope: Scope) {
     larkAppId: app, scope, chatId: CHAT_ID, session: makeSession('session-a', scope), initConfig: {},
   } as unknown as DaemonSession;
   await admitDurableLarkSession({ facade, message: message('om_first'), session: ds.session });
+  await admitDurableLarkSession({ facade, message: message('om_latest'), session: ds.session });
   const predecessor = controllerFor(ds);
   predecessor.bindWorker(1);
   await predecessor.flushPrimary();
@@ -129,6 +130,7 @@ async function closedPredecessor(scope: Scope) {
   const before = await lane(ds.session);
   expect(before.session).toMatchObject({ sessionId: 'session-a', status: 'closed' });
   expect(before.controls).toHaveLength(1);
+  expect(before.admissions.map(entry => entry.messageId)).toEqual(['om_first', 'om_latest']);
   return { ds, predecessor, before };
 }
 
@@ -182,9 +184,9 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
     expect(claimed.session).toMatchObject({ sessionId: 'session-b', status: 'active' });
     expect(claimed.session.sessionRuntimeContract!.session.ref).toEqual(replacement.ref);
     // The predecessor's session-bound control history does not follow it; its
-    // latest admission only anchors the envelope.
+    // latest admission only anchors the envelope; its earlier ones are dropped.
     expect(claimed.controls).toEqual([]);
-    expect(claimed.admissions.map(entry => entry.messageId)).toEqual(['om_first']);
+    expect(claimed.admissions.map(entry => entry.messageId)).toEqual(['om_latest']);
     expect(ds.session.sessionRuntimeContract!.session.revision)
       .toBe(claimed.session.sessionRuntimeContract!.session.revision);
 
@@ -194,7 +196,7 @@ describe('durable primary lane after a same-anchor /repo replacement', () => {
     expect(admitted.kind).toBe('committed');
     const afterAdmission = await lane(ds.session);
     expect(afterAdmission.session.sessionId).toBe('session-b');
-    expect(afterAdmission.admissions.map(entry => entry.messageId)).toEqual(['om_first', 'om_next']);
+    expect(afterAdmission.admissions.map(entry => entry.messageId)).toEqual(['om_latest', 'om_next']);
     expect(afterAdmission.session.sessionRuntimeContract!.session.revision)
       .toBe(claimed.session.sessionRuntimeContract!.session.revision);
 
