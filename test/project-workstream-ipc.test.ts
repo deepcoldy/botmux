@@ -6,6 +6,7 @@ import * as registry from '../src/bot-registry.js';
 import * as pool from '../src/core/worker-pool.js';
 import * as client from '../src/im/lark/client.js';
 import * as runtime from '../src/services/project-workstream-runtime.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as modes from '../src/services/group-collaboration-mode-store.js';
@@ -247,4 +248,99 @@ describe('project workstream IPC boundary', () => {
       }
     },
   );
+
+  it('returns 403 actor_nonhuman with actionable hint for bot-forwarded, scheduled, or unverified non-human turns', async () => {
+    for (const caller of [
+      undefined,
+      { requestLarkAppId: APP, requestUserOpenId: 'ou_owner', senderType: 'bot' },
+      { requestLarkAppId: APP, requestUserOpenId: 'ou_owner' },
+      { requestLarkAppId: APP, requestUserOpenId: 'ou_owner', senderType: 'user', source: 'schedule_creator' },
+    ]) {
+      ds.managedTurnOrigin.trustedCaller = caller;
+      ds.session.ownerOpenId = 'ou_owner';
+      const res = await post('attach', { ...source, claimOwner: true });
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: false, error: 'actor_nonhuman' });
+      expect(typeof body.hint).toBe('string');
+      expect(body.hint).toContain('确认登记');
+    }
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 source_owner_unknown when running grant inside an ownerless project thread session', async () => {
+    const dataDir = mkdtempSync(join(process.env.SESSION_DATA_DIR!, 'ownerless-grant-'));
+    roots.push(dataDir);
+    config.session.dataDir = dataDir;
+    await modes.writeGroupCollaborationMode(dataDir, {
+      chatId: CHAT, mode: 'project', coordinatorAppId: APP, workerAppIds: [APP],
+    });
+    ds.scope = 'thread';
+    ds.session.scope = 'thread';
+    ds.session.larkAppId = APP;
+    ds.session.ownerUnionId = undefined;
+    ds.session.ownerOpenId = undefined;
+    const res = await post('grant', {});
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, error: 'source_owner_unknown' });
+    expect(body.hint).toContain('--claim-owner');
+  });
+
+  it('explicitly claims an ownerless source session and attaches it in a verified human turn via claimOwner', async () => {
+    const dataDir = mkdtempSync(join(process.env.SESSION_DATA_DIR!, 'ownerless-human-claim-'));
+    roots.push(dataDir);
+    config.session.dataDir = dataDir;
+    const workerBot = registry.registerBot({
+      larkAppId: 'cli_worker', larkAppSecret: 'synthetic-worker', cliId: 'codex', allowedUsers: ['ou_worker_owner'],
+    });
+    workerBot.resolvedAllowedUsers = ['ou_worker_owner'];
+    const workerSession: any = {
+      sessionId: 'worker-ownerless',
+      larkAppId: 'cli_worker',
+      chatId: CHAT,
+      rootMessageId: 'om_task',
+      scope: 'thread',
+      chatType: 'group',
+      status: 'active',
+      projectRouteRevision: 2,
+      projectImportSource: 'relay',
+      cliSessionId: 'cli-1',
+      title: '宿主模块源码竞态复现',
+    };
+    const workerDs: any = { session: workerSession, larkAppId: 'cli_worker', chatId: CHAT, scope: 'thread', cliReady: true };
+    vi.spyOn(pool, 'findActiveBySessionId').mockImplementation(id => {
+      if (id === 'main-ipc') return ds;
+      if (id === 'worker-ownerless') return workerDs;
+      return undefined;
+    });
+    vi.spyOn(sessionStore, 'getOwnedSession').mockImplementation(id => {
+      if (id === 'main-ipc') return ds.session;
+      if (id === 'worker-ownerless') return workerSession;
+      return undefined;
+    });
+    const updateSession = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    vi.spyOn(client, 'resolveTargetAppOpenId').mockResolvedValue({ status: 'resolved', openId: 'ou_worker_owner' });
+
+    const res = await post('attach', {
+      sourceSessionId: 'worker-ownerless',
+      sourceLarkAppId: 'cli_worker',
+      rootMessageId: 'om_task',
+      claimOwner: true,
+    });
+    expect(res.status).toBe(200);
+    expect(workerSession.ownerUnionId).toBe('on_owner');
+    expect(workerSession.ownerOpenId).toBe('ou_worker_owner');
+    expect(workerDs.ownerOpenId).toBe('ou_worker_owner');
+    expect(updateSession).toHaveBeenCalledWith(workerSession);
+    expect(attach).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerKey: 'union:on_owner' }),
+      expect.objectContaining({
+        sourceSessionId: 'worker-ownerless',
+        sourceLarkAppId: 'cli_worker',
+        rootMessageId: 'om_task',
+        title: '宿主模块源码竞态复现',
+      }),
+    );
+  });
 });

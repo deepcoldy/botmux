@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   issue: vi.fn(),
   issueDeps: { marker: 'issue-deps' },
   boardCard: vi.fn(),
+  projectImportCard: vi.fn(),
   createDaemonClientFor: vi.fn((appId: string) => ({ client: appId })),
   v3: {
     gate: vi.fn(), blocked: vi.fn(), revisit: vi.fn(), loop: vi.fn(), revision: vi.fn(), runSave: vi.fn(), distill: vi.fn(),
@@ -42,6 +43,7 @@ vi.mock('../src/im/lark/overview-card.js', async (orig) => ({ ...(await orig<obj
 vi.mock('../src/im/lark/issue-command.js', async (orig) => ({ ...(await orig<object>()), handleIssueCardAction: mocks.issue }));
 vi.mock('../src/im/lark/issue-command-deps.js', async (orig) => ({ ...(await orig<object>()), buildIssueCommandDeps: () => mocks.issueDeps }));
 vi.mock('../src/core/decision-board/card-action.js', async (orig) => ({ ...(await orig<object>()), handleDecisionCardAction: mocks.boardCard }));
+vi.mock('../src/services/project-import-card-runtime.js', async (orig) => ({ ...(await orig<object>()), handleProjectImportCardAction: mocks.projectImportCard }));
 vi.mock('../src/daemon-internal-client-wrapper.js', async (orig) => ({ ...(await orig<object>()), createDaemonClientFor: mocks.createDaemonClientFor }));
 vi.mock('../src/im/lark/v3-gate-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3GateAction: mocks.v3.gate }));
 vi.mock('../src/im/lark/v3-blocked-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3BlockedAction: mocks.v3.blocked }));
@@ -66,7 +68,7 @@ const clickData = (action: string, extra: Record<string, unknown> = {}): any => 
 });
 
 beforeEach(() => {
-  for (const m of [mocks.settings, mocks.sessions, mocks.groupSessions, mocks.schedules, mocks.groups, mocks.overview, mocks.issue, mocks.boardCard,
+  for (const m of [mocks.settings, mocks.sessions, mocks.groupSessions, mocks.schedules, mocks.groups, mocks.overview, mocks.issue, mocks.boardCard, mocks.projectImportCard,
     ...Object.values(mocks.v3), mocks.createDaemonClientFor]) m.mockClear();
 });
 
@@ -74,7 +76,7 @@ describe('前缀路由表', () => {
   it('表序与前缀逐项钉死', () => {
     expect(CARD_PREFIX_ROUTES.map(r => r.prefix)).toEqual([
       'dash_settings_', 'dash_sessions_', 'group_sessions_', 'dash_schedules_', 'dash_groups_', 'issue_', 'dash_overview_',
-      'board_card_',
+      'board_card_', 'project_import_',
     ]);
   });
 
@@ -136,6 +138,14 @@ describe('前缀路由表', () => {
     expect(await handleCardAction(data, baseDeps(), 'cli_app')).toEqual({ toast: { type: 'error', content: 'board' } });
     expect(mocks.boardCard).toHaveBeenCalledWith(data, 'cli_app');
     expect(mocks.issue).not.toHaveBeenCalled();
+  });
+
+  it('project_import_ → handleProjectImportCardAction(data, larkAppId)，由迁入卡 handler 独立校验 owner 与审计', async () => {
+    mocks.projectImportCard.mockResolvedValueOnce({ toast: { type: 'success', content: 'claimed' } });
+    const data = clickData('project_import_confirm');
+    expect(await handleCardAction(data, baseDeps(), 'cli_app')).toEqual({ toast: { type: 'success', content: 'claimed' } });
+    expect(mocks.projectImportCard).toHaveBeenCalledWith(data, 'cli_app');
+    expect(mocks.boardCard).not.toHaveBeenCalled();
   });
 
   it.each(['dash_settings_open', 'dash_overview_goto', 'issue_refresh'])('%s 缺 larkAppId 时不转交（落空继续往下走）', async (action) => {

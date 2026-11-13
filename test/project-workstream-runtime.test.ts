@@ -562,6 +562,34 @@ describe('project workstream runtime report freshness', () => {
     expect(lookups).toBe(2);
   });
 
+  it('keeps a busy-turn recentSummary refresh out of the freshness proof while an authoritative change still fails closed', async () => {
+    const f = importedFixture();
+    mocks.live.get(SOURCE_ID).cliReady = false;
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      // recentSummary is built from currentTurnTitle: a busy-turn refresh changes
+      // only this display-only field between the first and final source read.
+      if (lookups === 1) mocks.live.get(SOURCE_ID).currentTurnTitle = '忙时回报：正在复测...';
+      if (lookups === 2) mocks.live.get(SOURCE_ID).cliReady = true;
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    await expect(f.validate()).resolves.toEqual({ ok: true, ownerKey: OWNER, routeRevision: 1 });
+    expect(lookups).toBe(2);
+
+    // The display-field exemption must not widen to an authoritative field:
+    // a route revision advancing mid-validation still fails closed.
+    lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      if (lookups === 2) mocks.live.get(SOURCE_ID).session.projectRouteRevision = 2;
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    await expect(f.validate()).resolves.toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(2);
+  });
+
   it('rejects a report when the worker generation is replaced and fully recovers mid-validation', async () => {
     const f = importedFixture();
     const live = mocks.live.get(SOURCE_ID);

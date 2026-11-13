@@ -10,6 +10,7 @@ import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
+import { botHasConfiguredAllowlist } from '../../core/bot-allowlist.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -2332,23 +2333,6 @@ function hasAllowedChatGroup(larkAppId: string, chatId: string | undefined): boo
   return !!chatId && !!getBot(larkAppId).config.allowedChatGroups?.includes(chatId);
 }
 
-/**
- * 是否配置了任何白名单（限制态）。判定用 **原始** config.allowedUsers, 不用
- * resolvedAllowedUsers——否则「配了 owner 但启动时邮箱/union 解析失败 → resolved 为空」
- * 会 fall through 成「无白名单 = 全开放」，把误配/解析失败 fail-open 成谁都能 operate。
- * 配了就算限制态：解析为空时成员判定一律落空 → fail-closed（由 owner 修配置）。
- */
-function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
-  return (bot.config.allowedUsers?.length ?? 0) > 0
-    || (bot.config.allowedChatGroups?.length ?? 0) > 0
-    || (bot.config.globalGrants?.length ?? 0) > 0
-    || !!bot.config.ownerOpenId
-    // p2pOpen 也是一次显式的权限边界声明：配了它 = 进入限制态。否则「只配 p2pOpen、
-    // 没配 allowedUsers」会 fall through 到 open 模式，把**群聊**和 **canOperate** 一起
-    // 放开（陌生人能 /restart /cd），与 p2pOpen「只开私聊 talk」的语义正好相反。
-    // 此时若没配 allowedUsers → 谁都不能 operate（fail-closed），bot-registry 会告警。
-    || bot.config.p2pOpen === true;
-}
 
 export function canTalk(
   larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined,
@@ -2437,9 +2421,9 @@ export function evaluateTalk(
   if (chatType === 'p2p' && bot.config.p2pOpen === true) return { allowed: true, reason: 'p2pOpen' };
 
   // globalGrants 与 allowedChatGroups 同样确立"有白名单"语义：只配 globalGrants 也算限制态，
-  // 不能 fall through 到"全开放"。用原始配置判定（见 hasConfiguredAllowlist）：配了 owner
+  // 不能 fall through 到"全开放"。用原始配置判定（见 botHasConfiguredAllowlist）：配了 owner
   // 但解析失败时也保持限制态, 不 fail-open。
-  if (!hasConfiguredAllowlist(bot)) return { allowed: true, reason: 'open' };
+  if (!botHasConfiguredAllowlist(bot)) return { allowed: true, reason: 'open' };
 
   if (hasChatGrant(larkAppId, chatId, senderOpenId)) {
     return { allowed: true, reason: 'chatGrant', quotaKey: chatQuotaKey(chatId!, senderOpenId!) };
@@ -2625,8 +2609,8 @@ export function canOperate(
   // globalGrants（与 allowedChatGroups 同理）确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 否则 canOperate 会 fall through 到"全开放"，把 talk-only 授权变成 operate 全开——正是 PR #46
   // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
-  // 用原始配置判定（hasConfiguredAllowlist）：配了 owner 但解析为空时 fail-closed, 不 fail-open。
-  if (!hasConfiguredAllowlist(bot)) return true;
+  // 用原始配置判定（botHasConfiguredAllowlist）：配了 owner 但解析为空时 fail-closed, 不 fail-open。
+  if (!botHasConfiguredAllowlist(bot)) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
 

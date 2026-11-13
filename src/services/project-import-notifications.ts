@@ -86,6 +86,12 @@ export interface ProjectImportNotificationDeps {
   /** Required to retarget a previously attempted notification safely. Without
    * a definitive not_delivered result, a successor must not get a second copy. */
   reconcileDelivery?(notification: ProjectImportNotification): Promise<'delivered' | 'not_delivered' | 'unknown'>;
+  /** Uninitialized project group with notifications on: no coordinator exists and
+   * none is created for an import. The host may post a visible waiting card in
+   * the imported topic; the notification itself stays pending until a human
+   * initializes the project. Failures are ignored (best-effort, retried with
+   * the pending record). */
+  onAwaitingProject?(notification: ProjectImportNotification): Promise<void>;
   now?(): number;
   leaseMs?: number;
   log?(message: string): void;
@@ -116,11 +122,18 @@ function validSnapshot(value: unknown): value is ProjectImportSnapshot {
     && typeof s.ordinary === 'boolean' && SOURCES.has(s.source);
 }
 
+export const UNINITIALIZED_PROJECT_GENERATION = '__uninitialized__';
+
 function projectAllows(policy: ProjectImportPolicy | undefined, source: ProjectImportSnapshot): policy is ProjectImportPolicy & { coordinatorAppId: string } {
   return !!policy && policy.mode === 'project' && policy.importedSessionPolicy === 'notify'
-    && policy.projectExists && safeId(policy.projectGeneration)
+    && (policy.projectExists ? safeId(policy.projectGeneration) : policy.projectGeneration === UNINITIALIZED_PROJECT_GENERATION)
     && prefixedId(policy.coordinatorAppId, 'cli_') && policy.coordinatorAppId !== source.larkAppId
     && (!policy.workerAppIds || policy.workerAppIds.includes(source.larkAppId));
+}
+
+function generationMatchesPolicy(recordedGeneration: string, policy: ProjectImportPolicy): boolean {
+  if (policy.projectGeneration === recordedGeneration) return true;
+  return recordedGeneration === UNINITIALIZED_PROJECT_GENERATION && policy.projectExists && safeId(policy.projectGeneration);
 }
 
 function sameAssociation(a: ProjectImportSnapshot, b: ProjectImportSnapshot): boolean {
@@ -260,7 +273,7 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
 
   async function liveFence(record: ProjectImportNotification, target?: ProjectImportCoordinator): Promise<void> {
     const policy = deps.getPolicy(record.snapshot.chatId);
-    if (!projectAllows(policy, record.snapshot) || policy.projectGeneration !== record.projectGeneration
+    if (!projectAllows(policy, record.snapshot) || !generationMatchesPolicy(record.projectGeneration, policy)
       || policy.coordinatorAppId !== record.coordinatorAppId) throw new NotificationFenceError('project_policy_changed', true);
     const current = await deps.getCurrent(record.snapshot.larkAppId, record.snapshot.sessionId);
     if (!current) throw new NotificationFenceError('source_unavailable', false);
@@ -280,7 +293,7 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
     }
     // Awaited source/coordinator lookups cannot preserve an old policy grant.
     const latestPolicy = deps.getPolicy(record.snapshot.chatId);
-    if (!projectAllows(latestPolicy, record.snapshot) || latestPolicy.projectGeneration !== record.projectGeneration
+    if (!projectAllows(latestPolicy, record.snapshot) || !generationMatchesPolicy(record.projectGeneration, latestPolicy)
       || latestPolicy.coordinatorAppId !== record.coordinatorAppId) throw new NotificationFenceError('project_policy_changed', true);
   }
 
@@ -338,7 +351,15 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
           return { record: current, result: structuredClone(current) };
         });
       }
-      if (!candidate) throw new NotificationFenceError('coordinator_unavailable', false);
+      if (!candidate) {
+        const latest = deps.getPolicy(record.snapshot.chatId);
+        if (!record.delivery && latest && !latest.projectExists
+          && latest.projectGeneration === UNINITIALIZED_PROJECT_GENERATION) {
+          await deps.onAwaitingProject?.(structuredClone(record)).catch(() => undefined);
+          throw new NotificationFenceError('project_uninitialized', false);
+        }
+        throw new NotificationFenceError('coordinator_unavailable', false);
+      }
       if (!record.delivery) {
         record = mutateRecord(id, current => {
           if (!current || current.state !== 'pending' || current.lease?.token !== token) {

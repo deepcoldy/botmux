@@ -36348,6 +36348,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         projectCardRuntimeSync.notify(source.chatId);
       })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
+    if (findActiveBySessionId(event.sessionId)?.session.projectImportPending) {
+      void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+    }
   });
   // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
   // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
