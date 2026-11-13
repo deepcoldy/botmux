@@ -81,6 +81,62 @@ function detail(seq: number, patch: Partial<BoardDetailResponse> = {}): BoardDet
   };
 }
 
+describe('close in chat UI', () => {
+  beforeEach(() => {
+    resetBoardNavMemory();
+    vi.stubGlobal('location', { hash: '#/board/cli_a/31', pathname: '/', search: '' });
+    vi.stubGlobal('history', { state: null, replaceState: () => {} });
+  });
+  const action = (name: string) => renderer!.root.find(n => n.type === 'button' && n.props['data-action'] === name);
+  function serve() {
+    let closed = false;
+    let draft: any = { seq: 31, author: 'owner', choice: 'B', text: '草稿不能投递', fileIds: [], baseRev: 5, updatedAt: 1 };
+    routes = (url, init) => {
+      if (url.endsWith('/boards')) return json({ ok: true, boards: [{ larkAppId: 'cli_a', botName: '管家', online: true, steward: { enabled: true, ready: true } }] });
+      if (url.includes('/items?')) return json({ ok: true, view: 'decide', steward: { enabled: true, ready: true }, counts: { decide: closed ? 0 : 1, active: 0, all: 1 },
+        items: closed ? [] : [{ ...boardItem(31), links: [], hasDraft: true, pendingDecisions: 0, unseen: false }], drafts: closed ? [] : [{ seq: 31, updatedAt: 1 }], batches: [] });
+      if (url.endsWith('/items/31')) return json({ ok: true, ...detail(31, { item: boardItem(31, { state: closed ? 'closed' : 'decide' }), draft,
+        events: closed ? [{ id: 1, seq: 31, at: 1, actor: 'owner', kind: 'state', text: '本人标记已在会话里决定', fileIds: [] }] : [] }) });
+      if (url.endsWith('/seen')) return json({ ok: true });
+      if (url.endsWith('/draft')) { draft = { ...draft, ...JSON.parse(String(init.body)) }; return json({ ok: true, draft }); }
+      if (url.endsWith('/close-in-chat')) { closed = true; draft = undefined; return json({ ok: true }); }
+      return json({ ok: false, error: 'unexpected' }, 404);
+    };
+  }
+  it('detail requires confirmation, cancellation does nothing, closure refreshes and disables old decision editor without submit', async () => {
+    serve();
+    await act(async () => { renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 31 })); });
+    await flush();
+    await act(async () => action('close-in-chat').props.onClick());
+    expect(calls('POST', '/close-in-chat')).toHaveLength(0);
+    await act(async () => buttonByText(zh('decisionBoard.cancel')).props.onClick());
+    expect(calls('POST', '/close-in-chat')).toHaveLength(0);
+    act(() => renderer!.root.findByType('textarea').props.onChange({ currentTarget: { value: '未保存，也不能投递' } }));
+    await act(async () => action('close-in-chat').props.onClick());
+    await act(async () => action('confirm-close-in-chat').props.onClick());
+    await flush();
+    expect(calls('POST', '/close-in-chat').map(c => c.body)).toEqual([{ baseRev: 5, confirmed: true }]);
+    expect(calls('POST', '/submit')).toEqual([]);
+    expect(calls('PUT', '/draft')).toHaveLength(1);
+    expect(text()).toContain('本人标记已在会话里决定');
+    expect(renderer!.root.findAllByType('textarea')).toEqual([]);
+    expect(renderer!.root.findAll(n => n.props['data-action'] === 'close-in-chat')).toEqual([]);
+  });
+  it('summary has a separate close button and refreshes its list after confirmation', async () => {
+    serve();
+    await act(async () => { renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { appId: 'cli_a', view: 'decide' } })); });
+    for (let i = 0; i < 4; i++) await flush();
+    const close = action('close-in-chat');
+    for (let p = close.parent; p; p = p.parent) expect(p.type).not.toBe('a');
+    await act(async () => close.props.onClick());
+    await act(async () => action('confirm-close-in-chat').props.onClick());
+    await flush();
+    expect(calls('POST', '/close-in-chat')).toHaveLength(1);
+    expect(calls('POST', '/submit')).toEqual([]);
+    expect(renderer!.root.findAll(n => n.type === 'button' && n.props['data-action'] === 'close-in-chat')).toEqual([]);
+  });
+});
+
 describe('submit dialog', () => {
   function serveDrafts(): void {
     const details: Record<string, BoardDetailResponse> = {

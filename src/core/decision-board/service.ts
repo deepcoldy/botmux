@@ -61,6 +61,7 @@ import {
   type TaskNoticeEntry,
 } from './chat-task.js';
 import {
+  DECISION_CARD_ACTION_CLOSE,
   DECISION_CARD_ACTION_NOTE,
   DECISION_CARD_ACTION_PICK,
   DecisionCards,
@@ -904,6 +905,14 @@ export class DecisionBoardService {
     this.scheduleTaskFlush();
   }
 
+  /** Owner-only UI action; never calls submit, submitCard, deliverBatch or deliver. */
+  closeInChat(seq: number, baseRev: number, actorRef: string) {
+    this.requireSteward();
+    const result = this.store().closeInChat(this.appId, seq, baseRev, actorRef);
+    this.syncCard(seq);
+    return result;
+  }
+
   markSeen(seq: number): void {
     this.store().markSeen(this.appId, seq);
   }
@@ -1232,6 +1241,14 @@ export class DecisionBoardService {
       const r = cards.render(seq, 'replaced');
       return { toast: { type: 'warning', content: T.replaced }, ...(r ? { card: r.card } : {}) };
     }
+    // Close is separate from the form. Ignore all key/note fields and never return a delivery callback.
+    if (v.action === DECISION_CARD_ACTION_CLOSE) {
+      if (item.state !== 'decide') return refreshed(T.notDeciding);
+      if (v.ask !== decisionAskKey(item) || Number(v.rev) !== item.rev) return refreshed(T.stale);
+      this.closeInChat(seq, item.rev, click.operatorUnionId && /^[A-Za-z0-9_-]{1,128}$/.test(click.operatorUnionId)
+        ? `u:${click.operatorUnionId}` : 'owner');
+      return refreshed(this.deps.locale() === 'en' ? 'Closed only; nothing sent to the session' : '已处理；未向会话投递', 'info');
+    }
     const choice = v.action === DECISION_CARD_ACTION_PICK && typeof v.key === 'string' && v.key ? v.key : undefined;
     if (v.action !== DECISION_CARD_ACTION_PICK && v.action !== DECISION_CARD_ACTION_NOTE) return { toast: { type: 'warning', content: T.unavailable } };
     if (v.action === DECISION_CARD_ACTION_PICK && !choice) return { toast: { type: 'warning', content: T.unavailable } };
@@ -1554,7 +1571,8 @@ export function boardErrorStatus(error: unknown): { status: number; error: strin
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
           : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'
-            || error.code === 'item_ended' || error.code === 'item_not_awaiting' || error.code === 'ask_changed'
+            || error.code === 'item_ended' || error.code === 'item_changed' || error.code === 'item_not_deciding'
+            || error.code === 'item_not_awaiting' || error.code === 'ask_changed'
             || error.code === 'request_id_reused' ? 409
             : 400;
     return { status, error: error.code, message: error.message };

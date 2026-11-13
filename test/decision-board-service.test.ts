@@ -66,6 +66,46 @@ async function addDecideItem(title = 'PR #1 合不合') {
   return res.item;
 }
 
+describe('close in chat', () => {
+  it('仅关闭：事务记录状态/历史、清掉本项草稿和提示，重复请求和重启不重复记账，不投递', async () => {
+    const item = await addDecideItem();
+    const other = await addDecideItem('other');
+    const draft = service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev }).draft!;
+    service.putDraft(other.seq, 'owner', { choice: 'B', baseRev: other.rev });
+    const store = service.store();
+    const nextCheckAt = Date.now() + 1000;
+    store.updateItem(APP, item.seq, { nextCheckAt });
+    store.sweepHints(APP, { now: nextCheckAt + 60_000, locale: 'zh', prState: () => undefined });
+    expect(store.getItem(APP, item.seq)?.hint).toBeDefined();
+    const res = service.closeInChat(item.seq, item.rev, 'local');
+    expect(res).toMatchObject({ duplicate: false, item: { state: 'closed', rev: item.rev + 1 } });
+    expect(res.item.stateAt).toBe(res.item.updatedAt);
+    expect(res.item.hint).toBeUndefined();
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.detail(other.seq, 'owner').draft).toBeDefined();
+    expect(service.closeInChat(item.seq, item.rev, 'local').duplicate).toBe(true);
+    expect(store.detail(APP, item.seq)?.events.filter(e => e.text === '本人标记已在会话里决定')).toHaveLength(1);
+    await expect(service.submit({ author: 'owner', nonce: 'late', items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
+      .rejects.toMatchObject({ code: 'draft_missing' });
+    expect(() => service.putDraft(item.seq, 'owner', { text: 'late save', baseRev: item.rev })).toThrow();
+    expect(store.listBatches(APP)).toEqual([]);
+    service.close();
+    expect(service.closeInChat(item.seq, item.rev, 'local').duplicate).toBe(true);
+    await service.redeliverUndelivered();
+    expect(delivered).toEqual([]);
+  });
+  it('rejects stale versions, wrong state and disabled steward without modifying anything', async () => {
+    const item = await addDecideItem();
+    expect(() => service.closeInChat(item.seq, item.rev - 1, 'local')).toThrow();
+    expect(service.detail(item.seq, 'owner').item.state).toBe('decide');
+    service.store().updateItem(APP, item.seq, { state: 'active' });
+    expect(() => service.closeInChat(item.seq, item.rev + 1, 'local')).toThrow();
+    steward = undefined;
+    expect(() => service.closeInChat(item.seq, item.rev, 'local')).toThrow();
+    expect(delivered).toEqual([]);
+  });
+});
+
 describe('管家开关', () => {
   it('没开管家时 CLI 一律拒绝，且不建库', async () => {
     steward = undefined;

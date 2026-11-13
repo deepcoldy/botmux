@@ -31,6 +31,8 @@ export const DECISION_CARD_ACTION_PREFIX = 'board_card_';
 export const DECISION_CARD_ACTION_PICK = 'board_card_pick';
 /** 只交说明，不选选项。 */
 export const DECISION_CARD_ACTION_NOTE = 'board_card_note';
+/** Close only: deliberately outside the decision form and batch submission path. */
+export const DECISION_CARD_ACTION_CLOSE = 'board_card_close_in_chat';
 /** 卡片表单里说明输入框的字段名（回调的 form_value 里取）。 */
 export const DECISION_CARD_NOTE_FIELD = 'board_note';
 
@@ -205,6 +207,26 @@ function linkButton(links: DecisionCardInput['links'], locale: Locale): Record<s
   };
 }
 
+function closeButton(input: DecisionCardInput): Record<string, unknown> {
+  const en = input.locale === 'en';
+  const { item } = input;
+  const ask = decisionAskKey(item);
+  return {
+    tag: 'button', type: 'default', width: 'fill',
+    text: { tag: 'plain_text', content: en ? 'Already decided in chat' : '已在会话里定了' },
+    confirm: {
+      title: { tag: 'plain_text', content: en ? 'Close this item only?' : '只关闭这一项？' },
+      text: { tag: 'plain_text', content: en
+        ? 'Marks this item as handled and clears its drafts. No option or note is sent to the session; earlier submissions are not recalled.'
+        : '只标记已处理并清空这一项的草稿，不向会话发送任何选项或说明；此前的提交不会撤回。' },
+    },
+    behaviors: [{ type: 'callback', value: {
+      action: DECISION_CARD_ACTION_CLOSE, app: input.appId, seq: String(item.seq), ask, rev: String(item.rev),
+      card_nonce: `close:${item.seq}:${item.rev}:${ask}`,
+    } }],
+  };
+}
+
 function shell(title: string, template: string, elements: unknown[]): Record<string, unknown> {
   return {
     schema: '2.0',
@@ -226,6 +248,7 @@ function linkOnlyCard(input: DecisionCardInput, template: string, notice: string
   body.push(notice);
   if (!input.links.url) body.push(L.noLink(item.seq));
   const elements: unknown[] = [{ tag: 'markdown', content: body.join('\n') }];
+  if (!input.retired && item.state === 'decide') elements.push(closeButton(input));
   const btn = linkButton(input.links, input.locale);
   if (btn) elements.push(btn);
   const suffix = input.locale === 'en' ? ` (${label})` : `（${label}）`;
@@ -283,6 +306,7 @@ function openCard(input: DecisionCardInput): Record<string, unknown> {
     },
   ];
   elements.push({ tag: 'form', name: `board_form_${item.seq}`, elements: formElements });
+  if (!input.retired && item.state === 'decide') elements.push(closeButton(input));
   const btn = linkButton(input.links, input.locale);
   if (btn) elements.push(btn);
   else elements.push({ tag: 'markdown', content: L.noLink(item.seq) });

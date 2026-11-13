@@ -24,6 +24,7 @@ import { toast } from './toast.js';
 import { botDefaultsHref } from './bot-defaults.js';
 import {
   BoardRequestError,
+  closeBoardItemInChat,
   boardFileUrl,
   fetchBoardItem,
   fetchBoardItems,
@@ -599,7 +600,53 @@ function BatchList(props: { appId: string; batches: BoardBatch[]; now: number; o
 
 // ─── 汇总页 ─────────────────────────────────────────────────────────────────
 
-function BoardRow(props: { appId: string; item: BoardListResponse['items'][number]; now: number }) {
+function CloseInChatButton(props: {
+  appId: string; item: Pick<BoardItem, 'seq' | 'rev' | 'state'>; disabled?: boolean;
+  beforeClose?(): Promise<unknown>; onChanged(): void;
+}) {
+  const tr = useT();
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [error, setError] = useState('');
+  if (props.item.state !== 'decide' && props.item.state !== 'accept') return null;
+  async function closeOnly(): Promise<void> {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      // Settle autosave before clearing this item's draft; never submit it.
+      await props.beforeClose?.();
+      await closeBoardItemInChat(props.appId, props.item.seq, props.item.rev);
+      setOpen(false);
+      props.onChanged();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+  return <>
+    <button type="button" className="dboard-text-btn" disabled={props.disabled || busy}
+      data-action="close-in-chat" onClick={() => setOpen(true)}>{tr('decisionBoard.closeInChat')}</button>
+    <ModalDialog open={open} className="confirm-modal-dialog" aria-label={tr('decisionBoard.closeInChatTitle')}
+      backdropClose={!busy} onRequestClose={() => { if (!busy) setOpen(false); }}>
+      <div className="confirm-modal-card">
+        <h3 className="confirm-modal-title">{tr('decisionBoard.closeInChatTitle')}</h3>
+        <p>{tr('decisionBoard.closeInChatBody')}</p>
+        {error ? <p role="alert">{error}</p> : null}
+        <div className="confirm-modal-footer">
+          <button type="button" disabled={busy} onClick={() => setOpen(false)}>{tr('decisionBoard.cancel')}</button>
+          <button type="button" disabled={busy} data-action="confirm-close-in-chat" onClick={() => void closeOnly()}>{tr('decisionBoard.closeInChatConfirm')}</button>
+        </div>
+      </div>
+    </ModalDialog>
+  </>;
+}
+
+function BoardRow(props: { appId: string; item: BoardListResponse['items'][number]; now: number; onChanged(): void }) {
   const tr = useT();
   const { item } = props;
   const asking = item.state === 'decide' || item.state === 'accept';
@@ -637,6 +684,7 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
         </span>
       </a>
       <span className="dboard-row-join">
+        <CloseInChatButton appId={props.appId} item={item} onChanged={props.onChanged} />
         {chat.primary ? <JoinChatLink link={chat.primary} className="dboard-join-btn">{tr('decisionBoard.joinChat')}</JoinChatLink> : null}
       </span>
     </li>
@@ -806,7 +854,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
           {list ? (
             items.length ? (
               <ul className={`dboard-list${listLoading ? ' is-loading' : ''}`}>
-                {items.map(item => <BoardRow key={item.seq} appId={activeAppId} item={item} now={now} />)}
+                {items.map(item => <BoardRow key={item.seq} appId={activeAppId} item={item} now={now} onChanged={() => setReloadTick(n => n + 1)} />)}
               </ul>
             ) : (
               <p className="dboard-empty-line">
@@ -1340,7 +1388,8 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
 
   const { item } = detail;
   const now = Date.now();
-  const hasAsk = !!item.question?.trim() || item.options.length > 0;
+  const ended = item.state === 'closed' || item.state === 'done';
+  const hasAsk = !ended && (!!item.question?.trim() || item.options.length > 0);
   const ownDraft = !!editor.saved || !isDraftEmpty(editor.draft);
   const scope = submitScope(detail.drafts, seq, ownDraft);
   const stale = draftNeedsReview(editor.saved, item);
@@ -1366,6 +1415,8 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
+      <CloseInChatButton appId={appId} item={item} disabled={uploads.length > 0}
+        beforeClose={() => editor.flush()} onChanged={() => { editor.reset(null); void load({ resetDraft: true }); }} />
       <HintBanner hint={item.hint} />
       <TaskHintChip hint={detail.taskHint} banner />
       <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />
@@ -1410,7 +1461,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         </section>
       ) : null}
 
-      <section className="dboard-block dboard-decision">
+      {!ended ? <section className="dboard-block dboard-decision">
         <h2 className="dboard-block-title">
           {tr('decisionBoard.decisionTitle')}
           <small>{tr('decisionBoard.decisionHint')}</small>
@@ -1500,7 +1551,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
           </div>
         </div>
         <ItemNav neighbors={neighbors} busy={navigating} onGo={target => void goTo(target)} placement="bottom" />
-      </section>
+      </section> : null}
 
       <section className="dboard-block dboard-history">
         <h2 className="dboard-block-title">{tr('decisionBoard.historyTitle')}</h2>

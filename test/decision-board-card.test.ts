@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DecisionBoardService, type DecisionBoardServiceDeps } from '../src/core/decision-board/service.js';
 import {
+  DECISION_CARD_ACTION_CLOSE,
   DECISION_CARD_ACTION_NOTE,
   DECISION_CARD_ACTION_PICK,
   DECISION_CARD_NOTE_FIELD,
@@ -134,6 +135,59 @@ async function webSubmit(seq: number, choice: string, text: string, nonce: strin
   return res;
 }
 
+describe('仅关闭，不投递', () => {
+  const closeValue = (card: any) => callbackButtons(card).find(b => b.behaviors[0].value.action === DECISION_CARD_ACTION_CLOSE).behaviors[0].value;
+  it('按钮不在表单内、含确认；真实回调关闭、记 owner 历史、原地换卡，无 afterAck 或批次', async () => {
+    const seq = await addDecide();
+    const card = currentCard();
+    const button = card.body.elements.find((e: any) => e.behaviors?.[0]?.value?.action === DECISION_CARD_ACTION_CLOSE);
+    expect(button.text.content).toBe('已在会话里定了');
+    expect(button.confirm.text.content).toContain('不向会话');
+    expect(button.form_action_type).toBeUndefined();
+    const item = service.store().getItem(APP, seq)!;
+    service.putDraft(seq, 'owner', { choice: 'B', text: '不要投递的旧草稿', baseRev: item.rev });
+    setDecisionCardService(service);
+    const out = await handleDecisionCardAction({ operator: { open_id: OWNER },
+      action: { value: { ...closeValue(card), key: 'A' }, form_value: { [DECISION_CARD_NOTE_FIELD]: '也不能投递' } },
+      context: { open_message_id: sent[0]!.messageId } } as any, APP);
+    expect(out.afterAck).toBeUndefined();
+    expect(out.card.type).toBe('raw');
+    expect(out.card.data.header.template).toBe('grey');
+    expect(callbackButtons(out.card.data)).toHaveLength(0);
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
+    expect(service.store().getCard(APP, seq)?.messageId).toBe(sent[0]!.messageId);
+    expect(service.cards!.render(seq)?.card).toEqual(out.card.data);
+    const detail = service.detail(seq, 'owner');
+    expect(detail.item).toMatchObject({ state: 'closed', rev: item.rev + 1 });
+    expect(detail.draft).toBeUndefined();
+    expect(detail.events.filter(e => e.text === '本人标记已在会话里决定')).toMatchObject([{ actor: 'owner', kind: 'state' }]);
+    expect(service.store().listBatches(APP)).toEqual([]);
+    expect(service.store().latestDecision(APP, seq)).toBeUndefined();
+    await service.redeliverUndelivered();
+    expect(delivered).toEqual([]);
+    const again = service.cardClick({ operatorOpenId: OWNER, value: closeValue(card), messageId: sent[0]!.messageId });
+    expect(again.deliver).toBeUndefined();
+    expect(service.detail(seq, 'owner').events.filter(e => e.text === '本人标记已在会话里决定')).toHaveLength(1);
+    // Old option callback and late autosave cannot turn closure into delivery.
+    expect(click(card).deliver).toBeUndefined();
+    expect(() => service.putDraft(seq, 'owner', { choice: 'A', baseRev: item.rev })).toThrow(BoardError);
+  });
+  it('非 owner、旧版内容、被替换卡片和已禁用卡片均不能关闭', async () => {
+    const seq = await addDecide();
+    const value = closeValue(currentCard());
+    expect(service.cardClick({ operatorOpenId: 'ou_other', value }).toast?.type).toBe('error');
+    expect(service.cardClick({ operatorOpenId: OWNER, value, messageId: 'om_replaced' }).toast?.type).toBe('warning');
+    await service.cli({ action: 'set', ref: String(seq), fields: { summary: 'new revision' } }, { sessionId: 's' });
+    expect(service.cardClick({ operatorOpenId: OWNER, value }).toast?.type).toBe('warning');
+    steward = { enabled: true, chatId: 'oc_steward', decisionCards: false };
+    expect(service.cardClick({ operatorOpenId: OWNER, value }).toast?.type).toBe('warning');
+    expect(service.detail(seq, 'owner').item.state).toBe('decide');
+    expect(service.store().listBatches(APP)).toEqual([]);
+    expect(delivered).toEqual([]);
+  });
+});
+
 describe('发卡', () => {
   it('新建即待拍板：往管家群发一张卡，每个选项一个按钮、推荐项标出、带说明框和看板链接', async () => {
     const seq = await addDecide();
@@ -200,7 +254,9 @@ describe('原地更新', () => {
 
     await service.cli({ action: 'set', ref: String(seq), fields: { progress: '又跑了一轮 CI' } }, { sessionId: 's' });
     await service.cardsIdle();
-    expect(updated).toHaveLength(1);
+    // The close confirmation is revision-bound, so a content edit must refresh its revision too.
+    expect(updated).toHaveLength(2);
+    expect(updated[1]!.messageId).toBe(sent[0]!.messageId);
   });
 
   it('daemon 重启后照样更新原来那张卡（消息 id 落库）', async () => {
@@ -262,7 +318,8 @@ describe('降级', () => {
     const options = Array.from({ length: DECISION_CARD_MAX_OPTIONS + 1 }, (_, i) => `${String.fromCharCode(65 + i)}=选项${i}`);
     await addDecide(options, { recommend: 'A' });
     const card = sent[0]!.card;
-    expect(callbackButtons(card)).toHaveLength(0);
+    expect(pickButtons(card)).toHaveLength(0);
+    expect(callbackButtons(card).map(b => b.behaviors[0].value.action)).toEqual([DECISION_CARD_ACTION_CLOSE]);
     expect(linkButtons(card)).toHaveLength(1);
     expect(cardText(card)).toContain(`${DECISION_CARD_MAX_OPTIONS + 1} 个选项`);
   });

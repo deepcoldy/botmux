@@ -895,6 +895,30 @@ export class DecisionBoardStore {
     });
   }
 
+  /** Owner closes an already-decided item. No batch/decision/outbox is created. */
+  closeInChat(appId: string, seq: number, baseRev: number, actorRef: string, now = Date.now()) {
+    return this.tx(() => {
+      const row = this.itemRow(appId, seq);
+      if (!row) throw new BoardError('item_not_found', `没有 #${seq}`);
+      const item = rowToItem(row);
+      // Retried acknowledgements are idempotent, including after a process restart.
+      if (isEndedState(item.state)) return { item, duplicate: true };
+      if (!Number.isSafeInteger(baseRev) || baseRev !== item.rev) {
+        throw new BoardError('item_changed', '事项刚改过，请刷新后再确认关闭');
+      }
+      if (item.state !== 'decide' && item.state !== 'accept') {
+        throw new BoardError('item_not_deciding', '这一项已经不再等待决定，请刷新看板');
+      }
+      this.dismissCurrentHint(appId, seq, row);
+      this.stmt(`UPDATE board_items SET state = 'closed', state_at = ?, updated_at = ?, rev = rev + 1
+        WHERE app_id = ? AND seq = ?`).run(now, now, appId, seq);
+      // Remove only this item's drafts so a later bulk submission cannot send its old option.
+      this.stmt('DELETE FROM board_drafts WHERE app_id = ? AND seq = ?').run(appId, seq);
+      this.insertEvent(appId, seq, now, 'owner', actorRef, 'state', '本人标记已在会话里决定');
+      return { item: rowToItem(this.itemRow(appId, seq)!), duplicate: false };
+    });
+  }
+
   /**
    * 管家追加一条历史；handled=true 时把这一项【最早一个未执行批次】里的决定标为已执行
    * （时间线上这条历史就是对那条决定的回复）。只标最早批次：同一事项连提多个批次时，
@@ -1296,6 +1320,9 @@ export class DecisionBoardStore {
     if (fileIds.length > BOARD_LIMITS.filesPerDraft) throw new BoardError('too_many_files', `每项最多附 ${BOARD_LIMITS.filesPerDraft} 张图`);
     const item = this.getItem(appId, seq);
     if (!item) throw new BoardError('item_not_found', `没有 #${seq}`);
+    if (isEndedState(item.state) && (input.choice?.trim() || text.trim() || fileIds.length)) {
+      throw new BoardError('item_ended', '这一项已处理，不能再保存决定草稿');
+    }
     const choice = input.choice?.trim() || undefined;
     if (choice && !item.options.some(o => o.key === choice)) throw new BoardError('unknown_choice', `没有选项 ${choice}`);
     for (const id of fileIds) {
@@ -1342,6 +1369,7 @@ export class DecisionBoardStore {
         if (draft.updatedAt !== it.draftUpdatedAt) throw new BoardError('draft_changed', `#${it.seq} 的草稿在别处改过，刷新后再提交`);
         const item = this.getItem(appId, it.seq);
         if (!item) throw new BoardError('item_not_found', `没有 #${it.seq}`);
+        if (isEndedState(item.state)) throw new BoardError('item_ended', '这一项已处理，不能再提交决定');
         drafts.push({ draft, item });
       }
       const id = ((this.stmt('SELECT MAX(id) AS m FROM board_batches WHERE app_id = ?').get(appId) as { m: number | null }).m ?? 0) + 1;
