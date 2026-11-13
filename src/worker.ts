@@ -438,7 +438,7 @@ import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
-import { doubaoTrajectoryPathForSession } from './services/doubao-transcript.js';
+import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -2133,6 +2133,16 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'doubao') {
+      // A configured --resume target alone is not proof of the running CLI.
+      // The reattach path corroborates its PID marker and exact native user
+      // journal before saving this process-bound identity. Publish it on the
+      // first runtime binding so the host can reuse the existing execution.
+      const proof = doubaoRestoredRuntimeIdentity;
+      if (proof?.pid === childPid && proof.procStart === start
+        && proof.nativeSessionId === (lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId)) {
+        nativeSessionId = proof.nativeSessionId;
+      }
     } else if (!nativeSessionId && lastInitConfig?.cliId === 'codex' && !lastInitConfig.existingAppServerEndpoint) {
       // A busy re-attached Codex pane may stay silent until the running turn
       // completes, and can hold internal/subagent rollouts open alongside the
@@ -7535,11 +7545,19 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
  */
 function bindCliPidMarker(markerPath: string, pid: number): void {
   cliPidMarker = markerPath;
+  let previousLiveTurn: { turnId: string; dispatchAttempt?: number } | undefined;
   if (sessionId && existsSync(markerPath)) {
     try {
       withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
-        if (markerBelongsToLiveProcess(raw, { sessionId: sessionId!, procStart: readProcessStartIdentity(pid) })) return;
+        if (markerBelongsToLiveProcess(raw, { sessionId: sessionId!, procStart: readProcessStartIdentity(pid) })) {
+          const parsed = JSON.parse(raw);
+          if (typeof parsed.turnId === 'string') previousLiveTurn = {
+            turnId: parsed.turnId,
+            ...(typeof parsed.dispatchAttempt === 'number' ? { dispatchAttempt: parsed.dispatchAttempt } : {}),
+          };
+          return;
+        }
         unlinkSync(markerPath);
         log(`Discarded a CLI PID marker not written for this live CLI process (pid ${pid})`);
       });
@@ -7550,6 +7568,15 @@ function bindCliPidMarker(markerPath: string, pid: number): void {
   const turnBefore = currentBotmuxTurnId;
   const attemptBefore = currentBotmuxDispatchAttempt;
   restoreQueuedTurnsFromMarkerDisk(markerPath);
+  if (lastInitConfig?.cliId === 'doubao' && previousLiveTurn && backend
+    && 'isReattach' in backend && backend.isReattach === true
+    && activeTurnAuthority.snapshot()?.started
+    && currentBotmuxTurnId === previousLiveTurn.turnId
+    && currentBotmuxDispatchAttempt === previousLiveTurn.dispatchAttempt
+    && markerQueuedTurnStillLive(previousLiveTurn)) {
+    doubaoRestoredExecution = previousLiveTurn;
+    log('Doubao live process marker accepted for bridge recovery');
+  }
   if (currentBotmuxTurnId
     && (currentBotmuxTurnId !== turnBefore || currentBotmuxDispatchAttempt !== attemptBefore)) {
     log(`Restored executing turn ${currentBotmuxTurnId.slice(0, 12)} from the CLI PID marker`);
@@ -9454,6 +9481,9 @@ function resetThinkingChannel(): void {
 // independent. Marker file (`<DATA_DIR>/turn-sends/<sid>.jsonl`) and the
 // gate function are CLI-agnostic and shared.
 let codexBridgeRolloutPath: string | undefined;
+/** Same-process marker evidence; never populated by a cold --resume spawn. */
+let doubaoRestoredExecution: { turnId: string; dispatchAttempt?: number } | undefined;
+let doubaoRestoredRuntimeIdentity: { pid: number; procStart: string; nativeSessionId: string } | undefined;
 let codexBridgeOffset = 0;
 /** Driver-owned incremental state of the active transcript driver (codex drain
  *  state, OMP / ebsd / antigravity provisional-terminal state). Opaque to the
@@ -9838,7 +9868,7 @@ function checkpointStructuredBridgeRecovery(): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = structuredBridgeJournalPath();
   if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
-  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset, structuredBridgeIs('doubao')); }
   catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
@@ -13018,11 +13048,64 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       // recovery. Cursor both cursors to EOF, including the drainer's own
       // two-file state, so the first ingest only sees the resumed live turn.
       const traj = baselineJsonlCursor(rolloutPath);
-      codexBridgeOffset = traj.newOffset;
-      codexBridgePendingTail = traj.pendingTail;
+      // Reattach to a surviving native execution differs from a cold
+      // resume of history. Corroborate the exact marker owner against the latest
+      // native submission before re-establishing a collecting queue head.
+      const restored = doubaoRestoredExecution;
+      doubaoRestoredExecution = undefined;
+      let restoredLiveOwner = false;
+      let recoveredOffset: number | undefined;
+      let recoveredAssignmentOffset: number | undefined;
+      const recoverySkipReason = !restored ? 'no live execution marker'
+        : !sessionId || !backend ? 'session/backend unavailable'
+        : currentBotmuxTurnId !== restored.turnId || currentBotmuxDispatchAttempt !== restored.dispatchAttempt ? 'owner mismatch'
+        : !markerQueuedTurnStillLive(restored) ? 'marker turn expired'
+        : codexBridgeQueue.peek().length !== 0 ? 'queue already owns a turn'
+        : !backendScreenEvidenceIsAuthoritativeForMutation() ? 'backend evidence unavailable'
+        : undefined;
+      if (recoverySkipReason) log(`Doubao bridge recovery skipped (${recoverySkipReason})`);
+      if (restored && !recoverySkipReason) {
+        const journalPath = structuredBridgeJournalPath();
+        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => entry.turnId === restored.turnId
+          && entry.dispatchAttempt === restored.dispatchAttempt && entry.jsonlPath === rolloutPath)?.nativeUserProof : undefined;
+        const validFrontier = proof && Number.isSafeInteger(proof.trajectoryOffset)
+          && proof.trajectoryOffset >= 0 && proof.trajectoryOffset <= traj.newOffset
+          && traj.newOffset - proof.trajectoryOffset <= 64 * 1024 * 1024;
+        const user = validFrontier ? doubaoLiveUser(rolloutPath, proof) : undefined;
+        if (!user) log('Doubao bridge recovery skipped (missing exact native owner/frontier proof)');
+        if (user) {
+          // Progress written during the detach still belongs to this owner.
+          // Its replay floor is the saved frontier, not the new attach EOF.
+          codexBridgeQueue.mark(restored.turnId, user.text, user.timestampMs, restored.dispatchAttempt,
+            { jsonlPath: rolloutPath, offsetAtMark: proof!.trajectoryOffset }, currentBotmuxLinkRefMode);
+          codexBridgeQueue.confirmPendingTurn(restored.turnId, undefined, restored.dispatchAttempt);
+          codexBridgeQueue.ingest([user]);
+          restoredLiveOwner = codexBridgeQueue.peek().some(turn => turn.turnId === restored.turnId && turn.started);
+          if (restoredLiveOwner) {
+            recoveredOffset = proof!.trajectoryOffset;
+            recoveredAssignmentOffset = user.assignmentOffset;
+            const nativeSessionId = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+            const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
+            const procStart = pid ? readProcessStartIdentity(pid) : undefined;
+            if (pid && procStart && nativeSessionId && doubaoTrajectoryPathForSession(nativeSessionId) === rolloutPath) {
+              doubaoRestoredRuntimeIdentity = { pid, procStart, nativeSessionId };
+            }
+          }
+          if (restoredLiveOwner) log(`Doubao live execution restored (turn=${restored.turnId}, attempt=${restored.dispatchAttempt ?? 'none'})`);
+          else log('Doubao bridge recovery skipped (native user did not establish queue owner)');
+        }
+      }
+      codexBridgeOffset = recoveredOffset ?? traj.newOffset;
+      codexBridgePendingTail = recoveredOffset !== undefined ? '' : traj.pendingTail;
       let assignmentOffset = 0;
       try { assignmentOffset = statSync(rolloutPath.replace(/\/trajectory\.jsonl$/, '/assignment.md')).size; } catch { /* no assignment yet */ }
-      structuredBridgeDriverState = { assignmentOffset, trajectoryOffset: traj.newOffset };
+      // Use the same assignment snapshot that proved the owner; a later stat
+      // could skip a successor appended between proof and baseline commit.
+      assignmentOffset = recoveredAssignmentOffset ?? assignmentOffset;
+      structuredBridgeDriverState = {
+        assignmentOffset, trajectoryOffset: codexBridgeOffset,
+        ...(traj.pendingTail && !restoredLiveOwner ? { skipTrajectoryTail: true } : {}),
+      };
       codexBridgeBaselineDone = true;
       structuredBridgeRecoveryAttempted = true;
       log(`Codex bridge baselined (doubao two-file): ${rolloutPath} (trajectoryOffset=${traj.newOffset}, assignmentOffset=${assignmentOffset})`);
@@ -14160,6 +14243,10 @@ function codexBridgeIngest(opts: {
   }
   codexBridgeQueue.ingest(result.events);
   const hasAssistantFinal = result.events.some(event => event.kind === 'assistant_final');
+  // Keep a complete-line frontier for the already attributed live owner.
+  // Do not advance it past an undelivered terminal: a successor must replay
+  // that terminal rather than leave the old owner collecting the next answer.
+  if (structuredBridgeIs('doubao') && !hasAssistantFinal) checkpointStructuredBridgeRecovery();
   observeStructuredBackgroundTasks(result);
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
@@ -14393,6 +14480,11 @@ function codexBridgeMarkPendingTurn(
   linkRefMode?: 'observe' | 'enabled',
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
+  // Doubao has no per-tool timestamp/turn ID. Retire already-written orphan
+  // progress before marking a successor, and capture the resulting complete-
+  // line cursor rather than the last poll's stale offset. Keep other CLIs'
+  // submission and recovery ordering unchanged.
+  if (structuredBridgeIs('doubao')) codexBridgeIngest();
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   structuredTurnsWithSubmitNotice.delete(turnId);
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
@@ -24420,6 +24512,7 @@ async function spawnCliBody(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: Parameters<typeof spawnCli>[1] = {},
 ): Promise<void> {
+  doubaoRestoredRuntimeIdentity = undefined;
   followBotTraeHome(cfg);
   const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
   if (protectedCliError) throw new Error(protectedCliError + FROZEN_NETWORK_POLICY_HINT);
@@ -31125,6 +31218,8 @@ function killCli(opts: {
     }
     cliPidMarker = null;
   }
+  doubaoRestoredExecution = undefined;
+  doubaoRestoredRuntimeIdentity = undefined;
   cliOutlivesWorker = false;
   completeManagedTurnOriginRevocation(
     sandboxRelayCapability,

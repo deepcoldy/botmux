@@ -576,7 +576,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     });
   });
 
-  it.each((['traex', 'pi'] as const).flatMap(cliId => [
+  it.each((['traex', 'pi', 'doubao'] as const).flatMap(cliId => [
     'legacy', 'api-only', 'adopt', 'headless', 'remote', 'document', 'vc', 'scheduled', 'non-lark',
   ].map(entry => ({ cliId, entry }))))('keeps $cliId $entry on the established path', ({ cliId, entry }) => {
     const ds = session();
@@ -596,7 +596,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
   });
 
-  it.each((['grok', 'traex', 'pi'] as const).flatMap(cliId =>
+  it.each((['grok', 'traex', 'pi', 'doubao'] as const).flatMap(cliId =>
     (['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const).map(phase => ({ cliId, phase })),
   ))('settles $cliId as $phase and isolates later turns', async ({ cliId, phase }) => {
     const ds = session();
@@ -627,7 +627,8 @@ describe('reply-card runtime eligibility and recovery', () => {
 
   it.each([['grok', 'opencode', 'unified'], ['opencode', 'grok', 'legacy'],
     ['traex', 'opencode', 'unified'], ['opencode', 'traex', 'legacy'],
-    ['pi', 'opencode', 'unified'], ['opencode', 'pi', 'legacy']] as const)(
+    ['pi', 'opencode', 'unified'], ['opencode', 'pi', 'legacy'],
+    ['doubao', 'opencode', 'unified'], ['opencode', 'doubao', 'legacy']] as const)(
     'uses frozen %s rather than stale %s for reply-card admission', (frozen, stale, expected) => {
       const ds = session();
       ds.session.cliId = stale;
@@ -639,7 +640,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     },
   );
 
-  it.each(['grok', 'traex', 'pi'] as const)('preserves a superseded %s card across disconnect and startup recovery', async cliId => {
+  it.each(['grok', 'traex', 'pi', 'doubao'] as const)('preserves a superseded %s card across disconnect and startup recovery', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     const send = vi.fn(async () => 'om_reply');
@@ -887,7 +888,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(patched).toContain('README.md');
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi', 'doubao'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     ds.session.sandbox = true;
@@ -941,7 +942,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(replyCardModeFor(legacyIsolated)).toBe('legacy');
   });
 
-  it.each(['claude-code', 'traex', 'pi', 'kimi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
+  it.each(['claude-code', 'traex', 'pi', 'kimi', 'doubao'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     expect(replyCardModeFor(ds)).toBe('unified');

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionController, controllerForSession } from '../src/core/session-controller.js';
@@ -20,6 +21,10 @@ import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 import { RUNTIME_RESERVATION_DEADLINE_MS, RuntimeReservationExpiredError } from '../src/services/runtime-reservation.js';
 import { prepareCodexAppDispatch, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
 import { publishCliSessionIdToDaemon } from '../src/core/cli-session-id-publisher.js';
+import { baselineJsonlCursor } from '../src/services/jsonl-cursor.js';
+import { readBridgeTurnJournal, writeBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { doubaoLiveUser, doubaoSystemDirForSession } from '../src/services/doubao-transcript.js';
 import { createManagedAskControl, managedAskOriginKey } from '../src/core/managed-ask-control.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
@@ -27,7 +32,7 @@ vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return
 
 const directories: string[] = [];
 const handles: Array<{ close(): void }> = [];
-function fixture() {
+function fixture(nativeSessionId = 'native1') {
   const data = mkdtempSync(join(tmpdir(), 'contract-gateway-')); directories.push(data);
   fixtureConfig.dataDir = data;
   const appId = 'cli_gateway_test'; const ref = { appId, sessionId: 'session-test' };
@@ -35,7 +40,7 @@ function fixture() {
   const ds = { larkAppId: appId, chatId: 'oc_test', session: { sessionId: ref.sessionId, larkAppId: appId, status: 'active' }, cliReadyGeneration: 0 } as DaemonSession;
   const controller = new SessionController(ds, store); const worker = controller.bindWorker(1).worker;
   const runtime = controller.reserveBinding('binding-old', worker);
-  controller.bindRuntime('binding-old', worker, { backend: 'tmux', physicalId: '111:start1', nativeSessionId: 'native1', proof: 'process_start' });
+  controller.bindRuntime('binding-old', worker, { backend: 'tmux', physicalId: '111:start1', nativeSessionId, proof: 'process_start' });
   const context = (sequence: number, scope: any = { runtime }) => ({ version: 2 as const, session: ref, producer: worker, eventId: `${worker.workerId}:${sequence}`, sequence, scope });
   return { data, appId, ref, store, ds, controller, worker, runtime, context };
 }
@@ -711,6 +716,109 @@ describe('contract gateway and real worker boundaries', () => {
     env.cliAdapter = {}; env.lastInitConfig = { cliId: 'codex' };
     env.readClaudeLiveSessionId = () => { throw new Error('read for a non-Claude CLI'); };
     expect(identity(scope.beginRuntime())).toEqual({ backend: 'tmux', physicalId: '111:start1', proof: 'process_start' });
+  });
+  it.each([true, false])('cross-checks the Doubao native trajectory before saving attach identity (matching=%s)', matching => {
+    const nativeSessionId = '38459999999999999';
+    const s = fixture(nativeSessionId);
+    const turnId = 'running'; const stamp = Date.now(); const prompt = 'Read the docs';
+    const execution = s.controller.admitInput(turnId);
+    expect(s.controller.ingest({ type: 'turn_execution_started', turnId,
+      sessionContract: s.context(1, { runtime: s.runtime, execution }) }, s.worker)).toMatchObject({ kind: 'current' });
+    const replacement = s.controller.bindWorker(2).worker;
+    const scope = new WorkerSessionEventScope(s.ref, replacement);
+    scope.noteAdmission({ ref: execution, runtime: s.runtime, phase: 'running' });
+    const binding = scope.beginRuntime();
+    const sessionsRoot = join(s.data, 'native', 'workspace', '.sessions');
+    const nativeSystem = join(sessionsRoot, nativeSessionId, 'agents', 'main', 'system');
+    mkdirSync(nativeSystem, { recursive: true });
+    const nativeTrajectory = join(nativeSystem, 'trajectory.jsonl');
+    writeFileSync(nativeTrajectory, '');
+    // Both cases have a valid user proof for the attached log. Only the
+    // independent Session-ID-to-trajectory lookup differs, so earlier owner
+    // or journal checks cannot make the negative case pass vacuously.
+    const attachedSystem = matching ? nativeSystem : join(s.data, 'other-native-session', 'system');
+    mkdirSync(attachedSystem, { recursive: true });
+    const rolloutPath = join(attachedSystem, 'trajectory.jsonl');
+    const assignment = join(attachedSystem, 'assignment.md');
+    writeFileSync(assignment, `## [${new Date(stamp).toISOString()}] 需求\n${prompt}\n`);
+    writeFileSync(rolloutPath, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'read', function: { name: 'Read', arguments: '{}' } }] }) + '\n');
+    const proof = { uuid: `${assignment}:0`, hash: createHash('sha256').update(prompt).digest('hex'), timestampMs: stamp, trajectoryOffset: 0 };
+    const journal = join(s.data, 'bridge-journal.json');
+    writeBridgeTurnJournal(journal, [{ turnId, markTimeMs: stamp, jsonlPath: rolloutPath, offsetAtMark: 0, nativeUserProof: proof }]);
+    const env: any = {
+      workerSessionEventScope: scope, backend: { cliPid: 111 }, effectiveBackendType: 'tmux',
+      lastInitConfig: { cliId: 'doubao', cliSessionId: nativeSessionId }, lastSpawnEffectiveCliSessionId: nativeSessionId,
+      sessionId: s.ref.sessionId, currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined,
+      nativeSessionForkPending: () => false, structuredBridgeIs: (id: string) => id === 'doubao',
+      codexSubagentLimitTracker: { clear() {} }, existsSync, statSync, baselineJsonlCursor,
+      doubaoRestoredExecution: { turnId }, markerQueuedTurnStillLive: () => true,
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      structuredBridgeJournalPath: () => journal, readBridgeTurnJournal, doubaoLiveUser,
+      codexBridgeQueue: new CodexBridgeQueue(() => stamp), readProcessStartIdentity: () => 'start1',
+      doubaoTrajectoryPathForSession: (id: string) => {
+        const system = doubaoSystemDirForSession(id, [sessionsRoot]);
+        return system ? join(system, 'trajectory.jsonl') : undefined;
+      },
+      log: vi.fn(), fsWatch: () => ({ close() {} }), codexBridgeStartTimer() {}, checkpointStructuredBridgeRecovery() {},
+    };
+    const attach = loadWorkerFunction<(path: string, mode: string) => void>('codexBridgeAttach', env);
+    attach(rolloutPath, 'baseline-existing');
+    expect(env.codexBridgeQueue.peek()).toMatchObject([{ turnId, started: true }]);
+    expect(env.doubaoRestoredExecution).toBeUndefined();
+    if (matching) expect(env.doubaoRestoredRuntimeIdentity).toEqual({ pid: 111, procStart: 'start1', nativeSessionId });
+    else expect(env.doubaoRestoredRuntimeIdentity).toBeUndefined();
+    const identity = loadWorkerFunction<(binding: any) => any>('runtimeIdentityForContract', env);
+    s.controller.reserveBinding(binding.bindingId, replacement);
+    const runtime = s.controller.bindRuntime(binding.bindingId, replacement, identity(binding));
+    scope.assign(binding.bindingId, runtime.ref); scope.enterTurn(turnId);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    const progress = metadata({ type: 'thinking_update', turnId, entries: [{ kind: 'tool_result', id: 'read', result: 'done' }] });
+    const final = metadata({ type: 'final_output', turnId, content: 'Recovered answer' });
+    if (matching) {
+      expect(runtime.ref).toEqual(s.runtime);
+      expect(s.controller.ingest(progress, replacement)).toMatchObject({ kind: 'current' });
+      expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'current' });
+    } else {
+      expect(runtime.ref).not.toEqual(s.runtime);
+      expect(s.controller.ingest(progress, replacement)).toMatchObject({ kind: 'reject', reason: 'execution_scope_unproven' });
+      expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'reject', reason: 'execution_scope_unproven' });
+    }
+  });
+  it.each(['exact', 'missing', 'different-pid', 'different-start', 'different-native'])('keeps a proven Doubao live reattach on its original execution (%s)', condition => {
+    const s = fixture();
+    const execution = s.controller.admitInput('running');
+    s.controller.ingest({ type: 'turn_execution_started', turnId: 'running',
+      sessionContract: s.context(1, { runtime: s.runtime, execution }) }, s.worker);
+    const replacement = s.controller.bindWorker(2).worker;
+    const scope = new WorkerSessionEventScope(s.ref, replacement);
+    scope.noteAdmission({ ref: execution, runtime: s.runtime, phase: 'running' });
+    const binding = scope.beginRuntime();
+    const env: any = { backend: { cliPid: 111 }, effectiveBackendType: 'tmux',
+      workerSessionEventScope: scope, lastInitConfig: { cliId: 'doubao', cliSessionId: 'native1' },
+      readProcessStartIdentity: () => 'start1',
+      doubaoRestoredRuntimeIdentity: condition === 'missing' ? undefined : {
+        pid: condition === 'different-pid' ? 222 : 111,
+        procStart: condition === 'different-start' ? 'start2' : 'start1',
+        nativeSessionId: condition === 'different-native' ? 'foreign-native' : 'native1',
+      },
+    };
+    const identity = loadWorkerFunction<(binding: any) => any>('runtimeIdentityForContract', env);
+    s.controller.reserveBinding(binding.bindingId, replacement);
+    const runtime = s.controller.bindRuntime(binding.bindingId, replacement, identity(binding));
+    scope.assign(binding.bindingId, runtime.ref); scope.enterTurn('running');
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    const progress = metadata({ type: 'thinking_update', turnId: 'running', entries: [{ kind: 'tool_call', id: 'read', name: 'Read', args: '{}' }] });
+    const final = metadata({ type: 'final_output', turnId: 'running', content: 'Recovered answer' });
+    if (condition === 'exact') {
+      expect(runtime.ref).toEqual(s.runtime);
+      expect(s.controller.ingest(progress, replacement)).toMatchObject({ kind: 'current' });
+      expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'current' });
+    } else {
+      expect(identity(binding).nativeSessionId).toBeUndefined();
+      expect(runtime.ref).not.toEqual(s.runtime);
+      expect(s.controller.ingest(progress, replacement)).toMatchObject({ kind: 'reject' });
+      expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'reject' });
+    }
   });
   it('uses fresh unambiguous PID-owned native identity on a busy reattach before granting the binding', () => {
     const s = fixture(); const old = s.store.runtime(s.ref)!;

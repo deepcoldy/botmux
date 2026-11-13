@@ -276,6 +276,9 @@ export interface CodexBridgeEvent {
    *  offset and of parse-time timestamp fallbacks. Absent only for events
    *  synthesized without a single backing record. */
   rawId?: string;
+  /** Physical tool-progress position for drivers without native timestamps.
+   * Compared only with the same file's submit cursor; never final evidence. */
+  progressCursor?: { jsonlPath: string; offset: number };
   /** Wall-clock ms parsed from the event's `timestamp` field. Falls back
    *  to Date.now() if missing/unparseable so the gate's window math still
    *  has something to compare against. */
