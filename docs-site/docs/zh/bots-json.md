@@ -495,10 +495,10 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 规则：
 
 - 只有 `enabled` 写成 `true` 才算开。`tools` 不写表示覆盖全部工具；写了不认识的工具名会直接报错，不会悄悄降级。
-- 可选 `capabilities` 按能力逐项开关：`lark-user`（飞书用户身份，`lark-cli --as user`）、`bytecloud`（ByteCloud：bytedcli、codebase、git push、bitscli / bits-cli，同一个开关）、`meego`（仅 `bytedcli meego`，独立的 `meegle` 命令不受管）。写了不认识的值会直接报错。不写时由 `tools` 推导（`lark-cli` → `lark-user`，`bytedcli` → `bytecloud` + `meego`）。`bytecloud` / `meego` 没开时对应命令保持原生：直接用这台机器自己的登录态，botmux 不做任何干预。`lark-user` 没开时，`lark-cli --as user` 仍由 `larkToolBinding` 决定。
+- 可选 `capabilities` 按能力逐项开关：`lark-user`（飞书用户身份，`lark-cli --as user`）、`bytecloud`（ByteCloud：bytedcli、codebase、git push、bitscli / bits-cli，同一个开关）、`meego`（仅 `bytedcli meego`，独立的 `meegle` 命令不受管）。写了不认识的值会直接报错。不写时由 `tools` 推导（`lark-cli` → `lark-user`，`bytedcli` → `bytecloud` + `meego`）。`bytecloud` / `meego` 没开时对应命令保持原生：直接用这台机器自己的登录态，botmux 不做任何干预。`lark-user` 没开时要分两种：只写 `tools` 的旧配置（不写 `capabilities`）行为与上游一致，`lark-cli --as user` 仍用当轮触发人自己的授权；只有**显式写了 `capabilities` 且不含 `lark-user`** 时，`lark-cli --as user` 才原生执行——用这台机器自己的 lark-cli 配置和登录，botmux 不注入凭据、不发授权请求（`botmux auth request` 对 lark-cli 返回 `lark_user_auth_disabled`）。
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
 - 绝不会退回到 Bot 或其他人的身份代跑，也没有「退回机器登录态」的选项。旧配置里的 `fallback` 字段会被忽略。`bytedcli` 没有 Bot 身份，没授权就是失败。
-- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`allowSpeakerSwitch`（默认 `false`：设为 `true` 后，多人话题里才能在某一条命令前加 `BOTMUX_AS=<open_id>` 用本轮另一位发言人的身份执行；默认关闭时 `BOTMUX_AS` 一律被拒）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
