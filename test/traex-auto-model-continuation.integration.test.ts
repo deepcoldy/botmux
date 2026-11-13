@@ -255,24 +255,23 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(fixtureState.noticeDeliveries.filter(message => message.type === 'user_notify'
       && message.message === t('worker.traex_auto_model.continuation_timeout'))).toHaveLength(1);
     pausedGrant?.mockRestore();
-    // Bind every distinct runtime the worker actually registered, then assert on
-    // the continuation records by their durable state rather than on whichever
-    // `runtime_binding` happens to arrive last. Under host load the worker's
-    // repeated re-publications flush in nondeterministic order, so "the last
-    // runtime_binding message" is not reliably the replacement binding. The
-    // original binding never had a continuation plan (undefined), while the
-    // exact model replacement binding is the unique one with a rejected plan.
-    const distinctBindings = new Map<string, Extract<WorkerToDaemon, { type: 'runtime_binding' }>>();
-    for (const message of fixtureState.messages) {
-      if (message.type === 'runtime_binding') distinctBindings.set(message.bindingId, message);
-    }
-    expect(distinctBindings.size).toBeGreaterThanOrEqual(2);
-    for (const registration of distinctBindings.values()) {
-      controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
-    }
-    const rejectedBindings = [...distinctBindings.keys()].filter(bindingId =>
-      controller.store.executionContinuation(controller.ref, bindingId)?.status === 'rejected');
-    expect(rejectedBindings).toHaveLength(1);
+    // The replacement is the runtime the worker announced with the continuation
+    // plan. Without native identity (missing-native-identity) the worker first
+    // registers it only when the grant times out, right before it writes the
+    // queued follow-up; the follow-up wait above reads the fake CLI's file and
+    // can pass before that IPC registration reaches this host. Wait for it
+    // instead of taking whichever runtime_binding happens to be last.
+    const replacement = fixtureState.messages.find((message): message is Extract<WorkerToDaemon, { type: 'runtime_binding_started' }> =>
+      message.type === 'runtime_binding_started' && !!message.continuation);
+    expect(replacement).toBeDefined();
+    const replacementRegistration = () => [...fixtureState.messages].reverse().find((message): message is Extract<WorkerToDaemon, { type: 'runtime_binding' }> =>
+      message.type === 'runtime_binding' && message.bindingId === replacement!.bindingId);
+    await fixtureState.wait(() => !!replacementRegistration(), 'replacement runtime registration');
+    const registration = replacementRegistration()!;
+    controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
+    const registered = new Set(fixtureState.messages.flatMap(message => message.type === 'runtime_binding' ? [message.bindingId] : []));
+    expect([...registered].filter(bindingId =>
+      controller.store.executionContinuation(controller.ref, bindingId)?.status === 'rejected')).toEqual([replacement!.bindingId]);
     expect(controller.store.executions(controller.ref, 'om_ungranted')[0]!.phase).toBe('failed');
     if (mode === 'lost-approval') {
       expect(withheldApproval).toBeDefined();
