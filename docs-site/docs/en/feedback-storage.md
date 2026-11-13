@@ -1,5 +1,29 @@
 # Feedback Storage & Migration
 
+## Supabase
+
+The optional Supabase backend uses `@supabase/supabase-js` and installation-bound
+transactional RPCs. SQLite and PostgreSQL feedback sources can migrate directly
+to an independently bootstrapped Supabase schema. Sessions and schedules remain
+outside this migration.
+
+Configure a candidate with `backend: "supabase"` and
+`supabase: { url, keyRef, schema, requestTimeoutMs }`. Use an HTTPS project URL,
+a private server secret reference such as `env:SUPABASE_KEY`, and a dedicated
+schema. Configuring a candidate does not change active storage.
+
+Generate SQL with `botmux feedback storage supabase-schema`; an administrator
+must review and install it in the target project and expose that dedicated schema
+through its Data API. The command only prints SQL and does not execute it.
+Then test the saved connection with `botmux feedback storage test`.
+
+After separate maintenance authorization, run from an independent host process:
+`botmux feedback storage migrate --to supabase --yes --request-id ORIGINAL_REQUEST_ID`.
+Use `status` and the original `resume MIGRATION_ID` after interruption. Unknown
+mutations are reconciled from their original markers, never blindly replayed.
+The source, snapshots, IDs, revision order and event-stream positions are retained.
+After target writes begin, switching directly back to the stale source is unsafe.
+
 botmux keeps "feedback data" in a database: user ratings of final answers, the outcome of each turn, the delivery queue for feedback webhooks, and so on. This is what the Dashboard "Feedback analytics" page shows.
 
 - **SQLite by default**: a local file, `botmux-feedback.sqlite`, in the botmux data directory (`~/.botmux/data/` by default). Nothing to install, and most people never need anything else.

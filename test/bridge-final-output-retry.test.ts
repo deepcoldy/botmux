@@ -20,6 +20,8 @@ import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { drainDoubaoTranscript } from '../src/services/doubao-transcript.js';
+import { pathToFileURL } from 'node:url';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
 import { OutputDeliveryJournal, outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
@@ -533,7 +535,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
   });
 
-  it.each(['workspace', 'temporary'])('uploads a local Codex App %s screenshot before replying', async location => {
+  it.each(['codex-app', 'doubao'].flatMap(cliId => ['workspace', 'temporary'].map(location => ({ cliId, location }))))('uploads a local $cliId $location screenshot before replying', async ({ cliId, location }) => {
     const dir = mkdtempSync(join(location === 'workspace' ? config.session.dataDir : tmpdir(), 'codex-reply-image-'));
     try {
       const png = Buffer.from('89504e470d0a1a0a', 'hex');
@@ -543,7 +545,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
       ds.adoptedFrom = undefined;
-      ds.session.cliId = 'codex-app';
+      ds.session.cliId = cliId;
       ds.workingDir = config.session.dataDir;
       const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
       deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
@@ -558,8 +560,91 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it.each(['legacy', 'unified'] as const)('delivers all twelve Doubao native gallery images with the %s reply card and reuses uploads after a transient send failure', async mode => {
+    getBot('app_test').config.replyCardMode = mode;
+    const dir = mkdtempSync(join(tmpdir(), 'doubao-gallery-'));
+    try {
+      const png = Buffer.from('89504e470d0a1a0a', 'hex');
+      const paths = Array.from({ length: 12 }, (_, i) => join(dir, `shot-${i}) preview.png`));
+      paths.forEach(path => writeFileSync(path, png));
+      const body = [[0, 1, 2, 3], [4, 5], [6, 7, 8], [9, 10, 11]].map((indices, i) =>
+        `Gallery ${i}\n\n<RichMediaCard>${JSON.stringify({ refs: indices.map(n => n % 2 ? pathToFileURL(paths[n]).href : paths[n]) })}</${i === 3 ? 'MediaCard' : 'RichMediaCard'}>`).join('\n\n');
+      const prompt = 'Create comparison screenshots for all repository forms';
+      writeFileSync(join(dir, 'assignment.md'), `## [${new Date().toISOString()}] 需求\n${prompt}\n`);
+      const trajectory = join(dir, 'trajectory.jsonl');
+      writeFileSync(trajectory, JSON.stringify({ role: 'assistant', content: body }) + '\n');
+      const queue = new CodexBridgeQueue();
+      queue.mark('om_doubao_gallery', prompt);
+      queue.ingest(drainDoubaoTranscript(trajectory, 0).events);
+      const [ready] = queue.drainEmittable();
+      expect(ready?.finalText).toBe(body);
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_gallery');
+      sessionReply.mockRejectedValueOnce(new Error('temporary send failure'));
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'doubao';
+      ds.workingDir = config.session.dataDir;
+      const complete = vi.fn();
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), turnId: ready!.turnId, kind: 'bridge', content: ready!.finalText! }, 'tag', 0, complete);
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+      expect(uploadImageMock).toHaveBeenCalledTimes(12);
+      paths.forEach(path => rmSync(path));
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_gallery'));
+      expect(sessionReply).toHaveBeenCalledTimes(2);
+      expect(uploadImageMock).toHaveBeenCalledTimes(12);
+      const card = sessionReply.mock.calls[1][1];
+      expect(card.match(/img_v3_uploaded_preview/g)).toHaveLength(12);
+      expect(card).not.toContain('RichMediaCard');
+      expect(card).not.toContain(dir);
+      expect(card).toContain('Gallery 3');
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      const record = new TurnReplyCardStore(config.session.dataDir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ready!.turnId,
+      });
+      if (mode === 'unified') expect(record).toMatchObject({ mode: 'unified', finalDelivered: true });
+      else expect(record).toBeUndefined();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('shows Doubao tools in a standard card before the final and retains its final images', async () => {
+    vi.useRealTimers();
+    getBot('app_test').config.replyCardMode = 'unified';
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'doubao';
+    ds.currentTurnId = 'om_doubao_visible_tools';
+    ds.workingDir = config.session.dataDir;
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn(async () => 'om_doubao_visible_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const store = new TurnReplyCardStore(config.session.dataDir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId };
+    ds.worker!.emit('message', { type: 'turn_input_committed', turnId: ds.currentTurnId });
+    ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      entries: [{ kind: 'tool_call', id: 'read', name: 'Read', args: '{"file_path":"README.md"}', subject: 'README.md' }] });
+    await vi.waitFor(() => expect(store.read(key)).toMatchObject({ mode: 'unified', phase: 'working', messageId: 'om_doubao_visible_card' }), { timeout: 4000 });
+    await vi.waitFor(() => expect(store.read(key)?.lastCard).toContain('README.md'), { timeout: 4000 });
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(getBotClient).not.toHaveBeenCalled();
+    ds.worker!.emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      kind: 'bridge', content: 'DOUBAO visible final\n\n<RichMediaCard>{"refs":["preview.png"]}</RichMediaCard>' });
+    await vi.waitFor(() => expect(store.read(key)?.finalDelivered).toBe(true), { timeout: 4000 });
+    expect(store.read(key)?.lastCard).toContain('DOUBAO visible final');
+    expect(store.read(key)?.lastCard).toContain('img_v3_uploaded_preview');
+    expect(store.read(key)?.lastCard).not.toContain('RichMediaCard');
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_doubao_visible_card')).toBe(true);
+  });
+
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'].flatMap(mode =>
-    (mode === 'non-adopted' ? ['claude-code'] : ['claude-code', 'codex-app']).map(cliId => ({ mode, cliId }))))(
+    (mode === 'non-adopted' ? ['claude-code'] : ['claude-code', 'codex-app', 'doubao']).map(cliId => ({ mode, cliId }))))(
     'does not add host image uploads to $mode $cliId sessions', async ({ mode, cliId }) => {
       writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');

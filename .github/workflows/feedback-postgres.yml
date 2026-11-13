@@ -65,7 +65,7 @@ jobs:
           export BOTMUX_TEST_POSTGRES_CA="$RUNNER_TEMP/feedback-pg/server.crt"
           export HOME="$RUNNER_TEMP/feedback-home"
           mkdir -p "$HOME"
-          bun run test:e2e -- test/feedback-postgres.e2e.ts test/feedback-migration.e2e.ts
+          bun run test:e2e -- test/feedback-postgres.e2e.ts test/feedback-migration.e2e.ts test/feedback-supabase.e2e.ts test/feedback-supabase-migration.e2e.ts
       - name: Stop test database
         if: always()
         run: docker rm -f feedback-pg || true
