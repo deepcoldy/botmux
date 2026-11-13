@@ -112,8 +112,9 @@ export function doubaoTrajectoryPathForSession(sessionId: string): string | unde
   return systemDir ? join(systemDir, TRAJECTORY_FILE) : undefined;
 }
 
-/** The native artifact workspace for this exact bound session, never a
- * guessed account root or a workspace belonging only to another session. */
+/** Account-level artifact workspace selected by an exact, unique bound
+ * native session ID. This includes artifacts from other sessions in the same
+ * account; it is not a per-session filesystem boundary. */
 export function doubaoWorkspaceForSession(sessionId: string | undefined,
   sessionRoots: readonly string[] = doubaoSessionRoots()): string | undefined {
   if (!sessionId || !SESSION_ID_RE.test(sessionId)) return;
@@ -251,8 +252,8 @@ function parseTrajectoryLine(path: string, line: string, lineStart: number): Cod
   try { obj = JSON.parse(line); } catch { return null; }
   const base = { uuid: `${path}:${lineStart}`, timestampMs: Date.now(), text: '' };
   if (obj?.role === 'tool') {
-    if (typeof obj.tool_call_id !== 'string' || !obj.tool_call_id) return null;
-    const result = typeof obj.content === 'string' ? obj.content : '';
+    if (typeof obj.tool_call_id !== 'string' || !obj.tool_call_id || typeof obj.content !== 'string') return null;
+    const result = obj.content;
     return { ...base, kind: 'cot', progressCursor: { jsonlPath: path, offset: lineStart }, cotEntries: [{
       kind: 'tool_result', id: obj.tool_call_id,
       result: result.length > 800 ? `${result.slice(0, 800)}…` : result,

@@ -10,7 +10,7 @@
  * the real logged-in account's session store.
  */
 import { describe, it, expect } from 'vitest';
-import { appendFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -22,6 +22,7 @@ import {
 } from '../src/services/doubao-transcript.js';
 import { doubaoBridgeSpec } from '../src/adapters/cli/doubao.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const SID = '38459999999999999';
 const AGENT = 'm_agent1';
@@ -85,7 +86,24 @@ describe('doubao transcript bridge', () => {
     // The native CLI flushes old progress after handling the stop; the next
     // poll has not run when B captures its submit frontier and gets accepted.
     appendFileSync(trajectory, rows('old-task-a'));
-    queue.mark('B', 'New unrelated task', now, undefined, { jsonlPath: trajectory, offsetAtMark: statSync(trajectory).size });
+    // Run the production mark path with the production recovery cursor: it
+    // reads the last drain offset, not stat(trajectory).size. Polling has not
+    // run since A stopped, so mark must drain before acquiring B's owner.
+    const scope = {
+      codexBridgeFallbackActive: () => true,
+      structuredBridgeIs: (id: string) => id === 'doubao',
+      codexBridgeIngest: () => {
+        drained = drainDoubaoTranscript(trajectory, drained.newOffset, { state: drained.state, openTurns: 0 });
+        queue.ingest(drained.events);
+      },
+      codexBridgeQueue: queue,
+      structuredTurnsWithSubmitNotice: new Set(),
+      structuredBridgeRecoveryCursorAtMark: () => ({ jsonlPath: trajectory, offsetAtMark: drained.newOffset }),
+      checkpointCodexAdoptRecovery: () => {},
+      checkpointStructuredBridgeRecovery: () => {},
+    };
+    const mark = loadWorkerFunction<(...args: any[]) => string>('codexBridgeMarkPendingTurn', scope);
+    mark('New unrelated task', 'B', undefined, now);
     appendFileSync(assignment, '## [2026-11-12T00:00:01Z] 需求\nNew unrelated task\n');
     appendFileSync(trajectory, rows('new-task-b'));
     drained = drainDoubaoTranscript(trajectory, drained.newOffset, { state: drained.state, openTurns: 0 });
@@ -320,6 +338,8 @@ describe('doubao execution timeline', () => {
       JSON.stringify({ role: 'assistant', content: '', reasoning_content: 'PRIVATE_REASONING' }) + '\n',
       JSON.stringify({ role: 'assistant', content: 'not a final', tool_calls: [null, { id: 'missing-function' }] }) + '\n',
       JSON.stringify({ role: 'tool', tool_call_id: null, content: 'unmatched' }) + '\n',
+      ...[undefined, null, 42, { text: 'unsupported' }, ['unsupported']].map(content =>
+        JSON.stringify({ role: 'tool', tool_call_id: 'invalid-result', content }) + '\n'),
       toolRow('write', 'Write', args), resultRow('write', output),
     ].join(''));
     const result = drainDoubaoTranscript(trajectory, 0);
