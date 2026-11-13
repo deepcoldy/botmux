@@ -26,9 +26,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { killProcessTree } from './helpers/process-tree.js';
+import { workerTmuxArgs } from './helpers/worker-tmux-session.js';
 
 const FAKE_KIMI = resolve('test/fixtures/fake-kimi-cache-expiry.mjs');
 const hasTmux = spawnSync('tmux', ['-V']).status === 0;
@@ -55,6 +57,14 @@ function startWorker(opts: {
   const data = join(root, 'data');
   mkdirSync(data);
   const fakeLog = join(root, 'fake-kimi.log');
+  // tmux backend: the worker subscribes to the pane (`pipe-pane`) only after
+  // `new-session` has started the CLI, and what the CLI writes before that
+  // never reaches the worker. Real Kimi 2.5.3 writes its first byte ~0.6s
+  // after exec; the fake would paint within tens of milliseconds, and under CI
+  // load the subscription came later: the composer and the only startup `idle`
+  // were lost and the worker was left on its 15s first-prompt fallback, past
+  // the readiness wait below. So the fake paints once the pane is piped.
+  const startFile = join(root, 'fake-kimi.start');
   const wrapper = join(root, 'kimi');
   const q = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
   writeFileSync(wrapper, `#!/bin/sh\nexec ${q(process.execPath)} ${q(FAKE_KIMI)} "$@"\n`, { mode: 0o700 });
@@ -77,7 +87,9 @@ function startWorker(opts: {
   child.stdout?.on('data', b => { logs += b; });
   child.stderr?.on('data', b => { logs += b; });
   const exited = new Promise<void>(r => child.once('exit', () => r()));
+  let closed = false;
   cleanups.push(async () => {
+    closed = true;
     if (child.connected) child.send({ type: 'close' } satisfies DaemonToWorker);
     const timer = setTimeout(() => { void killProcessTree(child); }, 5000);
     await exited;
@@ -95,6 +107,7 @@ function startWorker(opts: {
     env: {
       FAKE_KIMI_LOG: fakeLog,
       FAKE_KIMI_SCENARIO: opts.scenario,
+      ...(opts.backendType === 'tmux' ? { FAKE_KIMI_START_FILE: startFile } : {}),
       ...(opts.pointer ? { FAKE_KIMI_POINTER: opts.pointer } : {}),
       ...(opts.ignoreEnter ? { FAKE_KIMI_IGNORE_ENTER: '1' } : {}),
       ...(opts.workingDelayMs ? { FAKE_KIMI_WORKING_DELAY_MS: String(opts.workingDelayMs) } : {}),
@@ -102,6 +115,18 @@ function startWorker(opts: {
     ...(opts.auto ? { kimiCacheExpiryAutoCompact: true as const } : {}),
     larkAppId: 'test', larkAppSecret: 'test', apiOnly: true, locale: 'en',
   } satisfies DaemonToWorker);
+  if (opts.backendType === 'tmux') {
+    void (async () => {
+      const piped = [...workerTmuxArgs(env), 'display-message', '-p', '-t', TmuxBackend.sessionName(sessionId), '#{pane_pipe}'];
+      while (!closed && child.exitCode == null) {
+        if (spawnSync('tmux', piped, { env, encoding: 'utf8' }).stdout?.trim() === '1') {
+          writeFileSync(startFile, '');
+          return;
+        }
+        await pause(20);
+      }
+    })();
+  }
 
   const fake = (): FakeEvent[] => existsSync(fakeLog)
     ? readFileSync(fakeLog, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as FakeEvent)

@@ -38,6 +38,7 @@ import {
   type BoardUnlink,
   type BoardView,
   isBoardState,
+  isInstantBatchSource,
   stateInView,
 } from '../core/decision-board/model.js';
 import {
@@ -325,7 +326,7 @@ function migrateHintColumns(db: DatabaseSyncLike): void {
  * 再挂回来会悄悄复位成主群）；已经有群的事项清掉无群原因（否则群删光后显示的是过期原因而不是缺群）。
  */
 /**
- * 拍板卡片的三列：board_batches.source（'card' = 管家群卡片上点的，NULL = 网页）、
+ * 拍板卡片的三列：board_batches.source（'card' = 管家群卡片上点的，'local' = 本机外部客户端，NULL = 网页）、
  * board_decisions.superseded_by（同一项后来又提交了决定时，覆盖它的批次号）、
  * board_decisions.ask_key（决定时待拍板内容的指纹，见 ask-key.ts）。照 migrateChatColumns
  * 按列在不在补，幂等；都可空，旧构建的 SELECT * 与显式列 INSERT 照常工作，不升版本号。
@@ -485,7 +486,7 @@ export class DecisionBoardStore {
           turn_id TEXT,
           delivered_at INTEGER,
           error TEXT,
-          -- 'card' = 管家群拍板卡片上点的；NULL = 网页看板。
+          -- 'card' = 管家群拍板卡片上点的；'local' = 本机外部客户端；NULL = 网页看板。
           source TEXT,
           PRIMARY KEY (app_id, id)
         ) WITHOUT ROWID;
@@ -1374,6 +1375,18 @@ export class DecisionBoardStore {
    * 之后网页再提交就按「以后提交的为准」覆盖这次）。同一个 nonce 重复提交返回已有批次。
    */
   submitCard(appId: string, input: CardSubmitInput, now = Date.now()): { batch: BoardBatch; decision: BoardDecision; duplicate: boolean; supersedes: number[] } {
+    return this.submitSingle(appId, input, 'card', now);
+  }
+
+  /**
+   * 本机外部客户端（`botmux owner-board decide`）的一次决定：和卡片一样一项一批、不经草稿、以后提交的为准，
+   * 批次来源记 'local'，历史里注明「本机客户端」。
+   */
+  submitLocal(appId: string, input: CardSubmitInput, now = Date.now()): { batch: BoardBatch; decision: BoardDecision; duplicate: boolean; supersedes: number[] } {
+    return this.submitSingle(appId, input, 'local', now);
+  }
+
+  private submitSingle(appId: string, input: CardSubmitInput, source: 'card' | 'local', now: number): { batch: BoardBatch; decision: BoardDecision; duplicate: boolean; supersedes: number[] } {
     if (!input.nonce || input.nonce.length > 100) throw new BoardError('invalid_nonce');
     const text = input.text.replace(/\r\n/g, '\n');
     checkLen('说明', text, BOARD_LIMITS.longText);
@@ -1391,21 +1404,23 @@ export class DecisionBoardStore {
       if (choice && !item.options.some(o => o.key === choice)) throw new BoardError('unknown_choice', `没有选项 ${choice}`);
       const id = ((this.stmt('SELECT MAX(id) AS m FROM board_batches WHERE app_id = ?').get(appId) as { m: number | null }).m ?? 0) + 1;
       this.stmt(`INSERT INTO board_batches (app_id, id, author, author_name, nonce, created_at, delivery, attempts, source)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 'card')`).run(appId, id, input.submitter, input.authorName ?? null, input.nonce, now);
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)`).run(appId, id, input.submitter, input.authorName ?? null, input.nonce, now, source);
       const askKey = decisionAskKey(item);
       this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev, ask_key)
         VALUES (?, ?, ?, ?, ?, '[]', ?, ?)`).run(appId, id, item.seq, choice ?? null, text, item.rev, askKey);
       const summary = [choice ? `选 ${choice}` : '', text.trim()].filter(Boolean).join('：');
-      this.insertEvent(appId, item.seq, now, 'owner', input.submitter, 'decision', `${summary}（飞书卡片）`, [], id);
-      const supersedes = this.supersedeEarlier(appId, item.seq, id, 'card', now);
+      this.insertEvent(appId, item.seq, now, 'owner', input.submitter, 'decision',
+        `${summary}${source === 'card' ? '（飞书卡片）' : '（本机客户端）'}`, [], id);
+      // 覆盖只在待拍板时发生（与网页提交同一口径）；卡片本身只在待拍板时可点，待验收的说明逐条都交给管家。
+      const supersedes = item.state === 'decide' ? this.supersedeEarlier(appId, item.seq, id, source, now) : [];
       const decision: BoardDecision = { batchId: id, seq: item.seq, ...(choice ? { choice } : {}), text, fileIds: [], itemRev: item.rev, askKey };
       return { batch: this.getBatch(appId, id)!, decision, duplicate: false, supersedes };
     });
   }
 
   /**
-   * 同一项又有了新决定时，较早的、还没执行的决定以新的为准（以后提交的为准）。只在卡片参与时生效
-   *（新决定来自卡片，或较早的那条来自卡片）：网页上连续提交的几批仍按原来的规则逐批执行。
+   * 同一项又有了新决定时，较早的、还没执行的决定以新的为准（以后提交的为准）。只在点了就交的来源（卡片、
+   * 本机客户端）参与时生效（新决定来自它们，或较早的那条来自它们）：网页上连续提交的几批仍按原来的规则逐批执行。
    *
    *   - 较早那批还没送到管家（pending / failed）：直接作废——记 superseded_by，同时记 handled_at，
    *     它不再算待执行，`--handled` 也不会落到它头上；之后真被投递时消息里写明「不用执行」。
@@ -1420,7 +1435,7 @@ export class DecisionBoardStore {
       JOIN board_batches b ON b.app_id = d.app_id AND b.id = d.batch_id
       WHERE d.app_id = ? AND d.seq = ? AND d.batch_id < ? AND d.handled_at IS NULL AND d.superseded_by IS NULL
       ORDER BY d.batch_id`).all(appId, seq, batchId) as Array<{ batch_id: number; source: string | null; delivery: string }>;
-    const hit = rows.filter(r => source === 'card' || r.source === 'card');
+    const hit = rows.filter(r => isInstantBatchSource(source) || isInstantBatchSource(r.source));
     for (const old of hit) {
       const voided = old.delivery === 'pending' || old.delivery === 'failed';
       this.stmt(`UPDATE board_decisions SET superseded_by = ?, handled_at = CASE WHEN ? THEN ? ELSE handled_at END
@@ -1563,7 +1578,7 @@ function rowToBatch(r: BatchRow): BoardBatch {
     delivery: r.delivery === 'delivered' || r.delivery === 'failed' || r.delivery === 'dispatched' ? r.delivery : 'pending', attempts: r.attempts,
     ...(r.session_id ? { sessionId: r.session_id } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}),
     ...(r.delivered_at ? { deliveredAt: r.delivered_at } : {}), ...(r.error ? { error: r.error } : {}),
-    ...(r.source === 'card' ? { source: 'card' as const } : {}),
+    ...(r.source === 'card' || r.source === 'local' ? { source: r.source } : {}),
   };
 }
 

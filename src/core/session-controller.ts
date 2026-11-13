@@ -368,7 +368,10 @@ export class SessionController {
       if (!proven || (context.scope.runtime && !sameRuntime(context.scope.runtime, proven.scope.runtime))
         || (context.scope.execution && proven.scope.execution && context.scope.execution.executionId !== proven.scope.execution.executionId)) return { kind: 'reject', reason: 'output_origin_conflict' };
     }
-    if (!context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
+    // A native conversation ID observes the runtime even when its opening
+    // input is still queued. Do not reconstruct execution authority from the
+    // notification's display-only turnId (or create an input admission for it).
+    if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
       const preliminary = this.gateway.admit(message.type, context, channel);
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);

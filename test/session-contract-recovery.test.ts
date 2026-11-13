@@ -169,8 +169,20 @@ describe('user input during control operations', () => {
     s.controller.controlResult(operation.operationId, 'confirmed', runtime);
     expect(() => s.controller.bindRuntime('replacement', s.worker, { ...bare, physicalId: '333:other' }, operation.operationId)).toThrow('runtime_identity_changed');
     s.controller.beginControl('close');
+    // Same-executor enrichment completes the identity without retiring the
+    // runtime, but the closing lifecycle still owns the control fence.
+    const before = s.store.runtime(s.ref, runtime.runtimeId)!;
     const bound = s.controller.bindRuntime('replacement', s.worker, { ...bare, nativeSessionId: 'replacement-native' }, operation.operationId);
-    expect(bound.phase).toBe('retiring');
+    expect(bound.phase).toBe(before.phase);
+    expect(bound.phase).not.toBe('retiring');
+    expect(s.store.read(s.ref)?.activeRuntime).toEqual(runtime);
+    expect(s.controller.acceptsUserInput()).toBe(false);
+    // Once the close settles, the session stays closed and keeps refusing input;
+    // the reducer-level closed fence for a later binding is pinned separately in
+    // session-contract.test.ts's reducer fence cases.
+    const close = s.store.read(s.ref)?.activeOperationId!;
+    s.controller.controlResult(close, 'confirmed');
+    expect(s.store.read(s.ref)?.lifecycle).toBe('closed');
     expect(s.controller.acceptsUserInput()).toBe(false);
   });
 

@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.214.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Use /skills to list available skills.
+
+
+▍ ask me
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Question 2/3 (1 unanswered)
+  Which features do you want to enable?
+
+    [✓] 1. Caching  Redis in front of the database
+    [ ] 2. Metrics  Prometheus exporter
+  ❯ [✓] 3. Tracing  OpenTelemetry spans
+    [ ] 4. Other    Optionally, add details in notes (tab).
+
+  space toggle  |  tab add notes  |  enter submit answer  |  ←/→ navigate questions  |  esc interrupt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
