@@ -1,7 +1,13 @@
-import { registerApp } from '@larksuiteoapi/node-sdk';
+// 命名空间导入而非 `import { registerApp }`：bun:test 下大量测试用
+// vi.mock('@larksuiteoapi/node-sdk', 工厂) 做部分 mock，工厂只列各自用到的名字。
+// event-dispatcher 静态引入本模块后，命名导入会在模块链接期对缺失的 registerApp
+// 直接抛 SyntaxError，让所有部分 mock 的 bun 腿测试加载即失败；命名空间导入只在
+// 取属性时得到 undefined，不阻断模块图加载（真正调用注册的测试都显式 mock 了它）。
+// 与 event-dispatcher、bot-registry 等既有 SDK 引用方式保持一致。
+import * as LarkSdk from '@larksuiteoapi/node-sdk';
 import qrcode from 'qrcode-terminal';
 
-type SdkOptions = Parameters<typeof registerApp>[0];
+type SdkOptions = Parameters<typeof LarkSdk.registerApp>[0];
 
 export type RegisterBrand = 'feishu' | 'lark';
 
@@ -82,7 +88,7 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
   let switchedToLark = false;
   let linkShown = false;
   try {
-    const result = await registerApp({
+    const result = await LarkSdk.registerApp({
       signal: opts.signal,
       source: 'botmux',
       addons: opts.addons,
