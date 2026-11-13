@@ -10,6 +10,17 @@ import {
   reasoningEffortsForCliModel,
 } from '../src/services/codex-reasoning-effort.js';
 
+describe('Doubao CLI reasoning efforts', () => {
+  it('offers the five CLI levels independently of the provider model and rejects ultra', () => {
+    expect(isConfigurableReasoningCliId('doubao')).toBe(true);
+    for (const model of [undefined, 'Auto', '豆包 2.1 Lite', '豆包 2.1 Pro', 'DeepSeek V4.1 Flash', 'GPT-6.1 Sol', '豆包 2.1 Turbo', 'future-model']) {
+      expect(reasoningEffortsForCliModel('doubao', model)).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+      expect(cliModelSupportsReasoningEffort('doubao', model, 'max')).toBe(true);
+      expect(cliModelSupportsReasoningEffort('doubao', model, 'ultra')).toBe(false);
+    }
+  });
+});
+
 describe('Kimi managed K3 reasoning efforts', () => {
   it('accepts only the native K3 levels on managed K3 model aliases', () => {
     expect(isConfigurableReasoningCliId('kimi')).toBe(true);
