@@ -34,12 +34,12 @@ export interface RiffHostContext {
 }
 
 // The remote caller supplies content and supported options, never an executable,
-// environment, host path, destination session or application. Existing CLI and
-// daemon policies still authorize the resulting operation.
+// environment, host path, destination session or application. Requested chat
+// destinations are authorized by the daemon, just like sandbox outbox sends.
 const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; files?: string }> = {
   send: {
-    values: '--response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
-    bools: '--mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card',
+    values: '--chat-id --response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
+    bools: '--top-level --mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card',
     files: '--content-file --card-file --images --image --files --file --videos --video-covers --completion-proposal-file',
   },
   ask: { sub: ['buttons'], values: '--options --timeout', bools: '--json --multi', files: '--questions-file' },
@@ -52,6 +52,7 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
   history: { values: '--limit --scope', bools: '--with-card-json' },
   quoted: { bools: '--raw' },
   bots: { sub: ['list'], values: '--scope' },
+  chat: { sub: ['create', 'members'], values: '--name --member --chat-mode --chat-id', bools: '--json' },
   project: {
     sub: ['init', 'status', 'update', 'close', 'resume'],
     values: '--title --goal --phase --focus --remaining --progress --blocker --milestone --next-milestone',

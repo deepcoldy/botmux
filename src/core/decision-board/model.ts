@@ -173,12 +173,17 @@ export interface BoardBatch {
   turnId?: string;
   deliveredAt?: number;
   error?: string;
-  /** 从哪里提交的：飞书拍板卡片为 'card'；缺省 = 网页看板。 */
+  /** 从哪里提交的：飞书拍板卡片为 'card'，本机外部客户端（`botmux owner-board`）为 'local'；缺省 = 网页看板。 */
   source?: BatchSource;
 }
 
-/** 批次来源：网页看板（缺省）或管家群里的拍板卡片。 */
-export type BatchSource = 'web' | 'card';
+/** 批次来源：网页看板（缺省）、管家群里的拍板卡片，或本机外部客户端。 */
+export type BatchSource = 'web' | 'card' | 'local';
+
+/** 一项一批、点了就交的来源（卡片、本机客户端）：同一项以后提交的为准。 */
+export function isInstantBatchSource(source: BatchSource | string | null | undefined): boolean {
+  return source === 'card' || source === 'local';
+}
 
 export interface BoardDecision {
   batchId: number;
@@ -189,7 +194,7 @@ export interface BoardDecision {
   itemRev: number;
   handledAt?: number;
   /**
-   * 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号。还没送到管家时同时记
+   * 同一项后来又提交了决定（卡片、本机客户端参与时以后提交的为准）：覆盖它的批次号。还没送到管家时同时记
    * handledAt（作废）；已送到的仍待执行，由管家按实际情况 --handled。
    */
   supersededBy?: number;
@@ -830,8 +835,10 @@ export interface BatchMessageEntry {
   fileCount: number;
   /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
   primaryChat?: { text: string; url: string };
-  /** 在管家群的拍板卡片上点的（缺省 = 网页看板）。 */
+  /** 在管家群的拍板卡片上点的、或本机外部客户端提交的（缺省 = 网页看板）。 */
   source?: BatchSource;
+  /** 提交之后管家改过问题或选项：选项键可能已经换了意思，不附现在的选项原文。 */
+  optionsChanged?: boolean;
   /** 这次决定作废了这些较早批次里对同一项的决定（以后提交的为准；它们还没送到管家，不用执行）。 */
   supersedes?: number[];
   /**
@@ -884,14 +891,19 @@ export function formatBatchEntries(
     if (e.primaryChat) lines.push(`${zh ? '主群：' : 'Main chat: '}${e.primaryChat.text.replace(/\s+/g, ' ').trim()} ${e.primaryChat.url}`);
     if (e.choice) {
       const tag = e.recommended ? (zh ? '（管家推荐）' : ' (recommended)') : '';
+      const changed = e.optionsChanged
+        ? (zh ? '（提交后你改过问题或选项，这个键现在可能是别的意思，先按提交时的意思和 owner 核对）'
+          : ' (you changed the question or options after it was submitted; this key may mean something else now, confirm with the owner)')
+        : '';
       lines.push(zh
-        ? `选：${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`
-        : `Choice: ${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`);
+        ? `选：${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}${changed}`
+        : `Choice: ${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}${changed}`);
     } else {
       lines.push(zh ? '选：未选' : 'Choice: none');
     }
     // 来源与覆盖关系紧跟「选」：放在多行说明后面会像说明的一部分。
     if (e.source === 'card') lines.push(zh ? '来源：管家群的拍板卡片' : 'Source: decision card in the steward chat');
+    if (e.source === 'local') lines.push(zh ? '来源：本机客户端' : 'Source: a local client on this machine');
     const ids = (list: number[]) => list.map(id => `#${id}`).join(zh ? '、' : ', ');
     if (e.supersedes?.length) {
       lines.push(zh

@@ -740,4 +740,272 @@ describe('project workstream attachments', () => {
     });
     expect(f.registry().om_topic.lastReport).toBeUndefined();
   });
+
+  it('stores human-readable botName in owners on attach and upgrades legacy appId owners on reconcile', async () => {
+    const f = await fixture();
+    f.source().botName = 'BotAlpha';
+    await f.service.attach(f.actor, f.request);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners).toEqual(['BotAlpha']);
+
+    // Simulate legacy stored row with raw appId owner, then reconcile.
+    await mutateProjectGroup(f.dataDir, 'oc_group', current => {
+      current!.workstreams[0]!.owners = ['cli_worker'];
+      return current;
+    });
+    await f.service.reconcile(f.actor);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners).toEqual(['BotAlpha']);
+  });
+
+  it('allows coordinator manual status update on an ordinary dispatched workstream with verified binding', async () => {
+    const f = await fixture();
+    await f.coordinator.run(f.context, {
+      action: 'dispatch',
+      dispatchRoot: 'om_ordinary_dispatch',
+      title: '历史补跑任务：评估与停用',
+      purpose: '评估并停用自动补跑任务',
+      owners: ['BotAlpha'],
+      status: 'in_progress',
+      progress: 20,
+    });
+    await updateDispatchRegistry(join(f.dataDir, 'orchestrate-dispatch.json'), registry => {
+      registry.om_ordinary_dispatch = {
+        orchChatId: f.actor.chatId,
+        orchScope: 'chat',
+        orchAppId: f.actor.larkAppId,
+        orchSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetAppIds: ['cli_worker'],
+        title: '历史补跑任务：评估与停用',
+        status: 'accepted',
+        createdAt: '2026-11-10T00:00:00.000Z',
+        updatedAt: '2026-11-10T00:00:00.000Z',
+        reportBinding: createDispatchReportBinding(SECRET, {
+          dispatchRoot: 'om_ordinary_dispatch',
+          targetLarkAppId: f.actor.larkAppId,
+          targetSessionId: f.actor.sessionId,
+          targetChatId: f.actor.chatId,
+          targetScope: 'chat',
+          sourceName: '历史补跑任务：评估与停用',
+          issuedAt: '2026-11-10T00:00:00.000Z',
+        }),
+      };
+    });
+
+    const res = await f.service.update(f.actor, {
+      rootMessageId: 'om_ordinary_dispatch',
+      status: 'completed',
+      progress: 100,
+      content: '子项目已完成：评估停用收口',
+    });
+    expect(res).toMatchObject({ registered: true, cardSynced: true });
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]).toMatchObject({
+      dispatchRoot: 'om_ordinary_dispatch',
+      status: 'completed',
+      progress: 100,
+      lastReport: '子项目已完成：评估停用收口',
+    });
+    expect(f.registry().om_ordinary_dispatch.lastReport).toMatchObject({
+      status: 'completed',
+      line: '子项目已完成：评估停用收口',
+    });
+  });
+
+  async function seedOrdinaryDispatch(
+    f: Awaited<ReturnType<typeof fixture>>,
+    rootMessageId: string,
+    entryMutate: (entry: Record<string, unknown>) => void,
+  ): Promise<void> {
+    await f.coordinator.run(f.context, {
+      action: 'dispatch',
+      dispatchRoot: rootMessageId,
+      title: '普通派单任务',
+      purpose: '验证收口边界',
+      owners: ['BotAlpha'],
+      status: 'in_progress',
+      progress: 20,
+    });
+    await updateDispatchRegistry(join(f.dataDir, 'orchestrate-dispatch.json'), registry => {
+      const entry: Record<string, unknown> = {
+        orchChatId: f.actor.chatId,
+        orchScope: 'chat',
+        orchAppId: f.actor.larkAppId,
+        orchSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetAppIds: ['cli_worker'],
+        title: '普通派单任务',
+        status: 'accepted',
+        createdAt: '2026-11-10T00:00:00.000Z',
+        updatedAt: '2026-11-10T00:00:00.000Z',
+      };
+      entryMutate(entry);
+      registry[rootMessageId] = entry;
+    });
+  }
+
+  it('refuses manual update on an ordinary dispatch whose signed binding targets another coordinator', async () => {
+    const f = await fixture();
+    await seedOrdinaryDispatch(f, 'om_foreign_binding', entry => {
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_foreign_binding',
+        targetLarkAppId: 'cli_other_coordinator',
+        targetSessionId: 'other-session',
+        targetChatId: 'oc_other_chat',
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+      });
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_foreign_binding',
+      status: 'completed',
+      progress: 100,
+      content: '越权收口必须被拒绝',
+    })).rejects.toThrow('workstream_not_found');
+    const item = readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === 'om_foreign_binding')!;
+    expect(item).toMatchObject({ status: 'in_progress', progress: 20 });
+    expect(item.lastReport).toBeUndefined();
+    expect(f.registry().om_foreign_binding.lastReport).toBeUndefined();
+  });
+
+  it('refuses manual update when the registry row already belongs to an imported attachment', async () => {
+    const f = await fixture();
+    // Attachment marker on the registry row wins regardless of binding shape.
+    await seedOrdinaryDispatch(f, 'om_marked_attachment', entry => {
+      entry.projectAttachmentOperationId = 'op-imported-elsewhere';
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_marked_attachment',
+        targetLarkAppId: f.actor.larkAppId,
+        targetSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+      });
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_marked_attachment',
+      status: 'completed',
+      content: '迁入登记行不得走普通派单收口',
+    })).rejects.toThrow('workstream_root_already_registered');
+
+    // A signed attachment payload without the operation marker must also stay on the imported path.
+    await seedOrdinaryDispatch(f, 'om_signed_attachment', entry => {
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_signed_attachment',
+        targetLarkAppId: f.actor.larkAppId,
+        targetSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+        attachment: {
+          sourceSessionId: 'source-one',
+          sourceLarkAppId: 'cli_worker',
+          ownerKey: 'union:on_owner',
+          sourceRouteRevision: 1,
+          revision: 1,
+          state: 'active',
+          reportCapability: 'verified',
+        },
+      });
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_signed_attachment',
+      status: 'completed',
+      content: '带 attachment 的签名不得走普通派单收口',
+    })).rejects.toThrow('workstream_not_found');
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === 'om_signed_attachment')!)
+      .toMatchObject({ status: 'in_progress', progress: 20 });
+  });
+
+  it('passes resolveCardRuntime into published project card JSON', async () => {
+    const f = await fixture();
+    f.transport.resolveCardRuntime = vi.fn(async () => ({
+      ownerDisplayNames: { cli_worker: 'BotAlpha' },
+      sessionFactsByRoot: {
+        om_topic: { status: 'idle', lastTurn: { turnId: 'om_turn_1', outcome: 'delivered', at: Date.now() } },
+      },
+    }));
+    await f.service.attach(f.actor, f.request);
+    const lastCardPayload = vi.mocked(f.transport.updateCard).mock.calls.at(-1)?.[2] ?? '';
+    expect(lastCardPayload).toContain('BotAlpha');
+    expect(lastCardPayload).not.toContain('cli_worker');
+    expect(lastCardPayload).toContain('等回复');
+  });
+
+  it('refuses manual update when the signed binding differs from this coordinator in app only or chat only', async () => {
+    const f = await fixture();
+    const cases = [
+      { root: 'om_other_app', targetLarkAppId: 'cli_other_coordinator', targetChatId: f.actor.chatId },
+      { root: 'om_other_chat', targetLarkAppId: f.actor.larkAppId, targetChatId: 'oc_other_chat' },
+    ];
+    for (const item of cases) {
+      await seedOrdinaryDispatch(f, item.root, entry => {
+        entry.reportBinding = createDispatchReportBinding(SECRET, {
+          dispatchRoot: item.root,
+          targetLarkAppId: item.targetLarkAppId,
+          targetSessionId: f.actor.sessionId,
+          targetChatId: item.targetChatId,
+          targetScope: 'chat',
+          sourceName: '普通派单任务',
+          issuedAt: '2026-11-10T00:00:00.000Z',
+        });
+      });
+      await expect(f.service.update(f.actor, {
+        rootMessageId: item.root, status: 'completed', content: '越权收口必须被拒绝',
+      }), item.root).rejects.toThrow('workstream_not_found');
+      const row = readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === item.root)!;
+      expect(row, item.root).toMatchObject({ status: 'in_progress', progress: 20 });
+      expect(f.registry()[item.root].lastReport, item.root).toBeUndefined();
+    }
+  });
+
+  it('does not record a registry report when the project generation changes before the manual update commits', async () => {
+    const f = await fixture();
+    await seedOrdinaryDispatch(f, 'om_generation_race', entry => {
+      entry.reportBinding = createDispatchReportBinding(SECRET, {
+        dispatchRoot: 'om_generation_race',
+        targetLarkAppId: f.actor.larkAppId,
+        targetSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetScope: 'chat',
+        sourceName: '普通派单任务',
+        issuedAt: '2026-11-10T00:00:00.000Z',
+      });
+    });
+    // The project is re-created after the registry check but before the business write commits.
+    f.projectRun.mockImplementationOnce(async (ctx, action, beforeApply) => {
+      await mutateProjectGroup(f.dataDir, 'oc_group', current => {
+        current!.createdAt = '2026-11-11T00:00:00.000Z';
+        return current;
+      });
+      return f.coordinator.run(ctx, action, beforeApply);
+    });
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_generation_race', status: 'completed', progress: 100, content: '旧一代项目的收口',
+    })).rejects.toThrow('project_generation_changed');
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams.find(i => i.dispatchRoot === 'om_generation_race'))
+      .toMatchObject({ status: 'in_progress', progress: 20 });
+    expect(f.registry().om_generation_race.lastReport).toBeUndefined();
+  });
+
+  it('only replaces an owner that is exactly the raw source app id; human-entered owners survive attach and reconcile', async () => {
+    const f = await fixture();
+    f.source().botName = 'BotAlpha';
+    await f.coordinator.run(f.context, {
+      action: 'dispatch', dispatchRoot: 'om_topic', title: '已有子任务', purpose: '人工维护负责人',
+      owners: ['人工负责人'], status: 'in_progress', progress: 30,
+    });
+    await f.service.attach(f.actor, f.request);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners).toEqual(['人工负责人']);
+
+    for (const owners of [['另一位负责人'], ['cli_worker', '协作负责人']]) {
+      await mutateProjectGroup(f.dataDir, 'oc_group', current => {
+        current!.workstreams[0]!.owners = owners;
+        return current;
+      });
+      await f.service.reconcile(f.actor);
+      expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners, owners.join(',')).toEqual(owners);
+    }
+  });
 });

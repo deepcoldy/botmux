@@ -24,6 +24,12 @@
 // - rawStatus/raw fields let diagnostics keep the original SessionRow view
 //   without any consumer re-inferring canonical fields.
 
+import {
+  deriveSessionTaskStatus,
+  type NeedsYouReason,
+  type SessionTaskKind,
+} from '../core/session-task-status.js';
+
 export const OBSERVE_SCHEMA_VERSION = 1 as const;
 
 export type ObserveLiveness = 'alive' | 'not_running' | 'closed' | 'unknown';
@@ -73,6 +79,24 @@ export interface ObserveContext {
   compactions: number | null;
   measuredAt: number;
   source: string;
+}
+
+/** Task status from `deriveSessionTaskStatus()` (core/session-task-status.ts),
+ *  the same derivation the Dashboard board, table and decision board use.
+ *  Only fields that apply to `kind` are present:
+ *  - needs_you: `reason`, optional `detail` (raise reason or error code) and `at`;
+ *  - working: optional `busySinceAt`;
+ *  - delivered: `at` and optional `summary` (first line of the final reply);
+ *  - unfinished: `remaining` open TODOs;
+ *  - closed: optional `at` (closedAt). */
+export interface ObserveTask {
+  kind: SessionTaskKind;
+  reason?: NeedsYouReason;
+  detail?: string;
+  at?: number;
+  busySinceAt?: number;
+  summary?: string;
+  remaining?: number;
 }
 
 export interface ObserveSession {
@@ -130,6 +154,9 @@ export interface ObserveSession {
    *  Codex session whose transcript has a usable measurement; bulk listings skip
    *  transcript scans and therefore never carry it. */
   context?: ObserveContext;
+  /** Present only when requested (`--include-task`) and the daemon answered
+   *  with a known runtime status. */
+  task?: ObserveTask;
   rawStatus?: string;
   raw?: unknown;
 }
@@ -182,6 +209,37 @@ function normalizeContext(raw: unknown): ObserveContext | undefined {
   return { usedTokens, windowTokens, compactions, measuredAt, source: c.source };
 }
 
+/** Project the shared task-status derivation; no re-derivation here. */
+export function observeTaskFromRow(row: RawSessionRow, now: number): ObserveTask {
+  const status = deriveSessionTaskStatus(row, now);
+  switch (status.kind) {
+    case 'needs_you':
+      return {
+        kind: status.kind,
+        reason: status.reason,
+        ...(status.detail ? { detail: status.detail } : {}),
+        ...(status.at !== undefined ? { at: status.at } : {}),
+      };
+    case 'working':
+      return { kind: status.kind, ...(status.since !== undefined ? { busySinceAt: status.since } : {}) };
+    case 'delivered':
+      return { kind: status.kind, at: status.at, ...(status.summary ? { summary: status.summary } : {}) };
+    case 'unfinished':
+      return { kind: status.kind, remaining: status.remaining };
+    case 'closed':
+      return { kind: status.kind, ...(status.at !== undefined ? { at: status.at } : {}) };
+    case 'idle':
+      return { kind: status.kind };
+  }
+}
+
+/** `--active` / `--since`: not closed, and either resident or active within the window. */
+export function isRecentlyActiveObserveSession(session: ObserveSession, cutoff: number): boolean {
+  if (session.closed === true) return false;
+  if (session.liveness === 'alive') return true;
+  return session.lastActivityAt !== undefined && session.lastActivityAt >= cutoff;
+}
+
 /**
  * Normalize a raw daemon SessionRow (whatever shape `GET /api/sessions` emits)
  * into the canonical ObserveSession. Never inspects live processes, backends,
@@ -195,7 +253,7 @@ function normalizeContext(raw: unknown): ObserveContext | undefined {
  */
 export function normalizeSessionRow(
   row: RawSessionRow,
-  options: { observedAt: number; probe?: ObserveProbe; includeRaw?: boolean },
+  options: { observedAt: number; probe?: ObserveProbe; includeRaw?: boolean; includeTask?: boolean },
 ): ObserveSession {
   const probe = options.probe ?? { status: 'ok', source: 'daemon-ipc' };
   const hasRuntimeFacts = probe.status === 'ok';
@@ -320,6 +378,7 @@ export function normalizeSessionRow(
       };
     }
   }
+  if (options.includeTask && hasKnownStatus) observe.task = observeTaskFromRow(row, options.observedAt);
   if (hasRuntimeFacts && status) observe.rawStatus = status;
   if (hasRuntimeFacts && options.includeRaw) observe.raw = row;
 

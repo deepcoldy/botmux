@@ -28,6 +28,8 @@ import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, codexCleanupArchiveEnabled, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
 import { privateReplyEnabled } from './private-reply.js';
+import { GoalStatusCardController, goalStatusCardOrigin } from './goal-status-card.js';
+import { updateCardJson } from '../im/lark/client.js';
 import { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
 export { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
@@ -18286,6 +18288,9 @@ function forkWorkerPrepared(
     // Full local-address rule in the system prompt; like leadOnly it is read
     // when a worker process is forked. Rewriting replies reads the live value.
     ...(botCfg.hideLocalAddresses === true ? { hideLocalAddresses: true as const } : {}),
+    // Opt-in native goal status card: the worker reads the CLI goal store only
+    // when this is on at worker start; the daemon also checks the live value.
+    ...(botCfg.goalStatusCard === true ? { goalStatusCard: true as const } : {}),
     // Per-session 缓存过期自动压缩 (core/kimi-cache-expiry.ts); later toggles
     // reach the live worker as `kimi_cache_expiry_auto_compact`.
     ...(isKimiCacheExpiryAutoCompactEnabled(ds.session) ? { kimiCacheExpiryAutoCompact: true as const } : {}),
@@ -18832,6 +18837,13 @@ function setupWorkerHandlers(
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => scopedReplyTo(sessionAnchorId(ds), ds.larkAppId, content, msgType, turnId, opts);
+  let goalStatusCard: GoalStatusCardController | undefined;
+  let goalCardEntity: { messageId: string; cardId: string } | undefined;
+  const goalCardOwns = () => {
+    if (!ownsWorkerSession() || ds.session.status === 'closed') return false;
+    try { return !getBot(ds.larkAppId).config.apiOnly && !privateReplyEnabled(ds.session); }
+    catch { return false; }
+  };
   const ordinaryManagedSuppression = (
     turnId?: string,
     dispatchAttempt?: number,
@@ -18869,6 +18881,17 @@ function setupWorkerHandlers(
     // the load-bearing "手动@不回复" fix.)
     if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
+  };
+  // Opt-in bot switch, read live: turning it off stops cards immediately. It is
+  // not part of goalCardOwns, which also decides whether a goal is born hidden.
+  const goalCardEnabled = () => {
+    try { return getBot(ds.larkAppId).config.goalStatusCard === true; }
+    catch { return false; }
+  };
+  const goalCardCanDisplay = () => {
+    const origin = ds.session.nativeGoalCardOrigin;
+    return goalCardEnabled() && goalCardOwns() && origin?.hidden === false && !managedAuxUiSuppressed(origin.turnId, origin.dispatchAttempt)
+      && !isSubstituteTurn(ds, origin.turnId) && !isTriggerFinalSuppressed(ds, origin.turnId);
   };
   // Opt-in, daemon-owned watchdog: it still ticks when the CLI/model stops
   // producing events. Never run it for App, synthetic turns or silent listeners.
@@ -20802,6 +20825,66 @@ function setupWorkerHandlers(
         if (ds.scope === 'chat' && ds.chatType === 'group') {
           acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
         }
+        break;
+      }
+
+      case 'goal_update': {
+        if (!ownsWorkerSession()) break;
+        const binding = `${ds.larkAppId}:${ds.chatId}:${sessionAnchorId(ds)}:${ds.session.sessionId}`;
+        if (msg.goal) {
+          const hidden = !goalCardOwns() || ds.session.headless || !!ds.adoptedFrom || !!ds.session.vcMeetingReceiver || isDocNativeSession(ds)
+            || !ds.chatId.startsWith('oc_') || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+            || isSubstituteTurn(ds, msg.turnId) || isTriggerFinalSuppressed(ds, msg.turnId);
+          const origin = goalStatusCardOrigin(ds.session.nativeGoalCardOrigin, msg.goal, {
+            binding, turnId: fallbackTurnId(ds, msg.turnId), dispatchAttempt: msg.dispatchAttempt, hidden: !!hidden,
+          });
+          if (JSON.stringify(origin) !== JSON.stringify(ds.session.nativeGoalCardOrigin)) {
+            const previousOrigin = ds.session.nativeGoalCardOrigin;
+            ds.session.nativeGoalCardOrigin = origin;
+            try { sessionStore.updateSession(ds.session); }
+            catch (error) { ds.session.nativeGoalCardOrigin = previousOrigin; throw error; }
+          }
+        }
+        if (!goalCardCanDisplay()) {
+          goalStatusCard?.suspend();
+          if (msg.signature) worker.send({ type: 'goal_update_ack', signature: msg.signature });
+          break;
+        }
+        if (!goalStatusCard || goalStatusCard.isDisposed) goalStatusCard = new GoalStatusCardController({
+          binding,
+          read: () => ds.session.nativeGoalStatusCard,
+          save: record => {
+            const previous = ds.session.nativeGoalStatusCard;
+            ds.session.nativeGoalStatusCard = record;
+            try { sessionStore.updateSession(ds.session); }
+            catch (error) { ds.session.nativeGoalStatusCard = previous; throw error; }
+          },
+          owns: goalCardOwns,
+          canDisplay: goalCardCanDisplay,
+          // TOPIC_SEND_CHECK_FAILED is a lookup that may succeed next tick; only a
+          // proven withdrawal retires the card.
+          isTerminalError: error => error instanceof MessageWithdrawnError || error instanceof MessageUpdateExpiredError
+            || error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED',
+          locale: localeForBot(ds.larkAppId) === 'en' ? 'en' : 'zh',
+          warn: error => logger.warn(`[${t}] Goal status card update failed: ${error instanceof Error ? error.message : String(error)}`),
+          post: (card, uuid, turnId) => scopedReply(card, 'interactive', turnId, {
+            uuid, suppressHook: true, beforeWrite: () => { if (!goalCardCanDisplay()) throw new Error('goal card owner retired'); },
+          }),
+          patch: async (messageId, card, sequence, uuid) => {
+            if (goalCardEntity?.messageId !== messageId) {
+              // Convert first: it classifies a withdrawn card, while the chat
+              // lookup of a withdrawn message only yields null.
+              const cardId = await resolveCardKitId(ds.larkAppId, messageId);
+              if (await getMessageChatId(ds.larkAppId, messageId) !== ds.chatId) throw new Error('goal card chat mismatch');
+              goalCardEntity = { messageId, cardId };
+            }
+            return updateCardJson(ds.larkAppId, goalCardEntity.cardId, messageId, card, sequence, uuid, {
+              beforeWrite: () => { if (!goalCardCanDisplay()) throw new Error('goal card owner retired'); },
+            });
+          },
+        });
+        goalStatusCard.update(msg.goal, msg.turnId);
+        if (msg.signature) worker.send({ type: 'goal_update_ack', signature: msg.signature });
         break;
       }
 

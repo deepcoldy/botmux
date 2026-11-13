@@ -355,20 +355,25 @@ main:has(.sessions-page) {
   overflow: hidden;
 }
 
+/* 宽屏整页纵向 flex：视图舞台伸缩占满剩余高度，其余子元素（含文档评论失败块、已关闭
+   会话分页提示、批量操作栏等可选块）按真实高度排。别改回按位置枚举的
+   grid-template-rows：多渲染一个可选块，给舞台的 1fr 行就落到它头上、塌成 0 高，
+   内容压到看板列头 / 表头下面；也别改成全 auto 行：列表短时剩余高度会平摊给标题、
+   筛选栏，把它们拉高。 */
 main:has(.sessions-page) .sessions-page {
+  display: flex;
+  flex-direction: column;
   height: 100%;
   min-height: 0;
-  /* rows: 标题 / 运行时统计 / 筛选栏 / 批量操作栏 / 视图舞台(占满剩余) */
-  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 
-main:has(.sessions-page) .sessions-page:not(:has(#bulk-bar:not([hidden]))) {
-  /* 批量操作栏隐藏(display:none 退出 grid)时少一行 */
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+main:has(.sessions-page) .sessions-page > * {
+  flex: none;
 }
 
 main:has(.sessions-page) .sessions-view-stage {
+  flex: 1 1 0;
   min-height: 0;
   overflow: hidden;
 }
@@ -5932,12 +5937,22 @@ dialog.onboarding-dialog::backdrop {
   line-height: 1.4;
 }
 
-#g-drawer .g-card-section-config {
+#g-drawer .g-card-section-config,
+#g-drawer .g-card-completed-display {
   display: grid;
   gap: 6px;
+  min-width: 0;
   color: var(--muted);
   font-size: var(--fs-12);
   font-weight: var(--fw-s);
+}
+
+#g-drawer .g-card-completed-display select {
+  width: 100%;
+  min-height: var(--button-height);
+  margin: 0;
+  border-color: var(--border-strong);
+  background: var(--surface);
 }
 
 #g-drawer .g-card-section-grid {
@@ -26575,15 +26590,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
     -webkit-overflow-scrolling: touch;
   }
 
+  /* 窄屏整页随 main 滚动、高度交还内容：退回 .page 的普通 grid（全是 auto 行），
+     宽屏那套「舞台占满剩余」的 flex 在这里不适用。 */
   main:has(.sessions-page) .sessions-page {
+    display: grid;
     height: auto;
     min-height: 100%;
-    grid-template-rows: none;
     overflow: visible;
-  }
-
-  main:has(.sessions-page) .sessions-page:not(:has(#bulk-bar:not([hidden]))) {
-    grid-template-rows: none;
   }
 
   main:has(.sessions-page) .sessions-heading-main,

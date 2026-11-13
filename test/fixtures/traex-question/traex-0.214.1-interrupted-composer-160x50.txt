@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.214.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Use /skills to list available skills.
+
+
+▍ ask me
+
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ok ─
+❯ Run /review on my current changes
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-model · /tmp/repo · Context 100% left
+  ☢ Full Access (shift+tab to cycle) · ? for shortcuts · ← for agents
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

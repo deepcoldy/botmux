@@ -129,11 +129,20 @@ export async function mutateProjectGroup(
   return result;
 }
 
+export function isVisibleProjectWorkstream(item: ProjectWorkstream): boolean {
+  return item.attachment?.state !== 'moved';
+}
+
+export function visibleProjectWorkstreams(project: ProjectGroupState): ProjectWorkstream[] {
+  return project.workstreams.filter(isVisibleProjectWorkstream);
+}
+
 export function projectOverallProgress(project: ProjectGroupState): number {
   if (project.manualProgress !== undefined) return project.manualProgress;
-  if (project.workstreams.length === 0) return project.status === 'completed' ? 100 : 0;
-  const total = project.workstreams.reduce((sum, item) => sum + item.progress, 0);
-  return Math.round(total / project.workstreams.length);
+  const visible = visibleProjectWorkstreams(project);
+  if (visible.length === 0) return project.status === 'completed' ? 100 : 0;
+  const total = visible.reduce((sum, item) => sum + item.progress, 0);
+  return Math.round(total / visible.length);
 }
 
 const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
@@ -146,7 +155,8 @@ export function projectTitleWithoutTaskMarker(title: string): string {
 
 export function projectRemainingSummary(project: ProjectGroupState): string {
   if (project.remaining?.trim()) return project.remaining.trim();
-  if (project.workstreams.length === 0) return project.status === 'completed' ? '无' : '待拆解';
-  const pending = project.workstreams.filter(item => item.status !== 'completed').length;
+  const visible = visibleProjectWorkstreams(project);
+  if (visible.length === 0) return project.status === 'completed' ? '无' : '待拆解';
+  const pending = visible.filter(item => item.status !== 'completed').length;
   return pending === 0 ? '无' : `${pending} 个子任务`;
 }
