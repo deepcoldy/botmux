@@ -1,5 +1,5 @@
 /* Token usage: reuse the dashboard panels and color tokens in every skin. */
-.usage-page { display: flex; flex-direction: column; gap: 18px; }
+.page.usage-page { display: flex; flex-direction: column; gap: 18px; }
 .usage-page .sect-header { margin-bottom: 0; }
 .usage-page .sect-header p, .usage-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0 0; }
 .usage-page .panel { padding: 20px; min-width: 0; }
