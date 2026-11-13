@@ -91,7 +91,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
-    if (typeof key === 'string' && ['revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { TraexAutoModelController, traexAutoModelPreflightEnabled } from '../src/services/traex-auto-model.js';
 import { traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible } from '../src/adapters/cli/traex.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { beginRuntimeWriteCycle } from '../src/utils/runtime-screen-status.js';
 import { finalizeRawCommandDelivery } from '../src/core/raw-command-writer.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
+import { sendTuiKeySequence, submitTuiTextInput } from '../src/utils/tui-input-delivery.js';
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -201,4 +202,96 @@ describe('idle auto-model input after a transient admission refusal', () => {
     expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
     expect(scope.pendingMessages).toHaveLength(1);
   });
+
+  it('invalidates capture when a later key in a paused control sequence is written', async () => {
+    vi.useFakeTimers();
+    const h = idleAdmissionHarness();
+    const { scope } = h;
+    Object.assign(scope, {
+      cliLifetimeNonce: 1, logError: vi.fn(), KEY_TO_ANSI: {}, sendTuiKeySequence,
+    });
+    scope.backend.sendSpecialKeys = vi.fn(() => true);
+    scope.runAfterAmbiguousSubmissionWrites = loadWorkerFunction('runAfterAmbiguousSubmissionWrites', scope);
+    scope.handleTuiKeysDirect = loadWorkerFunction('handleTuiKeysDirect', scope);
+    const keys = loadWorkerFunction('handleTuiKeys', scope)(['Down', 'Enter'], true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scope.backend.sendSpecialKeys).toHaveBeenCalledWith('Down');
+    let release!: (screen: string) => void;
+    scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const first = h.flush();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(scope.backend.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    scope.backendScreenRevision++;
+    release('❯ Use /skills to list available skills');
+    await first;
+    expect(scope.isPromptReady).toBe(false);
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await keys).toBe(true);
+  });
+
+  it.each(['final keys', 'quick Enter', 'native question', 'text answer', 'prompt submitted', 'busy event'] as const)(
+    'does not send rename after %s invalidates an in-flight capture', async control => {
+      vi.useFakeTimers();
+      const h = idleAdmissionHarness();
+      const { scope } = h;
+      scope.flushPending = h.flush;
+      scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
+      Object.assign(scope, {
+        cliLifetimeNonce: 1, logError: vi.fn(), KEY_TO_ANSI: { Enter: '\r' },
+        sendTuiKeySequence, submitTuiTextInput, strictInputHandle: (backend: unknown) => backend,
+        bindSessionObservation: (callback: unknown) => callback,
+        noteClaudeBridgeTurnStarted: vi.fn(), publishScreenStatus: vi.fn(),
+        writtenInputs: { takeSubmitted: () => undefined }, armSessionRenameIdleTimeout: vi.fn(),
+        sendRawCommandLineWithRecoveryFence: vi.fn(async () => {}),
+        isCriticalInterruptKey: () => false, PTY_SEQ_MAP: { enter: '\r' },
+        TMUX_KEY_MAP: { enter: 'Enter' }, scheduleOneShotAfterAction: vi.fn(),
+      });
+      scope.runAfterAmbiguousSubmissionWrites = loadWorkerFunction('runAfterAmbiguousSubmissionWrites', scope);
+      scope.handleTuiKeysDirect = loadWorkerFunction('handleTuiKeysDirect', scope);
+      scope.sendTermActionOnce = loadWorkerFunction('sendTermActionOnce', scope);
+      scope.backend.write = vi.fn(() => true);
+      let release!: (screen: string) => void;
+      scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+      const first = h.flush();
+      if (control === 'final keys') {
+        const keys = loadWorkerFunction('handleTuiKeys', scope)(['Enter'], true);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(await keys).toBe(true);
+        expect(scope.backend.write).toHaveBeenCalledWith('\r');
+      } else if (control === 'quick Enter') {
+        await loadWorkerFunction('handleTermAction', scope)('enter');
+        expect(scope.backend.write).toHaveBeenCalledWith('\r');
+      } else if (control === 'native question') {
+        expect(await loadWorkerFunction('traexQuestionWrite', scope)(
+          (input: { write: (data: string) => boolean }) => input.write('\r'),
+        )).toBe(true);
+        expect(scope.backend.write).toHaveBeenCalledWith('\r');
+      } else if (control === 'text answer') {
+        const text = loadWorkerFunction('handleTuiTextInput', scope)([], 'answer');
+        await vi.advanceTimersByTimeAsync(200);
+        expect(await text).toBe(true);
+        expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+      } else if (control === 'prompt submitted') {
+        await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+      } else {
+        let busy!: () => void;
+        loadWorkerFunction('wireIdleDetectorBusyTransition', scope)(
+          { onBusy: (callback: () => void) => { busy = callback; } }, 'test',
+        );
+        busy();
+      }
+      const writesAfterControl = scope.cliAdapter.writeInput.mock.calls.length;
+      scope.pendingSessionRename = 'after-answer';
+      scope.cliAdapter.buildSessionRenameCommand = (title: string) => `/rename ${title}`;
+      scope.backendScreenRevision++;
+      release('❯ Use /skills to list available skills');
+      await first;
+      expect(scope.isPromptReady).toBe(false);
+      expect(scope.cliAdapter.writeInput).toHaveBeenCalledTimes(writesAfterControl);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(scope.sendRawCommandLineWithRecoveryFence).not.toHaveBeenCalled();
+      expect(scope.pendingSessionRename).toBe('after-answer');
+    },
+  );
 });

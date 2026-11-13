@@ -3572,8 +3572,31 @@ let isPromptReady = false;
  * readiness it cleared itself, never a later write, busy event or control. */
 let promptReadinessRevision = 0;
 
-function revokePromptReadiness(): void {
+function invalidatePromptReadinessEvidence(): void {
   promptReadinessRevision++;
+}
+
+/** Track every physical write in a multi-step control input, including keys
+ * after an awaited pause. Read methods retain the original handle's receiver. */
+function readinessTrackedInput(input: PtyHandle): PtyHandle {
+  return new Proxy(input, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== 'function') return value;
+      if (property === 'write' || property === 'sendText'
+        || property === 'sendSpecialKeys' || property === 'pasteText') {
+        return (...args: unknown[]) => {
+          invalidatePromptReadinessEvidence();
+          return Reflect.apply(value, target, args);
+        };
+      }
+      return value.bind(target);
+    },
+  });
+}
+
+function revokePromptReadiness(): void {
+  invalidatePromptReadinessEvidence();
   isPromptReady = false;
 }
 /** Prompt-ready edges published by markPromptReady(). A backend compares it with
@@ -5031,7 +5054,10 @@ async function sendRawCommandLineWithRecoveryFence(
       be,
       () => sendRawCommandLine(be, content, { turnId }),
       undefined,
-      beforeWrite,
+      () => {
+        invalidatePromptReadinessEvidence();
+        beforeWrite?.();
+      },
     );
     if (transaction.recoveryFailureReason) {
       throw new SubmissionWriteError(
@@ -16925,9 +16951,11 @@ function exitTmuxScrollMode(): void {
 
 function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | boolean {
   if ('sendSpecialKeys' in target && TMUX_KEY_MAP[key]) {
+    invalidatePromptReadinessEvidence();
     return (target as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
   }
   if (PTY_SEQ_MAP[key]) {
+    invalidatePromptReadinessEvidence();
     target.write(PTY_SEQ_MAP[key]);
     return true;
   }
@@ -17396,9 +17424,10 @@ async function handleTuiKeysDirect(
   isFinal: boolean,
 ): Promise<boolean> {
   if (keys.length === 0 || nativeSessionForkPending()) return false;
+  invalidatePromptReadinessEvidence();
   try {
     const delivered = await sendTuiKeySequence(
-      targetBackend,
+      readinessTrackedInput(targetBackend),
       keys,
       KEY_TO_ANSI,
       { isCurrent: () => backend === targetBackend && !nativeSessionForkPending() },
@@ -17414,8 +17443,9 @@ async function handleTuiKeysDirect(
 
   if (isFinal) {
     tuiPromptBlocking = false;
-    if (isPromptReady) {
-      revokePromptReadiness();
+    const wasPromptReady = isPromptReady;
+    revokePromptReadiness();
+    if (wasPromptReady) {
       idleDetector?.reset();
     }
   }
@@ -17548,7 +17578,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
     const transaction = await runAmbiguousSubmissionTransaction(
       targetBackend,
       () => submitTuiTextInput({
-        target: strictInputHandle(targetBackend),
+        target: readinessTrackedInput(strictInputHandle(targetBackend)),
         keys,
         text,
         keyToAnsi: KEY_TO_ANSI,
@@ -17562,6 +17592,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
         },
       }),
       delivered => delivered,
+      invalidatePromptReadinessEvidence,
     );
     if (transaction.recoveryFailureReason) {
       throw new SubmissionWriteError(
@@ -17588,8 +17619,9 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
 
   // Clear blocking only after navigation and adapter submission both succeed.
   tuiPromptBlocking = false;
-  if (isPromptReady) {
-    revokePromptReadiness();
+  const wasPromptReady = isPromptReady;
+  revokePromptReadiness();
+  if (wasPromptReady) {
     idleDetector?.reset();
   }
   return true;
@@ -17916,7 +17948,11 @@ async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void): 
   try {
     return await runAfterAmbiguousSubmissionWrites(
       target,
-      () => backend === target && write(adapterInputHandle(target)) !== false,
+      () => {
+        if (backend !== target) return false;
+        invalidatePromptReadinessEvidence();
+        return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+      },
     );
   } catch (err: any) {
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
@@ -18630,6 +18666,7 @@ function handleVisibleStartupInteraction(data: string): boolean {
   setTimeout(() => {
     if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
     try {
+      if (backend) invalidatePromptReadinessEvidence();
       if (backend && 'sendSpecialKeys' in backend) {
         (backend as any).sendSpecialKeys('Enter');
       } else {
@@ -23986,8 +24023,9 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
   detector.onBusy(bindSessionObservation(() => {
     // The CLI went back to work while an idle edge was still settling.
     idleTranscriptSettle?.cancel();
-    if (!isPromptReady) return;
+    const wasPromptReady = isPromptReady;
     revokePromptReadiness();
+    if (!wasPromptReady) return;
     log(`Explicit busy marker detected — ${label}`);
     noteClaudeBridgeTurnStarted();
     publishScreenStatus('working', { force: true });
@@ -37227,8 +37265,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'prompt_submitted': {
-      if (isPromptReady) {
-        revokePromptReadiness();
+      const wasPromptReady = isPromptReady;
+      revokePromptReadiness();
+      if (wasPromptReady) {
         idleDetector?.reset();
         log('User prompt submitted via hook — publishing working state');
         // Web 终端/沙箱 hook 直提路径无 managed turn；显式 clearTurnId 避免携带
