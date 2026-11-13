@@ -167,7 +167,9 @@ describe('program-status relay launch plan', () => {
     const large = compiledLaunch('/usr/bin/claude', ['x'.repeat(12_000)]);
     const len = (a: string[]) => a.join(' ').length;
     expect(len(large.args)).toBe(len(small.args));
-    expect(len(large.args)).toBeLessThan(600);
+    // The absolute plan path follows TMPDIR, so exclude that environment-sized
+    // segment while keeping the relay's fixed overhead far below tmux's limit.
+    expect(len(large.args) - large.args.at(-1)!.length).toBeLessThan(1_024);
   });
 
   it.skipIf(!!process.versions.bun)('declines (CLI launched directly) when the entry only exists as Node-unrunnable source', () => {
