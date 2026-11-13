@@ -47,17 +47,11 @@ function parse(json: string): any {
   return JSON.parse(json);
 }
 
-/** Primary-area controls. They normally live in top-level action modules; when
- *  压缩+停止 are both visible they render in a weighted two-column column_set
- *  row instead (same-row mobile layout). The 「更多操作」 collapsible panel is
- *  excluded — neither button ever lives there. */
+/** The FIRST action element is the main control row (headerActions); the
+ *  quick-action key rows come after it. */
 function headerActions(card: any): any[] {
-  const walkButtons = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
-    ...(n?.tag === 'button' ? [n] : []),
-    ...(Array.isArray(n?.actions) ? walkButtons(n.actions) : []),
-    ...(Array.isArray(n?.columns) ? walkButtons(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
-  ]);
-  return walkButtons(card.elements.filter((e: any) => e.tag !== 'collapsible_panel'));
+  const actionEl = card.elements.find((e: any) => e.tag === 'action');
+  return actionEl?.actions ?? [];
 }
 
 function findButton(actions: any[], action: string): any {
@@ -254,104 +248,54 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 });
 
-describe('buildStreamingCard: compact + stop share one weighted row', () => {
-  /** Top-level weighted two-column row holding the compact/stop pair. Panel
-   *  rows are nested inside collapsible_panel and never match this find. */
-  function pairRow(card: any): any {
-    return card.elements.find((e: any) =>
-      e.tag === 'column_set'
-      && e.flex_mode === 'none'
-      && Array.isArray(e.columns) && e.columns.length === 2
-      && e.columns.every((c: any) => c.tag === 'column' && c.width === 'weighted' && c.weight === 1),
-    );
+describe('buildStreamingCard: primary control row narrow-screen layout', () => {
+  /** Every top-level element that carries a primary control (terminal URL, retry, compact, stop,
+   *  takeover, close/disconnect). The 「更多操作」 panel is nested and never matches. */
+  const PRIMARY = new Set(['retry_last_task', 'compact_session', 'stop_turn', 'takeover', 'disconnect', 'close']);
+  const isPrimary = (b: any) => b?.tag === 'button' && (!!b.multi_url || PRIMARY.has(b.value?.action));
+  function primaryModules(card: any): any[] {
+    return card.elements.filter((e: any) =>
+      (e.actions ?? []).some(isPrimary)
+      || (e.columns ?? []).some((c: any) => (c.elements ?? []).some(isPrimary)));
   }
+  const ids = (mod: any) => mod.actions.map((a: any) => a.value?.action ?? 'url');
 
-  function rowActionIds(row: any): string[] {
-    return row.columns
-      .flatMap((c: any) => c.elements ?? [])
-      .filter((b: any) => b.tag === 'button')
-      .map((b: any) => b.value.action);
-  }
-
-  it.each(['working', 'analyzing', 'stalled'] as const)('places compact and stop side by side in one weighted column_set while %s', (status) => {
+  // flow：窄屏按文字宽度横排、放不下才折行（不截断），桌面宽卡排法不变。
+  it.each([
+    ['working', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['analyzing', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['stalled', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['idle', ['url', 'compact_session', 'close']],
+    ['starting', ['url', 'compact_session', 'close']],
+  ] as const)('keeps all primary controls in ONE flow-layout action module while %s', (status, expected) => {
     const card = build({ status, cliId: 'claude-code' });
-    const row = pairRow(card);
-    expect(row).toBeTruthy();
-    expect(rowActionIds(row)).toEqual(['compact_session', 'stop_turn']);
-    // 等宽双列 + fill 按钮：手机窄屏强制同排、不换行。
-    expect(row.horizontal_spacing).toBe('small');
-    for (const col of row.columns) {
-      const btn = col.elements[0];
-      expect(btn.width).toBe('fill');
-      expect(btn.value).toMatchObject({ session_id: SID, root_id: ROOT, cli_id: 'claude-code' });
-    }
-    // 两个按钮只在双列行出现一次，普通 action 模块里不再重复。
-    const actionModuleIds = card.elements
-      .filter((e: any) => e.tag === 'action')
-      .flatMap((e: any) => e.actions ?? [])
-      .map((a: any) => a.value?.action)
-      .filter(Boolean);
-    expect(actionModuleIds).not.toContain('compact_session');
-    expect(actionModuleIds).not.toContain('stop_turn');
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(expected);
   });
 
-  it('keeps the terminal button before and the danger close button after the pair row', () => {
-    const card = build({ status: 'working', cliId: 'claude-code' });
-    const row = pairRow(card);
-    expect(row).toBeTruthy();
-    const rowIdx = card.elements.indexOf(row);
-    const before = card.elements.slice(0, rowIdx);
-    const after = card.elements.slice(rowIdx + 1);
-    expect(before.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.multi_url))).toBe(true);
-    expect(after.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.value?.action === 'close'))).toBe(true);
-  });
-
-  it('renders no pair row when idle — compact stays in a plain action module in the old order', () => {
-    const card = build({ status: 'idle', cliId: 'claude-code' });
-    expect(pairRow(card)).toBeFalsy();
-    const moduleIds = card.elements
-      .filter((e: any) => e.tag === 'action')
-      .flatMap((e: any) => e.actions ?? [])
-      .map((a: any) => a.value?.action ?? 'url');
-    expect(moduleIds).toEqual(['url', 'compact_session', 'close']);
-  });
-
-  it('renders no pair row when compact is hidden — stop stays alone in a plain action module', () => {
-    const card = parse(buildStreamingCard(
-      SID, ROOT, URL, TITLE, '', 'working' as any, 'claude-code' as any, 'hidden' as any,
-      undefined, undefined, false, false, undefined, undefined, undefined, false,
-      undefined, undefined, undefined, undefined, undefined, ['compact'],
-    ));
-    expect(pairRow(card)).toBeFalsy();
-    const stop = card.elements
-      .filter((e: any) => e.tag === 'action')
-      .flatMap((e: any) => e.actions ?? [])
-      .find((a: any) => a.value?.action === 'stop_turn');
-    expect(stop).toBeTruthy();
-  });
-
-  it('renders no pair row for a CLI without compact support (mira) — stop renders alone in an action module', () => {
-    const card = build({ status: 'working', cliId: 'mira' });
-    expect(pairRow(card)).toBeFalsy();
-    const stop = card.elements
-      .filter((e: any) => e.tag === 'action')
-      .flatMap((e: any) => e.actions ?? [])
-      .find((a: any) => a.value?.action === 'stop_turn');
-    expect(stop).toBeTruthy();
-    expect(findButton(headerActions(card), 'compact_session')).toBeFalsy();
-  });
-
-  it('still pairs on adopt cards and keeps takeover/disconnect in the trailing action module', () => {
+  it('applies the same layout to adopt cards (takeover / disconnect stay in the same module)', () => {
     const card = parse(buildStreamingCard(
       SID, ROOT, URL, TITLE, '', 'working' as any, 'claude-code' as any, 'hidden' as any,
       undefined, undefined, true, true, undefined,
     ));
-    const row = pairRow(card);
-    expect(row).toBeTruthy();
-    expect(rowActionIds(row)).toEqual(['compact_session', 'stop_turn']);
-    const after = card.elements.slice(card.elements.indexOf(row) + 1);
-    expect(after.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.value?.action === 'takeover'))).toBe(true);
-    expect(after.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.value?.action === 'disconnect'))).toBe(true);
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(['url', 'compact_session', 'stop_turn', 'takeover', 'disconnect']);
+  });
+
+  it('applies the same layout to the retry-ready limited card', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'limited' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined,
+      { limited: true, kind: 'usage', retryAtMs: 0, retryLabel: '', retryReady: true } as any,
+    ));
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(['url', 'retry_last_task', 'compact_session', 'close']);
   });
 });
 

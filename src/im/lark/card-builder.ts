@@ -1123,27 +1123,6 @@ function pushStreamBody(
  */
 export const STREAMING_CARD_PATCH_VERSION = '1';
 
-/**
- * 把两个按钮包成一行双等宽列（column_set）。手机飞书里 `action` 模块的按钮按全宽
- * 竖排渲染，两个按钮就要占两行；weighted 双列强制同排、窄屏也不换行——与「更多操作」
- * 折叠面板内的双列行是同一布局。只给按钮补 `width:'fill'`，tag/type/value 等线协议
- * 字段原样保留，卡片回调按 value.action 路由，不受嵌套位置影响。
- */
-function pairedButtonRow(buttons: any[]): any {
-  return {
-    tag: 'column_set',
-    flex_mode: 'none',
-    horizontal_spacing: 'small',
-    columns: buttons.map(btn => ({
-      tag: 'column',
-      width: 'weighted',
-      weight: 1,
-      vertical_align: 'top',
-      elements: [{ ...btn, width: 'fill' }],
-    })),
-  };
-}
-
 export function buildStreamingCard(
   sessionId: string,
   rootId: string,
@@ -1213,8 +1192,6 @@ export function buildStreamingCard(
   //    move into the 「更多操作」 collapsible panel below, so narrow cards (e.g.
   //    meeting chats) no longer render a dozen full-width buttons stacked into
   //    one long vertical strip.
-  //    「压缩」与「停止」同时出现时再抽成 column_set 双列同行（见下方发射逻辑），
-  //    手机窄屏上从两行压成一行，继续缩短卡片高度。
   const primaryActions: any[] = [];
   const hidden = new Set(hiddenButtons);
 
@@ -1253,26 +1230,11 @@ export function buildStreamingCard(
   } else if (!hidden.has('close')) {
     primaryActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
-  // 「压缩」与「停止」同时出现时抽成双列同行：工作中状态下两者都是高频操作，而手机
-  // 飞书的 action 模块把按钮全宽竖排，同行后卡片主区由 [终端]/[压缩]/[停止]/[关闭] 四行
-  // 变为 [终端]/[压缩｜停止]/[关闭] 三行。push 顺序保证两者相邻；任一缺失（idle 无停止、
-  // CLI 不支持压缩、按钮被隐藏、remote/后台等待）时走 else，保持单个 action 模块的原结构。
-  const compactIndex = primaryActions.findIndex(
-    (a: any) => a.tag === 'button' && a.value?.action === 'compact_session',
-  );
-  const stopIndex = primaryActions.findIndex(
-    (a: any) => a.tag === 'button' && a.value?.action === 'stop_turn',
-  );
-  if (compactIndex !== -1 && stopIndex === compactIndex + 1) {
-    const beforePair = primaryActions.slice(0, compactIndex);
-    const pair = primaryActions.slice(compactIndex, stopIndex + 1);
-    const afterPair = primaryActions.slice(stopIndex + 1);
-    if (beforePair.length > 0) elements.push({ tag: 'action', actions: beforePair });
-    elements.push(pairedButtonRow(pair));
-    if (afterPair.length > 0) elements.push({ tag: 'action', actions: afterPair });
-  } else if (primaryActions.length > 0) {
-    elements.push({ tag: 'action', actions: primaryActions });
-  }
+  // layout 是飞书 action 模块的「窄屏自适应布局方式」，只在窄屏（实测卡宽约 330px 以下）
+  // 生效；不设时窄屏把每个按钮拉成整行竖排。flow 让按钮按文字宽度横排、放不下才折行：
+  // 手机上主区行数减少（中文工作中常见 4 行 → 2 行），桌面宽卡排法不变。不用 bisected：
+  // 等分半宽列放不下「打开 Web 终端」「Open Web Terminal」等标签，会被截断。
+  if (primaryActions.length > 0) elements.push({ tag: 'action', layout: 'flow', actions: primaryActions });
 
   // ── Secondary row + collapsible panels ──────────────────────────────────
   // The terminal-key grid is a daemon-controlled toggle (state must survive
