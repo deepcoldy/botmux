@@ -88,9 +88,15 @@ botmux restart
 
 最终文本自动来自 Doubao 的本地原生日志：`assignment.md` 中的用户需求与 `trajectory.jsonl` 中的终态 assistant 回答。工具结果和带 `tool_calls` 的中间旁白不当作最终回答。**不要求模型执行 `botmux send` 才能收到结果**，HTTP wait 模式也通过同一 bridge 返回 `output.content`。
 
+运行中的工具调用和工具结果会接入 Botmux 现有的执行过程展示，例如读取文件、搜索代码、执行命令。更新以原生日志落盘为准；这些进度事件不会提前结束任务或替代最终回复，也不读取模型的私有推理字段。
+
+要在普通回复卡片内直接显示工具执行过程，可为 Doubao Bot 配置 `replyCardMode: "unified"`，并保持 `cotEnabled` 与 `replyCardShowTools` 开启。`legacy` 模式沿用飞书原生进度气泡；仅收到气泡创建成功的回执，不代表客户端已经展示工具明细。
+
 Doubao Bot 的 `replyDelivery` 缺省为 `transcript`（其它 CLI 缺省仍是 `send`）：系统提示不教模型调用 `botmux send`，最终回复只从上述日志收取。原因是 Doubao 的工具命令由账号级常驻进程 `doubao --type=service` 执行，同一台机器上所有 Doubao 终端共用它；该进程的环境变量和进程树沿用**第一个**拉起它的终端。模型在工具里执行 `botmux send` 时，botmux 会按那棵进程树判断归属，可能把回复投到另一个会话、另一个群，甚至以另一个 Bot 的身份发出。不建议显式改回 `send`；确有需要时，请保证这台机器上只有一个 Doubao 会话，并在切换后重启常驻进程。
 
 首轮的原生 Session ID 在提交后最多等待 20 秒捕获（常驻进程冷启动时，`assignment.md` 要 7～8 秒才写入）。
+
+最终回复里的独立 `RichMediaCard` / `MediaCard` 图片引用和 Markdown 图片，会在本机非隔离会话中自动上传并展示。支持项目工作区内图片、当前用户拥有的系统临时目录截图，以及由精确原生 Session ID 唯一定位的账户产物目录 `agent_mode/<account>/workspace` 内图片。该产物目录是账户级范围，包含同账户其他会话的产物，并非单个 session 的隔离边界；Session ID 缺失、无匹配或跨账户匹配不唯一时不启用此目录。每轮最多 16 张、单张不超过 8 MiB；代码示例不会作为图片上传。远程后端、沙箱、readIsolation 和 apiOnly 会话不读取宿主图片；文件不存在、超限或上传失败时保留文字回退，发送重试复用已上传的图片。
 
 沙箱组合：oncall（`sandbox: true` 或 `"oncall"`，含 legacy readIsolation）下 Doubao 的 `~/.local/share/doubao_cli` 以目录级 bind 挂到真实宿主路径，转写桥正常工作，缺省 transcript 不受影响。全根 COW 的 `sandbox: "scratch"` 会把整个容器根挂成 merged overlay 且不应用 authPaths，Doubao 写入的会话树宿主侧桥读不到，首轮 ID 捕获与转写回收都会落空——此组合下 `replyDelivery` 自动回落 `send`（Dashboard 显示不支持 transcript，显式写 `transcript` 会被拒绝），即回到模型自己 `botmux send` 的旧行为，因此仍带有上文的共享常驻进程串号风险；多 Bot 共用机器上不建议让 Doubao 跑 scratch。`promptInjection: none`（零注入）在 scratch 下会被直接拒绝（它强制 transcript，没有 send 退路）。
 

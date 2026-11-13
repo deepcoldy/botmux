@@ -9,6 +9,7 @@ export function checkpointCodexAdoptTurns(
   rolloutPath: string,
   queue: CodexBridgeQueue,
   offsetAtMark: number = 0,
+  persistNativeUserProof = false,
 ): void {
   const previous = readBridgeTurnJournal(path);
   const safeOffsetAtMark = Number.isSafeInteger(offsetAtMark) && offsetAtMark >= 0
@@ -31,7 +32,14 @@ export function checkpointCodexAdoptTurns(
     const supersededTurnIds = turn.supersededTurns
       ?.filter(identity => identity.dispatchAttempt === undefined)
       .map(identity => identity.turnId);
+    // A terminal can remain queued until delivery. Empty polls or another
+    // mark must not checkpoint beyond it and erase the successor's replay.
+    const nativeUserProof = persistNativeUserProof && turn.started && turn.nativeUserProof
+      ? turn.finalText !== undefined ? prior?.nativeUserProof
+        : { ...turn.nativeUserProof, trajectoryOffset: safeOffsetAtMark }
+      : undefined;
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
+      ...(nativeUserProof ? { nativeUserProof } : {}),
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
       ...(turn.inputTextHash ? { inputTextHash: turn.inputTextHash } : {}),
       ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),

@@ -1230,7 +1230,11 @@ export function buildStreamingCard(
   } else if (!hidden.has('close')) {
     primaryActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
-  if (primaryActions.length > 0) elements.push({ tag: 'action', actions: primaryActions });
+  // layout 是飞书 action 模块的「窄屏自适应布局方式」，只在窄屏（实测卡宽约 330px 以下）
+  // 生效；不设时窄屏把每个按钮拉成整行竖排。flow 让按钮按文字宽度横排、放不下才折行：
+  // 手机上主区行数减少（中文工作中常见 4 行 → 2 行），桌面宽卡排法不变。不用 bisected：
+  // 等分半宽列放不下「打开 Web 终端」「Open Web Terminal」等标签，会被截断。
+  if (primaryActions.length > 0) elements.push({ tag: 'action', layout: 'flow', actions: primaryActions });
 
   // ── Secondary row + collapsible panels ──────────────────────────────────
   // The terminal-key grid is a daemon-controlled toggle (state must survive

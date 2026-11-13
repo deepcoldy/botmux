@@ -40,6 +40,7 @@ export interface ProjectAttachmentSource {
   ordinary: boolean;
   reportCapability: DispatchReportAttachment['reportCapability'];
   title?: string;
+  recentSummary?: string;
   botName?: string;
 }
 
@@ -307,8 +308,9 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
       || source.chatId !== actor.chatId || source.rootMessageId !== request.rootMessageId
       || source.scope !== 'thread' || source.status !== 'active') fail('source_route_mismatch');
     if (!source.ordinary) fail('source_managed_elsewhere');
-    if (!source.ownerKey || (source.ownerKey !== actor.ownerKey
-      && source.ownerKey !== actor.authorizedSourceOwnerKey)) fail('source_owner_authorization_required');
+    if (!source.ownerKey) fail('source_owner_unknown');
+    if (source.ownerKey !== actor.ownerKey
+      && source.ownerKey !== actor.authorizedSourceOwnerKey) fail('source_owner_authorization_required');
     if (source.ownerKey !== actor.ownerKey
       && (source.sessionId !== actor.authorizedSourceSessionId
         || source.larkAppId !== actor.authorizedSourceLarkAppId
@@ -428,6 +430,28 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
     }
   }
 
+  const GENERIC_PLACEHOLDER_TITLES = new Set([
+    '子任务', '子项目', '新对话', '新会话', '会话', 'New Chat', 'New Session', 'Untitled',
+  ]);
+  function synthesizeWorkstreamTitle(source: ProjectAttachmentSource): string {
+    for (const raw of [source.title, source.recentSummary]) {
+      const stripped = (raw ?? '')
+        .replace(/^(Adopt:\s*|\[Relay\]\s*|\[迁入\]\s*)/iu, '')
+        .replace(/^[#*>\-\s`]+/gu, '')
+        .trim();
+      const cleaned = cleanText(stripped, 80);
+      if (!cleaned || GENERIC_PLACEHOLDER_TITLES.has(cleaned)) continue;
+      const chars = Array.from(cleaned);
+      const bounded = chars.length <= 24 ? cleaned : `${chars.slice(0, 23).join('')}…`;
+      if (bounded && !GENERIC_PLACEHOLDER_TITLES.has(bounded)) return bounded;
+    }
+    const botLabel = Array.from(cleanText(source.botName, 40)).slice(0, 10).join('') || '迁入';
+    const shortId = source.sessionId.slice(0, 8);
+    const fallback = `${botLabel}会话 ${shortId}`;
+    const fallbackChars = Array.from(fallback);
+    return fallbackChars.length <= 24 ? fallback : `${fallbackChars.slice(0, 23).join('')}…`;
+  }
+
   return {
     async inspect(actor: ProjectAttachmentActor, request: ProjectAttachmentRequest) {
       const { source } = await authorizeSource(actor, request);
@@ -437,6 +461,9 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
         chatId: source.chatId, rootMessageId: source.rootMessageId,
         routeRevision: source.routeRevision, source: source.source,
         title: source.title,
+        ...(source.recentSummary ? { recentSummary: source.recentSummary } : {}),
+        ...(source.botName ? { botName: source.botName } : {}),
+        suggestedTitle: synthesizeWorkstreamTitle(source),
         reportCapability: source.reportCapability,
       };
     },
@@ -455,7 +482,14 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
         const changed = !!old && sourceIdentity(source) !== sourceIdentity(old.source);
         if (changed && request.expectedRevision !== old!.revision) fail('attachment_revision_required');
         const existingItem = project.workstreams.find(item => item.dispatchRoot === request.rootMessageId);
-        const title = cleanText(request.title ?? old?.title ?? existingItem?.title, 80);
+        const explicitCandidate = request.title !== undefined
+          ? cleanText(request.title, 80)
+          : cleanText(old?.title ?? existingItem?.title, 80);
+        const title = request.title !== undefined
+          ? explicitCandidate
+          : (explicitCandidate && explicitCandidate !== '子任务' && explicitCandidate !== '子项目' && Array.from(explicitCandidate).length <= 24
+            ? explicitCandidate
+            : synthesizeWorkstreamTitle(source));
         if (!title || title === '子任务' || title === '子项目' || Array.from(title).length > 24) {
           fail('project_workstream_title_required');
         }
@@ -466,7 +500,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           rootMessageId: request.rootMessageId,
           coordinatorSessionId: actor.sessionId, coordinatorLarkAppId: actor.larkAppId,
           coordinatorOwnerKey: actor.ownerKey!,
-          source: { ...source, title: undefined, botName: undefined }, revision: old ? old.revision + (changed ? 1 : 0) : 1,
+          source: { ...source, title: undefined, recentSummary: undefined, botName: undefined }, revision: old ? old.revision + (changed ? 1 : 0) : 1,
           state: 'pending', phase: 'pending', title,
           purpose: cleanText(request.purpose ?? old?.purpose ?? existingItem?.purpose, 300),
           createdAt: old?.createdAt ?? stamp, updatedAt: stamp,
