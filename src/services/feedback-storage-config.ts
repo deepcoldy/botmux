@@ -7,6 +7,7 @@ import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 import type { FeedbackStorageConfig, FeedbackStorageTarget, PostgresTarget } from './feedback-storage-types.js';
 import { createDoasTokenSource, type PostgresCredential } from './feedback-doas-token.js';
+import { assertFeedbackMigrationSlotAvailable } from './feedback-migration-slot.js';
 
 const secretReference = z.string().regex(/^(env:[A-Za-z_][A-Za-z0-9_]*|file:[0-9a-f-]{36})$/);
 const postgresSchema = z.object({
@@ -113,7 +114,11 @@ export async function saveFeedbackStorageCandidate(
   if (!parsed.success) throw new Error('feedback_storage_target_invalid');
   await readFeedbackStorageConfig(dataDir);
   const path = join(await canonicalDirectory(dataDir), 'feedback-storage.json');
-  return withFileLock(path, async () => {
+  const migrations = join(await canonicalDirectory(dataDir), 'feedback-migrations');
+  await mkdir(migrations, { recursive: true, mode: 0o700 });
+  if (await realpath(migrations) !== migrations) throw new Error('feedback_migration_directory_invalid');
+  return withFileLock(join(migrations, 'operation'), () => withFileLock(path, async () => {
+    await assertFeedbackMigrationSlotAvailable(dataDir);
     const current = await readConfig(path);
     if (!current || current.generation !== expectedGeneration) {
       throw new Error('feedback_storage_generation_conflict');
@@ -121,7 +126,7 @@ export async function saveFeedbackStorageCandidate(
     const next = configSchema.parse({ ...current, generation: current.generation + 1, candidate: parsed.data });
     await persistConfig(path, next);
     return next;
-  });
+  }));
 }
 
 export async function putFeedbackStorageSecret(dataDir: string, value: string): Promise<string> {

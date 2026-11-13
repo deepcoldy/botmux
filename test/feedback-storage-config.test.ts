@@ -81,6 +81,17 @@ describe('feedback storage configuration', () => {
       expect(await pending).toBe('feedback_storage_generation_conflict');
     } finally { globalThis.fetch = originalFetch; }
   });
+  it('blocks candidate changes while a migration owns the shared cutover slot', async () => {
+    const path = await directory();
+    const current = await readFeedbackStorageConfig(path);
+    const saved = await saveFeedbackStorageCandidate(path, current.generation, { backend: 'supabase', supabase: {
+      url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000,
+    } });
+    const { prepareSupabaseFeedbackMigration } = await import('../src/services/feedback-supabase-migration.js');
+    await prepareSupabaseFeedbackMigration(path, { requestId: 'owns-cutover', expectedGeneration: saved.generation, maintenanceConfirmed: true });
+    await expect(saveFeedbackStorageCandidate(path, saved.generation, target)).rejects.toThrow('feedback_migration_conflict');
+    expect(await readFeedbackStorageConfig(path)).toEqual(saved);
+  });
   it.each([
     { url: 'http://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
     { url: 'https://user:password@example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },

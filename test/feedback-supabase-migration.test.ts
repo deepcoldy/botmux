@@ -31,6 +31,23 @@ afterEach(async () => {
 });
 
 describe('Supabase migration preparation safety', () => {
+  it('prevents the legacy PostgreSQL preparer from occupying a Supabase migration slot after configuration drift', async () => {
+    const migration = await service();
+    const directory = await fixture();
+    await migration!.prepareSupabaseFeedbackMigration(directory, {
+      requestId: 'supabase-slot', expectedGeneration: 4, maintenanceConfirmed: true,
+    });
+    const config = JSON.parse(await readFile(join(directory, 'feedback-storage.json'), 'utf8'));
+    config.candidate = { backend: 'postgresql', postgres: {
+      host: 'localhost', port: 1, user: 'test', database: 'test', schema: 'feedback',
+      passwordRef: 'env:UNSET', tls: { mode: 'disable' }, connectTimeoutMs: 100,
+    } };
+    await writeFile(join(directory, 'feedback-storage.json'), JSON.stringify(config), { mode: 0o600 });
+    const { prepareFeedbackMigration } = await import('../src/services/feedback-migration.js');
+    await expect(prepareFeedbackMigration(directory, {
+      requestId: 'legacy-slot', expectedGeneration: 4, maintenanceConfirmed: true,
+    })).rejects.toThrow('feedback_migration_conflict');
+  });
   it('persists an idempotent generation-bound request without opening either database', async () => {
     const migration = await service();
     expect(migration?.prepareSupabaseFeedbackMigration).toBeTypeOf('function');

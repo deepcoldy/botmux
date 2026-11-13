@@ -17,6 +17,7 @@ import { validateRecoveryDecision, withFeedbackRecoveryLock, type RecoveryDecisi
 import { currentFeedbackMaintenance, restoreFeedbackSource } from './feedback-maintenance.js';
 import { openDatabaseSync } from './sqlite-compat.js';
 import { existsSync } from 'node:fs';
+import { assertFeedbackMigrationSlotAvailable } from './feedback-migration-slot.js';
 
 export interface MigrationStatus {
   migrationId: string;
@@ -97,6 +98,7 @@ export async function prepareFeedbackMigration(dataDir: string, request: { reque
     const jobs = await listFeedbackMigrations(dataDir);
     const previous = jobs.find(job => job.requestId === request.requestId);
     if (previous) return previous;
+    await assertFeedbackMigrationSlotAvailable(dataDir);
     if (jobs.some(job => !['complete', 'cancelled'].includes(job.phase))) throw new Error('feedback_migration_conflict');
     const config = await readFeedbackStorageConfig(dataDir);
     if (config.generation !== request.expectedGeneration) throw new Error('feedback_storage_generation_conflict');
