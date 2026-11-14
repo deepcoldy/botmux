@@ -307,3 +307,27 @@ describe('chat reply mode store', () => {
     });
   });
 });
+
+// Another bot's un-@ answer in its own topic, read from its bots.json entry (the
+// cross-daemon view used by the managed-subtopic handoff).
+describe('peerAnswersTopicWithoutMention', () => {
+  const CHAT = 'oc_peer_answers';
+  it.each([
+    { name: 'bot default always (unset)', cfg: {}, want: false },
+    { name: 'bot default topic', cfg: { regularGroupMentionMode: 'topic' }, want: true },
+    { name: 'bot default ambient', cfg: { regularGroupMentionMode: 'ambient' }, want: true },
+    { name: 'bot default never', cfg: { regularGroupMentionMode: 'never' }, want: true },
+    { name: 'per-chat topic over always default', cfg: { chatMentionModes: { [CHAT]: 'topic' } }, want: true },
+    { name: 'per-chat always over topic default', cfg: { chatMentionModes: { [CHAT]: 'always' }, regularGroupMentionMode: 'topic' }, want: false },
+    { name: 'other chat override does not apply', cfg: { chatMentionModes: { oc_other: 'never' } }, want: false },
+    // The signed default may lift 'always' to 'ambient', but it is verified and
+    // cached only in the owning bot's own daemon — unreadable from another one.
+    { name: 'signed default over always', cfg: { signedChatDefaults: true }, want: 'unknown' },
+    { name: 'signed default over topic (answers either way)', cfg: { signedChatDefaults: true, regularGroupMentionMode: 'topic' }, want: true },
+    { name: 'per-chat always pins over signed default', cfg: { signedChatDefaults: true, chatMentionModes: { [CHAT]: 'always' } }, want: false },
+    { name: 'config missing', cfg: undefined, want: 'unknown' },
+  ] as const)('$name → $want', async ({ cfg, want }) => {
+    const { peerAnswersTopicWithoutMention } = await import('../src/services/chat-reply-mode-store.js');
+    expect(peerAnswersTopicWithoutMention(cfg as Parameters<typeof peerAnswersTopicWithoutMention>[0], CHAT)).toBe(want);
+  });
+});
