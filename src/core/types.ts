@@ -499,6 +499,8 @@ export interface DaemonSession {
     completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
+    /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
+    lastDashboardPublishedAtMs?: number;
   }>;
   /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
    * Values are receipt epoch milliseconds, also fencing older legacy starts
