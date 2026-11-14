@@ -2164,10 +2164,12 @@ export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined 
     return { backgroundTasks: ds.backgroundTaskCount };
   }
   // A failed turn whose automatic continuation waits for the provider: the CLI
-  // sits at its prompt, but 「等待输入」 would read as a hang.
+  // sits at its prompt, but 「等待输入」 would read as a hang. Claude's
+  // `providerRecovery` only — Codex capacity recovery keeps its card as it was.
   const recovery = ds.session.ordinaryTurnRecovery;
   if (ds.lastScreenStatus === 'idle' && recovery?.status === 'backoff' && recovery.nextAttemptAt !== undefined
-    && ordinaryTurnRecoveryArmed(ds.session) && sessionProviderRecoveryPolicy(ds).enabled) {
+    && ordinaryTurnRecoveryArmed(ds.session) && sessionCliId(ds, getBot(ds.larkAppId).config) === 'claude-code'
+    && sessionProviderRecoveryPolicy(ds).enabled) {
     return { recoveryAt: recovery.nextAttemptAt, ...(recovery.nextAttemptAt <= Date.now() ? { due: true } : {}) };
   }
   const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;

@@ -1262,16 +1262,16 @@ export function cancelOrdinaryTurnRecoveryForStop(
   return attached.coordinator.cancelForStop();
 }
 
-/** The CLI of this session reached an idle prompt (worker `prompt_ready`).
- *  Arms the lost-continuation check when a delivered continuation is still
- *  waiting for its terminal; a no-op otherwise or when the attached policy
- *  disables the check. */
 /** A recovery coordinator currently owns this exact session object (its
  *  timers are live). A persisted `backoff` without one is not going to run. */
 export function ordinaryTurnRecoveryArmed(session: OrdinaryTurnRecoverySession): boolean {
   return attachedRecoveries.get(session.sessionId)?.session === session;
 }
 
+/** The CLI of this session reached an idle prompt (worker `prompt_ready`).
+ *  Arms the lost-continuation check when a delivered continuation is still
+ *  waiting for its terminal; a no-op otherwise or when the attached policy
+ *  disables the check. */
 export function noteOrdinaryTurnRecoveryCliIdle(session: OrdinaryTurnRecoverySession): void {
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached || attached.session !== session) return;

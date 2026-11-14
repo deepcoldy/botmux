@@ -10700,6 +10700,15 @@ describe('Codex capacity recovery', () => {
     expect(continuations(worker)).toHaveLength(0);
   });
 
+  it('its backoff keeps the card as before even where the Claude auto-continue switch is on', async () => {
+    const { ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    ds.lastScreenStatus = 'idle';
+    expect(streamCardLabel(ds)).not.toEqual(expect.objectContaining({ recoveryAt: expect.any(Number) }));
+  });
+
   it('a turn typed in the terminal during the capacity backoff leaves it running as before', async () => {
     const { ds, worker } = await boot();
     fail(ds, worker);
