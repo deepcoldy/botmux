@@ -158,6 +158,9 @@ vi.mock('../src/services/chat-manager.js', async (importOriginal) => ({
 }));
 
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
+// Authoritative /members/bots roster (observer-scoped bot open_ids). Default: empty → the
+// in-chat @ check fails closed because this bot itself is missing from the roster.
+const mockListCurrentChatBotMembers = vi.fn(async (..._args: any[]) => [] as Array<{ openId: string; displayName: string }>);
 const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
   ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
 } as { ok: true; mappings: Array<{ larkAppId: string; subjectOpenId: string }> } | { ok: false; error: string; message: string }));
@@ -199,6 +202,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendEphemeralCard: vi.fn(async () => 'om_eph'),
   resolveUserUnionId: vi.fn(async () => null),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
+  listCurrentChatBotMembers: (...args: any[]) => mockListCurrentChatBotMembers(...args),
   resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
@@ -17222,6 +17226,7 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
   const WORKER_OPEN_AS_SEEN_BY_COORD = 'ou_worker_seen_by_coord';
   const COORD_OPEN_ID = 'ou_coord_self';
   const WORKER_SELF_OPEN_ID = 'ou_worker_self';
+  const THIRD_PARTY_BOT_SEEN_BY_COORD = 'ou_third_party_seen_by_coord';
   let realDataDir = '';
 
   beforeEach(() => {
@@ -17232,6 +17237,10 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
   afterEach(() => {
     if (realDataDir) rmSync(realDataDir, { recursive: true, force: true });
     __resetSubtopicHandoffCacheForTest();
+    mockListCurrentChatBotMembers.mockReset();
+    mockListCurrentChatBotMembers.mockImplementation(async () => []);
+    mockListChatMemberOpenIds.mockReset();
+    mockListChatMemberOpenIds.mockImplementation(async () => []);
   });
 
   async function setupOutMentionGroup(chatId: string, subtopicRootId: string) {
@@ -17260,16 +17269,20 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
 
     // Reliable in-group rosters: sender + teammate are in-group humans; coord + worker are in-group bots.
     mockListChatMemberOpenIds.mockResolvedValue([USER_OPEN_ID, IN_GROUP_HUMAN]);
-    mockListChatBotMembers.mockImplementation(async (observerAppId: string) => {
+    // Authoritative /members/bots roster: observer-scoped open_ids, including the
+    // observer itself and an in-chat third-party bot that is not in bots.json.
+    mockListCurrentChatBotMembers.mockImplementation(async (observerAppId: string) => {
       if (observerAppId === COORD_APP_ID) {
         return [
-          { larkAppId: COORD_APP_ID, openId: COORD_OPEN_ID, name: 'coord', displayName: '主控', mentionable: true } as any,
-          { larkAppId: WORKER_IN_GROUP_APP_ID, openId: WORKER_OPEN_AS_SEEN_BY_COORD, name: 'worker', displayName: '群内Worker', mentionable: true } as any,
+          { openId: COORD_OPEN_ID, displayName: '主控' },
+          { openId: WORKER_OPEN_AS_SEEN_BY_COORD, displayName: '群内Worker' },
+          { openId: THIRD_PARTY_BOT_SEEN_BY_COORD, displayName: '第三方机器人' },
         ];
       }
       return [
-        { larkAppId: WORKER_IN_GROUP_APP_ID, openId: WORKER_SELF_OPEN_ID, name: 'worker', displayName: '群内Worker', mentionable: true } as any,
-        { larkAppId: COORD_APP_ID, openId: 'ou_coord_seen_by_worker', name: 'coord', displayName: '主控', mentionable: true } as any,
+        { openId: WORKER_SELF_OPEN_ID, displayName: '群内Worker' },
+        { openId: 'ou_coord_seen_by_worker', displayName: '主控' },
+        { openId: 'ou_third_party_seen_by_worker', displayName: '第三方机器人' },
       ];
     });
 
@@ -17385,12 +17398,15 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
     expect(handlersByApp.get(WORKER_IN_GROUP_APP_ID)!.handleThreadReply).not.toHaveBeenCalled();
   });
 
-  it('case 2 (群外 bot): treats @out-of-group bot (app_id or open_id) as unmentioned at BOTH top-level and managed subtopics', async () => {
+  it('case 2 (群外 bot): open_id-addressed out-of-group bot counts as unmentioned; an app_id-only @ cannot be checked and keeps yielding', async () => {
     const chatId = 'oc_out_bot_chat';
     const subtopicRoot = 'om_out_bot_subroot';
     const { handlersByApp, deliverToCoordAndWorker } = await setupOutMentionGroup(chatId, subtopicRoot);
 
-    // 2a) Group top-level mentioning an out-of-group bot (app_id shape) -> coordinator answers!
+    // 2a) Top-level @ of a bot known only by app_id: the authoritative /members/bots
+    // roster carries observer-scoped open_ids only, and matching by display name
+    // could hit a renamed in-chat bot (the mention name is a send-time snapshot).
+    // Undecidable → keep yielding, exactly like the syntactic check on master.
     await deliverToCoordAndWorker(makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '为什么 @_app_1 之前报了这个错？' }),
@@ -17399,17 +17415,13 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
       chatType: 'group',
       mentions: [{ key: '@_app_1', name: '群外机器人', id: { app_id: OUT_OF_GROUP_BOT_APP } } as any],
     }));
-    expect(handlersByApp.get(COORD_APP_ID)!.handleThreadReply).toHaveBeenCalledTimes(1);
-    expect(handlersByApp.get(COORD_APP_ID)!.handleThreadReply.mock.calls[0]![1]).toMatchObject({
-      larkAppId: COORD_APP_ID,
-      chatId,
-      scope: 'chat',
-      anchor: chatId,
-      replyRootId: 'om_out_bot_top_1',
-    });
+    expect(handlersByApp.get(COORD_APP_ID)!.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlersByApp.get(COORD_APP_ID)!.handleNewTopic).not.toHaveBeenCalled();
     expect(handlersByApp.get(WORKER_IN_GROUP_APP_ID)!.handleThreadReply).not.toHaveBeenCalled();
-
-    handlersByApp.get(COORD_APP_ID)!.handleThreadReply.mockClear();
+    expect(await mentionsAnotherInChatMember(COORD_APP_ID, {
+      mentions: [{ key: '@_app_1', name: '群外机器人', id: { app_id: OUT_OF_GROUP_BOT_APP } }],
+      content: JSON.stringify({ text: '@_app_1' }),
+    }, chatId, USER_OPEN_ID, true)).toBe(true);
 
     // 2b) Managed subtopic mentioning an out-of-group bot (open_id shape) -> coordinator answers inside subtopic!
     await deliverToCoordAndWorker(makeUserMessageEvent({
@@ -17508,6 +17520,39 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
     });
   });
 
+  it('an in-chat third-party bot (not in bots.json) keeps the yield, and an unavailable /members/bots fails closed', async () => {
+    const chatId = 'oc_third_party_chat';
+    const subtopicRoot = 'om_third_party_subroot';
+    const { handlersByApp, deliverToCoordAndWorker } = await setupOutMentionGroup(chatId, subtopicRoot);
+    const thirdPartyAt = (messageId: string) => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_3 部署一下 staging' }),
+      messageId,
+      chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_3', name: '第三方机器人', id: { open_id: THIRD_PARTY_BOT_SEEN_BY_COORD } }],
+    });
+
+    // Listed by the authoritative roster → addressed to someone in the group → coordinator yields.
+    await deliverToCoordAndWorker(thirdPartyAt('om_third_party_top_1'));
+    expect(handlersByApp.get(COORD_APP_ID)!.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlersByApp.get(COORD_APP_ID)!.handleNewTopic).not.toHaveBeenCalled();
+
+    // /members/bots down: the roster cannot prove the target is outside → keep yielding,
+    // even for a target that would otherwise count as out-of-group.
+    mockListCurrentChatBotMembers.mockRejectedValue(new Error('live_chat_bot_members_unavailable: timeout'));
+    await deliverToCoordAndWorker(makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '这个问题修完后找 @_user_1 确认下' }),
+      messageId: 'om_third_party_top_2',
+      chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: '群外同事', id: { open_id: OUT_OF_GROUP_HUMAN } }],
+    }));
+    expect(handlersByApp.get(COORD_APP_ID)!.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlersByApp.get(COORD_APP_ID)!.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('case 4 (只 @ 群内真人): all bots yield at BOTH top-level and managed subtopics', async () => {
     const chatId = 'oc_in_human_chat';
     const subtopicRoot = 'om_in_human_subroot';
@@ -17556,7 +17601,7 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
     expect(await mentionsAnotherInChatMember(COORD_APP_ID, msg, chatId, USER_OPEN_ID, true)).toBe(true);
 
     // Also simulate incomplete bot roster (missing self) across top-level + subtopic -> never steals
-    mockListChatBotMembers.mockResolvedValue([]);
+    mockListCurrentChatBotMembers.mockResolvedValue([]);
     await deliverToCoordAndWorker(makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@_user_1 顶层失败兜底' }),
@@ -17731,5 +17776,75 @@ describe('managed subtopic: coordinator with its own thread session at the root'
     expect(handlersByApp.get(COORD)!.handleThreadReply.mock.calls[0]![1]).toMatchObject({
       larkAppId: COORD, chatId, scope: 'thread', anchor: rootId,
     });
+  });
+});
+
+describe('in-chat @ membership check is only paid when its answer matters (command path)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  let seq = 0;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 5, botCount: 2 });
+    mockListChatMemberOpenIds.mockReset();
+    mockListChatMemberOpenIds.mockImplementation(async () => [USER_OPEN_ID, 'ou_mate_in_group']);
+    mockListCurrentChatBotMembers.mockReset();
+    mockListCurrentChatBotMembers.mockImplementation(async () => [{ openId: MY_OPEN_ID, displayName: 'BotA' }]);
+  });
+
+  afterEach(() => {
+    mockListChatMemberOpenIds.mockReset();
+    mockListChatMemberOpenIds.mockImplementation(async () => []);
+    mockListCurrentChatBotMembers.mockReset();
+    mockListCurrentChatBotMembers.mockImplementation(async () => []);
+  });
+
+  function commandAfterMention(command: string, mentionedOpenId: string) {
+    return makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: `@_user_1 ${command}` }),
+      messageId: `om_lazy_roster_${++seq}`,
+      chatId: 'oc_lazy_roster',
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: '某人', id: { open_id: mentionedOpenId } }],
+    });
+  }
+
+  it('a default (always) bot without command triggers fetches no roster for "@another bot /status"', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](commandAfterMention('/status', 'ou_another_bot'));
+    await flushEventWork();
+
+    expect(mockListChatMemberOpenIds).not.toHaveBeenCalled();
+    expect(mockListCurrentChatBotMembers).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('a configured command after an @ of someone outside the group still triggers; an in-group @ still yields', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], commandTriggers: { enabled: true, commands: [{ cmd: '/solve' }] } });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](commandAfterMention('/solve 看看登录', 'ou_outsider'));
+    await flushEventWork();
+    expect(mockListCurrentChatBotMembers).toHaveBeenCalledTimes(1);
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: expect.objectContaining({ cmd: '/solve' }),
+    }));
+
+    handlers.handleNewTopic.mockClear();
+    await capturedHandlers['im.message.receive_v1'](commandAfterMention('/solve 看看登录', 'ou_mate_in_group'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });

@@ -2035,8 +2035,16 @@ function extractOtherMentions(larkAppId: string, message: any): OtherMentionTarg
 /**
  * Membership-aware variant of `mentionsAnotherMember`: returns `true` iff at
  * least one `@`-mentioned non-self target is a member (human or bot) of `chatId`
- * — or if membership cannot be authoritatively verified (fail-safe: preserve
- * existing yield behavior when APIs fail or rosters are incomplete).
+ * — or if membership cannot be verified authoritatively (fail closed: keep the
+ * existing yield behavior).
+ *
+ * Bot membership comes from the authoritative `/members/bots` roster
+ * (`listCurrentChatBotMembers`, which throws on any failure), never from the
+ * discovery helper `listChatBotMembers`: when that endpoint fails, discovery
+ * degrades to configured/observed rows and silently drops in-chat third-party
+ * bots, which would turn "@thatBot …" into an unmentioned message here. The
+ * roster carries observer-scoped open_ids only, so a target known only by its
+ * app_id cannot be checked and counts as in-chat.
  *
  * When ALL `@`-mentioned targets are provably outside `chatId` (e.g. quoting or
  * naming an out-of-group person/bot in prose), returns `false` so top-level
@@ -2055,59 +2063,32 @@ export async function mentionsAnotherInChatMember(
 
   const others = extractOtherMentions(larkAppId, message);
   if (others.length === 0) return false;
-  if (others.some(t => t.unresolved || (!t.openId && !t.appId))) {
+  // Unresolved `@_user_N` placeholders and app_id-only targets (no observer-scoped
+  // open_id to compare against the roster) cannot be decided: keep yielding.
+  if (others.some(t => t.unresolved || !t.openId || t.openId.startsWith('cli_'))) {
     return true;
   }
+  const selfOpenId = getBot(larkAppId).botOpenId;
+  if (!selfOpenId) return true;
 
   try {
     const [humanOpenIds, botMembers] = await Promise.all([
       larkClient.listChatMemberOpenIds(larkAppId, chatId),
-      larkClient.listChatBotMembers(larkAppId, chatId),
+      larkClient.listCurrentChatBotMembers(larkAppId, chatId),
     ]);
     if (!Array.isArray(humanOpenIds) || !Array.isArray(botMembers)) {
       return true;
     }
     const humanSet = new Set(humanOpenIds);
+    const botSet = new Set(botMembers.map(b => b.openId));
     // Self-consistency guard: the human sender and this bot are both known to be
-    // in `chatId`. If either roster omits them (partial/stale response or test stub),
-    // treat the lookup as incomplete and fail closed (do not steal).
-    if (!humanSet.has(senderOpenId)) {
+    // in `chatId`. If either roster omits them (partial/stale response), treat the
+    // lookup as incomplete and fail closed (do not steal).
+    if (!humanSet.has(senderOpenId) || !botSet.has(selfOpenId)) {
       return true;
     }
-    const selfOpenId = getBot(larkAppId).botOpenId;
-    const hasSelfBot = botMembers.some(b =>
-      (!!selfOpenId && b.openId === selfOpenId)
-      || (!!b.larkAppId && b.larkAppId === larkAppId));
-    if (!hasSelfBot) {
+    if (others.some(t => humanSet.has(t.openId!) || botSet.has(t.openId!))) {
       return true;
-    }
-
-    for (const target of others) {
-      if (target.openId && humanSet.has(target.openId)) {
-        return true;
-      }
-      for (const bot of botMembers) {
-        if (target.openId && bot.openId && bot.openId === target.openId) {
-          return true;
-        }
-        if (target.appId && bot.larkAppId && bot.larkAppId === target.appId) {
-          return true;
-        }
-        const display = typeof (bot as any).displayName === 'string' ? (bot as any).displayName.trim() : '';
-        const name = typeof bot.name === 'string' ? bot.name.trim() : '';
-        // Legacy fallback when `/members/bots` failed (`mentionable === false`):
-        // `bot.openId` is self-scoped rather than observer-scoped, so if `target`
-        // could plausibly refer to this in-chat bot by name, fail closed.
-        if ((bot as any).mentionable === false) {
-          if (!target.name || target.name === display || target.name === name) {
-            return true;
-          }
-        }
-        if (!target.openId && target.appId && !bot.larkAppId && target.name
-            && (target.name === display || target.name === name)) {
-          return true;
-        }
-      }
     }
 
     logger.info(
@@ -6708,14 +6689,17 @@ export function createLarkEventDispatcherRuntime(
         if (soloGroupMentionBypass && ownsSession && !replyRootId && mentionMode !== 'never') {
           stats = await getGroupStats(larkAppId, chatId, { requireFresh: !!primary, revalidateSolo: mentionsOtherSyntactic });
         }
-        const needsInChatMentionCheck = isAllowed && mentionsOtherSyntactic && (
+        // ambient / 已拥有话题的 topic 条款要用 mentionsOther：@ 的对象都不在本群时不算点名让路，
+        // 按群内成员核验。免@ 命令的让路判定（commandYieldsToMention）只在候选命令真的命中后
+        // 才核验——默认 always 的 bot 收到「@别的 bot /status」时用不上这个结果，不为它拉名单。
+        const mentionsOther = isAllowed && mentionsOtherSyntactic && (
           mentionMode === 'ambient'
           || (mentionMode === 'topic' && ownsSession && !!message.thread_id)
-          || (!!triggeredCommand && !commandLeadsMessage)
-        );
-        const mentionsOther = needsInChatMentionCheck
+        )
           ? await mentionsOtherInChat()
           : mentionsOtherSyntactic;
+        const commandYieldsToMention = async (): Promise<boolean> =>
+          !commandLeadsMessage && mentionsOtherSyntactic && await mentionsOtherInChat();
         // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
         // 的免@，只放开配置里那几条命令，所以 mentionMode 留在默认 'always' 的群
         // 也能用。三道闸（群范围 / 命令白名单 / 保留命令 fail-closed）都在
@@ -6726,17 +6710,19 @@ export function createLarkEventDispatcherRuntime(
         //   • `!!triggeredCommand` 必须在前 —— 它让 resolvePassthroughCommands
         //     （建 Set + 解析 adapter 默认集）只在真是斜杠命令时才求值，不进每条
         //     群消息的热路径。
-        //   • `!mentionsOther` 与 ambient 同款语义：`@张三 /solve` 是指给张三的，
+        //   • 让路（commandYieldsToMention）与 ambient 同款语义：`@张三 /solve` 是指给张三的，
         //     命令形态不改变「点名了别人就让路」这条群礼仪。但只有**命令之前**的
         //     @ 才算点名让路：`/solve @张三` 里的 @ 是命令自己的参数，命令仍然是
         //     冲本 bot 来的，所以用 commandLeadsMessage 放行（见其定义处）。
         //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
         //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
-        const commandTriggerEntry = isAllowed
-          && (!mentionsOther || commandLeadsMessage)
+        const commandTriggerCandidate = isAllowed
           && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
           && triggeredCommand
           ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))
+          : undefined;
+        const commandTriggerEntry = commandTriggerCandidate && !(await commandYieldsToMention())
+          ? commandTriggerCandidate
           : undefined;
         // 命中的条目连同本条消息的参数一起下发；模板渲染在 daemon 侧做（与
         // messageListener 同款：dispatcher 只判定，daemon 才拼 prompt）。
@@ -6761,9 +6747,9 @@ export function createLarkEventDispatcherRuntime(
         // 解析不出同一条内置命令，群闸就不放行，杜绝「放行后 daemon 落建会话/
         // auto-worktree」。
         const builtinMentionlessCommand = isAllowed
-          && (!mentionsOther || commandLeadsMessage)
           && isBuiltinMentionlessInvocation(triggeredCommand, strippedRoutingText)
           && builtinMentionlessConfirmedByDaemonLane(data, triggeredCommand)
+          && !(await commandYieldsToMention())
           ? triggeredCommand
           : undefined;
         // replyRootId means this turn has already been explicitly addressed
