@@ -2159,7 +2159,7 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
         : ownedRollouts.has(sid.toLowerCase()));
       if (liveSid && isOwnedSid(liveSid)) {
         nativeSessionId = liveSid;
-      } else if ((!ownedRollouts || ownedRollouts.size === 1) && typeof findCodexRolloutByPid === 'function') {
+      } else if (ownedRollouts?.size === 1 && typeof findCodexRolloutByPid === 'function') {
         const observed = findCodexRolloutByPid(childPid);
         if (observed && isOwnedSid(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
       } else if (ownedRollouts && ownedRollouts.size > 1) {

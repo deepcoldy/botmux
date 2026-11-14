@@ -8,7 +8,7 @@ import { createDispatchReportBinding } from '../src/core/dispatch-report-binding
 import { authorizeReportSessionRelayRequest, deliverReportSessionRelay } from '../src/core/report-session-relay.js';
 import { SessionController } from '../src/core/session-controller.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
-import { findCodexRolloutByPid, findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
+import { codexGenerationSessionIdFromRolloutPath, codexHistorySidIsOwned, findCodexRolloutByPid, findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -23,10 +23,13 @@ const APP = 'cli_restart_report';
 const ROOT = 'om_dispatch_report';
 const OLD_CAPABILITY = '11'.repeat(32);
 
+function rolloutPath(root: string, id = NATIVE): string {
+  return join(root, 'sessions/2026/11/13', `rollout-2026-11-13T01-02-03-${id}.jsonl`);
+}
+
 function ownedRollout(root: string, id = NATIVE): number {
-  const dir = join(root, 'sessions/2026/11/13');
-  mkdirSync(dir, { recursive: true });
-  const file = join(dir, `rollout-2026-11-13T01-02-03-${id}.jsonl`);
+  mkdirSync(join(root, 'sessions/2026/11/13'), { recursive: true });
+  const file = rolloutPath(root, id);
   writeFileSync(file, '');
   const fd = openSync(file, 'r');
   cleanups.push(() => closeSync(fd));
@@ -130,11 +133,19 @@ function fixture() {
 }
 
 describe('same-turn report after a persistent Codex daemon restart', () => {
-  it.each(['single-rollout', 'parent-and-subagent'] as const)('recovers live %s lineage, rotates authority, and relays completion', async mode => {
+  it.each(['single-rollout', 'parent-and-subagent', 'bridge-turn-over-configured-id'] as const)('recovers live %s lineage, rotates authority, and relays completion', async mode => {
     const h = fixture();
     if (mode === 'parent-and-subagent') {
       ownedRollout(h.root, OTHER);
       h.env.lastInitConfig.cliSessionId = NATIVE;
+    }
+    if (mode === 'bridge-turn-over-configured-id') {
+      // Both conversations are held open; the active owned bridge turn is live
+      // evidence and outranks the daemon-frozen resume id.
+      ownedRollout(h.root, OTHER);
+      h.env.lastInitConfig.cliSessionId = OTHER;
+      Object.assign(h.env, { codexBridgeRolloutPath: rolloutPath(h.root), codexBridgeQueue: { peek: () => [{ turnId: TURN }] },
+        codexGenerationSessionIdFromRolloutPath, codexHistorySidIsOwned });
     }
     expect(h.identity(h.binding).nativeSessionId).toBe(NATIVE);
     expect(h.bind().ref).toEqual(h.leaf);
@@ -157,7 +168,7 @@ describe('same-turn report after a persistent Codex daemon restart', () => {
     expect(h.store.executions(h.controller.ref, TURN)).toHaveLength(1);
   });
 
-  it.each(['ambiguous-rollouts', 'other-owned-conversation', 'changed-process', 'changed-conversation', 'rpc-engine'] as const)('does not inherit an old execution with %s', async mode => {
+  it.each(['ambiguous-rollouts', 'other-owned-conversation', 'changed-process', 'changed-conversation', 'rpc-engine', 'unenumerable-fds'] as const)('does not inherit an old execution with %s', async mode => {
     const h = fixture();
     if (mode === 'ambiguous-rollouts') ownedRollout(h.root, OTHER);
     if (mode === 'other-owned-conversation') {
@@ -167,6 +178,12 @@ describe('same-turn report after a persistent Codex daemon restart', () => {
     if (mode === 'changed-process') h.env.readProcessStartIdentity = () => 'recycled-pid-birth';
     if (mode === 'changed-conversation') h.env.findCodexRolloutByPid = () => ({ cliSessionId: OTHER });
     if (mode === 'rpc-engine') h.env.codexRpcEngine = { appServerPid: process.pid };
+    // Without the PID's open-rollout set, ownership is unproven: fail closed
+    // even if a separate single-rollout probe happens to answer.
+    if (mode === 'unenumerable-fds') {
+      h.env.findCodexRolloutSetByPid = () => undefined;
+      h.env.findCodexRolloutByPid = () => ({ path: rolloutPath(h.root), cliSessionId: NATIVE });
+    }
     expect(h.bind().ref).not.toEqual(h.leaf);
     expect(h.observedExecutions()).toEqual([]);
     expect(await h.publish()).toMatchObject({ kind: 'reject' });
