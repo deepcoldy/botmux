@@ -25,7 +25,7 @@ import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
-import { platformTeammateVerdict } from './platform-teammate.js';
+import { askPlatformToAuthorize } from './platform-authorization-request.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -174,8 +174,6 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { readPlatformTeamSync } from '../services/platform-team-store.js';
-import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
@@ -4560,9 +4558,8 @@ export async function handleCommand(
         // bare and explicit forms; status/done must not report one either.
         const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
           && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
-        // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
-        // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
+        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 与显式的
+        // /login lark|bytedcli 都请平台给本人发授权卡片，平台没有该端点时回退到平台凭据页。
         const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
         const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
         const bytedcliGoverned = capabilityOn(botCfg2.triggerUserAuth, 'bytecloud');
@@ -4617,31 +4614,18 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
           break;
         }
-        if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
-          // The platform only issues to the machine owner or a teammate of theirs.
-          // Someone outside every team would authorize there and still get nothing
-          // here, so tell them that up front and offer what does work.
-          const senderUnionId = message.senderUnionId
-            ?? (loginOpenId ? (await resolveUserUnionId(botCfg2.larkAppId, loginOpenId)).unionId : undefined);
-          const owner = platformMachineOwner();
-          const teammate = platformTeammateVerdict({
-            senderUnionId,
-            ownerUnionId: owner.unionId,
-            teams: readPlatformTeamSync(config.session.dataDir),
+        if (platformCredsUrl && (subCmd === '' || explicitGoverned)) {
+          const asked = await askPlatformToAuthorize({
+            botConfig: botCfg2,
+            ...(isUsableOpenId(loginOpenId) ? { openId: loginOpenId } : {}),
+            ...(message.senderUnionId ? { unionId: message.senderUnionId } : {}),
           });
-          if (teammate === 'not_teammate') {
-            const localCommands = [larkGoverned ? '/login lark' : '', bytedcliGoverned ? '/login bytedcli' : '']
-              .filter(Boolean).join(t('cmd.login.platform_not_teammate_or', undefined, loc));
-            await authLinkReply([
-              t('cmd.login.platform_not_teammate_title', undefined, loc), '',
-              t('cmd.login.platform_not_teammate_body', {
-                owner: owner.name ?? t('cmd.login.platform_not_teammate_owner_fallback', undefined, loc),
-              }, loc), '',
-              credSource === 'auto'
-                ? t('cmd.login.platform_not_teammate_local', { commands: localCommands }, loc)
-                : t('cmd.login.platform_not_teammate_platform_only', undefined, loc),
-              t('cmd.login.platform_not_teammate_join', { url: platformCredsUrl }, loc),
-            ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
+          if (asked.kind !== 'legacy') {
+            await sessionReply(rootId, asked.kind === 'sent' ? t('cmd.login.platform_sent', undefined, loc)
+              : asked.kind === 'ready' ? t('cmd.login.platform_ready', undefined, loc)
+                : asked.kind === 'undeliverable' ? t('cmd.login.platform_undeliverable', { url: platformCredsUrl }, loc)
+                  : asked.kind === 'request_cap' ? t('cmd.login.platform_request_cap', { url: platformCredsUrl }, loc)
+                    : t('cmd.login.platform_unavailable', undefined, loc));
             break;
           }
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
@@ -4649,17 +4633,13 @@ export async function handleCommand(
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
             ? t('trigger_user_auth.provider_lark', undefined, loc)
             : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
-          const lines = [
+          await authLinkReply([
             t('cmd.login.platform_title', undefined, loc), '',
             t('cmd.login.platform_step1', { provider }, loc),
             platformCredsUrl, '',
             t('cmd.login.platform_step2', undefined, loc), '',
             t('cmd.login.platform_note', { tool: which }, loc),
-          ];
-          if (credSource === 'auto' && subCmd === '') {
-            lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
-          }
-          await authLinkReply(lines.join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
+          ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
           break;
         }
 

@@ -48,7 +48,7 @@ import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome, ensureMeegoStore, MEEGO_ENV_CREDENTIALS, MEEGO_STORE_DIR } from '../services/bytedcli-home.js';
 import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
-import { NOT_AUTHORIZED_REASONS, PLATFORM_NOT_AUTHORIZED_REASONS, PLATFORM_WILL_NOT_ISSUE_REASONS, reasonTag } from './refusal-reasons.js';
+import { NOT_AUTHORIZED_REASONS, PLATFORM_NOT_AUTHORIZED_REASONS, reasonTag } from './refusal-reasons.js';
 import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
@@ -1759,14 +1759,13 @@ export function renderIdentityWrapper(
       '  esac',
       'fi',
     ] : []),
-    // Not authorized yet, locally or on the platform, or the platform will not
-    // issue for the person (botmux then sends the local entry, or says who must
-    // act): botmux hands the entry to the person privately. If the person has
+    // Not authorized yet, locally or on the platform: botmux hands the entry
+    // to the person privately (on a bound host the platform's own card). If the person has
     // meanwhile authorized (answer 0), the identity is resolved once more and
     // the original command goes on, instead of making the agent repeat it.
     ...(isBytecloudFamily ? [
       `if [ "$${MODE_VAR}" = denied ] && [ -z "$${UNATTENDED_VAR}" ]; then`,
-      `  case "$${DENY_MSG_VAR}" in ${reasonCase([...NOT_AUTHORIZED_REASONS, ...PLATFORM_WILL_NOT_ISSUE_REASONS])})`,
+      `  case "$${DENY_MSG_VAR}" in ${reasonCase([...NOT_AUTHORIZED_REASONS])})`,
       '    __botmux_t0=$' + TURN_VAR + '; __botmux_o0=$' + OPEN_ID_VAR,
       '    __botmux_auth_request --provider bytedcli',
       '    __botmux_rc=$?',

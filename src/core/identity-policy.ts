@@ -43,6 +43,6 @@ export type IdentityDecision =
 export function resolveIdentity(source: TriggerUserAuthCredentialSource, availability: Availability): IdentityDecision {
   const { platformBound, platformGrant, localLogin } = availability;
   if (source !== 'local' && platformBound && platformGrant === true) return { kind: 'person', source: 'platform' };
-  if (source !== 'platform' && localLogin) return { kind: 'person', source: 'local' };
+  if ((source === 'local' || (source === 'auto' && !platformBound)) && localLogin) return { kind: 'person', source: 'local' };
   return { kind: 'needs-auth', entry: platformBound || source === 'platform' ? 'platform-page' : 'private-link' };
 }

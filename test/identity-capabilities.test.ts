@@ -40,8 +40,11 @@ const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.j
 const { recallProvenIdentityContent, forgetProvenIdentityContent } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { beginBytedcliLogin } = await import('../src/services/bytedcli-auth.js');
+const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
 const { requestUnattendedAuthorization, clearRestoredLapses, offerAuthorizationAtCreation, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+const { __resetPlatformAuthorizationRequestForTest } = await import('../src/core/platform-authorization-request.js');
+const credentialRequestClient = await import('../src/platform/credential-request-client.js');
 const { renewExpiringBytedcliIdentities, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 
 const SESSION = 'sess-cap';
@@ -210,8 +213,18 @@ describe('unattended turns (scheduled and background)', () => {
 
   describe('the one private notice, with every missing authorization in it', () => {
     const send = vi.fn(async (_to: string, _text: string) => undefined);
-    beforeEach(() => { send.mockReset(); send.mockResolvedValue(undefined); __setPlatformCredentialDepsForTest(null); vi.mocked(beginBytedcliLogin).mockClear(); });
-    afterEach(() => __setPlatformCredentialDepsForTest(null));
+    let platformRequest: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      send.mockReset(); send.mockResolvedValue(undefined); __setPlatformCredentialDepsForTest(null); vi.mocked(beginBytedcliLogin).mockClear();
+      __resetPlatformAuthorizationRequestForTest();
+      platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
+        .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
+    });
+    afterEach(() => { __setPlatformCredentialDepsForTest(null); platformRequest.mockRestore(); });
+    const bindPlatform = () => __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+    });
     const asked = (provider: 'bytedcli' | 'meego' | 'lark-cli', opts: { caps?: string[]; source?: 'local' | 'auto'; task?: string } = {}) => requestUnattendedAuthorization({
       appId: 'cli_bot', taskId: opts.task ?? 't1', taskName: 'nightly', openId: ALICE, locale: 'zh', provider, sendDirect: send,
       botConfig: { larkAppId: 'cli_bot', larkToolBinding: true, triggerUserAuth: parseTriggerUserAuthConfig({
@@ -267,12 +280,59 @@ describe('unattended turns (scheduled and background)', () => {
       expect(send).toHaveBeenCalledTimes(2);
     });
 
-    it('on a platform-bound host the link is the non-expiring platform credentials page, no device login is started', async () => {
+    it('on a platform-bound host the platform is asked for its own card once; no link is sent and no device login is started', async () => {
+      bindPlatform();
       bytedcliJwts.clear();
-      __setPlatformCredentialDepsForTest({
-        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
-        resolveUnionId: async () => 'on_alice', requestGrant: async () => ({ ok: false, reason: 'network', error: 'x' }) as any,
-      });
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('delivered');
+      await asked('bytedcli', { source: 'auto' });
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(platformRequest.mock.calls[0][0]).toEqual({ unionId: 'on_alice', appId: 'cli_bot', tools: ['bytedcli'] });
+      expect(send).not.toHaveBeenCalled();
+      expect(beginBytedcliLogin).not.toHaveBeenCalled();
+    });
+
+    it('on a platform-bound host a local login does not end the lapse: the platform is the only source', async () => {
+      bindPlatform();
+      bytedcliJwts.set(ALICE, { cloudJwt: 'cloud-jwt', codeJwt: 'code-jwt' });
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('a platform card that cannot be delivered is undelivered, and an immediate retry does not ask the platform again', async () => {
+      bindPlatform();
+      bytedcliJwts.clear();
+      platformRequest.mockResolvedValueOnce({ ok: true, status: 'undeliverable', detail: 'x' });
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('undelivered');
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('undelivered');
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('on a platform-bound host Meego is still sent by botmux, without any platform link', async () => {
+      bindPlatform();
+      bytedcliJwts.clear();
+      expect(await asked('bytedcli', { source: 'auto', caps: ['bytecloud', 'meego'] })).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][1]).toContain('https://meego.example.test/device');
+      expect(send.mock.calls[0][1]).not.toContain('platform.example.test');
+    });
+
+    it('a refreshed Meego link is sent again without asking the platform for a second card', async () => {
+      bindPlatform();
+      bytedcliJwts.clear();
+      const caps = ['bytecloud', 'meego'];
+      expect(await asked('bytedcli', { source: 'auto', caps })).toBe('delivered');
+      vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'link', authUrl: 'https://meego.example.test/device-2' } as any);
+      expect(await asked('bytedcli', { source: 'auto', caps })).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[1][1]).toContain('https://meego.example.test/device-2');
+    });
+
+    it('a platform without the endpoint keeps the plain credentials page notice', async () => {
+      bindPlatform();
+      bytedcliJwts.clear();
+      platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
       await asked('bytedcli', { source: 'auto' }); await asked('bytedcli', { source: 'auto' });
       expect(send).toHaveBeenCalledTimes(1);
       expect(send.mock.calls[0][1]).toContain('https://platform.example.test');
@@ -327,37 +387,51 @@ describe('unattended turns (scheduled and background)', () => {
   describe('at creation, for the sender of the turn that creates the task', () => {
     const send = vi.fn(async () => undefined);
     const requestGrant = vi.fn(async () => ({ ok: false, reason: 'network', error: 'x' }) as any);
+    let platformRequest: ReturnType<typeof vi.spyOn>;
     beforeEach(() => {
       send.mockClear(); requestGrant.mockClear(); meegoLoggedIn.add(ALICE);
+      __resetPlatformAuthorizationRequestForTest();
+      platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
+        .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
       __setPlatformCredentialDepsForTest({
         readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
         resolveUnionId: async () => 'on_alice', requestGrant,
       });
     });
-    afterEach(() => __setPlatformCredentialDepsForTest(null));
+    afterEach(() => { __setPlatformCredentialDepsForTest(null); platformRequest.mockRestore(); });
     const offer = (published: (tool: string) => string | undefined) => offerAuthorizationAtCreation({
       botConfig: { larkAppId: 'cli_bot', larkAppSecret: 's', brand: 'feishu', larkToolBinding: true,
         triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, credentialSource: 'auto', capabilities: ['bytecloud'] }) } as any,
       openId: ALICE, locale: 'zh', sendDirect: send, published,
     });
 
-    it('a sender whose turn was refused for want of the platform grant gets one private entry with the platform page', async () => {
+    it('a sender whose turn was refused for want of the platform grant gets the platform card, not a link from botmux', async () => {
+      await offer(() => "BOTMUX_IDENTITY_MODE='denied'\n[reason=platform_not_authorized]");
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(platformRequest.mock.calls[0][0]).toMatchObject({ tools: ['bytedcli'] });
+      expect(send).not.toHaveBeenCalled();
+      expect(requestGrant).not.toHaveBeenCalled();
+      expect(beginBytedcliLogin).not.toHaveBeenCalled();
+    });
+
+    it('a platform without the endpoint keeps the private entry with the platform page', async () => {
+      platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
       await offer(() => "BOTMUX_IDENTITY_MODE='denied'\n[reason=platform_not_authorized]");
       expect(send).toHaveBeenCalledTimes(1);
       expect(send.mock.calls[0]).toEqual([ALICE, expect.stringContaining('https://platform.example.test')]);
-      expect(requestGrant).not.toHaveBeenCalled();
-      expect(beginBytedcliLogin).not.toHaveBeenCalled();
     });
 
     it('an authorized sender gets nothing', async () => {
       await offer(() => "BOTMUX_IDENTITY_MODE='user'");
       expect(send).not.toHaveBeenCalled();
+      expect(platformRequest).not.toHaveBeenCalled();
     });
 
     it.each(['[reason=platform_timeout]', '[reason=platform_unreachable]', '[reason=platform_unavailable]', undefined])(
       'an outage or nothing published (%s) gets nothing', async reason => {
         await offer(() => reason && `BOTMUX_IDENTITY_MODE='denied'\n${reason}`);
         expect(send).not.toHaveBeenCalled();
+        expect(platformRequest).not.toHaveBeenCalled();
       });
   });
 

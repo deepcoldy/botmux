@@ -71,6 +71,17 @@ describe('adoptLocalBytedcliAuthorization', () => {
     expect(current()).not.toContain("BOTMUX_IDENTITY_MODE='denied'");
   });
 
+  it.each(['platform_not_teammate', 'platform_forbidden'])('does not replace a [reason=%s] refusal with a local login', async reason => {
+    const { writeSessionIdentity } = await import('../src/core/cli-identity.js');
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', mode: 'denied', turnId: TURN, openId: ALICE, message: `botmux: refused\n[reason=${reason}]`,
+    } as any, 'proven');
+    minted = { cloudJwt: 'cloud-jwt' };
+    expect(await adopt()).toBe('none');
+    expect(current()).toContain(`[reason=${reason}]`);
+    expect(current()).not.toContain('cloud-jwt');
+  });
+
   it('leaves a turn that holds no not-authorized refusal alone', async () => {
     minted = { cloudJwt: 'cloud-jwt' };
     expect(await adopt()).toBe('none');

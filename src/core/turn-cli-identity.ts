@@ -35,7 +35,7 @@ import {
   reasonTag,
   type PlatformIdentityResolution,
 } from './platform-credential-source.js';
-import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
+import { hasReason } from './refusal-reasons.js';
 import {
   writeSessionIdentity,
   meegoStoreShape,
@@ -305,9 +305,9 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
   // Platform first, keyed by the union_id in the verified dispatch record. The
   // issuer-scoped credentialOpenId means nothing to this bot's app, and
   // re-deriving the union_id from targetOpenId would hang the grant on a
-  // contact lookup that need not be reachable. In strict `platform` mode a
-  // non-grant is final and local stores are never read; in `auto` an
-  // already-provisioned local HOME is still honoured below.
+  // contact lookup that need not be reachable. On a bound host a non-grant is
+  // final and local stores are never read; an unbound `auto` host still
+  // honours an already-provisioned local HOME below.
   const source = policy.credentialSource;
   if (source !== 'local') {
     const platform = await resolvePlatformIdentity({
@@ -315,7 +315,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
       sessionId: args.sessionId, ...(args.turnId ? { turnId: args.turnId } : {}),
     });
     if (platform.state === 'granted') identity = platform.identity;
-    else if (source === 'platform') return denyDelegated(tool, args, user);
+    else if (source === 'platform' || platform.state !== 'unbound') return denyDelegated(tool, args, user);
   }
   let localMint = false;
   if (!identity && tool === 'bytedcli') {
@@ -406,9 +406,8 @@ async function publishOne(
   // are gathered here, the decision is resolveIdentity's:
   //   local            → this machine's per-person HOME only.
   //   auto, unbound    → same as local, including auto-starting a local login.
-  //   auto, bound      → platform grant; else an EXISTING local HOME; else a
-  //                      refusal that points at the platform. A bound machine
-  //                      never starts a new local login on its own.
+  //   auto, bound      → platform grant or a refusal that has the platform send
+  //                      the person its authorization card; local is never consulted.
   //   platform         → platform grant or refusal; local is never consulted.
   const { platform, local, decision } = await gatherCredentials(tool, botConfig, policy, senderOpenId, sessionId, turnId);
   if (decision.kind === 'person') {
@@ -449,9 +448,11 @@ async function gatherCredentials(
     ? await resolvePlatformIdentity({ botConfig, tool, openId, sessionId, ...(turnId ? { turnId } : {}) })
     : undefined;
   const granted = platform?.state === 'granted';
-  const local = source !== 'platform' && !granted ? await resolveIdentityFor(tool, botConfig, openId) : null;
+  const platformBound = !!platform && platform.state !== 'unbound';
+  const local = (source === 'local' || (source === 'auto' && !platformBound)) && !granted
+    ? await resolveIdentityFor(tool, botConfig, openId) : null;
   const decision = resolveIdentity(source, {
-    platformBound: !!platform && platform.state !== 'unbound',
+    platformBound,
     platformGrant: granted ? true : platform?.state === 'unavailable' ? 'unavailable' : false,
     localLogin: !!local,
   });
@@ -602,6 +603,8 @@ export async function retryTransientTurnIdentity(args: {
    *  so any snapshot (including `botConfig`) stays stale and would let an
    *  in-flight attempt publish under a policy the operator already left. */
   currentPolicy?: () => TriggerUserAuthConfig | undefined;
+  /** Re-ask now even if the refusal's pacing interval has not passed (the platform just said the person lacks nothing). */
+  force?: boolean;
 }): Promise<void> {
   const key = transientKey(args.sessionDataDir, args.sessionId, args.turnId, args.tool);
   const entry = transientRefusals.get(key);
@@ -615,7 +618,7 @@ export async function retryTransientTurnIdentity(args: {
       transientRefusals.delete(key);
       return;
     }
-    if (now - entry.lastAttemptAt < retryIntervalOf(entry)) return;
+    if (!args.force && now - entry.lastAttemptAt < retryIntervalOf(entry)) return;
     entry.lastAttemptAt = now;
     entry.retries++;
     entry.inFlight = runTransientRetry(key, entry, args.currentPolicy, args.botConfig)
@@ -736,7 +739,7 @@ export async function adoptLocalBytedcliAuthorization(args: {
   const policy = policyFromConfig(botConfig.triggerUserAuth);
   const before = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
   if (before?.includes("BOTMUX_IDENTITY_MODE='user'")) return 'already';
-  if (!hasReason(before, ['not_authorized', ...PLATFORM_WILL_NOT_ISSUE_REASONS])) return 'none';
+  if (!hasReason(before, ['not_authorized'])) return 'none';
   const identity = await resolveIdentityFor('bytedcli', botConfig, senderOpenId);
   if (!identity || recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli') !== before) return 'none';
   const stamped = withMeegoStore({ ...identity, turnId, openId: senderOpenId }, policy);

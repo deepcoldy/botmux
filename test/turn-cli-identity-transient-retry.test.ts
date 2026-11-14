@@ -243,6 +243,26 @@ describe('not authorized yet within a turn (#3312)', () => {
     expect(grantCalls).toBe(2); // recovered: nothing more to ask
   });
 
+  it('a forced re-ask skips the spacing once: the platform just said nothing is missing', async () => {
+    responses = [CONSENT_MISSING, GRANTED];
+    await prepare();
+    await retryTransientTurnIdentity({
+      sessionDataDir: dir, sessionId: SESSION, turnId: TURN, tool: 'bytedcli', botConfig: config, force: true,
+    });
+    expect(grantCalls).toBe(2);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+
+  it('a forced re-ask that still finds the same refusal keeps pacing the following ones', async () => {
+    responses = [NOT_AUTHORIZED];
+    await prepare();
+    await retryTransientTurnIdentity({
+      sessionDataDir: dir, sessionId: SESSION, turnId: TURN, tool: 'bytedcli', botConfig: config, force: true,
+    });
+    await retry();
+    expect(grantCalls).toBe(2);
+  });
+
   it('keeps the same refusal while they have not authorized, and stops after a bounded number of re-asks', async () => {
     responses = [NOT_AUTHORIZED];
     await prepare();

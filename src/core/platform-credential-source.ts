@@ -150,7 +150,7 @@ export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: u
 const unionIdLookups = new Map<string, Promise<string | null>>();
 export const UNION_ID_SHARE_MS = 5_000;
 
-async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
+export async function platformUnionIdFor(larkAppId: string, openId: string): Promise<string | null> {
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
   if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) {
@@ -252,7 +252,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
 
   const unionId = args.unionId !== undefined
     ? (UNION_ID_RE.test(args.unionId) && !args.unionId.startsWith('ou_') ? args.unionId : null)
-    : await unionIdFor(args.botConfig.larkAppId, args.openId);
+    : await platformUnionIdFor(args.botConfig.larkAppId, args.openId);
   if (!unionId) {
     logger.warn(`[trigger-user-auth] platform grant skipped for ${args.tool}: could not resolve union_id for sender`);
     return { state: 'unavailable', detail: 'sender union_id unresolved' };

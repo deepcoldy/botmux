@@ -27,7 +27,8 @@ export type ProviderAuthStatus = 'ready' | 'delivered' | 'pending' | 'undelivera
 
 export interface ProviderAuthResult {
   status: ProviderAuthStatus;
-  delivery?: AuthLinkDelivery;
+  /** `platform_dm`: the platform's own bot sent the person its authorization card. */
+  delivery?: AuthLinkDelivery | 'platform_dm';
   /** For the agent. Never carries the link. */
   message: string;
 }

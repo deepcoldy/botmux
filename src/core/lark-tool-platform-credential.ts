@@ -106,15 +106,15 @@ function platformRefusal(resolution: PlatformIdentityResolution, delegated: bool
   const noBotApp = 'Do not ask them to authorize the bot application or run botmux auth request for it.';
   const delivered = delegated
     ? 'They must authorize on the platform themselves; report this, there is no link to relay.'
-    : 'They get the platform page by sending /login to the bot; never relay a link.';
+    : 'botmux has the platform send them an authorization card; never relay a link.';
   switch (resolution.state) {
     case 'not_authorized':
       return withUrl(resolution.consent
-        ? `${who} authorized lark-cli on the botmux platform but has not allowed this machine's team to use it. ${delivered} Retry with --as user after they confirm. ${noBotApp}`
-        : `${who} has not authorized lark-cli on the botmux platform; one authorization works on every bound machine and renews itself. ${delivered} Retry with --as user after they confirm. ${noBotApp}`);
+        ? `${who} has not authorized lark-cli on the botmux platform, or has not yet allowed this machine to use it. ${delivered} Retry with --as user after they confirm. ${noBotApp}`
+        : `${who} has not authorized lark-cli on the botmux platform. ${delivered} Retry with --as user after they confirm. ${noBotApp}`);
     case 'denied':
       return withUrl(resolution.reason === 'not_teammate'
-        ? `${who} is not in a botmux platform team with this machine's owner, so the platform will not issue their credentials here. The machine owner must invite them into a team on the platform first; then they authorize on the platform page. ${noBotApp}`
+        ? `The botmux platform does not issue ${delegated ? "the original user's" : "this user's"} lark-cli credentials on this machine (an older platform only issues to the machine owner's team members). Do not retry automatically; report it to the operator. ${noBotApp}`
         : `The botmux platform refused ${delegated ? "the original user's" : "this user's"} lark-cli credentials (${resolution.detail}). Do not retry automatically.`);
     case 'unbound':
       return withUrl('This bot takes lark-cli user credentials only from the botmux platform, but this machine is not bound to it. Ask the operator to run botmux bind on the host. Do not ask the user to log in.');
@@ -167,7 +167,7 @@ export async function platformAuthRequestRedirect(input: {
   const scoped = url !== page;
   const getPage = input.delegated
     ? 'the original user must do it on the platform page themselves; report this, there is no link to relay. '
-    : 'botmux offers them the platform page privately (the delivery result says whether it reached them); never ask for or relay a link. ';
+    : 'botmux has the platform send them an authorization card (the delivery result says whether it went out); never ask for or relay a link. ';
   return {
     error: `${who}'s lark-cli authorization comes from the botmux platform, not from application ${input.bot.larkAppId}. `
       // The platform application cannot hold every scope (some need tenant-wide

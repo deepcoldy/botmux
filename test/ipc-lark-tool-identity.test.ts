@@ -25,6 +25,8 @@ import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
+import { __resetPlatformAuthorizationRequestForTest } from '../src/core/platform-authorization-request.js';
+import * as credentialRequestClient from '../src/platform/credential-request-client.js';
 import {
   createProtectedLoopbackProxyAttestation,
   PROTECTED_LOOPBACK_ATTESTATION_HEADER,
@@ -643,8 +645,12 @@ describe('platform-issued user credentials in a bound session', () => {
   const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
     triggerUserAuth: { enabled: true, tools: ['lark-cli'], ...(credentialSource ? { credentialSource } : {}) } });
   let grants: any[];
+  let platformRequest: ReturnType<typeof vi.spyOn>;
   beforeEach(() => {
     grants = [];
+    __resetPlatformAuthorizationRequestForTest();
+    platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
+      .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
     __setPlatformCredentialDepsForTest({
       readBinding: () => PLATFORM,
       resolveUnionId: async () => 'on_sender',
@@ -713,11 +719,11 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_platform', issuer: 'platform' });
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
   });
-  it('does not hand the platform page to the agent: botmux delivers it privately when the platform has nothing for the person', async () => {
+  it('a refused --as user asks the platform for a card: no link reaches the agent, a DM or the group', async () => {
     session.chatType = 'group';
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
     const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
-    vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
+    const reply = vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
     __setPlatformCredentialDepsForTest({
       readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
       requestGrant: async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }) as any,
@@ -728,6 +734,24 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(body).toMatchObject({ ok: false });
     expect(JSON.stringify(body)).not.toContain('https://');
     expect(body.error).toContain('[reason=platform_not_authorized]');
+    expect(platformRequest).toHaveBeenCalledTimes(1);
+    expect(platformRequest.mock.calls[0][0]).toEqual({ unionId: 'on_sender', appId: 'cli_bound', tools: ['lark-cli'] });
+    expect(dm).not.toHaveBeenCalled();
+    expect(reply.mock.calls.map(c => String(c[2])).join('')).not.toContain('https://');
+  });
+  it('a platform without the credential-request endpoint keeps the plain credentials page DM', async () => {
+    session.chatType = 'group';
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }) as any,
+    });
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(JSON.stringify(await response.json())).not.toContain('https://');
     expect(dm).toHaveBeenCalledTimes(1);
     expect(dm.mock.calls[0][1]).toBe('ou_sender');
     expect(dm.mock.calls[0][2]).toContain('https://platform.example.test/credentials');
@@ -750,7 +774,7 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(await (await request('bot')).json()).toMatchObject({ appId: 'cli_bound', mode: 'bot' });
     expect(grants).toHaveLength(0);
   });
-  it('auth request sends a person without a bot-app grant to the platform page, delivered privately, instead of a bot-app device link', async () => {
+  it('auth request asks the platform for a card carrying the missing scopes, instead of a bot-app device link', async () => {
     session.chatType = 'group';
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
     const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
@@ -764,8 +788,24 @@ describe('platform-issued user credentials in a bound session', () => {
     const body = await response.json();
     expect(body).toMatchObject({ ok: false, error: 'platform_authorization_required' });
     expect(JSON.stringify(body)).not.toContain('https://');
-    expect(dm.mock.calls[0][2]).toContain('https://platform.example.test/credentials?scope=search%3Adocs%3Aread');
+    expect(platformRequest).toHaveBeenCalledTimes(1);
+    expect(platformRequest.mock.calls[0][0]).toMatchObject({ tools: ['lark-cli'], scopes: ['search:docs:read'] });
+    expect(dm).not.toHaveBeenCalled();
     expect(deviceFlow).not.toHaveBeenCalled();
+  });
+  it('auth request on a platform without the endpoint DMs the incremental credentials page', async () => {
+    session.chatType = 'group';
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+    });
+    expect(response.status).toBe(409);
+    expect(JSON.stringify(await response.json())).not.toContain('https://');
+    expect(dm.mock.calls[0][2]).toContain('https://platform.example.test/credentials?scope=search%3Adocs%3Aread');
   });
   it('auth request does not start a bot-app device flow for a turn that moved on during the platform check', async () => {
     vi.mocked(tokens.resolveUserToken).mockImplementation(async () => { session.managedTurnOrigin.turnId = 'om_later'; return 'bot-app-token'; });

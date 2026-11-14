@@ -46,8 +46,8 @@ describe('resolveIdentity credential-source table', () => {
     ['auto', false, false, false, { kind: 'needs-auth', entry: 'private-link' }],
     ['auto', true, true, true, { kind: 'person', source: 'platform' }],
     ['auto', true, true, false, { kind: 'person', source: 'platform' }],
-    ['auto', true, false, true, { kind: 'person', source: 'local' }],
-    ['auto', true, 'unavailable', true, { kind: 'person', source: 'local' }],
+    ['auto', true, false, true, { kind: 'needs-auth', entry: 'platform-page' }],
+    ['auto', true, 'unavailable', true, { kind: 'needs-auth', entry: 'platform-page' }],
     ['auto', true, false, false, { kind: 'needs-auth', entry: 'platform-page' }],
     ['auto', true, 'unavailable', false, { kind: 'needs-auth', entry: 'platform-page' }],
     ['platform', false, false, true, { kind: 'needs-auth', entry: 'platform-page' }],
@@ -282,7 +282,7 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
       expect(readFileSync(join(dir, 'botmux.calls'), 'utf8')).toContain('auth request --provider bytedcli');
     });
 
-    it.each(['platform_not_authorized', 'platform_consent_missing', 'platform_not_teammate', 'platform_forbidden'])(
+    it.each(['platform_not_authorized', 'platform_consent_missing'])(
       'a [reason=%s] refusal goes to botmux and its link-free answer is what the agent sees', reason => {
         writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: `botmux: 平台没有签发 [reason=${reason}]` }, 'single');
         const r = run(installFor('bytedcli'), ['codebase', 'mr', 'list'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
@@ -293,18 +293,15 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
         expect(botmuxCalls()).toBe('auth request --provider bytedcli\n');
       });
 
-    it('the platform will not issue for the person, who meanwhile finished the local entry botmux sent: the same call goes on', () => {
-      const ready = mkdtempSync(join(tmpdir(), 'botmux-ready-'));
-      mkdirSync(personHome(), { recursive: true });
-      writeSessionIdentity(ready, 'sess', { tool: 'bytedcli', cloudJwt: 'person-jwt', codeJwt: 'person-code', home: personHome(), openId: 'ou_1', turnId: 't1' }, 'single');
-      writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: 'botmux: 平台不会签发 [reason=platform_not_teammate]' }, 'single');
-      const r = run(installFor('bytedcli'), ['x', 'y'], { PATH: `${fakeBotmux(0, join(ready, 'cli-identity/sess.bin/.data/bytedcli.env'))}:/usr/bin:/bin` });
-      rmSync(ready, { recursive: true, force: true });
-      expect(r.status).toBe(0);
-      expect(r.out).toContain('ARGS=x y');
-      expect(r.out).toContain('CLOUD=person-jwt');
-    });
-
+    it.each(['platform_not_teammate', 'platform_forbidden'])(
+      'a [reason=%s] refusal is final: botmux is not asked and the published text is shown', reason => {
+        writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: `botmux: 平台没有签发 [reason=${reason}]` }, 'single');
+        const r = run(installFor('bytedcli'), ['codebase', 'mr', 'list'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.out).toBe('');
+        expect(r.err).toContain('平台没有签发');
+        expect(botmuxCalls()).toBe('');
+      });
     it('lark-cli: a platform refusal goes to botmux and its link-free answer is what the agent sees', () => {
       const wrapper = join(dir, 'lark-cli');
       writeFileSync(wrapper, renderIdentityWrapper('lark-cli', realBinary('lark-cli'), 'single'));

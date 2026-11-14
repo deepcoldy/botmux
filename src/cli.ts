@@ -15540,8 +15540,8 @@ async function cmdAuth(rest: string[]): Promise<void> {
         // The speaker this call acts for (see BOTMUX_AS); the daemon accepts only a speaker of the current turn.
         ...(process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}),
       };
-      // A provider request may start a device login and send a DM before it answers.
-      const requestTimeout = Math.min(provider ? 60_000 : 10_000, Math.max(1, remaining));
+      // A request may start a device login, or ask the platform to send a card, before it answers.
+      const requestTimeout = Math.min(parsed.command === 'request' ? 60_000 : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {

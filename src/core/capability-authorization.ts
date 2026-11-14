@@ -18,6 +18,7 @@ import { capabilityOn, TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from 
 import type { ToolIdentityOutcome } from './turn-cli-identity.js';
 import { capabilityOfTool, policyFromConfig } from './identity-policy.js';
 import { platformAuthorizeUrl } from './platform-credential-source.js';
+import { askPlatformToAuthorize } from './platform-authorization-request.js';
 import { userTokenAuthState } from '../utils/user-token.js';
 import * as scheduler from './scheduler.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
@@ -40,19 +41,19 @@ export function privateNoticeSender(appId: string, chat: { chatId?: string; chat
 /** What an unattended refusal can ask botmux to notify about. */
 export type UnattendedProvider = TriggerUserAuthTool | 'meego';
 
+/** Whether the platform issues this provider's credentials on this host: the host is bound and the bot's source is not local. */
+function platformBacked(botConfig: BotConfig, provider: UnattendedProvider): boolean {
+  return provider !== 'meego' && policyFromConfig(botConfig.triggerUserAuth).credentialSource !== 'local' && !!platformAuthorizeUrl();
+}
+
 /**
- * Where a person who has no credentials gets them: the platform credentials
- * page on a platform-bound host (it does not expire), else a device login link
- * (the same one until its challenge expires, then a fresh one). Undefined when
- * the credentials can only come from a platform this host is not bound to.
+ * Where a person who has no credentials gets them when the platform does not
+ * issue them: a device login link (the same one until its challenge expires,
+ * then a fresh one). Undefined when the credentials can only come from a
+ * platform this host is not bound to.
  */
 async function authorizationLink(tool: TriggerUserAuthTool, botConfig: BotConfig, openId: string): Promise<string | undefined> {
-  const source = botConfig.triggerUserAuth?.credentialSource ?? 'auto';
-  if (source !== 'local') {
-    const page = platformAuthorizeUrl();
-    if (page) return page;
-    if (source === 'platform') return undefined;
-  }
+  if (botConfig.triggerUserAuth?.credentialSource === 'platform') return undefined;
   return (tool === 'bytedcli' ? await beginBytedcliLogin(openId) : await beginLarkCliLogin(openId))?.authUrl;
 }
 
@@ -76,8 +77,9 @@ async function definitelyUnauthorized(tool: TriggerUserAuthTool, botConfig: BotC
 /** Whether published identity text or a refusal carries a definite "not authorized" tag; an outage, an unavailable platform or no publication at all does not. */
 export const definitelyNotAuthorized = (text: string | undefined): boolean => hasReason(text, NOT_AUTHORIZED_REASONS);
 
-/** One enabled capability whose credential is missing, and where the person gets it. */
-export interface AuthorizationEntry { provider: UnattendedProvider; url?: string }
+/** One enabled capability whose credential is missing. `platform`: the platform
+ *  sends the person its own authorization card, so there is no link here. */
+export interface AuthorizationEntry { provider: UnattendedProvider; url?: string; platform?: true }
 
 /**
  * The one builder of authorization entries, used by the creation offer, the
@@ -104,8 +106,9 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
       if (tool === 'lark-cli' && botConfig.larkToolBinding !== false) continue;
       if (!await (published ? definitelyNotAuthorized(published(tool)) : definitelyUnauthorized(tool, botConfig, openId))) continue;
     }
-    entries.push({ provider: tool, url: known?.provider === tool && known.url !== undefined
-      ? known.url ?? undefined : await authorizationLink(tool, botConfig, openId).catch(() => undefined) });
+    entries.push(platformBacked(botConfig, tool) ? { provider: tool, platform: true }
+      : { provider: tool, url: known?.provider === tool && known.url !== undefined
+        ? known.url ?? undefined : await authorizationLink(tool, botConfig, openId).catch(() => undefined) });
   }
   if (except !== 'meego' && capabilityOn(botConfig.triggerUserAuth, 'meego')) {
     if (known?.provider === 'meego') entries.push({ provider: 'meego', url: known.url ?? undefined });
@@ -118,9 +121,34 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
 }
 
 /**
+ * Platform-backed entries become one platform authorization card (the platform
+ * delivers it, botmux never sees a link); a platform without that endpoint
+ * leaves them as plain credentials-page entries. `rest` is what botmux still
+ * delivers itself; `platformOk` is false when the platform could not take the
+ * request (nothing reached the person).
+ */
+async function deliverPlatformEntries(args: {
+  botConfig: BotConfig; openId: string; entries: readonly AuthorizationEntry[];
+}): Promise<{ rest: AuthorizationEntry[]; platformOk: boolean }> {
+  const rest = args.entries.filter(e => !e.platform);
+  if (rest.length === args.entries.length) return { rest, platformOk: true };
+  const result = await askPlatformToAuthorize({ botConfig: args.botConfig, openId: args.openId });
+  if (result.kind === 'legacy') {
+    const url = platformAuthorizeUrl() ?? undefined;
+    return { rest: [...args.entries.filter(e => e.platform).map(({ provider }) => ({ provider, url })), ...rest], platformOk: true };
+  }
+  if (result.kind === 'undeliverable' || result.kind === 'unavailable' || result.kind === 'request_cap') {
+    logger.warn(`[unattended-auth] platform authorization card not sent: ${result.kind}`);
+    return { rest, platformOk: false };
+  }
+  return { rest, platformOk: true };
+}
+
+/**
  * Sends `openId` ONE private message with an authorization entry for every
  * capability the bot will run as them that they definitely have no credentials
- * for. Reads state only and never blocks or fails the creation: problems are logged.
+ * for (platform-backed ones arrive as the platform's own card). Reads state only
+ * and never blocks or fails the creation: problems are logged.
  */
 export async function offerAuthorizationAtCreation(args: {
   botConfig: BotConfig; openId: string; locale: Locale | undefined; sendDirect: SendDirect;
@@ -129,7 +157,10 @@ export async function offerAuthorizationAtCreation(args: {
 }): Promise<void> {
   const { botConfig, openId, locale } = args;
   try {
-    const entries = await missingAuthorizationEntries(botConfig, openId, { published: args.published });
+    const { rest: entries } = await deliverPlatformEntries({
+      botConfig, openId,
+      entries: await missingAuthorizationEntries(botConfig, openId, { published: args.published }),
+    });
     if (entries.some(e => e.url)) {
       const lines = entries.flatMap(({ provider, url }) =>
         url ? [t('unattended.lapse_entry', { capability: capabilityOfProvider(provider), where: url }, locale)] : []);
@@ -175,21 +206,28 @@ export function unattendedTask(appId: string, sessionId: string, turnId: string,
  */
 export async function deliverUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined;
+  botConfig: BotConfig;
   entries: readonly AuthorizationEntry[]; sendDirect: SendDirect;
 }): Promise<boolean> {
   const { appId, taskId, openId, locale, entries } = args;
-  const marker = (e: AuthorizationEntry) => e.url ?? '';
+  const marker = (e: AuthorizationEntry) => e.platform ? 'platform' : e.url ?? '';
   const keyOf = (e: AuthorizationEntry) => lapseKey(appId, taskId, openId, e.provider);
-  if (entries.every(e => lastSent.get(keyOf(e)) === marker(e))) return true;
-  const lines = entries.map(e => t('unattended.lapse_entry', {
+  const changed = entries.filter(e => lastSent.get(keyOf(e)) !== marker(e));
+  if (!changed.length) return true;
+  for (const e of changed) lastSent.set(keyOf(e), marker(e));
+  const { rest, platformOk } = await deliverPlatformEntries({
+    botConfig: args.botConfig, openId, entries: entries.filter(e => !e.platform || changed.includes(e)),
+  });
+  if (!platformOk) for (const e of changed.filter(e => e.platform)) lastSent.delete(keyOf(e));
+  if (!rest.length) return platformOk;
+  const lines = rest.map(e => t('unattended.lapse_entry', {
     capability: capabilityOfProvider(e.provider),
     where: e.url ?? t(e.provider === 'meego' ? 'unattended.how_meego' : e.provider === 'bytedcli' ? 'unattended.how_bytecloud' : 'unattended.how_lark', undefined, locale),
   }, locale));
-  const text = [t('unattended.lapse_notice', { task: args.taskName, capabilities: entries.map(e => capabilityOfProvider(e.provider)).join(', ') }, locale), ...lines].join('\n');
-  for (const e of entries) lastSent.set(keyOf(e), marker(e));
-  try { await args.sendDirect(openId, text); return true; }
+  const text = [t('unattended.lapse_notice', { task: args.taskName, capabilities: rest.map(e => capabilityOfProvider(e.provider)).join(', ') }, locale), ...lines].join('\n');
+  try { await args.sendDirect(openId, text); return platformOk; }
   catch (error) {
-    for (const e of entries) lastSent.delete(keyOf(e));
+    for (const e of rest) lastSent.delete(keyOf(e));
     logger.warn(`[unattended-auth] lapse notice not delivered: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
@@ -225,6 +263,7 @@ export async function requestUnattendedAuthorization(args: {
     if (login.state === 'ready') { clearUnattendedLapse(args.appId, args.taskId, openId, provider); return 'ready'; }
     url = login.authUrl;
   } else if (policyFromConfig(botConfig.triggerUserAuth).credentialSource !== 'platform'
+    && !platformBacked(botConfig, provider)
     && await localLoginState(provider, botConfig, openId) === 'authorized') {
     // The refusal that led here is the evidence of a lapse; a login that has appeared since ends it.
     clearUnattendedLapse(args.appId, args.taskId, openId, provider);

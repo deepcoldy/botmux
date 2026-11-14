@@ -18,6 +18,10 @@ import { __resetUnattendedNoticesForTest } from '../src/core/capability-authoriz
 import { sessionAuthRequests } from '../src/core/session-auth-requests.js';
 import { __resetProviderAuthForTest } from '../src/core/provider-auth-request.js';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
+import { __resetPlatformAuthorizationRequestForTest } from '../src/core/platform-authorization-request.js';
+import * as credentialRequestClient from '../src/platform/credential-request-client.js';
+import * as turnCliIdentity from '../src/core/turn-cli-identity.js';
+import { t } from '../src/i18n/index.js';
 
 const CAP = 'ab'.repeat(32);
 const SECRET = 'auth-request-test-secret';
@@ -878,16 +882,117 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
     const publish = (reason: string) => vi.spyOn(cliIdentity, 'recallProvenIdentityContent')
       .mockReturnValue(`BOTMUX_IDENTITY_MODE='denied'\n[reason=${reason}]`);
     let device: ReturnType<typeof vi.spyOn>;
+    let platformRequest: ReturnType<typeof vi.spyOn>;
     beforeEach(() => {
-      __setPlatformCredentialDepsForTest({ readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }) as any });
+      __resetPlatformAuthorizationRequestForTest();
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }) as any,
+        resolveUnionId: async () => 'on_sender',
+      });
+      platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
+        .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
       device = vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: DEVICE } as any);
       vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
     });
     afterEach(() => __setPlatformCredentialDepsForTest(null));
 
-    it('auto: one DM with the platform page and the Meego link, no local device login, no link back to the agent', async () => {
+    it.each([undefined, 'platform'])('credentialSource %s: the platform sends the card; no link goes to the agent, a DM, a card or the group', async source => {
+      botWith(source);
+      publish('platform_not_authorized');
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_private');
+      const body = await (await ask({ provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'delivered', delivery: 'platform_dm' });
+      expect(JSON.stringify(body)).not.toMatch(/https?:/);
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(platformRequest.mock.calls[0][0]).toEqual({ unionId: 'on_sender', appId: 'cli_test', tools: ['bytedcli'] });
+      expect(dm).not.toHaveBeenCalled();
+      expect(ephemeral).not.toHaveBeenCalled();
+      expect(device).not.toHaveBeenCalled();
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).not.toMatch(/https?:/);
+      // Burst of retries: the platform is not asked again.
+      expect(await (await ask({ provider: 'bytedcli' })).json()).toMatchObject({ status: 'pending' });
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(replies).toHaveLength(1);
+    });
+
+    it('auto: a login asked for by someone this turn already acts as is answered ready, and the platform is not asked', async () => {
+      botWith();
+      vi.spyOn(cliIdentity, 'recallProvenIdentityContent').mockReturnValue("BOTMUX_IDENTITY_MODE='user'\n");
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'ready' });
+      expect(dm).not.toHaveBeenCalled();
+      expect(platformRequest).not.toHaveBeenCalled();
+      expect(device).not.toHaveBeenCalled();
+    });
+
+    it('the platform says nothing is missing: the turn re-asks for the grant at once and the agent is told to retry', async () => {
+      botWith();
+      publish('platform_consent_missing');
+      platformRequest.mockResolvedValue({ ok: true, status: 'ready' });
+      const retry = vi.spyOn(turnCliIdentity, 'retryTransientTurnIdentity').mockResolvedValue();
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'ready' });
+      expect(JSON.stringify(body)).not.toMatch(/https?:/);
+      expect(retry).toHaveBeenCalledTimes(1);
+      expect(retry.mock.calls[0][0]).toMatchObject({ sessionId: 'auth-session', turnId: 'om_turn', tool: 'bytedcli', force: true });
+      expect(dm).not.toHaveBeenCalled();
+    });
+
+    it('the platform cannot deliver the card: the conversation gets the platform page to open, the agent no link and no raw detail', async () => {
       botWith();
       publish('platform_not_authorized');
+      platformRequest.mockResolvedValue({ ok: true, status: 'undeliverable', detail: 'feishu code=230013 msg=user not in scope' });
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ provider: 'bytedcli' })).json() as { message: string };
+      expect(body).toMatchObject({ ok: true, status: 'undeliverable' });
+      expect(JSON.stringify(body)).not.toMatch(/https?:|230013/);
+      expect(dm).not.toHaveBeenCalled();
+      expect(replies).toEqual([t('auth_link.platform_undeliverable', { url: PAGE }, 'zh')]);
+      expect(replies[0]).not.toContain('230013');
+    });
+
+    it('five quick retries after an undeliverable card cause one platform call and one conversation line', async () => {
+      botWith();
+      publish('platform_not_authorized');
+      platformRequest.mockResolvedValue({ ok: true, status: 'undeliverable', detail: 'feishu code=230013' });
+      for (let i = 0; i < 5; i++) {
+        expect(await (await ask({ provider: 'bytedcli' })).json()).toMatchObject({ ok: true, status: 'undeliverable' });
+      }
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(replies).toEqual([t('auth_link.platform_undeliverable', { url: PAGE }, 'zh')]);
+    });
+
+    it('the daily cap is reached: the conversation is told to use an earlier card or the platform page', async () => {
+      botWith();
+      publish('platform_not_authorized');
+      platformRequest.mockResolvedValue({ ok: false, reason: 'request_cap' });
+      const body = await (await ask({ provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'unavailable' });
+      expect(replies).toEqual([t('auth_link.platform_request_cap', { url: PAGE }, 'zh')]);
+    });
+
+    it.each([
+      [{ ok: false, reason: 'failed', detail: 'http 503 store_unavailable' }],
+      [{ ok: false, reason: 'failed', detail: 'ECONNREFUSED' }],
+    ])('the platform did not take the request (%j): unavailable, no local fallback', async answer => {
+      botWith();
+      publish('platform_not_authorized');
+      platformRequest.mockResolvedValue(answer as any);
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'unavailable' });
+      expect(dm).not.toHaveBeenCalled();
+      expect(device).not.toHaveBeenCalled();
+    });
+
+    it('a platform without the endpoint (404): the plain credentials page is DMed with the Meego link, as before', async () => {
+      botWith();
+      publish('platform_not_authorized');
+      platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       const body = await (await ask({ provider: 'bytedcli' })).json();
       expect(body).toMatchObject({ ok: true, status: 'delivered', delivery: 'dm' });
@@ -896,24 +1001,14 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(dm.mock.calls[0][2]).toContain(PAGE);
       expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
       expect(device).not.toHaveBeenCalled();
-      // Burst of retries: the same page is not sent again.
       expect(await (await ask({ provider: 'bytedcli' })).json()).toMatchObject({ status: 'pending' });
       expect(dm).toHaveBeenCalledTimes(1);
     });
 
-    it('auto: a login asked for by someone this turn already acts as is answered ready, and nothing is sent', async () => {
-      botWith();
-      vi.spyOn(cliIdentity, 'recallProvenIdentityContent').mockReturnValue("BOTMUX_IDENTITY_MODE='user'\n");
-      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
-      const body = await (await ask({ provider: 'bytedcli' })).json();
-      expect(body).toMatchObject({ ok: true, status: 'ready' });
-      expect(dm).not.toHaveBeenCalled();
-      expect(device).not.toHaveBeenCalled();
-    });
-
-    it('auto: the DM fails, so the platform page goes in a card only the person sees', async () => {
+    it('a platform without the endpoint (404): the DM fails, so the page goes in a card only the person sees', async () => {
       botWith();
       publish('platform_not_authorized');
+      platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
       vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013'));
       const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_private');
       const body = await (await ask({ provider: 'bytedcli' })).json();
@@ -922,32 +1017,18 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(ephemeral).toHaveBeenCalledExactlyOnceWith('cli_test', 'oc_test', 'ou_sender', expect.stringContaining(PAGE));
     });
 
-    it('auto: the platform will not issue for this person (not a teammate): the local entry is sent instead, and the agent is told so without a link', async () => {
-      botWith();
-      publish('platform_not_teammate');
-      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
-      const body = await (await ask({ provider: 'bytedcli' })).json() as { message: string };
-      expect(body).toMatchObject({ ok: true, status: 'delivered' });
-      expect(body.message).toContain('不会为这位发起人签发');
-      expect(JSON.stringify(body)).not.toMatch(/https?:/);
-      expect(dm).toHaveBeenCalledTimes(1);
-      expect(dm.mock.calls[0][2]).toContain(DEVICE);
-      expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
-      expect(dm.mock.calls[0][2]).not.toContain(PAGE);
-    });
-
-    it('platform only: no local fallback; the agent is told the person must be added to the platform team', async () => {
-      botWith('platform');
+    it.each([undefined, 'platform'])('credentialSource %s: an old platform that will not issue for the person is final: refused, no device login, no request', async source => {
+      botWith(source);
       publish('platform_not_teammate');
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       const response = await ask({ provider: 'bytedcli' });
       expect(response.status).toBe(409);
       const body = await response.json() as { message: string };
       expect(body).toMatchObject({ ok: false, status: 'refused', error: 'platform_denied' });
-      expect(body.message).toContain('加入平台上的团队');
       expect(JSON.stringify(body)).not.toMatch(/https?:/);
       expect(dm).not.toHaveBeenCalled();
       expect(device).not.toHaveBeenCalled();
+      expect(platformRequest).not.toHaveBeenCalled();
     });
 
     it('source local ignores the platform and keeps the device login', async () => {
@@ -956,28 +1037,41 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       await ask({ provider: 'bytedcli' });
       expect(dm.mock.calls[0][2]).toContain(DEVICE);
       expect(dm.mock.calls[0][2]).not.toContain(PAGE);
+      expect(platformRequest).not.toHaveBeenCalled();
     });
 
-    it('lark-cli asks the same way and gets the platform page', async () => {
+    it('lark-cli asks the platform the same way', async () => {
       vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
         larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], capabilities: ['lark-user'] },
       } } as any);
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       const body = await (await ask({ provider: 'lark-cli' })).json();
-      expect(body).toMatchObject({ ok: true, status: 'delivered' });
+      expect(body).toMatchObject({ ok: true, status: 'delivered', delivery: 'platform_dm' });
       expect(JSON.stringify(body)).not.toMatch(/https?:/);
-      expect(dm.mock.calls[0][2]).toContain(PAGE);
+      expect(platformRequest.mock.calls[0][0]).toMatchObject({ tools: ['lark-cli'] });
+      expect(dm).not.toHaveBeenCalled();
     });
 
-    it('the one platform page serves both tools: a lark-cli refusal right after a ByteCloud one sends nothing more', async () => {
+    it('one card covers both tools: a lark-cli refusal right after a ByteCloud one asks nothing more', async () => {
       vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
         larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, capabilities: ['lark-user', 'bytecloud'] },
       } } as any);
       publish('platform_not_authorized');
-      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       expect(await (await ask({ provider: 'bytedcli' })).json()).toMatchObject({ status: 'delivered' });
       expect(await (await ask({ provider: 'lark-cli' })).json()).toMatchObject({ status: 'pending' });
-      expect(dm).toHaveBeenCalledTimes(1);
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(platformRequest.mock.calls[0][0]).toMatchObject({ tools: ['lark-cli', 'bytedcli'] });
+    });
+
+    it('Meego on a bound host is still delivered by botmux, with no platform link in the message', async () => {
+      botWith();
+      publish('platform_not_authorized');
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ provider: 'meego' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'delivered', delivery: 'dm' });
+      expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
+      expect(dm.mock.calls[0][2]).not.toContain(PAGE);
+      expect(platformRequest).not.toHaveBeenCalled();
     });
   });
 
@@ -1029,6 +1123,36 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       await ask({ unattended: true });
       await ask({ unattended: true, provider: 'bytedcli' });
       expect(dm).toHaveBeenCalledTimes(1);
+    });
+
+    it('--unattended on a bound host: the platform card is requested and botmux DMs only the Meego link', async () => {
+      __resetPlatformAuthorizationRequestForTest();
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }) as any,
+        resolveUnionId: async () => 'on_sender',
+      });
+      const platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
+        .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, capabilities: ['bytecloud', 'meego'] },
+      } } as any);
+      try {
+        const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+        const body = await (await ask({ unattended: true, provider: 'bytedcli' })).json();
+        expect(body).toMatchObject({ ok: true, status: 'delivered' });
+        expect(platformRequest).toHaveBeenCalledTimes(1);
+        expect(platformRequest.mock.calls[0][0]).toEqual({ unionId: 'on_sender', appId: 'cli_test', tools: ['bytedcli'] });
+        expect(dm).toHaveBeenCalledTimes(1);
+        expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
+        expect(dm.mock.calls[0][2]).not.toContain('platform.example.test');
+        expect(dm.mock.calls[0][2]).not.toContain('https://cloud.example/device');
+        // The same lapse is not requested again.
+        await ask({ unattended: true, provider: 'bytedcli' });
+        expect(platformRequest).toHaveBeenCalledTimes(1);
+        expect(dm).toHaveBeenCalledTimes(1);
+      } finally {
+        __setPlatformCredentialDepsForTest(null);
+      }
     });
 
     it('--unattended ByteCloud answers at once with one DM and no wait', async () => {

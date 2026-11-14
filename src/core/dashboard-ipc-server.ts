@@ -625,6 +625,7 @@ import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { capabilityOfTool } from './identity-policy.js';
 import { reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
+import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, type UnattendedProvider } from './capability-authorization.js';
 import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
@@ -4482,9 +4483,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!resolved.ok && resolved.reason === 'platform') {
     const page = resolved.authorizeUrl;
     const tag = resolved.error.match(/\[reason=[a-z_]+\]/)?.[0];
-    if (!delegated && ds && page && definitelyNotAuthorized(resolved.error)) {
-      const result = await deliverPlatformAuthorization(ds, bot, sender, page, 'lark-cli');
-      return jsonRes(res, 403, { ok: false, error: [result.message, tag].filter(Boolean).join(' ') });
+    if (!delegated && ds && definitelyNotAuthorized(resolved.error)) {
+      const asked = await askPlatformToAuthorize({ botConfig: bot, openId: sender });
+      const result = asked.kind !== 'legacy' ? await platformCardOutcome(ds, asked)
+        : page ? await deliverPlatformAuthorization(ds, bot, sender, page, 'lark-cli') : undefined;
+      return jsonRes(res, 403, { ok: false, error: [result?.message, tag].filter(Boolean).join(' ') });
     }
     return jsonRes(res, 403, { ok: false, error: resolved.error });
   }
@@ -4596,32 +4599,45 @@ async function handleProviderAuthRequest(
   if (getLarkToolDelegation(config.session.dataDir, sessionId, origin.identityTurnId ?? origin.turnId)) {
     return refuse('delegated_turn', 'delegated turn');
   }
-  // On a bound host the platform page is the entry for lark-user and ByteCloud; a local device login is only for a local source or an unbound host.
+  // On a bound host the platform works out what the person lacks and sends them its own authorization card; a local device login is only for a local source or an unbound host.
   const source = credentialSourceOf(cfg.triggerUserAuth);
-  const platformUrl = source !== 'local' ? platformAuthorizeUrl() : null;
+  const platformHost = source !== 'local' && !!platformAuthorizeUrl();
+  const bound = provider !== 'meego' && platformHost;
   const publishedTurnId = choice.speaker?.turnId ?? origin.identityTurnId ?? origin.turnId!;
-  const published = platformUrl && identityStorageModelForDaemonSession(ds) === 'proven'
+  const published = platformHost && identityStorageModelForDaemonSession(ds) === 'proven'
     ? (tool: TriggerUserAuthTool) => recallProvenIdentityContent(config.session.dataDir, sessionId, publishedTurnId, tool)
     : undefined;
-  // The platform will never issue ByteCloud to this person (not a teammate, or refused for this machine): `auto` falls back to the local entry, `platform` has none.
-  const platformDenied = provider === 'bytedcli' && !!platformUrl
-    && hasReason(published?.('bytedcli'), PLATFORM_WILL_NOT_ISSUE_REASONS);
-  if (platformDenied && source === 'platform') {
+  // A platform that predates machine consent will never issue ByteCloud to this person (not a teammate of the owner, or refused for this machine).
+  if (bound && provider === 'bytedcli' && hasReason(published?.('bytedcli'), PLATFORM_WILL_NOT_ISSUE_REASONS)) {
     return jsonRes(res, 409, {
       ok: false, status: 'refused', error: 'platform_denied', message: t('provider_auth.platform_team_required', undefined, loc),
     });
   }
-  const platformPage = provider !== 'meego' && !platformDenied ? platformUrl : null;
-  if (provider === 'lark-cli' && !platformPage) return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
-  if (provider === 'bytedcli' && source === 'platform' && !platformPage) {
+  if (provider === 'lark-cli' && !bound) return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+  if (provider === 'bytedcli' && source === 'platform' && !bound) {
     return refuse('platform_credentials', 'ByteCloud identity comes from the platform and this host is not bound to it');
   }
-  if (platformPage) {
+  if (bound) {
     if (provider === 'bytedcli' && published?.('bytedcli')?.includes("BOTMUX_IDENTITY_MODE='user'")) {
       return jsonRes(res, 200, { ok: true, provider, status: 'ready', message: t('provider_auth.ready_bytedcli_already', undefined, loc) });
     }
-    const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformPage, provider as AuthProvider | 'lark-cli', published);
-    return jsonRes(res, 200, { ok: true, provider, ...delivered });
+    const asked = await askPlatformToAuthorize({ botConfig: cfg, openId });
+    if (asked.kind === 'legacy') {
+      const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformAuthorizeUrl()!, provider as AuthProvider | 'lark-cli', published);
+      return jsonRes(res, 200, { ok: true, provider, ...delivered });
+    }
+    if (asked.kind === 'ready') {
+      // The platform holds everything the person needs: take it up now so the retried command finds it.
+      await retryTransientTurnIdentity({
+        sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId, tool: provider as TriggerUserAuthTool,
+        force: true, currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
+      });
+      const effective = recallProvenIdentityContent(config.session.dataDir, sessionId, publishedTurnId, provider as TriggerUserAuthTool)
+        ?.includes("BOTMUX_IDENTITY_MODE='user'");
+      return jsonRes(res, 200, { ok: true, provider, status: 'ready',
+        message: t(effective ? 'provider_auth.platform_ready_now' : 'provider_auth.platform_ready', undefined, loc) });
+    }
+    return jsonRes(res, 200, { ok: true, provider, ...await platformCardOutcome(ds, asked) });
   }
   const result = await requestProviderAuth({
     provider: provider as AuthProvider, openId, locale: loc, chatId: ds.chatId,
@@ -4641,11 +4657,37 @@ async function handleProviderAuthRequest(
     }),
     deliver: authLinkDeliverer(ds, cfg, openId, provider as AuthProvider, published),
   });
-  return jsonRes(res, 200, { ok: true, provider, ...result, ...(platformDenied && (result.status === 'delivered' || result.status === 'pending')
-    ? { message: `${result.message} ${t('provider_auth.platform_fallback', undefined, loc)}` } : {}) });
+  return jsonRes(res, 200, { ok: true, provider, ...result });
 }
 
 type PublishedIdentity = ((tool: TriggerUserAuthTool) => string | undefined) | undefined;
+
+/**
+ * What the agent and the conversation learn after the platform was asked for an
+ * authorization card. The card itself is the platform bot's direct message to
+ * the person: neither the agent's result nor the conversation carries a link.
+ */
+async function platformCardOutcome(
+  ds: DaemonSession, asked: Exclude<PlatformAuthorizationRequestResult, { kind: 'legacy' }>,
+): Promise<ProviderAuthResult> {
+  const loc = localeForBot(ds.larkAppId);
+  switch (asked.kind) {
+    case 'sent':
+      if (asked.deduped) return { status: 'pending', message: t('provider_auth.platform_pending', undefined, loc) };
+      await replyInSession(ds, t('auth_link.platform_card_sent', undefined, loc)).catch(() => undefined);
+      return { status: 'delivered', delivery: 'platform_dm', message: t('provider_auth.platform_sent', undefined, loc) };
+    case 'ready':
+      return { status: 'ready', message: t('provider_auth.platform_ready', undefined, loc) };
+    case 'undeliverable':
+      if (!asked.repeat) await replyInSession(ds, t('auth_link.platform_undeliverable', { url: platformAuthorizeUrl() ?? '' }, loc)).catch(() => undefined);
+      return { status: 'undeliverable', message: t('provider_auth.platform_undeliverable', undefined, loc) };
+    case 'request_cap':
+      if (!asked.repeat) await replyInSession(ds, t('auth_link.platform_request_cap', { url: platformAuthorizeUrl() ?? '' }, loc)).catch(() => undefined);
+      return { status: 'unavailable', message: t('provider_auth.platform_request_cap', undefined, loc) };
+    case 'unavailable':
+      return { status: 'unavailable', message: t('provider_auth.platform_unavailable', undefined, loc) };
+  }
+}
 
 /**
  * {@link deliverAuthLink} bound to this conversation and person, carrying
@@ -4654,13 +4696,13 @@ type PublishedIdentity = ((tool: TriggerUserAuthTool) => string | undefined) | u
  */
 function authLinkDeliverer(
   ds: DaemonSession, cfg: ReturnType<typeof getBot>['config'], openId: string, provider: AuthProvider | 'lark-cli',
-  published: PublishedIdentity, page?: string,
+  published: PublishedIdentity,
 ): (text: string, privateCommand: string) => Promise<AuthLinkDelivery> {
   const loc = localeForBot(ds.larkAppId);
   const privateChat = ds.chatType === 'p2p';
   return async (text, privateCommand) => {
     const others = (await missingAuthorizationEntries(cfg, openId, { except: provider, ...(published ? { published } : {}) }).catch(() => []))
-      .flatMap(({ provider: other, url }) => url && url !== page
+      .flatMap(({ provider: other, url }) => url
         ? [t('auth_link.also_needed', { capability: other === 'meego' ? 'meego' : capabilityOfTool(other), url }, loc)] : []);
     return deliverAuthLink({
       privateChat,
@@ -4678,14 +4720,14 @@ function authLinkDeliverer(
   };
 }
 
-/** Delivers the platform credentials page (with whatever else the person lacks) privately; the agent gets a status without it. */
+/** Legacy platform without authorization requests: delivers its credentials page privately; the agent gets a status without it. */
 async function deliverPlatformAuthorization(
   ds: DaemonSession, cfg: ReturnType<typeof getBot>['config'], openId: string, page: string,
   provider: AuthProvider | 'lark-cli', published?: PublishedIdentity,
 ): Promise<ProviderAuthResult> {
   const locale = localeForBot(ds.larkAppId);
   return deliverProviderLink({ provider, openId, locale, chatId: ds.chatId }, platformAuthLink(page, locale), {
-    deliver: authLinkDeliverer(ds, cfg, openId, provider, published, page),
+    deliver: authLinkDeliverer(ds, cfg, openId, provider, published),
   });
 }
 
@@ -4940,11 +4982,16 @@ for (const action of ['auth-request', 'auth-status']) {
       return unattendedRefused(await deliverUnattendedEntry(platformRedirect.authorizeUrl ?? null) === 'undelivered');
     }
     if (platformRedirect) {
-      const page = platformRedirect.authorizeUrl;
-      const delivered = !delegated && page ? await deliverPlatformAuthorization(ds, cfg, callerOpenId, page, 'lark-cli') : undefined;
+      let result: ProviderAuthResult | undefined;
+      if (!delegated) {
+        const asked = await askPlatformToAuthorize({ botConfig: cfg, openId: callerOpenId, scopes });
+        const page = platformRedirect.authorizeUrl;
+        result = asked.kind !== 'legacy' ? await platformCardOutcome(ds, asked)
+          : page ? await deliverPlatformAuthorization(ds, cfg, callerOpenId, page, 'lark-cli') : undefined;
+      }
       return jsonRes(res, 409, {
         ok: false, error: 'platform_authorization_required',
-        message: [delivered?.message, platformRedirect.error].filter(Boolean).join(' '),
+        message: [result?.message, platformRedirect.error].filter(Boolean).join(' '),
       });
     }
     // The check above awaited; the turn may have moved on meanwhile.

@@ -22,31 +22,39 @@ Botmux 提供的短期 bot token。
 
 ## 凭据来源：中心化平台（`triggerUserAuth.credentialSource`）
 
-按触发人鉴权开启后，该人的凭据可以来自两处：本机的按人 HOME（扫码一次、只在本机有效），或**中心化平台**（在平台凭据页授权一次，平台保管刷新凭据并按轮次向绑定的机器签发短期票，所有机器通用、可集中查看与撤销）。`bots.json` 的 `triggerUserAuth.credentialSource` 决定取法：
+按触发人鉴权开启后，该人的凭据可以来自两处：本机的按人 HOME（扫码一次、只在本机有效），或**中心化平台**（在平台凭据页授权一次，平台保管刷新凭据并按轮次向绑定的机器签发短期票，可集中查看与撤销；允许后，这台机器上的 bot 可以用你的身份使用这些服务）。`bots.json` 的 `triggerUserAuth.credentialSource` 决定取法：
 
 | 机器状态 | `auto`（默认） | `platform` | `local` |
 |---|---|---|---|
 | 未绑定平台 | 等同今天的本机扫码 | 一律拒绝，提示执行 `botmux bind` | 等同今天 |
 | 已绑定，平台签发成功 | 用平台短期票 | 用平台短期票 | 忽略平台，用本机 HOME |
-| 已绑定，该人未在平台授权 | 本机已有 HOME 则用，否则拒绝；平台凭据页由 botmux 私发本人，拒绝文案不含链接 | 拒绝；平台凭据页由 botmux 私发本人 | 本机已有 HOME 则用，否则本机扫码 |
-| 已绑定，平台不可达 | 本机已有 HOME 则用，否则按「暂时不可用」拒绝，不自动发起本机扫码 | 拒绝 | 不受影响 |
+| 已绑定，该人未在平台授权，或没允许这台机器 | 拒绝；botmux 请平台向本人私发授权卡片，拒绝文案不含链接 | 同 `auto` | 本机已有 HOME 则用，否则本机扫码 |
+| 已绑定，平台不可达 | 按「暂时不可用」拒绝，不读本机 HOME，不自动发起本机扫码 | 拒绝 | 不受影响 |
 
 要点：
 - **用谁的授权由 botmux 决定，模型只能在角色内选择。** daemon 从飞书事件的发送人解析 union_id 后向平台请求，CLI 侧没有任何参数能改变它；模型只能用 `--as user` / `--as bot` 这类角色开关切换，不能指名任何人。委派与定时任务用已验签的原请求人（定时任务若经认领卡片认领，则用认领人，见 execution-identity.md）。
 - 平台只返回短期变量（lark 为 user_access_token + app id，bytedcli 为 cloud JWT + code JWT，以及请求里声明过的海外分区 cloud JWT，见 bytedcli-jwt-lifecycle.md「平台供票」），**永不返回刷新凭据**；返回的变量键按工具白名单校验，多余键一律拒绝。
-- 已绑定的机器**不再自动发起本机扫码**：有人值守的回合里，受管命令因平台没有该人的授权被拒绝时（原因 `platform_not_authorized` / `platform_consent_missing`），包装脚本向 botmux 发 `botmux auth request --provider <bytedcli|lark-cli>`，botmux 把平台凭据页（飞书用户身份和 ByteCloud 共用一页）连同缺失的 Meego 登录链接合成**一条**消息发给本人：先私聊，私聊发不出去时在当前群里发一张仅本人可见的卡片；agent 只收到不含链接的状态（「已私发给本人，等 TA 授权后重试」），拒绝文案里也没有链接。同一链接 3 分钟内不重复发。绑定会话里 `--as user` 被拒绝、`botmux auth request --scope` 走平台时同样如此。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
-- **平台不会为这个人签发时**（`platform_not_teammate`：与机器所有者不同队；`platform_forbidden`：平台拒绝了本机的请求）：`auto` 模式下 botmux 改为私发本机的 ByteCloud 授权入口（和缺失的 Meego 链接同一条消息），并告诉 agent「平台不会为这位发起人签发，已改发本机授权入口」；`platform` 模式没有本机兜底，agent 得到的说明是需要机器所有者把这个人加入平台上的团队（或检查本机的平台绑定），不会发起任何授权。本机授权完成后，同一回合内可继续使用。
+- 已绑定的机器上，`auto` 与 `platform` 的凭据只来自平台，本机 HOME 不会被读取或发起扫码。有人值守的回合里，受管命令因平台没有该人的授权或该人没允许这台机器被拒绝时（原因 `platform_not_authorized` / `platform_consent_missing`），包装脚本向 botmux 发 `botmux auth request --provider <bytedcli|lark-cli>`，botmux 调用平台的 `POST /v1/machine/credential-request`（机器令牌鉴权，请求体含发送人 union_id、bot 的 app id、本 bot 治理的全部平台工具 `tools`、可选的 `scopes`）。平台自己算出该人在这台机器上还缺什么，用平台机器人给本人私发**一张**授权卡片（按钮进入平台凭据页，一次点击先登记「允许这台机器」，再依次完成各服务授权）；botmux 不构造、不接收、不转述任何链接。平台的回答分类：
+  - `ready`：该人在这台机器上什么都不缺；botmux 立即强制重取一次本回合的身份（绕过 30 秒节流），命令重试即可成功。
+  - `sent`：卡片已发出（`deduped` 表示 10 分钟内已发过同样范围的卡片，不再重发）；agent 只收到不含链接的状态（「平台机器人已私聊发给本人，等 TA 授权后重试」），会话里补一句不含链接的提示。同一人同一范围在 3 分钟内不重复请求。
+  - `undeliverable`：平台发不出卡片（例如该人收不到平台机器人的私聊）；会话里发一句固定提示，让本人打开平台凭据页（`<平台地址>/credentials`，需单点登录，只列本人的待处理请求）处理，agent 得到同样的指引；平台给出的错误原文只写日志。
+  - 平台返回 404（没有该端点的旧平台）：回退到旧流程，由 botmux 私发平台凭据页，行为同旧版（见下条）。
+  - 当日请求上限（429 `request_cap`）：会话与 agent 被告知今天已发过好几张授权卡片，请用其中一张或打开平台凭据页，不建议重试。
+  - 其他失败（限流、401/403、5xx、超时或网络错误）：命令继续被拒绝，agent 收到「暂时无法让平台发出授权卡片」，不做任何本机兜底；只发一次请求，不重试（超时后重试可能让本人收到两张卡片）。
+  绑定会话里 `--as user` 被拒绝、`botmux auth request --scope` 走平台时同样如此（后者把缺的权限随请求带给平台）。Meego 登录不经过平台，仍由 botmux 私发登录链接；发给本人的消息里不含平台工具的链接。`/login`、`/login lark`、`/login bytedcli` 在绑定机器上（非 `local` 来源）同样请平台发卡片，并回复不含链接的一句话；`/login --scope`、`/login tags` 不变。
+- **旧平台（发送人与机器所有者不同队时返回 `platform_not_teammate`）**：新 daemon 在请求里声明 `machineConsent`，新平台据此返回 `consent_missing` 并发卡片；旧平台仍返回 `not_teammate`，该回答是终态：命令被拒绝，agent 得到的说明是平台不在这台机器上为此人签发，botmux 不发起任何本机授权，也不再发起 `botmux auth request`。`platform_forbidden`（平台拒绝了本机的请求）同样是终态。
+- **旧流程（仅在平台没有 `credential-request` 端点时保留）**：botmux 把平台凭据页（飞书用户身份和 ByteCloud 共用一页）连同缺失的 Meego 登录链接合成**一条**消息发给本人：先私聊，私聊发不出去时在当前群里发一张仅本人可见的卡片；agent 只收到不含链接的状态，同一链接 3 分钟内不重复发。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
 - **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
 - **能力开关（`triggerUserAuth.capabilities`）**：`lark-user`、`bytecloud`、`meego` 三项各自开关。`bytecloud` 覆盖 bytedcli、codebase、git push 与 bitscli / bits-cli（后两者读取同一份 ByteCloud 授权派生的 JWT，在按人 scratch HOME 下执行，不会读到机器上的登录文件）；`meego` 只覆盖 `bytedcli meego`，独立的 `meegle` 命令不受管。没开的能力保持原生：命令直接使用这台机器自己的登录态，botmux 不注入身份、不改 HOME。只开 `meego`（不开 `bytecloud`）时，`bytedcli meego` 使用本人的 Meego 登录，其余 bytedcli 子命令原生执行。未写 `capabilities` 时由 `tools` 推导（`lark-cli`→`lark-user`，`bytedcli`→`bytecloud`+`meego`）。绑定会话里 `--as user` 的归属见上表：`triggerUserAuth` 开启且不含 `lark-user` 时它原生执行。
-- **无人值守的运行（定时任务、`execution background`、外部触发 `trg_`、工作流事件 `workflow-event:`）**：运行时不发起任何授权。创建定时任务时，任务执行人会私下收到一条授权入口，列出尚未授权的已开启能力（只读检查，不向平台申请授权。任务执行人就是创建任务那一轮的发起人时，读取该轮已发布的身份：已授权则不提示，明确未授权则附平台凭据页或设备码链接，平台故障或尚未发布则不提示；其他情况只检查本机登录，平台来源的凭据无法只读判断，不在此列）。运行时只取任务执行人已有的凭据；受管命令因凭据缺失被拒绝时以 77 退出，命令未执行，不发链接给 agent、不往群里发任何内容，同时由包装脚本向 botmux 发一次非交互请求（`botmux auth request --provider <bytedcli|lark-cli|meego> --unattended`），botmux 私聊本人一条通知，列出该人所有缺失能力的授权入口（平台已绑定时是平台凭据页，未绑定时是设备码链接）；同一任务同一人同一能力的同一链接只发一次，送达成功后才记录，设备码过期后下一次拒绝会发新链接，凭据恢复后重置；没有触及受管工具的运行不发任何通知。重新授权后任务会再次运行。私聊发不出去时（执行人不在 bot 的可用范围等），通知改为发一张仅本人可见的卡片，位置是任务所在的群；创建任务时的授权入口同样如此。两者都失败时记录日志，agent 看到的拒绝文案说明联系不上这位执行人、需要把 TA 加入本 bot 的可用范围，文案里没有链接。无人值守运行里的 `bytedcli auth login`、`bitscli ... auth login`、`meego login` 同样直接拒绝；只有 `auth login` 和 `meego login` 视为登录命令，`login` 作为其他参数（如 `codebase search login`）照常执行。带 `--session` 或 `--session-method` 的 `bytedcli auth login` 是浏览器会话登录（Meego GoAPI 需要的飞书网页会话），不是 ByteCloud 登录：有人值守时在本人的目录下运行真实命令，会话落在本人名下；无人值守时以 77 拒绝且不运行。这条命令仍要先取到本人的身份，没有 ByteCloud 授权的人会先收到 ByteCloud 授权入口，授权后再重试。
-- 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
+- **无人值守的运行（定时任务、`execution background`、外部触发 `trg_`、工作流事件 `workflow-event:`）**：运行时不发起任何授权。创建定时任务时，任务执行人会私下收到一条授权入口，列出尚未授权的已开启能力（只读检查，不向平台申请授权。任务执行人就是创建任务那一轮的发起人时，读取该轮已发布的身份：已授权则不提示，明确未授权则请平台发授权卡片（平台来源）或附设备码链接，平台故障或尚未发布则不提示；其他情况只检查本机登录，平台来源的凭据无法只读判断，不在此列）。运行时只取任务执行人已有的凭据；受管命令因凭据缺失被拒绝时以 77 退出，命令未执行，不发链接给 agent、不往群里发任何内容，同时由包装脚本向 botmux 发一次非交互请求（`botmux auth request --provider <bytedcli|lark-cli|meego> --unattended`），botmux 私聊本人一条通知，列出该人所有缺失的非平台能力（Meego 登录链接、未绑定平台时的设备码链接）的授权入口；平台来源的能力（绑定且来源不是 `local`）改为请平台给本人发授权卡片，botmux 不检查本机登录；同一任务同一人同一能力的同一链接只发一次（平台卡片以 `platform` 为标记，只请求一次），送达成功后才记录，设备码过期后下一次拒绝会发新链接，凭据恢复后重置；没有触及受管工具的运行不发任何通知。重新授权后任务会再次运行。私聊发不出去时（执行人不在 bot 的可用范围等），通知改为发一张仅本人可见的卡片，位置是任务所在的群；创建任务时的授权入口同样如此。两者都失败时记录日志，agent 看到的拒绝文案说明联系不上这位执行人、需要把 TA 加入本 bot 的可用范围，文案里没有链接。无人值守运行里的 `bytedcli auth login`、`bitscli ... auth login`、`meego login` 同样直接拒绝；只有 `auth login` 和 `meego login` 视为登录命令，`login` 作为其他参数（如 `codebase search login`）照常执行。带 `--session` 或 `--session-method` 的 `bytedcli auth login` 是浏览器会话登录（Meego GoAPI 需要的飞书网页会话），不是 ByteCloud 登录：有人值守时在本人的目录下运行真实命令，会话落在本人名下；无人值守时以 77 拒绝且不运行。这条命令仍要先取到本人的身份，没有 ByteCloud 授权的人会先收到 ByteCloud 授权入口，授权后再重试。
+- 平台按以下任一条件签发：发送人就是机器所有者；发送人与机器所有者同属一个团队且已对该团队开启同意；发送人已允许这台机器（按机器同意，绑定在机器当时的所有者上，机器换主即失效，只覆盖卡片上列出的服务，可在平台凭据页撤销）。不满足时返回 `consent_missing`（请求里带 `machineConsent: true` 的新 daemon）或 `not_teammate`（旧 daemon），botmux 原样告知发送人，不退回任何其他身份。
 - **绑定会话（`larkToolBinding` 默认开启）里的 `--as user` 同样会用平台凭据。** 自建 bot 应用的可用范围通常只有所有者本人，别人打开该应用的授权链接只会看到「你没有使用权限」，所以对他们来说平台是唯一可用的来源。取法：
   - `auto`：该人已有对本 bot 应用的授权就用它（所有者保留 bot 应用更多的权限）；没有则向平台申请，lark-cli 的用户调用改用平台应用的 app id 执行；机器未绑定平台时与以前一致。
   - `platform`：只用平台凭据，不看对 bot 应用的授权。
   - `local`，或 `triggerUserAuth` 未覆盖 lark-cli：与以前一致，只用对 bot 应用的授权。
   - `--as bot` 始终是本 bot 应用，不受影响；只有 daemon 明确标注为平台签发的用户票，lark-cli 包装器才接受与绑定应用不同的 app id。
-  - 这种情况下 `botmux auth request` 不再发 bot 应用的设备码链接，而是由 botmux 把平台凭据页（带上缺的权限）私发给本人，返回 `platform_authorization_required` 与不含链接的说明；平台应用缺某个权限时，需要先在平台应用后台开通，再让用户在平台重新授权。
+  - 这种情况下 `botmux auth request` 请平台向本人发授权卡片（请求里带上缺的权限），不发 bot 应用的设备码链接，返回 `platform_authorization_required` 与不含链接的说明；平台应用缺某个权限时，需要先在平台应用后台开通，再让用户在平台重新授权。
   - 平台应用拿不到某些敏感权限（例如以用户身份读群聊/私聊消息，全员可见的应用通常批不下来）时，数据若在本 bot 能访问的群或文档里，提示会先引导模型对这次**读取**改用 `--as bot`，再考虑补权限；写操作不改用 bot 身份。执行者由模型在命令里显式选择，包装器不会自动换身份重试。
 
 ## 多人发言的回合：按调用选择身份（`BOTMUX_AS`）
