@@ -235,6 +235,23 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     expect(late).toEqual({ submitted: true });
   });
 
+  it('late recovery distinguishes an owned receipt from foreign same-text history', async () => {
+    const ownedPid = spawnRolloutHolder(SID_1);
+    await new Promise(r => setTimeout(r, 150));
+    const pty = ptyThatNeverCommits(ownedPid);
+    const result = await createTraexAdapter('/bin/traex').writeInput(pty, 'late owned receipt');
+    expect(result?.submitted).toBe(false);
+    expect(result?.recheck).toBeTypeOf('function');
+    seedHistory(SID_2, 'late owned receipt');
+    expect(await result!.recheck!()).toEqual({ submitted: true });
+    seedHistory(SID_1, 'late owned receipt');
+    expect(await result!.recheck!()).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    const enters = pty.sendSpecialKeys.mock.calls.length;
+    await result!.recheck!();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(enters);
+  });
+
   // ── Session-id ownership (only RETURN a pid-owned id) ──
 
   it('returns the session id when THIS pid provably owns the rollout', async () => {
@@ -246,7 +263,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     const result = await adapter.writeInput(pty, 'owned submit');
 
-    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
   });
 
   it('confirms the submit but WITHHOLDS a foreign sibling id the pid does not own', async () => {
@@ -278,7 +295,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     const result = await adapter.writeInput(pty, 'duplicate text foreign-first');
 
-    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
   });
 
   it('keeps polling past a foreign-first sighting until the OWNED line lands later (async timing)', async () => {
@@ -298,7 +315,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     const result = await adapter.writeInput(pty, 'duplicate text owned-later');
     for (const t of pty.timers) clearTimeout(t);
 
-    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
   });
 
   it('withholds the id when fd enumeration is unavailable (pid not running)', async () => {
