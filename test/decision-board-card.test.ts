@@ -177,6 +177,19 @@ describe('仅关闭，不投递', () => {
     expect(click(card).deliver).toBeUndefined();
     expect(() => service.putDraft(seq, 'owner', { choice: 'A', baseRev: item.rev })).toThrow(BoardError);
   });
+  it('在网页上关闭：同一张飞书卡片原地刷新为灰色终态，不再有能点的按钮，也不另发卡', async () => {
+    const seq = await addDecide();
+    const item = service.store().getItem(APP, seq)!;
+    updated.length = 0;
+    // Dashboard 的 close-in-chat 路由直接调 service.closeInChat，不经卡片回调。
+    service.closeInChat(seq, item.rev, 'u:on_owner');
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
+    expect(updated.map(u => u.messageId)).toEqual([sent[0]!.messageId]);
+    expect(updated[0]!.card.header.template).toBe('grey');
+    expect(callbackButtons(updated[0]!.card)).toHaveLength(0);
+    expect(delivered).toEqual([]);
+  });
   it('非 owner、旧版内容、被替换卡片和已禁用卡片均不能关闭', async () => {
     const seq = await addDecide();
     const value = closeValue(currentCard());
