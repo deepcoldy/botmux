@@ -1,3 +1,4 @@
+import { normalizeExecutionActivity } from '../../core/execution-activity.js';
 // 会话任务状态的展示文案：看板卡片、表格状态、状态筛选共用。推导本身在 core/session-task-status。
 import {
   deriveSessionTaskStatus,
@@ -51,9 +52,19 @@ export function taskKindLabel(kind: SessionTaskKind): string {
   return kind === 'needs_you' ? t('sessions.task.needsYou') : t(KIND_LABEL_KEYS[kind]);
 }
 
+export function sessionExecutionActivityText(raw: unknown): string {
+  const activity = normalizeExecutionActivity(raw);
+  const phase = activity?.phase ?? 'unknown';
+  const label = t(`sessions.activity.${phase}`);
+  const elapsed = activity?.elapsedSeconds === undefined ? '' : ` · ${t('sessions.activity.elapsed', { seconds: activity.elapsedSeconds })}`;
+  const progress = activity?.progressAgeSeconds === undefined ? '' : ` · ${t('sessions.activity.progress', { seconds: activity.progressAgeSeconds })}`;
+  return label + elapsed + progress;
+}
+
 /** 表格状态列：任务状态短语，休眠会话补一个「休眠」。 */
 export function sessionTaskStatusText(row: Record<string, any>): string {
-  const label = taskStatusLabel(deriveSessionTaskStatus(row));
+  const status = deriveSessionTaskStatus(row);
+  const label = taskStatusLabel(status) + (status.kind === 'working' ? ` · ${sessionExecutionActivityText(row.executionActivity)}` : '');
   return row.status === 'dormant' ? `${label} · ${t('sessions.status.dormant')}` : label;
 }
 
@@ -64,13 +75,13 @@ export interface TaskCardLine {
 }
 
 /** 看板卡片上的状态行；空闲与已关闭不占行。 */
-export function sessionTaskCardLine(status: SessionTaskStatus, now: number = Date.now()): TaskCardLine | null {
+export function sessionTaskCardLine(status: SessionTaskStatus, now: number = Date.now(), activity?: unknown): TaskCardLine | null {
   switch (status.kind) {
     case 'needs_you':
       return { tone: 'need', label: needsYouReasonLabel(status.reason), ...(status.detail ? { detail: status.detail } : {}) };
     case 'working': {
       const span = status.since !== undefined ? taskDurationText(now - status.since) : '';
-      return { tone: 'work', label: t('sessions.task.working'), ...(span ? { detail: t('sessions.task.runningFor', { time: span }) } : {}) };
+      return { tone: 'work', label: t('sessions.task.working'), detail: sessionExecutionActivityText(activity) + (span ? ` · ${t('sessions.task.runningFor', { time: span })}` : '') };
     }
     case 'delivered':
       return {

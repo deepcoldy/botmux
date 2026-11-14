@@ -32,8 +32,12 @@ import {
 } from './session-message-preview.js';
 import { isSuspendableBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { isNativeTopicId } from './native-topic-id.js';
+import { sessionExecutionActivity } from './session-execution-activity.js';
+import type { ExecutionActivity } from './execution-activity.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  executionActivity?: ExecutionActivity;
+  lastActivityAt?: number;
   modelPin?: ReturnType<typeof modelPinView>;
   /** Closed rows only: whether a new message in the topic will resume this session. */
   resumable?: boolean;
@@ -364,6 +368,8 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
   const topicId = sessionThreadId(ds.session);
+  const executionActivity = sessionExecutionActivity(ds);
+  const lastActivityAt = Math.max(sessionLastActivityAtMs(ds.session), ds.lastMessageAt || 0, executionActivity?.lastProgressAtMs || 0);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -397,7 +403,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
           : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'))),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
-    lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
+    lastMessageAt: lastActivityAt,
+    ...(lastActivityAt > 0 ? { lastActivityAt } : {}),
+    ...(executionActivity ? { executionActivity } : {}),
     workingDir: ds.workingDir,
     chatId: ds.chatId,
     chatType: ds.chatType,

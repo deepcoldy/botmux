@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { t } from '../src/i18n/index.js';
 
 const mocks = vi.hoisted(() => ({ request: vi.fn(), create: vi.fn(), reply: vi.fn(), patch: vi.fn(), upload: vi.fn() }));
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
@@ -198,16 +199,16 @@ describe('background-wait label on the live card', () => {
     await worker.listeners('message')[0]({ type: 'capture_identity', revision: 1, turnId: 'om_turn', dispatchAttempt: 1 });
     expect(streamCardLabel(ds)).toMatchObject({ activity: 'tool' });
     ds.turnDispatchAttemptHighWater = { turnId: 'om_turn', dispatchAttempt: 2 };
-    expect(streamCardLabel(ds)).toBeUndefined();
+    expect(streamCardLabel(ds)).toEqual({ activity: 'unknown' });
     await worker.listeners('message')[0]({ type: 'capture_identity', revision: 2, turnId: 'om_turn', dispatchAttempt: 2 });
-    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'unknown' });
     ds.managedTurnOrigin = { turnId: 'om_turn', dispatchAttempt: 2 } as NonNullable<DaemonSession['managedTurnOrigin']>;
     await worker.listeners('message')[0]({ type: 'capture_identity', revision: 3, turnId: 'om_other', dispatchAttempt: 1 });
-    expect(streamCardLabel(ds)).toBeUndefined();
+    expect(streamCardLabel(ds)).toEqual({ activity: 'unknown' });
     await worker.listeners('message')[0]({ type: 'capture_identity', revision: 4 });
-    expect(streamCardLabel(ds)).toBeUndefined();
+    expect(streamCardLabel(ds)).toEqual({ activity: 'unknown' });
     ds.captureIdentity = undefined;
-    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'unknown' });
   });
 
   it('carries real Trae transcript tool activity through the native bridge into the card', async () => {
@@ -274,9 +275,9 @@ describe('background-wait label on the live card', () => {
     await worker.listeners('message')[0]({ type: 'turn_progress', turnId: 'om_other', dispatchAttempt, stage: 'tool_returned' });
     expect(streamCardLabel(ds)).toMatchObject({ activity: 'tool' });
     await worker.listeners('message')[0]({ type: 'turn_progress', turnId: 'om_turn', dispatchAttempt, stage: 'tool_returned' });
-    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'unknown' });
     ds.currentTurnId = 'om_successor';
-    expect(streamCardLabel(ds)).toBeUndefined();
+    expect(streamCardLabel(ds)).toEqual({ activity: 'unknown' });
   });
 
   it('patches the header when only the background count changes', async () => {
@@ -298,7 +299,7 @@ describe('background-wait label on the live card', () => {
     // The worker drops the field once the main agent works again.
     await screenUpdate('working');
     expect(ds.backgroundTaskCount).toBeUndefined();
-    expect(patchedHeaders().at(-1)).toContain('工作中');
+    expect(patchedHeaders().at(-1)).toContain(t('card.status.activity_unknown', undefined, 'zh'));
     expect(mocks.patch).toHaveBeenCalledTimes(3);
   });
 
