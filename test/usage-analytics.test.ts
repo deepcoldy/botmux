@@ -136,6 +136,11 @@ describe('usage ledger analytics', () => {
     expect(m.cacheReadShare).toBeCloseTo(1 / 3); expect(m.outputInputRatio).toBeCloseTo(2 / 3);
     expect(m.pricedTokenShare).toBeCloseTo(2 / 3); expect(m.costPerMillionTokens).toBeCloseTo(4000);
     expect(result.bots.map(b => b.averageTpm)).toEqual([75, 75]);
+    // 分组行的缓存读取占比以该组全部输入（含缓存读写）为分母，与全局指标同口径。
+    expect(result.bots[0]!.cacheReadShare).toBeCloseTo(.4);
+    expect(result.bots[1]!.cacheReadShare).toBeCloseTo(.25);
+    expect(result.models[0]!.cacheReadShare).toBeCloseTo(.4);
+    expect(result.models[1]!.cacheReadShare).toBeCloseTo(.25);
     const filtered = await queryUsageLedger({ ...range, bot: 'bot-a' }, { ledgerDir: dir, now: new Date('2026-11-10T01:00:00Z') });
     expect(filtered.metrics).toMatchObject({ averageTpm: 75, activeMinutes: 1, activeMinuteAverageTpm: 150,
       tokensPerRecordMean: 75, tokensPerRecordP50: 75, tokensPerRecordP95: 100, tokensPerSessionMean: 150 });
