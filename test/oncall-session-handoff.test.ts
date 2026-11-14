@@ -142,14 +142,15 @@ describe('Oncall configuration and platform adapters', () => {
     expect(loadOncallGroupTarget(dir, 'app')).toEqual(native);
     expect(loadOncallGroupTarget(dir, 'other')).toEqual(target);
   });
-  it('uses the platform AppLink, opens the launch step, prefills the question and discards fixed legacy selection', async () => {
-    const page = new URL('https://oncall.example.test/chat?tenant=12&type=None&region=None');
+  it('uses the platform AppLink, prefills the question and discards stale legacy selection and query', async () => {
+    const page = new URL('https://oncall.example.test/chat?tenant=12&type=None&region=None&query=stale&step=launch-oncall');
     const appLink = 'https://applink.feishu.cn/client/web_url/open?url=' + encodeURIComponent(page.href);
     const fetcher = vi.fn().mockResolvedValue(response({ lark_dialog_url: appLink }));
     const link = new URL(await createNativeOncallLink(target, 'secret', '', 'question', 'feishu', fetcher));
     const native = new URL(link.searchParams.get('url')!);
     expect(link.searchParams.get('mode')).toBe('sidebar-semi');
-    expect(native.searchParams.get('step')).toBe('launch-oncall');
+    expect(native.searchParams.has('step')).toBe(false); expect(native.searchParams.get('query')).toBe('question');
+    expect(native.searchParams.get('directly')).toBe('true');
     expect(native.searchParams.has('type')).toBe(false); expect(native.searchParams.has('region')).toBe(false);
     expect(JSON.parse(native.searchParams.get('context')!)).toEqual({ trigger_message: 'question' });
     expect(link.href).not.toContain('secret');
@@ -161,17 +162,41 @@ describe('Oncall configuration and platform adapters', () => {
       await expect(createNativeOncallLink(target, 'secret', '', '', 'feishu', vi.fn().mockResolvedValue(response({ lark_dialog_url: url })))).rejects.toThrow();
     }
   });
-  it('reloads platform choices on submit and refuses special actions, prerequisites or unmapped custom fields', async () => {
+  it('reloads platform choices and delegates custom forms while rejecting invalid routes', async () => {
     const category = { id: 34, name: 'category', tenant_id: 12, type_action: 'create_chat', workflow_id: 10 };
     const fetcher = vi.fn().mockResolvedValueOnce(response({ region: { cn: [category] } }))
       .mockResolvedValueOnce(response({ tenant_id: 12, type_id: 34, config: '[]' }));
-    await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34, fetcher)).resolves.toMatchObject(category);
+    await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34, fetcher)).resolves.toMatchObject({ ...category, requiresNativeForm: false });
     for (const config of [{ ...category, type_action: 'redirect' }, { ...category, tenant_id: 99 }]) {
       await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34, vi.fn().mockResolvedValue(response({ region: { cn: [config] } })))).rejects.toThrow();
     }
     const custom = vi.fn().mockResolvedValueOnce(response({ region: { cn: [category] } }))
       .mockResolvedValueOnce(response({ tenant_id: 12, type_id: 34, config: '[{"required":true}]' }));
-    await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34, custom)).rejects.toThrow();
+    await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34, custom)).resolves.toMatchObject({ requiresNativeForm: true });
+  });
+  it('uses the native platform for a valid category without a workflow and rejects malformed schemas', async () => {
+    const category = { id: 34, name: 'category', tenant_id: 12, type_action: 'create_chat' };
+    await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34,
+      vi.fn().mockResolvedValue(response({ region: { cn: [category] } })))).resolves.toMatchObject({ requiresNativeForm: true });
+    for (const config of ['{', '{}', 'null']) {
+      const fetcher = vi.fn().mockResolvedValueOnce(response({ region: { cn: [{ ...category, workflow_id: 10 }] } }))
+        .mockResolvedValueOnce(response({ tenant_id: 12, type_id: 34, config }));
+      await expect(validateOncallSelection(target, 'secret', 'actor', 'cn', 34, fetcher)).rejects.toThrow();
+    }
+  });
+  it.each(['feishu', 'lark'] as const)('preserves the selected native form and full description on %s', async brand => {
+    const page = new URL('https://oncall.example.test/chat?tenant=12&type=999&region=legacy&level=P2&directly=false&locale=zh&query=stale&step=launch-oncall');
+    const host = brand === 'lark' ? 'applink.larksuite.com' : 'applink.feishu.cn';
+    const fetcher = vi.fn().mockResolvedValue(response({ lark_dialog_url: `https://${host}/client/web_url/open?url=${encodeURIComponent(page.href)}` }));
+    const description = '中文问题与完整上下文'.repeat(30);
+    const link = new URL(await createNativeOncallLink(target, 'secret', '', description, brand, fetcher,
+      { region: 'cn_all', typeId: 34, priority: 'P1' }));
+    const native = new URL(link.searchParams.get('url')!);
+    expect(Object.fromEntries(native.searchParams)).toMatchObject({ tenant: '12', type: '34', region: 'cn_all', level: 'P1', directly: 'true' });
+    expect(native.searchParams.get('query')).toBe(description); expect(native.searchParams.has('step')).toBe(false);
+    expect(JSON.parse(native.searchParams.get('context')!)).toEqual({ trigger_message: description });
+    expect(link.searchParams.get('mode')).toBe('sidebar-semi');
+    expect(link.href).not.toContain('secret');
   });
   it('submits the validated selection and verified actor rather than the legacy fixed target', async () => {
     const fetcher = vi.fn().mockResolvedValue(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' }));

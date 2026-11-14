@@ -1416,6 +1416,7 @@ export async function unpinMessage(larkAppId: string, messageId: string): Promis
  */
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
   cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
@@ -1427,6 +1428,7 @@ export async function sendEphemeralCard(
     } catch (err) {
       throw new Error(`Invalid ephemeral card JSON: ${err}`);
     }
+    if (options?.beforeWrite) await options.beforeWrite();
     const res: any = await (c as any).request({
       method: 'POST',
       url: '/open-apis/ephemeral/v1/send',
