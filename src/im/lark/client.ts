@@ -24,6 +24,7 @@ import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
 import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
+import { readMessageWithinContext } from './message-read-context.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_CONTACT_INVALID_PARAM,
@@ -1670,28 +1671,31 @@ export async function getMessageDetail(
   messageId: string,
   options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
-  const c = getBotClient(larkAppId);
-  // card_msg_content_type=user_card_content returns the original card JSON
-  // (including v2 schema/body/elements) instead of Lark's simplified fallback
-  // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
-  // fetches, but merge_forward enumeration MUST pass false — Lark returns
-  // HTTP 500 when the param is combined with a merge_forward message_id.
-  // Without the param, sub-messages still come back in the "Format A"
-  // simplified card shape which extractCardContent handles.
-  const userCardContent = options.userCardContent ?? true;
-  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
-    // Opt into server-side sender names (sender_name / sender_i18n_names, for
-    // user AND bot senders); without it the server omits them. Matters here for
-    // merge_forward sub-messages, whose senders appear nowhere else.
-    with_sender_name: 'true',
-    // Explicit ID type makes Feishu return app_id for bot mentions.
-    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
-  }, options);
-  if (res.code !== 0) {
-    throw larkApiError('get message', res);
-  }
-  return res.data;
+  const key = options.signal ? undefined : JSON.stringify([larkAppId, messageId, options.userCardContent ?? true, options.timeoutMs ?? null, options.userIdType ?? null]);
+  return readMessageWithinContext(key, async () => {
+    const c = getBotClient(larkAppId);
+    // card_msg_content_type=user_card_content returns the original card JSON
+    // (including v2 schema/body/elements) instead of Lark's simplified fallback
+    // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
+    // fetches, but merge_forward enumeration MUST pass false — Lark returns
+    // HTTP 500 when the param is combined with a merge_forward message_id.
+    // Without the param, sub-messages still come back in the "Format A"
+    // simplified card shape which extractCardContent handles.
+    const userCardContent = options.userCardContent ?? true;
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+      // Opt into server-side sender names (sender_name / sender_i18n_names, for
+      // user AND bot senders); without it the server omits them. Matters here for
+      // merge_forward sub-messages, whose senders appear nowhere else.
+      with_sender_name: 'true',
+      ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
+    }, options);
+    if (res.code !== 0) {
+      throw larkApiError('get message', res);
+    }
+    return res.data;
+  });
+
 }
 
 /** Parse the sender union_id from an IM message fetched with

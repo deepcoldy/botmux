@@ -45,6 +45,9 @@ import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolat
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { writeAndFlush } from './cli/stdout-flush.js';
+import { parseHistoryReadOptions, parseQuotedReadOptions, readHistoryMessages, HISTORY_READ_USAGE, QUOTED_READ_USAGE } from './cli/history-read.js';
+import { withMessageReadContext } from './im/lark/message-read-context.js';
+import { readQuotedMessages } from './cli/quoted-read.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -8171,11 +8174,13 @@ ${SEND_HELP_BODY}
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
                                        详见 \`botmux bots invite --help\`
-  history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
+  history [--limit N] [--scope session|thread|chat|ambient] [--view full|index]
+          [--query text] [--type text,interactive] [--since ISO] [--until ISO] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文；
                                        --with-card-json 为每张卡片附原始结构化 JSON（消息均带 resources 附件 key）
-  quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
+  quoted <message_id> [<id> ...] [--raw] [--no-download]
+                                       按消息 id 定向读取（最多 20 条）；默认下载附件，--no-download 只取文本和资源信息；
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
@@ -9753,6 +9758,7 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) { console.log(HISTORY_READ_USAGE); return; }
   // Reject unrecognized flags BEFORE anything else. Every flag below is pulled
   // out of argv by name; a flag that is not pulled is simply not there, so a
   // typo or an invented flag used to be answered with the default behaviour and
@@ -9760,14 +9766,17 @@ async function cmdHistory(rest: string[]): Promise<void> {
   // `--scope thread`) came back as session scope, which for a thread-scope
   // session is the same window — so the mistake was invisible in the output too.
   const unknown = unknownFlags(rest, {
-    valueFlags: ['--limit', '--scope', '--session-id'],
+    valueFlags: ['--limit', '--scope', '--session-id', '--view', '--query', '--type', '--since', '--until'],
     boolFlags: ['--with-card-json'],
   });
   if (unknown.length > 0) {
     console.error(`未知参数: ${unknown.join(' ')}`);
-    console.error('  botmux history [--limit <n>] [--scope session|thread|chat|ambient] [--session-id <id>] [--with-card-json]');
+    console.error(HISTORY_READ_USAGE);
     process.exit(2);
   }
+  let readOptions: ReturnType<typeof parseHistoryReadOptions>;
+  try { readOptions = parseHistoryReadOptions(rest); }
+  catch (err: any) { console.error(err.message); process.exit(2); }
   // No-transport turn has no Feishu chat history to read — central hard gate.
   assertTurnTransportOrExit('history');
   // Read isolation: register this bot from its cred file so the Lark client is
@@ -9794,149 +9803,116 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
   const withCardJson = rest.includes('--with-card-json');
   const { getMessageDetail, listAmbientChatMessages, listThreadMessages, listChatMessages } = await import('./im/lark/client.js');
-  const { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, extractResources, createImgNumberer } = await import('./im/lark/message-parser.js');
+  const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   try {
-    // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
-    // chat container directly and let the caller cap with --limit. Thread-scope
-    // sessions walk the thread container by root_id. `--scope chat|ambient`
-    // lets a thread-scope session intentionally read outside its thread when
-    // it needs the surrounding group conversation (for example `/t` spawned
-    // from an ongoing 普通群 discussion).
-    const isChatScope = s.scope === 'chat';
-    const effectiveScope = scopeArg === 'session'
-      ? (isChatScope ? 'chat' : 'thread')
-      : scopeArg;
+    await withMessageReadContext(async () => {
+      // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
+      // chat container directly and let the caller cap with --limit. Thread-scope
+      // sessions walk the thread container by root_id. `--scope chat|ambient`
+      // lets a thread-scope session intentionally read outside its thread when
+      // it needs the surrounding group conversation (for example `/t` spawned
+      // from an ongoing 普通群 discussion).
+      const isChatScope = s.scope === 'chat';
+      const effectiveScope = scopeArg === 'session'
+        ? (isChatScope ? 'chat' : 'thread')
+        : scopeArg;
 
-    if (effectiveScope === 'thread' && isChatScope) {
-      console.error('当前 session 是 chat-scope，没有 thread 历史可读取。请使用 --scope chat。');
-      process.exit(1);
-    }
-
-    if (effectiveScope === 'ambient' && isChatScope) {
-      console.error('当前 session 是 chat-scope，没有 thread root 可作为 ambient 边界。请使用 --scope chat。');
-      process.exit(1);
-    }
-
-    // Silent listener sessions anchor on an internal `ml:` route id that must
-    // never reach Lark read APIs; use the frozen real source message id.
-    const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
-
-    let ambientBeforeCreateTime: string | undefined;
-    if (effectiveScope === 'ambient') {
-      try {
-        const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
-        ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
-      } catch {
-        // Best-effort only: ambient history should still work if the root
-        // message was withdrawn or is otherwise unavailable; it will then fall
-        // back to the chat tail with current-thread messages filtered out.
+      if (effectiveScope === 'thread' && isChatScope) {
+        console.error('当前 session 是 chat-scope，没有 thread 历史可读取。请使用 --scope chat。');
+        process.exit(1);
       }
-    }
 
-    const raw = effectiveScope === 'chat'
-      ? await listChatMessages(appId, s.chatId, limit)
-      : effectiveScope === 'ambient'
-        ? await listAmbientChatMessages(appId, s.chatId, limit, {
-            beforeCreateTime: ambientBeforeCreateTime,
-            excludeRootMessageId: threadRootMessageId,
-          })
-        : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
-    // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
-    // path in daemon.ts. Each message gets its own numberer with resources
-    // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
-    // the surfaced `resources` order (same contract as parseEventMessage).
-    // Resources carry key+name only — no download here; `botmux quoted <om_id>`
-    // fetches any message's full text AND downloads its attachments locally.
-    const messages = await Promise.all(raw.map(async (m: any) => {
-      const numberer = createImgNumberer();
-      let resources = extractResources(m.msg_type ?? 'text', m.body?.content ?? '', numberer);
-      const parsed = parseApiMessage(m, numberer);
-      let cardJson: unknown;
-      // `im.v1.message.list` returns Lark's simplified "请升级客户端" fallback for
-      // complex cards — the whole body (user-forwarded) or nested sub-cards
-      // buried mid-body (Argos alarms). Those are the cards where the list view
-      // alone is incomplete, so resolve them by unioning both `im.message.get`
-      // representations (server-rendered + full structured). Failures keep the
-      // list text. Simple cards (no fallback) already render fully here —
-      // --with-card-json resolves ALL cards since the structured JSON only
-      // exists on the `im.message.get` representation.
-      if (parsed.msgType === 'interactive' && (withCardJson || cardContentHasUpgradeFallback(parsed.content))) {
-        // Fresh numberer: the resolve REPLACES both content and resources, so
-        // its [图片 N] numbering must restart at 1 alongside merged.resources.
-        // Keeping the list-view resources would leak the upgrade-fallback
-        // shell's phantom image (a "请升级" placeholder, absent from the real
-        // card) into every complex card's resource list.
-        const cardNumberer = createImgNumberer();
-        const merged = await resolveMergedCardContent(appId, parsed.messageId, cardNumberer).catch(() => null);
-        if (merged) {
-          parsed.content = merged.text;
-          resources = merged.resources;
-          if (withCardJson) {
-            try { cardJson = JSON.parse(merged.structuredContent); }
-            catch { cardJson = merged.structuredContent; }
-          }
+      if (effectiveScope === 'ambient' && isChatScope) {
+        console.error('当前 session 是 chat-scope，没有 thread root 可作为 ambient 边界。请使用 --scope chat。');
+        process.exit(1);
+      }
+
+      // Listener routes are internal; Lark reads require the frozen source message.
+      const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
+      let ambientBeforeCreateTime: string | undefined;
+      if (effectiveScope === 'ambient') {
+        try {
+          const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
+          ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
+        } catch {
+          // Best-effort only: ambient history should still work if the root
+          // message was withdrawn or is otherwise unavailable; it will then fall
+          // back to the chat tail with current-thread messages filtered out.
         }
       }
-      if (parsed.msgType === 'merge_forward') {
-        const { extraResources } = await expandMergeForward(appId, parsed.messageId, parsed, numberer);
-        if (extraResources.length) resources = [...resources, ...extraResources];
-      }
-      return {
-        ...parsed,
-        ...(resources.length ? { resources } : {}),
-        ...(cardJson !== undefined ? { cardJson } : {}),
-      };
-    }));
-    // Range guidance, emitted at the moment the model is actually reading
-    // history. The decisive fact is `sessionScope` (this session's own scope),
-    // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
-    // chat_mode='group' while its session is thread-scope, so reasoning from the
-    // group type would wrongly conclude "I may search the whole chat". Both
-    // `--scope` gates above key on isChatScope for exactly that reason.
-    //
-    // Wording note: describe only what the model can OBSERVE. Daemon-side
-    // invocations (`/t` and friends) are stripped before the prompt is built, so
-    // the model never sees them — naming them here would be an instruction it
-    // cannot act on. Describe the symptom instead: the topic starts mid-discussion
-    // and its own history looks too short to explain the task.
-    const rangeHint = isChatScope
-      ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
-      : effectiveScope === 'thread'
-        ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+
+      const raw = effectiveScope === 'chat'
+        ? await listChatMessages(appId, s.chatId, limit)
         : effectiveScope === 'ambient'
-          ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
-          : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
-    const historyResult = {
-      sessionId: sid,
-      chatId: s.chatId,
-      scope: effectiveScope,
-      sessionScope: isChatScope ? 'chat' : 'thread',
-      ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
-      ...(effectiveScope === 'ambient' ? {
-        ambient: {
-          source: 'chat',
-          beforeCreateTime: ambientBeforeCreateTime,
-          excludeRootMessageId: s.rootMessageId,
-        },
-      } : {}),
-      messages,
-      total: messages.length,
-      rangeHint,
-      // Discoverability: agents reading history often need the actual image
-      // bytes (alert charts) or the raw card JSON — both live one command away.
-      ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
-        hint: '查看某条消息的附件图片/文件或卡片全文：botmux quoted <messageId>（任意消息 id 均可，附件会下载到本地）；需要原始卡片 JSON：botmux quoted <messageId> --raw 或本命令加 --with-card-json',
-      } : {}),
-    };
-    const decorated = await decorateSessionCliLinkRefResult({
-      sessionId: sid,
-      appId,
-      sourceType: 'history',
-      sourceId: `${effectiveScope}:${messages.length}`,
-      value: historyResult,
+          ? await listAmbientChatMessages(appId, s.chatId, limit, {
+              beforeCreateTime: ambientBeforeCreateTime,
+              excludeRootMessageId: threadRootMessageId,
+            })
+          : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
+      // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
+      // path in daemon.ts. Each message gets its own numberer with resources
+      // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
+      // the surfaced `resources` order (same contract as parseEventMessage).
+      // Resources carry key+name only — no download here; `botmux quoted <om_id>`
+      // fetches any message's full text AND downloads its attachments locally.
+      const { messages, retrieval } = await readHistoryMessages(appId, raw, readOptions, withCardJson, {
+        expandMergeForward, resolveMergedCard: resolveMergedCardContent,
+      });
+      // Range guidance, emitted at the moment the model is actually reading
+      // history. The decisive fact is `sessionScope` (this session's own scope),
+      // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
+      // chat_mode='group' while its session is thread-scope, so reasoning from the
+      // group type would wrongly conclude "I may search the whole chat". Both
+      // `--scope` gates above key on isChatScope for exactly that reason.
+      //
+      // Wording note: describe only what the model can OBSERVE. Daemon-side
+      // invocations (`/t` and friends) are stripped before the prompt is built, so
+      // the model never sees them — naming them here would be an instruction it
+      // cannot act on. Describe the symptom instead: the topic starts mid-discussion
+      // and its own history looks too short to explain the task.
+      const rangeHint = isChatScope
+        ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
+        : effectiveScope === 'thread'
+          ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+          : effectiveScope === 'ambient'
+            ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
+            : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
+      const historyResult = {
+        sessionId: sid,
+        chatId: s.chatId,
+        scope: effectiveScope,
+        sessionScope: isChatScope ? 'chat' : 'thread',
+        ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
+        ...(effectiveScope === 'ambient' ? {
+          ambient: {
+            source: 'chat',
+            beforeCreateTime: ambientBeforeCreateTime,
+            excludeRootMessageId: threadRootMessageId,
+          },
+        } : {}),
+        messages,
+        total: messages.length,
+        incomplete: retrieval.detailFailures.length > 0,
+        retrieval: { ...retrieval, requestedLimit: limit, countLimitReached: raw.length >= limit },
+        rangeHint,
+        // Discoverability: agents reading history often need the actual image
+        // bytes (alert charts) or the raw card JSON — both live one command away.
+        ...(readOptions.view === 'index' || messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
+          hint: readOptions.view === 'index'
+            ? '索引未展开卡片或转发。用 botmux quoted <id> [<id> ...] --no-download 定向读全文；需要附件时去掉 --no-download。queryMatch=deferred 表示未展开内容尚未核验关键词。筛选仅覆盖本次 --limit 窗口，需要更早消息请增大 --limit。'
+            : '查看某条消息的附件图片/文件或卡片全文：botmux quoted <messageId>（附件会下载到本地）；只读文本用 --no-download，可一次指定多个 id；原始卡片用 --raw。筛选仅覆盖本次 --limit 窗口。',
+        } : {}),
+      };
+      const decorated = readOptions.view === 'index' ? historyResult : await decorateSessionCliLinkRefResult({
+        sessionId: sid,
+        appId,
+        sourceType: 'history',
+        sourceId: `${effectiveScope}:${messages.length}`,
+        value: historyResult,
+      });
+      console.log(JSON.stringify(decorated, null, 2));
     });
-    console.log(JSON.stringify(decorated, null, 2));
   } catch (err: any) {
     console.error(`获取消息失败: ${err.message}`);
     process.exit(1);
@@ -9945,94 +9921,48 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
 
 async function cmdQuoted(rest: string[]): Promise<void> {
-  // No-transport turn cannot fetch a quoted Feishu message — central hard gate.
+  if (rest.includes('--help') || rest.includes('-h')) { console.log(QUOTED_READ_USAGE); return; }
   assertTurnTransportOrExit('quoted');
+  let readOptions: ReturnType<typeof parseQuotedReadOptions>;
+  try { readOptions = parseQuotedReadOptions(rest); }
+  catch (err: any) { console.error(err.message); process.exit(2); }
   const sessionIdArg = argValue(rest, '--session-id');
   const remoteRunnerSessionTool = rest.includes('--remote-runner-session-tool');
   if (remoteRunnerSessionTool && process.env.BOTMUX_HOST_RELAY_AUTHORIZED !== '1') {
-    console.error('botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority');
+    console.error("botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority");
     process.exit(2);
   }
-  // Positional message_id is required. The id comes verbatim from the
-  // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
-  // injects when the user used the Lark quote-reply UI. Skip --session-id and
-  // its value so `botmux quoted --session-id <uuid> om_xxx` doesn't pick up
-  // the uuid as the message id.
-  const messageId = firstPositional(rest, ['--session-id']);
-  const rawFlag = rest.includes('--raw');
-  if (!messageId) {
-    console.error('用法: botmux quoted <message_id> [--raw] [--session-id <id>]');
-    process.exit(1);
-  }
-
-  // Read isolation: register this bot from its own send-cred file so the Lark
-  // client (getMessageDetail below) is available WITHOUT reading the denied
-  // bots.json — same as cmdHistory / cmdSend. Missing this was why a sandboxed
-  // isolated bot's `botmux quoted` failed "Bot not registered".
   await registerSelfFromCredFile();
   const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
-  // Target-aware gate (see cmdHistory).
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
-
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const { getQuotedMessageDetail, renderQuotedMessage } = await import('./cli/quoted-render.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
-    const detail = await getQuotedMessageDetail(appId, messageId, getMessageDetail);
-    const msg = detail?.items?.[0];
-    if (!msg) {
-      console.error(`未找到消息 ${messageId}`);
-      process.exit(1);
-    }
-    if (remoteRunnerSessionTool && (msg as any).chat_id !== quotedSession.chatId) {
-      console.error('botmux quoted refused: message is outside the current session chat');
-      process.exit(2);
-    }
-    // Interactive cards are re-resolved inside the render pipeline (both
-    // im.message.get representations unioned, content + resources replaced
-    // wholesale with fresh [图片 N] numbering — see renderQuotedMessage).
-    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent, detail);
-    if (rawFlag) {
-      if (rendered.mergedStructuredContent !== undefined) {
-        // --raw: surface the full structured card JSON (v2 body/elements) so
-        // automation can read exact field values, button URLs and image keys
-        // instead of re-parsing the rendered text (告警自动化场景).
-        try { (rendered as { cardJson?: unknown }).cardJson = JSON.parse(rendered.mergedStructuredContent); }
-        catch { (rendered as { cardJson?: unknown }).cardJson = rendered.mergedStructuredContent; }
-      } else {
-        // Non-card messages (and cards whose merge failed): expose the
-        // original body content verbatim for the same automation use case.
-        (rendered as { rawContent?: string }).rawContent = msg.body?.content ?? '';
-      }
-    }
-    delete rendered.mergedStructuredContent;
-    // The referenced message's file/media resources arrive as key+name only. A
-    // read-isolated agent can't call the Lark resource API itself (bots.json
-    // creds are deny-read), so download the bytes HERE — via the bot client
-    // registered above — into this bot's OWN attachment bucket
-    // (attachments/<appId>/<messageId>/, read-allowed by its carve-out; sandbox
-    // denies file *reads*, not writes). Surface the local paths so the agent can
-    // actually open the file instead of only seeing its key.
-    if (rendered.resources?.length) {
-      const { downloadResources } = await import('./core/session-manager.js');
-      const { attachments, needLogin } = await downloadResources(appId, messageId, rendered.resources);
-      (rendered as { attachments?: unknown }).attachments = attachments;
-      if (needLogin) (rendered as { needLogin?: boolean }).needLogin = true;
-    }
-    const decorated = await decorateSessionCliLinkRefResult({
-      sessionId: sid,
-      appId,
-      sourceType: 'quoted',
-      sourceId: messageId,
-      value: rendered,
+    const result = await readQuotedMessages(appId, {
+      ...readOptions, raw: rest.includes('--raw'),
+      ...(remoteRunnerSessionTool ? { currentChatId: quotedSession.chatId } : {}),
+    }, {
+      getMessageDetail, expandMergeForward, resolveMergedCard: resolveMergedCardContent,
+      downloadResources: async (...args) => {
+        const { downloadResources } = await import('./core/session-manager.js');
+        return downloadResources(...args);
+      },
+      decorate: message => decorateSessionCliLinkRefResult({
+        sessionId: sid, appId, sourceType: 'quoted', sourceId: message.messageId, value: message,
+      }),
     });
-    console.log(JSON.stringify(decorated, null, 2));
+    if (readOptions.batch) {
+      console.log(JSON.stringify({ sessionId: sid, ...result, requestedCount: readOptions.messageIds.length,
+        total: result.messages.length, incomplete: result.errors.length > 0 }, null, 2));
+      if (result.errors.length) process.exitCode = 1;
+    } else console.log(JSON.stringify(result.messages[0], null, 2));
   } catch (err: any) {
     console.error(`获取被引用消息失败: ${err.message}`);
-    process.exit(1);
+    process.exit(err.exitCode ?? 1);
   }
 }
+
 
 // ─── Send subcommand ─────────────────────────────────────────────────────────
 
