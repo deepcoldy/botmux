@@ -352,6 +352,7 @@ describe('report session relay authorization', () => {
       requestId: 'report:session-source:1',
       receivedAt: '2026-08-07T07:00:00.000Z',
     })).toEqual({
+      options: { suppressFinalOutput: true },
       source: {
         type: 'ui', connectorId: 'botmux-report',
         requestId: 'report:session-source:1', receivedAt: '2026-08-07T07:00:00.000Z',
@@ -399,6 +400,7 @@ describe('report session relay authorization', () => {
       receivedAt: '2026-08-07T07:00:01.000Z',
       publishedMessageId: 'om_published',
     });
+    expect(trigger.options).toEqual({ suppressFinalOutput: true });
     expect(trigger.envelope.payload).toMatchObject({
       delivery: 'publish-and-relay', publishedMessageId: 'om_published',
     });

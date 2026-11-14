@@ -22,9 +22,10 @@ import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
-const { loggerWarnMock, loggerDebugMock } = vi.hoisted(() => ({
+const { loggerWarnMock, loggerDebugMock, updateTurnReplyCardMock } = vi.hoisted(() => ({
   loggerWarnMock: vi.fn(),
   loggerDebugMock: vi.fn(),
+  updateTurnReplyCardMock: vi.fn(async () => ({ messageId: 'om_placeholder' })),
 }));
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
@@ -70,6 +71,14 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
+
+vi.mock('../src/core/turn-reply-card.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/turn-reply-card.js')>();
+  return {
+    ...actual,
+    updateTurnReplyCard: (...args: Parameters<typeof actual.updateTurnReplyCard>) => updateTurnReplyCardMock(...args),
+  };
+});
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
@@ -138,6 +147,8 @@ import {
   parkStreamCard,
   postFreshStreamingCard,
   postTurnStartingCard,
+  releaseDeferredUnifiedReplyCard,
+  unifiedReplyTurnNotCapturing,
   setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
@@ -148,6 +159,7 @@ import {
   canRestoreStreamingCardIdentity,
   restoreStreamingCardIdentityFromProof,
 } from '../src/core/worker-pool.js';
+import { replyCardModeFor } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, MessageUpdateExpiredError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
@@ -223,6 +235,7 @@ beforeEach(() => {
   persistStreamCardStateMock.mockClear();
   loggerWarnMock.mockClear();
   loggerDebugMock.mockClear();
+  updateTurnReplyCardMock.mockClear();
   buildStreamingCardMock.mockClear();
   getBotMock.mockReturnValue({
     config: { larkAppId: APP_ID, cliId: 'claude-code' },
@@ -234,6 +247,7 @@ beforeEach(() => {
 afterEach(() => {
   setActiveSessionsRegistry(undefined as any);
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 function flush(): Promise<void> {
@@ -732,6 +746,99 @@ describe('postTurnStartingCard', () => {
     expect(ds.streamCardId).toBe('om_turn_card_1');
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('does not post the unified placeholder while another turn still owns the terminal', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 1, turnId: 'om_active' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_should_not_post');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(false);
+
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(true);
+    expect(replyCardModeFor(ds, 'om_followup')).toBe('unified');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    ds.captureIdentity = { workerGeneration: 3, revision: 2, turnId: 'om_followup' };
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(false);
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(true);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts the unified placeholder immediately when this turn is already capturing', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 4, turnId: 'om_followup' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(true);
+
+    expect(replyCardModeFor(ds, 'om_followup')).toBe('unified');
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts the unified placeholder immediately when no capture identity exists yet', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_first';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await postTurnStartingCard(ds, sessionReply, 'om_first');
+
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_first')).toBe(false);
+    expect(replyCardModeFor(ds, 'om_first')).toBe('unified');
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_first');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
   });
 
   it('isolates frozen-card cleanup when one chat session moves A to B to A', async () => {

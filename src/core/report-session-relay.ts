@@ -536,10 +536,15 @@ export function buildOrchestratorReportTrigger(
   meta: { requestId: string; receivedAt: string; turnIdempotencyKey?: string; publishedMessageId?: string },
   target = decision.target,
 ): Record<string, unknown> {
+  // Report wakes are synthetic turns. Shared chat-scope copies the last human
+  // topic onto them, and /api/trigger has no stableTurnId, so this flag arms
+  // loud final suppression: the transcript fallback is dropped, including when
+  // the model sent nothing. An explicit `botmux send` is a separate delivery
+  // and still reaches the topic the model addressed.
+  const options: Record<string, unknown> = { suppressFinalOutput: true };
+  if (meta.turnIdempotencyKey) options.turnIdempotencyKey = meta.turnIdempotencyKey;
   return {
-    ...(meta.turnIdempotencyKey ? { options: {
-      turnIdempotencyKey: meta.turnIdempotencyKey,
-    } } : {}),
+    options,
     source: {
       type: 'ui',
       connectorId: 'botmux-report',
