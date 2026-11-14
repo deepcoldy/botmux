@@ -312,6 +312,8 @@ description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted 
 
 看到这种提示，先判断引用内容是否对当前任务必要：必要就调用 \`botmux quoted om_xxx\` 拉取，不必要就忽略（不要无脑调用、污染上下文）。
 
+**正文与关联附件**：读取由 botmux 新版本发送的主消息时，输出可包含 \`delivery\` 交付记录，列出文件/视频的显示名、status 与实际 messageId。只对所需 sent 项的 messageId 再运行 \`botmux quoted <附件消息ID>\` 下载。pending 表示中断后结果未确认，failed 表示该项发送失败，不自动重发；记录缺失时不要猜测附件关联。
+
 **不限于引用场景**：\`message_id\` 可以是任意你可见的消息 id——典型用法是从 \`botmux history\` 的输出里拿到某张卡片/图片消息的 \`messageId\`，再用本命令拉全文 + 把附件下载到本地（history 本身不下载附件）。
 
 ## 用法
@@ -835,6 +837,8 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 ## 输出
 
 成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"...","quotedMessageId":"om_yyy 或 null","mentioned":[{"open_id":"ou_x","name":"Codex"}]}\`
+正文与文件/视频附件会关联为交付记录，成功输出的 \`replyDeliveryId\` 标识这次附件交付；后续 quoted 主消息可找到各附件的真实 messageId。返回 \`failedAttachments\` / \`failedVideoAttachments\` 时，应向用户说明具体失败项；\`attachmentTrackingErrors\` 表示关联记录未完整保存，已成功发送的正文和附件仍然有效，请勿因此重发。
+
 其中 \`quotedMessageId\` 是实际引用的消息（纯发为 null），\`mentioned\` 是实际 @ 的对象。stderr 另给一行人类可读摘要。
 失败 exit 1；**未做 @ 决策 exit 2**（按提示补 \`--mention\`/\`--mention-back\`/\`--no-mention\`）。
 `;

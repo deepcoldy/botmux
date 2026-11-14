@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { ReplyDeliveryStore } from '../src/services/reply-delivery-store.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
@@ -46,12 +47,13 @@ function send(args: string[], env: Record<string, string> = {}): Record<string, 
       cwd: repo, encoding: 'utf8', timeout: 30000,
       env: { PATH: process.env.PATH, HOME: root, BOTS_CONFIG: join(root, 'bots.json'), SESSION_DATA_DIR: data,
         BOTMUX_SESSION_ID: 'sid', BOTMUX_TURN_ID: 'om_turn', BOTMUX_LARK_APP_ID: 'cli_test',
-        BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1', ...env },
+        BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1', BOTMUX_TEST_DISTINCT_MESSAGE_IDS: '1', ...env },
     });
     expect(result.status, String(result.stderr)).toBe(0);
     const json = String(result.stdout).split('\n').find(line => line.startsWith('{') && line.includes('"messageId"'));
     expect(json, String(result.stdout)).toBeDefined();
-    return JSON.parse(json!);
+    const value = JSON.parse(json!);
+    return { ...value, delivery: new ReplyDeliveryStore(data).read('cli_test', value.messageId, 'oc_test') };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -62,18 +64,22 @@ describe('botmux send 成功 JSON 带出附件消息 id', () => {
     const out = send(['result', '--files', '@a.txt', '--files', '@b.txt']);
     expect(out.attachmentMessageIds).toHaveLength(2);
     expect(out.failedAttachments ?? []).toEqual([]);
+    expect(out.replyDeliveryId).toBeDefined();
+    expect(out.delivery.attachments.map((item: { messageId: string }) => item.messageId)).toEqual(out.attachmentMessageIds);
   }, 40000);
 
   it('附件全部上传失败时只报失败，不冒充成功', () => {
     const out = send(['result', '--files', '@a.txt'], { BOTMUX_TEST_FAIL_FILE_UPLOAD: '1' });
     expect(out.attachmentMessageIds).toBeUndefined();
     expect(out.failedAttachments).toHaveLength(1);
+    expect(out.delivery.attachments[0].status).toBe('failed');
   }, 40000);
 
   it('视频附件在正文之后发送和纯视频发送两条路径上都带出消息 id', () => {
     const withText = send(['result', '--videos', '@v.mp4', '--video-covers', '@c.png']);
     expect(withText.videoMessageIds).toHaveLength(1);
     expect(withText.failedVideoAttachments ?? []).toEqual([]);
+    expect(withText.delivery.attachments[0]).toMatchObject({ type: 'media', messageId: withText.videoMessageIds[0] });
     const pureVideo = send(['--videos', '@v.mp4', '--video-covers', '@c.png']);
     expect(pureVideo.videoMessageIds).toHaveLength(1);
   }, 80000);
