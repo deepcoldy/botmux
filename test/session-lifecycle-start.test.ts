@@ -286,7 +286,7 @@ import {
   streamCardLabel,
 } from '../src/core/worker-pool.js';
 import { formatClockTime } from '../src/utils/clock-time.js';
-import { buildRecoveryFailedCard } from '../src/im/lark/card-builder.js';
+import { buildRecoveryFailedCard, buildTurnFailedCard } from '../src/im/lark/card-builder.js';
 import { disposeOrdinaryTurnRecovery } from '../src/services/ordinary-turn-recovery.js';
 import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
@@ -10453,6 +10453,7 @@ describe('providerRecovery switch (Claude auto-continue)', () => {
     expect(cardsOf(sessionReply, 'turn-failed')).toHaveLength(0);
     expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({
       continuationOff: { providerRetryAt: new Date(retryAt) },
+      outcomeKey: 'card.recovery_failed.outcome.off',
     }));
     expect(ds.agentAttention).toEqual(expect.objectContaining({ kind: 'blocked' }));
     await vi.advanceTimersByTimeAsync(60 * 60_000);
@@ -10465,6 +10466,45 @@ describe('providerRecovery switch (Claude auto-continue)', () => {
     fail(ds, worker, 'om_original', Date.now() - 1_000);
     await vi.advanceTimersByTimeAsync(0);
     expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({ continuationOff: {} }));
+  });
+
+  it('the waiting notice re-checks at send time that the wait is still on', async () => {
+    const { ds, worker, sessionReply } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    const notice = sessionReply.mock.calls.find((call: unknown[]) => call[2] === 'text') as unknown[] | undefined;
+    const beforeWrite = (notice?.[5] as { beforeWrite?: () => void } | undefined)?.beforeWrite;
+    expect(beforeWrite).toBeTypeOf('function');
+    expect(() => beforeWrite!()).not.toThrow();
+    admit(ds, worker, 'om_next');
+    expect(() => beforeWrite!()).toThrow();
+  });
+
+  it.each([
+    ['working', 0], ['analyzing', 0], ['stalled', 0],
+    // A usage limit is not someone driving the CLI: the continuation goes and
+    // meets the rate-limit handling.
+    ['limited', 1],
+  ] as const)('a continuation that comes due while the CLI is %s: %i sent', async (status, sent) => {
+    const { ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    ds.lastScreenStatus = status;
+    await vi.advanceTimersByTimeAsync(ds.session.ordinaryTurnRecovery!.nextAttemptAt! - Date.now());
+    expect(continuations(worker)).toHaveLength(sent);
+  });
+
+  it('a 1-hour cache window that closes is explained by the cache on the card', async () => {
+    const { ds, worker } = await boot({ providerRecovery: { enabled: true }, promptCache: { ttl: '1h' } });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true,
+      providerRetryAtMs: Date.now() + 3 * 60 * 60_000, providerLastSuccessAtMs: Date.now() - 60_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({
+      recoveryWindow: expect.objectContaining({ minutes: 55, followsCache: true }),
+    }));
   });
 
   it('with it off, the next admitted message clears that failure\'s attention, as before', async () => {
@@ -10698,6 +10738,42 @@ describe('Codex capacity recovery', () => {
     expect(restored.session.ordinaryTurnRecovery?.status).toBe('cancelled');
     expect(sessionReply).toHaveBeenCalledOnce();
     expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it.each([[60_000, true], [-60_000, false]] as const)(
+    'a failure card outside any recovery names an upcoming provider time only (offset %i)', async (offset, shown) => {
+      const { ds, worker } = await boot({ codexCapacityRecovery: undefined });
+      // A terminal no recovery owns gets the generic failure card.
+      worker.emit('message', {
+        type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'ambiguous',
+        errorCode: 'cli_exit', providerRetryAtMs: Date.now() + offset,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const opts = vi.mocked(buildTurnFailedCard).mock.calls.at(-1)?.[0] as { providerRetryAt?: Date } | undefined;
+      expect(opts).toBeDefined();
+      expect(opts!.providerRetryAt !== undefined).toBe(shown);
+    });
+
+  it('a restart with the opt-in off still delivers a failure card it owed but never recorded', async () => {
+    const { ds, sessionReply } = await boot({ codexCapacityRecovery: undefined });
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_capacity', currentTurnId: 'om_capacity', status: 'exhausted', continuationsStarted: 2,
+      lastErrorCode: 'codex_capacity_exceeded', alertSentAt: Date.now(), warningDispatched: true, failureNoticeOwed: true,
+    };
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('a restart with the opt-in off still re-arms the silent mark of a scheduled turn it tracked', async () => {
+    const { ds } = await boot({ codexCapacityRecovery: undefined });
+    const fire = 'schedule:task-1:00000000-0000-4000-8000-000000000001';
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: fire, currentTurnId: fire, status: 'completed', continuationsStarted: 0, silentLogicalTurnIds: [fire],
+    };
+    expect(isSilentScheduledTurn(ds, fire)).toBe(false);
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    expect(isSilentScheduledTurn(ds, fire)).toBe(true);
   });
 
   it('its backoff keeps the card as before even where the Claude auto-continue switch is on', async () => {

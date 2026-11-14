@@ -780,6 +780,21 @@ describe('BridgeTurnQueue', () => {
       });
     });
 
+    it('a failure only the placeholder reports still carries the last answered request', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t0');
+      q.ingest([user('u0'), {
+        type: 'assistant', uuid: 'a0', timestamp: '2026-11-13T11:07:58.000Z',
+        message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+      } as TranscriptEvent, turnDurationMarker('d0')]);
+      q.drainEmittable({ explicitTerminalOnly: true });
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1')]);
+      const [failed] = q.drainEmittable();
+      expect(failed.terminalOutcome).toEqual({ status: 'failed', errorCode: 'provider_no_model_reply', retryable: true });
+      expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+    });
+
     it('control: the same record served by a real model is the completed reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
@@ -1308,6 +1323,28 @@ describe('BridgeTurnQueue', () => {
       expect(ready.map(t => [t.turnId, t.terminalOutcome?.status, t.terminalErrorDetail])).toEqual([
         ['tA', 'failed', text],
         ['tB', 'failed', text],
+      ]);
+    });
+
+    it('the absorbed turn that fails with its host also carries the last answered request', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        { ...assistantToolUse('a-tool'), timestamp: '2026-11-13T11:07:58.000Z' } as TranscriptEvent,
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        {
+          type: 'assistant', uuid: 'a-503', timestamp: '2026-11-13T11:08:18.000Z', isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 503,
+          message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: 503' }] },
+        } as TranscriptEvent,
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => [t.turnId, t.terminalOutcome?.status, t.terminalProviderLastSuccessAtMs])).toEqual([
+        ['tA', 'failed', Date.parse('2026-11-13T11:07:58.000Z')],
+        ['tB', 'failed', Date.parse('2026-11-13T11:07:58.000Z')],
       ]);
     });
 
