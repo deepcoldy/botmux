@@ -14,7 +14,7 @@ import * as identities from '../src/im/lark/identity-cache.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import * as tokens from '../src/utils/user-token.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
@@ -104,6 +104,28 @@ describe('managed origin publication through the session contract', () => {
     expect(h.env.writeCliPidMarker).toHaveBeenCalled(); expect(h.authority.identity().caller).toEqual(h.caller);
     expect(h.ds.managedTurnOrigin).toBeUndefined();
     expect(h.hostEnv.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Dropped managed_turn_origin from current worker turn=\S+ reason=(stale_runtime_scope|execution_scope_unproven)$/));
+  });
+  it('republishes the opening turn origin with the runtime once the daemon assigns it', async () => {
+    const h = fixture({ preAdmit: true });
+    const worker = h.controller.bindWorker(7).worker;
+    const opening = h.scope.beginRuntime(); h.controller.reserveBinding(opening.bindingId, worker);
+    h.scope.rememberExecution(h.execution, opening);
+    h.env.currentBotmuxDispatchAttempt = undefined; h.env.retiredTurnIds = new Set();
+    const assigned = loadWorkerMessageHandler('runtime_contract_assigned', h.env);
+    h.scope.run(opening, () => { h.scope.enterTurn(h.execution.turnId); h.env.publishSandboxRelayCapability(); }, h.execution);
+    await h.drain();
+    expect(h.wire).toHaveLength(1);
+    expect(h.wire[0].sessionContract.scope.runtime).toBeUndefined();
+    expect(h.ds.managedTurnOrigin).toBeUndefined();
+
+    opening.identity = { backend: 'tmux', physicalId: '100:1000', proof: 'process_start', nativeSessionId: 'opening-native' };
+    const runtime = h.controller.bindRuntime(opening.bindingId, worker, opening.identity).ref;
+    await assigned({ type: 'runtime_contract_assigned', bindingId: opening.bindingId, runtime, mayExecute: true,
+      executions: [h.execution], admissionStates: [{ ref: h.execution, phase: 'queued' }] });
+    await h.drain();
+    expect(h.wire).toHaveLength(2);
+    expect(h.wire[1].sessionContract.scope.runtime).toEqual(runtime);
+    expect(h.ds.managedTurnOrigin).toMatchObject({ turnId: h.execution.turnId, callerOpenId: 'ou_human' });
   });
 });
 

@@ -7059,7 +7059,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     const execution = capability.turnId
       ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
       : undefined;
-    publishedOriginContractScope = binding && execution
+    publishedOriginContractScope = binding?.runtime && execution
       ? { bindingId: binding.bindingId, executionId: execution.executionId }
       : undefined;
     const explicitOrigin = binding?.runtime
