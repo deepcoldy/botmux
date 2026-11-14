@@ -7,10 +7,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { botmuxCliInvocation, buildRelayHostEnv } from '../adapters/backend/sandbox.js';
-import { quotedAttachments, QuotedAttachmentLimitError } from './remote-runner-session-tool.js';
+import { quotedAttachments, QuotedAttachmentCountError, QuotedAttachmentLimitError } from './remote-runner-session-tool.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
 import { parseRiffUploadIndex } from './riff-upload-placeholder.js';
 import { parseSendInvocation, validateHostSendInvocation } from '../cli/send-invocation.js';
+import { parseQuotedReadOptions } from '../cli/history-read.js';
 
 export const RIFF_HOST_TOOLS_ROUTE = '/api/riff-host-tools';
 export const RIFF_HOST_BINDING_ENV = 'BOTMUX_RIFF_HOST_BINDING';
@@ -52,8 +53,8 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
     values: '--name --id --prompt --schedule --model --reasoning-effort --calendar --calendar-day-type --topic-title',
     bools: '--top-level --topic --new-topic --silent --follow-active', files: '--prompt-file',
   },
-  history: { values: '--limit --scope', bools: '--with-card-json' },
-  quoted: { bools: '--raw' },
+  history: { values: '--limit --scope --view --query --type --since --until', bools: '--with-card-json' },
+  quoted: { bools: '--raw --no-download' },
   bots: { sub: ['list'], values: '--scope' },
   chat: { sub: ['create', 'members'], values: '--name --member --chat-mode --chat-id', bools: '--json' },
   project: {
@@ -152,6 +153,11 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
       argv[i] = path;
     }
     if (argv[0] === 'quoted') argv.push('--remote-runner-session-tool');
+    // Batch quoted exits 1 for per-id errors while still printing the
+    // successful messages and their downloaded attachments; package those too.
+    const quotedBatch = argv[0] === 'quoted' && (() => {
+      try { return parseQuotedReadOptions(argv.slice(1)).batch; } catch { return false; }
+    })();
     if (argv[0] === 'schedule' && argv[1] === 'add') {
       if (!ctx.workingDir) throw new Error('riff_host_working_directory_unavailable');
       argv.push('--workdir', ctx.workingDir);
@@ -183,7 +189,7 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
         clearTimeout(deadline); clearInterval(fence);
         stdout += outDecoder.end(); stderr += errDecoder.end();
         try {
-          const packaged = argv[0] === 'quoted' && code === 0
+          const packaged = argv[0] === 'quoted' && (code === 0 || (code === 1 && quotedBatch))
             ? quotedAttachments(stdout, env, RIFF_HOST_MAX_ATTACHMENT_BYTES) : { stdout };
           resolve({ exitCode: failed || code === null ? 1 : code, stdout: packaged.stdout,
             stderr: failed ? 'riff_host_execution_unknown; do not repeat this operation automatically' : stderr,
@@ -192,6 +198,8 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
           let diagnostic = 'riff_host_attachment_invalid';
           if (error instanceof QuotedAttachmentLimitError) {
             diagnostic = `riff_host_attachment_too_large: ${error.actualBytes} bytes > ${error.limitBytes} bytes; reduce the attachment size`;
+          } else if (error instanceof QuotedAttachmentCountError) {
+            diagnostic = `riff_host_attachment_too_many: ${error.actualCount} > ${error.limitCount}; request fewer message ids or add --no-download`;
           } else {
             // Expose filesystem failure categories without leaking host paths.
             const code = (error as NodeJS.ErrnoException | null)?.code;

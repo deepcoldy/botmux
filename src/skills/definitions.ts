@@ -242,6 +242,12 @@ description: 需要查看当前飞书会话历史消息时触发。话题/thread
 # 拉取最近 50 条（默认）
 botmux history
 
+# 先读精简索引（不展开卡片/转发，不下载附件）
+botmux history --view index --limit 50
+
+# 在本次读取窗口内按关键词、类型、时间筛选
+botmux history --view index --query "queue" --type text,interactive --since "2026-11-14T00:00:00+08:00"
+
 # 拉取最近 100 条
 botmux history --limit 100
 
@@ -259,6 +265,12 @@ botmux history --with-card-json
 \`\`\`
 
 ## 输出
+
+默认 \`--view full\` 保持完整消息输出。\`--view index\` 返回消息 id、发送人、时间、最多 240 个字符的 \`preview\`、资源数量/类型，卡片和合并转发留到指定消息的详情读取。索引不注册预览中的 LinkRef；需要可打开的完整链接时读取对应消息详情。
+
+筛选只覆盖 \`--limit\` 取得的最近消息窗口，\`--since\` 包含边界、\`--until\` 不包含边界，推荐 ISO 时间带时区。\`retrieval\` 返回列出/筛选/返回的数量、筛选范围、待展开消息和详情失败消息；\`countLimitReached\` 表示已碰到条数上限，不证明已检索全部历史。索引中 \`queryMatch=deferred\` 的卡片/转发仍需核验关键词，不能当作不匹配丢掉。\`--view index\` 与 \`--with-card-json\` 不能同时用。
+
+先从索引选择 id，再运行 \`botmux quoted <id> [<id> ...] --no-download\` 取文本详情；需要附件时去掉 \`--no-download\`。每次命令重新取证，命令内只合并同一消息、同一表示形式的重复请求，并限制读取并发。
 
 JSON 格式，字段：
 
@@ -319,6 +331,12 @@ description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted 
 \`\`\`bash
 botmux quoted <message_id>
 
+# 只读取文本、卡片和资源信息，暂不下载附件
+botmux quoted <message_id> --no-download
+
+# 一次指定最多 20 个消息 id，避免重复启动 CLI
+botmux quoted <id_1> <id_2> --no-download
+
 # 附带原始内容：卡片消息输出 cardJson（结构化卡片 JSON，含精确字段值/按钮链接/图片 key），
 # 其它类型输出 rawContent（原始 body content）。适合告警卡等自动化解析场景。
 botmux quoted <message_id> --raw
@@ -327,6 +345,8 @@ botmux quoted <message_id> --raw
 \`message_id\` 从提示行或 \`botmux history\` 输出里复制即可。
 
 ## 输出
+
+单消息保持原有 JSON 形状。多消息返回 \`messages\`、\`errors\`、\`requestedCount\`、\`total\`、\`incomplete\`；重复 id 只读一次，成功消息保留输入顺序。部分失败时成功结果仍返回，退出码为 1，按 \`errors[].messageId\` 定向重试；不要重读已成功消息。\`--no-download\` 保留 \`resources\`，有资源时标 \`attachmentDownloadSkipped=true\`，不产生 \`attachments\` 本地路径。
 
 JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`resources\` / \`attachments\` 列表：
 
