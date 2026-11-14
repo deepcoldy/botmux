@@ -318,6 +318,4 @@ export function platformRefusalReason(resolution: Exclude<PlatformIdentityResolu
   }
 }
 
-export function reasonTag(reason: string): string {
-  return `[reason=${reason}]`;
-}
+export { reasonTag } from './refusal-reasons.js';

@@ -790,9 +790,11 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_howto_status': 'botmux: 想确认自己是否已授权，可发 /login status。',
   // 中心化平台来源（triggerUserAuth.credentialSource = auto/platform 且本机已绑定）：
   // 拒绝文案指向平台凭据页，不再让人在本机扫码——一次授权，所有机器通用。
-  'trigger_user_auth.denied_platform_login': 'botmux: 这一步要用你本人的 {tool}（{provider}）权限。请在中心化平台授权一次，之后所有绑定平台的机器都通用（自动续期、不用重复授权），打开下面的链接完成：',
-  'trigger_user_auth.denied_platform_consent': 'botmux: 你已在中心化平台授权过 {tool}（{provider}），但还没允许本机所在的团队使用。请在平台凭据页为该团队开启后重试：',
-  'trigger_user_auth.denied_platform_retry': '完成后直接让我重试刚才的操作即可，不用再发任何命令。不授权 = 这一步不会执行（也不会用机器人或别人的身份代跑）。',
+  'trigger_user_auth.denied_platform_login': 'botmux: 这一步要用你本人的 {tool}（{provider}）权限，而你还没有在中心化平台授权，命令未执行。本人给 bot 发 /login 就能拿到平台授权页；不要转述链接，也不要替人登录。授权后重试即可，不授权这一步不会执行，也不会用机器人或别人的身份代跑。',
+  'trigger_user_auth.denied_platform_consent': 'botmux: 你已在中心化平台授权过 {tool}（{provider}），但还没允许本机所在的团队使用，命令未执行。本人给 bot 发 /login 就能打开平台凭据页，为该团队开启后重试即可；不要转述链接。',
+  'auth_link.platform_title': '🔐 本轮任务需要你本人授权。请在中心化平台的授权页完成（飞书用户身份和 ByteCloud 都在这一页，授权一次后所有绑定平台的机器都通用；只发给你本人，请勿转发）：',
+  'auth_link.platform_footer': '授权后回到原会话让我重试即可。',
+  'trigger_user_auth.denied_unattended_unreachable': 'botmux: 无人值守的运行：任务执行人对 {capability} 的授权缺失，命令未执行。botmux 没法私下联系到这位执行人（私聊和仅本人可见的卡片都发不出去），授权入口没有送达。请把 TA 加入本机器人的可用范围，之后任务会再次运行；不会在这里发起授权。',
   'trigger_user_auth.denied_platform_unavailable': 'botmux: 中心化平台暂时不可达，拿不到你的 {tool}（{provider}）授权，命令未执行。请停止自动重试和重复要求用户登录，稍后再试；已有授权会保留。',
   'trigger_user_auth.denied_platform_unavailable_retryable': 'botmux: 中心化平台暂时不可达，拿不到你的 {tool}（{provider}）授权，命令未执行。botmux 会在本轮之后的调用里自动重新获取，不用让用户重新登录；不要连续反复重试，隔十几秒再试一次即可。已有授权会保留。',
   'trigger_user_auth.denied_platform_unbound': 'botmux: 本机尚未绑定中心化平台，而本 bot 要求 {tool} 凭据只能来自平台，命令未执行。请管理员在宿主终端执行 botmux bind，或把 triggerUserAuth.credentialSource 改为 auto / local。',
@@ -821,6 +823,8 @@ export const messages: Record<string, string> = {
   'provider_auth.unavailable': 'botmux: 暂时无法发起 {provider} 授权（{detail}），命令未执行。稍后重试。',
   'provider_auth.native': 'botmux: 本机器人上 {provider} 使用这台机器自己的登录态，不按触发人授权，不会发起授权链接，命令未经 botmux 代为授权。',
   'provider_auth.refused': 'botmux: 本轮不能为发起人发起 {provider} 授权（{reason}），命令未执行。',
+  'provider_auth.platform_fallback': '中心化平台不会为这位发起人签发授权，所以 botmux 发给 TA 的是本机授权入口。',
+  'provider_auth.platform_team_required': 'botmux: 中心化平台不会为这位发起人签发 ByteCloud 授权，而本 bot 只接受平台凭据，命令未执行。需要机器所有者把 TA 加入平台上的团队（或检查本机的平台绑定）后再重试；不用让 TA 登录，也不要重复请求授权。',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.step1': '1. 点击下方链接完成授权：',
   'cmd.login.step2_auto': '2. 授权完成后浏览器会显示「✅ 授权成功」，到这里就结束了——不需要复制任何东西，回到本话题重试即可。',
@@ -1370,7 +1374,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/、meego-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
   'ai.credentials.on_auth_failure': '遇到飞书鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`：返回 authUrl 时（只在和发起人的单聊里）用 `botmux send` 发给本轮用户；返回 delivery=dm 时链接已由 botmux 私聊给发起人，只在当前会话告诉用户去私聊里打开。授权链接只发给发起人本人，绝不贴到群里。之后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。凭证沿用本轮注入的用户身份。',
-  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify、ByteCloud/cloud.bytedance 或中心化平台凭据页链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（设备码、OAuth 这类授权链接只会出现在和发起人的单聊里，不得贴到群里；中心化平台凭据页是每个人管理自己授权的固定页面，可以照常转发；链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
+  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify 或 ByteCloud/cloud.bytedance 链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（这类授权链接只会出现在和发起人的单聊里，不得贴到群里；链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
   // 那只会拿到同样的权限再失败一次。补授权按已确定的任务步骤汇总，不逐个报错逐次申请。
   'ai.credentials.turn_speakers': '本轮有多人发言：{speakers}。受管命令默认以发起本轮的人的身份运行；要以本轮另一位发言人的身份做某一条命令，只在那一条命令前加 `BOTMUX_AS=<open_id>`，例如 `BOTMUX_AS=ou_xxx bytedcli codebase mr create ...`。只能填上面列出的 open_id，否则命令被拒。命令因缺授权被拒后，后续的 `botmux auth request` / `botmux auth wait` 要带上同一个 `BOTMUX_AS=<open_id>`，授权入口才会发给你选中的那位。',

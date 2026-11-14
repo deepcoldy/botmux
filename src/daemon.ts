@@ -678,7 +678,7 @@ import {
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
-import { offerAuthorizationAtCreation, clearRestoredLapses, unattendedTask } from './core/capability-authorization.js';
+import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
 import { isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -36034,7 +36034,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const identityTurnId = ds?.managedTurnOrigin?.identityTurnId ?? creatingTurn?.turnId;
     void offerAuthorizationAtCreation({
       botConfig: getBot(appId).config, openId: runnerOpenId,
-      locale: localeForBot(appId), sendDirect: (to, text) => sendUserMessage(appId, to, text),
+      locale: localeForBot(appId), sendDirect: privateNoticeSender(appId, task),
       ...(sameTurn ? { published: tool => recallProvenIdentityContent(config.session.dataDir, creatingTurn!.sessionId, identityTurnId!, tool) } : {}),
     });
   });

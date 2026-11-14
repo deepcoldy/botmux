@@ -22,8 +22,20 @@ import { userTokenAuthState } from '../utils/user-token.js';
 import * as scheduler from './scheduler.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import { sendEphemeralCard, sendUserMessage } from '../im/lark/client.js';
+import { directOrEphemeral } from './auth-link-delivery.js';
+import { hasReason, NOT_AUTHORIZED_REASONS } from './refusal-reasons.js';
 
 type SendDirect = (openId: string, text: string) => Promise<unknown>;
+
+/** The sender of a task's authorization notices: a direct message, else a card only that person sees in the task's chat (none in a one-to-one chat). */
+export function privateNoticeSender(appId: string, chat: { chatId?: string; chatType?: string }): SendDirect {
+  const { chatId } = chat;
+  return directOrEphemeral(
+    (to, text) => sendUserMessage(appId, to, text),
+    chatId && chat.chatType !== 'p2p' ? (to, card) => sendEphemeralCard(appId, chatId, to, card) : undefined,
+  );
+}
 
 /** What an unattended refusal can ask botmux to notify about. */
 export type UnattendedProvider = TriggerUserAuthTool | 'meego';
@@ -62,8 +74,7 @@ async function definitelyUnauthorized(tool: TriggerUserAuthTool, botConfig: BotC
 }
 
 /** Whether published identity text or a refusal carries a definite "not authorized" tag; an outage, an unavailable platform or no publication at all does not. */
-const NOT_AUTHORIZED_TAG = /\[reason=(not_authorized|platform_not_authorized|platform_consent_missing)\]/;
-export const definitelyNotAuthorized = (text: string | undefined): boolean => !!text && NOT_AUTHORIZED_TAG.test(text);
+export const definitelyNotAuthorized = (text: string | undefined): boolean => hasReason(text, NOT_AUTHORIZED_REASONS);
 
 /** One enabled capability whose credential is missing, and where the person gets it. */
 export interface AuthorizationEntry { provider: UnattendedProvider; url?: string }
@@ -154,8 +165,9 @@ export function unattendedTask(appId: string, sessionId: string, turnId: string,
 /**
  * The one private notice for an unattended run whose command was refused for a
  * missing credential, with an authorization entry for every capability the
- * person lacks. Private to the principal only: never the group, a group card,
- * the agent or a claim card. A link is delivered once per task, person and
+ * person lacks. Private to the principal only: a direct message, or a card only
+ * they see in the task's chat when that fails; never a plain group message, the
+ * agent or a claim card. A link is delivered once per task, person and
  * provider: the keys are recorded before the send, so concurrent refusals give
  * one message, and dropped again when the send fails, so the next refusal
  * retries. A changed link (the earlier challenge expired) is sent again.

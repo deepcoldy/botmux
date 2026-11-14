@@ -713,15 +713,24 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_platform', issuer: 'platform' });
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
   });
-  it('refuses with the platform page, not a bot-app login, when the platform has nothing for the person', async () => {
+  it('does not hand the platform page to the agent: botmux delivers it privately when the platform has nothing for the person', async () => {
+    session.chatType = 'group';
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
     __setPlatformCredentialDepsForTest({
       readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
       requestGrant: async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }) as any,
     });
     const response = await request('user');
     expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ ok: false, authorizeUrl: 'https://platform.example.test/credentials' });
+    const body = await response.json() as { error: string };
+    expect(body).toMatchObject({ ok: false });
+    expect(JSON.stringify(body)).not.toContain('https://');
+    expect(body.error).toContain('[reason=platform_not_authorized]');
+    expect(dm).toHaveBeenCalledTimes(1);
+    expect(dm.mock.calls[0][1]).toBe('ou_sender');
+    expect(dm.mock.calls[0][2]).toContain('https://platform.example.test/credentials');
   });
   it('does not hand out a platform credential when the turn changes while it is being fetched', async () => {
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
@@ -741,16 +750,21 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(await (await request('bot')).json()).toMatchObject({ appId: 'cli_bound', mode: 'bot' });
     expect(grants).toHaveLength(0);
   });
-  it('auth request sends a person without a bot-app grant to the platform page instead of a bot-app device link', async () => {
+  it('auth request sends a person without a bot-app grant to the platform page, delivered privately, instead of a bot-app device link', async () => {
+    session.chatType = 'group';
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
     const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
     const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
       body: JSON.stringify({ scopes: ['search:docs:read'] }),
     });
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ ok: false, error: 'platform_authorization_required',
-      authUrl: 'https://platform.example.test/credentials?scope=search%3Adocs%3Aread' });
+    const body = await response.json();
+    expect(body).toMatchObject({ ok: false, error: 'platform_authorization_required' });
+    expect(JSON.stringify(body)).not.toContain('https://');
+    expect(dm.mock.calls[0][2]).toContain('https://platform.example.test/credentials?scope=search%3Adocs%3Aread');
     expect(deviceFlow).not.toHaveBeenCalled();
   });
   it('auth request does not start a bot-app device flow for a turn that moved on during the platform check', async () => {

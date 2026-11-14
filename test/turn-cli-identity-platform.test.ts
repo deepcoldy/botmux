@@ -170,13 +170,14 @@ describe('credentialSource = auto, machine bound', () => {
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
 
-  it('refuses with the platform link — and starts no local login — when neither side has credentials', async () => {
+  it('refuses without any link — and starts no local login — when neither side has credentials', async () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     const body = read('lark-cli');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
-    expect(body).toContain('https://platform.example.test/credentials');
-    expect(body).toContain('中心化平台授权一次');
+    expect(body).not.toContain('https://');
+    expect(body).toContain('中心化平台授权');
+    expect(body).toContain('[reason=platform_not_authorized]');
     expect(body).not.toContain('local-lark-device');
     expect(beginLarkCliLogin).not.toHaveBeenCalled();
   });
@@ -186,7 +187,7 @@ describe('credentialSource = auto, machine bound', () => {
     await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE);
     const body = read('bytedcli');
     expect(body).toContain('还没允许本机所在的团队使用');
-    expect(body).toContain('https://platform.example.test/credentials');
+    expect(body).not.toContain('https://');
     expect(beginBytedcliLogin).not.toHaveBeenCalled();
   });
 

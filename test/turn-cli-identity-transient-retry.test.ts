@@ -209,7 +209,7 @@ describe('transient platform refusal within a turn', () => {
     later();
     await retry();
     expect(grantCalls).toBe(2);
-    expect(current()).toContain('https://platform.example.test/credentials');
+    expect(current()).toContain('[reason=platform_not_authorized]');
     later(); // the outage pace no longer applies
     await retry();
     expect(grantCalls).toBe(2);
@@ -226,7 +226,8 @@ describe('not authorized yet within a turn (#3312)', () => {
     responses = [NOT_AUTHORIZED, GRANTED];
     const out = await prepare();
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
-    expect(current()).toContain('https://platform.example.test/credentials');
+    expect(current()).toContain('[reason=platform_not_authorized]');
+    expect(current()).not.toContain('https://');
     // The refusal was itself just asked: no re-ask before the spacing has passed.
     await retry();
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS - 1);
@@ -261,7 +262,7 @@ describe('not authorized yet within a turn (#3312)', () => {
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
     await retry();
     expect(current()).not.toBe(notAuthorized);
-    expect(current()).toContain('consent=1');
+    expect(current()).toContain('[reason=platform_consent_missing]');
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
     await retry();
     expect(grantCalls).toBe(3);

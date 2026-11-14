@@ -60,6 +60,26 @@ export async function deliverAuthLink(input: AuthLinkDeliveryInput): Promise<Aut
   return 'dm_failed';
 }
 
+/**
+ * A private send for runs nobody attends: a direct message, and when that
+ * cannot be delivered a card only `openId` sees in the task's chat. Throws when
+ * neither could be sent (or no card is possible), so the caller can log it and
+ * keep its retry state.
+ */
+export function directOrEphemeral(
+  sendDirect: (openId: string, text: string) => Promise<unknown>,
+  sendEphemeral?: (openId: string, cardJson: string) => Promise<unknown>,
+): (openId: string, text: string) => Promise<unknown> {
+  return async (openId, text) => {
+    try {
+      return await sendDirect(openId, text);
+    } catch (error) {
+      if (!sendEphemeral) throw error;
+      return sendEphemeral(openId, authLinkCard(text));
+    }
+  };
+}
+
 async function attempt(send: () => Promise<unknown>): Promise<boolean> {
   try {
     await send();

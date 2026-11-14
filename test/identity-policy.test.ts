@@ -282,6 +282,48 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
       expect(readFileSync(join(dir, 'botmux.calls'), 'utf8')).toContain('auth request --provider bytedcli');
     });
 
+    it.each(['platform_not_authorized', 'platform_consent_missing', 'platform_not_teammate', 'platform_forbidden'])(
+      'a [reason=%s] refusal goes to botmux and its link-free answer is what the agent sees', reason => {
+        writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: `botmux: 平台没有签发 [reason=${reason}]` }, 'single');
+        const r = run(installFor('bytedcli'), ['codebase', 'mr', 'list'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.out).toBe('');
+        expect(r.err).toContain('BOTMUX-SAYS');
+        expect(r.err).not.toContain('平台没有签发');
+        expect(botmuxCalls()).toBe('auth request --provider bytedcli\n');
+      });
+
+    it('the platform will not issue for the person, who meanwhile finished the local entry botmux sent: the same call goes on', () => {
+      const ready = mkdtempSync(join(tmpdir(), 'botmux-ready-'));
+      mkdirSync(personHome(), { recursive: true });
+      writeSessionIdentity(ready, 'sess', { tool: 'bytedcli', cloudJwt: 'person-jwt', codeJwt: 'person-code', home: personHome(), openId: 'ou_1', turnId: 't1' }, 'single');
+      writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: 'botmux: 平台不会签发 [reason=platform_not_teammate]' }, 'single');
+      const r = run(installFor('bytedcli'), ['x', 'y'], { PATH: `${fakeBotmux(0, join(ready, 'cli-identity/sess.bin/.data/bytedcli.env'))}:/usr/bin:/bin` });
+      rmSync(ready, { recursive: true, force: true });
+      expect(r.status).toBe(0);
+      expect(r.out).toContain('ARGS=x y');
+      expect(r.out).toContain('CLOUD=person-jwt');
+    });
+
+    it('lark-cli: a platform refusal goes to botmux and its link-free answer is what the agent sees', () => {
+      const wrapper = join(dir, 'lark-cli');
+      writeFileSync(wrapper, renderIdentityWrapper('lark-cli', realBinary('lark-cli'), 'single'));
+      writeSessionIdentity(dir, 'sess', { tool: 'lark-cli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: 'botmux: 平台没有签发 [reason=platform_not_authorized]' }, 'single');
+      const r = run(wrapper, ['contact', '+get-user'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+      expect(r.status).toBe(77);
+      expect(r.out).toBe('');
+      expect(r.err).toContain('BOTMUX-SAYS');
+      expect(r.err).not.toContain('平台没有签发');
+      expect(botmuxCalls()).toBe('auth request --provider lark-cli\n');
+    });
+
+    it('a platform refusal with botmux unreachable prints the published text', () => {
+      writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: 'botmux: 平台没有签发 [reason=platform_not_authorized]' }, 'single');
+      const r = run(installFor('bytedcli'), ['codebase', 'mr', 'list'], { PATH: `${fakeBotmux(1)}:/usr/bin:/bin` });
+      expect(r.status).toBe(77);
+      expect(r.err).toContain('平台没有签发');
+    });
+
     describe('the browser-session login is no ByteCloud login', () => {
       it.each([
         [['--json', 'auth', 'login', '--begin', '--session', '--feishu']],
@@ -565,6 +607,28 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
         expect(r.err).toContain('[reason=unattended]');
         expect(r.err).not.toContain('BOTMUX-SAYS');
         expect(botmuxCalls()).toBe('auth request --provider bytedcli --unattended\n');
+      });
+
+      it('an unattended notice that could not be delivered tells the agent so, with botmux\'s own text', () => {
+        writeSessionIdentity(dir, 'sess', {
+          tool: 'bytedcli', mode: 'denied', message: 'botmux: 无人值守 [reason=unattended]',
+          turnId: 'schedule:abc:11111111-1111-1111-1111-111111111111', openId: 'ou_1',
+        }, 'single');
+        const r = run(installFor('bytedcli'), ['tce', 'list'], { PATH: `${fakeBotmux(5)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.err).toContain('BOTMUX-SAYS');
+        expect(r.err).not.toContain('[reason=unattended]');
+      });
+
+      it('a platform that will not issue for the person in an unattended run asks botmux for nothing and keeps its text', () => {
+        writeSessionIdentity(dir, 'sess', {
+          tool: 'bytedcli', mode: 'denied', message: 'botmux: 不同团队 [reason=platform_not_teammate]',
+          turnId: 'schedule:abc:11111111-1111-1111-1111-111111111111', openId: 'ou_1',
+        }, 'single');
+        const r = run(installFor('bytedcli'), ['tce', 'list'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.err).toContain('不同团队');
+        expect(botmuxCalls()).toBe('');
       });
 
       it('a refusal that is not a lapse (platform unavailable) asks botmux for nothing', () => {

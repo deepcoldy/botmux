@@ -31,11 +31,11 @@ import { policyFromConfig, resolveIdentity, capabilityOfTool, type IdentityPolic
 import type { IdentityStorageModel } from './lark-tool-binding.js';
 import {
   resolvePlatformIdentity,
-  platformAuthorizeUrl,
   platformRefusalReason,
   reasonTag,
   type PlatformIdentityResolution,
 } from './platform-credential-source.js';
+import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import {
   writeSessionIdentity,
   meegoStoreShape,
@@ -736,7 +736,7 @@ export async function adoptLocalBytedcliAuthorization(args: {
   const policy = policyFromConfig(botConfig.triggerUserAuth);
   const before = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
   if (before?.includes("BOTMUX_IDENTITY_MODE='user'")) return 'already';
-  if (!before?.includes(reasonTag('not_authorized'))) return 'none';
+  if (!hasReason(before, ['not_authorized', ...PLATFORM_WILL_NOT_ISSUE_REASONS])) return 'none';
   const identity = await resolveIdentityFor('bytedcli', botConfig, senderOpenId);
   if (!identity || recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli') !== before) return 'none';
   const stamped = withMeegoStore({ ...identity, turnId, openId: senderOpenId }, policy);
@@ -784,15 +784,9 @@ function refuseViaPlatform(
     case 'unbound':
       tail = [t('trigger_user_auth.denied_platform_unbound', vars, locale)];
       break;
-    case 'not_authorized': {
-      const url = platform.authorizeUrl ?? platformAuthorizeUrl();
-      tail = [
-        t(platform.consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login', vars, locale),
-        ...(url ? [url] : []),
-        t('trigger_user_auth.denied_platform_retry', undefined, locale),
-      ];
+    case 'not_authorized':
+      tail = [t(platform.consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login', vars, locale)];
       break;
-    }
     case 'denied':
       tail = [platform.reason === 'not_teammate'
         ? t('trigger_user_auth.denied_platform_not_teammate', vars, locale)

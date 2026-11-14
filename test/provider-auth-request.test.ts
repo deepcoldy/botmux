@@ -64,6 +64,16 @@ describe('requestProviderAuth — Meego', () => {
     expect(deps.deliver).toHaveBeenCalledTimes(2);
   });
 
+  it('refusals that arrive while the link is still going out do not send it again', async () => {
+    let release!: () => void;
+    deps.deliver.mockImplementationOnce(() => new Promise<AuthLinkDelivery>(resolve => { release = () => resolve('dm'); }));
+    const first = ask('meego');
+    expect((await ask('meego')).status).toBe('pending');
+    release();
+    expect((await first).status).toBe('delivered');
+    expect(deps.deliver).toHaveBeenCalledTimes(1);
+  });
+
   it('a new link (the old one expired) goes out at once', async () => {
     await ask('meego');
     meego = { state: 'link', authUrl: 'https://meego.example/device?code=M2' };
