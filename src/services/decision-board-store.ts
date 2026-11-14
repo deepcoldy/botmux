@@ -1370,7 +1370,7 @@ export class DecisionBoardStore {
         if (draft.updatedAt !== it.draftUpdatedAt) throw new BoardError('draft_changed', `#${it.seq} 的草稿在别处改过，刷新后再提交`);
         const item = this.getItem(appId, it.seq);
         if (!item) throw new BoardError('item_not_found', `没有 #${it.seq}`);
-        if (isEndedState(item.state)) throw new BoardError('item_ended', '这一项已处理，不能再提交决定');
+        if (isEndedState(item.state)) throw new BoardError('item_ended', `#${it.seq} 已结束，不能再提交决定，刷新后去掉这一项再提交`);
         drafts.push({ draft, item });
       }
       const id = ((this.stmt('SELECT MAX(id) AS m FROM board_batches WHERE app_id = ?').get(appId) as { m: number | null }).m ?? 0) + 1;

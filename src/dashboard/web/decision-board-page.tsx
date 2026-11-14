@@ -67,6 +67,7 @@ import {
   checkBoardImages,
   draftFromServer,
   draftNeedsReview,
+  isBoardItemEnded,
   isDraftEmpty,
   itemChatView,
   knownHint,
@@ -467,14 +468,16 @@ export function SubmitDialog(props: {
         {candidates.length === 0 ? <p className="dboard-empty-line">{tr('decisionBoard.submitDialogEmpty')}</p> : (
           <ul className="dboard-submit-list">
             {candidates.map(c => {
-              const checked = !excluded.has(c.seq);
+              // 已结束的项上留下的草稿：列出来让人知道，但不能勾选提交（服务端会拒掉整批）。
+              const ended = isBoardItemEnded(c.state);
+              const checked = !excluded.has(c.seq) && !ended;
               return (
                 <li key={c.seq} className={checked ? undefined : 'is-excluded'}>
                   <label>
                     <input
                       type="checkbox"
                       checked={checked}
-                      disabled={phase === 'submitting'}
+                      disabled={phase === 'submitting' || ended}
                       onChange={event => {
                         const on = event.currentTarget.checked;
                         setExcluded(current => {
@@ -488,7 +491,8 @@ export function SubmitDialog(props: {
                       <span className="dboard-submit-item-head">
                         <span className="dboard-seq">#{c.seq}</span>
                         <strong>{c.title}</strong>
-                        {c.stale ? <span className="dboard-flag-warn">{tr('decisionBoard.staleRow')}</span> : null}
+                        {ended ? <span className="dboard-flag-warn">{tr('decisionBoard.endedRow')}</span>
+                          : c.stale ? <span className="dboard-flag-warn">{tr('decisionBoard.staleRow')}</span> : null}
                       </span>
                       <span className="dboard-submit-item-choice">
                         {c.choice
@@ -1389,7 +1393,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
 
   const { item } = detail;
   const now = Date.now();
-  const ended = item.state === 'closed' || item.state === 'done';
+  const ended = isBoardItemEnded(item.state);
   const hasAsk = !ended && (!!item.question?.trim() || item.options.length > 0);
   const ownDraft = !!editor.saved || !isDraftEmpty(editor.draft);
   const scope = submitScope(detail.drafts, seq, ownDraft);
@@ -1554,6 +1558,24 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         </div>
         <ItemNav neighbors={neighbors} busy={navigating} onGo={target => void goTo(target)} placement="bottom" />
       </section> : null}
+
+      {ended && ownDraft ? (
+        // 管家改成已完成 / 已关闭时不清草稿：这份草稿不能再提交，也不能再改，只给看和清空，
+        // 否则它会一直算在「提交 N 项」里，且在详情页上清不掉。
+        <section className="dboard-block dboard-decision" data-ended-draft="">
+          <h2 className="dboard-block-title">{tr('decisionBoard.decisionTitle')}</h2>
+          <p className="dboard-warn">{tr('decisionBoard.endedDraft')}</p>
+          {editor.draft.choice ? <p>{tr('decisionBoard.choiceLabel', { key: editor.draft.choice })}</p> : null}
+          {editor.draft.text.trim() ? <p className="dboard-submit-item-text">{editor.draft.text}</p> : null}
+          {editor.draft.fileIds.length ? <p className="dboard-muted">{tr('decisionBoard.imagesN', { n: editor.draft.fileIds.length })}</p> : null}
+          <div className="dboard-decision-foot">
+            <SaveStatus editor={editor} />
+            <div className="dboard-decision-actions">
+              <button type="button" data-action="clear-ended-draft" onClick={() => void clearDraft()}>{tr('decisionBoard.clearDraft')}</button>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       <section className="dboard-block dboard-history">
         <h2 className="dboard-block-title">{tr('decisionBoard.historyTitle')}</h2>

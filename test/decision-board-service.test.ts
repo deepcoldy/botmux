@@ -120,6 +120,17 @@ describe('close in chat', () => {
     // 事务回滚：草稿原样留着，没有被失败的提交消费掉。
     expect(service.detail(item.seq, 'owner').draft?.updatedAt).toBe(draft.updatedAt);
   });
+  it('已结束事项上留下的草稿：不能再改成别的内容，但能清空，清空后不再算在待提交里', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'A', text: '还没提交的草稿', baseRev: item.rev });
+    service.store().updateItem(APP, item.seq, { state: 'closed' }, 'steward-1');
+    const rev = service.detail(item.seq, 'owner').item.rev;
+    expect(() => service.putDraft(item.seq, 'owner', { text: '改一下', baseRev: rev })).toThrow(expect.objectContaining({ code: 'item_ended' }));
+    expect(service.list('all', 'owner').drafts.map(d => d.seq)).toEqual([item.seq]);
+    service.putDraft(item.seq, 'owner', { text: '', fileIds: [], baseRev: rev });
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+  });
   it('待验收（accept）事项也允许 owner 关闭，落 closed 并清草稿', async () => {
     const item = await addDecideItem();
     service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev });
