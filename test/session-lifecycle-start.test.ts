@@ -10514,12 +10514,27 @@ describe('providerRecovery switch (Claude auto-continue)', () => {
     await vi.advanceTimersByTimeAsync(waiting.nextAttemptAt! - Date.now());
     expect(continuations(worker)).toHaveLength(0);
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
-      status: 'cancelled', lastErrorCode: 'recovery_disabled', warningDispatched: true,
+      status: 'attention_required', lastErrorCode: 'recovery_disabled', warningDispatched: true,
     }));
     expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
     expect(ds.agentAttention?.reason).toMatch(/自动续跑已关闭|Automatic continuation/);
     await vi.advanceTimersByTimeAsync(60 * 60_000);
     expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('a wait settled by switching it off ends like any failure left to a person: the card keeps the message, the next one clears the attention', async () => {
+    const { bot, ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    admit(ds, worker, 'om_wait');
+    fail(ds, worker, 'om_wait', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    (bot.config as any).providerRecovery = { enabled: false };
+    await vi.advanceTimersByTimeAsync(ds.session.ordinaryTurnRecovery!.nextAttemptAt! - Date.now());
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({ task: 'message om_wait' }));
+    expect(ds.agentAttention).toEqual(expect.objectContaining({ kind: 'blocked' }));
+    admit(ds, worker, 'om_next');
+    complete(ds, worker, 'om_next');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.agentAttention).toBeUndefined();
   });
 
   it('switching it off during a wait and then sending a message replaces the wait quietly, as a new message always did', async () => {

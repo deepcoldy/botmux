@@ -876,10 +876,13 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       const live = this.state;
       if (!live || live.status !== 'backoff') return;
       if (this.deps.continuationsEnabled?.() === false) {
-        // Switched off during the wait: nothing is continued; say so.
+        // Switched off during the wait: nothing is continued; say so. It ends
+        // like any failure left to a person — not `cancelled`, which would drop
+        // the frozen input the card's retry needs and keep the next message
+        // from clearing the attention this notice raises.
         this.warnOnce({
-          ...live, status: 'cancelled', nextAttemptAt: undefined,
-          cancelledByTurnId: 'recovery_disabled', lastErrorCode: 'recovery_disabled',
+          ...live, status: 'attention_required', nextAttemptAt: undefined,
+          lastErrorCode: 'recovery_disabled',
         });
         return;
       }
