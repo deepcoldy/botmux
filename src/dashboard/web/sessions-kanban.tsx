@@ -1,3 +1,4 @@
+import { sessionDisplayTitle, sessionLastActivityAt } from './sessions.js';
 import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
 import {
@@ -139,7 +140,7 @@ function rawHtml(html: string): { __html: string } {
 }
 
 function rowTitle(row: any): string {
-  return stripMentionPrefix(row.title) || row.sessionId;
+  return stripMentionPrefix(sessionDisplayTitle(row)) || row.sessionId;
 }
 
 function clusterRows(columnRows: any[]): { clusters: ClusterItem[]; flat: any[] } {
@@ -659,7 +660,7 @@ function KanbanCardBase(props: {
       <CardPreview exchange={exchange} />
       <div className="kanban-card-foot">
         <span className="kanban-card-updated">
-          {t('sessions.kanban.updated', { time: relTime(row.lastMessageAt) })}
+          {t('sessions.kanban.updated', { time: relTime(sessionLastActivityAt(row) ?? 0) })}
           <span
             className="kanban-card-dot"
             data-status={cssToken(status)}
