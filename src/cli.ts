@@ -14971,16 +14971,36 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
+    const attachmentTrackingErrors: string[] = [];
+    let replyDeliveryId: string | undefined;
     if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
-      ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
-      ));
+      const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+      const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
+      if (files.length || videoAttachments.length) {
+        try {
+          replyDeliveryId = deliveryStore.begin(appId, messageId, targetChatId, [
+            ...files.map(path => ({ path, type: 'file' as const })),
+            ...videoAttachments.map(video => ({ path: video.videoPath, type: 'media' as const })),
+          ]);
+        } catch (error) { attachmentTrackingErrors.push(error instanceof Error ? error.message : String(error)); }
+      }
+      const onResult = replyDeliveryId ? (index: number, outcome: { messageId: string } | { failed: true }) =>
+        deliveryStore.record(appId, messageId, targetChatId, replyDeliveryId!, index, outcome) : undefined;
+      const fileResult = await sendFileAttachments(
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect, onResult }, appId, files,
+      );
+      attachmentMessageIds = fileResult.sent;
+      failedAttachments = fileResult.failed;
+      attachmentTrackingErrors.push(...(fileResult.trackingErrors ?? []).map(item => item.error));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect,
+          onResult: onResult ? (index, outcome) => onResult(files.length + index, outcome) : undefined }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+      attachmentTrackingErrors.push(...(videoResult.trackingErrors ?? []).map(item => item.error));
     }
+    for (const error of attachmentTrackingErrors) console.error(`⚠️ 正文/附件关联记录未完整保存（已发送的消息请勿重发）: ${error}`);
     // Attachments are independent Lark messages posted after the main reply
     // card. Record the actual bottom-most carrier so terminal auto mode never
     // PATCHes an earlier card and leaves a file/voice/custom carrier below it
@@ -15117,6 +15137,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         : {}),
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
+      ...(replyDeliveryId ? { replyDeliveryId } : {}),
+      ...(attachmentTrackingErrors.length ? { attachmentTrackingErrors } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
