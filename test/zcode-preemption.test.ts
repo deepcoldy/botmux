@@ -20,6 +20,7 @@ import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { createZcodeAdapter } from '../src/adapters/cli/zcode.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const start = source.indexOf('/** Key name → ANSI escape sequence (for PtyBackend) */');
@@ -108,7 +109,9 @@ function harness(opts: Opts = {}) {
     runAfterAmbiguousSubmissionWrites: async (_b: unknown, action: () => unknown) => action(),
     sendCriticalControlKey: async (key: string, action: () => unknown) => { controlKey(key); return action(); },
     sendTermActionOnce: (target: unknown, key: string) => (target as any).sendSpecialKeys(key),
+    promptReadinessRevision: 0,
   });
+  context.revokePromptReadiness = loadWorkerFunction('revokePromptReadiness', context);
   runInContext(helpers, context);
   const preempt = (incoming: Record<string, unknown> = { turnId: 'om_new' }) =>
     runInContext('preemptActiveTurnForNewMessage', context)(
