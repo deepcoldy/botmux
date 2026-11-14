@@ -54,6 +54,36 @@ export function pinWorkerTraeHome(env: NodeJS.ProcessEnv, opts: {
   else delete env.TRAE_HOME;
 }
 
+/**
+ * The TRAE home the CLI CHILD will actually use, composed exactly like the
+ * child's env:
+ *
+ *   base (worker env) → session envUnset / strict policy → per-bot env → mojo env
+ *
+ * This is the only correct input for the shared-cache domain gate. Reading
+ * `process.env.TRAE_HOME` (or `homedir()`) is wrong in two ways: an `envUnset`
+ * entry can remove the variable (the CLI then falls back to `$HOME/.trae`), and
+ * a per-bot `env.TRAE_HOME` reaches only the child, never the worker's own
+ * process env. `HOME` itself is read from the composed env for the same reason.
+ */
+export function resolveTraexChildHome(input: {
+  baseEnv: NodeJS.ProcessEnv;
+  envPolicy?: EnvPolicy;
+  envUnset?: readonly string[];
+  perBotEnv?: Record<string, string>;
+  mojoEnv?: Record<string, string> | undefined;
+}): string {
+  const composed: NodeJS.ProcessEnv = {
+    ...buildSessionChildEnv(input.baseEnv, input.envPolicy, input.envUnset),
+    ...(input.perBotEnv ?? {}),
+    ...(input.mojoEnv ?? {}),
+  };
+  const configured = composed.TRAE_HOME?.trim();
+  if (configured) return expandHome(configured);
+  const home = composed.HOME?.trim();
+  return join(home && home.length > 0 ? expandHome(home) : homedir(), '.trae');
+}
+
 /** TraeX and CoCo share the same Codex-compatible TOML configuration. */
 export function traeConfigPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(traeHomeFor(env), 'traecli.toml');

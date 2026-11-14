@@ -50,6 +50,7 @@ vi.mock('../src/services/codex-transcript.js', async orig => ({
   drainCodexRollout: vi.fn(() => ({ events: [{ kind: 'assistant_final' }], newOffset: 1, pendingTail: '' })),
 }));
 import { drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import { logger } from '../src/utils/logger.js';
 
 beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
@@ -135,6 +136,22 @@ describe('runPendingSuspendIfSettled', () => {
   // A CLI whose install was replaced under it must not take another turn, and a
   // pty session has no dormant state: the worker is retired the way /cd does,
   // so the next message cold-starts with resume.
+  it('holds an install-change reclaim until the last reply delivery settles', () => {
+    const { ds, worker } = busySession('idle', { pending: 'cli_install_changed' });
+    const endDelivery = beginFinalOutputDelivery(ds, 'om_turn');
+
+    // The reply-delivery hold is checked before the CLI_INSTALL_CHANGED branch:
+    // retiring the CLI here would drop the answer that is still being written.
+    runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+
+    endDelivery();
+    runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
   it('retires a pty worker for an install-change claim instead of waiting forever', () => {
     const { ds, worker } = busySession('idle', { pending: 'cli_install_changed' });
     ds.initConfig = { backendType: 'pty' };

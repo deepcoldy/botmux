@@ -24,6 +24,11 @@ it('a real direct Trae worker pins managed tool PATH after the CLI launcher rese
   const fixture = [
     '#!' + node,
     'const fs = require("node:fs"), {spawnSync} = require("node:child_process");',
+    // The managed TRAE handoff materialises a snapshot copy of this launcher
+    // and probes its hook-trust support with `--version` before the real
+    // spawn. Answer that probe like a CLI; only the actual launch writes the
+    // tool-result fixture the test asserts on.
+    'if (process.argv.includes("--version") || process.argv.includes("-V")) { process.stdout.write("traex 0.212.1\\n"); process.exit(0); }',
     'const explicit = {}; const prefix = "shell_environment_policy.set.";',
     'for (const a of process.argv.slice(2)) { if (a.startsWith(prefix)) {const i = a.indexOf("="); explicit[a.slice(prefix.length,i)] = JSON.parse(a.slice(i+1));}}',
     // Native tool runners may rebuild inherited PATH; explicit policy survives.

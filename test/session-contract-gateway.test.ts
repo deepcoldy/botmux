@@ -992,7 +992,7 @@ describe('contract gateway and real worker boundaries', () => {
       credentialIsolated: false, cliPid: 111, cliProcStart: 'start1' }), execution);
     const worker: any = { send: vi.fn() }; s.ds.worker = worker; s.ds.workerGeneration = 1;
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
-      workerGeneration: 1,
+      workerGeneration: s.ds.workerGeneration,
       logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code' };
     handlerScope.handleLegacyWorkerMessage = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleLegacyWorkerMessage', handlerScope);
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);

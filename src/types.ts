@@ -1758,6 +1758,95 @@ export interface ScheduleUntilDone {
  *  streak). `expired`: an until-done task reached its deadline. */
 export type ScheduleNotifyEvent = 'failing' | 'expired';
 
+/** Per-target progress of a deferred run.
+ *
+ *  `waiting` has not been handed to any session yet and is safe to dispatch.
+ *  `dispatching` was persisted immediately before the IPC send; a crash in this
+ *  state becomes `ambiguous` on restart because we cannot prove whether the
+ *  worker accepted the turn.
+ *  `dispatched` means the target's turn input was accepted by a worker/CLI
+ *  session (accepted ≠ finished — this only prevents re-dispatch).
+ *  `ambiguous` must never be replayed automatically: doing so could execute the
+ *  same input twice. */
+export type ScheduleDeferredTargetState =
+  | 'waiting'
+  | 'dispatching'
+  | 'dispatched'
+  | 'ambiguous'
+  /** A worker owns this target's exact turn and is still waiting in its start
+   *  gate (input accepted by the queue, not yet submitted to the CLI). The run
+   *  must not settle success and a retry must NOT re-dispatch this target. */
+  | 'held';
+
+/** A scheduled run parked behind a managed-runtime handoff. */
+/** Execution-relevant task fields frozen when a run is first admitted.
+ *
+ *  A deferred retry must re-enter the SAME logical run: the prompt a person
+ *  accepted, the identity it runs as, and the routing it was created for are
+ *  not re-read from the live task row. Otherwise an edit made while one target
+ *  is still waiting would silently change what the remaining targets receive,
+ *  and a pause/revoke would either resurrect or half-deliver the run. Only
+ *  execution inputs live here — never mutable run state (lastStatus, nextRunAt,
+ *  runStats, repeat, deferredRun itself). */
+export interface ScheduledTaskDeferredContext {
+  prompt: string;
+  workingDir: string;
+  chatId: string;
+  chatIds?: string[];
+  rootMessageId?: string;
+  chatType?: ScheduledTask['chatType'];
+  scope?: ScheduledTask['scope'];
+  executionPosition?: ScheduledTask['executionPosition'];
+  topicTitle?: string;
+  larkAppId?: string;
+  creatorChatId?: string;
+  creatorRootMessageId?: string;
+  creatorLarkAppId?: string;
+  ownerOpenId?: string;
+  ownerUnionId?: string;
+  runAsClaim?: ScheduledTask['runAsClaim'];
+  model?: string;
+  reasoningEffort?: ScheduledTask['reasoningEffort'];
+  silent?: boolean;
+  deliver?: ScheduledTask['deliver'];
+  followActive?: boolean;
+}
+
+export interface ScheduledTaskDeferredRun {
+  /** Stable logical run identity reused by every retry until it settles. */
+  runId: string;
+  /** When the run first deferred (ISO). Never updated by later retries. */
+  since: string;
+  reason: 'traex_runtime';
+  /** Human-readable blocker summary for the dashboard / owner notice. */
+  detail?: string;
+  /** Effective extra prompt from the Bash precondition, preserved so a retry
+   *  runs the exact same prompt instead of silently dropping it. */
+  additionalPrompt?: string;
+  /** Precondition observation that admitted the original attempt, preserved so
+   *  the eventual run log reports what actually happened. */
+  precondition?: 'none' | 'disabled' | 'passed';
+  /** Earliest time the next retry may claim this parked run. */
+  retryAt?: string;
+  targets: Record<string, ScheduleDeferredTargetState>;
+  /** Targets whose exact turn is already owned by a worker that is waiting in
+   *  its start gate. Unlike `waiting`, these must not be re-dispatched; they
+   *  settle only after the worker reports the turn accepted. */
+  heldTargets?: Record<string, string>;
+  /** Exact turns the worker has proven accepted (queued/native submission).
+   *  A run settles only when every target is both `dispatched` and accepted;
+   *  fork return alone is never a success fact. */
+  acceptedTargets?: Record<string, string>;
+  /** Stable per-target scheduled turn ids. Persisted before dispatch so a
+   *  retry (or a daemon restart) cannot mint a second turn for the same
+   *  target; the worker's turn-id dedupe then rejects a duplicate input. */
+  targetTurnIds?: Record<string, string>;
+  /** Frozen execution inputs captured when this run was first admitted. A
+   *  retry overlays these onto the live task row so human edits after the
+   *  first partial dispatch cannot change what still-waiting targets receive. */
+  context?: ScheduledTaskDeferredContext;
+}
+
 export interface ScheduledTask {
   id: string;
   /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
@@ -1861,10 +1950,20 @@ export interface ScheduledTask {
   lastRunAt?: string;
   nextRunAt?: string;
   /** Durable state of the most recently claimed run. `running` is written
-   *  before asynchronous dispatch and settled only by the matching run id. */
-  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+   *  before asynchronous dispatch and settled only by the matching run id.
+   *  `deferred` means the run could not start because an incompatible managed
+   *  runtime still occupies the shared cache; it is waiting, not finished. */
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped' | 'deferred';
   /** Scheduler-generated identity for the run represented by lastStatus. */
   lastRunId?: string;
+  /** Waiting state for a run held behind a managed-runtime handoff.
+   *
+   *  This is deliberately NOT a run-log outcome: it has no finishedAt and must
+   *  not consume a repeat/one-shot. It keeps the exact run identity (runId,
+   *  per-target turn ids, effective extra prompt) so a retry after the gate
+   *  opens re-enters the same logical run instead of minting a second turn.
+   *  Cleared by every terminal settlement (ok/error/skipped/calendar). */
+  deferredRun?: ScheduledTaskDeferredRun;
   lastError?: string;
   lastDeliveryError?: string;
   /** 管理员告警水印（#2334）：这串连续失败的管理员 DM 已在结算时记账（落盘
@@ -2102,6 +2201,11 @@ export interface QueuedActivationTailEntry {
   cliInput: CliTurnPayload;
   turnId: string;
   dispatchAttempt?: number;
+  /** Which runtime may execute this queued turn. `'new'` is stamped when the
+   *  entry was admitted while an install-change reclaim was pending: it must
+   *  never be injected into the old worker being retired, and it must not keep
+   *  that worker alive. Absent/`'old'` entries belong to the current runtime. */
+  ownerRuntime?: 'old' | 'new';
 }
 
 /** Durable opening/setup state while a repository picker or detached default
@@ -2588,12 +2692,21 @@ export type WorkerToDaemonBase =
        * `/proc/<pid>/exe` at publish time. Absent when the platform has no
        * proven source (macOS) or the pid is not the TRAE leaf yet. */
       cliExe?: import('./services/cli-install-identity.js').ExecutableIdentity;
-      /** The install entry this worker's adapter resolved at spawn. The daemon
-       * re-resolves it to detect an install replacement under the process. */
+      /** The configured install entry this worker's adapter resolved. The
+       *  daemon re-resolves it to detect an install replacement. It stays the
+       *  mutable configured path even when the exec target is a frozen copy. */
       cliInstallEntry?: string;
       /** `cliInstallEntry` statted right before the spawn that produced
        * `cliSpawnGeneration`. Absent when it did not resolve. */
       cliInstallAtSpawn?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** Exact object this generation exec'd (snapshot copy or pinned path). */
+      cliLaunchTarget?: string;
+      /** Identity of `cliLaunchTarget` captured before exec. */
+      cliLaunchTargetIdentity?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** Content combination key of the exec'd object. */
+      cliLaunchComboKey?: string;
+      /** Private snapshot directory backing `cliLaunchTarget`, if any. */
+      cliSnapshotDir?: string;
       /** Monotonic per-worker CLI spawn counter. Late attestations from an
        * older spawn are rejected by the daemon handler. */
       cliSpawnGeneration?: number;
@@ -2672,6 +2785,19 @@ export type WorkerToDaemonBase =
    *  The daemon retires the worker once the current turn settles, so the next
    *  turn cold-starts on the new install. */
   | { type: 'cli_install_changed'; runningVersion: string; installedVersion: string }
+  /** A managed TRAE spawn is holding its input because another runtime with
+   *  incompatible content still occupies the shared physical skills cache.
+   *  The worker keeps waiting inside the gate; this is a status edge (the
+   *  daemon may surface it), never an input receipt. */
+  | {
+      type: 'traex_runtime_deferred';
+      blockers: Array<{ occupantId: string; comboKey: string; phase: 'starting' | 'running' | 'draining'; fixedPath?: boolean; pid?: number }>;
+      detail: string;
+      /** Turn this spawn is holding. Lets the daemon correct a scheduled run
+       *  that was already accounted as dispatched but whose worker is waiting
+       *  in the start gate (no input was accepted yet). */
+      turnId?: string;
+    }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';

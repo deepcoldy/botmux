@@ -22,7 +22,7 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduleUntilDone } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleDeferredTargetState, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduledTaskDeferredContext, ScheduledTaskDeferredRun, ScheduleUntilDone } from '../types.js';
 import { parseScheduleRunAsClaim } from '../core/schedule-run-as.js';
 import {
   absorbLegacyFailureStats,
@@ -321,6 +321,177 @@ function fileVersion(fp: string): string {
  * Migrate legacy schedule task (pre-parsed field) to current shape.
  * Legacy tasks had { type, schedule } only — promote schedule+type into parsed.
  */
+/**
+ * Normalize a persisted deferred-run marker. A malformed value is dropped
+ * rather than carried into fire time: it only ever means "waiting for a
+ * managed-runtime handoff", so losing it degrades to a normal retry, while
+ * keeping a half-parsed identity could make a retry look already dispatched.
+ */
+export function normalizeDeferredRun(raw: unknown): ScheduledTaskDeferredRun | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.runId !== 'string' || !r.runId) return undefined;
+  if (typeof r.since !== 'string' || !r.since) return undefined;
+  if (r.reason !== 'traex_runtime') return undefined;
+  const targets: Record<string, ScheduleDeferredTargetState> = {};
+  if (r.targets && typeof r.targets === 'object' && !Array.isArray(r.targets)) {
+    for (const [chatId, state] of Object.entries(r.targets as Record<string, unknown>)) {
+      if (!chatId) continue;
+      if (state === 'dispatched' || state === 'dispatching' || state === 'ambiguous'
+        || state === 'held' || state === 'waiting') {
+        targets[chatId] = state;
+      } else {
+        // A corrupt state must never degrade to a re-dispatchable `waiting`:
+        // we cannot prove the target has no worker owner, so fail closed.
+        targets[chatId] = 'ambiguous';
+      }
+    }
+  }
+  const targetTurnIds: Record<string, string> = {};
+  const validTurn = (chatId: string, turnId: unknown): turnId is string =>
+    !!targets[chatId] && typeof turnId === 'string' && turnId.startsWith('schedule:');
+  if (r.targetTurnIds && typeof r.targetTurnIds === 'object' && !Array.isArray(r.targetTurnIds)) {
+    for (const [chatId, turnId] of Object.entries(r.targetTurnIds as Record<string, unknown>)) {
+      // Only keep turn ids for targets we also track, and only the exact
+      // `schedule:<taskId>:<uuid>` shape the provenance layer accepts.
+      if (validTurn(chatId, turnId)) targetTurnIds[chatId] = turnId;
+    }
+  }
+  const heldTargets: Record<string, string> = {};
+  if (r.heldTargets && typeof r.heldTargets === 'object' && !Array.isArray(r.heldTargets)) {
+    for (const [chatId, turnId] of Object.entries(r.heldTargets as Record<string, unknown>)) {
+      if (validTurn(chatId, turnId)) {
+        heldTargets[chatId] = turnId;
+        // The held turn is authoritative: a retry must reuse it.
+        targetTurnIds[chatId] = turnId;
+      }
+    }
+  }
+  const acceptedTargets: Record<string, string> = {};
+  if (r.acceptedTargets && typeof r.acceptedTargets === 'object' && !Array.isArray(r.acceptedTargets)) {
+    for (const [chatId, turnId] of Object.entries(r.acceptedTargets as Record<string, unknown>)) {
+      if (validTurn(chatId, turnId)) {
+        acceptedTargets[chatId] = turnId;
+        targetTurnIds[chatId] = turnId;
+      }
+    }
+  }
+  // Legacy rows predate `acceptedTargets`: a PERSISTED `dispatched` target was
+  // accepted under the old contract. Fresh in-memory fork-accounting never goes
+  // through normalize, so it still requires the worker's acceptance receipt.
+  for (const [chatId, state] of Object.entries(targets)) {
+    if (state === 'dispatched' && !acceptedTargets[chatId]
+      && !heldTargets[chatId] && targetTurnIds[chatId]) {
+      acceptedTargets[chatId] = targetTurnIds[chatId];
+    }
+  }
+  const context = normalizeDeferredContext(r.context);
+  return {
+    runId: r.runId,
+    since: r.since,
+    reason: 'traex_runtime',
+    ...(typeof r.detail === 'string' && r.detail.trim()
+      ? { detail: Array.from(r.detail.trim()).slice(0, 500).join('') }
+      : {}),
+    ...(typeof r.additionalPrompt === 'string' && r.additionalPrompt
+      ? { additionalPrompt: r.additionalPrompt.slice(0, 32_000) }
+      : {}),
+    ...(r.precondition === 'none' || r.precondition === 'disabled' || r.precondition === 'passed'
+      ? { precondition: r.precondition }
+      : {}),
+    ...(typeof r.retryAt === 'string' && Number.isFinite(Date.parse(r.retryAt))
+      ? { retryAt: new Date(Date.parse(r.retryAt)).toISOString() }
+      : {}),
+    targets,
+    ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
+    ...(Object.keys(heldTargets).length > 0 ? { heldTargets } : {}),
+    ...(Object.keys(acceptedTargets).length > 0 ? { acceptedTargets } : {}),
+    ...(context ? { context } : {}),
+  };
+}
+
+/** Whitelist the frozen execution inputs. A malformed context is dropped whole
+ *  rather than partially applied: a half-restored prompt/identity pair would
+ *  make a retry run something nobody accepted. */
+export function normalizeDeferredContext(raw: unknown): ScheduledTaskDeferredContext | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.prompt !== 'string') return undefined;
+  if (typeof r.workingDir !== 'string' || !r.workingDir) return undefined;
+  if (typeof r.chatId !== 'string' || !r.chatId) return undefined;
+  const context: ScheduledTaskDeferredContext = {
+    prompt: r.prompt,
+    workingDir: r.workingDir,
+    chatId: r.chatId,
+  };
+  if (Array.isArray(r.chatIds)) {
+    const chatIds = r.chatIds.filter((value): value is string => typeof value === 'string' && !!value);
+    if (chatIds.length > 0) context.chatIds = chatIds;
+  }
+  const str = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+  if (str(r.rootMessageId)) context.rootMessageId = r.rootMessageId;
+  if (r.chatType === 'group' || r.chatType === 'p2p' || r.chatType === 'topic_group') context.chatType = r.chatType;
+  if (r.scope === 'thread' || r.scope === 'chat') context.scope = r.scope;
+  if (r.executionPosition === 'top-level' || r.executionPosition === 'topic'
+    || r.executionPosition === 'new-topic' || r.executionPosition === 'task') {
+    context.executionPosition = r.executionPosition;
+  }
+  if (str(r.topicTitle)) context.topicTitle = r.topicTitle;
+  if (str(r.larkAppId)) context.larkAppId = r.larkAppId;
+  if (str(r.creatorChatId)) context.creatorChatId = r.creatorChatId;
+  if (str(r.creatorRootMessageId)) context.creatorRootMessageId = r.creatorRootMessageId;
+  if (str(r.creatorLarkAppId)) context.creatorLarkAppId = r.creatorLarkAppId;
+  if (str(r.ownerOpenId)) context.ownerOpenId = r.ownerOpenId;
+  if (str(r.ownerUnionId)) context.ownerUnionId = r.ownerUnionId;
+  const claim = r.runAsClaim as Record<string, unknown> | undefined;
+  if (claim && typeof claim === 'object' && !Array.isArray(claim)
+    && str(claim.openId) && str(claim.unionId) && str(claim.larkAppId) && str(claim.claimedAt)) {
+    context.runAsClaim = {
+      openId: claim.openId, unionId: claim.unionId,
+      larkAppId: claim.larkAppId, claimedAt: claim.claimedAt,
+    };
+  }
+  if (str(r.model)) context.model = r.model;
+  if (r.reasoningEffort === 'low' || r.reasoningEffort === 'medium' || r.reasoningEffort === 'high'
+    || r.reasoningEffort === 'xhigh' || r.reasoningEffort === 'max' || r.reasoningEffort === 'ultra') {
+    context.reasoningEffort = r.reasoningEffort;
+  }
+  if (typeof r.silent === 'boolean') context.silent = r.silent;
+  if (r.deliver === 'origin' || r.deliver === 'local' || r.deliver === 'new-topic') context.deliver = r.deliver;
+  if (typeof r.followActive === 'boolean') context.followActive = r.followActive;
+  return context;
+}
+
+/** Re-enter the exact accepted run: overlay the frozen inputs onto the claimed
+ *  task so human edits made while the run was parked cannot change its prompt,
+ *  identity or routing. */
+export function applyDeferredRunContext(task: ScheduledTask): ScheduledTask {
+  const context = task.deferredRun?.context;
+  if (!context) return task;
+  const next: ScheduledTask = { ...task };
+  const keys: ReadonlyArray<keyof ScheduledTaskDeferredContext> = [
+    'prompt', 'workingDir', 'chatId', 'chatIds', 'rootMessageId', 'chatType',
+    'scope', 'executionPosition', 'topicTitle', 'larkAppId', 'creatorChatId',
+    'creatorRootMessageId', 'creatorLarkAppId', 'ownerOpenId', 'ownerUnionId',
+    'runAsClaim', 'model', 'reasoningEffort', 'silent', 'deliver', 'followActive',
+  ];
+  for (const key of keys) {
+    const value = (context as any)[key];
+    if (value === undefined) delete (next as any)[key];
+    else (next as any)[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return next;
+}
+
+/** A parked run may only be settled once every target was dispatched. */
+function deferredRunStillOwesTargets(task: ScheduledTask, runId: string | undefined): boolean {
+  const deferred = task.deferredRun;
+  if (!deferred || runId === undefined || deferred.runId !== runId) return false;
+  return Object.values(deferred.targets).some(state => state !== 'dispatched');
+}
+
+const DEFERRED_RETRY_MS = 30_000;
+
 function migrate(raw: any): ScheduledTask | null {
   if (!raw || typeof raw !== 'object') return null;
 
@@ -432,6 +603,10 @@ function migrate(raw: any): ScheduledTask | null {
     runStats: absorbLegacyFailureStats(raw.runStats, raw.consecutiveFailures),
     untilDone: normalizeUntilDone(raw.untilDone),
     notify: normalizeScheduleNotify(raw.notify),
+    // A deferred run survives daemon restarts and external reloads: dropping it
+    // would mint a fresh run id and re-dispatch a target that already accepted
+    // its turn. normalizeDeferredRun drops malformed rows to a plain retry.
+    deferredRun: normalizeDeferredRun(raw.deferredRun),
   };
 }
 
@@ -830,7 +1005,7 @@ export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
     'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
-    | 'runStats' | 'untilDone' | 'notify'
+    | 'runStats' | 'untilDone' | 'notify' | 'deferredRun'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): boolean {
@@ -897,6 +1072,46 @@ export function claimRun(
   }, appId);
 }
 
+export type ScheduleDeferredClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' | 'not_deferred' | 'run_mismatch' };
+
+/** Atomically re-claim the SAME parked run for a retry. Unlike claimRun this
+ *  never advances nextRunAt: the occurrence was already consumed when the run
+ *  was first admitted, and re-arming it would create a second fire. The
+ *  persisted runId must match, so a stale retry cannot hijack a newer run. */
+export function claimDeferredRun(
+  id: string,
+  runId: string,
+  appId?: string,
+): ScheduleDeferredClaimResult {
+  return mutateTasks<ScheduleDeferredClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    if (!task.deferredRun) {
+      return { result: { ok: false, error: 'not_deferred' } as const, changed: false };
+    }
+    if (task.deferredRun.runId !== runId) {
+      return { result: { ok: false, error: 'run_mismatch' } as const, changed: false };
+    }
+    const manualRunRequested = task.manualRunRequested;
+    delete task.manualRunRequested;
+    Object.assign(task, {
+      lastStatus: 'running' as const,
+      lastRunId: runId,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    // Re-enter the exact accepted run: frozen inputs win over edits made while
+    // the run was parked.
+    const claimed = applyDeferredRunContext(task);
+    return { result: { ok: true, task: { ...claimed, manualRunRequested } } as const, changed: true };
+  }, appId);
+}
+
 /** Atomically make a task due without re-arming one that is already running. */
 export function requestRunNow(
   id: string,
@@ -926,11 +1141,12 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string): voi
     if (runId !== undefined && task.lastRunId !== runId) {
       return { result: undefined, changed: false };
     }
-
     task.lastRunAt = new Date().toISOString();
     task.lastStatus = 'skipped';
     task.lastError = undefined;
     task.lastDeliveryError = undefined;
+    // Terminal settlement: the parked run is over, so no retry may revive it.
+    delete task.deferredRun;
     task.runStats = recordRunOutcome(task.runStats, 'skipped');
     if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
     working.set(id, settleUntilDoneSkip(task, runId, Date.now()));
@@ -957,12 +1173,24 @@ export function markRun(
     if (runId !== undefined && task.lastRunId !== runId) {
       return { result: undefined, changed: false };
     }
+    if (!success && deferredRunStillOwesTargets(task, runId)) {
+      // A failed retry attempt must not settle a run that still owes targets
+      // (waiting / dispatching / ambiguous): keep the parked identity, record
+      // no outcome and consume no repeat/once.
+      task.lastStatus = 'deferred';
+      task.lastError = error;
+      if (task.deferredRun) task.deferredRun.retryAt = new Date(Date.now() + DEFERRED_RETRY_MS).toISOString();
+      working.set(id, task);
+      return { result: undefined, changed: true };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;
     task.lastStatus = success ? 'ok' : 'error';
     task.lastError = success ? undefined : error;
     task.lastDeliveryError = deliveryError;
+    // Terminal settlement: a parked run never survives an ok/error outcome.
+    delete task.deferredRun;
 
     // Shared failure counter lives in the ledger (before any early return, so
     // until-done settlements advance it too). Admin watermark: recorded when
@@ -1183,6 +1411,8 @@ export function markCalendarBlocked(
     task.lastCalendarCheck = check;
     task.lastError = check.status === 'error' ? check.reason : undefined;
     task.lastDeliveryError = undefined;
+    // Terminal settlement: the parked run is over.
+    delete task.deferredRun;
     if (check.status === 'error') {
       const tracking = nextFailureTracking(task.runStats, false);
       task.runStats = tracking.runStats;

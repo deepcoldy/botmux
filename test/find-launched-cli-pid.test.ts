@@ -150,6 +150,10 @@ function runWorkerWiring(late: boolean, options: {
     // wiring runs in this VM without worker.ts's declaration, so supply its
     // initial value. It is only read inside the slice, never assigned.
     cliSpawnGeneration: 0,
+    // The slice calls this closure (declared earlier in spawnCliBody, outside
+    // the slice) after it resolves the real CLI leaf. PID resolution is what
+    // this suite covers; the lease bookkeeping is exercised elsewhere.
+    attachTraexLeaseCli: vi.fn(),
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,

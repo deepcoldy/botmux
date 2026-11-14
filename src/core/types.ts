@@ -151,11 +151,22 @@ export interface DaemonSession {
     /** Actual running executable image (Linux `/proc/<pid>/exe`). Absent when
      * unknown; an unknown identity never authorizes an automatic reclaim. */
     cliExe?: import('../services/cli-install-identity.js').ExecutableIdentity;
-    /** Install entry the worker's adapter resolved at spawn. */
+    /** Configured install entry the operator/bot selected (the mutable path a
+     *  version upgrade rewrites). It is NOT the snapshot the process may exec. */
     cliInstallEntry?: string;
-    /** What `cliInstallEntry` resolved to right before this CLI spawn. Only a
-     *  process whose `cliExe` is this very object was launched from the entry. */
+    /** What `cliInstallEntry` resolved to right before this CLI spawn. Compared
+     *  against a later resolution of the same configured entry to detect an
+     *  upgrade; it need not equal `cliExe` when the launch used a frozen copy. */
     cliInstallAtSpawn?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** The exact object this generation exec'd (snapshot copy or pinned path). */
+    cliLaunchTarget?: string;
+    /** Identity of `cliLaunchTarget` right after materialisation, before exec.
+     *  A proven launch means `cliExe` is this very object. */
+    cliLaunchTargetIdentity?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Content combination key of the exec'd object. */
+    cliLaunchComboKey?: string;
+    /** Private snapshot directory backing `cliLaunchTarget`, when one was used. */
+    cliSnapshotDir?: string;
     /** Worker-local CLI spawn counter that produced `cliExe`. */
     cliSpawnGeneration?: number;
     enginePid?: number;
@@ -331,6 +342,11 @@ export interface DaemonSession {
   };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Exact structured scheduled input (content + trustedCaller/linkRefs) built
+   *  for a fresh scheduled fire. A refused durable admission keeps it here so
+   *  the same run/turn retry re-sends the ORIGINAL payload instead of only its
+   *  text. In-memory only; a restart rebuilds it from the frozen task identity. */
+  scheduledStagedInput?: import('../types.js').CliTurnPayload;
   /** Exact Lark message id whose user input is waiting for the first worker
    *  spawn. This is intentionally in-memory and must come from the accepted
    *  inbound event: restoring a session must never recover per-turn authority

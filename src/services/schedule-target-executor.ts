@@ -2,7 +2,9 @@ import type { ScheduledTask } from '../types.js';
 import type { ScheduleRunTargetResult } from './schedule-run-log-store.js';
 import { errorMessage } from '../utils/error-message.js';
 
-export type ScheduledTaskTargetExecutor = (task: ScheduledTask) => Promise<void>;
+export type ScheduledTaskTargetExecutor = (
+  task: ScheduledTask,
+) => Promise<'dispatched' | 'deferred' | void>;
 
 function taskForTarget(task: ScheduledTask, chatId: string): ScheduledTask {
   const singleTargetTask = { ...task };
@@ -45,7 +47,9 @@ export async function executeScheduledTaskForTargets(
   );
   const targetResults = settled.map<ScheduleRunTargetResult>((result, index) => (
     result.status === 'fulfilled'
-      ? { chatId: targetChatIds[index]!, outcome: 'model_dispatched' }
+      ? result.value === 'deferred'
+        ? { chatId: targetChatIds[index]!, outcome: 'deferred' }
+        : { chatId: targetChatIds[index]!, outcome: 'model_dispatched' }
       : { chatId: targetChatIds[index]!, outcome: 'error', error: errorMessage(result.reason) }
   ));
   const failed = settled.find(result => result.status === 'rejected');

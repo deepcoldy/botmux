@@ -25,7 +25,11 @@ import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
+import { precheckTraexRuntime } from '../services/traex-runtime-gate.js';
+import { releaseDirForExecutable } from '../services/traex-runtime-snapshot.js';
+import { resolveTraexChildHome } from '../services/traex-paths.js';
+import { botInjectedEnv } from './env-policy.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
@@ -4573,8 +4577,21 @@ export async function executeScheduledTask(
     /** Scheduler run id, kept on a hidden run so a later delivery failure can
      *  amend that run's execution-log record. */
     runId?: string;
+    /** Persisted turn id for a deferred retry. Must be reused verbatim so the
+     *  retry is the same logical turn and cannot double-deliver a target. */
+    turnId?: string;
+    /** Called immediately before the input is handed to a worker, after the
+     *  caller persisted the target's `dispatching` state. Returning `false`
+     *  means that durable admission did not land; the fire must stop before any
+     *  fork/send and report `deferred` instead of a false success. */
+    onBeforeDispatch?: (
+      turnId: string,
+      /** The EXACT session this target's input is being handed to. The daemon
+       *  must classify/accept by this identity, never by a guessed anchor. */
+      selectedSession?: DaemonSession,
+    ) => boolean | void | Promise<boolean | void>;
   },
-): Promise<void> {
+): Promise<'dispatched' | 'deferred'> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
   const allBots = getAllBots();
@@ -4582,7 +4599,7 @@ export async function executeScheduledTask(
     // Expected at startup before bot configs finish loading; scheduler will
     // re-fire on the next cron tick. Not actionable.
     logger.debug('No bots configured, skipping scheduled task');
-    return;
+    return 'dispatched';
   }
   const bot = task.larkAppId
     ? allBots.find(b => b.config.larkAppId === task.larkAppId)
@@ -4620,6 +4637,18 @@ export async function executeScheduledTask(
   task = applyFollowActive(task, { persist: persistLanding });
   const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
 
+  // Managed TRAE runtime handoff: do not create an anchor, banner or session
+  // for a run that cannot start yet. The worker gate stays the authority
+  // immediately before exec; this read-only pre-check only parks the run early
+  // with its exact turn identity intact so the retry can deliver it exactly
+  // once. `unknown` proceeds — the worker holds the input itself. Runs on the
+  // FINAL landing point so it inspects the same session the dispatch selects.
+  const runtimeBlocker = scheduledTraexRuntimeBlocker(bot, task, larkAppId, activeSessions);
+  if (runtimeBlocker) {
+    logger.info(`[scheduler] Task "${task.name}" (${task.id}) deferred: ${runtimeBlocker}`);
+    return 'deferred';
+  }
+
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
 
   // Prefer the explicit three-state position, with scope/deliver fallbacks for
@@ -4635,7 +4664,111 @@ export async function executeScheduledTask(
   // Every fire gets a stable identity before it enters a worker queue. Besides
   // silent-output suppression, this identifies the exact shared-topic reply
   // target when a chat-scope session already has another turn queued.
-  const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  const scheduledTurnId = runtime?.turnId ?? `schedule:${task.id}:${randomUUID()}`;
+  let dispatchPersisted = false;
+  /** A refused durable admission (the scheduler could not persist `dispatching`)
+   *  must stop this fire before any fork/send. */
+  let dispatchRefused = false;
+  /** Persist the target's `dispatching` state once, immediately before the
+   *  first real dispatch attempt. A later fallback within the same turn reuses
+   *  the same turn id and needs no second write. Returns false when the write
+   *  did not land; every fork/send path must then abort. */
+  const persistDispatch = async (selectedSession?: DaemonSession): Promise<boolean> => {
+    if (dispatchPersisted) return true;
+    const admitted = await runtime?.onBeforeDispatch?.(scheduledTurnId, selectedSession);
+    if (admitted === false) {
+      logger.warn(
+        `[scheduler] Task "${task.name}" (${task.id}) dispatch refused: `
+        + 'durable admission did not persist',
+      );
+      dispatchRefused = true;
+      return false;
+    }
+    dispatchPersisted = true;
+    return true;
+  };
+  // ── Idempotent continuation of a staged fresh run ─────────────────────────
+  // A previous attempt created and registered this run's fresh session (and,
+  // for a loud new-topic fire, its banner/anchor) but was refused before any
+  // fork/send. Reuse that exact session instead of posting a second banner or
+  // creating a second session. Only the SAME run/turn may bypass the staged
+  // placeholder; every other `initialStartPending` owner keeps its protection.
+  if (runtime?.runId) {
+    const stagedEntry = [...activeSessions.entries()].find(([, candidate]) =>
+      candidate.initialStartPending === true
+      && candidate.session.scheduledRun?.runId === runtime.runId
+      && candidate.session.scheduledRun?.turnId === scheduledTurnId,
+    );
+    if (stagedEntry) {
+      const [stagedKey, staged] = stagedEntry;
+      // Serialize with any concurrent creator/restore of the same anchor.
+      return withActiveSessionKeyLock(activeSessions, stagedKey, async () => {
+        if (activeSessions.get(stagedKey) !== staged) {
+          throw new Error(
+            `scheduled staged session ${staged.session.sessionId} lost its active registration`,
+          );
+        }
+        try {
+          await runtime.prepareTurnIdentity?.(staged, scheduledTurnId);
+        } catch (err) {
+          // The authority was revoked between attempts; this staged session
+          // never accepted input, so retire it rather than leaving a stuck
+          // placeholder.
+          if (activeSessions.get(stagedKey) === staged) activeSessions.delete(stagedKey);
+          sessionStore.closeSession(staged.session.sessionId);
+          throw err;
+        }
+        try {
+          if (!(await persistDispatch(staged))) return 'deferred';
+          // Re-send the ORIGINAL structured payload. A restart loses the
+          // in-memory copy, so rebuild it from the frozen task identity instead
+          // of degrading to the stored text (which drops trustedCaller).
+          const rebuildStagedInput = () => {
+            const trusted = trustedCallerForScheduledTask(task, larkAppId);
+            const effective = additionalPrompt === undefined
+              ? task.prompt
+              : `${task.prompt}\n\n${additionalPrompt}`;
+            const fire = silent
+              ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effective}`
+              : effective;
+            return buildNewTopicCliInput(
+              fire,
+              staged.session.sessionId,
+              staged.session.cliLaunchSnapshot?.cliId ?? staged.session.cliId ?? bot.config.cliId,
+              staged.session.cliLaunchSnapshot?.cliPathOverride
+                ?? staged.session.cliPathOverride
+                ?? bot.config.cliPathOverride,
+              undefined, undefined, undefined, undefined,
+              { name: bot.botName, openId: bot.botOpenId },
+              localeForBot(larkAppId),
+              undefined,
+              {
+                larkAppId,
+                chatId: task.chatId,
+                whiteboardId: staged.session.whiteboardId,
+                trustedCaller: trusted,
+                promptInjection: sessionPromptInjection(staged),
+                larkToolResume: false,
+              },
+            );
+          };
+          const stagedPrompt = staged.scheduledStagedInput ?? rebuildStagedInput();
+          refreshCliVersion(bot.config);
+          forkWorker(staged, stagedPrompt, scheduledTurnId);
+        } catch (err) {
+          if (silent) disarmSilentScheduledTurn(staged, scheduledTurnId);
+          throw err;
+        }
+        staged.initialStartPending = false;
+        staged.pendingPrompt = undefined;
+        logger.info(
+          `[scheduler] Task "${task.name}" (${task.id}) resumed staged session `
+          + `${staged.session.sessionId} after refused admission`,
+        );
+        return 'dispatched';
+      });
+    }
+  }
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -4916,7 +5049,7 @@ export async function executeScheduledTask(
   }
 
   const key = sessionKey(anchor, larkAppId);
-  return withActiveSessionKeyLock(activeSessions, key, async () => {
+  await withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
     // worker:null entry is also used for deliberately non-runnable states:
     // first-turn setup, repo selection (including an in-flight repo commit),
@@ -5051,6 +5184,8 @@ export async function executeScheduledTask(
             // this is the steady-state path for a recurring task (first fire
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
+            // A refused durable admission must stop before the IPC send.
+            if (!(await persistDispatch(existing))) return;
             if (sendWorkerInput(
               existing,
               input,
@@ -5069,6 +5204,7 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
+          if (!(await persistDispatch(existing))) return;
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
@@ -5169,6 +5305,10 @@ export async function executeScheduledTask(
       // below receives no resume flag.
       larkToolResume: false,
     });
+    // Keep the EXACT structured payload (content + trustedCaller/linkRefs) so a
+    // refused durable admission can resume the same run/turn without losing the
+    // admitted requester provenance.
+    ds.scheduledStagedInput = prompt;
     // Keep the candidate out of the live registry until authorization succeeds.
     // On rejection there is no worker or activation journal to recover: close
     // its durable row so the next fire can create a fresh candidate.
@@ -5193,6 +5333,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
+      if (!(await persistDispatch(ds))) return;
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -5202,8 +5343,70 @@ export async function executeScheduledTask(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
 
-    logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    logger.info(`[scheduler] Task "${task.name}" (${task.id}) spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
   });
+  // A refused durable admission means nothing was sent; keep the run parked
+  // (with its original run/turn/prompt) instead of settling it as dispatched.
+  return dispatchRefused ? 'deferred' : 'dispatched';
+}
+
+/**
+ * Daemon-side cheap pre-check for the managed TRAE runtime handoff.
+ *
+ * The worker gate immediately before exec remains the authority; this only
+ * avoids creating a session/anchor/banner for a run that is certain to wait.
+ * `unknown` (registry unreadable/corrupt) ALSO defers: a run whose admission
+ * cannot be proven must not be settled as dispatched. The caller keeps the
+ * original run/turn/prompt and retries once the domain is readable.
+ */
+function scheduledTraexRuntimeBlocker(
+  bot: {
+    config: Pick<
+      BotConfig,
+      'cliId' | 'cliPathOverride' | 'env' | 'envUnset' | 'envPolicy'
+    >;
+  },
+  task: ScheduledTask,
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+): string | undefined {
+  // Only a RETAINED topic has a provable target before routing: its exact
+  // anchor is task.rootMessageId. New-topic / rootless task / chat top-level
+  // choose their session later; their target proof comes from the actual
+  // dispatch (onBeforeDispatch selectedSession), never from a guessed anchor.
+  if (resolveScheduledTaskExecutionPosition(task) !== 'topic' || !task.rootMessageId) {
+    return undefined;
+  }
+  const selected = activeSessions.get(sessionKey(task.rootMessageId, larkAppId));
+  const targetCliId = selected?.session.cliLaunchSnapshot?.cliId
+    ?? selected?.session.cliId
+    ?? bot.config.cliId;
+  if (targetCliId !== 'traex') return undefined;
+  try {
+    const executablePath = resolveCommandReal(bot.config.cliPathOverride?.trim() || 'traex');
+    // Pre-check the SAME cache domain the CLI child will write. Using the
+    // daemon's ambient TRAE_HOME here would read a different domain whenever
+    // the bot has its own env.TRAE_HOME / envUnset, and could report
+    // `dispatched` while the worker actually waits in the target domain.
+    const traeHome = resolveTraexChildHome({
+      baseEnv: process.env,
+      envPolicy: bot.config.envPolicy,
+      envUnset: bot.config.envUnset,
+      perBotEnv: botInjectedEnv(bot.config.env, bot.config.envPolicy),
+    });
+    const check = precheckTraexRuntime({
+      traeHome,
+      releaseDir: releaseDirForExecutable(executablePath),
+      executablePath,
+    });
+    if (check.state === 'blocked') return check.detail;
+    if (check.state === 'unknown') return `runtime registry unavailable: ${check.detail}`;
+    return undefined;
+  } catch {
+    // A missing/unresolvable binary is the worker's error to report; it must
+    // not turn into an endless deferral here.
+    return undefined;
+  }
 }
 
 // ─── 决策看板：owner 提交的一批决定 → 管家群会话的一个回合 ─────────────────────

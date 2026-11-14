@@ -232,6 +232,7 @@ import { ensureSchedulePreconditionRoot } from './services/schedule-precondition
 import {
   executeScheduledTaskWithPrecondition,
   type ScheduledTaskPreconditionObservation,
+  type ScheduledTaskPreconditionOutcome,
 } from './services/schedule-precondition-gate.js';
 import { SchedulePreconditionError } from './services/schedule-precondition-runner.js';
 import {
@@ -473,6 +474,7 @@ import {
   promoteQueuedActivationTail,
   admitQueuedActivationTail,
   reserveQueuedActivationTailAdmission,
+  installReclaimPendingForCurrentGeneration,
   type QueuedActivationTailReservation,
   type WorkerForkAdmission,
   codexAppCleanInputAcceptedForSession,
@@ -22530,6 +22532,15 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
   }
   const head = [...ds.session.queuedActivationTail!]
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))[0]!;
+  // A head retagged for the replacement runtime is parked, not failed: the old
+  // CLI must not accept it, and the reclaim predicate ignores it so retirement
+  // proceeds. onInstallChangeReclaimed starts the replacement runtime. Report
+  // success here so the 100ms release retry loop does not spin forever.
+  if (head.ownerRuntime === 'new' && installReclaimPendingForCurrentGeneration(ds)) {
+    clearInitialStartBuffers(ds);
+    clearInitialStartClaim(ds);
+    return true;
+  }
   const workerUnavailable = !ds.worker
     || ds.worker.killed;
   if (!promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {})) return false;
@@ -22564,6 +22575,83 @@ function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string
 }
 
 export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitted;
+
+/** Sessions whose replacement runtime is being auto-started after an
+ * install-change reclaim. One in-flight start per session. */
+const traexReplacementStartInFlight = new Set<string>();
+
+/**
+ * Start the replacement TRAE runtime after an install-change reclaim retired the
+ * old CLI — but ONLY when input was parked for it while the old process drained.
+ * A quiet reclaim leaves the session dormant: the next inbound message
+ * cold-starts it with resume, exactly as before.
+ *
+ * The parked head is promoted with `send:false` first so the durable activation
+ * journal is the single owner of the input, then the exact promoted payload is
+ * forked — the same recovery contract as the quarantined activation-tail path.
+ * The claim token is stamped synchronously, before any await, so a concurrent
+ * inbound sees `initialStartPending` and buffers behind this opening instead of
+ * forking a second worker. Running on the session turn queue keeps the promote
+ * and fork atomic with respect to other session commands.
+ */
+function startReplacementRuntimeAfterReclaim(ds: DaemonSession): void {
+  const sessionId = ds.session.sessionId;
+  if (traexReplacementStartInFlight.has(sessionId)) return;
+  if (findActiveBySessionId(sessionId) !== ds) return;
+  if (ds.worker && !ds.worker.killed) return;
+  if (ds.initialStartPending || ds.initialStartClaimToken !== undefined) return;
+  const hasParked = (ds.session.queuedActivationTail ?? [])
+    .some(entry => entry.ownerRuntime === 'new');
+  if (!hasParked) return;
+
+  const token = randomUUID();
+  ds.initialStartPending = true;
+  ds.initialStartClaimToken = token;
+  traexReplacementStartInFlight.add(sessionId);
+  void runSessionTurn(sessionId, async () => {
+    let started = false;
+    try {
+      if (findActiveBySessionId(sessionId) !== ds) return;
+      if (ds.worker && !ds.worker.killed) return;
+      if (ds.initialStartClaimToken !== token) return;
+      if (!(ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new')) return;
+      if (!promoteQueuedActivationTail(ds, { send: false })) {
+        logger.warn(`[${tag(ds)}] Replacement runtime start deferred: activation head promotion failed`);
+        return;
+      }
+      const recoverThroughCodexLedger = isCodexAppCliId(
+        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
+      );
+      const accepted = forkWorker(
+        ds,
+        recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
+        {
+          resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+          turnId: ds.session.queuedActivationTurnId,
+          dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          ...(ds.session.queuedActivationInput?.trustedCaller
+            ? { trustedCaller: ds.session.queuedActivationInput.trustedCaller }
+            : {}),
+        },
+      );
+      started = accepted && !!ds.worker && !ds.worker.killed;
+      if (!started) {
+        logger.warn(`[${tag(ds)}] Replacement runtime start rejected; parked activation kept for recovery`);
+      }
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] Replacement runtime start failed; parked activation kept for recovery: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      traexReplacementStartInFlight.delete(sessionId);
+      // A started fork keeps the claim until its adapter ACK releases it via
+      // onQueuedActivationSubmitted. Every failure path releases the gate so the
+      // next inbound/scheduler trigger can retry the parked head.
+      if (!started && ds.initialStartClaimToken === token) clearInitialStartClaim(ds, token);
+    }
+  });
+}
 
 function setActiveInteractiveTurn(
   ds: DaemonSession,
@@ -30056,10 +30144,18 @@ async function handleThreadReplyAdmitted(
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
   });
 
+  // A TRAE install-change reclaim in flight means the live worker is the CLI
+  // being retired. Any input arriving now belongs to the replacement runtime:
+  // handing it to the old CLI would run it on a binary that is about to be
+  // reclaimed. Park it in the activation tail tagged `new` and treat the
+  // session like an opening whose worker is not ready yet, so the reclaim can
+  // drain and the replacement runtime takes the queued work.
+  const traexHandoffHolding = !!ds && installReclaimPendingForCurrentGeneration(ds);
   const liveTakeoverReady = !!ds?.worker && !ds.worker.killed
+    && !traexHandoffHolding
     && !hasQueuedActivationAdmissionGate(ds)
     && ds.initialStartClaimToken === undefined;
-  const initialStartPending = ds?.initialStartPending === true
+  const initialStartPending = (ds?.initialStartPending === true || traexHandoffHolding)
     && !ownsInitialStartClaim()
     && !liveTakeoverReady;
   if (ds && initialStartPending && !ds.pendingRepo) {
@@ -33893,6 +33989,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then(() => undefined);
     },
     onQueuedActivationSubmitted,
+    // An install-change reclaim provably retired the old CLI. If input was
+    // parked for the replacement runtime while it drained, start it now and
+    // hand over the parked FIFO head; otherwise stay dormant for the next
+    // inbound/scheduler trigger.
+    onInstallChangeReclaimed(ds) {
+      startReplacementRuntimeAfterReclaim(ds);
+    },
     // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
     // 卡片，只把批次退回 failed，owner 在 Dashboard 批次行看到原因并重投（同一 turnId）。
     onBoardTurnDeliveryFailed(ds, context) {
@@ -34147,6 +34250,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onWorkerExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
+      // A scheduled turn held behind the TRAE runtime handoff can never be
+      // accepted once its worker is gone. Settle that parked run now instead of
+      // waiting for the handoff timeout; the same single-exit helper is used by
+      // the ambiguous and timeout paths.
+      const scheduledRuns = [
+        ...(ds.session.scheduledRun ? [ds.session.scheduledRun] : []),
+        ...Object.values(ds.session.scheduledRuns ?? {}),
+      ];
+      for (const run of scheduledRuns) {
+        const parked = scheduler.getRuntimeTask(run.taskId, ds.larkAppId)?.deferredRun;
+        if (!parked || parked.runId !== run.runId) continue;
+        if (Object.values(parked.acceptedTargets ?? {}).includes(run.turnId)) continue;
+        if (!Object.values(parked.heldTargets ?? {}).includes(run.turnId)) continue;
+        scheduler.settleParkedRunOnce(
+          run.taskId,
+          run.runId,
+          'scheduled turn worker exited while the TRAE runtime handoff was still waiting',
+          ds.larkAppId,
+        );
+      }
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.
@@ -36102,50 +36225,155 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     };
 
     try {
-      const outcome = await executeScheduledTaskWithPrecondition(
-        task,
-        effectiveAppId,
-        async (additionalPrompt) => {
-          const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
-          // Until-done runs carry their own run context (attempt, deadline, how
-          // to mark done) so the task prompt only states what to wait for.
-          const untilDonePrompt = buildUntilDoneRunPrompt(
-            task,
-            executionContext.runId,
-            iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
-          );
-          const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
+      // A parked run is retried with the SAME run id: targets recorded as
+      // `dispatched` are never replayed, `ambiguous` targets refuse automatic
+      // replay, and `waiting` targets keep their persisted turn id.
+      const parked = (() => {
+        const deferred = scheduler.getRuntimeTask(task.id, effectiveAppId)?.deferredRun;
+        return deferred && deferred.runId === executionContext.runId ? deferred : undefined;
+      })();
+      const runTargets = async (additionalPrompt?: string): Promise<'dispatched' | 'deferred'> => {
+        const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
+        // Until-done runs carry their own run context (attempt, deadline, how
+        // to mark done) so the task prompt only states what to wait for.
+        const untilDonePrompt = buildUntilDoneRunPrompt(
+          task,
+          executionContext.runId,
+          iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
+        );
+        const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
+        const turnIds = new Map<string, string>();
+        const pending: string[] = [];
+        const heldTarget = (chatId: string, turnId: string | undefined): boolean =>
+          parked?.targets[chatId] === 'held'
+          || (turnId !== undefined && parked?.heldTargets?.[chatId] === turnId);
+        for (const chatId of targetChatIds) {
+          const state = parked?.targets[chatId];
+          if (state === 'ambiguous') {
+            // The turn may or may not have reached the worker before the
+            // restart; replaying it could double-send. Settle the run ONCE
+            // (single run-log error, single alert, next occurrence armed) and
+            // stop retrying — a per-tick throw here would never settle it.
+            scheduler.settleParkedRunOnce(
+              task.id,
+              executionContext.runId,
+              `scheduled target ${chatId} may or may not have received the turn before a restart; `
+              + 'refusing to replay it automatically',
+              effectiveAppId,
+            );
+            return 'deferred';
+          }
+          const turnId = parked?.targetTurnIds?.[chatId] ?? `schedule:${task.id}:${randomUUID()}`;
+          turnIds.set(chatId, turnId);
+          if (state === 'dispatched') continue;
+          // A worker already owns this exact turn and is waiting in its start
+          // gate. Do NOT re-dispatch it; keep the run parked until acceptance.
+          if (heldTarget(chatId, turnId)) continue;
+          pending.push(chatId);
+        }
+        let results: ScheduleRunTargetResult[] = targetChatIds
+          .filter(chatId => !pending.includes(chatId))
+          .map(chatId => ({
+            chatId,
+            outcome: heldTarget(chatId, turnIds.get(chatId)) ? 'deferred' as const : 'model_dispatched' as const,
+          }));
+        if (pending.length > 0) {
           try {
-            const results = await executeScheduledTaskForTargets(
+            results = results.concat(await executeScheduledTaskForTargets(
               task,
-              targetChatIds,
+              pending,
               targetTask => withBotTurnAdmission(
                 effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  runPrompt,
-                  {
-                    prepareTurnIdentity: async (session, turnId) => {
-                      // Re-read after preconditions/admission waits. A human can
-                      // pause, revoke or edit while those awaits are outstanding.
-                      const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      if (!current || (current.state !== 'active'
-                        && !(current.state === 'paused'
-                          && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
-                        throw new Error('schedule authority changed before turn admission');
-                      }
-                      assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
-                      await prepareTurnCliIdentity(session, turnId);
-                      const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                () => {
+                  // The EXACT session the dispatch path hands this target's
+                  // input to, captured synchronously at the admission seam.
+                  // Classification must use this identity: the target may be a
+                  // freshly created new-topic session that no anchor scan can
+                  // see yet, and an unrelated older session under the same chat
+                  // must never decide the outcome.
+                  let dispatchedSession: DaemonSession | undefined;
+                  // Whether the admission seam ran at all. No admission means
+                  // nothing was handed to any worker (e.g. no bot configured
+                  // yet), so the run must stay re-dispatchable rather than be
+                  // recorded as a held turn that no worker will ever accept.
+                  let admissionSeen = false;
+                  return executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    runPrompt,
+                    {
+                      prepareTurnIdentity: async (session, turnId) => {
+                        // Re-read after preconditions/admission waits. A human can
+                        // pause, revoke or edit while those awaits are outstanding.
+                        const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                        if (!current || (current.state !== 'active'
+                          && !(current.state === 'paused'
+                            && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
+                          throw new Error('schedule authority changed before turn admission');
+                        }
+                        assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+                        await prepareTurnCliIdentity(session, turnId);
+                        const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                        assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                      },
+                      runId: executionContext.runId,
+                      turnId: turnIds.get(targetTask.chatId!)!,
+                      onBeforeDispatch: (turnId, selectedSession) => {
+                        admissionSeen = true;
+                        dispatchedSession = selectedSession;
+                        // Persist `dispatching` before the input can reach a
+                        // worker: a crash after this point is never auto-replayed.
+                        // Return the durable result — `executeScheduledTask` must
+                        // stop before any fork/send when the write did not land.
+                        return scheduler.markDeferredTargetDispatching(
+                          task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
+                        );
+                      },
                     },
-                    runId: executionContext.runId,
-                  },
-                ),
+                  ).then(dispatched => {
+                    if (dispatched !== 'deferred') {
+                      const targetTurnId = turnIds.get(targetTask.chatId!)!;
+                      // No admission seam ran, so no worker owns this turn:
+                      // leave it waiting for the next tick instead of holding
+                      // a nonexistent owner forever.
+                      if (!admissionSeen) return 'deferred' as const;
+                      // Fork return is NOT an acceptance fact. Classify by the
+                      // ACTUAL dispatched session runtime, not the bot default
+                      // and not a guessed anchor: a retained session can freeze
+                      // TRAE while the bot defaults to another CLI, and a fresh
+                      // new-topic session may not be discoverable yet. Managed
+                      // TRAE queues the input in a worker that may still wait in
+                      // its start gate, so the target stays held until the
+                      // worker reports the exact turn accepted. Without proof of
+                      // a non-TRAE target we fail closed (deferred).
+                      // A fresh session has no frozen CLI until its first
+                      // spawn; it launches with the owning bot's configured
+                      // default. Resolve that same default for the selected
+                      // session's app, never the daemon's own config.
+                      const selectedBotCliId = dispatchedSession
+                        ? getAllBots().find(b => b.config.larkAppId === dispatchedSession!.larkAppId)?.config.cliId
+                        : undefined;
+                      const targetCliId = dispatchedSession
+                        ? (dispatchedSession.session.cliLaunchSnapshot?.cliId
+                          ?? dispatchedSession.session.cliId
+                          ?? selectedBotCliId)
+                        : undefined;
+                      if (targetCliId === undefined || targetCliId === 'traex') {
+                        scheduler.markDeferredTargetHeld(
+                          task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
+                        );
+                        return 'deferred' as const;
+                      }
+                      scheduler.markDeferredTargetAccepted(
+                        task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
+                      );
+                    }
+                    return dispatched;
+                  });
+                },
               ),
-            );
+            ));
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {
             if (error instanceof ScheduleTargetExecutionError) {
@@ -36153,11 +36381,74 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             }
             throw error;
           }
-        },
-        undefined,
-        observation => { precondition = observation; },
-      );
-      appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+        }
+        // The `parked` snapshot above was captured before the awaits. Re-read
+        // CURRENT ownership so an acceptance that landed while awaiting cannot
+        // be overwritten by the stale snapshot (and accepted turns are never
+        // re-sent on the retry).
+        const currentDeferred = scheduler.getRuntimeTask(task.id, effectiveAppId)?.deferredRun;
+        const acceptedNow = (chatId: string): boolean => {
+          const accepted = currentDeferred?.acceptedTargets?.[chatId];
+          return accepted !== undefined && accepted === turnIds.get(chatId);
+        };
+        const heldNow = (chatId: string): boolean =>
+          currentDeferred?.heldTargets?.[chatId] === turnIds.get(chatId)
+          || currentDeferred?.targets[chatId] === 'held';
+        results = results.map(result => acceptedNow(result.chatId)
+          ? { ...result, outcome: 'model_dispatched' as const }
+          : result);
+        const deferredResults = results.filter(result => result.outcome === 'deferred');
+        if (deferredResults.length === 0) return 'dispatched';
+        // Keep the claimed run parked. Targets already dispatched stay recorded
+        // so the retry can only deliver the ones still waiting.
+        const parkedTargets: Record<string, 'waiting' | 'dispatched' | 'held'> = {};
+        const persistedTurnIds: Record<string, string> = {};
+        for (const chatId of targetChatIds) {
+          const result = results.find(entry => entry.chatId === chatId);
+          const turnId = turnIds.get(chatId);
+          if (acceptedNow(chatId)) {
+            parkedTargets[chatId] = 'dispatched';
+          } else if (result?.outcome === 'deferred') {
+            parkedTargets[chatId] = heldNow(chatId) ? 'held' : 'waiting';
+          } else {
+            parkedTargets[chatId] = 'dispatched';
+          }
+          if (turnId) persistedTurnIds[chatId] = turnId;
+        }
+        scheduler.parkDeferredRun(task.id, executionContext, {
+          runId: executionContext.runId,
+          detail: `managed TRAE runtime handoff: waiting for ${deferredResults.length} target(s)`,
+          ...(additionalPrompt ? { additionalPrompt } : {}),
+          precondition: precondition.precondition === 'disabled' || precondition.precondition === 'passed'
+            ? precondition.precondition
+            : 'none',
+          targets: parkedTargets,
+          ...(parked?.heldTargets ? { heldTargets: parked.heldTargets } : {}),
+          targetTurnIds: persistedTurnIds,
+        });
+        return 'deferred';
+      };
+      let outcome: ScheduledTaskPreconditionOutcome;
+      if (parked) {
+        // The Bash precondition already ran for this logical run; reuse its
+        // observation instead of re-running it (and re-generating its prompt).
+        precondition = {
+          precondition: parked.precondition ?? 'none',
+          additionalPrompt: !!parked.additionalPrompt,
+        };
+        outcome = (await runTargets(parked.additionalPrompt)) === 'deferred' ? 'deferred' : 'executed';
+      } else {
+        outcome = await executeScheduledTaskWithPrecondition(
+          task,
+          effectiveAppId,
+          runTargets,
+          undefined,
+          observation => { precondition = observation; },
+        );
+      }
+      if (outcome !== 'deferred') {
+        appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+      }
       return outcome;
     } catch (error) {
       appendExecutionLog(

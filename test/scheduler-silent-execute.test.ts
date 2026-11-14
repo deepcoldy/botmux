@@ -548,7 +548,7 @@ describe('executeScheduledTask — fresh-topic execution', () => {
       executionPosition: 'top-level',
       topicTitle: '{{owner}}',
       ownerOpenId: undefined,
-    }), active, refreshCliVersion)).resolves.toBeUndefined();
+    }), active, refreshCliVersion)).resolves.toBe('dispatched');
   });
 
   it('thread task without a real root safely degrades to silent chat scope', async () => {
@@ -1990,5 +1990,169 @@ describe('task-position restart recovery', () => {
 
     expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-restore-unmaterialized');
     expect(daemonActiveSessions.size).toBe(0);
+  });
+});
+
+import * as realScheduler from '../src/core/scheduler.js';
+describe('independent PR2 round2 schedule admission', () => {
+  it('does not fork when the production dispatch marker returns false', async () => {
+    const active = new Map<string, DaemonSession>();
+    let persisted: boolean | undefined;
+    const outcome = await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined,
+      {
+        runId: 'run-not-owned', turnId: 'schedule:task0001:stable',
+        // Exact daemon callback shape: the durable result is returned, and a
+        // failed/no-longer-owned write must abort the external send.
+        onBeforeDispatch: turnId => {
+          persisted = realScheduler.markDeferredTargetDispatching(
+            'task0001', 'run-not-owned', CHAT, turnId, APP,
+          );
+          return persisted;
+        },
+      },
+    );
+    expect(persisted).toBe(false);
+    expect(outcome).toBe('deferred');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+});
+
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { precheckTraexRuntime as realRuntimePrecheck } from '../src/services/traex-runtime-gate.js';
+describe('independent PR2 round2 unknown schedule gate', () => {
+  it('keeps a run waiting when the actual registry cannot be read', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-schedule-unknown-'));
+    const home = join(isolated, 'home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(home, 'skills'), { recursive: true });
+    mkdirSync(release);
+    writeFileSync(join(home, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'fake-executable');
+    const priorHome = process.env.TRAE_HOME;
+    const priorId = BOT.config.cliId;
+    const priorPath = BOT.config.cliPathOverride;
+    try {
+      process.env.TRAE_HOME = home;
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      expect(realRuntimePrecheck({ traeHome: home, releaseDir: release }).state).toBe('unknown');
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        new Map(), refreshCliVersion, undefined,
+        { runId: 'run-unknown', turnId: 'schedule:task0001:unknown' },
+      );
+      expect(outcome).toBe('deferred');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+    } finally {
+      if (priorHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = priorHome;
+      BOT.config.cliId = priorId;
+      BOT.config.cliPathOverride = priorPath;
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('independent PR2 r3 deferred retry', () => {
+  it('recovers the same scheduled turn after durable admission is refused once', async () => {
+    const active = new Map<string, DaemonSession>();
+    const t = baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true });
+    const onBeforeDispatch = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const runtime = {runId:'run-retry', turnId:'schedule:task0001:retry', onBeforeDispatch};
+    expect(await executeScheduledTask(t, active, refreshCliVersion, undefined, runtime)).toBe('deferred');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(await executeScheduledTask(t, active, refreshCliVersion, undefined, runtime)).toBe('dispatched');
+    expect(active.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+    expect(forkedTurnId()).toBe(runtime.turnId);
+  });
+});
+
+describe('independent PR2 r3 per-bot schedule domain', () => {
+  it('does not report dispatched when the target bot cache is unreadable but ambient cache is free', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-schedule-bot-domain-'));
+    const targetHome = join(isolated, 'target-home');
+    const ambientHome = join(isolated, 'ambient-home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(targetHome, 'skills'), { recursive: true });
+    mkdirSync(release);
+    writeFileSync(join(targetHome, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'fake-executable');
+    const priorHome = process.env.TRAE_HOME;
+    const prior = { cliId:BOT.config.cliId, cliPathOverride:BOT.config.cliPathOverride, env:(BOT.config as any).env };
+    try {
+      process.env.TRAE_HOME = ambientHome;
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      (BOT.config as any).env = {TRAE_HOME:targetHome};
+      expect(realRuntimePrecheck({ traeHome: targetHome, releaseDir: release }).state).toBe('unknown');
+      expect(realRuntimePrecheck({ traeHome: ambientHome, releaseDir: release }).state).toBe('free');
+      const result = await executeScheduledTask(
+        baseTask({rootMessageId:ROOT, scope:'thread', silent:true}),
+        new Map(), refreshCliVersion, undefined,
+        {runId:'run-bot-cache', turnId:'schedule:task0001:bot-cache'},
+      );
+      expect(result).toBe('deferred');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+    } finally {
+      if (priorHome === undefined) delete process.env.TRAE_HOME; else process.env.TRAE_HOME = priorHome;
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, {recursive:true, force:true});
+    }
+  });
+});
+
+describe('independent PR2 r4 staged payload', () => {
+  it('keeps the admitted requester provenance when a staged scheduled fire retries', async () => {
+    const active = new Map<string,DaemonSession>();
+    const current = baseTask({rootMessageId:ROOT,scope:'thread',silent:true,ownerOpenId:'ou_creator',ownerUnionId:'on_creator',creatorLarkAppId:APP});
+    const runtime = {runId:'run-provenance',turnId:'schedule:task0001:provenance',onBeforeDispatch:vi.fn().mockReturnValueOnce(false).mockReturnValue(true)};
+    expect(await executeScheduledTask(current,active,refreshCliVersion,undefined,runtime)).toBe('deferred');
+    expect(await executeScheduledTask(current,active,refreshCliVersion,undefined,runtime)).toBe('dispatched');
+    expect(forkedPayload().trustedCaller).toEqual({requestUserOpenId:'ou_creator',requestUserUnionId:'on_creator',requestLarkAppId:APP,senderType:'user',source:'schedule_creator',taskId:current.id});
+  });
+});
+
+describe('independent PR2 r7 actual session runtime classification', () => {
+  it('does not block a non-TRAE retained session under a TRAE-default bot', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-reverse-domain-'));
+    const targetHome = join(isolated, 'target-home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(targetHome, 'skills'), { recursive: true });
+    mkdirSync(release);
+    writeFileSync(join(targetHome, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'fake-executable');
+    const prior = { cliId:BOT.config.cliId, cliPathOverride:BOT.config.cliPathOverride, env:(BOT.config as any).env };
+    try {
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      (BOT.config as any).env = {TRAE_HOME:targetHome};
+      // The retained session froze a non-TRAE CLI; the bot default must not
+      // pull it into the TRAE shared-cache precheck.
+      const session: Session = {
+        sessionId: 'sess-nontraex', chatId: CHAT, rootMessageId: ROOT, title: 'x',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z', cliId: 'claude-code',
+      };
+      store.set(session.sessionId, session);
+      const existing: DaemonSession = {
+        session, worker: null, workerPort: null, workerToken: null,
+        larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+        spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+        hasHistory: true, workingDir: '/tmp',
+      };
+      const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        active, refreshCliVersion,
+      );
+      expect(outcome).toBe('dispatched');
+      expect(forkWorkerMock).toHaveBeenCalledOnce();
+    } finally {
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, { recursive: true, force: true });
+    }
   });
 });

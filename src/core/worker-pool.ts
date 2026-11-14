@@ -1446,6 +1446,11 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     activationToken: string,
   ) => boolean | void | Promise<boolean | void>;
+  /** An install-change reclaim retired the old TRAE generation. Any tail entry
+   *  retagged for the replacement runtime is now free to start there; the
+   *  receiver starts it exactly once (held input must not wait for an unrelated
+   *  inbound message). */
+  onInstallChangeReclaimed?: (ds: DaemonSession) => void | Promise<void>;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -11140,6 +11145,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
 /** Queued-suspend reason for a CLI whose install changed under it. */
 const CLI_INSTALL_CHANGED_SUSPEND = 'cli_install_changed';
 
+/** Last TRAE gate blocker signature surfaced per session, so a worker that
+ *  keeps polling the shared-cache domain notifies once per distinct blocker
+ *  instead of every 500ms. Purely a notification dedupe — the worker holds the
+ *  input itself; this never records delivery. */
+const traexRuntimeDeferredNotice = new Map<string, string>();
+
 type InstallClaimVerdict = 'stale' | 'replaced' | 'reverted' | 'unknown';
 
 /**
@@ -11271,6 +11282,10 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
     // answer, no transfer, no accepted-but-unsettled input. Keep the claim
     // pending instead of consuming it; screen/final-delivery/transfer edges and
     // the periodic sweep re-run this checkpoint.
+    // First retag every still-unpromoted tail entry for the replacement
+    // runtime. This is a single-queue ownership transfer, not a second copy:
+    // once retagged, the old generation neither promotes nor waits for it.
+    if (!transferQueuedActivationOwnershipToNew(ds)) return;
     if (ds.pendingSuspendInstallClaim && !canSafelyReclaimWorkerForInstallChange(ds)) {
       if (isSessionTransferring(ds)) {
         deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration));
@@ -11288,6 +11303,11 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
     // here keeps the "fulfilled by the deferred path" signal distinguishable
     // from a suspend that came from anywhere else.
     logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
+    if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
+      // The old CLI is provably gone (suspendWorker verified the backing).
+      // Hand any input retagged for the replacement runtime to the daemon.
+      queueMicrotask(() => { void callbacks?.onInstallChangeReclaimed?.(ds); });
+    }
     return;
   }
   // A pty backend cannot go dormant, yet a CLI running from a replaced install
@@ -11301,6 +11321,7 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
     clearPendingSuspendClaim(ds, 'pty worker retired for install change');
     killWorker(ds);
     logger.info(`[${tag(ds)}] Retired pty worker after its CLI install changed`);
+    queueMicrotask(() => { void callbacks?.onInstallChangeReclaimed?.(ds); });
     return;
   }
   // Refused by an in-flight transfer: keeping the flag is not enough on its own.
@@ -11385,7 +11406,7 @@ export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession, suspen
   if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
   if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;
   if (ds.initialStartPending) return false;
-  if (ds.session.queuedActivationPending || (ds.session.queuedActivationTail?.length ?? 0) > 0) return false;
+  if (ds.session.queuedActivationPending || (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime !== 'new')) return false;
   if (ds.pendingPrompt !== undefined || ds.pendingTurnId !== undefined) return false;
   if (ds.pendingRawInput !== undefined || ds.pendingFollowUpInput !== undefined) return false;
   if ((ds.pendingFollowUps?.length ?? 0) > 0) return false;
@@ -11453,6 +11474,11 @@ export function requestInstallChangeSuspend(
       + `installed ino=${detail.install.ino} mtime=${detail.install.mtimeNs}, entry=${detail.entry}) — `
       + 'queued a safe reclaim once this generation owns no more work',
     );
+    // Hand every unpromoted successor to the replacement runtime in the same
+    // synchronous step that queued the reclaim, so the two owners never
+    // coexist. A failed write leaves the claim pending; the settlement
+    // checkpoint retries the transfer and the predicate keeps blocking.
+    transferQueuedActivationOwnershipToNew(ds);
   }
   if (opts.tryNow) runPendingSuspendIfSettled(ds);
   return firstRequest;
@@ -15999,6 +16025,10 @@ export function promoteQueuedActivationTail(
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
   if (!head) return false;
+  // A reclaim queued for this generation means the entry was handed to the
+  // replacement runtime. Never promote it onto the CLI being retired: the old
+  // process would otherwise accept work that must run on the new binary.
+  if (head.ownerRuntime === 'new' && installReclaimPendingForCurrentGeneration(ds)) return false;
 
   const priorJournal = snapshotQueuedActivationJournal(ds.session);
   const priorTail = ds.session.queuedActivationTail?.map(entry => ({
@@ -16173,7 +16203,54 @@ export type QueuedActivationTailReservation = Pick<QueuedActivationTailEntry, 'i
   /** Clean-input decision captured synchronously with FIFO order, before any
    * caller-specific async prompt construction. This field is runtime-only. */
   codexAppInputAccepted?: boolean;
+  /** Runtime that must execute this entry. Captured with the order so a
+   *  reclaim queued between reservation and durable admission still tags the
+   *  entry correctly. */
+  ownerRuntime?: 'old' | 'new';
 };
+
+/** True while an install-change reclaim is pending for the CURRENT worker
+ *  generation. New input admitted in this window belongs to the replacement
+ *  runtime, not to the old CLI being retired. */
+export function installReclaimPendingForCurrentGeneration(ds: DaemonSession): boolean {
+  return ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND
+    && (ds.pendingSuspendGeneration === undefined
+      || ds.pendingSuspendGeneration === ds.workerGeneration);
+}
+
+/**
+ * Atomically hand every not-yet-promoted activation tail entry to the
+ * replacement runtime. `queuedActivationTail` is a single queue with a target
+ * tag, not two queues: an entry that has never crossed the old runtime's
+ * submission boundary is still unowned, so retagging it is the whole transfer.
+ *
+ * The promotion journal (`queuedActivationPending`) is deliberately NOT
+ * transferred — it is bound to the old generation and must settle first; the
+ * reclaim predicate already refuses while it is set.
+ *
+ * Returns false when the store write failed; the caller must not retire the
+ * old runtime this round and retries on the next settlement checkpoint.
+ */
+export function transferQueuedActivationOwnershipToNew(ds: DaemonSession): boolean {
+  const tail = ds.session.queuedActivationTail;
+  if (!tail || tail.length === 0) return true;
+  if (tail.every(entry => entry.ownerRuntime === 'new')) return true;
+  const priorTail = tail;
+  ds.session.queuedActivationTail = tail.map(entry => (
+    entry.ownerRuntime === 'new' ? entry : { ...entry, ownerRuntime: 'new' as const }
+  ));
+  try {
+    sessionStore.updateSession(ds.session);
+    return true;
+  } catch (err) {
+    ds.session.queuedActivationTail = priorTail;
+    logger.error(
+      `[${tag(ds)}] Failed to transfer activation tail ownership to the replacement runtime: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
 
 /** Reserve arrival order synchronously, before any caller-specific prompt
  * rendering may await. Gaps are harmless; reusing an order after a failed
@@ -16187,6 +16264,7 @@ export function reserveQueuedActivationTailAdmission(
     id: randomUUID(),
     order,
     codexAppInputAccepted: codexAppCleanInputAcceptedForSession(ds),
+    ...(installReclaimPendingForCurrentGeneration(ds) ? { ownerRuntime: 'new' as const } : {}),
   };
 }
 
@@ -16217,6 +16295,7 @@ export function admitQueuedActivationTail(
     id: reservation.id,
     order: reservation.order,
     ...entry,
+    ...(reservation.ownerRuntime ? { ownerRuntime: reservation.ownerRuntime } : {}),
     cliInput: {
       content: frozenInput.content,
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
@@ -16252,6 +16331,10 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
   return ds.session.queuedActivationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
     || hasPendingSessionTurns(ds.session.sessionId)
+    // An install-change reclaim for the current generation means the live
+    // worker is being retired: every new input belongs to the replacement
+    // runtime and must be held in the tail, never sent over the old CLI's IPC.
+    || installReclaimPendingForCurrentGeneration(ds)
     || (ds.initialStartPending === true
       && ds.session.queuedActivationInput !== undefined);
 }
@@ -19839,6 +19922,20 @@ function setupWorkerHandlers(
         // Native proof upgrades the phase, but a submitted turn is still owned
         // work until its terminal: reclaim must wait for that boundary too.
         noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
+        // A native submission proof for a scheduled turn is the acceptance fact
+        // that lets the scheduler settle the parked run exactly once.
+        if (msg.turnId) {
+          const taskId = parseScheduledTurnId(msg.turnId);
+          const run = scheduledSessionRun(ds.session, msg.turnId);
+          if (taskId && run) {
+            const turnId = msg.turnId;
+            void import('./scheduler.js')
+              .then(scheduler => scheduler.noteWorkerRuntimeAccepted(
+                taskId, run.runId, ds.chatId, turnId, ds.larkAppId,
+              ))
+              .catch(() => { /* correction is best-effort */ });
+          }
+        }
         try {
           cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
         } catch (err) {
@@ -19858,6 +19955,18 @@ function setupWorkerHandlers(
         // A native submit proof still leaves the turn running; keep it protected
         // until the terminal arrives.
         noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
+        if (msg.turnId) {
+          const taskId = parseScheduledTurnId(msg.turnId);
+          const run = scheduledSessionRun(ds.session, msg.turnId);
+          if (taskId && run) {
+            const turnId = msg.turnId;
+            void import('./scheduler.js')
+              .then(scheduler => scheduler.noteWorkerRuntimeAccepted(
+                taskId, run.runId, ds.chatId, turnId, ds.larkAppId,
+              ))
+              .catch(() => { /* correction is best-effort */ });
+          }
+        }
         try {
           cb.onPromptSubmittedInput?.(ds, msg.turnId, { workerGeneration });
         } catch (err) {
@@ -19925,6 +20034,21 @@ function setupWorkerHandlers(
         // turn protected until its terminal/rejection, even though the
         // transport delivery record settles right below.
         noteAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration, 'queue-commit');
+        // A scheduled target previously marked `held` (worker waiting in the
+        // start gate) has now been accepted by that worker. Clear the held
+        // marker so the next retry can settle the run exactly once.
+        if (msg.turnId) {
+          const taskId = parseScheduledTurnId(msg.turnId);
+          const run = scheduledSessionRun(ds.session, msg.turnId);
+          if (taskId && run) {
+            const turnId = msg.turnId;
+            void import('./scheduler.js')
+              .then(scheduler => scheduler.noteWorkerRuntimeAccepted(
+                taskId, run.runId, ds.chatId, turnId, ds.larkAppId,
+              ))
+              .catch(() => { /* correction is best-effort */ });
+          }
+        }
         if (msg.durablePrimaryInbox) {
           try {
             cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });
@@ -20022,6 +20146,12 @@ function setupWorkerHandlers(
           ...(msg.cliExe !== undefined ? { cliExe: msg.cliExe } : {}),
           ...(msg.cliInstallEntry !== undefined ? { cliInstallEntry: msg.cliInstallEntry } : {}),
           ...(msg.cliInstallAtSpawn !== undefined ? { cliInstallAtSpawn: msg.cliInstallAtSpawn } : {}),
+          ...(msg.cliLaunchTarget !== undefined ? { cliLaunchTarget: msg.cliLaunchTarget } : {}),
+          ...(msg.cliLaunchTargetIdentity !== undefined
+            ? { cliLaunchTargetIdentity: msg.cliLaunchTargetIdentity }
+            : {}),
+          ...(msg.cliLaunchComboKey !== undefined ? { cliLaunchComboKey: msg.cliLaunchComboKey } : {}),
+          ...(msg.cliSnapshotDir !== undefined ? { cliSnapshotDir: msg.cliSnapshotDir } : {}),
           ...(msg.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: msg.cliSpawnGeneration } : {}),
           ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
           ...(msg.engineProcStart !== undefined
@@ -20704,6 +20834,41 @@ function setupWorkerHandlers(
           { sourceSessionId: ds.session.sessionId },
         ).catch(err => logger.warn(`[${t}] install-change notice failed: ${err instanceof Error ? err.message : String(err)}`));
         runPendingSuspendIfSettled(ds, ownsLifecycleMutation);
+        break;
+      }
+
+      case 'traex_runtime_deferred': {
+        if (!ownsLifecycleMutation()) break;
+        // The daemon may already have accounted this scheduled dispatch. The
+        // worker never reached the CLI, so keep a still-parked target waiting
+        // instead of letting it settle as dispatched. Best-effort: a settled
+        // run is intentionally left alone (the worker still holds the input).
+        if (msg.turnId) {
+          const taskId = parseScheduledTurnId(msg.turnId);
+          const run = scheduledSessionRun(ds.session, msg.turnId);
+          if (taskId && run) {
+            const turnId = msg.turnId;
+            void import('./scheduler.js')
+              .then(scheduler => scheduler.noteWorkerRuntimeDeferred(
+                taskId, run.runId, ds.chatId, turnId, ds.larkAppId,
+              ))
+              .catch(() => { /* correction is best-effort */ });
+          }
+        }
+        const noticeKey = `${ds.workerGeneration}:${msg.detail}`;
+        if (traexRuntimeDeferredNotice.get(ds.session.sessionId) === noticeKey) break;
+        traexRuntimeDeferredNotice.set(ds.session.sessionId, noticeKey);
+        // The worker still owns the input and is waiting inside the start gate;
+        // this only explains the wait. It is NOT a delivery or run receipt.
+        logger.warn(`[${t}] TRAE runtime deferred: ${msg.detail}`);
+        void cb.sessionReply(
+          sessionAnchorId(ds),
+          tr('worker.traex_runtime_deferred', { detail: msg.detail }, localeForBot(ds.larkAppId)),
+          'text',
+          ds.larkAppId,
+          undefined,
+          { sourceSessionId: ds.session.sessionId },
+        ).catch(err => logger.warn(`[${t}] TRAE defer notice failed: ${err instanceof Error ? err.message : String(err)}`));
         break;
       }
 
