@@ -119,6 +119,37 @@ describe('next-step row placement', () => {
     expect(writes.map(write => write.op)).toEqual(['insert', 'remove']);
   });
 
+  it('removes a row inserted by the only write in flight when the next turn started', async () => {
+    const ds = session();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const { io, writes } = fakeIo();
+    const insert = io.insert;
+    io.insert = async (...args) => { await gate; return insert(...args); };
+    noteNextStepTurnStarted(ds, 'turn-1', io);
+    noteNextStepSuggestion(ds, 'turn-1', '继续盯 MR 到合入', io);
+    await nextStepIdle(ds);
+    // The card settles last: its single write is the only one queued.
+    noteNextStepCard(ds, 'turn-1', { kind: 'legacy', messageId: 'om_one' }, io);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    noteNextStepTurnStarted(ds, 'turn-2', io);
+    release();
+    await nextStepIdle(ds);
+    expect(writes.map(write => write.op)).toEqual(['insert', 'remove']);
+  });
+
+  it('never puts an older turn back once the next one started', async () => {
+    const ds = session();
+    const { io, writes } = fakeIo();
+    noteNextStepTurnStarted(ds, 'turn-1', io);
+    noteNextStepTurnStarted(ds, 'turn-2', io);
+    // turn-1's card and suggestion arrive late, in this order.
+    noteNextStepCard(ds, 'turn-1', { kind: 'legacy', messageId: 'om_one' }, io);
+    noteNextStepSuggestion(ds, 'turn-1', '确认发版', io);
+    await nextStepIdle(ds);
+    expect(writes).toEqual([]);
+  });
+
   it('moves to the next turn card instead of updating the old one', async () => {
     const ds = session();
     const { io, writes } = fakeIo();
