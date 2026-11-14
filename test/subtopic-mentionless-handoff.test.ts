@@ -230,6 +230,55 @@ describe('subtopic-mentionless-handoff service', () => {
     });
   });
 
+  it('a coordinator holding its own live thread session still yields to a live免@ worker in the managed subtopic', async () => {
+    await enableProjectGroup();
+    // Imported worker topic + the coordinator's own thread session at the same
+    // root (the coordinator was @-ed inside the topic under chat-topic mode).
+    liveSessions = [
+      {
+        sessionId: 'sess-imported-topic',
+        larkAppId: WORKER_TOPIC,
+        chatId: CHAT_PROJECT,
+        scope: 'thread',
+        rootMessageId: 'om_root_coord_own',
+        status: 'active',
+        projectImportSource: 'relay',
+      },
+      {
+        sessionId: 'sess-coord-own-thread',
+        larkAppId: COORD_APP,
+        chatId: CHAT_PROJECT,
+        scope: 'thread',
+        rootMessageId: 'om_root_coord_own',
+        status: 'active',
+      },
+    ];
+    const deps = makeDeps();
+
+    // Both answer un-@ in this topic; only the live worker may (no double reply).
+    expect(resolveManagedSubtopicMentionlessHandoff(deps, 'om_root_coord_own', CHAT_PROJECT, COORD_APP)).toEqual({
+      kind: 'imported',
+      sourceLarkAppId: WORKER_TOPIC,
+      sourceAnswersWithoutMention: true,
+      hasProjectCoordinator: true,
+      isProjectCoordinator: true,
+    });
+    expect(findLiveMentionlessSubtopicOwner(deps, 'om_root_coord_own', CHAT_PROJECT, COORD_APP)).toBe(WORKER_TOPIC);
+    expect(resolveManagedSubtopicMentionlessHandoff(deps, 'om_root_coord_own', CHAT_PROJECT, WORKER_TOPIC)).toBeNull();
+
+    // Worker requires @ → plain fold candidate; the dispatcher's continuesRoot
+    // (isSessionOwner) keeps the coordinator on its own thread session.
+    mentionlessBots.delete(WORKER_TOPIC);
+    expect(resolveManagedSubtopicMentionlessHandoff(deps, 'om_root_coord_own', CHAT_PROJECT, COORD_APP)).toEqual({
+      kind: 'imported',
+      sourceLarkAppId: WORKER_TOPIC,
+      sourceAnswersWithoutMention: false,
+      hasProjectCoordinator: true,
+      isProjectCoordinator: true,
+    });
+    expect(findLiveMentionlessSubtopicOwner(deps, 'om_root_coord_own', CHAT_PROJECT, COORD_APP)).toBeUndefined();
+  });
+
   it('ignores unmanaged topics, cross-chat dispatch entries, moved attachments, and preserves non-project group behavior', async () => {
     await enableProjectGroup(CHAT_PROJECT);
     writeFileSync(join(dataDir, ORCHESTRATE_DISPATCH_STORE_FILE), JSON.stringify({

@@ -17642,3 +17642,94 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
     expect(handlersByApp.get(COORD_APP_ID)!.handleNewTopic).not.toHaveBeenCalled();
   });
 });
+
+describe('managed subtopic: coordinator with its own thread session at the root', () => {
+  const COORD = 'cli_own_thread_coord';
+  const WORKER = 'cli_own_thread_worker';
+  const chatId = 'oc_own_thread_chat';
+  const rootId = 'om_own_thread_root';
+  let dataDir = '';
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX));
+    __resetSubtopicHandoffCacheForTest();
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReturnValue('group');
+    mockGetCachedChatModeStrict.mockReturnValue('group');
+  });
+
+  afterEach(() => {
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+    __resetSubtopicHandoffCacheForTest();
+  });
+
+  // Coordinator in `topic` mode was @-ed inside an imported topic under the
+  // default chat-topic reply mode, so it holds its own thread session at root.
+  async function start(workerMentionMode: 'topic' | 'always') {
+    await writeGroupCollaborationMode(dataDir, { chatId, mode: 'project', coordinatorAppId: COORD, workerAppIds: [WORKER] });
+    const botStates = new Map<string, any>([
+      [COORD, { config: { larkAppId: COORD, larkAppSecret: 's', cliId: 'codex', allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' },
+        botOpenId: 'ou_own_thread_coord', resolvedAllowedUsers: [USER_OPEN_ID], resolvedBlockedUsers: [] }],
+      [WORKER, { config: { larkAppId: WORKER, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: workerMentionMode },
+        botOpenId: 'ou_own_thread_worker', resolvedAllowedUsers: [USER_OPEN_ID], resolvedBlockedUsers: [] }],
+    ]);
+    mockGetBot.mockImplementation((id: string) => botStates.get(id));
+    mockGetAllBots.mockImplementation(() => [...botStates.values()]);
+    const sessions: SubtopicSessionSnapshot[] = [
+      { sessionId: 'own-thread-worker', larkAppId: WORKER, chatId, scope: 'thread', rootMessageId: rootId, status: 'active', projectImportSource: 'relay' },
+      { sessionId: 'own-thread-coord', larkAppId: COORD, chatId, scope: 'thread', rootMessageId: rootId, status: 'active' },
+    ];
+    const deps = {
+      dataDir,
+      getLiveThreadSessionsAtRoot: (r: string, c: string) => sessions.filter(s => s.rootMessageId === r && s.chatId === c),
+      findActiveSessionsByRoot: (r: string) => sessions.filter(s => s.rootMessageId === r),
+      findActiveChatScopeSessionsByChat: () => [],
+      doesBotAnswerTopicWithoutMention: (t: string) => (botStates.get(t)?.config?.regularGroupMentionMode ?? 'always') !== 'always',
+    };
+    const receivers: Array<(data: any) => Promise<any>> = [];
+    const handlersByApp = new Map<string, ReturnType<typeof makeHandlers>>();
+    for (const appId of botStates.keys()) {
+      capturedHandlers = {};
+      const h = {
+        ...makeHandlers(),
+        isSessionOwner: vi.fn((anchor: string, a: string) => sessions.some(s => s.larkAppId === a && s.rootMessageId === anchor)),
+        resolveReplyThreadAlias: vi.fn(() => null),
+        resolveSubtopicMentionlessHandoff: (r: string, c: string, a: string) => resolveManagedSubtopicMentionlessHandoff(deps, r, c, a),
+      };
+      startLarkEventDispatcher(appId, 'secret', h);
+      receivers.push(capturedHandlers['im.message.receive_v1']);
+      handlersByApp.set(appId, h);
+    }
+    const deliver = async (messageId: string) => {
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID, chatId, chatType: 'group', messageId, rootId, threadId: 'omt_own_thread',
+        content: JSON.stringify({ text: '这个子任务继续，顺便把测试补上' }),
+      });
+      await Promise.all(receivers.map(receive => receive(event)));
+      await flushEventWork();
+    };
+    const replies = (appId: string) => {
+      const h = handlersByApp.get(appId)!;
+      return h.handleNewTopic.mock.calls.length + h.handleThreadReply.mock.calls.length;
+    };
+    return { deliver, replies, handlersByApp };
+  }
+
+  it('yields to the live免@ importing worker instead of answering on its own thread session (no double reply)', async () => {
+    const { deliver, replies } = await start('topic');
+    await deliver('om_own_thread_msg_1');
+    expect(replies(WORKER)).toBe(1);
+    expect(replies(COORD)).toBe(0);
+  });
+
+  it('keeps answering on its own thread session when the importing worker requires @', async () => {
+    const { deliver, replies, handlersByApp } = await start('always');
+    await deliver('om_own_thread_msg_2');
+    expect(replies(WORKER)).toBe(0);
+    expect(replies(COORD)).toBe(1);
+    expect(handlersByApp.get(COORD)!.handleThreadReply.mock.calls[0]![1]).toMatchObject({
+      larkAppId: COORD, chatId, scope: 'thread', anchor: rootId,
+    });
+  });
+});

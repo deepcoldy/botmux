@@ -321,16 +321,12 @@ export function resolveManagedSubtopicMentionlessHandoff(
     };
   }
 
-  // Project group (`mode === 'project'` with `coordinatorAppId`):
-  // If the coordinator itself owns an active thread-scope session at this root
-  // (e.g. an explicit `@coordinator /t` isolated topic) and answers without `@`,
-  // let that thread session continue without folding into chat-scope.
-  if (currentAppId === coordinatorAppId
-      && activeThreadSessions.some(s => s.larkAppId === coordinatorAppId)
-      && deps.doesBotAnswerTopicWithoutMention(coordinatorAppId, chatId, currentAppId) === true) {
-    return null;
-  }
-
+  // Project group (`mode === 'project'` with `coordinatorAppId`).
+  // A coordinator that owns its own thread-scope session at this root (e.g. it
+  // was @-ed inside the topic under `chat-topic` reply mode) is NOT exempted
+  // here: a live免@ worker below still wins and the coordinator yields (no
+  // double reply). Without such a worker the dispatcher's `continuesRoot`
+  // (isSessionOwner) keeps the coordinator on its own thread session.
   let matchedImported = false;
   let matchedDispatch = false;
   let matchedWorkstream = false;
