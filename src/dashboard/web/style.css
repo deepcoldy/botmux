@@ -1,3 +1,43 @@
+/* Token usage: reuse the dashboard panels and color tokens in every skin. */
+.page.usage-page { display: flex; flex-direction: column; gap: 18px; }
+.usage-page .sect-header { margin-bottom: 0; }
+.usage-page .sect-header p, .usage-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0 0; }
+.usage-page .panel { padding: 20px; min-width: 0; }
+.usage-page h2 { font-size: 15px; margin: 0 0 16px; }
+.usage-filter-fields { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
+.usage-filter-fields label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+.usage-filter-fields input, .usage-filter-fields select { min-width: 150px; max-width: 260px; min-height: 36px; }
+.usage-presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.usage-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
+.usage-page .metric-card { min-width: 0; padding: 18px; }
+.usage-page .metric-card strong { font-size: 25px; overflow-wrap: anywhere; }
+.usage-notice { background: var(--surface); color: var(--muted); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin: 0; }
+.usage-legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+.usage-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.usage-legend i { width: 8px; height: 8px; border-radius: 2px; }
+.usage-color-inputTokens { background: #3b82f6; }
+.usage-color-outputTokens { background: #8b5cf6; }
+.usage-color-cacheReadTokens { background: #10b981; }
+.usage-color-cacheCreateTokens { background: #f59e0b; }
+.usage-chart-scroll { overflow-x: auto; }
+.usage-chart { display: flex; gap: 4px; }
+.usage-chart-day { flex: 1; min-width: 20px; padding-top: 8px; }
+.usage-chart-day:hover, .usage-chart-day:focus-visible { background: var(--surface); outline: 1px solid var(--border); border-radius: 4px; }
+.usage-chart-stack { height: 180px; display: flex; flex-direction: column-reverse; justify-content: flex-start; border-bottom: 1px solid var(--border); }
+.usage-chart-stack i { flex-shrink: 0; display: block; width: 100%; max-width: 36px; margin: 0 auto; }
+.usage-chart-day small { display: block; height: 24px; text-align: center; color: var(--muted); font-size: 10px; margin-top: 8px; }
+.usage-breakdowns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.usage-table-scroll { overflow-x: auto; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-table th, .usage-table td { padding: 12px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+.usage-table th:first-child { text-align: left; white-space: normal; min-width: 140px; max-width: 360px; overflow-wrap: anywhere; }
+.usage-table thead th { font-weight: 500; color: var(--muted); }
+.usage-table tbody th { font-weight: 500; }
+.usage-table tr:last-child td, .usage-table tr:last-child th { border-bottom: 0; }
+.usage-empty { color: var(--muted); text-align: center; padding: 28px 12px; font-size: 13px; }
+@media (max-width: 1100px) { .usage-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); } .usage-breakdowns { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .usage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-page .panel { padding: 14px; } .usage-filter-fields label { flex: 1; min-width: 140px; } .usage-filter-fields input, .usage-filter-fields select { width: 100%; min-width: 0; } }
+
 /* Base tokens — the default look (incl. the "数字员工工作台" redesign from
    PR #123) is layered later in this file. Skins override these per [data-skin]. */
 :root {

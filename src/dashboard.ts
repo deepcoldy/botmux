@@ -135,6 +135,8 @@ import {
   sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleUsageAnalyticsApi } from './dashboard/usage-analytics-api.js';
+import { createUsageAnalytics } from './services/usage-analytics.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
 import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
 import { handleFeedbackExtensionApi } from './dashboard/feedback-extension-api.js';
@@ -459,6 +461,7 @@ const dashboardAutostart = createDashboardAutostartController({
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const queryDashboardUsage = createUsageAnalytics();
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
@@ -4720,6 +4723,8 @@ const server = createServer(async (req, res) => {
       }
       return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
     }
+
+    if (await handleUsageAnalyticsApi(req, res, url, { canManageHost: authed, query: queryDashboardUsage })) return;
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
       await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
