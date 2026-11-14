@@ -665,7 +665,8 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { assertScheduledAuthorityCurrent, authorizeScheduledTurn, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { validateScheduleChildOneShot } from './core/schedule-child-one-shot.js';
 import {
   prepareScheduledRecoveryRun,
   reconcileScheduledDelivery,
@@ -9755,6 +9756,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
   let botGrantHolds: (() => boolean) | undefined;
+  let scheduledChildParent: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord | undefined;
+  let scheduledChildParsed: ReturnType<typeof scheduler.parseSchedule> | undefined;
+  let scheduledChildMaxTasksPerTurn: number | undefined;
   const caller = scheduleCallerForTurn(ds, turnId);
   const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
@@ -9765,6 +9769,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
   }
   const direct = directHuman || providerActor;
+  const scheduledParentTaskId = parseScheduledTurnId(turnId);
   const capability = ds.managedTurnOrigin.capability;
   try {
     if (directHuman) {
@@ -9776,6 +9781,67 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       controlOpenId = remoteRunnerControllerOpenId;
       controlUnionId = await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined;
       grantId = `provider-actor:${sessionId}:${turnId}`;
+    } else if (scheduledParentTaskId) {
+      const rawWorkingDir = ds.workingDir ?? ds.session.workingDir;
+      let sessionWorkingDir: string | undefined;
+      try { sessionWorkingDir = rawWorkingDir ? realpathSync(rawWorkingDir) : undefined; }
+      catch { sessionWorkingDir = undefined; }
+      const parent = scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId);
+      if (!parent) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      let parsed: ReturnType<typeof scheduler.parseSchedule>;
+      try { parsed = scheduler.parseSchedule(task.schedule); }
+      catch {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_requires_once' });
+      }
+      const childDecision = validateScheduleChildOneShot({
+        policy: readGlobalConfig().scheduleDelegation,
+        parent,
+        task,
+        parsed,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        rootMessageId: expectedRoot,
+        workingDir: sessionWorkingDir ?? '',
+        nowMs: Date.now(),
+      });
+      if (!childDecision.ok) {
+        return jsonRes(res, 403, { ok: false, error: childDecision.error });
+      }
+      const parentAuth = authorizeScheduledTurn({
+        turnId,
+        sessionLarkAppId: ds.larkAppId,
+        sessionChatId: ds.chatId,
+        loadTask: (appId, taskId) => readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
+        isOwnerAllowed: (appId, ownerOpenId) => getDashboardAdminOpenIds(appId).includes(ownerOpenId),
+        isScheduledTurnLive: liveTurnId => ds.scheduledTurnCallers?.has(liveTurnId) === true,
+      });
+      if ('error' in parentAuth
+        || parentAuth.ownerOpenId !== parent.controlOpenId
+        || parent.task.ownerUnionId !== parent.controlUnionId) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      const resolved = await resolveTargetAppOpenId(ds.larkAppId, parent.controlUnionId!);
+      if (resolved.status !== 'resolved' || resolved.openId !== parent.controlOpenId) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
+      if (!targetTriggerPolicy?.enabled
+        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+        return jsonRes(res, 403, {
+          ok: false,
+          error: 'schedule_child_one_shot_identity_isolation_required',
+        });
+      }
+      scheduledChildParent = parent;
+      scheduledChildParsed = parsed;
+      scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+      controlOpenId = parent.controlOpenId;
+      controlUnionId = parent.controlUnionId;
+      grantId = `schedule-child:${ds.larkAppId}:${scheduledParentTaskId}:${turnId}`;
+      sourceMessageId = turnId;
+      sourceSessionId = sessionId;
     } else {
       if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
@@ -9860,6 +9926,36 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (botGrantHolds && !botGrantHolds()) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
     }
+    if (scheduledChildParent && scheduledChildParsed) {
+      try {
+        assertScheduledAuthorityCurrent(
+          scheduledChildParent,
+          scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId!),
+          { turnId, allowCompleted: true },
+        );
+      } catch {
+        return jsonRes(res, 409, { ok: false, error: 'schedule_child_one_shot_authority_changed' });
+      }
+      const rawWorkingDir = ds.workingDir ?? ds.session.workingDir;
+      let sessionWorkingDir: string | undefined;
+      try { sessionWorkingDir = rawWorkingDir ? realpathSync(rawWorkingDir) : undefined; }
+      catch { sessionWorkingDir = undefined; }
+      const childDecision = validateScheduleChildOneShot({
+        policy: readGlobalConfig().scheduleDelegation,
+        parent: scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId!),
+        task,
+        parsed: scheduledChildParsed,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        rootMessageId: expectedRoot,
+        workingDir: sessionWorkingDir ?? '',
+        nowMs: Date.now(),
+      });
+      if (!childDecision.ok) {
+        return jsonRes(res, 403, { ok: false, error: childDecision.error });
+      }
+      scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+    }
     const baseParams = {
       name: task.name.trim(),
       schedule: task.schedule,
@@ -9923,13 +10019,17 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       sourceSessionId,
       targetTurnId: turnId,
       targetGeneration: generation,
-      maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+      maxTasksPerTurn: scheduledChildMaxTasksPerTurn
+        ?? readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
         ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
     });
     if (!result.ok) {
+      const error = scheduledChildParent && result.error === 'grant_task_limit'
+        ? 'schedule_child_one_shot_task_limit'
+        : result.error;
       return jsonRes(res, result.error === 'grant_task_limit' ? 403 : 409, {
         ok: false,
-        error: result.error,
+        error,
       });
     }
     return jsonRes(res, result.replay ? 200 : 201, { ok: true, task: result.task, replay: result.replay });

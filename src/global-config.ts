@@ -285,9 +285,20 @@ export interface ScheduleDelegationGlobalConfig {
   runScopes?: Array<'bytedcli'>;
   /** Let a delegated scheduled turn pause or remove its own task. Default off. */
   selfManageEnabled?: boolean;
+  /** Allow an authenticated scheduled turn to create a bounded one-shot child
+   *  in its current topic. Independent from cross-bot createEnabled. */
+  childOneShotEnabled?: boolean;
+  /** Latest allowed child fire time relative to creation. Default 24h, capped at 7d. */
+  childOneShotMaxDelayMinutes?: number;
+  /** Distinct child tasks one scheduled turn may commit. Default 1, capped at 16. */
+  childOneShotMaxTasksPerTurn?: number;
 }
 
 export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
+export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_DELAY_MINUTES = 24 * 60;
+export const SCHEDULE_CHILD_ONE_SHOT_MAX_DELAY_MINUTES = 7 * 24 * 60;
+export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN = 1;
+export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
 export interface GlobalConfig {
   lang?: Locale;
@@ -754,6 +765,23 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
     if (runScopes.length > 0) out.runScopes = runScopes;
   }
   if (typeof value.selfManageEnabled === 'boolean') out.selfManageEnabled = value.selfManageEnabled;
+  if (typeof value.childOneShotEnabled === 'boolean') {
+    out.childOneShotEnabled = value.childOneShotEnabled;
+    if (value.childOneShotEnabled) {
+      const maxDelayMinutes = readPositiveInteger(value.childOneShotMaxDelayMinutes)
+        ?? SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_DELAY_MINUTES;
+      out.childOneShotMaxDelayMinutes = Math.min(
+        maxDelayMinutes,
+        SCHEDULE_CHILD_ONE_SHOT_MAX_DELAY_MINUTES,
+      );
+      const maxTasksPerTurn = readPositiveInteger(value.childOneShotMaxTasksPerTurn)
+        ?? SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN;
+      out.childOneShotMaxTasksPerTurn = Math.min(
+        maxTasksPerTurn,
+        SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN,
+      );
+    }
+  }
   if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
     const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
@@ -1453,20 +1481,22 @@ export function ignoredScheduleBotGrantCount(): number {
   return list.length - (readGlobalConfig().scheduleDelegation?.botGrants?.length ?? 0);
 }
 
-/** Dashboard write for the bot-grant entry (`createEnabled`, `selfManageEnabled`,
- *  `botGrants`). A value equal to its default (off / empty) removes the key
+/** Dashboard write for the schedule-delegation entry (`createEnabled`,
+ *  `selfManageEnabled`, `childOneShotEnabled`, `botGrants`). A value equal to
+ *  its default (off / empty) removes the key
  *  instead of being stored, an emptied block is dropped, and every other
  *  scheduleDelegation key on disk is left exactly as it was. */
 export function writeScheduleBotGrantConfig(patch: {
   createEnabled?: boolean;
   selfManageEnabled?: boolean;
+  childOneShotEnabled?: boolean;
   botGrants?: ScheduleBotGrant[];
 }): ScheduleDelegationGlobalConfig | undefined {
   const raw = readRawConfig();
   const next = raw.scheduleDelegation && typeof raw.scheduleDelegation === 'object' && !Array.isArray(raw.scheduleDelegation)
     ? { ...raw.scheduleDelegation as Record<string, unknown> }
     : {};
-  for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+  for (const key of ['createEnabled', 'selfManageEnabled', 'childOneShotEnabled'] as const) {
     if (patch[key] === true) next[key] = true;
     else if (patch[key] === false) delete next[key];
   }

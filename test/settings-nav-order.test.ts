@@ -33,7 +33,8 @@ const settings: Settings = {
   hostOverloadAlert: { enabled: false, targetBotAppId: null, enterLoadRatio: 1.5, enterMemUsedFrac: 0.9, botOptions: [], targetDaemonOnline: false },
   noVisibleOutputHint: false,
   crossPrincipalInterruption: false,
-  scheduleBotGrants: { createEnabled: false, selfManageEnabled: false, grants: [], ignoredCount: 0, botOptions: [] },
+  scheduleBotGrants: { createEnabled: false, selfManageEnabled: false,
+    childOneShotEnabled: false, grants: [], ignoredCount: 0, botOptions: [] },
   vcMeetingAgent: { enabled: false },
   repoPickerMode: 'all',
   maintenance: {},
@@ -128,5 +129,26 @@ describe('stuck-card initiator switch', () => {
     expect(key).toBe('stuckCardInitiatorKeys');
     expect(patch).toEqual({ stuckCardInitiatorKeys: false });
     expect(update(settings).stuckCardInitiatorKeys).toBe(false);
+  });
+});
+
+describe('scheduled one-shot child switch', () => {
+  it('lives in experimental settings and saves only its delegation field', async () => {
+    const onSave = vi.fn(async () => {});
+    let body!: TestRenderer.ReactTestRenderer;
+    await act(async () => { body = renderSettingsPageParts(onSave); });
+    const titles = new Set(['zh', 'en'].map(locale =>
+      createDashboardTranslator(locale as 'zh' | 'en')('settings.scheduleChildOneShot')));
+    const block = body.root.find(node => isBlock(node) && node.props.id === 'settings-experimental');
+    const [row] = block.findAll(node => titles.has(node.props.title) && typeof node.props.onChange === 'function');
+    expect(row.props.checked).toBe(false);
+    await act(async () => { row.props.onChange(true); });
+    act(() => body.unmount());
+    expect(onSave).toHaveBeenCalledTimes(1);
+    const [key, patch, update] = onSave.mock.calls[0] as unknown as
+      [string, unknown, (s: Settings) => Settings];
+    expect(key).toBe('scheduleBotGrants');
+    expect(patch).toEqual({ scheduleBotGrants: { childOneShotEnabled: true } });
+    expect(update(settings).scheduleBotGrants.childOneShotEnabled).toBe(true);
   });
 });
