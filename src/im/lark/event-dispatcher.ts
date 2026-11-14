@@ -14,7 +14,7 @@ import { botHasConfiguredAllowlist } from '../../core/bot-allowlist.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
-import { classifyLarkError } from './error-classify.js';
+import { classifyLarkError, extractLarkErrorShape } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { messageListenerTaskAnchor } from '../../core/message-listener-silence.js';
 import { logger } from '../../utils/logger.js';
@@ -53,6 +53,8 @@ import {
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { tryRegisterApp } from '../../setup/register-app.js';
+import { describeMissingScopes, diffScopeBuckets, readRegistrationScopes, registrationScopeBuckets, scopeBucketCount } from '../../setup/registration-manifest.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { isGrantTargetOnly, tryHandleGrantCommand } from './grant-command.js';
 import { applyDelegatedGrants } from './delegated-grant.js';
@@ -302,240 +304,129 @@ function getAdminOpenId(bot: BotState): string | undefined {
  * 先记「已通知」再发的话，一次网络失败就把那个版本永久节流掉，人再也收不到提醒，
  * 且是零信号的静默丢失。所以由这里如实回报，让**只有关心的那一处**去判断。
  */
-async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, contextTag: string): Promise<boolean> {
+async function dmAdmin(
+  larkAppId: string, adminOpenId: string, content: string, contextTag: string, beforeWrite?: () => void,
+): Promise<boolean> {
   try {
-    await sendUserMessage(larkAppId, adminOpenId, content, 'text');
+    if (beforeWrite) await sendUserMessage(larkAppId, adminOpenId, content, 'text', undefined, undefined, { beforeWrite });
+    else await sendUserMessage(larkAppId, adminOpenId, content, 'text');
     logger.info(`[${larkAppId}] notified admin ${adminOpenId.substring(0, 12)} about ${contextTag}`);
     return true;
-  } catch (err: any) {
-    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${err?.message ?? err}`);
+  } catch (error) {
+    const { larkCode, httpStatus } = extractLarkErrorShape(error);
+    const code = (error as { code?: unknown } | undefined)?.code;
+    const reason = [
+      larkCode !== undefined && `Lark code=${larkCode}`,
+      httpStatus !== undefined && `HTTP ${httpStatus}`,
+      typeof code === 'string' && /^E[A-Z0-9_]{1,19}$/.test(code) && code,
+      error instanceof Error && error.message === 'scope_repair_owner_changed' && error.message,
+    ].filter(Boolean).join(', ');
+    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${reason || 'message delivery failed'}`);
     return false;
   }
 }
 
-/**
- * Try to auto-fix missing scopes using the same Open Platform web-session
- * automation that powers `botmux setup`. If ~/.botmux/feishu-session.json holds
- * a valid cached session, this adds all botmux-required scopes and publishes
- * a new app version — no user interaction needed.
- *
- * Returns `true` if scopes were successfully applied (caller should stop),
- * `false` to fall through to the manual DM warning.
- *
- * `opts.disableQrLogin` — when the only thing missing is a non-critical scope,
- *   we still try to grab it (the automation imports the full manifest), but must
- *   NOT pop a second QR code if the cached session is gone. Passing this makes a
- *   missing/expired session fail cleanly (reason `invalid_session`) instead of
- *   prompting a login.
- * `opts.silent` — suppress the admin success DM (used for the opt-in / optional
- *   path so a bot that never asked for the feature isn't pinged; the log line is
- *   enough). Failures are always silent here regardless.
- */
-/**
- * `kind`：
- *   • `'fixed'` = 已处理完，调用方停止
- *   • `'under_review'` = 应用正在飞书审核中、配置被写锁。调用方**不该**再让管理员去点
- *     权限链接（审核期间连 scope/update 都被拒，点了也写不进去），也不该说「等审批通过
- *     就好」——触发审批通常意味着有配置不合规，那一版不会自己通过，得人工修配置。
- *   • `'failed'` = 落回人工深链 DM
- *
- * `inReviewVersionId`：仅 `under_review` 时可能有值 —— 当前那个待审版本的 id，用作
- * 「同一个待审版本别重复打扰管理员」的节流 key。**读不到时为 undefined，此时刻意不
- * 节流**（那意味着模型与飞书实际状态不一致，每次都值得说；万一是我们判据有 bug，
- * 节流会掐掉唯一的信号）。
- */
-type AutoFixOutcome = { kind: 'fixed' | 'under_review' | 'failed'; inReviewVersionId?: string };
+const activeScopeRepairs = new Map<string, { owner: string; cancel: AbortController }>();
 
 async function tryAutoFixScopes(
   larkAppId: string,
   bot: BotState,
   brand: Brand,
-  missingCritical: { name: string; desc: string }[],
-  missingOptional: { name: string; desc: string }[],
-  opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } },
-): Promise<AutoFixOutcome> {
-  if (brand !== 'feishu') return { kind: 'failed' };
+  names: string[],
+  granted?: { tenant: string[]; user: string[] },
+): Promise<boolean> {
+  const owner = getOwnerOpenId(larkAppId);
+  const active = activeScopeRepairs.get(larkAppId);
+  if (active && active.owner === owner && !active.cancel.signal.aborted) return true;
+  active?.cancel.abort();
+  if (!owner) return false;
+  const requested = registrationScopeBuckets(filterScopeManifest(readDefaultScopeManifest(), names));
+  const missing = granted ? diffScopeBuckets(requested, granted) : requested;
+  if (scopeBucketCount(missing) === 0) return false;
 
+  const cancel = new AbortController();
+  const repair = { owner, cancel };
+  activeScopeRepairs.set(larkAppId, repair);
+  const signal = AbortSignal.any([cancel.signal, AbortSignal.timeout(10 * 60_000)]);
+  const isCurrentOwner = () => getOwnerOpenId(larkAppId) === owner;
+  const assertCurrentOwner = () => {
+    if (signal.aborted || !isCurrentOwner()) throw new Error('scope_repair_owner_changed');
+  };
+  let delivered: Promise<boolean> | undefined;
   try {
-    const totalMissing = missingCritical.length + missingOptional.length;
-    logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
-    // 只申请「实际缺失」的那几项：把默认清单裁成缺失集合再传进去，避免
-    // 「用缺失项当触发器、却拿完整 manifest（300+ 项）当申请集合」——那会让补一个
-    // im:feed_group_v1:read 连带申请日历/文档/表格等一大批 botmux 不校验的权限。
-    // 分桶归属仍以默认 manifest 为准（见 filterScopeManifest）。
-    const wantedScopeNames = [...missingCritical, ...missingOptional].map(s => s.name);
-    const scopeManifest = filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames);
-    const result = await automateOpenPlatformSetup({
-      appId: bot.config.larkAppId,
-      brand,
-      maxWaitMs: 60_000,
-      disableQrLogin: opts?.disableQrLogin,
-      scopeManifest,
-      // 已授权集合（按 tenant/user 分桶）：automation 据此对上面这份 manifest 再按桶
-      // 各自做一次差集，并按「确有新增」而非「发过 scope/update」置 mutated——「配置本
-      // 就齐全」时才能命中无变更短路。分桶是为了不让 tenant 授权误伤 user 桶同名
-      // scope（#1044）。与 scopeManifest 叠加安全：缺失判定用的扁平集合是分桶集合的
-      // 超集，故本路径上二次差集恒为空操作；它真正兜住的是「裁剪后为空」那一轮。
-      // 拿不到 granted（self_manage 冷启动）时不传，退回保守近似。
-      grantedScopeNames: opts?.grantedScopeNames,
-      onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
-      onQrCode: (info) => {
-        logger.warn(
-          `[${larkAppId}] auto-fix: cached Feishu web session expired, QR login needed. ` +
-          `Run \`botmux setup\` to refresh session, or manually apply scopes from deep links below. ` +
-          `QR text (first 80 chars): ${info.qrText.substring(0, 80)}...`,
-        );
+    const result = await tryRegisterApp({
+      appId: larkAppId,
+      addons: { preset: false, scopes: missing },
+      signal,
+      onStatusChange: () => {},
+      onQRCodeReady: ({ url }) => {
+        if (signal.aborted || !isCurrentOwner()) {
+          cancel.abort();
+          return;
+        }
+        delivered = dmAdmin(larkAppId, owner,
+          `机器人「${bot.botName ?? larkAppId}」需要补齐以下权限。请打开飞书确认链接（10 分钟内），确认后 botmux 会再次回读：\n\n`
+          + `${describeMissingScopes(missing)}\n\n${url}`,
+          'scope repair confirmation',
+          assertCurrentOwner,
+        ).then(ok => {
+          if (!ok) cancel.abort();
+          return ok;
+        });
       },
     });
-
-    if (result.ok) {
-      // ⚠️ `scopeCount === 0` 有三种**互相矛盾**的成因，不能共用一句话。自从申请集合
-      // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
-      // 多少」变成「**缺失的那几项里成功了多少**」，于是 0 不再等于「本来就齐」，
-      // 反而最可能是「一项都没补上」——照旧说「所有必需权限已在应用清单中」就成了
-      // 恰在全部失败时谎报齐全。三种成因按可诊断性分开：
-      //   ① scopeWarning 有值 → scope/update 被租户整批拒了（开放平台明确报错）
-      //   ② skippedScopeCount > 0 → 这些名字不在该租户的开放平台目录里，不可授予
-      //      （automation 自己 warn 过「not present in the Open Platform catalog」）
-      //   ③ 都没有 → 申请集合本就是空的（缺失项已在清单中），才是真的「已齐全」
-      // 这句同时进 daemon 日志**和**下面的管理员 DM，DM 开头写着「✅ 已自动修复了
-      // 缺失的权限」，一旦这里说反就自相矛盾，管理员会以为不用管。
-      const scopeDetail = result.scopeCount > 0
-        ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
-        : result.scopeWarning
-          ? `0 项权限已导入——开放平台拒绝了本次权限申请（${result.scopeWarning}），需到「权限管理」手动开通`
-          : result.skippedScopeCount > 0
-            ? `0 项权限已导入——这 ${result.skippedScopeCount} 项不在当前租户的开放平台权限目录中，无法自动申请，需到「权限管理」手动开通`
-            : '所有必需权限已在应用清单中';
-      // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
-      const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
-      // 数据范围只在**真做了事**或**真出错**时才进日志：常态是「没有待配的」，
-      // 那句话对读日志的人零信息量，还会淹没上面真正的 scope 结论。
-      const privilegeRangeDetail = result.privilegeRangeCount > 0
-        ? `, ${result.privilegeRangeCount} 项权限数据范围已设为「与应用的可用范围一致」`
-        : result.privilegeRangeWarning
-          ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
-          : '';
-      // 三种结局互斥，判定顺序不能反（#1044 的 publishSkipped 必须最先判）：
-      //   ① publishSkipped —— 无变更、**根本没建版本**，报 `version n/a published` 会误导
-      //   ② versionWarning —— 建/提交了但回读仍是草稿。「version X published」曾是**谎报**：
-      //      `publish/commit` 回 code=0 而版本仍停在未提交草稿态，日志照样写 published，
-      //      于是那个草稿一路卡死后续每一次自愈（`app_version/create` 撞 code=10043）。
-      //   ③ 正常发布
-      const versionDetail = result.publishSkipped
-        ? '无变更，已跳过发版'
-        : result.versionWarning
-          ? `version ${result.versionId ?? 'n/a'} NOT published（${result.versionWarning}）`
-          : `version ${result.versionId ?? 'n/a'} ${result.versionReused ? '(复用既有草稿) ' : ''}published`;
-      // 「秒过」与「要人审」是两种截然不同的结局，日志必须分开——否则运维看到
-      // published 会以为权限已经生效，而实际上可能还在等某个人点同意。
-      const approvalDetail = result.approvalAutoPassed === true
-        ? '（审批流自动通过，已即时生效）'
-        : result.approvalHumanApprovers?.length
-          ? `（需人工审批：${result.approvalHumanApprovers.join('、')}）`
-          : '';
-      const summary =
-        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
-        `${versionDetail}${approvalDetail}, ` +
-        `${result.subscribedEventCount} events subscribed`;
-      if (autoFixEffective && !result.versionWarning) logger.info(summary);
-      else logger.warn(summary);
-      // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
-      // never enabled the feature must not be pinged just because a non-critical
-      // scope was topped up in the background). The log line above is the record.
-      if (opts?.silent) return { kind: 'fixed' };
-      // Notify admin that auto-fix worked — even if im:message was missing before,
-      // the newly published version should now have it.
-      const adminOpenId = getAdminOpenId(bot);
-      if (adminOpenId) {
-        const fixedList = [...missingCritical, ...missingOptional];
-        const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
-        // 标题跟着实际结果走：一项都没落地时说「已自动修复」是谎报，管理员会以为
-        // 不用管，而这条路径的下游（缺 critical scope）恰恰是最需要人工介入的。
-        // 同理「新版本已发布」也不能写死：scope 写进了清单但版本没提交，权限就**不会
-        // 生效**，而管理员读到「已发布」只会干等。versionWarning 有值时直接给出
-        // 手动收尾的动作。
-        //
-        // 三种结局要分清，因为「用户接下来该做什么」完全不同：
-        //   ① 秒过（审批流全自动通过）→ 已经生效了，什么都不用做
-        //   ② 要人审 → 已提交，但在等具体某个人；告诉他等谁，免得重复点或干等
-        //   ③ 判不出来 → 保持中性措辞，不猜
-        const versionLine = result.versionWarning
-          ? `⚠️ 但新版本**没有成功提交发布**（${result.versionWarning}）。权限要等版本发布后才生效。`
-          : result.approvalAutoPassed === true
-            ? '新版本已提交，审批流**自动通过**，权限已即时生效。'
-            : result.approvalHumanApprovers?.length
-              ? `新版本已提交，但需要**人工审批**（审批人：${result.approvalHumanApprovers.join('、')}），`
-                + '通过后权限才生效——不用重复提交，等审批即可。'
-              : '新版本已发布。';
-        await dmAdmin(
-          larkAppId,
-          adminOpenId,
-          (autoFixEffective && !result.versionWarning
-            ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
-            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能全部落地，需要你手动收尾：\n\n`) +
-          `${missingList}\n\n` +
-          `${scopeDetail}，${versionLine}\n` +
-          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
-          autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
-        );
-      }
-      return { kind: 'fixed' };
+    if (!await delivered) return !isCurrentOwner() || activeScopeRepairs.get(larkAppId) !== repair;
+    if (!result.ok || result.brand !== brand) {
+      logger.info(`[${larkAppId}] scope repair confirmation did not complete`);
+      return true;
     }
 
-    // Auto-fix failed — log reason. Critical path falls through to a manual
-    // deep-link DM; the silent optional-scope top-up path does NOT DM (it just
-    // leaves the opt-in scope ungranted), so don't claim a DM fallback there.
-    const reasons: Record<string, string> = {
-      missing_session: '无可用的 Feishu Web session',
-      invalid_session: 'Web session 已失效',
-      login_failed: 'Web session 登录失败',
-      qr_expired: '需要扫码但二维码已过期',
-      timeout: '等待扫码超时',
-      unsupported_brand: '仅支持 feishu.cn 租户',
-      network: '网络错误',
-      missing_csrf: '开放平台页面未返回 CSRF token',
-      scope_mapping_failed: '权限映射失败',
-      api_error: '开放平台 API 错误',
-      app_under_review: '应用正在飞书审核中（配置被开放平台写锁，审批通过后自动恢复）',
-    };
-    // ⚠️ 泛化标签和具体消息**两个都要打**。这里曾写成
-    // `reasons[result.reason] ?? result.message`——`api_error` 在表里有值,`??`
-    // 永远短路,于是 `result.message` 一次都进不了日志。线上真实后果:一天 5 次自愈
-    // 失败只留下 5 行「开放平台 API 错误」,而被吞掉的那句正是唯一有用的诊断
-    // (`code=10043 版本已创建,请刷新`),排查只能靠重放整条链路才拿到。
-    // 泛化标签帮人快速归类,具体消息才说得清到底哪儿坏——别再让前者盖掉后者。
-    const reasonLabel = reasons[result.reason] ?? result.reason;
-    // 审核中不是「修不了」，是「现在不能改、审批通过就好」。日志级别降为 info 并显式
-    // 说明不会落回深链 DM——把权限链接推给管理员是**错误的建议**：审核期间开放平台
-    // 连 scope/update 都拒（实测 code=10046），点了也写不进去。
-    if (result.reason === 'app_under_review') {
-      logger.info(
-        `[${larkAppId}] auto-fix deferred: ${reasonLabel}` +
-        `${result.message ? ` — ${result.message}` : ''}`,
-      );
-      return { kind: 'under_review', inReviewVersionId: result.inReviewVersionId };
+    // 使用当前配置的应用凭证回读，确认页的凭证不写入配置。
+    if (signal.aborted || !isCurrentOwner()) return true;
+    const currentBot = getBot(larkAppId);
+    const readback = await readRegistrationScopes({
+      appId: larkAppId, appSecret: currentBot.config.larkAppSecret, brand,
+    }, missing);
+    const detail = !readback
+      ? '飞书已返回确认结果，当前无法回读授权状态，请到开放平台检查。'
+      : scopeBucketCount(readback.missing) === 0
+        ? `已回读确认 ${readback.grantedCount} 项缺失权限全部补齐。`
+        : `授权回读仍缺失：${describeMissingScopes(readback.missing)}。请在开放平台检查租户可授权范围。`;
+    if (isCurrentOwner()) {
+      await dmAdmin(larkAppId, owner, detail, 'scope repair readback', assertCurrentOwner);
     }
-    logger.warn(
-      `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasonLabel}` +
-      `${result.message ? ` — ${result.message}` : ''}). ` +
-      (opts?.silent ? 'Leaving opt-in scope ungranted (no DM).' : 'Falling back to manual deep-link DM.'),
-    );
-    return { kind: 'failed' };
-  } catch (err: any) {
-    logger.warn(`[${larkAppId}] auto-fix error: ${err?.message ?? err}` +
-      (opts?.silent ? ' — leaving opt-in scope ungranted (no DM)' : ' — falling back to manual DM'));
-    return { kind: 'failed' };
+    return true;
+  } finally {
+    cancel.abort();
+    if (activeScopeRepairs.get(larkAppId) === repair) activeScopeRepairs.delete(larkAppId);
   }
 }
 
+const activeScopeChecks = new Map<string, { owner: string | undefined }>();
+
 export async function checkRequiredScopes(larkAppId: string): Promise<void> {
+  const owner = getOwnerOpenId(larkAppId);
+  const active = activeScopeChecks.get(larkAppId);
+  if (active && active.owner === owner) return;
+  activeScopeRepairs.get(larkAppId)?.cancel.abort();
+  const check = { owner };
+  activeScopeChecks.set(larkAppId, check);
+  const isCurrent = () => activeScopeChecks.get(larkAppId) === check && getOwnerOpenId(larkAppId) === owner;
+  try {
+    await checkRequiredScopesOnce(larkAppId, isCurrent);
+  } finally {
+    if (activeScopeChecks.get(larkAppId) === check) activeScopeChecks.delete(larkAppId);
+  }
+}
+
+async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boolean): Promise<void> {
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
   const openApi = larkHosts(brand).openApi;
   try {
     const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
       method: 'POST',
+      signal: AbortSignal.timeout(10_000),
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
     });
@@ -546,27 +437,18 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     }
     const infoRes = await fetch(
       `${openApi}/open-apis/application/v6/applications/${bot.config.larkAppId}?lang=zh_cn`,
-      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` } },
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: AbortSignal.timeout(10_000) },
     );
     const infoData = await infoRes.json() as any;
+    if (!isCurrent()) return;
 
     // 99991672 = 应用身份缺权限。最常见就是 admin:app.info:readonly /
     // application:application:self_manage 都没拿到，导致根本查不到自己的
     // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
     // self_manage 后下次重启就能自检了。
     if (infoData.code === LARK_CODE_APP_SCOPE_MISSING) {
-      // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
-      // are missing. Try the Open Platform web-session auto-fix to add every
-      // botmux-required scope (including self_manage) in one shot — passing the
-      // full BOTMUX_REQUIRED_SCOPES so the next restart's self-check finds them
-      // all present, without over-applying the whole 300+ scope manifest.
-      if (brand === 'feishu') {
-        const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
-        // 审核中同样直接返回：这条路径下游是让管理员去点 self_manage 深链，而审核期间
-        // 写锁生效，点了也开不了——等审批通过下次重启自检即可。
-        if (fixed.kind !== 'failed') return;
-      }
+      // 自查被拒时无法证明其他权限缺失，先只申请用于自查的权限。
+      if (await tryAutoFixScopes(larkAppId, bot, brand, [SELF_MANAGE_SCOPE]) || !isCurrent()) return;
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
       logger.warn(
@@ -594,26 +476,20 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       return;
     }
     // Lark 文档示例把 scopes 放在 data.app.scopes；为防响应结构变化，
-    // 同时兜底 data.scopes / data.application.scopes，取到的第一个非空数组为准。
+    // 同时兼容 data.scopes / data.application.scopes。空数组视为无法核验。
     const scopesRaw: any[] =
       infoData.data?.app?.scopes
       ?? infoData.data?.application?.scopes
-      ?? infoData.data?.scopes
-      ?? [];
+      ?? infoData.data?.scopes;
     if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
-      logger.debug(`[${larkAppId}] scope check inconclusive: scopes array empty or shape unexpected — skipping`);
+      logger.debug(`[${larkAppId}] scope check inconclusive: scopes array unavailable — skipping`);
       return;
     }
     const grantedScopes = new Set(
       scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
     );
 
-    // 按 token 类型分桶的已授权集合，专供 automation 的「无变更短路」按桶做差用。
-    // application/v6 每个 scope 条目自带 token_types:(tenant|user)[]（SDK 类型可查）。
-    // 之所以不能复用上面的扁平 grantedScopes：约 121 个名字同时在 tenant/user 两桶，
-    // tenant/user 是两份独立授权；扁平集合会让「tenant 已授权」误伤 user 桶同名 scope，
-    // 把真正缺的 user 权限静默吞掉（PR #1044 R2）。缺 token_types 的条目**两桶都不放**，
-    // 退回保守近似（该名字照发 scope/update），宁可多发一版也不少发。
+    // 旧响应只带名称时无法确认桶归属。保留它已有授权的兼容判定。
     const grantedScopeBuckets = { tenant: [] as string[], user: [] as string[] };
     for (const s of scopesRaw) {
       const name = typeof s === 'string' ? s : s?.scope;
@@ -622,6 +498,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       if (Array.isArray(tokenTypes)) {
         if (tokenTypes.includes('tenant')) grantedScopeBuckets.tenant.push(name);
         if (tokenTypes.includes('user')) grantedScopeBuckets.user.push(name);
+      } else {
+        grantedScopeBuckets.tenant.push(name);
+        grantedScopeBuckets.user.push(name);
       }
     }
 
@@ -713,50 +592,35 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       logger.debug(`[${larkAppId}] vc-meeting readiness check errored: ${err?.message ?? err}`);
     }
 
-    // Diff against the canonical list. Critical-missing is the main signal;
-    // non-critical is mentioned only when something critical is also missing,
-    // so deployments don't get nagged about purely optional scopes like
-    // `application:application:self_manage`.
-    const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedScopes.has(s.name));
-    const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
+    if (!isCurrent()) return;
+    const required = registrationScopeBuckets(filterScopeManifest(
+      readDefaultScopeManifest(), BOTMUX_REQUIRED_SCOPES.map(scope => scope.name),
+    ));
+    const missingBuckets = diffScopeBuckets(required, grantedScopeBuckets);
+    const missingNames = new Set([...missingBuckets.tenant, ...missingBuckets.user]);
+    const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(scope =>
+      scope.critical && (!grantedScopes.has(scope.name) || missingBuckets.tenant.includes(scope.name)),
+    );
+    const criticalNames = new Set(missingCritical.map(scope => scope.name));
+    const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !criticalNames.has(scope.name)
+      && (missingNames.has(scope.name) || (!scope.critical && !grantedScopes.has(scope.name))),
+    );
 
+    const reviewVersion = infoData.data?.app?.unaudit_version_id;
+    const inReviewVersionId = typeof reviewVersion === 'string' && reviewVersion ? reviewVersion : undefined;
+    if (!inReviewVersionId && missingCritical.length > 0) {
+      const confirmed = await tryAutoFixScopes(larkAppId, bot, brand,
+        [...missingCritical, ...missingOptional].map(scope => scope.name), grantedScopeBuckets);
+      if (confirmed || !isCurrent()) return;
+    }
     if (missingCritical.length === 0) {
-      // All critical scopes present. If an opt-in feature added a non-critical
-      // scope that isn't granted yet, top it up SILENTLY — but only when a cached
-      // Feishu web session already exists (disableQrLogin makes a missing session
-      // fail cleanly with no second QR code and no DM). This makes `botmux restart`
-      // actually pick up newly-declared optional scopes (e.g. the foreign-bot
-      // group-message scope) without the admin having to visit the Open Platform,
-      // while a bot with nothing missing — or no web session — behaves exactly as
-      // before (no API call / no prompt / no nag).
-      if (missingOptional.length > 0 && brand === 'feishu') {
-        const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
-          { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
-        // 只有真的补上了才说「auto-topped-up」：审核中什么都没写进去（开放平台
-        // 连 scope/update 都拒），说补上了就是谎报。审核中静默跳过，等审批通过。
-        if (toppedUp.kind === 'fixed') {
-          logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
-          return;
-        }
-        if (toppedUp.kind === 'under_review') return;
-        logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
+      if (missingOptional.length > 0) {
+        logger.debug(`[${larkAppId}] optional scopes missing: ${missingOptional.map(scope => scope.name).join(', ')}`);
       }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
     }
-
-    // Auto-fix: try the same Open Platform automation used by `botmux setup`.
-    // If a cached Feishu web session exists (~/.botmux/feishu-session.json), we can
-    // directly add missing scopes and publish a new version without user interaction.
-    // Falls through to manual DM warning if session is missing/expired.
-    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional,
-      { grantedScopeNames: grantedScopeBuckets });
-    if (autoFixed.kind === 'fixed') return;
-    // 审核中：**不推权限深链**（审核期间连 scope/update 都被拒，点了写不进去），
-    // 也**不说「等审批通过就好」**——触发审批通常意味着有配置不合规，那一版不会自己
-    // 通过（模板建的应用出生带「数据范围=全部」，正撞租户「非必要不申请全员数据」的
-    // 加签规则）。所以这里只做一件事：**如实告诉管理员卡在哪、为什么卡、怎么修**。
-    if (autoFixed.kind === 'under_review') {
+    if (inReviewVersionId) {
       const summary = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
       logger.warn(
         `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限（${summary}），` +
@@ -769,7 +633,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       // key 用待审版本 id：对齐「事情有没有变化」而非「过了多久」——人撤回重提了新版本，
       // 该说；同一版还卡着，不必再说。拿不到 id 时**刻意不节流**（见 store 注释）。
       const alreadyNotified = wasPendingReviewNotified(
-        config.session.dataDir, larkAppId, autoFixed.inReviewVersionId,
+        config.session.dataDir, larkAppId, inReviewVersionId,
       );
       if (reviewAdmin && !alreadyNotified) {
         const rangeHint = await inspectUnderReviewConfigHints(bot.config.larkAppId, brand);
@@ -786,7 +650,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
           + `1. 开放平台 →「版本管理与发布」→ 点进审核中那一版的**版本详情**，看审批详情里被卡的项\n`
           + `2. 修掉不合规项（如把权限的数据范围从「全部」改成「与应用的可用范围一致」）\n`
           + `3. 在版本详情页点 **Withdraw** 撤回该版本\n`
-          + `4. 执行 \`botmux restart\` —— botmux 会自动补齐权限并重新提交\n\n`
+          + `4. 执行 \`botmux restart\`，botmux 会发送权限确认链接\n\n`
           + `⚠️ 直接撤回重提**不管用**：不改配置的话同一条规则会再拦一次。\n`
           + `⚠️ 此时去权限管理页手动点开通也**无效**：审核期间飞书连「申请权限」都拒绝。`,
           `app under review, ${missingCritical.length} scopes deferred`,
@@ -794,11 +658,11 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
         // ⚠️ **发送成功才记账**。反了的话一次网络失败就把这个 versionId 永久节流掉，
         // 管理员再也收不到提醒，而且是零信号的静默丢失，比刷屏更难发现。
         if (delivered) {
-          markPendingReviewNotified(config.session.dataDir, larkAppId, autoFixed.inReviewVersionId);
+          markPendingReviewNotified(config.session.dataDir, larkAppId, inReviewVersionId);
         }
       } else if (alreadyNotified) {
         logger.info(
-          `[${larkAppId}] 待审版本 ${autoFixed.inReviewVersionId} 已通知过管理员，本次不重复打扰`,
+          `[${larkAppId}] 待审版本 ${inReviewVersionId} 已通知过管理员，本次不重复打扰`,
         );
       }
       return;
@@ -825,7 +689,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       `⚠️ botmux 启动检查发现机器人 "${bot.botName ?? larkAppId}" 缺少 ${missingCritical.length} 项必需权限\n\n` +
       `**操作步骤（点链接 → 申请开通 → 重启 daemon）**：\n\n` +
       `${criticalLines}\n\n` +
-      `开通完成后执行 \`botmux restart\`，botmux 会再次自检并把结果发到这里。${optionalBlock}`;
+      `开通完成后执行 \`botmux restart\`，botmux 会再次自检。${optionalBlock}`;
     await dmAdmin(larkAppId, adminOpenId, dm, `missing scopes: ${missingCritical.map(s => s.name).join(',')}`);
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);

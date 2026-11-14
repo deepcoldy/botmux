@@ -10,7 +10,6 @@ import {
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
-import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 // Profile scanning has its own component/browser tests. Keep these agent-save
@@ -1928,15 +1927,6 @@ describe('Codex-compatible runtime editor', () => {
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
-  });
-});
-
-describe('bot onboarding Agent availability warning', () => {
-  it('does not hard-disable submit from the PATH-only option-list probe', () => {
-    expect(isOnboardingSubmitDisabled(false, 'reuse')).toBe(false);
-    expect(isOnboardingSubmitDisabled(false, 'qr')).toBe(false);
-    expect(isOnboardingSubmitDisabled(true, 'reuse')).toBe(true);
-    expect(isOnboardingSubmitDisabled(false, 'checking')).toBe(true);
   });
 });
 

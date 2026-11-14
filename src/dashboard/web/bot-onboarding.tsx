@@ -1,3 +1,5 @@
+import QRCode from 'qrcode-terminal/vendor/QRCode/index.js';
+import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
@@ -37,6 +39,7 @@ type OnboardingPermission = {
   skippedScopeCount?: number;
   versionId?: string;
   scopeWarning?: string;
+  eventWarning?: string;
   /** 与 ok 独立：权限/发版全绿也可能没写上 redirect 白名单（见服务端同名字段注释）。 */
   redirectConfigured?: boolean;
   redirectWarning?: string;
@@ -55,7 +58,7 @@ type OnboardingJob = {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'sdk' | 'web' | 'compat';
   cliId?: string;
   workingDir?: string;
   addedBotIndex?: number;
@@ -88,20 +91,7 @@ type CliOptionsState = {
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
   suggestedAppName: string;
-  webSession:
-    | { status: 'checking' }
-    | { status: 'scan_required'; reason?: string }
-    | {
-        status: 'ready';
-        source: string;
-        identity: {
-          userId: string;
-          userName: string;
-          email?: string;
-          tenantId: string;
-          tenantName: string;
-        };
-      };
+
 };
 
 type OnboardingFormState = {
@@ -125,7 +115,6 @@ function defaultCliOptionsState(): CliOptionsState {
     ttadkModelDefault: DEFAULT_TTADK_MODEL,
     ttadkModelSuggestions: [],
     suggestedAppName: 'botmux-0',
-    webSession: { status: 'checking' },
   };
 }
 
@@ -137,13 +126,6 @@ function defaultFormState(): OnboardingFormState {
     workingDir: '~',
     model: '',
   };
-}
-
-export function isOnboardingSubmitDisabled(
-  submitting: boolean,
-  sessionMode: 'checking' | 'reuse' | 'qr',
-): boolean {
-  return submitting || sessionMode === 'checking';
 }
 
 function caughtErrorText(error: unknown): string {
@@ -163,6 +145,7 @@ function isSessionFailure(error?: string): boolean {
 
 function statusText(job: OnboardingJob): string {
   if (job.status === 'waiting_for_scan') {
+    if (job.registrationMode === 'sdk') return t('botOnboarding.waitingSdk', { name: job.appName ?? '' });
     return job.registrationMode === 'compat'
       ? t('botOnboarding.waitingCompat')
       : t('botOnboarding.waiting', { name: job.appName ?? '' });
@@ -178,7 +161,7 @@ function statusText(job: OnboardingJob): string {
   if (job.status === 'completed') return t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
   if (job.status === 'failed') {
     if (job.appId) return t('botOnboarding.partialFailureTitle');
-    if (job.error === 'qr_expired') return t('botOnboarding.qrExpiredTitle');
+    if ((job.error === 'qr_expired' || job.error === 'expired')) return t('botOnboarding.qrExpiredTitle');
     if (isSessionFailure(job.error)) return t('botOnboarding.authIncompleteTitle');
     return t('botOnboarding.createFailedTitle');
   }
@@ -187,12 +170,7 @@ function statusText(job: OnboardingJob): string {
 
 async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
-    // 裸端点保留「探测登录态」的旧语义，本弹窗正是要那个 webSession（决定
-    // sessionMode 走 reuse 还是 qr，并展示"将使用 …"的账号），所以不带任何
-    // probe 参数。反过来 Bot 配置页显式带 `?probe=none` 跳过探测。
-    // 为什么是 opt-out 而非 opt-in：见 dashboard.ts /api/cli-options 的注释
-    // （immutable chunk 长缓存 + stale-chunk 自愈只覆盖 import 失败）。
-    const res = await fetch('/api/cli-options');
+    const res = await fetch('/api/cli-options?probe=none');
     const body = await res.json();
     if (res.ok && Array.isArray(body?.options)) {
       const ttadkModelDefault = typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()
@@ -204,24 +182,6 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
       const suggestedAppName = typeof body.suggestedAppName === 'string' && body.suggestedAppName.trim()
         ? body.suggestedAppName.trim()
         : 'botmux-0';
-      const identity = body?.webSession?.identity;
-      const webSession: CliOptionsState['webSession'] = body?.webSession?.status === 'ready'
-        && typeof identity?.userId === 'string'
-        && typeof identity?.userName === 'string'
-        && typeof identity?.tenantId === 'string'
-        && typeof identity?.tenantName === 'string'
-        ? {
-            status: 'ready',
-            source: typeof body.webSession.source === 'string' ? body.webSession.source : 'botmux_cache',
-            identity: {
-              userId: identity.userId,
-              userName: identity.userName,
-              ...(typeof identity.email === 'string' ? { email: identity.email } : {}),
-              tenantId: identity.tenantId,
-              tenantName: identity.tenantName,
-            },
-          }
-        : { status: 'scan_required', ...(typeof body?.webSession?.reason === 'string' ? { reason: body.webSession.reason } : {}) };
       return {
         options: (body.options as any[]).map((o: any) => ({
           ...o,
@@ -233,11 +193,10 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
         ttadkModelDefault,
         ttadkModelSuggestions,
         suggestedAppName,
-        webSession,
       };
     }
   } catch { /* fall through to default */ }
-  return { ...defaultCliOptionsState(), webSession: { status: 'scan_required' } };
+  return defaultCliOptionsState();
 }
 
 function syncModelForCli(
@@ -352,7 +311,9 @@ function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | n
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
   const permission = job.permission;
   if (permission.ok) {
-    const parts = [t('botOnboarding.permissionOk', { count: permission.scopeCount ?? 0 })];
+    const permissionLabel = job.registrationMode === 'sdk'
+      ? 'botOnboarding.permissionReadback' : 'botOnboarding.permissionOk';
+    const parts = [t(permissionLabel, { count: permission.scopeCount ?? 0 })];
     if (permission.skippedScopeCount && permission.skippedScopeCount > 0) {
       parts.push(t('botOnboarding.permissionSkipped', { count: permission.skippedScopeCount }));
     }
@@ -361,6 +322,7 @@ function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | n
       <>
         <p className="hint-ok">{parts.join(' ')}</p>
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
+        {permission.eventWarning ? <p className="hint-warn">{permission.eventWarning}</p> : null}
         <RedirectWarning permission={permission} />
       </>
     );
@@ -399,15 +361,44 @@ function OnboardingMeta(props: { job: OnboardingJob }): React.JSX.Element | null
   );
 }
 
-function QrCard(props: { dataUrl: string; alt: string; link?: string }): React.JSX.Element {
+function RegistrationQr({ link }: { link: string }): React.JSX.Element | null {
+  const qr = useMemo(() => {
+    try {
+      const code = new QRCode(-1, QRErrorCorrectLevel.L);
+      code.addData(link);
+      code.make();
+      const path = code.modules.flatMap((row, y) => row.map((on, x) => on ? `M${x + 4} ${y + 4}h1v1h-1z` : '')).join('');
+      return { size: code.getModuleCount() + 8, path };
+    } catch {
+      return undefined;
+    }
+  }, [link]);
+  if (!qr) return null;
+  return (
+    <svg className="onboarding-registration-qr" viewBox={`0 0 ${qr.size} ${qr.size}`}
+      shapeRendering="crispEdges" role="img" aria-label={t('botOnboarding.qrAlt')}>
+      <rect width={qr.size} height={qr.size} fill="white" />
+      <path d={qr.path} fill="black" />
+    </svg>
+  );
+}
+
+function QrCard(props: { dataUrl?: string; alt: string; link?: string }): React.JSX.Element {
+  const [showQr, setShowQr] = useState(false);
+  if (!props.link) {
+    return <div className="qr-card"><img className="qr-image" src={props.dataUrl} alt={props.alt} /></div>;
+  }
   return (
     <div className="qr-card">
-      <img className="qr-image" src={props.dataUrl} alt={props.alt} />
-      {props.link ? (
-        <a className="onboarding-link" href={props.link} target="_blank" rel="noopener">
-          {t('botOnboarding.openLink')}
-        </a>
-      ) : null}
+      <a className="btn-link primary onboarding-link" href={props.link} target="_blank" rel="noopener noreferrer">
+        {t('botOnboarding.openLink')}
+      </a>
+      <details className="onboarding-qr-option" onToggle={event => setShowQr(event.currentTarget.open)}>
+        <summary>{t('botOnboarding.showQr')}</summary>
+        {showQr && (props.dataUrl
+          ? <img className="qr-image" src={props.dataUrl} alt={props.alt} />
+          : <RegistrationQr link={props.link} />)}
+      </details>
     </div>
   );
 }
@@ -426,14 +417,14 @@ function OnboardingJobView(props: {
   onOwnerInputChange(value: string): void;
   onOwnerIdInputChange(value: string): void;
   onSubmitOwner(job: OnboardingJob, owner: string, ownerId: string): void;
-  onRetry(mode: 'web' | 'compat'): void;
+  onRetry(mode: 'sdk' | 'compat'): void;
   onClose(): void;
 }): React.JSX.Element {
   const { job, ownerError } = props.view;
   return (
     <>
       <p className={`onboarding-status status-${job.status}`}>{statusText(job)}</p>
-      {job.status === 'waiting_for_scan' && job.qrDataUrl ? (
+      {job.status === 'waiting_for_scan' && (job.qrUrl || job.qrDataUrl) ? (
         <QrCard dataUrl={job.qrDataUrl} alt={t('botOnboarding.qrAlt')} link={job.qrUrl} />
       ) : null}
       {job.status === 'waiting_for_platform_scan' && job.platformQrDataUrl ? (
@@ -487,9 +478,11 @@ function OnboardingJobView(props: {
       {job.status === 'failed' ? (
         <>
           <p className="hint-warn">
-            {job.appId
-              ? t('botOnboarding.partialFailureDescription')
-              : job.error === 'qr_expired'
+            {job.error === 'unconfirmed'
+              ? job.message
+              : job.appId
+                ? t('botOnboarding.partialFailureDescription')
+              : (job.error === 'qr_expired' || job.error === 'expired')
                 ? t('botOnboarding.qrExpiredDescription')
                 : isSessionFailure(job.error)
                   ? t('botOnboarding.authIncompleteDescription')
@@ -501,11 +494,11 @@ function OnboardingJobView(props: {
           </details>
           <div className="actions onboarding-actions">
             <button type="button" onClick={props.onClose}>{t('botOnboarding.close')}</button>
-            {!job.appId ? (
+            {!job.appId && job.error !== 'unconfirmed' ? (
               <>
                 <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
-                <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
-                  {job.error === 'qr_expired'
+                <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('sdk')}>
+                  {(job.error === 'qr_expired' || job.error === 'expired')
                     ? t('botOnboarding.generateQr')
                     : isSessionFailure(job.error)
                       ? t('botOnboarding.scanAgain')
@@ -526,11 +519,9 @@ function OnboardingJobView(props: {
 function OnboardingForm(props: {
   cliState: CliOptionsState;
   form: OnboardingFormState;
-  sessionMode: 'checking' | 'reuse' | 'qr';
   error?: string;
   submitting: boolean;
   onFormChange(form: OnboardingFormState): void;
-  onSessionModeChange(mode: 'reuse' | 'qr'): void;
   onSubmit(event: FormEvent<HTMLFormElement>): void;
   onClose(): void;
 }): React.JSX.Element {
@@ -576,43 +567,6 @@ function OnboardingForm(props: {
 
   return (
     <form id="onboarding-form" className="onboarding-form" onSubmit={props.onSubmit}>
-      <div className="onboarding-session" aria-live="polite">
-        {props.sessionMode === 'checking' ? (
-          <p>{t('botOnboarding.sessionChecking')}</p>
-        ) : props.cliState.webSession.status === 'ready' ? (
-          props.sessionMode === 'reuse' ? (
-            <>
-              <div>
-                <strong>{t('botOnboarding.sessionReady', {
-                  user: props.cliState.webSession.identity.userName,
-                  tenant: props.cliState.webSession.identity.tenantName,
-                })}</strong>
-                {props.cliState.webSession.identity.email
-                  ? <small>{props.cliState.webSession.identity.email}</small>
-                  : null}
-              </div>
-              <button type="button" className="onboarding-session-action" onClick={() => props.onSessionModeChange('qr')}>
-                {t('botOnboarding.switchAccount')}
-              </button>
-            </>
-          ) : (
-            <>
-              <div>
-                <strong>{t('botOnboarding.sessionSwitching')}</strong>
-                <small>{t('botOnboarding.sessionSwitchingHint')}</small>
-              </div>
-              <button type="button" className="onboarding-session-action" onClick={() => props.onSessionModeChange('reuse')}>
-                {t('botOnboarding.reuseCurrentAccount')}
-              </button>
-            </>
-          )
-        ) : (
-          <div>
-            <strong>{t('botOnboarding.sessionScanRequired')}</strong>
-            <small>{t('botOnboarding.sessionScanRequiredHint')}</small>
-          </div>
-        )}
-      </div>
       <label className="onboarding-field">
         <span>{t('botOnboarding.appNameLabel')}</span>
         <input
@@ -704,13 +658,11 @@ function OnboardingForm(props: {
           // form never blocks the dashboard event loop on shell rc files. It is
           // a useful warning, not an authoritative gate: submit runs the full
           // shell-aware server check and returns cli_not_found when necessary.
-          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode)}
+          disabled={props.submitting}
         >
           {props.submitting
             ? t('botOnboarding.starting')
-            : props.sessionMode === 'reuse'
-              ? t('botOnboarding.confirmReuse')
-              : t('botOnboarding.startScan')}
+            : t('botOnboarding.startScan')}
         </button>
       </div>
     </form>
@@ -723,7 +675,6 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const loadSeqRef = useRef(0);
   const [cliState, setCliState] = useState<CliOptionsState>(() => defaultCliOptionsState());
   const [form, setForm] = useState<OnboardingFormState>(() => defaultFormState());
-  const [sessionMode, setSessionMode] = useState<'checking' | 'reuse' | 'qr'>('checking');
   const [view, setView] = useState<ViewState>({ kind: 'form' });
   const [submitting, setSubmitting] = useState(false);
   const [ownerInput, setOwnerInput] = useState('');
@@ -779,7 +730,6 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     // 克隆模式下用源 Bot 的值开局，让表单显示真正会生效的配置（后端克隆会用
     // 源 Bot 覆盖这几项）；普通新建仍是原来的默认值。
     setForm(applyCloneDefaults(defaultFormState(), cloneSourceDefaults));
-    setSessionMode('checking');
     setView({ kind: 'form' });
     setSubmitting(false);
     setOwnerInput('');
@@ -788,7 +738,6 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       if (loadSeqRef.current !== seq) return;
       setCliState(next);
       setForm(current => normalizeFormForOptions(current, next));
-      setSessionMode(next.webSession.status === 'ready' ? 'reuse' : 'qr');
     });
   }, [stopPolling]);
 
@@ -814,29 +763,18 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
   const startOnboarding = useCallback(async (
-    registrationMode: 'web' | 'compat',
-    sessionModeOverride?: 'reuse' | 'qr',
+    registrationMode: 'sdk' | 'compat',
   ) => {
     stopPolling();
     setSubmitting(true);
     setView({ kind: 'job', job: { id: '', status: 'starting' } });
     try {
-      const effectiveSessionMode = sessionModeOverride ?? (sessionMode === 'reuse' ? 'reuse' : 'qr');
-      const expectedIdentity = registrationMode === 'web'
-        && effectiveSessionMode === 'reuse'
-        && cliState.webSession.status === 'ready'
-        ? {
-            userId: cliState.webSession.identity.userId,
-            tenantId: cliState.webSession.identity.tenantId,
-          }
-        : undefined;
       const res = await fetch('/api/bot-onboarding/start', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          appName: registrationMode === 'web' ? form.appName.trim() || undefined : undefined,
+          appName: registrationMode === 'sdk' ? form.appName.trim() || undefined : undefined,
           registrationMode,
-          ...(registrationMode === 'web' ? { sessionMode: effectiveSessionMode, expectedIdentity } : {}),
           cliId: form.cliId,
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
@@ -858,24 +796,20 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     } finally {
       setSubmitting(false);
     }
-  }, [applyJob, cliState.webSession, form, sessionMode, startPolling, stopPolling]);
+  }, [applyJob, form, startPolling, stopPolling]);
 
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void startOnboarding('web');
+    void startOnboarding('sdk');
   }, [startOnboarding]);
 
-  const retry = useCallback(async (registrationMode: 'web' | 'compat') => {
+  const retry = useCallback(async (registrationMode: 'sdk' | 'compat') => {
     if (registrationMode === 'compat') {
       const accepted = await confirm({ title: '兼容性确认', message: t('botOnboarding.compatibilityConfirm'), danger: false });
       if (!accepted) return;
     }
-    const requiresFreshLogin = registrationMode === 'web'
-      && view.kind === 'job'
-      && isSessionFailure(view.job.error);
-    if (requiresFreshLogin) setSessionMode('qr');
-    void startOnboarding(registrationMode, requiresFreshLogin ? 'qr' : undefined);
-  }, [startOnboarding, view]);
+    void startOnboarding(registrationMode);
+  }, [startOnboarding]);
 
   const submitOwner = useCallback(async (job: OnboardingJob, ownerRaw: string, ownerIdRaw: string) => {
     const owner = [ownerRaw.trim(), ownerIdRaw.trim()].filter(Boolean).join(',');
@@ -910,11 +844,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         <OnboardingForm
           cliState={cliState}
           form={form}
-          sessionMode={sessionMode}
           error={view.error}
           submitting={submitting}
           onFormChange={setForm}
-          onSessionModeChange={setSessionMode}
           onSubmit={submitForm}
           onClose={close}
         />
@@ -932,7 +864,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         onClose={close}
       />
     );
-  }, [cliState, close, form, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, view]);
+  }, [cliState, close, form, ownerIdInput, ownerInput, props.open, retry, submitForm, submitOwner, submitting, view]);
 
   const canClose = view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed'));
 

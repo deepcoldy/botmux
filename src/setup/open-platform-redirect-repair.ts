@@ -1,12 +1,9 @@
 /**
  * 批量修复存量 bot 的开放平台 redirect 白名单 —— 「升级后仍然 20029」的补救入口。
  *
- * 背景：redirect 白名单只在建 bot / 权限自愈跑 {@link automateOpenPlatformSetup}
- * 时才写。对**已经导全 scope 的存量 bot**，今天没有任何路径会去补白名单
- * （daemon 启动时的 `tryAutoFixScopes` 只在缺 critical scope 时才触发，而
- * `im:feed_group_v1:*` 不在 `BOTMUX_REQUIRED_SCOPES` 里），于是升级到支持群聊模式
- * 的版本后，authorize 依旧报 20029：白名单里没有那条回调地址，用户连飞书授权页
- * 都进不去。本模块把「一次扫码 → 全部存量 bot 补齐」做成一个显式动作。
+ * 建 bot 和开放平台补配会尝试写入 redirect 白名单。存量 bot 的启动权限自愈
+ * 通过确认链接申请缺失的 scope，白名单需单独维护。升级后若新增的 OAuth 回调
+ * 地址还不在白名单，飞书授权会报 20029。本模块提供显式的批量白名单修复入口。
  *
  * 链路（模板 = `probeVcMeetingEventSubscription`）：
  *   1. `prepareFeishuWebSession({disableQrLogin:true})` —— 只复用缓存，**绝不**在
