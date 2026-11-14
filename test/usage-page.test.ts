@@ -12,6 +12,8 @@ import type { UsageReport } from '../src/dashboard/usage-types.js';
 const body = (totalTokens = 100): UsageReport => ({ query: { from: '2026-11-01T00:00:00Z', to: '2026-11-14T00:00:00Z', timeZone: 'Asia/Shanghai' },
   generatedAt: '2026-11-13T12:00:00Z', summary: { ...emptyUsageTotals(), totalTokens, records: 1 }, metrics: { ...emptyUsageMetrics('2026-11-13T12:00:00Z'), averageTpm: totalTokens / 2 }, trend: [], bots: [], models: [], sessions: [], sessionCount: 0,
   options: { bots: ['bot-a'], models: ['model-a'] }, coverage: { ledgerMissing: false, filesRead: 1, invalidRecords: 0, duplicateRecords: 0, futureRecords: 0, firstRecordAt: null, lastRecordAt: null } });
+// 直接 createElement(UsagePage, { initialData }) 在 tsc 下报 TS2769（本文件不在 typecheck 范围，运行时不受影响）；显式标注 props 类型。
+const page = (initialData: UsageReport) => React.createElement(UsagePage as React.FC<{ initialData?: UsageReport }>, { initialData });
 const response = (report: unknown, ok = true) => ({ ok, status: ok ? 200 : 503, json: async () => report, text: async () => 'error' }) as Response;
 let renderer: TestRenderer.ReactTestRenderer | undefined;
 const requests: { url: URL; signal?: AbortSignal | null }[] = [];
@@ -58,7 +60,7 @@ describe('token usage page', () => {
     expect(total()).toBe('—'); expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(1);
     await act(async () => renderer!.unmount());
     const missing = body(0); missing.coverage.ledgerMissing = true;
-    await act(async () => { renderer = TestRenderer.create(React.createElement(UsagePage, { initialData: missing })); });
+    await act(async () => { renderer = TestRenderer.create(page(missing)); });
     expect(total()).toBe('—');
     expect(renderer!.root.findByProps({ 'data-usage-metric': 'average-tpm' }).findByType('strong').children.join('')).toBe('—');
   });
@@ -66,10 +68,31 @@ describe('token usage page', () => {
   it('keeps small positive rates visible and does not cap output/input ratios at 100%', async () => {
     const report = body(); report.metrics.averageTpm = .0001;
     report.metrics.cacheReadShare = .9; report.metrics.outputInputRatio = 1.5;
-    await act(async () => { renderer = TestRenderer.create(React.createElement(UsagePage, { initialData: report })); });
+    await act(async () => { renderer = TestRenderer.create(page(report)); });
     const value = (id: string) => renderer!.root.findByProps({ 'data-usage-metric': id }).findByType('strong').children.join('');
     expect(value('average-tpm')).toBe('<0.01'); expect(value('cache-share')).toBe('90%'); expect(value('output-input')).toBe('150%');
     expect(usageMetricNumber(0)).toBe('0'); expect(usageMetricShare(null)).toBe('—'); expect(usageMetricShare(NaN)).toBe('—');
+  });
+
+  it('discloses excluded future records and renders unit cost, per-group rates and the peak minute in the queried zone', async () => {
+    const report = body(); report.query.timeZone = 'UTC'; report.coverage.futureRecords = 2;
+    Object.assign(report.metrics, { costPerMillionTokens: 4000, pricedTokenShare: .5, peakMinuteTpm: 150, peakMinuteAt: '2026-11-10T00:00:00.000Z' });
+    report.bots = [{ id: 'bot-a', ...emptyUsageTotals(), totalTokens: 100, records: 1, averageTpm: 75, cacheReadShare: .4 }];
+    await act(async () => { renderer = TestRenderer.create(page(report)); });
+    const text = (node: TestRenderer.ReactTestInstance): string => node.children.map(c => typeof c === 'string' ? c : text(c)).join('');
+    // 排除的未来记录必须有可见提示，不能静默从总量里消失。
+    const notices = renderer!.root.findAll(n => n.props.className === 'usage-notice');
+    expect(notices).toHaveLength(1); expect(text(notices[0]!)).toContain('2');
+    const costCard = renderer!.root.findByProps({ className: 'usage-metrics' }).findAllByType('article').at(-1)!;
+    const unitCost = text(costCard.findAllByType('small').at(-1)!);
+    expect(unitCost).toContain(new Intl.NumberFormat(undefined, { style: 'currency', currency: 'CNY' }).format(4000)); expect(unitCost).toContain('50%');
+    const botCells = renderer!.root.findAll(n => n.props.className === 'usage-table')[0]!.findByType('tbody').findAllByType('td').map(text);
+    expect(botCells.slice(4, 6)).toEqual(['75', '40%']);
+    // 峰值分钟按查询时区（UTC）显示，而不是浏览器时区（Asia/Shanghai）。
+    const peakAt = new Date('2026-11-10T00:00:00.000Z');
+    const peakHint = text(renderer!.root.findByProps({ 'data-usage-metric': 'peak-tpm' }).findByType('small'));
+    expect(peakHint).toBe(peakAt.toLocaleString(undefined, { timeZone: 'UTC', timeZoneName: 'shortOffset' }));
+    expect(peakHint).not.toBe(peakAt.toLocaleString(undefined, { timeZone: 'Asia/Shanghai', timeZoneName: 'shortOffset' }));
   });
 
   it('validates dates and supports calendar week/month presets', () => {

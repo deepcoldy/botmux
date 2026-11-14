@@ -146,6 +146,8 @@ describe('usage ledger analytics', () => {
       tokensPerRecordMean: 75, tokensPerRecordP50: 75, tokensPerRecordP95: 100, tokensPerSessionMean: 150 });
     expect(filtered.metrics.cacheReadShare).toBeCloseTo(.4);
     expect(filtered.metrics.costPerMillionTokens).toBeCloseTo(10000);
+    // 定价覆盖按 Token 加权：已定价 50 / 共 150 Token；按记录数会得到 1/2。
+    expect(filtered.metrics.pricedTokenShare).toBeCloseTo(1 / 3);
   });
 
   it('uses elapsed time today, includes the snapshot instant, and excludes future-dated records', async () => {
@@ -155,6 +157,8 @@ describe('usage ledger analytics', () => {
     expect(result.summary.records).toBe(2); expect(result.coverage.futureRecords).toBe(1);
     expect(result.metrics.elapsedMinutes).toBe(720); expect(result.metrics.averageTpm).toBeCloseTo(200 / 720);
     expect(result.metrics.activeMinuteAverageTpm).toBe(100); expect(result.metrics.rateWindowEnd).toBe('2026-11-10T12:00:00.000Z');
+    // 分组行与总览同口径：今天只按已过的 720 分钟摊，而不是整天 1440 分钟。
+    expect(result.bots[0]!.averageTpm).toBeCloseTo(200 / 720); expect(result.models[0]!.averageTpm).toBeCloseTo(200 / 720);
     const future = await queryUsageLedger({ from: '2026-11-11T00:00:00Z', to: '2026-11-12T00:00:00Z', timeZone: 'UTC' }, { ledgerDir: dir, now: new Date('2026-11-10T12:00:00Z') });
     expect(future.metrics.elapsedMinutes).toBe(0); expect(future.metrics.averageTpm).toBeNull();
   });
@@ -173,7 +177,7 @@ describe('usage ledger analytics', () => {
     expect(result.metrics.costPerMillionTokens).toBeNull(); expect(result.metrics.pricedTokenShare).toBe(0);
     ledger('2026-11-10', [record({ ts: '2026-11-10T00:00:00Z', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0, costCny: 0 })]);
     const zero = await queryUsageLedger(query, { ledgerDir: dir });
-    expect(zero.metrics.tokensPerRecordP50).toBe(0); expect(zero.metrics.activeMinutes).toBe(0);
+    expect(zero.metrics.tokensPerRecordP50).toBe(0); expect(zero.metrics.activeMinutes).toBe(0); expect(zero.metrics.activeMinuteAverageTpm).toBeNull();
     expect(zero.metrics.cacheReadShare).toBeNull(); expect(zero.metrics.outputInputRatio).toBeNull(); expect(zero.metrics.costPerMillionTokens).toBeNull();
     const missing = await queryUsageLedger(query, { ledgerDir: dir + '/missing' });
     expect(missing.metrics.averageTpm).toBeNull(); expect(missing.metrics.elapsedMinutes).toBeNull();
