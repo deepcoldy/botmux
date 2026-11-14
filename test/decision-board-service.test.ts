@@ -106,6 +106,30 @@ describe('close in chat', () => {
     expect(() => service.closeInChat(item.seq, item.rev, 'local')).toThrow();
     expect(delivered).toEqual([]);
   });
+  it('管家把带草稿的事项置为 done 后，迟到提交按 item_ended 拒绝且不建批次、不动草稿', async () => {
+    const item = await addDecideItem();
+    const draft = service.putDraft(item.seq, 'owner', { choice: 'A', text: '还没提交的草稿', baseRev: item.rev }).draft!;
+    // 既有管家路径：updateItem 改状态不清草稿，所以终态事项可能仍带着草稿（旧页面/迟到批量提交会撞上）。
+    service.store().updateItem(APP, item.seq, { state: 'done' }, 'steward-1');
+    expect(service.detail(item.seq, 'owner').draft).toBeDefined();
+    await expect(service.submit({ author: 'owner', nonce: 'late-after-done',
+      items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
+      .rejects.toMatchObject({ code: 'item_ended' });
+    expect(service.store().listBatches(APP)).toEqual([]);
+    expect(delivered).toEqual([]);
+    // 事务回滚：草稿原样留着，没有被失败的提交消费掉。
+    expect(service.detail(item.seq, 'owner').draft?.updatedAt).toBe(draft.updatedAt);
+  });
+  it('待验收（accept）事项也允许 owner 关闭，落 closed 并清草稿', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev });
+    service.store().updateItem(APP, item.seq, { state: 'accept' }, 'steward-1');
+    const acceptRev = service.detail(item.seq, 'owner').item.rev;
+    const res = service.closeInChat(item.seq, acceptRev, 'local');
+    expect(res).toMatchObject({ duplicate: false, item: { state: 'closed', rev: acceptRev + 1 } });
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.store().listBatches(APP)).toEqual([]);
+  });
 });
 
 describe('管家开关', () => {
