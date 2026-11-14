@@ -23,6 +23,7 @@ import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
 import { CARD_CLICK_TURN_ACTION } from '../src/services/card-click-turn.js';
 import type { TurnReplyCardRecord } from '../src/services/turn-reply-card.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 
 const GOLDEN_PATH = resolve('test/fixtures/next-step-card-golden.json');
 const UPDATE = process.env.UPDATE_CARD_GOLDEN === '1';
@@ -47,13 +48,14 @@ describe('next-step row wire format', () => {
     } }]);
   });
 
-  it('shortens a long label but keeps the full text in the signed token', () => {
+  it('shortens a long label, keeps the full text in the token and shows it on hover', () => {
     const long = 'x'.repeat(NEXT_STEP_LABEL_MAX_CHARS + 20);
-    const element = buildNextStepElement({ ...NEXT, text: long }) as any;
-    const label: string = element.columns[1].elements[0].text.content;
+    const button = (buildNextStepElement({ ...NEXT, text: long }, 'zh') as any).columns[1].elements[0];
+    const label: string = button.text.content;
     expect([...label]).toHaveLength(NEXT_STEP_LABEL_MAX_CHARS);
     expect(label.endsWith('…')).toBe(true);
-    expect(element.columns[1].elements[0].behaviors[0].value.payload).toBe(NEXT.payload);
+    expect(button.behaviors[0].value.payload).toBe(NEXT.payload);
+    expect(button.hover_tips.content).toContain(long);
   });
 });
 
@@ -128,6 +130,31 @@ describe('unified reply card', () => {
     const row = ids.indexOf(NEXT_STEP_ELEMENT_ID);
     expect(row).toBeGreaterThan(ids.indexOf('botmux_turn_process'));
     expect(ids.slice(row + 1).some((id: string) => id === 'botmux_reply_footer' || id === 'botmux_reply_actions')).toBe(true);
+  });
+
+  it('leaves the row out rather than overflow a card near the size limit', () => {
+    const record = (chars: number, nextStep = NEXT) => unifiedRecord({
+      nextStep,
+      finalCard: JSON.stringify(createReplyCard([
+        { tag: 'markdown', content: '答'.repeat(chars) },
+        ...buildReplyCardFooterElements({ presentation: { footerPreferences: { enabled: true } } } as any),
+      ])),
+    });
+    const size = (card: string) => turnReplyCardRequestBytes(card, 'oc_chat');
+    const withoutRow = (chars: number) => size(buildTurnReplyCard({ ...record(chars), nextStep: undefined }, presentation));
+    expect(buildTurnReplyCard(record(2_000), presentation)).toContain(NEXT_STEP_ELEMENT_ID);
+    // Largest answer that still fits without the row, measured rather than guessed.
+    let low = 0;
+    let high = 20_000;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (withoutRow(mid) <= TURN_REPLY_CARD_MAX_BYTES) low = mid; else high = mid - 1;
+    }
+    const tight = buildTurnReplyCard(record(low), presentation);
+    expect(tight).not.toContain(NEXT_STEP_ELEMENT_ID);
+    expect(size(tight)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+    // ...and the answer is still the card's own body, not an attachment notice.
+    expect(tight).toContain('答'.repeat(50));
   });
 
   it('renders nothing extra without a suggestion or before the turn completed', () => {

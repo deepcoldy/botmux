@@ -186,11 +186,18 @@ describe('next-step button click', () => {
     expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
   });
 
-  it('reports a delivery failure in the thread', async () => {
+  it('reports a delivery failure in the thread and keeps the button usable', async () => {
     mocks.sendWorkerInput.mockReturnValue(false);
     const { deps, sessionReply } = setup();
-    await click(nextStepClick('可以合了'), deps);
+    const data = nextStepClick('可以合了');
+    await click(data, deps);
     expect(sessionReply).toHaveBeenCalledWith(ROOT, '没能把这一轮送进会话', 'text', APP);
+    // Nothing reached the session, so the same button works once the session can take it.
+    mocks.sendWorkerInput.mockReturnValue(true);
+    const retry = await click(data, deps);
+    expect(retry.toast.type).toBe('info');
+    expect(sessionReply).toHaveBeenLastCalledWith(ROOT, '收到并开始执行：可以合了', 'text', APP);
+    expect(await click(data, deps)).toMatchObject({ toast: { type: 'error', content: '这个按钮已经用过了' } });
   });
 
   it('never turns an <at> in the echoed text into a mention', async () => {

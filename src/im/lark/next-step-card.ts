@@ -24,13 +24,20 @@ export interface NextStepButton {
   sig: string;
 }
 
-function label(text: string): string {
+function label(text: string): { label: string; shortened: boolean } {
   const chars = [...text];
-  return chars.length <= NEXT_STEP_LABEL_MAX_CHARS ? text : `${chars.slice(0, NEXT_STEP_LABEL_MAX_CHARS - 1).join('')}…`;
+  return chars.length <= NEXT_STEP_LABEL_MAX_CHARS
+    ? { label: text, shortened: false }
+    : { label: `${chars.slice(0, NEXT_STEP_LABEL_MAX_CHARS - 1).join('')}…`, shortened: true };
 }
 
 export function buildNextStepElement(next: NextStepButton, locale?: 'zh' | 'en'): Record<string, unknown> {
   const en = locale === 'en';
+  const shown = label(next.text);
+  // A shortened label hides part of what a click sends: the tip shows it all.
+  const tip = shown.shortened
+    ? `${en ? 'Sends: ' : '将发送：'}${next.text}`
+    : (en ? 'Send this as your next message' : '以你的身份发送这条输入');
   return {
     tag: 'column_set',
     element_id: NEXT_STEP_ELEMENT_ID,
@@ -46,8 +53,8 @@ export function buildNextStepElement(next: NextStepButton, locale?: 'zh' | 'en')
         tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
         elements: [{
           tag: 'button', type: 'default', size: 'small',
-          text: { tag: 'plain_text', content: label(next.text) },
-          hover_tips: { tag: 'plain_text', content: en ? 'Send this as your next message' : '以你的身份发送这条输入' },
+          text: { tag: 'plain_text', content: shown.label },
+          hover_tips: { tag: 'plain_text', content: tip },
           behaviors: [{ type: 'callback', value: {
             action: CARD_CLICK_TURN_ACTION, payload: next.payload, sig: next.sig, notice: NEXT_STEP_CLICK_NOTICE,
           } }],

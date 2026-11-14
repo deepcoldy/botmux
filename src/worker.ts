@@ -23759,7 +23759,7 @@ function startScreenUpdates(): void {
           const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
           if (pipeText) {
             content = pipeText.content;
-            if (suggestionReader && pipeText.cells) promptSuggestions.observe(suggestionReader(pipeText.cells));
+            if (suggestionReader && pipeText.cells) promptSuggestions.observe(suggestionReader(pipeText.cells), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
             // Geometry is part of the frame: the same ANSI re-wrapped on a
             // resized pane renders different text.
             const hash = `${pipeText.cols}x${pipeText.rows}:${pipeText.ansi}`;
@@ -23775,7 +23775,7 @@ function startScreenUpdates(): void {
             const snap = renderer.snapshot();
             content = snap.content;
             changed = snap.changed;
-            if (suggestionReader) promptSuggestions.observe(suggestionReader(renderer.viewportCells()));
+            if (suggestionReader) promptSuggestions.observe(suggestionReader(renderer.viewportCells()), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
           } else {
             return null;
           }

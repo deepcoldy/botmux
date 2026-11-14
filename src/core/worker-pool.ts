@@ -23049,9 +23049,14 @@ function setupWorkerHandlers(
           void settleTurnReplyCardTerminal(ds, msg, replyCardSend, ownsLifecycleMutation)
             .then(() => {
               if (msg.status !== 'completed') return;
+              // The row outlives this worker: its removal runs when the next
+              // turn starts, possibly on a replacement worker (suspend,
+              // restart, crash). Ownership is the session, not this process.
+              const session = ds.session;
+              const ownsCard = () => ds.session === session && session.status !== 'closed';
               noteNextStepCard(ds, msg.turnId, { kind: 'unified', publish: async next => {
                 await updateTurnReplyCard(ds, msg.turnId, { kind: 'next_step', ...(next ? { nextStep: next } : {}) },
-                  replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
+                  replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
               } }, nextStepIo);
             })
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));

@@ -179,7 +179,10 @@ export async function acceptCardClickTurn(
         ...(unionId ? { memberUnionId: unionId } : {}),
         prompt,
       });
-      if (!started.ok && started.reason !== 'delivery_failed') {
+      if (!started.ok) {
+        // startTurn reports failure only after rolling back: nothing reached
+        // the session, so the same button may be clicked again.
+        try { deps.nonces.release?.(claims.nonce); } catch { /* the button stays used */ }
         return { ok: false, reason: 'delivery_failed' };
       }
       return started;

@@ -113,7 +113,8 @@ import { beginFinalOutputDelivery, waitForFinalOutputDeliveryDrain } from '../sr
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
 import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement, insertCardElements } from '../src/im/lark/client.js';
-import { nextStepIdle } from '../src/core/next-step-suggestion.js';
+import { nextStepIdle, noteNextStepTurnStarted } from '../src/core/next-step-suggestion.js';
+import { nextStepIo } from '../src/core/next-step-io.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
@@ -820,6 +821,34 @@ describe('independent turn terminal receipt', () => {
     ), { timeout: 5_000, interval: 20 });
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+  });
+
+  it('clears a unified card\'s next-step row after the worker was replaced', async () => {
+    Object.assign(botConfig, { cliId: 'codex', replyCardMode: 'unified', replyCardNextStep: true });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    bindLarkTurn(ds, 'om_turn_unified_next');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    await deliver(ds, terminalMsg('om_turn_unified_next'));
+    await settle(ds);
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1), { timeout: 5_000, interval: 20 });
+    await deliver(ds, { type: 'prompt_suggestion', text: '跑一下 bun test', turnId: 'om_turn_unified_next' });
+    await vi.waitFor(async () => {
+      await nextStepIdle(ds);
+      expect(vi.mocked(updateMessage).mock.calls.some(call => String(call[2]).includes('botmux_next_step'))).toBe(true);
+    }, { timeout: 5_000, interval: 20 });
+    // The worker that settled this turn is gone (suspend / restart / crash)
+    // before the next turn starts; the row must still come off.
+    const replacement = new EventEmitter() as any;
+    replacement.killed = false;
+    replacement.send = vi.fn();
+    ds.worker = replacement;
+    vi.mocked(updateMessage).mockClear();
+    noteNextStepTurnStarted(ds, 'om_turn_after_restart', nextStepIo);
+    await nextStepIdle(ds);
+    const patches = vi.mocked(updateMessage).mock.calls.map(call => String(call[2]));
+    expect(patches.length).toBeGreaterThan(0);
+    expect(patches.at(-1)).not.toContain('botmux_next_step');
   });
 
   it('excludes silent schedules, VC receivers, and turns without a frozen Lark context', async () => {

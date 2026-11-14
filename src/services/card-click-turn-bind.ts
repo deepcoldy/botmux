@@ -297,7 +297,10 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
   const runtimeDeps = (larkAppId: string): CardClickTurnRuntimeDeps => ({
     now: () => Date.now(),
     secret: () => secret(larkAppId),
-    nonces: { consume: (nonce, exp, now) => nonceStore(larkAppId).consume(nonce, exp, now) },
+    nonces: {
+      consume: (nonce, exp, now) => nonceStore(larkAppId).consume(nonce, exp, now),
+      release: nonce => nonceStore(larkAppId).release(nonce),
+    },
     isBotOrApp: (appId, openId, unionId) => cardClickOperatorIsBotOrApp(deps.dataDir(), appId, openId, unionId),
     evaluateTalk: (appId, chatId, openId, chatType, unionId) =>
       evaluateTalk(appId, chatId, openId, undefined, unionId, chatType),

@@ -345,6 +345,39 @@ describe('one reply card per turn', () => {
     expect(cards.size).toBe(1);
   });
 
+  it('sets and clears the next-step row after completion, never by overflowing the answer', async () => {
+    const next = { text: 'CI 绿了就合', payload: 'p', sig: 's' };
+    await store.update(key, { kind: 'start' }, io);
+    io.sendOverflow = vi.fn(async () => 'om_file');
+    // An answer that fits on its own, but not together with the row.
+    const fits = (text: string) => (['working', 'completed'] as const).every(phase => turnReplyCardRequestBytes(
+      buildTurnReplyCard({ ...store.read(key)!, phase, finalCard: finalEvent(text).card, finalText: text }, presentation),
+      input.chatId) <= TURN_REPLY_CARD_MAX_BYTES);
+    let answer = '';
+    for (const chunk of [4096, 1024, 256, 64, 16, 4, 1]) {
+      while (fits(answer + '答'.repeat(chunk))) answer += '答'.repeat(chunk);
+    }
+    await store.update(key, finalEvent(answer), io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.sendOverflow).not.toHaveBeenCalled();
+    await store.update(key, { kind: 'next_step', nextStep: next }, io);
+    expect(store.read(key)).toMatchObject({ nextStep: next, finalDelivered: true });
+    expect(store.read(key)?.overflowMessageId).toBeUndefined();
+    expect(io.sendOverflow).not.toHaveBeenCalled();
+    expect(store.read(key)!.lastCard).not.toContain('botmux_next_step');
+    // A shorter answer has room: the row shows, and clearing takes it off again.
+    const roomyKey = { ...key, turnId: 'om_roomy' };
+    await store.prepare(roomyKey, input);
+    await store.update(roomyKey, { kind: 'start' }, io);
+    await store.update(roomyKey, finalEvent('短答复'), io);
+    await store.update(roomyKey, { kind: 'terminal', phase: 'completed' }, io);
+    await store.update(roomyKey, { kind: 'next_step', nextStep: next }, io);
+    expect(store.read(roomyKey)!.lastCard).toContain('botmux_next_step');
+    await store.update(roomyKey, { kind: 'next_step' }, io);
+    expect(store.read(roomyKey)?.nextStep).toBeUndefined();
+    expect(store.read(roomyKey)!.lastCard).not.toContain('botmux_next_step');
+  });
+
   it('recovers an undelivered final and its existing overflow attachment without uploading again', async () => {
     await store.update(key, { kind: 'start' }, io);
     io.sendOverflow = vi.fn(async () => 'om_file');
