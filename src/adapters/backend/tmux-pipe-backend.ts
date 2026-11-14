@@ -505,9 +505,15 @@ const SESSION_IDENTITY_FORMAT = '#{pid} #{session_id} #{session_created}';
 
 const RETIRE_KILLED = 'botmux-retired-own-session';
 const RETIRE_KEPT = 'botmux-kept-session';
+const DEAD_PANE_MARKER = 'botmux-pane-dead-before-pipe';
+
+function deadPaneSubscriptionError(): Error {
+  return Object.assign(new Error('pane is dead'), { status: 1, stderr: 'pane is dead' });
+}
 
 function parseSessionIdentity(raw: string): string | null {
-  const identity = raw.trim();
+  // A queued legacy pipe-pane guard may print a second, death-marker line.
+  const identity = raw.trim().split('\n')[0]!;
   return /^\d+ \$\d+ \d+$/.test(identity) ? identity : null;
 }
 
@@ -686,8 +692,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   // ─── SessionBackend implementation ────────────────────────────────────────
 
-  /** spawn() sets up the pipe-pane subscription + fifo reader. In managed
-   *  mode it first creates a detached bmx-* tmux session that runs the CLI. */
+  /** Prepare the reader before a managed CLI can emit its startup bytes. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
     if (this.ownsSession && !this.createSession && instanceIdentity) {
@@ -704,9 +709,7 @@ export class TmuxPipeBackend implements SessionBackend {
     this.cols = opts.cols;
     this.rows = opts.rows;
 
-    if (this.createSession) {
-      this.createDetachedSession(bin, args, opts);
-    } else if (this.ownsSession && this._isReattach) {
+    if (!this.createSession && this.ownsSession && this._isReattach) {
       // Backfill tmux options on an existing bmx-* session — daemon may have
       // been upgraded since the session was originally created, and options
       // like set-clipboard / window-size largest are idempotent to re-apply.
@@ -730,7 +733,7 @@ export class TmuxPipeBackend implements SessionBackend {
         this.fireExit(corpseDeath.status ?? 1, null);
         return;
       }
-    } else {
+    } else if (!this.createSession) {
       // ADOPT path (worker attaching to a CLI it did not launch, keyed by its
       // pid): neither createDetachedSession() nor applySessionOptions() runs
       // here, so the once-per-session remain-on-exit decision never happens.
@@ -766,7 +769,13 @@ export class TmuxPipeBackend implements SessionBackend {
     // stream dies before tmux ever gets a chance to write a byte. (This
     // exact bug ate the bridge final_output pipeline on first ship: an
     // strace showed worker only read its IPC fd, never the fifo.)
-    const fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR);
+    let fd: number;
+    try {
+      fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR);
+    } catch (err) {
+      try { fs.unlinkSync(this.fifoPath); } catch { /* best effort */ }
+      throw err;
+    }
     this.fifoFd = fd;
     // Acquire the wake-up write end NOW, while the pathname exists and the fd
     // table has room. Teardown must never need to allocate anything.
@@ -837,28 +846,64 @@ export class TmuxPipeBackend implements SessionBackend {
     // The copier must forward short writes at once, or a quiet CLI's ready /
     // final bytes never reach the worker and its next input queues forever.
     const pipeShellCommand = pipePaneShellCommand(this.fifoPath);
+    let queuedPipeError: { error: unknown } | undefined;
+    if (this.createSession) {
+      try {
+        queuedPipeError = this.createDetachedSession(bin, args, opts, pipeShellCommand);
+      } catch (err) {
+        this.teardownFifoReader();
+        throw err;
+      }
+      if (this.pipeAttached) {
+        // Subscribing earlier must not turn an already-dead CLI into a
+        // successful startup. Options/identity checks may have let it exit.
+        if (this.readPaneDeath().kind === 'dead') {
+          queuedPipeError = { error: deadPaneSubscriptionError() };
+        } else {
+          this.startLifecycleWatcher();
+          return;
+        }
+      }
+    }
     // Same-boundary decision as the applied remain-on-exit value: it was
     // resolved against the RUNNING server (serverTmuxVersion) in
     // createDetachedSession/applySessionOptions before this attach. Guard
     // whenever this session uses legacy `on` — including an unreadable
     // version (fail-closed: the extra verdict is harmless on a live pane).
     const guardDeadPane = this.legacyRetention;
-    const deadPaneMarker = 'botmux-pane-dead-before-pipe';
     for (let attempt = 0; ; attempt++) {
+      if (!queuedPipeError && this.ownsSession && instanceIdentity) {
+        // An operator can replace this name during a retry wait. A successful
+        // creation/preflight check does not authorize subscribing its successor.
+        // Identity refusal is final, outside the transient tmux retry classifier.
+        try {
+          TmuxBackend.assertInstanceIdentity(this.paneTarget, instanceIdentity, this.socketName);
+        } catch (err) {
+          this.teardownFifoReader();
+          throw err;
+        }
+      }
       try {
+        // Count a failed queued subscription as the first attach attempt.
+        // Retry only pipe-pane: the session has already been created.
+        if (queuedPipeError) {
+          const { error } = queuedPipeError;
+          queuedPipeError = undefined;
+          throw error;
+        }
         if (guardDeadPane) {
           // tmux 2.8 can crash its server when pipe-pane dereferences an
           // already-dead pane's released event. Keep this check and subscription
           // in ONE server queue; a client-side probe would race the CLI exit.
           const guardedPipePane = `pipe-pane -O -t ${tmuxQuote(this.paneTarget)} ${tmuxQuote(pipeShellCommand)}`;
           const output = execSync(
-            `${this.tmuxCmd} if-shell -F -t ${shellescape(this.paneTarget)} '#{pane_dead}' ${shellescape(`display-message -p ${deadPaneMarker}`)} ${shellescape(guardedPipePane)}`,
+            `${this.tmuxCmd} if-shell -F -t ${shellescape(this.paneTarget)} '#{pane_dead}' ${shellescape(`display-message -p ${DEAD_PANE_MARKER}`)} ${shellescape(guardedPipePane)}`,
             { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
-          if (String(output).trim() === deadPaneMarker) {
+          if (String(output).trim() === DEAD_PANE_MARKER) {
             // Reuse the deterministic startup-failure teardown and diagnostic
             // path below. A retained pane is not a successful subscription.
-            throw Object.assign(new Error('pane is dead'), { status: 1, stderr: 'pane is dead' });
+            throw deadPaneSubscriptionError();
           }
         } else {
           execSync(
@@ -1828,7 +1873,7 @@ export class TmuxPipeBackend implements SessionBackend {
     return true;
   }
 
-  private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
+  private createDetachedSession(bin: string, args: string[], opts: SpawnOpts, pipeShellCommand: string): { error: unknown } | undefined {
     const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
     // `new-session -e` only exists since tmux 3.2 (3.0/3.1 reject it with
     // "unknown flag", a deterministic non-retryable launch failure). On older
@@ -1896,6 +1941,14 @@ export class TmuxPipeBackend implements SessionBackend {
       // a NON-zero exit. Before 3.2, `on` also retains clean exits until the
       // lifecycle watcher reads their status and removes the dead pane.
       ';', 'set-option', '-t', this.paneTarget, 'remain-on-exit', remainOnExit,
+      // One server queue: subscribe before tmux can process the CLI's first
+      // output. No later client invocation may replace a successful pipe,
+      // since doing so could discard those one-shot startup/OSC bytes.
+      ';', ...(this.legacyRetention
+        ? ['if-shell', '-F', '-t', this.paneTarget, '#{pane_dead}',
+          `display-message -p ${DEAD_PANE_MARKER}`,
+          `pipe-pane -O -t ${tmuxQuote(this.paneTarget)} ${tmuxQuote(pipeShellCommand)}`]
+        : ['pipe-pane', '-O', '-t', this.paneTarget, pipeShellCommand]),
     ];
     const commandBytes = tmuxCommandBytes(argv);
     // Every failure below ends here. The chat only ever sees `error` (tmux's
@@ -1924,6 +1977,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // means an earlier timed-out attempt actually created the session
     // server-side → treat as success.
     let createdIdentity: string | null = null;
+    let queuedPipeError: { error: unknown } | undefined;
     let corpseReaped = false;
     // Anti-fork gate (default ON; BOTMUX_DISABLE_TMUX_ANTI_FORK=1 opts out):
     // BEFORE every new-session — including the first attempt — refuse to boot a
@@ -1959,8 +2013,21 @@ export class TmuxPipeBackend implements SessionBackend {
           env: tmuxEnv(bootSpawnEnv),
         });
         createdIdentity = parseSessionIdentity(String(printed ?? ''));
+        if (String(printed).trim().split('\n').includes(DEAD_PANE_MARKER)) {
+          queuedPipeError = { error: deadPaneSubscriptionError() };
+        } else {
+          this.pipeAttached = true;
+        }
         break;
       } catch (err: any) {
+        // new-session can succeed and print its identity before a later queue
+        // command fails. Preserve that ownership for rollback, and hand the
+        // failure to the existing bounded pipe-pane retry/diagnostic path.
+        createdIdentity = parseSessionIdentity(String(err?.stdout ?? ''));
+        if (createdIdentity) {
+          queuedPipeError = { error: err };
+          break;
+        }
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
         // A -N spawn that answered "no server running" raced an owner dying
         // between the gate probe and the exec. Retry: the next gate cycle sees
@@ -2025,6 +2092,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // once-per-session decision — resolving again would force a redundant
     // `tmux -V` (see applySessionOptions).
     this.applySessionOptions(tmuxVersion);
+    return queuedPipeError;
   }
 
   /**

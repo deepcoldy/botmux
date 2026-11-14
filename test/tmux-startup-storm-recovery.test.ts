@@ -181,10 +181,10 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       // The deadline genuinely fired (this was not a fast-path success) …
       expect(existsSync(markerPath)).toBe(true);
       expect(elapsedMs).toBeGreaterThanOrEqual(4500);
-      // … the retry ran and adopted the already-created session ("duplicate
-      // session" answered by the real server) instead of failing the launch.
+      // The printed identity proves creation even if the client later times
+      // out. Recover its subscription without trying to create it again.
       const attempts = readFileSync(attemptLogPath, 'utf-8').trim().split('\n').length;
-      expect(attempts).toBe(2);
+      expect(attempts).toBe(1);
       // The session the timed-out first attempt created is alive and is the one
       // we attached to (authoritative check against the real server).
       expect(() => execFileSync(REAL_TMUX!, ['has-session', '-t', SESSION_NAME], {
