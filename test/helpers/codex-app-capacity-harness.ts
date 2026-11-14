@@ -33,6 +33,8 @@ export function appRecoveryHarness(config: Record<string, any> = {}, sessionOver
     // Failure-card outbox wiring (re-armed on attach); inert for these cases.
     ordinaryRecoveryNoticeOutbox: { resume: vi.fn() }, ordinaryRecoveryNoticeHost: () => ({}),
     enqueueOrdinaryRecoveryNotice: vi.fn(),
+    // Live status-card label refresh on every recovery write; no card here.
+    refreshOrdinaryRecoveryWaitCard: vi.fn(),
   };
   scope.ordinaryTurnRecoveryEligible = loadWorkerPoolFunction('ordinaryTurnRecoveryEligible', scope);
   const attach = loadWorkerPoolFunction('ensureOrdinaryTurnRecoveryAttached', scope);

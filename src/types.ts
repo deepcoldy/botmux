@@ -2880,6 +2880,15 @@ export type WorkerToDaemonBase =
       /** Non-completed terminals only: the CLI screen's last rows when the
        *  turn ended, masked and clipped. */
       screenTail?: string;
+      /** Retryable failures only: epoch ms at which the provider's own error
+       *  text said the request may be retried (gateway "available at …",
+       *  Retry-After, "try again in 30s"). A scheduling hint for the daemon's
+       *  ordinary-turn recovery, which re-validates it. */
+      providerRetryAtMs?: number;
+      /** Non-completed terminals only: transcript time of the last request the
+       *  provider answered before this failure — when its prompt cache was last
+       *  refreshed. Bounds how long a recovery is worth waiting. */
+      providerLastSuccessAtMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

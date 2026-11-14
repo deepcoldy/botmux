@@ -88,6 +88,7 @@ import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-po
 import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy, type NoProgressNotifyPolicy } from './services/no-progress-notify-policy.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig, type ProviderRecoveryConfig } from './services/provider-recovery-policy.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
@@ -1670,6 +1671,15 @@ export interface BotConfig {
    * live by the daemon's idle sweep.
    */
   promptCache?: PromptCacheConfig;
+  /**
+   * Claude Code only: automatic continuation after a transient model-provider
+   * failure for this bot. Each field overrides the machine-wide
+   * `providerRecovery` in config.json; unset fields inherit it
+   * (services/provider-recovery-policy.ts). Missing on both layers = off.
+   * Read live: a new turn picks up the current value, and switching it off
+   * settles a pending automatic continuation.
+   */
+  providerRecovery?: ProviderRecoveryConfig;
   /**
    * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
    * backed by the locally installed Codex Chrome/Edge extension plugin.
@@ -4321,6 +4331,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         } catch (error) {
           logger.warn(
             `[bot-registry:${entry.larkAppId}] ignoring invalid promptCache: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      })(),
+      providerRecovery: (() => {
+        if (entry.providerRecovery === undefined) return undefined;
+        try {
+          return normalizeProviderRecoveryConfig(entry.providerRecovery);
+        } catch (error) {
+          logger.warn(
+            `[bot-registry:${entry.larkAppId}] ignoring invalid providerRecovery: `
             + `${error instanceof Error ? error.message : String(error)}`,
           );
           return undefined;
