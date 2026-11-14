@@ -6408,7 +6408,7 @@ export function createLarkEventDispatcherRuntime(
               routing.anchor = chatId;
               replyRootId = rootId;
               importedTopicCoordinatorFolded = true;
-                            logger.info(
+              logger.info(
                 `[subtopic-mentionless-routing] un-@ reply in ${handoff.kind} subtopic root=${rootId.substring(0, 12)} `
                 + `(owner=${handoff.sourceLarkAppId}) routed to coordinator=${larkAppId} chat=${chatId.substring(0, 12)}`,
               );

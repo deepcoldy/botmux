@@ -17568,6 +17568,34 @@ describe('out-of-group @mention routing at group top-level and managed subtopics
     expect(handlersByApp.get(COORD_APP_ID)!.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('a post `at` node carrying an app_id (cli_…) as user_id cannot be checked against the roster and keeps yielding', async () => {
+    const chatId = 'oc_post_app_at_chat';
+    const subtopicRoot = 'om_post_app_at_subroot';
+    const { handlersByApp, deliverToCoordAndWorker } = await setupOutMentionGroup(chatId, subtopicRoot);
+    // Rich-text @ of a bot by app_id: no mentions[] entry, the inline `at` node's
+    // user_id is the app_id. The roster is healthy and does not contain it.
+    const postWithAppAt = {
+      mentions: [],
+      content: JSON.stringify({ zh_cn: { title: '', content: [[
+        { tag: 'at', user_id: OUT_OF_GROUP_BOT_APP, user_name: '某个机器人' },
+        { tag: 'text', text: ' 帮忙看下这个报错' },
+      ]] } }),
+    };
+    expect(await mentionsAnotherInChatMember(COORD_APP_ID, postWithAppAt, chatId, USER_OPEN_ID, true)).toBe(true);
+
+    await deliverToCoordAndWorker(makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postWithAppAt.content,
+      messageType: 'post',
+      messageId: 'om_post_app_at_top_1',
+      chatId,
+      chatType: 'group',
+      mentions: [],
+    }));
+    expect(handlersByApp.get(COORD_APP_ID)!.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlersByApp.get(COORD_APP_ID)!.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('case 4 (只 @ 群内真人): all bots yield at BOTH top-level and managed subtopics', async () => {
     const chatId = 'oc_in_human_chat';
     const subtopicRoot = 'om_in_human_subroot';
