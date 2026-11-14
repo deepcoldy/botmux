@@ -119,4 +119,64 @@ describe('usage ledger analytics', () => {
     expect(() => validateUsageQuery({ ...query, from: '2020-01-01T00:00:00Z' })).toThrow('usage_range_too_large');
     expect(() => validateUsageQuery({ ...query, timeZone: 'Mars/Phobos' })).toThrow('usage_invalid_timezone');
   });
+
+  it('computes minute peaks, rates, quantiles and priced-token costs from one deduplicated cohort', async () => {
+    const rows = [
+      record({ recordId: 'b', ts: '2026-11-10T00:01:01Z', larkAppId: 'bot-b', model: 'model-b', sessionId: 'session-b', inputTokens: 30, outputTokens: 70, cacheReadTokens: 20, cacheCreateTokens: 30, costCny: .3 }),
+      record({ recordId: 'a1', ts: '2026-11-10T00:00:05Z', inputTokens: 10, outputTokens: 20, cacheReadTokens: 10, cacheCreateTokens: 10, costCny: .5 }),
+      record({ recordId: 'a2', ts: '2026-11-10T00:00:45Z', inputTokens: 20, outputTokens: 30, cacheReadTokens: 30, cacheCreateTokens: 20 }),
+    ];
+    ledger('2026-11-10', [...rows, rows[1], record({ kind: 'ownership' })]);
+    const range = { from: '2026-11-10T00:00:00Z', to: '2026-11-10T00:02:00Z', timeZone: 'Asia/Shanghai' };
+    const result = await queryUsageLedger(range, { ledgerDir: dir, now: new Date('2026-11-10T01:00:00Z') });
+    const m = result.metrics;
+    expect(m).toMatchObject({ elapsedMinutes: 2, activeMinutes: 2, averageTpm: 150, averageOutputTpm: 60,
+      activeMinuteAverageTpm: 150, peakMinuteTpm: 150, peakMinuteAt: '2026-11-10T00:00:00.000Z',
+      tokensPerRecordMean: 100, tokensPerRecordP50: 100, tokensPerRecordP95: 150, tokensPerRecordMax: 150, tokensPerSessionMean: 150 });
+    expect(m.cacheReadShare).toBeCloseTo(1 / 3); expect(m.outputInputRatio).toBeCloseTo(2 / 3);
+    expect(m.pricedTokenShare).toBeCloseTo(2 / 3); expect(m.costPerMillionTokens).toBeCloseTo(4000);
+    expect(result.bots.map(b => b.averageTpm)).toEqual([75, 75]);
+    const filtered = await queryUsageLedger({ ...range, bot: 'bot-a' }, { ledgerDir: dir, now: new Date('2026-11-10T01:00:00Z') });
+    expect(filtered.metrics).toMatchObject({ averageTpm: 75, activeMinutes: 1, activeMinuteAverageTpm: 150,
+      tokensPerRecordMean: 75, tokensPerRecordP50: 75, tokensPerRecordP95: 100, tokensPerSessionMean: 150 });
+    expect(filtered.metrics.cacheReadShare).toBeCloseTo(.4);
+    expect(filtered.metrics.costPerMillionTokens).toBeCloseTo(10000);
+  });
+
+  it('uses elapsed time today, includes the snapshot instant, and excludes future-dated records', async () => {
+    ledger('2026-11-10', [record({ recordId: 'early', ts: '2026-11-10T11:59:00Z' }),
+      record({ recordId: 'snapshot', ts: '2026-11-10T12:00:00Z' }), record({ recordId: 'future', ts: '2026-11-10T13:00:00Z' })]);
+    const result = await queryUsageLedger({ from: '2026-11-10T00:00:00Z', to: '2026-11-11T00:00:00Z', timeZone: 'UTC' }, { ledgerDir: dir, now: new Date('2026-11-10T12:00:00Z') });
+    expect(result.summary.records).toBe(2); expect(result.coverage.futureRecords).toBe(1);
+    expect(result.metrics.elapsedMinutes).toBe(720); expect(result.metrics.averageTpm).toBeCloseTo(200 / 720);
+    expect(result.metrics.activeMinuteAverageTpm).toBe(100); expect(result.metrics.rateWindowEnd).toBe('2026-11-10T12:00:00.000Z');
+    const future = await queryUsageLedger({ from: '2026-11-11T00:00:00Z', to: '2026-11-12T00:00:00Z', timeZone: 'UTC' }, { ledgerDir: dir, now: new Date('2026-11-10T12:00:00Z') });
+    expect(future.metrics.elapsedMinutes).toBe(0); expect(future.metrics.averageTpm).toBeNull();
+  });
+
+  it('treats the repeated DST hour as distinct UTC minutes and averages a 25-hour day', async () => {
+    ledger('2026-11-01', [record({ ts: '2026-11-01T05:30:00Z', recordId: 'first-hour' }), record({ ts: '2026-11-01T06:30:00Z', recordId: 'repeated-hour' })]);
+    const result = await queryUsageLedger({ from: '2026-11-01T04:00:00Z', to: '2026-11-02T05:00:00Z', timeZone: 'America/New_York' }, { ledgerDir: dir });
+    expect(result.metrics.elapsedMinutes).toBe(1500); expect(result.metrics.activeMinutes).toBe(2);
+    expect(result.metrics.peakMinuteTpm).toBe(100); expect(result.metrics.averageTpm).toBeCloseTo(200 / 1500);
+  });
+
+  it('uses the nearest-rank P95 and the arithmetic median, while keeping zero denominators unknown', async () => {
+    ledger('2026-11-10', Array.from({ length: 20 }, (_, i) => record({ recordId: String(i), ts: '2026-11-10T00:00:00Z', inputTokens: (i + 1) * 100, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 })));
+    const result = await queryUsageLedger(query, { ledgerDir: dir });
+    expect(result.metrics.tokensPerRecordP50).toBe(1050); expect(result.metrics.tokensPerRecordP95).toBe(1900); expect(result.metrics.tokensPerRecordMax).toBe(2000);
+    expect(result.metrics.costPerMillionTokens).toBeNull(); expect(result.metrics.pricedTokenShare).toBe(0);
+    ledger('2026-11-10', [record({ ts: '2026-11-10T00:00:00Z', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0, costCny: 0 })]);
+    const zero = await queryUsageLedger(query, { ledgerDir: dir });
+    expect(zero.metrics.tokensPerRecordP50).toBe(0); expect(zero.metrics.activeMinutes).toBe(0);
+    expect(zero.metrics.cacheReadShare).toBeNull(); expect(zero.metrics.outputInputRatio).toBeNull(); expect(zero.metrics.costPerMillionTokens).toBeNull();
+    const missing = await queryUsageLedger(query, { ledgerDir: dir + '/missing' });
+    expect(missing.metrics.averageTpm).toBeNull(); expect(missing.metrics.elapsedMinutes).toBeNull();
+  });
+
+  it('keeps an overflowing derived unit price unknown instead of returning Infinity', async () => {
+    ledger('2026-11-10', [record({ inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0, costCny: 1e308 })]);
+    const result = await queryUsageLedger(query, { ledgerDir: dir });
+    expect(result.metrics.costPerMillionTokens).toBeNull();
+  });
 });

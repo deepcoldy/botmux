@@ -3,7 +3,8 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { requestJson } from './dashboard-api.js';
 import { usageAnalyticsQuery, usageDateRange, type UsagePageFilters, type UsagePreset } from './usage-filters.js';
-import type { UsageGroup, UsageReport } from '../usage-types.js';
+import { usageMetricNumber, usageMetricShare } from './usage-format.js';
+import type { UsageBreakdown, UsageReport } from '../usage-types.js';
 
 type Bot = { larkAppId: string; botName?: string; name?: string };
 const buckets = ['inputTokens', 'cacheReadTokens', 'cacheCreateTokens', 'outputTokens'] as const;
@@ -12,15 +13,16 @@ const count = (value: number) => new Intl.NumberFormat(undefined, { notation: 'c
 const exact = (value: number) => new Intl.NumberFormat().format(value);
 const money = (value: number | null) => value === null ? '—' : new Intl.NumberFormat(undefined, { style: 'currency', currency: 'CNY' }).format(value);
 
-function GroupTable({ rows, label }: { rows: UsageGroup[]; label: (id: string) => string }): React.JSX.Element {
+function GroupTable({ rows, label }: { rows: UsageBreakdown[]; label: (id: string) => string }): React.JSX.Element {
   const t = useT();
   return <div className="usage-table-scroll"><table className="usage-table">
-    <thead><tr><th>{t('usage.name')}</th><th>{t('usage.prompt')}</th><th>{t('usage.output')}</th><th>{t('usage.cacheRead')}</th><th>{t('usage.total')}</th><th>{t('usage.cost')}</th></tr></thead>
+    <thead><tr><th>{t('usage.name')}</th><th>{t('usage.prompt')}</th><th>{t('usage.output')}</th><th>{t('usage.cacheRead')}</th><th>{t('usage.total')}</th><th>{t('usage.averageTpm')}</th><th>{t('usage.cacheShare')}</th><th>{t('usage.cost')}</th></tr></thead>
     <tbody>{rows.map(row => <tr key={row.id}>
       <th scope="row" title={row.id}>{label(row.id)}</th>
       <td title={exact(row.inputTokens + row.cacheReadTokens + row.cacheCreateTokens)}>{count(row.inputTokens + row.cacheReadTokens + row.cacheCreateTokens)}</td>
       <td title={exact(row.outputTokens)}>{count(row.outputTokens)}</td><td title={exact(row.cacheReadTokens)}>{count(row.cacheReadTokens)}</td>
-      <td title={exact(row.totalTokens)}><strong>{count(row.totalTokens)}</strong></td><td>{money(row.costCny)}</td>
+      <td title={exact(row.totalTokens)}><strong>{count(row.totalTokens)}</strong></td>
+      <td>{usageMetricNumber(row.averageTpm)}</td><td>{usageMetricShare(row.cacheReadShare)}</td><td>{money(row.costCny)}</td>
     </tr>)}</tbody>
   </table>{!rows.length && <p className="usage-empty">{t('usage.empty')}</p>}</div>;
 }
@@ -72,6 +74,7 @@ export function UsagePage({ initialData, initialBots = [] }: { initialData?: Usa
     } catch (e) { setValidation(e instanceof Error ? e.message : 'usage.invalidRange'); }
   };
   const summary = data?.summary;
+  const stats = data?.coverage.ledgerMissing ? undefined : data?.metrics;
   const allBots = [...new Set([...bots.map(bot => bot.larkAppId), ...(data?.options.bots ?? []), ...(draft.bot ? [draft.bot] : [])])];
   const allModels = [...new Set([...(data?.options.models ?? []), ...(draft.model ? [draft.model] : [])])];
   const max = Math.max(1, ...(data?.trend.map(row => row.totalTokens) ?? []));
@@ -79,6 +82,16 @@ export function UsagePage({ initialData, initialBots = [] }: { initialData?: Usa
     { label: 'usage.total', value: summary?.totalTokens }, { label: 'usage.input', value: summary?.inputTokens },
     { label: 'usage.output', value: summary?.outputTokens }, { label: 'usage.cacheRead', value: summary?.cacheReadTokens },
     { label: 'usage.cacheCreate', value: summary?.cacheCreateTokens },
+  ];
+  const insightMetrics = [
+    { id: 'average-tpm', label: 'usage.averageTpm', value: usageMetricNumber(stats?.averageTpm), hint: t('usage.outputTpmHint', { value: usageMetricNumber(stats?.averageOutputTpm) }) },
+    { id: 'peak-tpm', label: 'usage.peakTpm', value: usageMetricNumber(stats?.peakMinuteTpm), hint: stats?.peakMinuteAt ? new Date(stats.peakMinuteAt).toLocaleString(undefined, { timeZone: data!.query.timeZone, timeZoneName: 'shortOffset' }) : t('usage.noPeak') },
+    { id: 'active-tpm', label: 'usage.activeTpm', value: usageMetricNumber(stats?.activeMinuteAverageTpm), hint: t('usage.activeMinutesHint', { count: stats?.activeMinutes ?? '—' }) },
+    { id: 'cache-share', label: 'usage.cacheShare', value: usageMetricShare(stats?.cacheReadShare), hint: t('usage.cacheShareHint') },
+    { id: 'tokens-session', label: 'usage.tokensPerSession', value: usageMetricNumber(stats?.tokensPerSessionMean), hint: t('usage.sessionsHint', { count: data?.sessionCount ?? '—' }) },
+    { id: 'tokens-record', label: 'usage.tokensPerRecord', value: usageMetricNumber(stats?.tokensPerRecordMean), hint: t('usage.recordsHint', { count: summary?.records ?? '—' }) },
+    { id: 'p95-record', label: 'usage.p95Record', value: usageMetricNumber(stats?.tokensPerRecordP95), hint: t('usage.distributionHint', { p50: usageMetricNumber(stats?.tokensPerRecordP50), max: usageMetricNumber(stats?.tokensPerRecordMax) }) },
+    { id: 'output-input', label: 'usage.outputInput', value: usageMetricShare(stats?.outputInputRatio), hint: t('usage.outputInputHint') },
   ];
   const errorKey = ({ usage_invalid_range: 'usage.invalidRange', usage_range_too_large: 'usage.rangeTooLarge',
     usage_ledger_too_large: 'usage.tooLarge', usage_invalid_timezone: 'usage.invalidTimezone',
@@ -105,6 +118,7 @@ export function UsagePage({ initialData, initialBots = [] }: { initialData?: Usa
     {loading && <p role="status">{t('usage.loading')}</p>}
     {data?.coverage.ledgerMissing && <p role="status" className="usage-notice">{t('usage.noLedger')}</p>}
     {data && data.coverage.invalidRecords > 0 && <p role="status" className="usage-notice">{t('usage.skipped', { count: data.coverage.invalidRecords })}</p>}
+    {data && data.coverage.futureRecords > 0 && <p role="status" className="usage-notice">{t('usage.futureRecords', { count: data.coverage.futureRecords })}</p>}
     {data && <p className="usage-hint">{t('usage.appliedRange', {
       from: new Date(data.query.from).toLocaleDateString(undefined, { timeZone: data.query.timeZone }),
       to: new Date(Date.parse(data.query.to) - 1).toLocaleDateString(undefined, { timeZone: data.query.timeZone }),
@@ -112,7 +126,14 @@ export function UsagePage({ initialData, initialBots = [] }: { initialData?: Usa
     <section className="usage-metrics">{metrics.map(metric => <article className="metric-card" key={metric.label}>
       <span>{t(metric.label)}</span><strong title={metric.value === undefined ? undefined : exact(metric.value)}>{metric.value === undefined || data?.coverage.ledgerMissing ? '—' : count(metric.value)}</strong>
     </article>)}<article className="metric-card"><span>{t('usage.cost')}</span><strong>{money(summary?.costCny ?? null)}</strong>
-      <small>{summary ? t('usage.costCoverage', { priced: summary.pricedRecords, count: summary.records }) : t('usage.costHint')}</small></article></section>
+      <small>{summary ? t('usage.costCoverage', { priced: summary.pricedRecords, count: summary.records }) : t('usage.costHint')}</small>
+      <small>{t('usage.unitCost', { value: money(stats?.costPerMillionTokens ?? null), share: usageMetricShare(stats?.pricedTokenShare) })}</small></article></section>
+    <section className="panel usage-insights"><h2>{t('usage.insights')}</h2>
+      <div className="usage-insight-metrics">{insightMetrics.map(metric => <article className="metric-card" key={metric.id} data-usage-metric={metric.id}>
+        <span>{t(metric.label)}</span><strong>{metric.value}</strong><small>{metric.hint}</small>
+      </article>)}</div>
+      <p className="usage-hint">{t('usage.rateHint')}</p>
+    </section>
     <section className="panel usage-trend"><h2>{t('usage.trend')}</h2>
       <div className="usage-legend">{buckets.map((bucket, i) => <span key={bucket}><i className={`usage-color-${bucket}`} />{t(bucketLabels[i]!)}</span>)}</div>
       {data && summary?.records ? <div className="usage-chart-scroll"><div className="usage-chart" style={{ minWidth: Math.max(480, data.trend.length * 24) }}>

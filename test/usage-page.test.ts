@@ -4,12 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UsagePage } from '../src/dashboard/web/usage-page.js';
 import { usageAnalyticsQuery, usageDateRange } from '../src/dashboard/web/usage-filters.js';
 import { emptyUsageTotals } from '../src/services/usage-analytics.js';
+import { emptyUsageMetrics } from '../src/services/usage-metrics.js';
+import { usageMetricNumber, usageMetricShare } from '../src/dashboard/web/usage-format.js';
 import type { UsageReport } from '../src/dashboard/usage-types.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 const body = (totalTokens = 100): UsageReport => ({ query: { from: '2026-11-01T00:00:00Z', to: '2026-11-14T00:00:00Z', timeZone: 'Asia/Shanghai' },
-  generatedAt: '2026-11-13T12:00:00Z', summary: { ...emptyUsageTotals(), totalTokens, records: 1 }, trend: [], bots: [], models: [], sessions: [], sessionCount: 0,
-  options: { bots: ['bot-a'], models: ['model-a'] }, coverage: { ledgerMissing: false, filesRead: 1, invalidRecords: 0, duplicateRecords: 0, firstRecordAt: null, lastRecordAt: null } });
+  generatedAt: '2026-11-13T12:00:00Z', summary: { ...emptyUsageTotals(), totalTokens, records: 1 }, metrics: { ...emptyUsageMetrics('2026-11-13T12:00:00Z'), averageTpm: totalTokens / 2 }, trend: [], bots: [], models: [], sessions: [], sessionCount: 0,
+  options: { bots: ['bot-a'], models: ['model-a'] }, coverage: { ledgerMissing: false, filesRead: 1, invalidRecords: 0, duplicateRecords: 0, futureRecords: 0, firstRecordAt: null, lastRecordAt: null } });
 const response = (report: unknown, ok = true) => ({ ok, status: ok ? 200 : 503, json: async () => report, text: async () => 'error' }) as Response;
 let renderer: TestRenderer.ReactTestRenderer | undefined;
 const requests: { url: URL; signal?: AbortSignal | null }[] = [];
@@ -36,6 +38,7 @@ describe('token usage page', () => {
     expect(requests).toHaveLength(1);
     expect(Object.fromEntries(requests[0]!.url.searchParams)).toEqual({ from: '2026-11-09T16:00:00.000Z', to: '2026-11-10T16:00:00.000Z', timeZone: 'Asia/Shanghai', bot: 'bot-a', model: 'model-a' });
     expect(total()).toBe('5');
+    expect(renderer!.root.findByProps({ 'data-usage-metric': 'average-tpm' }).findByType('strong').children.join('')).toBe('2.5');
   });
 
   it('ignores an old response after filters change', async () => {
@@ -46,6 +49,7 @@ describe('token usage page', () => {
     const first = requests.find(r => r.url.pathname === '/api/usage/summary')!;
     change('usage-bot', 'bot-a'); await submit(); expect(first.signal?.aborted).toBe(true); expect(total()).toBe('5');
     await act(async () => resolve(response(body(999)))); expect(total()).toBe('5');
+    expect(renderer!.root.findByProps({ 'data-usage-metric': 'average-tpm' }).findByType('strong').children.join('')).toBe('2.5');
   });
 
   it('does not replace a failed or missing read with a zero consumption claim', async () => {
@@ -56,6 +60,16 @@ describe('token usage page', () => {
     const missing = body(0); missing.coverage.ledgerMissing = true;
     await act(async () => { renderer = TestRenderer.create(React.createElement(UsagePage, { initialData: missing })); });
     expect(total()).toBe('—');
+    expect(renderer!.root.findByProps({ 'data-usage-metric': 'average-tpm' }).findByType('strong').children.join('')).toBe('—');
+  });
+
+  it('keeps small positive rates visible and does not cap output/input ratios at 100%', async () => {
+    const report = body(); report.metrics.averageTpm = .0001;
+    report.metrics.cacheReadShare = .9; report.metrics.outputInputRatio = 1.5;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(UsagePage, { initialData: report })); });
+    const value = (id: string) => renderer!.root.findByProps({ 'data-usage-metric': id }).findByType('strong').children.join('');
+    expect(value('average-tpm')).toBe('<0.01'); expect(value('cache-share')).toBe('90%'); expect(value('output-input')).toBe('150%');
+    expect(usageMetricNumber(0)).toBe('0'); expect(usageMetricShare(null)).toBe('—'); expect(usageMetricShare(NaN)).toBe('—');
   });
 
   it('validates dates and supports calendar week/month presets', () => {
