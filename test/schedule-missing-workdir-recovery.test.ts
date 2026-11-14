@@ -526,6 +526,7 @@ describe('scheduled fire refused when a turn-created task\'s workingDir was swap
     return scheduler.addTask({
       id, name: '每日告警汇总', schedule: 'every 30m', prompt: TASK_PROMPT, workingDir,
       chatId: CHAT, chatType: 'group', larkAppId: APP, executionPosition: 'topic', rootMessageId: ROOT,
+      owner: { kind: 'ownerless' },
     }, audit);
   }
 

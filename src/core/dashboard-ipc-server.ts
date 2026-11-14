@@ -8478,8 +8478,9 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       // The Feishu-login person, else the bot owner (token login: the dashboard
       // is local + token-protected). Either way the daemon re-checks the
       // creator is still allowed at every run (scheduled-turn-provenance).
-      ownerOpenId,
-      ownerUnionId,
+      owner: ownerOpenId
+        ? { kind: 'human', openId: ownerOpenId, unionId: ownerUnionId }
+        : { kind: 'ownerless' },
       deliver,
       silent,
       followActive: followActive || undefined,

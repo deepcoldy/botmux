@@ -21,6 +21,7 @@ const params = {
   id: 'task', name: 'Daily report', schedule: '0 12 * * *',
   parsed: { kind: 'cron' as const, expr: '0 12 * * *', display: 'daily' },
   prompt: 'Report public news', workingDir: '/workspace', chatId: 'oc_test', larkAppId: app,
+  owner: { kind: 'ownerless' as const },
 };
 
 beforeEach(() => {

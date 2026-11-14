@@ -90,7 +90,7 @@ afterAll(() => rmSync(isolated.root, { recursive: true, force: true }));
 
 function add(extra: Record<string, unknown> = {}) {
   return scheduler.addTask({ id: `probe${String(++serial).padStart(3, '0')}`, name: 'probe',
-    schedule: 'every 1m', prompt: 'probe', workingDir: '/tmp', chatId: CHAT, larkAppId: APP, ...extra });
+    schedule: 'every 1m', prompt: 'probe', workingDir: '/tmp', chatId: CHAT, larkAppId: APP, owner: { kind: 'ownerless' }, ...extra });
 }
 function session(): Session {
   return { sessionId: `probe-session-${++serial}`, larkAppId: APP, chatId: CHAT,

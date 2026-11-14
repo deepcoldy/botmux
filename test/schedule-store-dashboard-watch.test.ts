@@ -18,7 +18,7 @@ it('reconciles real filesystem notifications after local writes and early reads'
       id: 'task', name: 'Report', schedule: '0 12 * * *',
       parsed: { kind: 'cron', expr: '0 12 * * *', display: 'daily' },
       prompt: 'Public news', workingDir: process.env.SESSION_DATA_DIR,
-      chatId: 'oc_test', larkAppId: app,
+      chatId: 'oc_test', larkAppId: app, owner: { kind: 'ownerless' },
     });
     const agg = new Aggregator();
     agg.hydrateSchedules(app, store.listTasks());
@@ -33,7 +33,7 @@ it('reconciles real filesystem notifications after local writes and early reads'
     }
     store.removeTask(task.id);
     await until(() => agg.getSchedules().length === 0);
-    store.createTask({ ...task, id: 'next' });
+    store.createTask({ ...task, id: 'next', owner: { kind: 'ownerless' } });
     await until(() => agg.getSchedules().length === 1);
     const file = store.scheduleFilePathFor(app);
     writeFileSync(file + '.test', '{}');

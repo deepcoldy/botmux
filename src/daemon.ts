@@ -677,7 +677,7 @@ import {
   type ScheduledSendSettlement,
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
-import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
+import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
 import { isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
@@ -9678,7 +9678,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     // the task's creator identity only if that person may operate this bot
     // now; every fire re-checks the same admission.
     const { runAs, ownerOpenId: _ownerOpenId, ownerUnionId: _ownerUnionId, ...hostTask } = task;
-    let runAsOwner: { ownerOpenId: string; ownerUnionId: string; creatorLarkAppId: string } | undefined;
+    let runAsOwner: scheduler.ScheduleOwner = { kind: 'ownerless' };
     if (runAs !== undefined) {
       if (!selfDaemonLarkAppId || typeof runAs !== 'string'
         || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
@@ -9692,10 +9692,15 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });
       }
-      runAsOwner = { ownerOpenId: openId, ownerUnionId: unionId, creatorLarkAppId: selfDaemonLarkAppId };
+      runAsOwner = { kind: 'human', openId, unionId };
     }
     try {
-      const created = scheduler.addTask({ ...hostTask, ...runAsOwner, ...untilDoneParams });
+      const created = scheduler.addTask({
+        ...hostTask,
+        owner: runAsOwner,
+        ...(runAsOwner.kind === 'human' ? { creatorLarkAppId: selfDaemonLarkAppId } : {}),
+        ...untilDoneParams,
+      });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     } catch (error) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
@@ -9897,7 +9902,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       let created;
       try {
         created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
-          ownerOpenId: controlOpenId, ownerUnionId: controlUnionId }, {
+          owner: { kind: 'human', openId: controlOpenId, unionId: controlUnionId } }, {
           // turnId is the live managed origin read above — never the request body.
           directTurn: {
             turnId,
@@ -36060,6 +36065,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // missing larkAppId falls through to bot-0 as a legacy fallback).
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
+    if (scheduleAuthorityStore?.getRecord(effectiveAppId, task.id)?.state === 'active') {
+      try {
+        if (getBot(effectiveAppId).config.triggerUserAuth?.enabled) {
+          task = await backfillOwnerUnionId({
+            task,
+            larkAppId: effectiveAppId,
+            lookupUnionId: async (appId, openId) => {
+              const found = await resolveUnionIdFromOpenIdStrict(appId, openId);
+              return found.status === 'resolved' ? found.unionId : undefined;
+            },
+            record: scheduler.recordTaskOwnerUnionId,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[scheduler] owner union_id backfill skipped for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const authority = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
     if (!authority) {
       throw new Error('schedule authority record missing; refusing unregistered task');

@@ -1112,13 +1112,13 @@ async function handleScheduleCommand(
       // workflow commands as them (scheduled-turn-provenance). On the
       // sandboxed relay path the daemon re-checks the creator is still
       // allowed at every run mutation; the default non-sandbox route does
-      // not re-check membership.
-      ownerOpenId: senderOpenId,
-      // union_id is the tenant-stable half of the same identity; it is what a
-      // scheduled turn presents to per-user backends. Only stamped for human
-      // creators (see the call site) — a task created by a bot deliberately
-      // keeps no user identity.
-      ownerUnionId: senderUnionId,
+      // not re-check membership. union_id is the tenant-stable half of the
+      // same identity; it is what a scheduled turn presents to per-user
+      // backends. Only stamped for human creators (see the call site) — a
+      // task created by a bot deliberately keeps no user identity.
+      owner: senderOpenId
+        ? { kind: 'human', openId: senderOpenId, unionId: senderUnionId }
+        : { kind: 'ownerless' },
       deliver: 'origin',
       silent,
     });
@@ -4330,14 +4330,16 @@ export async function handleCommand(
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
+        const scheduleSenderIsUser = message.senderType === 'user';
         await handleScheduleCommand(
-          scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId,
+          scheduleArgs, rootId, chatId, deps, larkAppId,
           // Non-human senders (bots, and anything else Lark reports as an app)
           // must not hand their own identity to a task: a bot-created task that
           // could query as itself would let any caller of that bot borrow its
-          // access, with the audit trail pointing at the bot. Withholding the
-          // union_id here is what makes such a task fail closed later.
-          message.senderType === 'user' ? message.senderUnionId : undefined,
+          // access, with the audit trail pointing at the bot. Such a task is
+          // ownerless and fails closed later.
+          scheduleSenderIsUser ? message.senderId : undefined,
+          scheduleSenderIsUser ? message.senderUnionId : undefined,
         );
         logger.info(`[${logTag}] Schedule command handled`);
         break;

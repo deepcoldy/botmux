@@ -7064,6 +7064,7 @@ describe('GET /api/schedules', () => {
       executionPosition: 'topic',
       rootMessageId: 'om_schedule_root',
       chatType: 'topic_group',
+      owner: { kind: 'ownerless' },
     });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
@@ -7463,6 +7464,7 @@ describe('GET /api/schedules/:id/logs', () => {
         workingDir: '/tmp/private-working-dir',
         chatId: 'oc_schedule_logs',
         larkAppId: appId,
+        owner: { kind: 'ownerless' },
       });
       appendScheduleRunLog({
         id: 'run-log-1',
@@ -7573,6 +7575,7 @@ describe('GET /api/schedules/:id/logs', () => {
         workingDir: '/tmp',
         chatId: 'oc_schedule_logs_owner',
         larkAppId: appId,
+        owner: { kind: 'ownerless' },
       });
       handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
       const base = `http://127.0.0.1:${handle.port}`;
@@ -7811,6 +7814,7 @@ describe('schedule target cap', () => {
       larkAppId: appId,
       executionPosition: 'top-level',
       scope: 'chat',
+      owner: { kind: 'ownerless' },
     });
     const renamed = await requestJson(handle!.port, `/api/schedules/${legacy.id}`, {
       method: 'PATCH',
@@ -7884,6 +7888,7 @@ describe('schedule dedicated task execution position', () => {
       larkAppId: appId,
       executionPosition: 'top-level',
       scope: 'chat',
+      owner: { kind: 'ownerless' },
       ...overrides,
     } as any);
   }

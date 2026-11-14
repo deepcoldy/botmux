@@ -7627,13 +7627,11 @@ describe('handleCommand', () => {
       }), deps, LARK_APP_ID);
 
       const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
-      expect(callArgs.ownerOpenId).toBe('ou_creator');
-      expect(callArgs.ownerUnionId).toBe('on_creator');
+      expect(callArgs.owner).toEqual({ kind: 'human', openId: 'ou_creator', unionId: 'on_creator' });
     });
 
-    it('withholds the union_id when the creating sender is not a human', async () => {
-      // A bot-created task must not be able to run as the bot: without a
-      // union_id the scheduled turn carries no identity at all, so
+    it('creates an ownerless task when the creating sender is not a human', async () => {
+      // A bot-created task must not carry the bot's identity at all, so
       // identity-bound tools fail closed instead of borrowing the bot's access.
       vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
         parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
@@ -7656,8 +7654,9 @@ describe('handleCommand', () => {
       }), deps, LARK_APP_ID);
 
       const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
-      expect(callArgs.ownerOpenId).toBe('ou_bot_sender');
-      expect(callArgs.ownerUnionId).toBeUndefined();
+      expect(callArgs.owner).toEqual({ kind: 'ownerless' });
+      expect(JSON.stringify(callArgs)).not.toContain('ou_bot_sender');
+      expect(JSON.stringify(callArgs)).not.toContain('on_bot_sender');
     });
   });
 

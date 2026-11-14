@@ -168,10 +168,10 @@ describe('delegated schedule add route', () => {
     h.scope.getBot = () => ({ config: {} });
     expect(await h.run()).toMatchObject({
       status: 201,
-      value: { task: { ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user' } },
+      value: { task: { owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' } } },
     });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
     }), DIRECT_TURN);
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
@@ -410,7 +410,7 @@ describe('until-done schedule creation', () => {
     h.body.task.notify = ['failing', 'expired'];
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
-      untilDone, notify: ['failing', 'expired'], ownerOpenId: 'ou_user_target',
+      untilDone, notify: ['failing', 'expired'], owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
     }), DIRECT_TURN);
   });
 
@@ -604,7 +604,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = scope;
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' }, executionPosition: 'new-topic',
     } } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
@@ -618,7 +618,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
       requestUserUnionId: 'on_active_user',
     } };
     h.ds.session.replyTargets = {};
-    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerUnionId: 'on_active_user' } } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { owner: { unionId: 'on_active_user' } } } });
   });
 
   it('accepts a Remote Runner session tool only inside its frozen chat, root, and working directory', async () => {
@@ -748,7 +748,7 @@ describe('auto-start-on-join first turn (join_ synthetic id)', () => {
   it('resolves the operator who added the bot as the direct human creator', async () => {
     const h = joinHarness();
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
     } } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
@@ -809,7 +809,7 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
   h.body.originCapability = 'd'.repeat(64);
   expect(h.ds.managedTurnOrigin.callerOpenId).toBe('ou_user_target');
   expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-    ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+    owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' }, executionPosition: 'new-topic',
   } } });
   expect(h.ds.activeInteractiveTurn).toBeUndefined();
   expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
@@ -855,7 +855,7 @@ describe('host-terminal --run-as identity', () => {
     expect(h.scope.canOperate).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_runner1', 'on_runner');
     const arg = addTaskArg(h);
     expect(arg).toMatchObject({
-      ownerOpenId: 'ou_runner1', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+      owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
     expect(arg).not.toHaveProperty('runAs');
   });
@@ -870,7 +870,7 @@ describe('host-terminal --run-as identity', () => {
       .toHaveBeenCalledWith('cli_target', ['runner@example.com']);
     expect(h.scope.resolveUnionIdFromOpenId).toHaveBeenCalledWith('cli_target', 'ou_from_email');
     expect(addTaskArg(h)).toMatchObject({
-      ownerOpenId: 'ou_from_email', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+      owner: { kind: 'human', openId: 'ou_from_email', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
   });
 
@@ -910,8 +910,7 @@ describe('host-terminal --run-as identity', () => {
     const h = hostRunAsHarness({ extraTask: { ownerOpenId: 'ou_evil', ownerUnionId: 'on_evil' } });
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     const arg = addTaskArg(h);
-    expect(arg.ownerOpenId).toBeUndefined();
-    expect(arg.ownerUnionId).toBeUndefined();
+    expect(arg.owner).toEqual({ kind: 'ownerless' });
   });
 
   it('lets a verified --run-as override body-supplied owner fields and creator app', async () => {
@@ -924,7 +923,7 @@ describe('host-terminal --run-as identity', () => {
     });
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     expect(addTaskArg(h)).toMatchObject({
-      ownerOpenId: 'ou_runner1', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+      owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
   });
 });

@@ -38,6 +38,7 @@ const TASK_PARAMS = {
   rootMessageId: 'om_origin',
   scope: 'thread' as const,
   executionPosition: 'topic' as const,
+  owner: { kind: 'ownerless' as const },
 };
 
 async function freshImport() {
