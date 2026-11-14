@@ -404,9 +404,12 @@ describe('daemon current actor attestation', () => {
       const { procRoot, ds, check, input } = fixture();
       writeProc(procRoot, 95, 1, '950');
       writeProc(procRoot, 100, 95, '1000');
+      symlinkSync('/usr/bin/node', join(procRoot, '95', 'exe'));
+      ds.session.cliId = 'codex';
       ds.localProcessAttestation.cliPid = 95;
       ds.localProcessAttestation.cliProcStart = '950';
       ds.managedTurnOrigin.preexistingProcessIdentities.push('95:950');
+      writeFileSync(join(procRoot, '100', 'cmdline'), 'codex\0app-server\0');
       // The runner is the CLI entry; the persistent native engine below it
       // must not be mistaken for a previous-turn tool.
       expect(resolveDaemonCurrentExecution(input)).toBeNull();
@@ -483,6 +486,102 @@ describe('daemon current actor attestation', () => {
         return { openId: 'ou_current', type: 'user' as const, email: 'current@example.com' };
       });
       await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
+  });
+
+  describe('native Codex behind a launcher root', () => {
+    function launcherFixture() {
+      const procRoot = mkdtempSync(join(tmpdir(), 'actor-codex-launcher-'));
+      writeProc(procRoot, 90, 1, '900');
+      writeProc(procRoot, 99, 1, '990');
+      writeProc(procRoot, 100, 99, '1000');
+      writeProc(procRoot, 101, 100, '1100');
+      writeProc(procRoot, 102, 101, '2000');
+      symlinkSync('/usr/bin/node', join(procRoot, '99', 'exe'));
+      symlinkSync('/release/bin/codex', join(procRoot, '100', 'exe'));
+      symlinkSync('/release/bin/codex-code-mode-host', join(procRoot, '101', 'exe'));
+      writeFileSync(join(procRoot, '100', 'cmdline'), 'codex\0');
+      writeFileSync(join(procRoot, '101', 'cmdline'), 'codex-code-mode-host\0');
+      const ds = activeSession();
+      ds.session.cliId = 'codex';
+      ds.localProcessAttestation.cliPid = 99;
+      ds.localProcessAttestation.cliProcStart = '990';
+      ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '101:1100'];
+      const attest = (pid = 102, procStart = '2000', onRefusal?: (reason: string) => void) =>
+        resolveDaemonCurrentExecution({
+          sessionId: 's1', peer: { pid, procStart }, findSession: () => ds, procRoot, onRefusal,
+        });
+      return { procRoot, ds, attest };
+    }
+
+    it('accepts a new tool below the pre-existing native codex and its host', () => {
+      const { attest } = launcherFixture();
+      expect(attest()).toMatchObject({ status: 'verified', turnId: 'om_turn' });
+    });
+
+    it('does not traverse an old direct child named codex when the session does not run Codex', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      ds.session.cliId = 'claude';
+      rmSync(join(procRoot, '99', 'exe'));
+      symlinkSync('/usr/local/bin/claude', join(procRoot, '99', 'exe'));
+      writeProc(procRoot, 120, 100, '4000');
+      expect(attest(120, '4000')).toBeNull();
+    });
+
+    it('does not let the native codex itself claim the turn', () => {
+      const { attest } = launcherFixture();
+      expect(attest(100, '1000')).toBeNull();
+    });
+
+    it('still refuses a tool below a pre-existing old tool', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      writeProc(procRoot, 103, 100, '1300');
+      writeProc(procRoot, 104, 103, '3000');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('103:1300');
+      expect(attest(104, '3000')).toBeNull();
+    });
+
+    it('refuses a native codex whose parent is not a trusted root', () => {
+      const { procRoot, attest } = launcherFixture();
+      writeProc(procRoot, 98, 1, '980');
+      writeProc(procRoot, 100, 98, '1000');
+      expect(attest()).toBeNull();
+    });
+
+    it('refuses a nested codex below a native codex root and reports the stop', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      ds.localProcessAttestation.cliPid = 100;
+      ds.localProcessAttestation.cliProcStart = '1000';
+      writeProc(procRoot, 110, 100, '1500');
+      writeProc(procRoot, 111, 110, '3000');
+      symlinkSync('/release/bin/codex', join(procRoot, '110', 'exe'));
+      writeFileSync(join(procRoot, '110', 'cmdline'), '/release/bin/codex\0exec\0');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('110:1500');
+      const reasons: string[] = [];
+      expect(attest(111, '3000', r => reasons.push(r))).toBeNull();
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('pid 110 comm "proc 110" was pre-existing');
+      expect(reasons[0]).toContain('trusted roots 100');
+    });
+
+    it('reports which precondition refused the proof', () => {
+      const { ds, attest } = launcherFixture();
+      ds.managedTurnOrigin.capability = undefined;
+      const reasons: string[] = [];
+      expect(attest(102, '2000', r => reasons.push(r))).toBeNull();
+      expect(reasons).toEqual(['no capability']);
+    });
+
+    it('reports where the lineage walk stopped and the trusted roots', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      writeProc(procRoot, 103, 100, '1300');
+      writeProc(procRoot, 104, 103, '3000');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('103:1300');
+      const reasons: string[] = [];
+      expect(attest(104, '3000', r => reasons.push(r))).toBeNull();
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('pid 103 comm "proc 103" was pre-existing');
+      expect(reasons[0]).toContain('trusted roots 99');
     });
   });
 

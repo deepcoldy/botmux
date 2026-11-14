@@ -1719,7 +1719,11 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.reason);
     return jsonRes(res, 403, blocked('peer_unresolved'));
   }
-  const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
+  let proofRefusal: string | undefined;
+  const document = resolveDaemonCurrentExecution({
+    sessionId, peer: peer.peer, findSession: findActiveBySessionId,
+    onRefusal: reason => { proofRefusal = reason; },
+  });
   const refuseAs = (reason: 'as_not_speaker' | 'as_unavailable') => {
     logIdentityRouteRefusal(sessionId, tool, reason);
     return jsonRes(res, 403, blocked(reason));
@@ -1821,7 +1825,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   // is absent. The caller is not proven, so it gets the coarse reason only.
   const live = findActiveBySessionId(sessionId);
   logIdentityRouteRefusal(sessionId, tool, 'lineage_unproven',
-    !live ? 'no active session' : !live.managedTurnOrigin?.turnId ? 'no live turn origin' : 'caller outside the live turn');
+    !live ? 'no active session' : !live.managedTurnOrigin?.turnId ? 'no live turn origin' : proofRefusal ?? 'caller outside the live turn');
   return jsonRes(res, 403, blocked('lineage_unproven'));
 });
 
