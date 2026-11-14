@@ -4676,11 +4676,11 @@ export async function handleCommand(
             if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
           } else if (larkBound) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
-          } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+          } else if (!platformCredsUrl && loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
-          if (loginOpenId && bytedcliGoverned) {
+          if (!platformCredsUrl && loginOpenId && bytedcliGoverned) {
             const status = await bytedcliLoginStatus(loginOpenId);
             lines.push(t(
               status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'

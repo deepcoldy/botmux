@@ -41,7 +41,7 @@ const { recallProvenIdentityContent, forgetProvenIdentityContent } = await impor
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { beginBytedcliLogin } = await import('../src/services/bytedcli-auth.js');
 const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
-const { requestUnattendedAuthorization, clearRestoredLapses, offerAuthorizationAtCreation, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
+const { requestUnattendedAuthorization, noticeUnattendedLapse, clearRestoredLapses, offerAuthorizationAtCreation, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
 const { __resetPlatformAuthorizationRequestForTest } = await import('../src/core/platform-authorization-request.js');
 const credentialRequestClient = await import('../src/platform/credential-request-client.js');
@@ -219,8 +219,12 @@ describe('unattended turns (scheduled and background)', () => {
       __resetPlatformAuthorizationRequestForTest();
       platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
         .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-14T01:00:00Z'));
     });
-    afterEach(() => { __setPlatformCredentialDepsForTest(null); platformRequest.mockRestore(); });
+    afterEach(() => { __setPlatformCredentialDepsForTest(null); platformRequest.mockRestore(); vi.useRealTimers(); });
+    const later = (ms: number) => vi.setSystemTime(Date.now() + ms);
+    const HOUR = 60 * 60_000;
     const bindPlatform = () => __setPlatformCredentialDepsForTest({
       readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
       resolveUnionId: async () => 'on_alice',
@@ -244,13 +248,33 @@ describe('unattended turns (scheduled and background)', () => {
       expect(send).toHaveBeenCalledTimes(2);
     });
 
-    it('an expired challenge means a fresh link: the next refusal sends it', async () => {
+    it('an expired challenge means a fresh link: a later refusal sends it, at most once an hour', async () => {
       bytedcliJwts.clear();
       await asked('bytedcli');
-      vi.mocked(beginBytedcliLogin).mockResolvedValueOnce({ authUrl: 'https://cloud.example.test/auth-fresh', completeToken: 'tok2' } as any);
+      const fresh = { authUrl: 'https://cloud.example.test/auth-fresh', completeToken: 'tok2' } as any;
+      vi.mocked(beginBytedcliLogin).mockResolvedValueOnce(fresh);
+      await asked('bytedcli');
+      expect(send).toHaveBeenCalledTimes(1);
+      later(HOUR);
+      vi.mocked(beginBytedcliLogin).mockResolvedValueOnce(fresh);
       await asked('bytedcli');
       expect(send).toHaveBeenCalledTimes(2);
       expect(send.mock.calls[1][1]).toContain('auth-fresh');
+    });
+
+    it('a link that changes at every fire is sent once an hour per task, person and capability', async () => {
+      bytedcliJwts.clear();
+      for (let fire = 0; fire < 5; fire++) {
+        vi.mocked(beginBytedcliLogin).mockResolvedValueOnce({ authUrl: `https://cloud.example.test/auth-${fire}`, completeToken: 't' } as any);
+        await asked('bytedcli');
+        later(10 * 60_000);
+      }
+      expect(send).toHaveBeenCalledTimes(1);
+      later(HOUR);
+      vi.mocked(beginBytedcliLogin).mockResolvedValueOnce({ authUrl: 'https://cloud.example.test/auth-next', completeToken: 't' } as any);
+      await asked('bytedcli');
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[1][1]).toContain('auth-next');
     });
 
     it('a person who has credentials again gets nothing, and the next lapse is a new one', async () => {
@@ -298,13 +322,47 @@ describe('unattended turns (scheduled and background)', () => {
       expect(platformRequest).toHaveBeenCalledTimes(1);
     });
 
-    it('a platform card that cannot be delivered is undelivered, and an immediate retry does not ask the platform again', async () => {
+    it.each([
+      ['an undeliverable card', { ok: true, status: 'undeliverable', detail: 'x' }, 1],
+      ['its daily card cap', { ok: false, reason: 'request_cap' }, 1],
+      ['a failure, which is asked again', { ok: false, reason: 'failed', detail: 'http 503' }, 2],
+    ])('a platform answering with %s is platform_undelivered and botmux sends nothing itself', async (_name, answer, requests) => {
       bindPlatform();
       bytedcliJwts.clear();
-      platformRequest.mockResolvedValueOnce({ ok: true, status: 'undeliverable', detail: 'x' });
-      expect(await asked('bytedcli', { source: 'auto' })).toBe('undelivered');
-      expect(await asked('bytedcli', { source: 'auto' })).toBe('undelivered');
+      platformRequest.mockResolvedValue(answer as any);
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('platform_undelivered');
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('platform_undelivered');
+      expect(platformRequest).toHaveBeenCalledTimes(requests);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('a platform card for a still-missing authorization is asked for again the next day, not before', async () => {
+      bindPlatform();
+      bytedcliJwts.clear();
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('delivered');
+      later(20 * HOUR);
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('delivered');
       expect(platformRequest).toHaveBeenCalledTimes(1);
+      later(4 * HOUR);
+      expect(await asked('bytedcli', { source: 'auto' })).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(2);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('lark-cli scopes reach the platform card, and a ready answer leaves the lapse open', async () => {
+      bindPlatform();
+      platformRequest.mockResolvedValueOnce({ ok: true, status: 'ready' });
+      const notice = () => noticeUnattendedLapse({
+        appId: 'cli_bot', taskId: 't1', taskName: 'nightly', openId: ALICE, locale: 'zh', provider: 'lark-cli', url: null,
+        scopes: ['im:chat:read'], sendDirect: send,
+        botConfig: { larkAppId: 'cli_bot', larkToolBinding: true, triggerUserAuth: parseTriggerUserAuthConfig({
+          enabled: true, capabilities: ['lark-user'], credentialSource: 'auto' }) } as any,
+      });
+      expect(await notice()).toBe('delivered');
+      expect(await notice()).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(2);
+      expect(platformRequest.mock.calls[1][0]).toEqual({ unionId: 'on_alice', appId: 'cli_bot', tools: ['lark-cli'], scopes: ['im:chat:read'] });
+      expect(send).not.toHaveBeenCalled();
     });
 
     it('on a platform-bound host Meego is still sent by botmux, without any platform link', async () => {
@@ -323,6 +381,7 @@ describe('unattended turns (scheduled and background)', () => {
       const caps = ['bytecloud', 'meego'];
       expect(await asked('bytedcli', { source: 'auto', caps })).toBe('delivered');
       vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'link', authUrl: 'https://meego.example.test/device-2' } as any);
+      later(HOUR);
       expect(await asked('bytedcli', { source: 'auto', caps })).toBe('delivered');
       expect(platformRequest).toHaveBeenCalledTimes(1);
       expect(send).toHaveBeenCalledTimes(2);
@@ -491,7 +550,13 @@ describe('unattended turns (scheduled and background)', () => {
       expect(beginBytedcliLogin).not.toHaveBeenCalled();
     });
 
-    it('is read-only: no platform grant is requested, and a platform-sourced credential is not judged', async () => {
+    it('several tasks created together send one message', async () => {
+      bytedcliJwts.clear();
+      await offer(['bytecloud', 'meego']); await offer(['bytecloud', 'meego']); await offer(['bytecloud', 'meego']);
+      expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    it('requests no platform grant, and a platform-sourced credential is not judged', async () => {
       bytedcliJwts.clear();
       const requestGrant = vi.fn(async () => ({ ok: false, reason: 'network', error: 'x' }) as any);
       __setPlatformCredentialDepsForTest({

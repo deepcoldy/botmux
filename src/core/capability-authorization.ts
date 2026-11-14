@@ -84,12 +84,14 @@ export interface AuthorizationEntry { provider: UnattendedProvider; url?: string
 /**
  * The one builder of authorization entries, used by the creation offer, the
  * unattended notice and the attended refusal: every enabled capability whose
- * credential is definitely missing (read-only), each with its link, so a person
- * who lacks several is told once. `known` is the provider whose refusal led
- * here (included without re-checking; `url` when the caller already has its
- * link); `except` leaves one provider out (the caller delivers it itself).
- * Links come from the login flows, which hand back the live challenge until it
- * expires, so asking again mints nothing new.
+ * credential is definitely missing, each with its link, so a person who lacks
+ * several is told once. Whether a credential is missing is judged from stored
+ * state; the links come from the login flows, so a Meego entry or a device
+ * login link starts a login challenge (the live one is handed back until it
+ * expires, so asking again mints nothing new). `known` is the provider whose
+ * refusal led here (included without re-checking; `url` when the caller
+ * already has its link); `except` leaves one provider out (the caller delivers
+ * it itself).
  */
 export async function missingAuthorizationEntries(botConfig: BotConfig, openId: string, opts: {
   known?: { provider: UnattendedProvider; url?: string | null }; except?: UnattendedProvider; tenant?: MeegoTenant;
@@ -124,31 +126,37 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
  * Platform-backed entries become one platform authorization card (the platform
  * delivers it, botmux never sees a link); a platform without that endpoint
  * leaves them as plain credentials-page entries. `rest` is what botmux still
- * delivers itself; `platformOk` is false when the platform could not take the
- * request (nothing reached the person).
+ * delivers itself; `platform` is how the platform answered: `failed` when it
+ * could not send the card or could not be asked (nothing reached the person),
+ * `none` when no card was asked for.
  */
 async function deliverPlatformEntries(args: {
-  botConfig: BotConfig; openId: string; entries: readonly AuthorizationEntry[];
-}): Promise<{ rest: AuthorizationEntry[]; platformOk: boolean }> {
+  botConfig: BotConfig; openId: string; entries: readonly AuthorizationEntry[]; scopes?: readonly string[];
+}): Promise<{ rest: AuthorizationEntry[]; platform: 'none' | 'sent' | 'ready' | 'failed' }> {
   const rest = args.entries.filter(e => !e.platform);
-  if (rest.length === args.entries.length) return { rest, platformOk: true };
-  const result = await askPlatformToAuthorize({ botConfig: args.botConfig, openId: args.openId });
+  if (rest.length === args.entries.length) return { rest, platform: 'none' };
+  const result = await askPlatformToAuthorize({
+    botConfig: args.botConfig, openId: args.openId, ...(args.scopes ? { scopes: args.scopes } : {}),
+  });
   if (result.kind === 'legacy') {
     const url = platformAuthorizeUrl() ?? undefined;
-    return { rest: [...args.entries.filter(e => e.platform).map(({ provider }) => ({ provider, url })), ...rest], platformOk: true };
+    return { rest: [...args.entries.filter(e => e.platform).map(({ provider }) => ({ provider, url })), ...rest], platform: 'none' };
   }
-  if (result.kind === 'undeliverable' || result.kind === 'unavailable' || result.kind === 'request_cap') {
-    logger.warn(`[unattended-auth] platform authorization card not sent: ${result.kind}`);
-    return { rest, platformOk: false };
-  }
-  return { rest, platformOk: true };
+  if (result.kind === 'sent' || result.kind === 'ready') return { rest, platform: result.kind };
+  logger.warn(`[unattended-auth] platform authorization card not sent: ${result.kind}`);
+  return { rest, platform: 'failed' };
 }
+
+/** Creation offers already made per app, person and provider, so several tasks created together give one message. */
+const offeredAt = new Map<string, number>();
+const CREATION_OFFER_COOLDOWN_MS = 10 * 60_000;
 
 /**
  * Sends `openId` ONE private message with an authorization entry for every
  * capability the bot will run as them that they definitely have no credentials
- * for (platform-backed ones arrive as the platform's own card). Reads state only
- * and never blocks or fails the creation: problems are logged.
+ * for (platform-backed ones arrive as the platform's own card). A capability
+ * offered to the person within the last ten minutes is left out. Never blocks
+ * or fails the creation: problems are logged.
  */
 export async function offerAuthorizationAtCreation(args: {
   botConfig: BotConfig; openId: string; locale: Locale | undefined; sendDirect: SendDirect;
@@ -156,11 +164,16 @@ export async function offerAuthorizationAtCreation(args: {
   published?: (tool: TriggerUserAuthTool) => string | undefined;
 }): Promise<void> {
   const { botConfig, openId, locale } = args;
+  const keyOf = (e: AuthorizationEntry) => JSON.stringify([botConfig.larkAppId, openId, e.provider]);
   try {
-    const { rest: entries } = await deliverPlatformEntries({
-      botConfig, openId,
-      entries: await missingAuthorizationEntries(botConfig, openId, { published: args.published }),
+    const missing = await missingAuthorizationEntries(botConfig, openId, { published: args.published });
+    const now = Date.now();
+    const due = missing.filter(e => {
+      const last = offeredAt.get(keyOf(e));
+      return last === undefined || now - last >= CREATION_OFFER_COOLDOWN_MS;
     });
+    for (const e of due) offeredAt.set(keyOf(e), now);
+    const { rest: entries } = await deliverPlatformEntries({ botConfig, openId, entries: due });
     if (entries.some(e => e.url)) {
       const lines = entries.flatMap(({ provider, url }) =>
         url ? [t('unattended.lapse_entry', { capability: capabilityOfProvider(provider), where: url }, locale)] : []);
@@ -173,11 +186,13 @@ export async function offerAuthorizationAtCreation(args: {
 
 const capabilityOfProvider = (provider: UnattendedProvider) => provider === 'meego' ? 'meego' : capabilityOfTool(provider);
 
-/** Last link delivered per task, person and provider; a different link means the earlier one expired. */
-const lastSent = new Map<string, string>();
+/** Last notice per task, person and provider: what it carried (a link, or the platform card's day) and when. */
+const lastSent = new Map<string, { marker: string; at: number }>();
+const DAY_MS = 86_400_000;
+const LINK_NOTICE_INTERVAL_MS = 60 * 60_000;
 
-/** Forgets the lapse notices (tests). */
-export function __resetUnattendedNoticesForTest(): void { lastSent.clear(); }
+/** Forgets the lapse notices and creation offers (tests). */
+export function __resetUnattendedNoticesForTest(): void { lastSent.clear(); offeredAt.clear(); }
 
 const lapseKey = (appId: string, taskId: string, openId: string, provider: string) => JSON.stringify([appId, taskId, openId, provider]);
 
@@ -194,42 +209,64 @@ export function unattendedTask(appId: string, sessionId: string, turnId: string,
 }
 
 /**
+ * How an unattended notice ended: `undelivered` when botmux could not reach the
+ * person privately, `platform_undelivered` when the platform could not send its
+ * card or could not be asked.
+ */
+export type UnattendedNoticeOutcome = 'delivered' | 'undelivered' | 'platform_undelivered';
+
+/** What the agent is told about a command an unattended run refused for a missing credential, after the notice ended with `outcome`. */
+export function unattendedRefusalText(outcome: UnattendedNoticeOutcome | undefined, capability: string, locale: Locale | undefined): string {
+  if (outcome === 'undelivered') return t('trigger_user_auth.denied_unattended_unreachable', { capability }, locale);
+  if (outcome === 'platform_undelivered') {
+    return t('trigger_user_auth.denied_unattended_platform', { capability, url: platformAuthorizeUrl() ?? '' }, locale);
+  }
+  return t('trigger_user_auth.denied_unattended', { capability }, locale);
+}
+
+/**
  * The one private notice for an unattended run whose command was refused for a
  * missing credential, with an authorization entry for every capability the
- * person lacks. Private to the principal only: a direct message, or a card only
- * they see in the task's chat when that fails; never a plain group message, the
- * agent or a claim card. A link is delivered once per task, person and
- * provider: the keys are recorded before the send, so concurrent refusals give
- * one message, and dropped again when the send fails, so the next refusal
- * retries. A changed link (the earlier challenge expired) is sent again.
- * Resolves true once the notice is delivered or already was.
+ * person lacks and was not just told about. Private to the principal only: a
+ * direct message, or a card only they see in the task's chat when that fails;
+ * never a plain group message, the agent or a claim card. Per task, person and
+ * provider, the platform card is asked for at most once a day, and a link is
+ * sent once, a changed link (the earlier challenge expired) again but at most
+ * once an hour. The keys are recorded before the send, so concurrent refusals
+ * give one message, and dropped again when nothing reached the person (or the
+ * platform answers that nothing is missing), so the next refusal retries.
  */
 export async function deliverUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined;
-  botConfig: BotConfig;
+  botConfig: BotConfig; scopes?: readonly string[];
   entries: readonly AuthorizationEntry[]; sendDirect: SendDirect;
-}): Promise<boolean> {
+}): Promise<UnattendedNoticeOutcome> {
   const { appId, taskId, openId, locale, entries } = args;
-  const marker = (e: AuthorizationEntry) => e.platform ? 'platform' : e.url ?? '';
+  const now = Date.now();
+  const marker = (e: AuthorizationEntry) => e.platform ? `platform:${Math.floor(now / DAY_MS)}` : e.url ?? '';
   const keyOf = (e: AuthorizationEntry) => lapseKey(appId, taskId, openId, e.provider);
-  const changed = entries.filter(e => lastSent.get(keyOf(e)) !== marker(e));
-  if (!changed.length) return true;
-  for (const e of changed) lastSent.set(keyOf(e), marker(e));
-  const { rest, platformOk } = await deliverPlatformEntries({
-    botConfig: args.botConfig, openId, entries: entries.filter(e => !e.platform || changed.includes(e)),
+  const due = entries.filter(e => {
+    const last = lastSent.get(keyOf(e));
+    return !last || (last.marker !== marker(e) && (e.platform || now - last.at >= LINK_NOTICE_INTERVAL_MS));
   });
-  if (!platformOk) for (const e of changed.filter(e => e.platform)) lastSent.delete(keyOf(e));
-  if (!rest.length) return platformOk;
+  if (!due.length) return 'delivered';
+  for (const e of due) lastSent.set(keyOf(e), { marker: marker(e), at: now });
+  const { rest, platform } = await deliverPlatformEntries({
+    botConfig: args.botConfig, openId, entries: due, ...(args.scopes ? { scopes: args.scopes } : {}),
+  });
+  if (platform === 'ready' || platform === 'failed') for (const e of due.filter(e => e.platform)) lastSent.delete(keyOf(e));
+  const outcome = platform === 'failed' ? 'platform_undelivered' : 'delivered';
+  if (!rest.length) return outcome;
   const lines = rest.map(e => t('unattended.lapse_entry', {
     capability: capabilityOfProvider(e.provider),
     where: e.url ?? t(e.provider === 'meego' ? 'unattended.how_meego' : e.provider === 'bytedcli' ? 'unattended.how_bytecloud' : 'unattended.how_lark', undefined, locale),
   }, locale));
   const text = [t('unattended.lapse_notice', { task: args.taskName, capabilities: rest.map(e => capabilityOfProvider(e.provider)).join(', ') }, locale), ...lines].join('\n');
-  try { await args.sendDirect(openId, text); return platformOk; }
+  try { await args.sendDirect(openId, text); return outcome; }
   catch (error) {
     for (const e of rest) lastSent.delete(keyOf(e));
     logger.warn(`[unattended-auth] lapse notice not delivered: ${error instanceof Error ? error.message : String(error)}`);
-    return false;
+    return 'undelivered';
   }
 }
 
@@ -248,13 +285,13 @@ export function clearRestoredLapses(args: {
 /**
  * The daemon's answer to a refusal in an unattended run: nothing interactive,
  * answered at once. `ready` when the person does have credentials (no notice),
- * `unavailable` when the provider cannot be asked, else the private notice
- * with every missing entry in it: `delivered` or `undelivered`.
+ * `unavailable` when the provider cannot be asked, else how the private notice
+ * with every missing entry in it ended.
  */
 export async function requestUnattendedAuthorization(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined; botConfig: BotConfig;
   provider: UnattendedProvider; tenant?: MeegoTenant; sendDirect: SendDirect;
-}): Promise<'ready' | 'unavailable' | 'delivered' | 'undelivered'> {
+}): Promise<'ready' | 'unavailable' | UnattendedNoticeOutcome> {
   const { provider, botConfig, openId } = args;
   let url: string | undefined;
   if (provider === 'meego') {
@@ -275,14 +312,15 @@ export async function requestUnattendedAuthorization(args: {
 /**
  * The private notice for a refusal already known to be a lapse of `provider`:
  * its own entry (`url` when the caller has the link) and one for every other
- * enabled capability the person lacks, in one message.
+ * enabled capability the person lacks, in one message. `scopes` are the extra
+ * lark-cli scopes the refused command needs, asked of the platform with its card.
  */
 export async function noticeUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined; botConfig: BotConfig;
-  provider: UnattendedProvider; url?: string | null; tenant?: MeegoTenant; sendDirect: SendDirect;
-}): Promise<'delivered' | 'undelivered'> {
+  provider: UnattendedProvider; url?: string | null; tenant?: MeegoTenant; scopes?: readonly string[]; sendDirect: SendDirect;
+}): Promise<UnattendedNoticeOutcome> {
   const entries = await missingAuthorizationEntries(args.botConfig, args.openId, {
     known: { provider: args.provider, url: args.url }, tenant: args.tenant,
   });
-  return await deliverUnattendedLapse({ ...args, entries }) ? 'delivered' : 'undelivered';
+  return await deliverUnattendedLapse({ ...args, entries });
 }

@@ -52,6 +52,19 @@ describe('askPlatformToAuthorize', () => {
     expect(requests[0]!.unionId).toBe('on_given');
   });
 
+  it('a lookup that never answers gives up after 15 s and does not block later requests', async () => {
+    vi.useFakeTimers();
+    try {
+      const { requests, deps } = setup();
+      deps.unionIdFor.mockReturnValueOnce(new Promise<string | null>(() => {}));
+      const first = askPlatformToAuthorize({ botConfig: bot(['lark-user']), openId: 'ou_a' }, deps);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await first).toEqual({ kind: 'unavailable' });
+      expect(await askPlatformToAuthorize({ botConfig: bot(['lark-user']), openId: 'ou_a' }, deps)).toEqual({ kind: 'sent', deduped: false });
+      expect(requests).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('is unavailable, and sends nothing, when the union id cannot be resolved', async () => {
     const { requests, deps } = setup();
     deps.unionIdFor.mockResolvedValue(null);

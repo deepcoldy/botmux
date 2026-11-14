@@ -1155,6 +1155,28 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       }
     });
 
+    it('--unattended on a bound host whose platform cannot send its card: the agent is told so, with the credentials page, and nothing about availability', async () => {
+      __resetPlatformAuthorizationRequestForTest();
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }) as any,
+        resolveUnionId: async () => 'on_sender',
+      });
+      vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization').mockResolvedValue({ ok: true, status: 'undeliverable', detail: 'x' } as any);
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, capabilities: ['bytecloud'] },
+      } } as any);
+      try {
+        const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+        const body = await (await ask({ unattended: true, provider: 'bytedcli' })).json() as { message: string };
+        expect(body).toMatchObject({ ok: true, status: 'platform_undelivered' });
+        expect(body.message).toContain('https://platform.example.test/credentials');
+        expect(body.message).not.toContain('可用范围');
+        expect(dm).not.toHaveBeenCalled();
+      } finally {
+        __setPlatformCredentialDepsForTest(null);
+      }
+    });
+
     it('--unattended ByteCloud answers at once with one DM and no wait', async () => {
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       const body = await (await ask({ unattended: true, provider: 'bytedcli' })).json();
@@ -1187,8 +1209,22 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect((await ask({ provider: 'lark-cli' })).status).toBe(409);
       expect(await (await ask({ provider: 'lark-cli', unattended: true })).json()).toMatchObject({ ok: true, status: 'delivered' });
       session.managedTurnOrigin.identityTurnId = undefined;
-      expect((await ask({ provider: 'lark-cli', unattended: true })).status).toBe(400);
+      expect((await ask({ provider: 'lark-cli' })).status).toBe(400);
       expect(dm).toHaveBeenCalledTimes(1);
+    });
+
+    it('a refusal marked unattended while someone else attends the live turn starts nothing for them', async () => {
+      session.managedTurnOrigin.identityTurnId = undefined;
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      for (const provider of ['bytedcli', 'meego']) {
+        const response = await ask({ provider, unattended: true });
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ ok: false, status: 'refused', error: 'unattended_turn_mismatch' });
+      }
+      expect(bytedcliAuth.beginBytedcliLogin).not.toHaveBeenCalled();
+      expect(meegoAuth.requestMeegoLogin).not.toHaveBeenCalled();
+      expect(dm).not.toHaveBeenCalled();
+      expect(replies).toEqual([]);
     });
 
     it('--unattended Meego whose private notice could not be sent reports undelivered', async () => {

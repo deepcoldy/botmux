@@ -27,6 +27,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 import { __resetPlatformAuthorizationRequestForTest } from '../src/core/platform-authorization-request.js';
 import * as credentialRequestClient from '../src/platform/credential-request-client.js';
+import { t } from '../src/i18n/index.js';
 import {
   createProtectedLoopbackProxyAttestation,
   PROTECTED_LOOPBACK_ATTESTATION_HEADER,
@@ -222,7 +223,9 @@ describe('session application identity route', () => {
     for (const [path, body] of [['lark-tool-identity', { mode: 'user', as: 'ou_x' }], ['auth-request', { scopes: ['im:chat:read'], as: 'ou_x' }], ['auth-status', { requestId: 'r', as: 'ou_x' }]] as const) {
       const response = await post(path, body);
       expect(response.status, path).toBe(403);
-      expect(JSON.stringify(await response.json())).toContain('delegated');
+      const answer = await response.json() as { error: string };
+      if (path === 'lark-tool-identity') expect(answer.error).toContain('BOTMUX_AS cannot name anyone in this turn');
+      else expect(answer).toEqual({ ok: false, error: 'as_unavailable' });
     }
   });
   it('authorizes the delegated human through the bound tool and retries with the target app token', async () => {
@@ -663,7 +666,7 @@ describe('session application identity route', () => {
     });
     const identity = await post('lark-tool-identity', { mode: 'user', as: 'ou_other' });
     expect(identity.status).toBe(403);
-    expect(((await identity.json()) as { error: string }).error).toContain('does not allow running a command for another speaker');
+    expect(((await identity.json()) as { error: string }).error).toContain('BOTMUX_AS cannot name anyone in this turn');
     for (const [path, body] of [['auth-request', { scopes: ['im:chat:read'], as: 'ou_other' }], ['auth-status', { requestId: 'r', as: 'ou_other' }]] as const) {
       const response = await post(path, body);
       expect(response.status, path).toBe(403);
@@ -1021,5 +1024,75 @@ describe('platform-issued user credentials in a bound session', () => {
       }
       expect(dm).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('unattended lark-cli turn on a platform-bound host', () => {
+  const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
+  const TRIGGERED = 'trg_abc12345';
+  let platformRequest: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    session.managedTurnOrigin.turnId = TRIGGERED;
+    session.managedTurnOrigin.identityTurnId = TRIGGERED;
+    __resetUnattendedNoticesForTest();
+    __resetPlatformAuthorizationRequestForTest();
+    platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
+      .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user'], credentialSource: 'auto' }) } } as any);
+  });
+  afterEach(() => __setPlatformCredentialDepsForTest(null));
+  const bind = (requestGrant: () => Promise<unknown>) => __setPlatformCredentialDepsForTest({
+    readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender', requestGrant: requestGrant as any,
+  });
+
+  it('a platform outage is passed through as the platform\'s own refusal, not as a missing authorization', async () => {
+    bind(async () => ({ ok: false, reason: 'unavailable', status: 503, error: 'store_unavailable' }));
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const response = await request('user');
+    const body = await response.json() as { error: string };
+    expect(response.status).toBe(403);
+    expect(body.error).toContain('temporarily unavailable');
+    expect(body.error).not.toContain('授权缺失');
+    expect(platformRequest).not.toHaveBeenCalled();
+    expect(dm).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['its daily card cap', { ok: false, reason: 'request_cap' }],
+    ['a failure', { ok: false, reason: 'failed', detail: 'http 503' }],
+    ['an undeliverable card', { ok: true, status: 'undeliverable', detail: 'x' }],
+  ])('a platform answering with %s is reported as the platform not sending its card, with the credentials page', async (_name, answer) => {
+    platformRequest.mockResolvedValue(answer as any);
+    bind(async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found' }));
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const body = await (await request('user')).json() as { error: string };
+    expect(body.error).toContain(t('trigger_user_auth.denied_unattended_platform', {
+      capability: 'lark-user', url: 'https://platform.example.test/credentials',
+    }, 'zh'));
+    expect(body.error).not.toContain('可用范围');
+    expect(dm).not.toHaveBeenCalled();
+  });
+
+  it('auth request --scope asks the platform for those scopes, and a ready answer does not count as notified', async () => {
+    bind(async () => ({ ok: true, value: { tool: 'lark-cli', unionId: 'on_sender', expiresAt: Date.now() + 3_600_000,
+      variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't' } } }));
+    platformRequest.mockResolvedValueOnce({ ok: true, status: 'ready' });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    vi.spyOn(tokens, 'requestUserAuthorization').mockRejectedValue(new Error('must not be used'));
+    const ask = () => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['im:chat:read'] }),
+    });
+    const first = await ask();
+    expect(first.status).toBe(409);
+    expect(await first.json()).toMatchObject({ ok: false, status: 'refused', error: 'unattended_turn' });
+    expect(await (await ask()).json()).toMatchObject({ error: 'unattended_turn' });
+    expect(platformRequest).toHaveBeenCalledTimes(2);
+    for (const [req] of platformRequest.mock.calls) {
+      expect(req).toEqual({ unionId: 'on_sender', appId: 'cli_bound', tools: ['lark-cli'], scopes: ['im:chat:read'] });
+    }
+    expect(dm).not.toHaveBeenCalled();
   });
 });

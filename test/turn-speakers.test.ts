@@ -8,6 +8,7 @@ import { chooseTurnSpeaker } from '../src/core/turn-speakers.js';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { forgetProvenIdentityContent, renderIdentityWrapper, writeSessionIdentity } from '../src/core/cli-identity.js';
 import { prepareLarkToolEnv, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { clearLarkToolDelegations, rememberLarkToolDelegation } from '../src/core/lark-tool-delegation.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as bots from '../src/bot-registry.js';
@@ -88,6 +89,7 @@ describe('BOTMUX_AS on the identity routes', () => {
   });
   afterEach(async () => {
     await ipc.close(); config.session.dataDir = previousDataDir; setIpcAuthSecret(null); vi.restoreAllMocks();
+    clearLarkToolDelegations(dir, 'speaker-session');
     rmSync(dir, { recursive: true, force: true });
   });
   const fetchIdentity = (as?: string) => fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
@@ -161,6 +163,43 @@ describe('BOTMUX_AS on the identity routes', () => {
     expect(named.status).toBe(403);
     expect(await named.json()).toMatchObject({ reason: 'as_unavailable' });
     expect(JSON.stringify(await (await fetchIdentity()).json())).toContain('jwt-owner');
+  });
+  describe('a turn that acts for one fixed person', () => {
+    const post = (path: string, body: object) => fetch(`http://127.0.0.1:${ipc.port}/api/sessions/speaker-session/${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify(body),
+    });
+    const expectRefusedOnEveryRoute = async (as: string) => {
+      const identity = await fetchIdentity(as);
+      expect(identity.status).toBe(403);
+      expect(await identity.json()).toMatchObject({ status: 'blocked', reason: 'as_unavailable' });
+      const larkTool = await post('lark-tool-identity', { mode: 'user', as });
+      expect(larkTool.status).toBe(403);
+      expect(((await larkTool.json()) as { error: string }).error).toContain('BOTMUX_AS cannot name anyone in this turn');
+      for (const body of [{ provider: 'bytedcli', as }, { provider: 'bytedcli', as, unattended: true }, { scopes: ['im:chat:read'], as }]) {
+        const response = await post('auth-request', body);
+        expect(response.status, JSON.stringify(body)).toBe(403);
+        expect(await response.json()).toEqual({ ok: false, error: 'as_unavailable' });
+      }
+    };
+    beforeEach(() => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_turn', larkAppSecret: 's', brand: 'feishu',
+        triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['bytecloud', 'lark-user'], credentialSource: 'local', allowSpeakerSwitch: true }) } } as any);
+    });
+    it('refuses BOTMUX_AS on every route once someone interjects in a scheduled turn', async () => {
+      const turn = 'schedule:task1:11111111-1111-4111-8111-111111111111';
+      session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_b', identityTurnId: turn, callerOpenId: 'ou_first',
+        speakers: [{ openId: 'ou_second', turnId: 'om_b' }] };
+      writeSessionIdentity(dir, 'speaker-session', { tool: 'bytedcli', cloudJwt: 'jwt-owner', turnId: turn, openId: 'ou_first' }, 'proven');
+      writeSessionIdentity(dir, 'speaker-session', { tool: 'bytedcli', cloudJwt: 'jwt-second-b', turnId: 'om_b', openId: 'ou_second' }, 'proven');
+      await expectRefusedOnEveryRoute('ou_second');
+      expect(JSON.stringify(await (await fetchIdentity()).json())).toContain('jwt-owner');
+    });
+    it('refuses BOTMUX_AS on every route in a delegated turn', async () => {
+      rememberLarkToolDelegation(dir, 'speaker-session', 'om_first', {
+        credentialOpenId: 'ou_src', unionId: 'on_target', targetOpenId: 'ou_target', tools: ['bytedcli', 'lark-cli'], dispatchRoot: 'om_first',
+      } as any);
+      await expectRefusedOnEveryRoute('ou_second');
+    });
   });
   it('sends the authorization entry for a speaker without credentials to that speaker only', async () => {
     const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');

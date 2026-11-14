@@ -1498,9 +1498,9 @@ const BYTEDCLI_AUTH_REQUEST_FN: readonly string[] = [
   '}',
 ];
 
-const UNATTENDED_LOGIN_MSG = 'botmux: 无人值守的运行不会发起 ByteCloud 登录；任务执行人对 ByteCloud 的授权缺失时，命令未执行，任务会在重新授权后再次运行。';
+const UNATTENDED_LOGIN_MSG = 'botmux: 无人值守的运行不会发起 ByteCloud 登录；任务执行人对 ByteCloud 的授权缺失时，命令未执行；授权后，任务下次触发时会正常运行。';
 const UNATTENDED_WEBSESSION_MSG = 'botmux: 无人值守的运行无法完成浏览器会话登录（auth login --session）；命令未执行，请在有人值守的对话里由本人执行。';
-const UNATTENDED_MEEGO_MSG = 'botmux: 无人值守的运行不会发起 Meego 登录；任务执行人的 Meego 登录缺失时，命令未执行，任务会在重新登录后再次运行。';
+const UNATTENDED_MEEGO_MSG = 'botmux: 无人值守的运行不会发起 Meego 登录；任务执行人的 Meego 登录缺失时，命令未执行；登录后，任务下次触发时会正常运行。';
 const UNATTENDED_LOGIN_READY_MSG = 'botmux: 无人值守的运行不会登录；任务执行人的 ByteCloud 凭据有效，请直接运行要执行的命令，不需要登录。';
 const UNATTENDED_MEEGO_READY_MSG = 'botmux: 无人值守的运行不会登录；任务执行人的 Meego 登录有效，请直接运行要执行的命令，不需要登录。';
 const BYTECLOUD_LOGIN_UNREACHABLE_MSG = 'botmux: ByteCloud 登录由 botmux 发起，授权链接只私下发给你本人；但现在联系不上 botmux，命令未执行。请稍后重试。';

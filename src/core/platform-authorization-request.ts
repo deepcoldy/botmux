@@ -13,6 +13,7 @@ import {
   type CredentialRequest,
   type CredentialRequestResult,
 } from '../platform/credential-request-client.js';
+import { withHardTimeout } from '../platform/credential-grant-client.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { logger } from '../utils/logger.js';
 import { policyFromConfig } from './identity-policy.js';
@@ -54,9 +55,13 @@ const realDeps: Deps = {
   now: () => Date.now(),
 };
 
-/** Answers remembered per app, person and scopes; the in-flight request is shared by concurrent refusals. */
+/** Answers remembered per app, person and scopes for a few minutes, so a repeat is marked as one. */
 type Remembered = Extract<PlatformAuthorizationRequestResult, { kind: 'sent' | 'undeliverable' | 'request_cap' }>;
-const recent = new Map<string, { at: number; answer?: Remembered; pending?: Promise<PlatformAuthorizationRequestResult> }>();
+const recent = new Map<string, { at: number; answer: Remembered }>();
+/** The request in flight per app, person and scopes, shared by concurrent refusals. */
+const inFlight = new Map<string, Promise<PlatformAuthorizationRequestResult>>();
+/** However the union_id lookup or the platform hangs, a refusal is answered within this. */
+const ASK_TIMEOUT_MS = 15_000;
 
 /** The same answer again within the window: a sent card is deduped, a failure is marked as a repeat. */
 function asRepeat(answer: PlatformAuthorizationRequestResult): PlatformAuthorizationRequestResult {
@@ -83,14 +88,16 @@ export async function askPlatformToAuthorize(
   const key = JSON.stringify([args.botConfig.larkAppId, who, scopes]);
   const now = d.now();
   const hit = recent.get(key);
-  if (hit?.pending) return asRepeat(await hit.pending);
-  if (hit?.answer && now - hit.at < LINK_RESEND_MS) return asRepeat(hit.answer);
-  for (const [k, v] of recent) if (!v.pending && now - v.at >= LINK_RESEND_MS) recent.delete(k);
-  const pending = ask(args, scopes, d);
-  recent.set(key, { at: now, pending });
-  const result = await pending;
+  if (hit && now - hit.at < LINK_RESEND_MS) return asRepeat(hit.answer);
+  for (const [k, v] of recent) if (now - v.at >= LINK_RESEND_MS) recent.delete(k);
+  const shared = inFlight.get(key);
+  if (shared) return asRepeat(await shared);
+  const pending = withHardTimeout(() => ask(args, scopes, d), ASK_TIMEOUT_MS)
+    .catch(() => unavailable(`no answer within ${ASK_TIMEOUT_MS}ms`));
+  inFlight.set(key, pending);
+  let result: PlatformAuthorizationRequestResult;
+  try { result = await pending; } finally { inFlight.delete(key); }
   if (result.kind === 'sent' || result.kind === 'undeliverable' || result.kind === 'request_cap') recent.set(key, { at: d.now(), answer: result });
-  else recent.delete(key);
   return result;
 }
 
@@ -129,4 +136,5 @@ function unavailable(detail: string): PlatformAuthorizationRequestResult {
 /** @internal test-only */
 export function __resetPlatformAuthorizationRequestForTest(): void {
   recent.clear();
+  inFlight.clear();
 }

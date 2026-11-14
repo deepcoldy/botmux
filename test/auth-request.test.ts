@@ -66,6 +66,7 @@ describe('auth request arguments', () => {
     expect(providerAuthExitCode(true, 'ready')).toBe(0);
     for (const status of ['delivered', 'pending', 'undeliverable']) expect(providerAuthExitCode(true, status)).toBe(3);
     expect(providerAuthExitCode(true, 'unavailable')).toBe(4);
+    for (const status of ['undelivered', 'platform_undelivered']) expect(providerAuthExitCode(true, status)).toBe(5);
     expect(providerAuthExitCode(false, 'refused')).toBe(3);
     expect(providerAuthExitCode(false, undefined)).toBe(1);
     expect(providerAuthExitCode(true, 'something-new')).toBe(1);

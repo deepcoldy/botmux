@@ -7691,6 +7691,25 @@ describe('handleCommand', () => {
       expect(reply(deps)).toContain('https://lark.example.com/device');
     });
 
+    it('auto + bound: /login status names the platform as the only source and reports no machine-local login', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true);
+      (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
+      for (const local of [false, true]) {
+        vi.mocked(hasBytedcliHome).mockResolvedValue(local);
+        vi.mocked(hasLarkCliHome).mockReturnValue(local);
+        (deps.sessionReply as ReturnType<typeof vi.fn>).mockClear();
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+        const status = reply(deps);
+        expect(status).toContain(t('cmd.login.platform_status', { tool: 'lark-cli / bytedcli', url: PAGE }, 'zh'));
+        expect(status).toContain('只从平台获取');
+        for (const key of ['cmd.login.bytedcli_status_yes', 'cmd.login.bytedcli_status_no', 'cmd.login.lark_status_yes', 'cmd.login.lark_status_no']) {
+          expect(status).not.toContain(t(key, undefined, 'zh'));
+        }
+      }
+      vi.mocked(hasBytedcliHome).mockResolvedValue(false);
+      vi.mocked(hasLarkCliHome).mockReturnValue(false);
+    });
+
     it('auto + bound: bare /login has the platform send the card and starts no local login', async () => {
       const deps = withPolicy({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true);
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login', { senderUnionId: 'on_sender' }), deps, LARK_APP_ID);

@@ -1,7 +1,28 @@
 import type { TrustedCaller } from '../types.js';
+import { capabilityOn, type IdentityRouteTool, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { capabilityOfTool } from './identity-policy.js';
+import { getLarkToolDelegation } from './lark-tool-delegation.js';
+import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 
 /** One human whose message is part of the running turn, with the message turn that carries their identity material. */
 export interface TurnSpeaker { openId: string; turnId: string }
+
+/**
+ * The speakers `BOTMUX_AS` may name in the live turn. None unless the bot allows switching speakers
+ * for the capability governing `tool`, and none in a turn nobody attends or one acting under a
+ * delegation: those act for one fixed person, whoever interjected since. The turn is judged by its
+ * identity turn (`identityTurnId`, else the envelope turn), the one whose principal the call acts for.
+ */
+export function governedSpeakers(args: {
+  policy: TriggerUserAuthConfig | undefined; tool: IdentityRouteTool; sessionDataDir: string; sessionId: string;
+  origin: { turnId?: string; identityTurnId?: string; speakers?: readonly TurnSpeaker[] } | undefined;
+}): readonly TurnSpeaker[] | undefined {
+  const { policy, origin } = args;
+  const turnId = origin?.identityTurnId ?? origin?.turnId;
+  if (!turnId || policy?.allowSpeakerSwitch !== true || !capabilityOn(policy, capabilityOfTool(args.tool))) return undefined;
+  if (isUnattendedIdentityTurnId(turnId) || getLarkToolDelegation(args.sessionDataDir, args.sessionId, turnId)) return undefined;
+  return origin?.speakers;
+}
 
 /**
  * The human speaker an inbound message adds to a turn; none for bots, schedules and recoveries.

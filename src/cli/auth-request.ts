@@ -80,7 +80,7 @@ export function providerAuthExitCode(ok: boolean, status: unknown): number {
   switch (status) {
     case 'ready': return 0;
     case 'delivered': case 'pending': case 'undeliverable': return 3;
-    case 'undelivered': return 5;
+    case 'undelivered': case 'platform_undelivered': return 5;
     case 'unavailable': return 4;
     default: return 1;
   }
