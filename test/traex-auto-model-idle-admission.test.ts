@@ -230,6 +230,51 @@ describe('idle auto-model input after a transient admission refusal', () => {
     expect(await keys).toBe(true);
   });
 
+  it('keeps queued input out of a TUI text answer whose text is pasted after a pause', async () => {
+    const h = idleAdmissionHarness();
+    const { scope } = h;
+    let reachedPause!: () => void;
+    const paused = new Promise<void>(resolve => { reachedPause = resolve; });
+    let resume!: () => void;
+    const resumed = new Promise<void>(resolve => { resume = resolve; });
+    Object.assign(scope, {
+      cliLifetimeNonce: 1, logError: vi.fn(), KEY_TO_ANSI: { Down: '\x1b[B' },
+      sendTuiKeySequence, strictInputHandle: (backend: unknown) => backend,
+      // 导航键之后、正文之前的停顿由测试放行：取屏在这段停顿里开始。
+      submitTuiTextInput: (options: Parameters<typeof submitTuiTextInput>[0]) =>
+        submitTuiTextInput({ ...options, pause: () => { reachedPause(); return resumed; } }),
+    });
+    scope.backend.write = vi.fn(() => true);
+    let release!: (screen: string) => void;
+    let flushed!: Promise<void>;
+    const typed: string[] = [];
+    scope.cliAdapter.writeInput = vi.fn(async (target: { write: (data: string) => unknown }, content: string) => {
+      target.write(content);
+      typed.push(content);
+      if (content === 'answer') {
+        // 正文已写进终端、文本事务还没收尾：在途的旧截图此刻才返回。
+        release('❯ Use /skills to list available skills');
+        await flushed;
+      }
+      return { submitted: true };
+    });
+    const answer = loadWorkerFunction('handleTuiTextInput', scope)(['Down'], 'answer');
+    await paused;
+    expect(scope.backend.write).toHaveBeenCalledWith('\x1b[B');
+    let captureStarted!: () => void;
+    const capturing = new Promise<void>(resolve => { captureStarted = resolve; });
+    scope.backend.captureViewportAsync.mockImplementationOnce(() => {
+      captureStarted();
+      return new Promise<string>(resolve => { release = resolve; });
+    });
+    flushed = h.flush();
+    await capturing;
+    resume();
+    expect(await answer).toBe(true);
+    expect(typed).toEqual(['answer']);
+    expect(scope.pendingMessages).toHaveLength(1);
+  });
+
   it.each(['final keys', 'quick Enter', 'native question', 'text answer', 'prompt submitted', 'busy event'] as const)(
     'does not send rename after %s invalidates an in-flight capture', async control => {
       vi.useFakeTimers();
@@ -240,10 +285,11 @@ describe('idle auto-model input after a transient admission refusal', () => {
       Object.assign(scope, {
         cliLifetimeNonce: 1, logError: vi.fn(), KEY_TO_ANSI: { Enter: '\r' },
         sendTuiKeySequence, strictInputHandle: (backend: unknown) => backend,
-        // bun:test 的假定时器接不住导入 ESM 模块异步续体里调度的 setTimeout
-        // （跨模块边界时该定时器既不被 advance 触发也不按墙钟触发，用例挂到超时），
-        // 注入无定时器的 pause，与 tui-input-delivery.test.ts 的做法一致；
-        // 真实写入、追踪代理与失效计数路径全部保留。
+        // bun:test 的 advanceTimersByTimeAsync 先推进时钟、之后才让出微任务；
+        // defaultPause 要经过几次 await 才注册 setTimeout，推进时它还不存在，
+        // 假时钟下又不会按墙钟触发，用例挂到超时（同文件内同样写法也挂，与是否
+        // 跨模块无关）。注入无定时器的 pause，与 tui-input-delivery.test.ts 的
+        // 做法一致；真实写入、追踪代理与失效计数路径全部保留。
         submitTuiTextInput: (options: Parameters<typeof submitTuiTextInput>[0]) =>
           submitTuiTextInput({ ...options, pause: async () => {} }),
         bindSessionObservation: (callback: unknown) => callback,
