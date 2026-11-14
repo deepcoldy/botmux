@@ -10379,6 +10379,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
+    providerRecovery: (() => { try { return getBot(cachedLarkAppId).config.providerRecovery ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -12060,6 +12061,21 @@ botConfigPutRoute<{ promptCache?: unknown }>('/api/bot-prompt-cache', 'promptCac
     return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
   },
   respond: value => ({ ok: true, promptCache: value ?? null }),
+});
+
+// Per-bot automatic continuation after transient provider failures. Body
+// `{ providerRecovery?: { enabled?, maxWaitMinutes? } | null }`: null/缺省 → 删除本 bot
+// 覆盖，回落全局 config.json `providerRecovery`（都没配 = 关闭）。daemon 实时读取：
+// 新轮次立即按新值，关闭时正在等待的续跑收尾并发通知。
+botConfigPutRoute<{ providerRecovery?: unknown }>('/api/bot-provider-recovery', 'providerRecovery', {
+  notBound: NOT_BOUND_BODY.okFalse,
+  normalize: (body, spec) => {
+    if (body.providerRecovery === null || body.providerRecovery === undefined) return fieldOk(null);
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.providerRecovery));
+    if (!parsed.ok && parsed.reason === 'empty') return fieldOk(null);
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, providerRecovery: value ?? null }),
 });
 
 botConfigPutRoute<{ feedback?: unknown }>('/api/bot-feedback', 'feedback', {

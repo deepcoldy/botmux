@@ -438,6 +438,49 @@ describe('classifyClaudeTerminalEvent', () => {
       retryable: true,
     });
   });
+
+  it('carries the provider\'s own retry time on a retryable failure (11-13 gateway record)', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'gateway-503',
+      timestamp: '2026-11-13T11:08:18.238Z',
+      isApiErrorMessage: true,
+      error: 'server_error',
+      apiErrorStatus: 503,
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: 503 no eligible upstream account is currently available; '
+          + 'the earliest account is expected to be available at 2026-11-13T11:10:16Z. This is a server-side '
+          + 'issue, usually temporary — try again in a moment.' }],
+      },
+    };
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+      retryAtMs: Date.parse('2026-11-13T11:10:16Z'),
+    });
+    // A relative hint is anchored at the record, not at whenever it is read.
+    expect(classifyClaudeTerminalEvent({
+      ...ev,
+      message: { ...ev.message!, content: [{ type: 'text', text: 'API Error: 529 overloaded, retry after 40s' }] },
+    })).toMatchObject({ retryAtMs: Date.parse('2026-11-13T11:08:58.238Z') });
+  });
+
+  it('keeps a retry time off a failure that is not retryable', () => {
+    const outcome = classifyClaudeTerminalEvent({
+      type: 'assistant',
+      uuid: 'auth-401',
+      timestamp: '2026-11-13T11:08:18.238Z',
+      isApiErrorMessage: true,
+      error: 'authentication_failed',
+      apiErrorStatus: 401,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 401 try again in 30 seconds' }] },
+    });
+    expect(outcome).toEqual({ status: 'failed', errorCode: 'provider_authentication_failed', retryable: false });
+  });
 });
 
 describe('extractAssistantText / joinAssistantText', () => {

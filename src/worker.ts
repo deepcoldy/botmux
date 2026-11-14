@@ -12407,6 +12407,11 @@ function emitReadyTurns(opts: {
       continue;
     }
     if (outcome && outcome.status !== 'completed') {
+      const providerTiming = {
+        ...(outcome.status === 'failed' && outcome.retryAtMs !== undefined ? { retryAtMs: outcome.retryAtMs } : {}),
+        ...(turn.terminalProviderLastSuccessAtMs !== undefined
+          ? { lastSuccessAtMs: turn.terminalProviderLastSuccessAtMs } : {}),
+      };
       emitTurnTerminal(
         turn.turnId,
         outcome.status,
@@ -12416,6 +12421,8 @@ function emitReadyTurns(opts: {
         outcome.retryable,
         undefined,
         turn.terminalErrorDetail,
+        undefined,
+        Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
       );
       continue;
     }
@@ -34975,6 +34982,9 @@ function emitTurnTerminal(
    *  and clipped below, before it leaves the worker. */
   errorDetail?: string,
   continuationFailure?: RuntimeExecutionContinuationFailure,
+  /** Non-completed terminals only: the provider's retry hint and the last
+   *  request it answered (see the turn_terminal fields of the same names). */
+  providerTiming?: { retryAtMs?: number; lastSuccessAtMs?: number },
 ): void {
   if (!sessionId || !turnId) return;
   if (workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(turnId, dispatchAttempt)) return;
@@ -35029,6 +35039,10 @@ function emitTurnTerminal(
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
     ...diagnostics,
+    ...(status !== 'completed' && Number.isFinite(providerTiming?.retryAtMs)
+      ? { providerRetryAtMs: providerTiming!.retryAtMs } : {}),
+    ...(status !== 'completed' && Number.isFinite(providerTiming?.lastSuccessAtMs)
+      ? { providerLastSuccessAtMs: providerTiming!.lastSuccessAtMs } : {}),
   };
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {

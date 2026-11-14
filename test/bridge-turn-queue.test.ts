@@ -177,6 +177,80 @@ describe('BridgeTurnQueue', () => {
     });
   });
 
+  it('stamps a failure with the last request the provider answered before it, even from an earlier turn', () => {
+    const q = new BridgeTurnQueue();
+    const reply = (uuid: string, timestamp: string, extra: Partial<TranscriptEvent> = {}): TranscriptEvent => ({
+      type: 'assistant', uuid, timestamp,
+      message: { role: 'assistant', model: 'claude-x', content: [{ type: 'text', text: `reply ${uuid}` }], stop_reason: 'end_turn' },
+      ...extra,
+    });
+    const apiError = (uuid: string, timestamp: string, text: string): TranscriptEvent => ({
+      type: 'assistant', uuid, timestamp, isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 503,
+      message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text }], stop_reason: 'stop_sequence' },
+    });
+    q.mark('t1');
+    q.ingest([user('u1', 'first'), reply('a1', '2026-11-13T11:07:58.000Z'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'd1' }]);
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toHaveLength(1);
+    q.mark('t2');
+    q.ingest([
+      user('u2', 'second'),
+      // Neither a sub-agent's reply nor a no-model placeholder is an answer
+      // from the main conversation's provider.
+      reply('side', '2026-11-13T11:08:05.000Z', { isSidechain: true } as Partial<TranscriptEvent>),
+      apiError('e2', '2026-11-13T11:08:18.238Z',
+        'API Error: 503 no eligible upstream account; the earliest account is expected to be available at 2026-11-13T11:10:16Z.'),
+    ]);
+    const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(failed.turnId).toBe('t2');
+    expect(failed.terminalOutcome).toEqual({
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+      retryAtMs: Date.parse('2026-11-13T11:10:16Z'),
+    });
+    expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+  });
+
+  it('keeps the newest answer when older history is read again, and does not count a no-model placeholder', () => {
+    const q = new BridgeTurnQueue();
+    const record = (uuid: string, timestamp: string, model: string, text: string): TranscriptEvent => ({
+      type: 'assistant', uuid, timestamp,
+      message: { role: 'assistant', model, content: [{ type: 'text', text }], stop_reason: 'stop_sequence' },
+    });
+    q.mark('t1');
+    q.ingest([user('u1', 'first'),
+      record('a-new', '2026-11-13T11:07:58.000Z', 'claude-x', 'answer'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'd1' }]);
+    q.drainEmittable({ explicitTerminalOnly: true });
+    q.mark('t2');
+    q.ingest([
+      user('u2', 'second'),
+      // A replayed record from before (journal restore / rotation) is older.
+      record('a-old', '2026-11-13T10:00:00.000Z', 'claude-x', 'old answer'),
+      // Claude Code's placeholder written without calling the model.
+      record('a-syn', '2026-11-13T11:08:10.000Z', '<synthetic>', 'No response requested.'),
+      {
+        type: 'assistant', uuid: 'e2', timestamp: '2026-11-13T11:08:18.238Z', isApiErrorMessage: true, error: 'server_error',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 503' }], stop_reason: 'stop_sequence' },
+      },
+      { type: 'system', subtype: 'turn_duration', uuid: 'd2' },
+    ]);
+    const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(failed.terminalOutcome?.status).toBe('failed');
+    expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+  });
+
+  it('leaves the last success unknown when no reply was read since the queue started', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    q.ingest([user('u1'), {
+      type: 'assistant', uuid: 'e1', timestamp: '2026-11-13T11:08:18.238Z', isApiErrorMessage: true, error: 'server_error',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500' }], stop_reason: 'stop_sequence' },
+    }]);
+    const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(failed.terminalOutcome?.status).toBe('failed');
+    expect(failed.terminalProviderLastSuccessAtMs).toBeUndefined();
+  });
+
   it('preserves an unexpected EOF failure when turn_duration closes the boundary', () => {
     const q = new BridgeTurnQueue();
     q.mark('om_original');
