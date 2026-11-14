@@ -22,6 +22,8 @@ import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
+import { noteNextStepTurnStarted } from '../../core/next-step-suggestion.js';
+import { nextStepIo } from '../../core/next-step-io.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { messageMentionsBot } from './message-parser.js';
@@ -2574,6 +2576,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
+    // Like beginNewTurn: the previous turn's「下一步」row comes off.
+    noteNextStepTurnStarted(ds, turnId, nextStepIo);
     ds.currentTurnTitle = topicTitle.slice(0, 50);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
