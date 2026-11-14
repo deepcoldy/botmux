@@ -58,9 +58,7 @@ export type OrdinaryTurnRecoveryStopReason =
  *   otherwise on the backoff ladder.
  * - Continuations stop once the window closes. It is measured from the last
  *   request the provider answered — while its (1 h) prompt cache is still warm
- *   a continuation picks up cheaply; later it rewrites the whole context. The
- *   same reasoning as the cache-keeper mod, which wakes 54 min after the last
- *   request.
+ *   a continuation picks up cheaply; later it rewrites the whole context.
  */
 export interface OrdinaryTurnRecoveryPacing {
   /** Delays without a provider hint; the last entry repeats. Restarts after a
