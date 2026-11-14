@@ -21,6 +21,13 @@ const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_ATTACHMENTS = 8;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+export class QuotedAttachmentCountError extends Error {
+  constructor(readonly actualCount: number, readonly limitCount: number) {
+    super(`quoted returned more than ${limitCount} attachments: ${actualCount}`);
+    this.name = 'QuotedAttachmentCountError';
+  }
+}
+
 export class QuotedAttachmentLimitError extends Error {
   constructor(readonly actualBytes: number, readonly limitBytes: number) {
     super(`quoted attachments exceed the transfer limit: ${actualBytes} bytes > ${limitBytes} bytes`);
@@ -148,7 +155,7 @@ export function quotedAttachments(
   const totalCount = holders.reduce((count, holder) => count + (holder.attachments as unknown[]).length, 0);
   if (totalCount === 0) return { stdout };
   if (totalCount > MAX_ATTACHMENTS) {
-    throw new Error(`quoted returned more than ${MAX_ATTACHMENTS} attachments`);
+    throw new QuotedAttachmentCountError(totalCount, MAX_ATTACHMENTS);
   }
 
   const dataDir = env.SESSION_DATA_DIR?.trim();

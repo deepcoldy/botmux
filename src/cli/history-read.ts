@@ -17,20 +17,32 @@ export interface HistoryReadOptions {
 }
 
 export function parseHistoryReadOptions(args: string[]): HistoryReadOptions {
+  // Same two spellings unknownFlags() admits: `--flag value` and `--flag=value`.
+  // An admitted spelling that is not read here would silently fall back to the
+  // unfiltered full view.
   const value = (flag: string): string | undefined => {
-    const index = args.indexOf(flag);
-    if (index < 0) return undefined;
-    const next = args[index + 1];
-    if (!next || next.startsWith('--')) throw new Error(`${flag} requires a value`);
-    return next;
+    for (let index = 0; index < args.length; index++) {
+      const arg = args[index]!;
+      if (arg.startsWith(`${flag}=`)) {
+        const inline = arg.slice(flag.length + 1);
+        if (!inline) throw new Error(`${flag} requires a value`);
+        return inline;
+      }
+      if (arg !== flag) continue;
+      const next = args[index + 1];
+      if (!next || next.startsWith('--')) throw new Error(`${flag} requires a value`);
+      return next;
+    }
+    return undefined;
   };
   const view = value('--view') ?? 'full';
   if (view !== 'full' && view !== 'index') throw new Error('--view must be full or index');
   if (view === 'index' && args.includes('--with-card-json')) throw new Error('--with-card-json requires --view full');
   const query = value('--query')?.trim();
   if (query === '') throw new Error('--query must not be empty');
-  const types = (value('--type') ?? '').split(',').map(type => type.trim()).filter(Boolean);
-  if (args.includes('--type') && (!types.length || types.some(type => !/^[a-z_]+$/.test(type)))) {
+  const rawTypes = value('--type');
+  const types = (rawTypes ?? '').split(',').map(type => type.trim()).filter(Boolean);
+  if (rawTypes !== undefined && (!types.length || types.some(type => !/^[a-z_]+$/.test(type)))) {
     throw new Error('--type requires comma-separated message types');
   }
   const timestamp = (flag: string): number | undefined => {
@@ -148,6 +160,8 @@ export function parseQuotedReadOptions(args: string[]) {
     const arg = args[index];
     if (arg === '--session-id') {
       if (!args[++index] || args[index].startsWith('--')) throw new Error('--session-id requires a value');
+    } else if (arg.startsWith('--session-id=')) {
+      if (arg === '--session-id=') throw new Error('--session-id requires a value');
     } else if (['--raw', '--no-download', '--remote-runner-session-tool'].includes(arg)) continue;
     else if (arg.startsWith('--')) throw new Error(`Unknown argument: ${arg}`);
     else {

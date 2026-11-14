@@ -22,6 +22,19 @@ describe('message read context isolation and concurrency', () => {
     }, 1);
     expect(read).toHaveBeenCalledTimes(2);
   });
+  it('evicts the oldest settled reads beyond 128 retained entries and keeps the newest', async () => {
+    const read = vi.fn(async () => ({ ok: true }));
+    await withMessageReadContext(async () => {
+      for (let index = 0; index < 130; index++) await readMessageWithinContext(String(index), read);
+      expect(read).toHaveBeenCalledTimes(130);
+      await readMessageWithinContext('129', read);
+      await readMessageWithinContext('2', read);
+      expect(read).toHaveBeenCalledTimes(130);
+      await readMessageWithinContext('0', read);
+      await readMessageWithinContext('1', read);
+      expect(read).toHaveBeenCalledTimes(132);
+    });
+  });
   it('bounds simultaneous reads while completing every queued request', async () => {
     let active = 0; let peak = 0;
     const read = vi.fn(async () => { peak = Math.max(peak, ++active); await Promise.resolve(); active--; return { ok: true }; });

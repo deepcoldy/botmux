@@ -465,8 +465,8 @@ describe('Riff host boundary', () => {
 
   it('keeps attachment count limits independent of the larger byte budget', async () => {
     const { ctx } = quotedFixture(Array(9).fill(1));
-    expect(await executeRiffHostTool(request(['quoted', 'om_many']), ctx))
-      .toEqual({ exitCode: 1, stdout: '', stderr: 'riff_host_attachment_invalid' });
+    expect(await executeRiffHostTool(request(['quoted', 'om_many']), ctx)).toEqual({ exitCode: 1, stdout: '',
+      stderr: 'riff_host_attachment_too_many: 9 > 8; request fewer message ids or add --no-download' });
   });
 
   it.each(['plain text', '{broken json', '{"content":"no images"}', '{"attachments":[]}'])('preserves quoted output without attachments: %s', async stdout => {
@@ -539,6 +539,46 @@ describe('Riff host boundary', () => {
     });
     expect(() => quotedAttachments(overCapStdout, { SESSION_DATA_DIR: dataDir }))
       .toThrow('more than 8 attachments');
+  });
+
+  function batchQuotedFixture(exitCode: number) {
+    const dataDir = root(), attachmentDir = join(dataDir, 'attachments', 'cli_app', 'om_one');
+    mkdirSync(attachmentDir, { recursive: true });
+    const hostPath = join(attachmentDir, 'chart.png');
+    writeFileSync(hostPath, 'chart bytes');
+    // Same envelope cmdQuoted prints for several ids: per-id errors exit 1.
+    const stdout = JSON.stringify({
+      sessionId: 'session-1',
+      messages: [{ messageId: 'om_one', attachments: [{ path: hostPath, name: 'chart.png', type: 'image' }] }],
+      errors: exitCode ? [{ messageId: 'om_gone', error: 'not found' }] : [],
+      requestedCount: 2, total: 1, incomplete: exitCode !== 0,
+    });
+    writeFileSync(join(dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(stdout)}); process.exitCode = ${exitCode};`);
+    return { ctx: context(dataDir, { cliPath: join(dataDir, 'quoted.mjs') }), dataDir };
+  }
+
+  it.each([0, 1])('restores batch quoted attachments into sandbox files end to end (exit %i)', async exitCode => {
+    const { ctx, dataDir } = batchQuotedFixture(exitCode);
+    const gateway = new RiffHostTools();
+    const binding = gateway.bind(await listen(gateway), ctx);
+    const wire = await callRiffHostTool(binding, request(['quoted', 'om_one', 'om_gone']));
+    expect(wire.exitCode).toBe(exitCode);
+    expect(wire.stdout).not.toContain(dataDir);
+    const restored = JSON.parse(restoreRiffHostAttachments(wire).stdout);
+    const path = restored.messages[0].attachments[0].path as string;
+    expect(path).not.toContain('botmux-session-tool://');
+    roots.push(join(path, '..'));
+    expect(readFileSync(path, 'utf8')).toBe('chart bytes');
+    expect(restored.errors).toEqual(exitCode ? [{ messageId: 'om_gone', error: 'not found' }] : []);
+  });
+
+  it('keeps a single quoted failure unpackaged for every non-zero status', async () => {
+    const { ctx, stdout, paths } = quotedFixture([1]);
+    rmSync(paths[0]!);
+    writeFileSync(join(ctx.dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(stdout)});
+      process.stderr.write('quoted resource unavailable'); process.exitCode = 1;`);
+    expect(await executeRiffHostTool(request(['quoted', 'om_failed']), ctx))
+      .toEqual({ exitCode: 1, stdout, stderr: 'quoted resource unavailable' });
   });
 
   it('preserves a failed quoted command instead of replacing its error with packaging failure', async () => {

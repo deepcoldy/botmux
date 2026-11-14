@@ -1,12 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import { parseHistoryReadOptions, parseQuotedReadOptions, readHistoryMessages } from '../src/cli/history-read.js';
+import type { ExpandMergeForwardFn, ResolveMergedCardFn } from '../src/cli/quoted-render.js';
 
 const message = (id: string, type: string, content: unknown, time = 1_700_000_000_000) => ({
   message_id: id, msg_type: type, create_time: String(time), root_id: 'om_root',
   sender: { id: 'ou_sender', sender_type: 'user' },
   body: { content: typeof content === 'string' ? content : JSON.stringify(content) },
 });
-const deps = () => ({ expandMergeForward: vi.fn(async () => ({ extraResources: [] })), resolveMergedCard: vi.fn(async () => null) });
+const deps = () => ({
+  expandMergeForward: vi.fn<ExpandMergeForwardFn>(async () => ({ extraResources: [] })),
+  resolveMergedCard: vi.fn<ResolveMergedCardFn>(async () => null),
+});
 
 describe('history read views', () => {
   it('keeps the default full text and resource keys', async () => {
@@ -80,6 +84,18 @@ describe('history read views', () => {
 describe('read option validation', () => {
   it.each([['--view', 'wrong'], ['--view', 'index', '--with-card-json'], ['--query'], ['--query', ' '], ['--type', ','], ['--since', 'yesterday'], ['--until', 'invalid'], ['--since', '2026-11-15', '--until', '2026-11-14']])('rejects invalid history options before reads: %j', (...args) => {
     expect(() => parseHistoryReadOptions(args)).toThrow();
+  });
+  it('reads --flag=value the same as --flag value, since both spellings pass the unknown-flag gate', () => {
+    const spaced = parseHistoryReadOptions(['--view', 'index', '--query', 'queue', '--type', 'text,interactive', '--since', '2026-11-14T00:00:00+08:00', '--until', '2026-11-15T00:00:00+08:00']);
+    expect(parseHistoryReadOptions(['--view=index', '--query=queue', '--type=text,interactive', '--since=2026-11-14T00:00:00+08:00', '--until=2026-11-15T00:00:00+08:00'])).toEqual(spaced);
+    expect(spaced).toMatchObject({ view: 'index', query: 'queue', types: ['text', 'interactive'] });
+    for (const args of [['--view='], ['--view=wrong'], ['--type='], ['--type=,'], ['--query='], ['--since=yesterday'], ['--view=index', '--with-card-json']]) {
+      expect(() => parseHistoryReadOptions(args), JSON.stringify(args)).toThrow();
+    }
+  });
+  it('accepts the inline --session-id=<id> spelling for quoted', () => {
+    expect(parseQuotedReadOptions(['om_one', '--session-id=session'])).toEqual({ messageIds: ['om_one'], batch: false, download: true });
+    expect(() => parseQuotedReadOptions(['om_one', '--session-id='])).toThrow('--session-id requires a value');
   });
   it('deduplicates a quoted batch and skips the session-id value', () => {
     expect(parseQuotedReadOptions(['om_one', '--session-id', 'session', '--no-download', 'om_two', 'om_one', '--raw'])).toEqual({ messageIds: ['om_one', 'om_two'], batch: true, download: false });
