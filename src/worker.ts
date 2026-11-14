@@ -7108,7 +7108,6 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     const explicitOrigin = binding?.runtime
       ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
       : undefined;
-    if (scope && !explicitOrigin) return true;
     pendingManagedTurnOriginScope = explicitOrigin;
     try {
     send({
@@ -36341,7 +36340,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           ? (msg.observedExecutions ?? []).find(entry =>
             entry.execution.turnId === currentBotmuxTurnId && entry.execution.dispatchAttempt === currentBotmuxDispatchAttempt)
           : undefined;
-        const resumedExecution = directExecution ?? observedEntry?.execution;
+        const unboundExecution = !directExecution && !observedEntry
+          ? scope.executionForTurn(currentBotmuxTurnId, currentBotmuxDispatchAttempt)
+          : undefined;
+        const unboundState = unboundExecution
+          ? (msg.admissionStates ?? []).find(state => state.ref.executionId === unboundExecution.executionId)
+          : undefined;
+        const resumedExecution = directExecution ?? observedEntry?.execution
+          ?? (unboundState && !unboundState.runtime ? unboundExecution : undefined);
         const resumedState = resumedExecution
           ? (msg.admissionStates ?? []).find(state => state.ref.executionId === resumedExecution.executionId)
           : undefined;

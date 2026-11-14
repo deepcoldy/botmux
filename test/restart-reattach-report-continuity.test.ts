@@ -1253,7 +1253,7 @@ describe('re-publication through the real worker and daemon paths after a launch
     const hostEnv: any = { ds, worker: daemonWorker, sessionController: controller, contractWorker: worker2, botCfg: {},
       sessionCliId: () => 'codex', logger, t: 'real-publish', sameWorker, sameTrustedPrincipal,
       currentGatewayCallerOpenId: () => undefined, currentTurnProcessIdentities: () => ['222:leafStart1'],
-      noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn() };
+      noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(), cb: {} };
     hostEnv.handleLegacyWorkerMessage = loadWorkerPoolClosure('handleLegacyWorkerMessage', hostEnv);
     const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostEnv);
     hostEnv.handleWorkerMessage = host;

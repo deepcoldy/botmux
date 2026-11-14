@@ -1414,6 +1414,9 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
   ) => void | Promise<void>;
+  /** The current worker published the live origin of `turnId`, an execution
+   *  the session contract admitted and has not terminated. */
+  onManagedTurnOrigin?: (ds: DaemonSession, turnId: string) => void;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
@@ -24063,6 +24066,11 @@ function setupWorkerHandlers(
             : {}),
         };
         ensureAutomaticTaskContinuationLease(ds, botCfg);
+        const admitted = sessionController?.admittedExecution();
+        if (admitted && admitted.turnId === identityTurnId
+          && !['succeeded', 'failed', 'cancelled'].includes(sessionController!.store.execution(sessionController!.ref, admitted.executionId)!.phase)) {
+          cb.onManagedTurnOrigin?.(ds, admitted.turnId);
+        }
         break;
       }
 

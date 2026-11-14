@@ -718,7 +718,7 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -4690,6 +4690,21 @@ async function handleIdentityDecisionFlip(
       + `turn=${turnId} model=${context.model}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+/** Proven identity material lives only in daemon memory, so a turn that was
+ *  executing when the daemon restarted has none once its re-attached worker
+ *  republishes the turn's origin. Before this daemon has published anything
+ *  for the session, prepare that turn again through the entry its original
+ *  publication used: the schedule authority for a scheduled run, the
+ *  session's reply target for a human message. */
+async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
+    || identityStorageModelForDaemonSession(ds) !== 'proven'
+    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId))
+    || !identityDecisionTurnIsLive(ds, turnId)) return;
+  const replay = prepareTurnCliIdentity(ds, turnId);
+  if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
 }
 
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
@@ -34323,6 +34338,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // handler — no unhandledRejection, and failures stay replayable.
       void handleIdentityDecisionFlip(ds, context).catch(error => {
         logger.error(`[trigger-user-auth] identity decision handler failed for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    },
+    onManagedTurnOrigin(ds, turnId) {
+      void restoreTurnCliIdentity(ds, turnId).catch(error => {
+        logger.error(`[trigger-user-auth] turn identity restore failed for ${ds.session.sessionId} turn=${turnId}: ${error instanceof Error ? error.message : String(error)}`);
       });
     },
     onCliExit(ds, context) {

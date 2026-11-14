@@ -1156,6 +1156,7 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
     currentGatewayCallerOpenId: (ds: any, turnId: string) => pickTurnReplyTarget(ds.session, turnId)?.senderOpenId,
     currentTurnProcessIdentities: () => undefined,
     noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(),
+    sessionController: undefined,
   };
   const dispatch = new Function('scope', 'msg', `with (scope) { ${ipcCode} }`);
   dispatch(scope, { type: 'managed_turn_origin_revoked', sessionId: 'target-session',
