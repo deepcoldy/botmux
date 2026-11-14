@@ -4985,14 +4985,14 @@ describe('ordinary Claude semantic recovery', () => {
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
 
     await vi.advanceTimersByTimeAsync(60_000);
-    // The worker's harvest of a turn typed in the pane (not a background wake).
+    // A turn typed in the pane: the worker forwards no reply for it (local-typed),
+    // only its terminal under the bridge's `local-<uuid>` id.
     worker.emit('message', {
-      type: 'final_output', content: '已经接着做完了', lastUuid: 'a-local', turnId: 'local-typed-1',
-      kind: 'local-turn', userText: '继续',
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-u-typed-1', status: 'completed',
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
-      status: 'cancelled', cancelledByTurnId: 'local-typed-1',
+      status: 'cancelled', cancelledByTurnId: 'local-u-typed-1',
     }));
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
@@ -5026,8 +5026,7 @@ describe('ordinary Claude semantic recovery', () => {
     const attention = ds.agentAttention;
     expect(attention).toEqual(expect.objectContaining({ kind: 'blocked' }));
     worker.emit('message', {
-      type: 'final_output', content: 'did something else', lastUuid: 'a-local', turnId: 'local-typed-2',
-      kind: 'local-turn', userText: 'ls',
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-u-typed-2', status: 'completed',
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('exhausted');
@@ -5056,6 +5055,9 @@ describe('ordinary Claude semantic recovery', () => {
     worker.emit('message', {
       type: 'final_output', content: 'background task finished', lastUuid: 'a-wake', turnId: 'local-headless-1',
       kind: 'local-turn-headless',
+    });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-headless-1', status: 'completed',
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
@@ -10681,6 +10683,18 @@ describe('Codex capacity recovery', () => {
     expect(restored.session.ordinaryTurnRecovery?.status).toBe('cancelled');
     expect(sessionReply).toHaveBeenCalledOnce();
     expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('a turn typed in the terminal during the capacity backoff leaves it running as before', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-u-typed', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(continuations(worker)).toHaveLength(1);
   });
 
   it('opt-off followed by a diagnostic before the timer settles once without a second card', async () => {

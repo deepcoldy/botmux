@@ -2824,10 +2824,20 @@ function notifyOrdinaryTurnRecoveryWaiting(
   });
 }
 
+/** A turn typed into the CLI itself (web terminal): the bridge mints
+ *  `local-<uuid>` for a user line that matched no delivered message. A
+ *  background wake is `local-headless-*`, a built-in scheduled fire
+ *  `scheduled-*`. (A prompt-cache keep-alive is typed the same way, which is
+ *  why none is sent while a continuation waits.) */
+function isTerminalTypedTurnId(turnId: string): boolean {
+  return turnId.startsWith('local-') && !turnId.startsWith('local-headless-');
+}
+
 /** Someone answered from the web terminal (a typed turn just completed) while
  *  a continuation waited for the provider: they took over, so the wait is
  *  cancelled exactly as a new Feishu message cancels it. Only a pending wait —
- *  a running continuation or a settled failure is left as it is. */
+ *  a running continuation or a settled failure is left as it is. Driven by the
+ *  turn's terminal: the worker forwards no reply for a typed turn. */
 function cancelOrdinaryRecoveryWaitForTerminalTurn(ds: DaemonSession, turnId: string): void {
   if (ds.session.ordinaryTurnRecovery?.status !== 'backoff') return;
   try {
@@ -23228,6 +23238,10 @@ function setupWorkerHandlers(
           ds.failedIdleTurnId = undefined;
           if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
         }
+        if (msg.status === 'completed' && isTerminalTypedTurnId(msg.turnId)
+          && sessionCliId(ds, botCfg) === 'claude-code') {
+          cancelOrdinaryRecoveryWaitForTerminalTurn(ds, msg.turnId);
+        }
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
@@ -24152,7 +24166,6 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
-        if (msg.kind === 'local-turn') cancelOrdinaryRecoveryWaitForTerminalTurn(ds, msg.turnId);
         if (!msg.handoff) { await processFinalOutput(msg); break; }
         try {
           if (!journal || msg.handoff.version !== 2 || msg.handoff.token !== ds.initConfig?.finalOutputHandoff?.token || msg.sessionId !== ds.session.sessionId) throw new Error('output_handoff_not_authorized');
