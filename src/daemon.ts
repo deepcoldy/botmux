@@ -683,7 +683,8 @@ import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.j
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
 import { isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
-import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
+import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
+import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -9893,7 +9894,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       }
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
       if (!targetTriggerPolicy?.enabled
-        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+        || !capabilityOn(targetTriggerPolicy, 'lark-user') || !capabilityOn(targetTriggerPolicy, 'bytecloud')) {
         return jsonRes(res, 403, {
           ok: false,
           error: 'schedule_child_one_shot_identity_isolation_required',
@@ -9950,12 +9951,11 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         if (!botGrantHolds()) return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
       }
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
-      if (!targetTriggerPolicy?.enabled
-        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+      if (!capabilityOn(targetTriggerPolicy, 'lark-user') || !capabilityOn(targetTriggerPolicy, 'bytecloud')) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
       }
       if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)
-        || !targetTriggerPolicy.tools.includes(scope))) {
+        || !capabilityOn(targetTriggerPolicy, capabilityOfTool(scope)))) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
       }
       if (capability.allowSelfManage === true && targetPolicy?.selfManageEnabled !== true) {

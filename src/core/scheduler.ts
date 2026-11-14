@@ -1430,7 +1430,11 @@ export function addTask(params: {
     ...untilDoneConfig,
   }, authoritativeCreateFor(params.larkAppId, audit?.directTurn));
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
-  createdObserver?.(task, audit?.creatingTurn);
+  try {
+    createdObserver?.(task, audit?.creatingTurn);
+  } catch (error) {
+    logger.warn(`[scheduler] creation observer failed for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return task;
 }
 

@@ -11,7 +11,8 @@ import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/co
 import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
-import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
+import { capabilityOn, parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { capabilityOfTool } from '../src/core/identity-policy.js';
 import { validateScheduleChildOneShot } from '../src/core/schedule-child-one-shot.js';
 import {
   assertScheduledAuthorityCurrent,
@@ -115,7 +116,8 @@ function harness(overrides: Record<string, unknown> = {}) {
     parseScheduledTurnId,
     readScheduledTaskFromAuthority,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-    TRIGGER_USER_AUTH_TOOLS,
+    capabilityOn,
+    capabilityOfTool,
     scheduleAuthorityStore: {},
     createHash,
     scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
@@ -302,6 +304,27 @@ describe('delegated schedule add route', () => {
       value: { error: 'schedule_delegation_target_identity_isolation_required' },
     });
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['lark-user and meego (bytedcli published for meego only)', ['lark-user', 'meego']],
+    ['bytecloud only', ['bytecloud']],
+  ])('requires target identity isolation for %s', async (_label, capabilities) => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities }) } });
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_delegation_target_identity_isolation_required' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('accepts a target that runs lark-user and bytecloud as the sender', async () => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: parseTriggerUserAuthConfig({
+      enabled: true, capabilities: ['lark-user', 'bytecloud'],
+    }) } });
+    expect((await h.run()).status).toBe(201);
   });
 
   it('returns a clear forbidden response when the turn task limit is exhausted', async () => {

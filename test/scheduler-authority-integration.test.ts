@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
+import { logger } from '../src/utils/logger.js';
 import type { ScheduledTask } from '../src/types.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
@@ -69,6 +70,17 @@ describe('creation observer', () => {
       larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } });
     commit('a1b2c3d4');
     expect(seen).toEqual([['direct01', 'ou_owner', 'om_t1'], ['direct02', 'ou_owner', undefined]]);
+  });
+
+  it('returns the stored task and logs when the observer throws', () => {
+    const warn = vi.spyOn(logger, 'warn');
+    scheduler.setScheduleCreatedObserver(() => { throw new Error('Bot not registered: cli_unknown'); });
+    const task = scheduler.addTask({ id: 'direct03', name: 'c', schedule: 'every 30m', prompt: 'p', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } });
+    expect(task.id).toBe('direct03');
+    expect(scheduleStore.getTask('direct03', APP)).toBeDefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Bot not registered: cli_unknown'));
+    warn.mockRestore();
   });
 });
 

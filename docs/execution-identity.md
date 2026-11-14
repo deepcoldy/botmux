@@ -61,6 +61,8 @@ Direct 定时任务沿用持久化的可信创建者。模型翻转后的重发�
 
 开着身份鉴权（`triggerUserAuth` 开且至少管一个工具）时，direct/legacy 定时任务到点若没有可用身份——没有记录创建人（早期任务、bot 轮次或平台创建），或创建人/认领人已过不了 `canOperate`——本次照常无身份执行（受管工具被拒），同时在任务所在群发一张认领卡片（任务绑定固定话题时回复在话题里）。卡片写明任务、需要认领的原因和提示词摘要。
 
+创建人只记了 `open_id`、没有 `union_id` 的 active 任务，若 `creatorLarkAppId` 就是执行 bot（会话直建、委托提交等能证明该 `open_id` 属于创建人本人的入口会记这个字段），到点前先在执行 bot 的应用下查出 `union_id` 并写回，本次即按创建人身份执行。没有 `creatorLarkAppId` 的任务（如 Dashboard token 登录新建、名义上记为 bot owner 的任务）不补全，照常走认领卡片。
+
 - **一个任务一张卡**：卡片记录存在 `schedule-authority.sqlite` 的 `schedule_identity_claim_cards` 表。待认领期间每次到点只原地更新这张卡；同一执行轮次的重发（重启恢复、身份模型切换重发）不算新的到点。已认领的卡在认领人失权后、或旧卡超出飞书可编辑期限/被撤回时才发新卡。卡片位置在发出时确定（绑定话题的任务回复在话题里，否则在群顶层），之后任务才建立话题（`task` 位置首次执行）时卡片不迁移。
 - **身份恢复时收敛**：到点时创建人或认领人重新过了 `canOperate`，仍在待认领状态的卡原地改成「已认领」或「现在按创建人的身份执行、无需认领」，不再挂着待认领。
 - **身份来源**：只取卡片回调的 `operator.open_id` / `operator.union_id`（缺 union_id 时用该 open_id 查通讯录），按钮 value 只带任务 id 和 `claim_rev`。认领写进 authority 记录里任务的 `runAsClaim`（并投影到 `schedules.json`），创建人字段不变。
@@ -85,7 +87,7 @@ Dashboard 有两种进入方式，记的创建人不同：
 
 | 进入方式 | 能证明的身份 | 新建任务记为 | 编辑保存 |
 |---|---|---|---|
-| 本机 token 链接（`?t=` / 管理 cookie） | 只证明持有 token，不知道是谁 | bot owner（部署 owner 的 union_id 与该 bot 的名单解析对得上时一并记 union_id），与之前一致 | 创建人、认领都不变 |
+| 本机 token 链接（`?t=` / 管理 cookie） | 只证明持有 token，不知道是谁 | bot owner（部署 owner 的 union_id 与该 bot 的名单解析对得上时一并记 union_id；对不上时只记 open_id，到点也不补全 union_id，按无身份任务发认领卡片），与之前一致 | 创建人、认领都不变 |
 | 经中心平台访问（平台用飞书 SSO 登录） | 平台注入的 `X-Botmux-Actor` = 登录人的 union_id | 登录人 | 登录人成为创建人，之前的认领被清掉 |
 
 - 平台的 `X-Botmux-Actor` 只在「这条连接确实是平台隧道桥接进来的」时才采信：隧道把桥接连接的本地端口登记在 `platform/tunnel-peers`，Dashboard 按请求的对端地址和端口核对。本机直连自带的同名头一律忽略。

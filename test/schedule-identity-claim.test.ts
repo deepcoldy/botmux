@@ -681,7 +681,7 @@ describe('claim card buttons', () => {
 });
 
 describe('creator union_id backfill', () => {
-  const legacy = { owner: { kind: 'human' as const, openId: ALICE.open } };
+  const legacy = { owner: { kind: 'human' as const, openId: ALICE.open }, creatorLarkAppId: APP };
   const backfill = (lookupUnionId: (appId: string, openId: string) => Promise<string | undefined>,
     task = authorityTask()) => backfillOwnerUnionId({
     task, larkAppId: APP, lookupUnionId, record: scheduler.recordTaskOwnerUnionId,
@@ -731,12 +731,35 @@ describe('creator union_id backfill', () => {
     expect(lookup).not.toHaveBeenCalled();
     expect(authorityTask().ownerUnionId).toBeUndefined();
   });
+
+  it('leaves a dashboard token-login task (open_id only, no creator app) to the claim card', async () => {
+    const h = harness();
+    addTask({ owner: { kind: 'human', openId: ALICE.open } });
+    const lookup = vi.fn(async () => ALICE.union);
+    const before = authorityTask();
+    expect(await backfill(lookup)).toEqual(before);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(authorityTask().ownerUnionId).toBeUndefined();
+    expect((await h.fire()).identity).toMatchObject({ ok: false, reason: 'no_creator' });
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('continues with a claim that lands while the union_id is being looked up', async () => {
+    addTask(legacy);
+    const next = await backfill(async () => {
+      const bobClaim = { openId: BOB.open, unionId: BOB.union, larkAppId: APP, claimedAt: '2026-10-26T02:00:00.000Z' };
+      expect(scheduler.claimTaskRunAs('a1b2c3d4', APP, bobClaim, null)).toMatchObject({ ok: true });
+      return ALICE.union;
+    });
+    expect(next).toMatchObject({ ownerUnionId: ALICE.union, runAsClaim: { openId: BOB.open, unionId: BOB.union } });
+    expect(resolveScheduledRunIdentity(next, APP, () => true)).toMatchObject({ ok: true, openId: BOB.open, source: 'claim' });
+  });
 });
 
 describe('fire admission around the union_id backfill', () => {
   const RUN = 'run1';
   const TURN = 'schedule:a1b2c3d4:00000001-0000-4000-8000-000000000000';
-  const legacy = { owner: { kind: 'human' as const, openId: ALICE.open } };
+  const legacy = { owner: { kind: 'human' as const, openId: ALICE.open }, creatorLarkAppId: APP };
   const lookup = async () => ALICE.union;
 
   /** The order the daemon's execute callback follows: backfill, then the

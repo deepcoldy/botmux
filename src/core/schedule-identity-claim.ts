@@ -81,10 +81,13 @@ export function resolveScheduledRunIdentity(
 
 /**
  * Records the union_id of a creator the task names by open_id only, so the
- * task resolves an identity without a claim. The lookup runs in the creator's
- * own app: a task recorded under another app is left alone. Returns the task a
- * fire should continue with: `task` carrying the stored union_id, or `task`
- * itself when nothing was recorded.
+ * task resolves an identity without a claim. Only a task whose
+ * `creatorLarkAppId` is this bot qualifies: that field is set where the
+ * open_id was proven to be the creator's own (direct and delegated creation).
+ * A task without it, such as a dashboard token-login task attributed to the
+ * bot owner, keeps the claim-card path. Returns the task a fire should
+ * continue with: the row `record` stored, or `task` itself when nothing was
+ * recorded.
  */
 export async function backfillOwnerUnionId(input: {
   task: ScheduledTask;
@@ -94,11 +97,11 @@ export async function backfillOwnerUnionId(input: {
 }): Promise<ScheduledTask> {
   const { task, larkAppId } = input;
   if (!task.ownerOpenId || task.ownerUnionId || parseScheduleRunAsClaim(task.runAsClaim)) return task;
-  if (task.creatorLarkAppId && task.creatorLarkAppId !== larkAppId) return task;
+  if (task.creatorLarkAppId !== larkAppId) return task;
   const unionId = await input.lookupUnionId(larkAppId, task.ownerOpenId);
   if (!unionId) return task;
   const stored = input.record(task.id, larkAppId, task.ownerOpenId, unionId);
-  return stored?.ownerUnionId ? { ...task, ownerUnionId: stored.ownerUnionId } : task;
+  return stored?.ownerUnionId ? stored : task;
 }
 
 export type ClaimCardLocation =
