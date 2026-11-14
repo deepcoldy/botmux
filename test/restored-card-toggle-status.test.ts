@@ -369,6 +369,33 @@ describe('toggle status without a fresh worker report', () => {
     vi.mocked(getBot).mockImplementation(defaultGetBot);
   });
 
+  it('never promises an auto-continuation wait once no coordinator owns it, even with the switch on', async () => {
+    const recoveryAt = Date.now() + 10 * 60_000;
+    const ds = makeRestoredDs({ worker: makeFakeWorker(), workerReady: true, lastScreenStatus: 'idle' });
+    (ds.session as any).ordinaryTurnRecovery = {
+      logicalTurnId: 'om_task', currentTurnId: 'om_task', continuationsStarted: 0,
+      status: 'backoff', nextAttemptAt: recoveryAt,
+    };
+    const defaultGetBot = vi.mocked(getBot).getMockImplementation()!;
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', providerRecovery: { enabled: true } },
+      resolvedAllowedUsers: ['ou_user'], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
+    }) as any);
+    // Switch on but no runtime coordinator owns this persisted wait: the card
+    // must not promise a continuation nobody is going to fire.
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(IDLE);
+    // Positive control: the same row shows the wait once a coordinator owns it.
+    attachOrdinaryTurnRecovery(ds.session as any, {
+      schedule: () => 0, cancel: () => {}, persist: () => {}, enqueue: () => true, warn: () => {},
+    });
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(
+      t('card.status.recovery_wait', { at: formatClockTime(recoveryAt, 'zh') }, 'zh'));
+    disposeOrdinaryTurnRecovery(ds.session as any);
+    // Detaching again hides the promise (the session became ineligible).
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(IDLE);
+    vi.mocked(getBot).mockImplementation(defaultGetBot);
+  });
+
   it('running worker reporting working → still 工作中 with the stop button', async () => {
     const ds = makeRestoredDs({ worker: makeFakeWorker(), workerReady: true, lastScreenStatus: 'working' });
     const card = await toggleCurrent(ds, activate(ds));
