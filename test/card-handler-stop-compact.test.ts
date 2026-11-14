@@ -70,7 +70,7 @@ const sendWorkerSessionInputMock = vi.fn();
 const sendKimiCacheExpiryAutoCompactSettingMock = vi.fn(() => true);
 const isSessionTransferringMock = vi.fn(() => false);
 const sessionAcceptsDirectCommandMock = vi.fn(() => true);
-const interruptCodexAppTurnMock = vi.fn(async () => 'stale_turn' as const);
+const interruptCodexAppTurnMock = vi.fn(async (): Promise<'delivered' | 'stale_turn' | 'delivery_failed'> => 'stale_turn');
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const { supportsIdleAutoCompact } = await vi.importActual<typeof import('../src/core/idle-auto-compact.js')>('../src/core/idle-auto-compact.js');

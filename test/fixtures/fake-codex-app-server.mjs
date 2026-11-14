@@ -625,6 +625,18 @@ function handle(request) {
       return;
     }
     const { threadId, turnId } = activeTurn;
+    if (behavior === 'operator-interrupt-steer') {
+      // Acknowledge first and report the interrupted terminal later, like an
+      // app-server that is still aborting tools. The turn stays steerable on
+      // this side, so input arriving in the window proves the runner's gate.
+      respond(request.id, {});
+      setTimeout(() => {
+        if (activeTurn?.turnId !== turnId) return;
+        activeTurn = undefined;
+        notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
+      }, 1500);
+      return;
+    }
     activeTurn = undefined;
     notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
     respond(request.id, {});
@@ -648,6 +660,14 @@ function handle(request) {
     return;
   }
   if (request.method === 'turn/steer') {
+    if (behavior === 'operator-interrupt-steer') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      respond(request.id, { turnId: activeTurn.turnId });
+      return;
+    }
     if (behavior === 'async-user-input-live-steer') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expected turn is not active'); return;

@@ -3820,6 +3820,50 @@ describe('Codex App native stop', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('cancels every member of a steered group and keeps input sent while stopping for the next turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-interrupt-steer-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    control.turnInterrupt = true;
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'operator-interrupt-steer', control.bootstrap.path);
+    const send = (id: string) => harness.child.stdin.write(
+      `${CONTROL_PREFIX}${encodeRunnerInput(id, { text: id }, id, true)}\r`);
+    const target = (id: string) => control.markers.find(m => m.kind === 'interrupt_target' && m.payload.replyTurnId === id)?.payload;
+    const receipt = (id: string) => control.markers.find(m => m.kind === 'interrupt_result' && m.payload.requestId === id)?.payload;
+    const turnMethods = () => readRequests(logPath).map(r => r.method)
+      .filter(method => method === 'turn/start' || method === 'turn/steer' || method === 'turn/interrupt');
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      send('om_root');
+      await waitFor(harness, () => !!target('om_root'));
+      send('om_follow');
+      // The steered member becomes the newest accepted input of the same native turn.
+      await waitFor(harness, () => !!target('om_follow'));
+      expect(target('om_follow')!.turnEpoch).toBe(target('om_root')!.turnEpoch);
+      control.interrupt('stop-group', target('om_follow')!.turnEpoch);
+      await waitFor(harness, () => receipt('stop-group')?.status === 'delivered');
+      // Sent after the stop was accepted but before the interrupted terminal:
+      // it must wait for a new turn instead of being steered into the stopped one.
+      send('om_after_stop');
+      await waitFor(harness, () => !!target('om_after_stop'));
+      expect(turnMethods()).toEqual(['turn/start', 'turn/steer', 'turn/interrupt', 'turn/start']);
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_root', content: '', errorCode: 'cancelled', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_follow', content: '', errorCode: 'cancelled' }),
+      ]);
+      expect(control.finals[1]).not.toHaveProperty('disposition');
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Codex App live reasoning effort', () => {
