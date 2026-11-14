@@ -312,4 +312,133 @@ describe('subtopic-mentionless-handoff service', () => {
     // dispatch root in CHAT_OTHER does NOT trigger project-group handoff!
     expect(resolveManagedSubtopicMentionlessHandoff(deps, 'om_other_chat_root', CHAT_OTHER, COORD_APP)).toBeNull();
   });
+
+  describe('non-project groups (another bot\'s imported topic)', () => {
+    const ROOT = 'om_plain_imported_root';
+    const imported = (over: Partial<SubtopicSessionSnapshot> = {}): SubtopicSessionSnapshot => ({
+      sessionId: `s-${Math.random().toString(36).slice(2)}`,
+      larkAppId: WORKER_TOPIC,
+      chatId: CHAT_OTHER,
+      scope: 'thread',
+      rootMessageId: ROOT,
+      status: 'active',
+      projectImportSource: 'relay',
+      ...over,
+    });
+    const resolveFor = (appId: string) => resolveManagedSubtopicMentionlessHandoff(makeDeps(), ROOT, CHAT_OTHER, appId);
+
+    it('counts only ANOTHER bot\'s active imported thread session at this root in this chat', () => {
+      expect(resolveFor(COORD_APP)).toBeNull();
+      // Worker dispatch topics (no projectImportSource) keep the regular routing.
+      diskActiveSessions = [imported({ projectImportSource: undefined })];
+      expect(resolveFor(COORD_APP)).toBeNull();
+      // The importing bot's own session is never a handoff: it answers there itself.
+      diskActiveSessions = [imported()];
+      expect(resolveFor(WORKER_TOPIC)).toBeNull();
+      for (const over of [{ chatId: 'oc_elsewhere' }, { status: 'closed' }, { scope: 'chat' as const }, { rootMessageId: 'om_other_root' }]) {
+        diskActiveSessions = [imported(over)];
+        expect(resolveFor(COORD_APP), JSON.stringify(over)).toBeNull();
+      }
+
+      diskActiveSessions = [imported()];
+      expect(resolveFor(COORD_APP)).toEqual({
+        kind: 'imported',
+        sourceLarkAppId: WORKER_TOPIC,
+        sourceAnswersWithoutMention: true,
+        hasProjectCoordinator: false,
+        isProjectCoordinator: false,
+      });
+      // Also seen through the in-process live view (not yet on disk).
+      diskActiveSessions = [];
+      liveSessions = [imported()];
+      expect(resolveFor(COORD_APP)?.sourceLarkAppId).toBe(WORKER_TOPIC);
+    });
+
+    it('passes the importing bot\'s un-@ answer through and never offers a fold (no coordinator)', async () => {
+      diskActiveSessions = [imported({ larkAppId: WORKER_ALWAYS })];
+      expect(resolveFor(COORD_APP)).toMatchObject({ sourceAnswersWithoutMention: false, hasProjectCoordinator: false, isProjectCoordinator: false });
+      expect(resolveFor(COORD_APP)).not.toHaveProperty('coordinatorMayFold');
+
+      const deps = { ...makeDeps(), doesBotAnswerTopicWithoutMention: () => 'unknown' as const };
+      expect(resolveManagedSubtopicMentionlessHandoff(deps, ROOT, CHAT_OTHER, COORD_APP)?.sourceAnswersWithoutMention).toBe('unknown');
+
+      // A `standard` collaboration mode naming this bot is not a project group.
+      await writeGroupCollaborationMode(dataDir, { chatId: CHAT_OTHER, mode: 'standard', coordinatorAppId: COORD_APP });
+      __resetSubtopicHandoffCacheForTest();
+      expect(resolveFor(COORD_APP)).toMatchObject({ hasProjectCoordinator: false, isProjectCoordinator: false });
+    });
+  });
+
+  describe('project coordinator fold guards (third bots continuing the root)', () => {
+    const ROOT = 'om_fold_guard_root';
+    const PEER = 'cli_fold_guard_peer';
+    let answers: Map<string, boolean | 'unknown'>;
+    const deps = (): ResolveSubtopicHandoffDeps => ({
+      ...makeDeps(),
+      doesBotAnswerTopicWithoutMention: appId => answers.get(appId) ?? false,
+    });
+    const alias = { createdAt: '2026-11-14T00:00:00.000Z', lastUsedAt: '2026-11-14T00:00:00.000Z' };
+
+    beforeEach(async () => {
+      await enableProjectGroup();
+      answers = new Map([[WORKER_ALWAYS, false]]);
+      diskActiveSessions = [{
+        sessionId: 's-fold-imported', larkAppId: WORKER_ALWAYS, chatId: CHAT_PROJECT, scope: 'thread',
+        rootMessageId: ROOT, status: 'active', projectImportSource: 'relay',
+      }];
+    });
+
+    it('folds when the importing worker requires @ and nobody else continues the root', () => {
+      expect(resolveManagedSubtopicMentionlessHandoff(deps(), ROOT, CHAT_PROJECT, COORD_APP)).toEqual({
+        kind: 'imported',
+        sourceLarkAppId: WORKER_ALWAYS,
+        sourceAnswersWithoutMention: false,
+        hasProjectCoordinator: true,
+        isProjectCoordinator: true,
+      });
+      // Not the coordinator: no fold offered (the dispatcher makes it yield).
+      expect(resolveManagedSubtopicMentionlessHandoff(deps(), ROOT, CHAT_PROJECT, PEER)).toMatchObject({ isProjectCoordinator: false });
+    });
+
+    it('a third bot\'s shared-topic alias for this root blocks the fold unless that bot requires @', () => {
+      const peerChat = (over: Partial<SubtopicSessionSnapshot> = {}): SubtopicSessionSnapshot => ({
+        sessionId: 's-peer-chat', larkAppId: PEER, chatId: CHAT_PROJECT, scope: 'chat', rootMessageId: 'om_peer_chat',
+        status: 'active', replyThreadAliases: { [ROOT]: alias }, ...over,
+      });
+      for (const peerAnswers of [true, 'unknown'] as const) {
+        answers.set(PEER, peerAnswers);
+        const d = { ...deps(), findActiveChatScopeSessionsByChat: () => [peerChat()] };
+        expect(resolveManagedSubtopicMentionlessHandoff(d, ROOT, CHAT_PROJECT, COORD_APP)?.coordinatorMayFold, String(peerAnswers)).toBe(false);
+      }
+      answers.set(PEER, false);
+      const requiresAt = { ...deps(), findActiveChatScopeSessionsByChat: () => [peerChat()] };
+      expect(resolveManagedSubtopicMentionlessHandoff(requiresAt, ROOT, CHAT_PROJECT, COORD_APP)).not.toHaveProperty('coordinatorMayFold');
+      // An alias for another root, or in another chat, does not count.
+      answers.set(PEER, true);
+      const unrelated = { ...deps(), findActiveChatScopeSessionsByChat: () => [
+        peerChat({ replyThreadAliases: { om_other_root: alias } }),
+        peerChat({ chatId: CHAT_OTHER }),
+      ] };
+      expect(resolveManagedSubtopicMentionlessHandoff(unrelated, ROOT, CHAT_PROJECT, COORD_APP)).not.toHaveProperty('coordinatorMayFold');
+    });
+
+    it('a third bot with its own live thread session at the root keeps it when it answers un-@ (or is undecidable)', () => {
+      diskActiveSessions.push({
+        sessionId: 's-peer-thread', larkAppId: PEER, chatId: CHAT_PROJECT, scope: 'thread', rootMessageId: ROOT, status: 'active',
+      });
+      answers.set(PEER, true);
+      expect(resolveManagedSubtopicMentionlessHandoff(deps(), ROOT, CHAT_PROJECT, COORD_APP)).toMatchObject({
+        sourceLarkAppId: PEER, sourceAnswersWithoutMention: true,
+      });
+      answers.set(PEER, 'unknown');
+      expect(resolveManagedSubtopicMentionlessHandoff(deps(), ROOT, CHAT_PROJECT, COORD_APP)).toMatchObject({
+        sourceLarkAppId: PEER, sourceAnswersWithoutMention: 'unknown',
+      });
+      // It requires @ as well → nobody answers there, the coordinator folds.
+      answers.set(PEER, false);
+      expect(resolveManagedSubtopicMentionlessHandoff(deps(), ROOT, CHAT_PROJECT, COORD_APP)).toMatchObject({
+        sourceAnswersWithoutMention: false, isProjectCoordinator: true,
+      });
+    });
+  });
 });

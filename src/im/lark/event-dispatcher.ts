@@ -95,7 +95,6 @@ import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode, isSoloGroupMentionBypassEnabled, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
-import type { ImportedTopicHandoff } from '../../services/imported-topic-handoff.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -4203,12 +4202,6 @@ export interface EventHandlers {
     chatId: string,
     larkAppId: string,
   ) => SubtopicMentionlessHandoff | null | Promise<SubtopicMentionlessHandoff | null>;
-  /** Legacy alias for `resolveSubtopicMentionlessHandoff` (kept for compatibility). */
-  resolveImportedTopicMentionlessHandoff?: (
-    rootId: string,
-    chatId: string,
-    larkAppId: string,
-  ) => ImportedTopicHandoff | SubtopicMentionlessHandoff | null | Promise<ImportedTopicHandoff | SubtopicMentionlessHandoff | null>;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
   /** True when this chat's chat-scope session already answered `rootId` as a FLAT
@@ -6368,8 +6361,6 @@ export function createLarkEventDispatcherRuntime(
       let importedTopicCoordinatorFolded = false;
       let aliasForRoot: { chatId: string; sessionId: string; anchor?: string } | null | undefined;
       const inboundMessageType = message.message_type ?? message.msg_type;
-      const resolveSubtopicHandoff = handlers.resolveSubtopicMentionlessHandoff
-        ?? handlers.resolveImportedTopicMentionlessHandoff;
       const canAnswerGroupUnmentioned = mentionModeForAlias !== 'always'
         || getBot(larkAppId).config.chatManagerEnabled === true;
       if (isAllowed
@@ -6385,10 +6376,10 @@ export function createLarkEventDispatcherRuntime(
           && message.thread_id
           && chatType === 'group') {
         const rootId: string = message.root_id;
-        let handoff: ImportedTopicHandoff | SubtopicMentionlessHandoff | null = null;
+        let handoff: SubtopicMentionlessHandoff | null = null;
         try {
           if (!mentionsAnotherMember(larkAppId, message) || !(await mentionsOtherInChat())) {
-            handoff = await resolveSubtopicHandoff?.(rootId, chatId, larkAppId) ?? null;
+            handoff = await handlers.resolveSubtopicMentionlessHandoff?.(rootId, chatId, larkAppId) ?? null;
           }
         } catch (err) {
           logger.warn(
@@ -6405,9 +6396,8 @@ export function createLarkEventDispatcherRuntime(
             aliasForRoot = handlers.resolveReplyThreadAlias?.(rootId, chatId, larkAppId) ?? null;
             continuesRoot = !!aliasForRoot;
           }
-          const coordinatorMayFold = 'coordinatorMayFold' in handoff && typeof handoff.coordinatorMayFold === 'boolean'
-            ? handoff.coordinatorMayFold
-            : (handoff.hasProjectCoordinator && handoff.isProjectCoordinator && handoff.sourceAnswersWithoutMention === false);
+          const coordinatorMayFold = handoff.coordinatorMayFold
+            ?? (handoff.hasProjectCoordinator && handoff.isProjectCoordinator && handoff.sourceAnswersWithoutMention === false);
           if (continuesRoot) {
             // Keep the regular routing: this bot already continues this root.
           } else if (coordinatorMayFold) {
@@ -6418,9 +6408,8 @@ export function createLarkEventDispatcherRuntime(
               routing.anchor = chatId;
               replyRootId = rootId;
               importedTopicCoordinatorFolded = true;
-              const subtopicKind = 'kind' in handoff && handoff.kind ? handoff.kind : 'imported';
-              logger.info(
-                `[subtopic-mentionless-routing] un-@ reply in ${subtopicKind} subtopic root=${rootId.substring(0, 12)} `
+                            logger.info(
+                `[subtopic-mentionless-routing] un-@ reply in ${handoff.kind} subtopic root=${rootId.substring(0, 12)} `
                 + `(owner=${handoff.sourceLarkAppId}) routed to coordinator=${larkAppId} chat=${chatId.substring(0, 12)}`,
               );
             }

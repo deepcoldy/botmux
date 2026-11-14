@@ -35121,8 +35121,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       resolveSubtopicMentionlessHandoff: (rootId, chatId, appId) =>
         resolveManagedSubtopicMentionlessHandoff(subtopicHandoffDeps(), rootId, chatId, appId),
-      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) =>
-        resolveManagedSubtopicMentionlessHandoff(subtopicHandoffDeps(), rootId, chatId, appId),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,

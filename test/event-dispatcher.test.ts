@@ -303,7 +303,7 @@ vi.mock('../src/im/lark/transport/resilient-ws-client.js', () => ({
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, learnSameOwnerSiblingCrossRef, maybeApplyForceTopicOverride, mentionsAnotherInChatMember, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, updateBotOpenIdCrossRef, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import { writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
-import { __resetSubtopicHandoffCacheForTest, findLiveMentionlessSubtopicOwner, ORCHESTRATE_DISPATCH_STORE_FILE, resolveManagedSubtopicMentionlessHandoff, type SubtopicSessionSnapshot } from '../src/services/subtopic-mentionless-handoff.js';
+import { __resetSubtopicHandoffCacheForTest, findLiveMentionlessSubtopicOwner, ORCHESTRATE_DISPATCH_STORE_FILE, resolveManagedSubtopicMentionlessHandoff, type SubtopicMentionlessHandoff, type SubtopicSessionSnapshot } from '../src/services/subtopic-mentionless-handoff.js';
 import { PROJECT_GROUP_STORE_FILE } from '../src/services/project-group-store.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
@@ -16344,16 +16344,19 @@ describe('migrated topic un-@ human reply routing', () => {
 
     const capturedByApp = new Map<string, Record<string, (data: any) => Promise<any>>>();
 
-    const handoffFor = (appId: string) => appId === MIGRATED_APP_ID ? null : ({
+    const handoffFor = (appId: string): SubtopicMentionlessHandoff | null => appId === MIGRATED_APP_ID ? null : ({
+      kind: 'imported',
       sourceLarkAppId: MIGRATED_APP_ID,
       sourceAnswersWithoutMention: false,
+      hasProjectCoordinator: true,
+      isProjectCoordinator: appId === COORD_APP_ID,
       coordinatorMayFold: appId === COORD_APP_ID,
     });
 
     const coordHandlers = {
       ...makeHandlers(),
       isSessionOwner: vi.fn((anchor: string, appId: string) => appId === COORD_APP_ID && anchor === chatId),
-      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+      resolveSubtopicMentionlessHandoff: (r: string, c: string, appId: string) =>
         (r === rootId && c === chatId) ? handoffFor(appId) : null,
     };
     startLarkEventDispatcher(COORD_APP_ID, 'secret', coordHandlers);
@@ -16362,7 +16365,7 @@ describe('migrated topic un-@ human reply routing', () => {
     const migratedHandlers = {
       ...makeHandlers(),
       isSessionOwner: vi.fn((anchor: string, appId: string) => appId === MIGRATED_APP_ID && anchor === rootId),
-      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+      resolveSubtopicMentionlessHandoff: (r: string, c: string, appId: string) =>
         (r === rootId && c === chatId) ? handoffFor(appId) : null,
     };
     startLarkEventDispatcher(MIGRATED_APP_ID, 'secret', migratedHandlers);
@@ -16371,7 +16374,7 @@ describe('migrated topic un-@ human reply routing', () => {
     const ambientHandlers = {
       ...makeHandlers(),
       isSessionOwner: vi.fn(() => false),
-      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+      resolveSubtopicMentionlessHandoff: (r: string, c: string, appId: string) =>
         (r === rootId && c === chatId) ? handoffFor(appId) : null,
     };
     startLarkEventDispatcher(AMBIENT_WORKER_APP_ID, 'secret', ambientHandlers);
@@ -16453,9 +16456,15 @@ describe('migrated topic un-@ human reply routing', () => {
       ...makeHandlers(),
       isSessionOwner: vi.fn((anchor: string, appId: string) => appId === COORD_APP_ID && anchor === chatId),
       resolveReplyThreadAlias: vi.fn(() => ({ chatId, sessionId: 'coord-session', anchor: chatId })),
-      resolveImportedTopicMentionlessHandoff: (r: string, c: string, appId: string) =>
+      resolveSubtopicMentionlessHandoff: (r: string, c: string, appId: string) =>
         (r === rootId && c === chatId && appId !== MIGRATED_APP_ID)
-          ? { sourceLarkAppId: MIGRATED_APP_ID, sourceAnswersWithoutMention: true, coordinatorMayFold: false }
+          ? {
+            kind: 'imported' as const,
+            sourceLarkAppId: MIGRATED_APP_ID,
+            sourceAnswersWithoutMention: true,
+            hasProjectCoordinator: true,
+            isProjectCoordinator: true,
+          }
           : null,
     };
     startLarkEventDispatcher(COORD_APP_ID, 'secret', coordHandlers);
@@ -16464,7 +16473,7 @@ describe('migrated topic un-@ human reply routing', () => {
     const migratedHandlers = {
       ...makeHandlers(),
       isSessionOwner: vi.fn((anchor: string, appId: string) => appId === MIGRATED_APP_ID && anchor === rootId),
-      resolveImportedTopicMentionlessHandoff: () => null,
+      resolveSubtopicMentionlessHandoff: () => null,
     };
     startLarkEventDispatcher(MIGRATED_APP_ID, 'secret', migratedHandlers);
     capturedByApp.set(MIGRATED_APP_ID, { ...capturedHandlers } as any);
@@ -16517,7 +16526,7 @@ describe('migrated topic un-@ human reply routing', () => {
     const coordHandlers = {
       ...makeHandlers(),
       isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
-      resolveImportedTopicMentionlessHandoff: () => null,
+      resolveSubtopicMentionlessHandoff: () => null,
     };
     startLarkEventDispatcher(MY_APP_ID, 'secret', coordHandlers);
 
@@ -16559,7 +16568,8 @@ describe('migrated topic un-@ human reply routing', () => {
 });
 
 // Daemon-side facts (which session counts, the importing bot's mention mode,
-// whether the coordinator may fold) are covered in imported-topic-handoff.test.ts;
+// whether the coordinator may fold) are covered in subtopic-mentionless-handoff.test.ts
+// and chat-reply-mode-store.test.ts;
 // here each bot's hook returns what its daemon would, and the cases pin how the
 // dispatcher acts on it.
 describe('migrated topic un-@ handoff — mention-policy gates', () => {
@@ -16569,9 +16579,14 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
   const chatId = 'chat-handoff';
   const rootId = 'om_handoff_root';
   const threadId = 'omt_handoff_thread';
-  type Handoff = NonNullable<Awaited<ReturnType<NonNullable<EventHandlers['resolveImportedTopicMentionlessHandoff']>>>>;
-  const handoff = (over: Partial<Handoff> = {}): Handoff => ({
-    sourceLarkAppId: SOURCE, sourceAnswersWithoutMention: false, coordinatorMayFold: false, ...over,
+  const handoff = (over: Partial<SubtopicMentionlessHandoff> = {}): SubtopicMentionlessHandoff => ({
+    kind: 'imported',
+    sourceLarkAppId: SOURCE,
+    sourceAnswersWithoutMention: false,
+    hasProjectCoordinator: false,
+    isProjectCoordinator: false,
+    coordinatorMayFold: false,
+    ...over,
   });
   let msgSeq = 0;
 
@@ -16601,7 +16616,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
     const bots = new Map<string, { handlers: ReturnType<typeof makeHandlers> & EventHandlers; receive: (data: any) => Promise<any> }>();
     for (const spec of specs) {
       capturedHandlers = {};
-      const handlers = { ...makeHandlers(), resolveImportedTopicMentionlessHandoff: vi.fn(() => null), ...spec.handlers };
+      const handlers = { ...makeHandlers(), resolveSubtopicMentionlessHandoff: vi.fn(() => null), ...spec.handlers };
       startLarkEventDispatcher(spec.appId, 'secret', handlers);
       bots.set(spec.appId, { handlers: handlers as any, receive: capturedHandlers['im.message.receive_v1'] });
     }
@@ -16637,7 +16652,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
     const bots = startBots([
       { appId: COORD, config: { regularGroupReplyMode: 'shared' }, handlers: {
         isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
-        resolveImportedTopicMentionlessHandoff: coordHook,
+        resolveSubtopicMentionlessHandoff: coordHook,
       } },
       sourceSpec,
     ]);
@@ -16654,12 +16669,12 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
       { appId: PEER, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
         isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
         resolveReplyThreadAlias: vi.fn((r: string) => r === rootId ? { chatId, sessionId: 'peer-chat-session', anchor: chatId } : null),
-        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff()),
+        resolveSubtopicMentionlessHandoff: vi.fn(() => handoff()),
       } },
       // The daemon reports coordinatorMayFold=false here because PEER continues the root.
       { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
         isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
-        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ coordinatorMayFold: false })),
+        resolveSubtopicMentionlessHandoff: vi.fn(() => handoff({ coordinatorMayFold: false })),
       } },
       sourceSpec,
     ]);
@@ -16678,7 +16693,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
       const bots = startBots([
         { appId: PEER, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'topic' }, handlers: {
           isSessionOwner: vi.fn((anchor: string) => anchor === rootId),
-          resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ sourceAnswersWithoutMention })),
+          resolveSubtopicMentionlessHandoff: vi.fn(() => handoff({ sourceAnswersWithoutMention })),
         } },
         sourceSpec,
       ]);
@@ -16697,7 +16712,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
     const bots = startBots([
       { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic', chatManagerEnabled: true }, handlers: {
         isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
-        resolveImportedTopicMentionlessHandoff: vi.fn((r: string) => r === rootId ? handoff() : null),
+        resolveSubtopicMentionlessHandoff: vi.fn((r: string) => r === rootId ? handoff() : null),
       } },
       sourceSpec,
     ]);
@@ -16725,7 +16740,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
     const bots = startBots([
       { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
         isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
-        resolveImportedTopicMentionlessHandoff: coordHook,
+        resolveSubtopicMentionlessHandoff: coordHook,
       } },
       sourceSpec,
     ]);
@@ -16746,7 +16761,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
     mockGetCachedChatModeStrict.mockReturnValue('topic');
     const bots = startBots([
       { appId: COORD, config: { regularGroupMentionMode: 'topic' }, handlers: {
-        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ coordinatorMayFold: true })),
+        resolveSubtopicMentionlessHandoff: vi.fn(() => handoff({ coordinatorMayFold: true })),
       } },
       sourceSpec,
     ]);
@@ -16763,7 +16778,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
     const bots = startBots([
       { appId: COORD, config: { regularGroupReplyMode: 'shared', regularGroupMentionMode: 'topic' }, handlers: {
         isSessionOwner: vi.fn((anchor: string) => anchor === chatId),
-        resolveImportedTopicMentionlessHandoff: coordHook,
+        resolveSubtopicMentionlessHandoff: coordHook,
       } },
       sourceSpec,
     ]);
@@ -16777,7 +16792,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
   it('a bot yielding the imported topic still answers built-in un-@ commands such as /dash', async () => {
     const bots = startBots([
       { appId: PEER, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'ambient' }, handlers: {
-        resolveImportedTopicMentionlessHandoff: vi.fn(() => handoff({ sourceAnswersWithoutMention: true })),
+        resolveSubtopicMentionlessHandoff: vi.fn(() => handoff({ sourceAnswersWithoutMention: true })),
       } },
     ]);
     const peer = bots.get(PEER)!.handlers;
@@ -16792,7 +16807,7 @@ describe('migrated topic un-@ handoff — mention-policy gates', () => {
   it('a failing lookup keeps the regular routing instead of dropping the message', async () => {
     const bots = startBots([
       { appId: PEER, config: { regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'ambient' }, handlers: {
-        resolveImportedTopicMentionlessHandoff: vi.fn(() => { throw new Error('group-collaboration-modes.json: Unexpected token'); }),
+        resolveSubtopicMentionlessHandoff: vi.fn(() => { throw new Error('group-collaboration-modes.json: Unexpected token'); }),
       } },
     ]);
 
@@ -17720,7 +17735,7 @@ describe('managed subtopic: coordinator with its own thread session at the root'
         botOpenId: 'ou_own_thread_worker', resolvedAllowedUsers: [USER_OPEN_ID], resolvedBlockedUsers: [] }],
     ]);
     mockGetBot.mockImplementation((id: string) => botStates.get(id));
-    mockGetAllBots.mockImplementation(() => [...botStates.values()]);
+    mockGetAllBots.mockImplementation(() => [...botStates.values()] as never[]);
     const sessions: SubtopicSessionSnapshot[] = [
       { sessionId: 'own-thread-worker', larkAppId: WORKER, chatId, scope: 'thread', rootMessageId: rootId, status: 'active', projectImportSource: 'relay' },
       { sessionId: 'own-thread-coord', larkAppId: COORD, chatId, scope: 'thread', rootMessageId: rootId, status: 'active' },
@@ -17743,7 +17758,7 @@ describe('managed subtopic: coordinator with its own thread session at the root'
         resolveSubtopicMentionlessHandoff: (r: string, c: string, a: string) => resolveManagedSubtopicMentionlessHandoff(deps, r, c, a),
       };
       startLarkEventDispatcher(appId, 'secret', h);
-      receivers.push(capturedHandlers['im.message.receive_v1']);
+      receivers.push(capturedHandlers['im.message.receive_v1'] as (data: any) => Promise<any>);
       handlersByApp.set(appId, h);
     }
     const deliver = async (messageId: string) => {

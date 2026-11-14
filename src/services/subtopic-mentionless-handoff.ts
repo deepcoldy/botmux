@@ -14,8 +14,12 @@
  *   2. `'dispatch'` — subtopics registered in `orchestrate-dispatch.json` for this chat;
  *   3. `'workstream'` — subtask topics registered in `project-groups.json` for this chat.
  *
- * In non-project groups, only active `'imported'` thread sessions participate,
- * preserving existing behavior for ordinary groups and unmanaged topics.
+ * In non-project groups, only another bot's active `'imported'` thread session
+ * participates (the routing that `/relay` / `/adopt` / `/fork` / `bind` topics
+ * already had). One deliberate tightening applies to every group: when that
+ * importing bot answers without `@`, `findChatReplyAlias` also stops a bot's
+ * historical `replyThreadAliases[rootId]` from folding the same reply in, so an
+ * earlier explicit `@` of another bot cannot cause a double reply.
  */
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -305,8 +309,8 @@ export function resolveManagedSubtopicMentionlessHandoff(
   const hasProjectCoordinator = !!coordinatorAppId;
   const activeThreadSessions = collectActiveThreadSessionsAtRoot(deps, rootId, chatId);
 
-  // Non-project groups: preserve existing behavior strictly (only active imported
-  // thread sessions owned by another bot participate).
+  // Non-project groups: only another bot's active imported thread session counts;
+  // this bot's own imported session is never a handoff (it answers there itself).
   if (!hasProjectCoordinator) {
     const imported = activeThreadSessions.find(
       s => !!s.projectImportSource && s.larkAppId !== currentAppId,
