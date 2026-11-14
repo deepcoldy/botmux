@@ -7,7 +7,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { botmuxCliInvocation, buildRelayHostEnv } from '../adapters/backend/sandbox.js';
-import { quotedAttachments } from './remote-runner-session-tool.js';
+import { quotedAttachments, QuotedAttachmentLimitError } from './remote-runner-session-tool.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
 import { parseRiffUploadIndex } from './riff-upload-placeholder.js';
 import { parseSendInvocation, validateHostSendInvocation } from '../cli/send-invocation.js';
@@ -15,6 +15,9 @@ import { parseSendInvocation, validateHostSendInvocation } from '../cli/send-inv
 export const RIFF_HOST_TOOLS_ROUTE = '/api/riff-host-tools';
 export const RIFF_HOST_BINDING_ENV = 'BOTMUX_RIFF_HOST_BINDING';
 export const RIFF_HOST_MAX_BYTES = 48 * 1024 * 1024;
+// 24 MiB of binary data becomes 32 MiB in base64, leaving room for text
+// and JSON metadata within the sandbox client's 48 MiB response limit.
+export const RIFF_HOST_MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const RECEIPT_LIMIT = 1000;
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -180,11 +183,24 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
         clearTimeout(deadline); clearInterval(fence);
         stdout += outDecoder.end(); stderr += errDecoder.end();
         try {
-          const packaged = argv[0] === 'quoted' && code === 0 ? quotedAttachments(stdout, env) : { stdout };
+          const packaged = argv[0] === 'quoted' && code === 0
+            ? quotedAttachments(stdout, env, RIFF_HOST_MAX_ATTACHMENT_BYTES) : { stdout };
           resolve({ exitCode: failed || code === null ? 1 : code, stdout: packaged.stdout,
             stderr: failed ? 'riff_host_execution_unknown; do not repeat this operation automatically' : stderr,
             ...('attachments' in packaged ? { attachments: packaged.attachments } : {}) });
-        } catch { resolve({ exitCode: 1, stdout: '', stderr: 'riff_host_attachment_invalid' }); }
+        } catch (error) {
+          let diagnostic = 'riff_host_attachment_invalid';
+          if (error instanceof QuotedAttachmentLimitError) {
+            diagnostic = `riff_host_attachment_too_large: ${error.actualBytes} bytes > ${error.limitBytes} bytes; reduce the attachment size`;
+          } else {
+            // Expose filesystem failure categories without leaking host paths.
+            const code = (error as NodeJS.ErrnoException | null)?.code;
+            if (typeof code === 'string' && /^(ENOENT|EACCES|EPERM|EIO|ENOTDIR|ELOOP)$/.test(code)) {
+              diagnostic = `riff_host_attachment_read_failed: ${code}`;
+            }
+          }
+          resolve({ exitCode: 1, stdout: '', stderr: diagnostic });
+        }
       };
       child.once('error', () => { failed = true; });
       child.once('close', finish);
