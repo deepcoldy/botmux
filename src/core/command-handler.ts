@@ -65,7 +65,7 @@ import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } 
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, interruptCodexAppTurn, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -3083,7 +3083,12 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
           break;
         }
-        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+        if (effectiveCliId === 'codex-app' && !isRemoteBackendSession(ds)) {
+          const status = await interruptCodexAppTurn(ds);
+          await sessionReply(rootId, t(`cmd.stop.app_${status}`, undefined, loc));
+          break;
+        }
+        if (ds.initConfig?.codexRpcInput === true || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
         }

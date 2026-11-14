@@ -30,6 +30,8 @@ function runnerScope(): Record<string, any> {
     detectedCodexVersion: () => ({ major: 0, minor: 162, patch: 1 }),
     supportsClientUserMessageId,
     codexAsyncSteerTargetMatches, steerAdmitting: false,
+    // Runner marker sink extracted out of the steer-driver functions under test.
+    publishInterruptTarget: vi.fn(),
   };
   scope.codexAsyncSteerTargetMatches = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncSteerTargetMatches', scope);
   scope.canSteerInputToNativeTurn = productionFunction('src/codex-app-runner.ts', 'canSteerInputToNativeTurn', scope);

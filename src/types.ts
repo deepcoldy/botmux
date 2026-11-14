@@ -2152,6 +2152,7 @@ type DaemonToWorkerBase =
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
   | { type: 'codex_app_effort'; requestId: string; effort: string }
+  | { type: 'codex_app_interrupt'; requestId: string; generation: string; turnEpoch: number }
   | { type: 'worker_ipc_probe' }
   | { type: 'protected_mcp_secret_channel_result'; requestId: string; ok: boolean; error?: string }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
@@ -2424,6 +2425,8 @@ export interface WorkerFinalOutput {
   /** Redacted terminal diagnostic only, without partial model text. May
    * surface as auxiliary failure UI when a loud trigger hides its answer. */
   turnFailureNotice?: string;
+  /** A signed Codex App final whose native terminal was interrupted. */
+  codexAppCancelled?: true;
   /** True when `content` is the worker's "completed but no final text matched"
    *  diagnostic, not a model answer: it must not count as the turn's delivered
    *  final reply. Presentation is unchanged. */
@@ -2476,6 +2479,8 @@ export type WorkerToDaemonBase =
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
+  | { type: 'codex_app_interrupt_target'; target?: { generation: string; turnEpoch: number; replyTurnId: string; dispatchAttempt?: number } }
+  | { type: 'codex_app_interrupt_result'; requestId: string; status: 'delivered' | 'stale_turn' | 'delivery_failed' }
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'runtime_binding_started'; bindingId: string; operationId?: string; continuation?: import('./services/session-contract.js').RuntimeExecutionContinuation }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }

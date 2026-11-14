@@ -38,6 +38,7 @@ import {
   encodeCodexAppControlAck,
   encodeCodexAppControlAccepted,
   encodeCodexAppControlChallenge,
+  encodeCodexAppControlInterrupt,
   ensureCodexAppControlDirectory,
   generateCodexAppControlChallenge,
   generateCodexAppControlEpoch,
@@ -96,6 +97,8 @@ class ControlCollector {
   private readonly server: Server;
   private readonly sockets = new Set<Socket>();
   private pendingAcceptance?: { socket: Socket; challenge: string };
+  private interruptConnection?: { socket: Socket; challenge: string };
+  turnInterrupt = false;
   private lastSeq = 0;
   private disconnectedFinalChunk = false;
   private omittedFinalChunk = false;
@@ -120,6 +123,15 @@ class ControlCollector {
   }
 
   get committedThrough(): number { return this.lastSeq; }
+
+  interrupt(requestId: string, turnEpoch: number): void {
+    const connection = this.interruptConnection;
+    if (!connection) throw new Error('No authenticated interrupt connection');
+    connection.socket.write(`${encodeCodexAppControlInterrupt({
+      sessionId: SESSION_ID, generation: this.bootstrap.identity.generation,
+      challenge: connection.challenge, requestId, turnEpoch,
+    })}\n`);
+  }
 
   listen(): Promise<void> {
     return new Promise((resolvePromise, rejectPromise) => {
@@ -192,10 +204,13 @@ class ControlCollector {
           this.resolveAuthObserved();
           if (this.manualAcceptance) this.pendingAcceptance = { socket, challenge };
           else {
+            this.interruptConnection = { socket, challenge };
             socket.write(`${encodeCodexAppControlAccepted(
               SESSION_ID,
               this.bootstrap.identity.generation,
               challenge,
+              undefined,
+              this.turnInterrupt ? true : undefined,
             )}\n`);
           }
           continue;
@@ -3747,6 +3762,102 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
       await waitFor(harness, () => control.finals.length >= 1);
       expect(control.finals[0].usage).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Codex App native stop', () => {
+  it.each(['operator-interrupt', 'operator-interrupt-reject'])('handles %s without closing the thread', async behavior => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-interrupt-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    control.turnInterrupt = true;
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path);
+    const start = (id: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(id, undefined, id)}\r`);
+    const target = (id: string) => control.markers.find(m => m.kind === 'interrupt_target' && m.payload.replyTurnId === id)?.payload;
+    const receipt = (id: string) => control.markers.find(m => m.kind === 'interrupt_result' && m.payload.requestId === id)?.payload;
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      start('om_first');
+      await waitFor(harness, () => !!target('om_first'));
+      const first = target('om_first')!.turnEpoch;
+      start('om_queued');
+      control.interrupt('stop-first', first);
+      await waitFor(harness, () => !!receipt('stop-first'));
+      const rejected = behavior.endsWith('-reject');
+      expect(receipt('stop-first')?.status).toBe(rejected ? 'delivery_failed' : 'delivered');
+      if (!rejected) {
+        await waitFor(harness, () => !!target('om_queued'));
+        expect(control.finals).toMatchObject([{ turnId: 'om_first', errorCode: 'cancelled', content: '' }]);
+        control.interrupt('old-card', first);
+        await waitFor(harness, () => !!receipt('old-card'));
+        expect(receipt('old-card')?.status).toBe('stale_turn');
+        control.interrupt('stop-second', target('om_queued')!.turnEpoch);
+        await waitFor(harness, () => !!receipt('stop-second') && control.finals.length === 2);
+        expect(receipt('stop-second')?.status).toBe('delivered');
+      } else {
+        expect(control.finals).toEqual([]);
+      }
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => r.method === 'thread/start')).toHaveLength(1);
+      expect(requests.filter(r => r.method === 'turn/start')).toHaveLength(rejected ? 1 : 2);
+      expect(requests.filter(r => r.method === 'turn/interrupt').map(r => r.params)).toEqual([
+        { threadId: 'thread-fake', turnId: 'turn-fake-1' },
+        ...(!rejected ? [{ threadId: 'thread-fake', turnId: 'turn-fake-2' }] : []),
+      ]);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels every member of a steered group and keeps input sent while stopping for the next turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-interrupt-steer-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    control.turnInterrupt = true;
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'operator-interrupt-steer', control.bootstrap.path);
+    const send = (id: string) => harness.child.stdin.write(
+      `${CONTROL_PREFIX}${encodeRunnerInput(id, { text: id }, id, true)}\r`);
+    const target = (id: string) => control.markers.find(m => m.kind === 'interrupt_target' && m.payload.replyTurnId === id)?.payload;
+    const receipt = (id: string) => control.markers.find(m => m.kind === 'interrupt_result' && m.payload.requestId === id)?.payload;
+    const turnMethods = () => readRequests(logPath).map(r => r.method)
+      .filter(method => method === 'turn/start' || method === 'turn/steer' || method === 'turn/interrupt');
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      send('om_root');
+      await waitFor(harness, () => !!target('om_root'));
+      send('om_follow');
+      // The steered member becomes the newest accepted input of the same native turn.
+      await waitFor(harness, () => !!target('om_follow'));
+      expect(target('om_follow')!.turnEpoch).toBe(target('om_root')!.turnEpoch);
+      control.interrupt('stop-group', target('om_follow')!.turnEpoch);
+      await waitFor(harness, () => receipt('stop-group')?.status === 'delivered');
+      // Sent after the stop was accepted but before the interrupted terminal:
+      // it must wait for a new turn instead of being steered into the stopped one.
+      send('om_after_stop');
+      await waitFor(harness, () => !!target('om_after_stop'));
+      expect(turnMethods()).toEqual(['turn/start', 'turn/steer', 'turn/interrupt', 'turn/start']);
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_root', content: '', errorCode: 'cancelled', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_follow', content: '', errorCode: 'cancelled' }),
+      ]);
+      expect(control.finals[1]).not.toHaveProperty('disposition');
+      expect(harness.child.exitCode).toBeNull();
     } finally {
       await stopChild(harness.child);
       await control.close();
