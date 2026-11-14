@@ -7065,6 +7065,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     const explicitOrigin = binding?.runtime
       ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
       : undefined;
+    if (scope && !explicitOrigin) return true;
     pendingManagedTurnOriginScope = explicitOrigin;
     try {
     send({

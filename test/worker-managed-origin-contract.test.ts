@@ -114,8 +114,7 @@ describe('managed origin publication through the session contract', () => {
     const assigned = loadWorkerMessageHandler('runtime_contract_assigned', h.env);
     h.scope.run(opening, () => { h.scope.enterTurn(h.execution.turnId); h.env.publishSandboxRelayCapability(); }, h.execution);
     await h.drain();
-    expect(h.wire).toHaveLength(1);
-    expect(h.wire[0].sessionContract.scope.runtime).toBeUndefined();
+    expect(h.wire.filter(m => m.type === 'managed_turn_origin')).toHaveLength(0);
     expect(h.ds.managedTurnOrigin).toBeUndefined();
 
     opening.identity = { backend: 'tmux', physicalId: '100:1000', proof: 'process_start', nativeSessionId: 'opening-native' };
@@ -123,8 +122,10 @@ describe('managed origin publication through the session contract', () => {
     await assigned({ type: 'runtime_contract_assigned', bindingId: opening.bindingId, runtime, mayExecute: true,
       executions: [h.execution], admissionStates: [{ ref: h.execution, phase: 'queued' }] });
     await h.drain();
-    expect(h.wire).toHaveLength(2);
-    expect(h.wire[1].sessionContract.scope.runtime).toEqual(runtime);
+    const origins = h.wire.filter(m => m.type === 'managed_turn_origin');
+    expect(origins).toHaveLength(1);
+    expect(origins[0].sessionContract.scope.runtime).toEqual(runtime);
+    expect(origins[0].sessionContract.scope.execution).toEqual(h.execution);
     expect(h.ds.managedTurnOrigin).toMatchObject({ turnId: h.execution.turnId, callerOpenId: 'ou_human' });
   });
 });
