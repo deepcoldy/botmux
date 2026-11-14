@@ -531,7 +531,7 @@ function KanbanCardBase(props: {
   const chatTitle = chatDisplayTitle(row);
   const repo = repoBasename(row.workingDir);
   const taskStatus = deriveSessionTaskStatus(row);
-  const taskLine = sessionTaskCardLine(taskStatus);
+  const taskLine = sessionTaskCardLine(taskStatus, Date.now(), row.executionActivity);
   // 状态色条：需要你 / 进行中 / 没做完 / 已交付 / 空闲（deriveSessionBoardColumn）；已关闭单独一色。
   const signalKind = deriveSessionBoardColumn(row) ?? 'closed';
   const exchange = sessionExchangePreview(row);

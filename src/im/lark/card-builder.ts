@@ -969,8 +969,8 @@ export interface BackgroundWaitCardLabel {
 }
 
 export interface ActivityCardLabel {
-  activity: 'working' | 'tool' | 'model_queue';
-  elapsedSeconds: number;
+  activity: 'working' | 'tool' | 'model_queue' | 'unknown';
+  elapsedSeconds?: number;
   progressAgeSeconds?: number;
 }
 
@@ -1003,6 +1003,7 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
   if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
+    if (idleLabel.activity === 'unknown') return t('card.status.activity_unknown', undefined, locale);
     if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
     if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
   }
@@ -1045,8 +1046,10 @@ function pushStreamBody(
 ): void {
   const { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable } = opts;
   const activity = opts.activity;
-  if (status === 'working' && activity && typeof activity === 'object' && 'activity' in activity) {
-    const elapsed = t('card.status.activity_elapsed', { seconds: activity.elapsedSeconds }, locale);
+  if (status === 'working' && activity && typeof activity === 'object' && 'activity' in activity
+    && (activity.elapsedSeconds !== undefined || activity.progressAgeSeconds !== undefined)) {
+    const elapsed = activity.elapsedSeconds === undefined ? t('card.status.activity_unknown', undefined, locale)
+      : t('card.status.activity_elapsed', { seconds: activity.elapsedSeconds }, locale);
     const progress = activity.progressAgeSeconds === undefined ? ''
       : ` · ${t('card.status.activity_progress_age', { seconds: activity.progressAgeSeconds }, locale)}`;
     elements.push({ tag: 'markdown', element_id: 'botmux_stream_activity', text_size: 'notation_small_v2',

@@ -29,6 +29,7 @@ import {
   type NeedsYouReason,
   type SessionTaskKind,
 } from '../core/session-task-status.js';
+import { normalizeExecutionActivity, type ExecutionActivity } from '../core/execution-activity.js';
 
 export const OBSERVE_SCHEMA_VERSION = 1 as const;
 
@@ -100,6 +101,7 @@ export interface ObserveTask {
 }
 
 export interface ObserveSession {
+  executionActivity?: ExecutionActivity;
   schemaVersion: typeof OBSERVE_SCHEMA_VERSION;
   observedAt: number;
   probe: ObserveProbe;
@@ -362,6 +364,8 @@ export function normalizeSessionRow(
   if (hasRuntimeFacts) {
     const context = normalizeContext(row.contextUsage);
     if (context) observe.context = context;
+    const activity = normalizeExecutionActivity(row.executionActivity);
+    if (liveness === 'alive' && turn === 'working' && activity) observe.executionActivity = activity;
   }
   if (closed === true && typeof row.resumable === 'boolean') {
     observe.resumable = row.resumable;
@@ -386,6 +390,7 @@ export function normalizeSessionRow(
 }
 
 export interface RawSessionRow {
+  executionActivity?: unknown;
   sessionId?: unknown;
   larkAppId?: unknown;
   botName?: unknown;

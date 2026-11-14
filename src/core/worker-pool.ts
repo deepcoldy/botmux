@@ -20,7 +20,7 @@ import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
-import { traexStreamCardActivity } from './stream-card-activity.js';
+import { sessionExecutionActivity } from './session-execution-activity.js';
 import { listPendingAsks } from './ask-broker.js';
 import { isHookPermissionAsk } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
@@ -2156,19 +2156,10 @@ export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined 
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
-  const source = currentCaptureIdentity(ds) ?? ds.managedTurnOrigin;
-  const highWater = ds.turnDispatchAttemptHighWater;
-  const currentSource = source?.turnId === ds.currentTurnId && source?.turnId
-    && (highWater?.turnId !== source.turnId || (source.dispatchAttempt !== undefined
-      && source.dispatchAttempt >= highWater.dispatchAttempt)) ? source : undefined;
-  const activity = currentSource ? traexStreamCardActivity({
-    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId,
-    status: ds.lastScreenStatus,
-    content: ds.lastScreenContent,
-    execution: ds.replyExecutionStarts?.get(JSON.stringify([currentSource.turnId, currentSource.dispatchAttempt ?? null])),
-    workerGeneration: ds.workerGeneration,
-    nowMs: Date.now(),
-  }) : undefined;
+  const observed = sessionExecutionActivity(ds);
+  const activity = observed ? { activity: observed.phase,
+    ...(observed.elapsedSeconds !== undefined ? { elapsedSeconds: observed.elapsedSeconds } : {}),
+    ...(observed.progressAgeSeconds !== undefined ? { progressAgeSeconds: observed.progressAgeSeconds } : {}) } : undefined;
   return activity ?? idleCardLabel(ds);
 }
 
@@ -19873,6 +19864,13 @@ function setupWorkerHandlers(
           const changed = execution.stage !== msg.stage;
           execution.stage = msg.stage;
           execution.lastProgressAtMs = Date.now();
+          const publishedAt = execution.lastDashboardPublishedAtMs ?? 0;
+          if (msg.stage !== 'model_output' || Date.now() - publishedAt >= 1000) {
+            execution.lastDashboardPublishedAtMs = Date.now();
+            const row = composeRowFromActive(ds, { includeTokenUsage: false });
+            dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
+              patch: { executionActivity: row.executionActivity, lastActivityAt: row.lastActivityAt, lastMessageAt: row.lastMessageAt } } });
+          }
           if (changed && sessionCliId(ds, getBot(ds.larkAppId).config) === 'traex') {
             syncUsageRefreshTimer(ds);
             refreshStreamingCardUsage(ds);
