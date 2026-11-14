@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { atomicWriteFileSync, isAtomicWriteTempName } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
-import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { readDurableProcessIdentity, readSelfApproxStartIdentity } from '../utils/process-identity.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 import { FEEDBACK_TABLES } from './feedback-tables.js';
@@ -49,7 +49,11 @@ export function feedbackMaintenanceActive(dataDir: string): boolean {
 }
 export function acquireFeedbackSendLease(dataDir: string): () => void {
   mkdirSync(dataDir, { recursive: true });
-  const identity = readDurableProcessIdentity(process.pid);
+  // A sandboxed `botmux send` (macOS Seatbelt) cannot exec the setuid `/bin/ps`,
+  // so the exact identity is unreadable from inside; refusing here would make
+  // every send of a sandboxed bot fail. Fall back to a self-reported birth time
+  // that the (unsandboxed) maintenance inspector verifies against the real one.
+  const identity = readDurableProcessIdentity(process.pid) ?? readSelfApproxStartIdentity();
   if (!identity) throw new Error('feedback_process_identity_unavailable');
   const directory = join(dataDir, 'feedback-send-leases');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
