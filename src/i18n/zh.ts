@@ -1729,7 +1729,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_disabled_auto': '⚠️ {cliName} 的暂态故障自动续跑已关闭，本轮不再续跑。请检查已有进度，需要时点失败卡上的「重试」或发送一条消息继续。',
   'worker.ordinary_recovery_provider_eta_beyond_window': '⚠️ {cliName} 的模型服务暂不可用，上游预计 {eta} 才恢复，晚于自动续跑的截止时间 {windowEnd}（{windowNote}）。Botmux 没有再自动续跑；{eta} 之后点失败卡上的「重试」，或发送一条消息让它从断点继续。',
   'worker.ordinary_recovery_max_continuations': '⚠️ {cliName} 因暂态模型服务故障反复中断，Botmux 已自动续跑 {count} 次（达到上限）仍未完成，已停止自动续跑。请检查 Web 终端和模型服务状态，再点失败卡上的「重试」或发送一条消息继续。',
-  'worker.ordinary_recovery_waiting': '⏳ {cliName} 的模型服务暂不可用{eta}。Botmux 会在 {at} 自动续跑原任务，无需操作；若仍未恢复会继续自动重试，最晚到 {windowEnd}（{windowNote}）。期间发送新消息、或在 Web 终端里接着做，都会取消自动续跑。',
+  'worker.ordinary_recovery_waiting': '⏳ {cliName} 的模型服务暂不可用{eta}。Botmux 会在 {at} 自动续跑原任务，无需操作；若仍未恢复会继续自动重试，最晚到 {windowEnd}（{windowNote}）。期间发送新消息、或在 Web 终端里接着做完一轮，都会取消自动续跑。',
   'worker.ordinary_recovery_waiting_eta': '（上游预计 {eta} 恢复）',
   'worker.ordinary_recovery_enqueue_failed': '⚠️ {cliName} 因暂态模型服务故障中断，但 Botmux 无法安全提交自动续跑。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
   'worker.ordinary_recovery_delivery_failed': '⚠️ {cliName} 因暂态模型服务故障中断，但自动续跑未能送达 Worker。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
