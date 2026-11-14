@@ -263,6 +263,25 @@ describe('schedule CLI prompt updates', () => {
     expect(f.read()['11223344']).toMatchObject({ executionPosition: 'topic', rootMessageId: 'om_current_topic' });
   });
 
+  it('does not serialize an implicit workday calendar selector for a plain topic task', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const result = await f.run(['add', '2m', 'one-shot child', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    const request = observed.find(item => 'task' in item);
+    expect(request).toBeDefined();
+    expect(request!.task as Record<string, unknown>).not.toHaveProperty('calendar');
+    expect(request!.task as Record<string, unknown>).not.toHaveProperty('calendarDayType');
+
+    const explicit = await f.run(['add', '2m', 'explicit day type', '--topic', '--id', '11223345',
+      '--calendar-day-type', 'restday']);
+    expect(explicit.code, explicit.output).toBe(0);
+    const explicitRequest = observed.filter(item => 'task' in item)[1];
+    expect(explicitRequest.task as Record<string, unknown>).not.toHaveProperty('calendar');
+    expect(explicitRequest.task as Record<string, unknown>).toHaveProperty('calendarDayType', 'restday');
+  });
+
   it.each(['missing', 'plain'])('refuses implicit --topic when the exact chat turn is %s', async mode => {
     const f = fixture();
     await managed(f);
