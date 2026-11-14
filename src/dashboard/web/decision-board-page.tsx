@@ -604,6 +604,11 @@ function BatchList(props: { appId: string; batches: BoardBatch[]; now: number; o
 
 // ─── 汇总页 ─────────────────────────────────────────────────────────────────
 
+/** 待拍板 / 待验收的事项 owner 可以直接关闭（不生成决定）。 */
+function closableInChat(state: BoardState): boolean {
+  return state === 'decide' || state === 'accept';
+}
+
 function CloseInChatButton(props: {
   appId: string; item: Pick<BoardItem, 'seq' | 'rev' | 'state'>; disabled?: boolean;
   beforeClose?(): Promise<unknown>; onChanged(): void;
@@ -613,7 +618,7 @@ function CloseInChatButton(props: {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState('');
-  if (props.item.state !== 'decide' && props.item.state !== 'accept') return null;
+  if (!closableInChat(props.item.state)) return null;
   async function closeOnly(): Promise<void> {
     if (busyRef.current) return;
     busyRef.current = true;
@@ -639,11 +644,11 @@ function CloseInChatButton(props: {
       backdropClose={!busy} onRequestClose={() => { if (!busy) setOpen(false); }}>
       <div className="confirm-modal-card">
         <h3 className="confirm-modal-title">{tr('decisionBoard.closeInChatTitle')}</h3>
-        <p>{tr('decisionBoard.closeInChatBody')}</p>
-        {error ? <p role="alert">{error}</p> : null}
+        <p className="confirm-modal-message">{tr('decisionBoard.closeInChatBody')}</p>
+        {error ? <p className="confirm-modal-message dboard-error-line" role="alert">{error}</p> : null}
         <div className="confirm-modal-footer">
-          <button type="button" disabled={busy} onClick={() => setOpen(false)}>{tr('decisionBoard.cancel')}</button>
-          <button type="button" disabled={busy} data-action="confirm-close-in-chat" onClick={() => void closeOnly()}>{tr('decisionBoard.closeInChatConfirm')}</button>
+          <button type="button" className="btn-cancel" disabled={busy} onClick={() => setOpen(false)}>{tr('decisionBoard.cancel')}</button>
+          <button type="button" className="btn-danger" disabled={busy} data-action="confirm-close-in-chat" onClick={() => void closeOnly()}>{tr('decisionBoard.closeInChatConfirm')}</button>
         </div>
       </div>
     </ModalDialog>
@@ -1420,8 +1425,13 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
-      <CloseInChatButton appId={appId} item={item} disabled={uploads.length > 0}
-        beforeClose={() => editor.flush()} onChanged={() => { editor.reset(null); void load({ resetDraft: true }); }} />
+      {/* 包一层块容器：.page 是 grid，按钮直接做格子会被拉满整行（文字居中、整行都能点到）。 */}
+      {closableInChat(item.state) ? (
+        <div>
+          <CloseInChatButton appId={appId} item={item} disabled={uploads.length > 0}
+            beforeClose={() => editor.flush()} onChanged={() => { editor.reset(null); void load({ resetDraft: true }); }} />
+        </div>
+      ) : null}
       {item.state === 'closed' ? <p className="dboard-detail-meta" role="status">{tr('decisionBoard.closeInChatDone')}</p> : null}
       <HintBanner hint={item.hint} />
       <TaskHintChip hint={detail.taskHint} banner />
