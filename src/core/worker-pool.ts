@@ -1026,9 +1026,11 @@ import {
   deferWorkerSpawnDuringDeviceIsolation,
 } from './device-isolation-activation.js';
 import {
-  buildBotmuxLarkNativeSessionTitle,
-  extractBotmuxLarkNativeSessionTitlePrompt,
+  prepareAutomaticSessionTitle,
+  type AutomaticSessionTitlePlan,
 } from './session-title.js';
+import { applyAutomaticSessionTitle, hasManualSessionTitle } from './session-title-content.js';
+import { resolveGroupJoinPrompt } from './auto-start.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit, resolveProseBotMentions, unboundInputCommitLogLevel } from './dispatch.js';
 import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
@@ -15492,6 +15494,59 @@ export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnI
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
  * clean-input gate at message acceptance time. This freezes the sidecar onto
  * the IPC item, so later config flips do not mutate an already queued turn. */
+function prepareInputTitle(ds: DaemonSession, input: string | CliTurnPayload, cliId: CliId, fresh = false): AutomaticSessionTitlePlan | undefined {
+  if (ds.adoptedFrom || isSharedAdoptSession(ds)) return undefined;
+  const bot = getBot(ds.larkAppId);
+  const payload = typeof input === 'string' ? { content: input } : input;
+  return prepareAutomaticSessionTitle(ds.session, payload.codexAppInput?.text ?? payload.content, {
+    native: supportsBotmuxLarkNativeSessionTitle(cliId), fresh,
+    groupName: ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
+    mentions: bot.botName ? [{ name: bot.botName }] : undefined,
+    bootstrapPrompts: [resolveGroupJoinPrompt(bot.config.autoStartOnGroupJoinPrompt, localeForBot(ds.larkAppId))],
+  });
+}
+
+function applyPreparedInputTitle(ds: DaemonSession, plan: AutomaticSessionTitlePlan | undefined) {
+  if (!plan || hasManualSessionTitle(ds.session) || ds.session.title !== plan.expectedTitle
+    || ds.session.titleSource !== plan.expectedSource || ds.session.nativeSessionTitleAwaitingContent !== plan.expectedAwaiting) return undefined;
+  const previous = { title: ds.session.title, titleSource: ds.session.titleSource, titleUpdatedAt: ds.session.titleUpdatedAt,
+    nativeSessionTitle: ds.session.nativeSessionTitle, nativeSessionTitleAwaitingContent: ds.session.nativeSessionTitleAwaitingContent,
+    automaticTitleBootstrap: ds.session.automaticTitleBootstrap };
+  const changed = applyAutomaticSessionTitle(ds.session, plan.title, plan.source, new Date().toISOString());
+  ds.session.nativeSessionTitleAwaitingContent = plan.awaitingContent ? true : undefined;
+  if (plan.nativeTitle !== undefined) ds.session.nativeSessionTitle = plan.nativeTitle;
+  if (plan.bootstrap) ds.session.automaticTitleBootstrap = plan.bootstrap;
+  return { changed, previous, plan };
+}
+
+function finishPreparedInputTitle(ds: DaemonSession, update: ReturnType<typeof applyPreparedInputTitle>): void {
+  if (!update) return;
+  if (ds.initConfig && update.plan.nativeTitle !== undefined) {
+    ds.initConfig.nativeSessionTitle = update.plan.nativeTitle;
+    if (update.plan.nativePrompt === undefined) delete ds.initConfig.nativeSessionTitlePrompt;
+    else ds.initConfig.nativeSessionTitlePrompt = update.plan.nativePrompt;
+  }
+  if (update.changed) {
+    try { dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
+      patch: { title: ds.session.title, titleSource: ds.session.titleSource, titleUpdatedAt: ds.session.titleUpdatedAt } } }); }
+    catch (error) { logger.warn(`[${tag(ds)}] Accepted title dashboard publication failed: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+}
+
+function commitAcceptedInputTitle(ds: DaemonSession, plan: AutomaticSessionTitlePlan | undefined): boolean {
+  const update = applyPreparedInputTitle(ds, plan);
+  if (!update) return false;
+  try { sessionStore.updateSession(ds.session); }
+  catch (error) {
+    Object.assign(ds.session, update.previous);
+    // The input already has an owner. A metadata error must never invite a duplicate send.
+    logger.warn(`[${tag(ds)}] Accepted input title persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  finishPreparedInputTitle(ds, update);
+  return true;
+}
+
 export function sendWorkerInput(
   ds: DaemonSession,
   payload: string | CliTurnPayload,
@@ -15568,24 +15623,6 @@ export function sendWorkerInput(
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, routingTurnId);
   let nativeSessionTitlePrompt: string | undefined;
   let nativeSessionTitle: string | undefined;
-  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
-    if (supportsBotmuxLarkNativeSessionTitle(effectiveCliId)) {
-      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
-        normalized.codexAppInput?.text ?? normalized.content,
-        bot.botName ? [{ name: bot.botName }] : undefined,
-      );
-      if (nativeSessionTitlePrompt) {
-        nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(nativeSessionTitlePrompt);
-        ds.session.nativeSessionTitle = nativeSessionTitle;
-        ds.session.nativeSessionTitleAwaitingContent = undefined;
-        if (ds.initConfig) {
-          ds.initConfig.nativeSessionTitle = nativeSessionTitle;
-          ds.initConfig.nativeSessionTitlePrompt = nativeSessionTitlePrompt;
-        }
-        sessionStore.updateSession(ds.session);
-      }
-    }
-  }
 
   if (hasQueuedActivationAdmissionGate(ds)) {
     const queuedTurnId = effectiveTurnId
@@ -15630,6 +15667,10 @@ export function sendWorkerInput(
       return false;
     }
   }
+
+  const automaticTitlePlan = prepareInputTitle(ds, normalized, effectiveCliId);
+  nativeSessionTitle = automaticTitlePlan?.nativeTitle;
+  nativeSessionTitlePrompt = automaticTitlePlan?.nativePrompt;
 
   // Real delivery boundary: subtract background sources covered while this
   // turn waited (FIFO / staged tail) and freeze what is actually sent. LinkRef
@@ -15743,6 +15784,7 @@ export function sendWorkerInput(
     );
     return false;
   }
+  commitAcceptedInputTitle(ds, automaticTitlePlan);
   rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, opts.trustedCaller);
   {
     const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
@@ -16053,6 +16095,8 @@ export function promoteQueuedActivationTail(
   exactInput = freezeAdmittedPayloadInPlace(exactInput, admittedLinkRefs.payload);
   codexAppInput = cloneFrozenCodexAppInput(exactInput.codexAppInput, head.turnId);
 
+  const promotedTitlePlan = prepareInputTitle(ds, exactInput, sessionCliId(ds, getBot(ds.larkAppId).config));
+  let promotedTitleUpdate: ReturnType<typeof applyPreparedInputTitle>;
   ds.session.queued = false;
   ds.session.queuedActivationPending = true;
   ds.session.queuedActivationToken = token;
@@ -16096,8 +16140,10 @@ export function promoteQueuedActivationTail(
       vcMeetingImTurnOrigin,
       { persist: false },
     );
+    promotedTitleUpdate = applyPreparedInputTitle(ds, promotedTitlePlan);
     sessionStore.updateSession(ds.session);
   } catch (err) {
+    if (promotedTitleUpdate) Object.assign(ds.session, promotedTitleUpdate.previous);
     restoreQueuedActivationJournal(ds.session, priorJournal);
     ds.session.queuedActivationTail = priorTail;
     ds.session.codexAppDispatchLedger = priorLedger;
@@ -16109,11 +16155,14 @@ export function promoteQueuedActivationTail(
     return false;
   }
 
+  finishPreparedInputTitle(ds, promotedTitleUpdate);
   if (opts.send === false) return true;
   try {
     ds.worker!.send({
       type: 'message',
       content: exactInput.content,
+      ...(promotedTitlePlan?.nativeTitle ? { nativeSessionTitle: promotedTitlePlan.nativeTitle } : {}),
+      ...(promotedTitlePlan?.nativePrompt ? { nativeSessionTitlePrompt: promotedTitlePlan.nativePrompt } : {}),
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
@@ -17689,48 +17738,12 @@ function forkWorkerPrepared(
     : freezeAdmittedPayloadInPlace(promptInput, admittedOpeningLinkRefs.payload);
   prompt = promptPayload.content;
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
-  let nativeSessionTitle: string | undefined;
-  let nativeSessionTitlePrompt: string | undefined;
-  if (supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)) {
-    const isFreshNativeSession = !resume && !ds.session.cliSessionId;
-    const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
-      promptPayload.codexAppInput?.text ?? prompt,
-      bot.botName ? [{ name: bot.botName }] : undefined,
-    );
-    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
-      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
-        titlePrompt,
-        bot.botName ? [{ name: bot.botName }] : undefined,
-        ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
-      );
-      ds.session.nativeSessionTitleAwaitingContent = titlePrompt ? undefined : true;
-      nativeSessionTitlePrompt = titlePrompt;
-      sessionStore.updateSession(ds.session);
-    } else if (
-      ds.session.nativeSessionTitleAwaitingContent
-      && !ds.session.nativeSessionTitleUserDefined
-      && titlePrompt
-    ) {
-      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(titlePrompt);
-      ds.session.nativeSessionTitleAwaitingContent = undefined;
-      nativeSessionTitlePrompt = titlePrompt;
-      sessionStore.updateSession(ds.session);
-    } else if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
-      ds.session.nativeSessionTitle = ds.session.title;
-      sessionStore.updateSession(ds.session);
-    }
-    if (
-      isFreshNativeSession
-      || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
-      || (
-        resume
-        && !!ds.session.nativeSessionTitleAwaitingContent
-        && !!ds.session.nativeSessionTitle
-      )
-      || (!!nativeSessionTitlePrompt && !!ds.session.nativeSessionTitle)
-    ) {
-      nativeSessionTitle = ds.session.nativeSessionTitle;
-    }
+  const initTitlePlan = prepareInputTitle(ds, promptPayload, agentCfg.cliId, !resume && !ds.session.cliSessionId);
+  let nativeSessionTitle: string | undefined = initTitlePlan?.nativeTitle;
+  let nativeSessionTitlePrompt: string | undefined = initTitlePlan?.nativePrompt;
+  if (!nativeSessionTitle && supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)
+    && ((!resume && !ds.session.cliSessionId) || ds.session.nativeSessionTitle)) {
+    nativeSessionTitle = ds.session.nativeSessionTitle || ds.session.title;
   }
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
@@ -18434,7 +18447,7 @@ function forkWorkerPrepared(
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
-    sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted);
+    if (sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted)) commitAcceptedInputTitle(ds, initTitlePlan);
   } else {
     afterWorkerIpcBootstrap(worker, () => {
       // Bootstrap may wait while a human stops or supersedes the task. A blank
@@ -18442,6 +18455,7 @@ function forkWorkerPrepared(
       if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       worker.send(initMsg);
+      commitAcceptedInputTitle(ds, initTitlePlan);
     });
   }
   if (prompt.length > 0) {
@@ -20819,17 +20833,15 @@ function setupWorkerHandlers(
       }
 
       case 'native_session_title_generated': {
-        if (ds.worker !== worker || ds.session.nativeSessionTitleUserDefined) break;
+        if (ds.worker !== worker || hasManualSessionTitle(ds.session)) break;
         const title = msg.title.trim();
         if (!title) break;
-        ds.session.nativeSessionTitle = title;
-        ds.session.nativeSessionTitleAwaitingContent = undefined;
-        if (ds.initConfig) {
-          ds.initConfig.nativeSessionTitle = title;
-          ds.initConfig.nativeSessionTitlePrompt = undefined;
-        }
-        sessionStore.updateSession(ds.session);
-        if (ds.scope === 'chat' && ds.chatType === 'group') {
+        const committed = commitAcceptedInputTitle(ds, {
+          title, source: 'cli', awaitingContent: false, nativeTitle: title,
+          expectedTitle: ds.session.title, expectedSource: ds.session.titleSource,
+          expectedAwaiting: ds.session.nativeSessionTitleAwaitingContent,
+        });
+        if (committed && ds.scope === 'chat' && ds.chatType === 'group') {
           acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
         }
         break;

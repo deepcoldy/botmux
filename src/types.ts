@@ -653,6 +653,8 @@ export interface Session {
   nativeSessionTitleUserDefined?: boolean;
   /** 首轮只有机器人 mention 时，等待第一条有效正文生成原生标题。 */
   nativeSessionTitleAwaitingContent?: boolean;
+  /** Fingerprint of the join bootstrap, retained across configuration changes. */
+  automaticTitleBootstrap?: { digest: string; length: number };
   /** Last explicit title update. Undefined means the title is the legacy initial fallback. */
   titleUpdatedAt?: string;
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
