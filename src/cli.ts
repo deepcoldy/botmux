@@ -9318,8 +9318,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         if (response) {
           const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
           if (!response.ok || body.ok !== true || !body.task) {
+            const daemonMessage = scheduleIpcErrorMessage(body.error);
+            // A live owning daemon can make a more specific, authority-backed
+            // decision than the CLI's preliminary creator probe. Preserve the
+            // probe error only for unrecognized / legacy daemon responses; in
+            // particular, a delegated child must surface the explicit
+            // no-grandchildren or per-turn quota refusal.
+            if (daemonMessage) throw new Error(daemonMessage);
             if (creatorAuthError) throw creatorAuthError;
-            throw new Error(scheduleIpcErrorMessage(body.error) ?? body.detail ?? body.error ?? `HTTP ${response.status}`);
+            throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
           }
           task = body.task;
         }

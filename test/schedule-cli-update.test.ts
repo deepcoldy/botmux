@@ -528,6 +528,17 @@ describe('schedule CLI prompt updates', () => {
     expect(result.output).not.toContain('unauthorized');
     expect(f.read()['11223344']).toBeUndefined();
   });
+  it('surfaces a structured child refusal even when the creator probe has no human actor', async () => {
+    const f = fixture();
+    await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' }; },
+      'schedule:aabbccdd:12345678-1234-1234-1234-123456789abc', undefined,
+      'schedule_child_one_shot_descendant_denied');
+    const result = await f.run(['add', '2m', 'grandchild', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('一次性子任务不能继续创建孙任务');
+    expect(result.output).not.toContain('not an allowed bot operator');
+    expect(f.read()['11223344']).toBeUndefined();
+  });
   it('lets a scheduled turn remove itself through the daemon without human creator auth', async () => {
     const f = fixture();
     const scheduledTurnId = `schedule:${f.task.id}:12345678-1234-1234-1234-123456789abc`;
