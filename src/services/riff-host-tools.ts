@@ -52,8 +52,8 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
     values: '--name --id --prompt --schedule --model --reasoning-effort --calendar --calendar-day-type --topic-title',
     bools: '--top-level --topic --new-topic --silent --follow-active', files: '--prompt-file',
   },
-  history: { values: '--limit --scope', bools: '--with-card-json' },
-  quoted: { bools: '--raw' },
+  history: { values: '--limit --scope --view --query --type --since --until', bools: '--with-card-json' },
+  quoted: { bools: '--raw --no-download' },
   bots: { sub: ['list'], values: '--scope' },
   chat: { sub: ['create', 'members'], values: '--name --member --chat-mode --chat-id', bools: '--json' },
   project: {

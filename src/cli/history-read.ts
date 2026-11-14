@@ -155,7 +155,8 @@ export function parseQuotedReadOptions(args: string[]) {
       messageIds.push(arg);
     }
   }
-  if (!messageIds.length) throw new Error('quoted requires at least one message id');
-  if (messageIds.length > 20) throw new Error('quoted accepts at most 20 message ids');
-  return { messageIds: [...new Set(messageIds)], batch: messageIds.length > 1, download: !args.includes('--no-download') };
+  const uniqueMessageIds = [...new Set(messageIds)];
+  if (!uniqueMessageIds.length) throw new Error('quoted requires at least one message id');
+  if (uniqueMessageIds.length > 20) throw new Error('quoted accepts at most 20 message ids');
+  return { messageIds: uniqueMessageIds, batch: uniqueMessageIds.length > 1, download: !args.includes('--no-download') };
 }

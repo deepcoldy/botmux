@@ -131,8 +131,23 @@ export function quotedAttachments(
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { stdout };
   const root = parsed as Record<string, unknown>;
-  if (!Array.isArray(root.attachments) || root.attachments.length === 0) return { stdout };
-  if (root.attachments.length > MAX_ATTACHMENTS) {
+  // Single quoted keeps a top-level `attachments` array; batch quoted nests one
+  // envelope per requested id under `messages`. Both shapes must cross the same
+  // root-escape and budget validation, otherwise multi-id reads would hand the
+  // remote side unreadable host paths without transferring any bytes.
+  const holders: Array<Record<string, unknown>> = [];
+  if (Array.isArray(root.attachments)) holders.push(root);
+  if (Array.isArray(root.messages)) {
+    for (const message of root.messages) {
+      if (message && typeof message === 'object' && !Array.isArray(message)
+          && Array.isArray((message as Record<string, unknown>).attachments)) {
+        holders.push(message as Record<string, unknown>);
+      }
+    }
+  }
+  const totalCount = holders.reduce((count, holder) => count + (holder.attachments as unknown[]).length, 0);
+  if (totalCount === 0) return { stdout };
+  if (totalCount > MAX_ATTACHMENTS) {
     throw new Error(`quoted returned more than ${MAX_ATTACHMENTS} attachments`);
   }
 
@@ -147,9 +162,9 @@ export function quotedAttachments(
   const attachmentPrefix = attachmentRoot.endsWith(sep) ? attachmentRoot : `${attachmentRoot}${sep}`;
   const transferred: RemoteRunnerSessionToolAttachment[] = [];
   let totalBytes = 0;
+  let placeholderIndex = 0;
 
-  for (let index = 0; index < root.attachments.length; index++) {
-    const raw = root.attachments[index];
+  const transfer = (raw: unknown): void => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new Error('quoted returned an invalid attachment');
     }
@@ -170,7 +185,7 @@ export function quotedAttachments(
     if (totalBytes > maxAttachmentBytes) {
       throw new QuotedAttachmentLimitError(totalBytes, maxAttachmentBytes);
     }
-    const placeholder = `botmux-session-tool://attachment/${index}`;
+    const placeholder = `botmux-session-tool://attachment/${placeholderIndex++}`;
     item.path = placeholder;
     transferred.push({
       placeholder,
@@ -181,6 +196,10 @@ export function quotedAttachments(
         : {}),
       dataBase64: readFileSync(resolved).toString('base64'),
     });
+  };
+
+  for (const holder of holders) {
+    for (const item of holder.attachments as unknown[]) transfer(item);
   }
 
   return {

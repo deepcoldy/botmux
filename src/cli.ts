@@ -9963,7 +9963,6 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   }
 }
 
-
 // ─── Send subcommand ─────────────────────────────────────────────────────────
 
 /** Read all of stdin until EOF. Returns '' if stdin is a TTY (no piped data). */

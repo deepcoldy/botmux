@@ -84,6 +84,12 @@ describe('read option validation', () => {
   it('deduplicates a quoted batch and skips the session-id value', () => {
     expect(parseQuotedReadOptions(['om_one', '--session-id', 'session', '--no-download', 'om_two', 'om_one', '--raw'])).toEqual({ messageIds: ['om_one', 'om_two'], batch: true, download: false });
     expect(parseQuotedReadOptions(['om_one'])).toEqual({ messageIds: ['om_one'], batch: false, download: true });
+    expect(parseQuotedReadOptions(['om_one', 'om_one'])).toEqual({ messageIds: ['om_one'], batch: false, download: true });
+  });
+  it('applies the 20-id cap after deduplication rather than on raw args', () => {
+    const repeated = [...Array.from({ length: 20 }, (_, index) => `om_${index}`), 'om_0'];
+    expect(parseQuotedReadOptions(repeated)).toMatchObject({ messageIds: Array.from({ length: 20 }, (_, index) => `om_${index}`), batch: true });
+    expect(() => parseQuotedReadOptions(Array.from({ length: 21 }, (_, index) => `om_${index}`))).toThrow('at most 20');
   });
   it.each([[], ['--session-id'], ['om_one', '--unknown'], ['oc_chat'], Array.from({ length: 21 }, (_, index) => `om_${index}`)].map(args => ({ args })))('rejects invalid quoted inputs: $args', ({ args }) => {
     expect(() => parseQuotedReadOptions(args)).toThrow();

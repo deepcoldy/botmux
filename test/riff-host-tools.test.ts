@@ -476,6 +476,71 @@ describe('Riff host boundary', () => {
       .toEqual({ exitCode: 0, stdout, stderr: '' });
   });
 
+  it('admits evidence-retrieval history filters and quoted --no-download while refusing unknown flags', () => {
+    expect(() => parseRiffHostRequest(request([
+      'history', '--view', 'index', '--query', 'queue', '--type', 'text,interactive',
+      '--since', '2026-11-14T00:00:00+08:00', '--until', '2026-11-15T00:00:00+08:00', '--limit', '50',
+    ]))).not.toThrow();
+    expect(() => parseRiffHostRequest(request(['quoted', 'om_one', 'om_two', '--no-download', '--raw']))).not.toThrow();
+    expect(() => parseRiffHostRequest(request(['history', '--bogus']))).toThrow('riff_host_flag_unsupported');
+    expect(() => parseRiffHostRequest(request(['quoted', 'om_one', '--bogus']))).toThrow('riff_host_flag_unsupported');
+  });
+
+  it('packs nested attachments from batch quoted envelopes and keeps host paths out of stdout', () => {
+    const dataDir = root();
+    const attachmentDir = join(dataDir, 'attachments');
+    mkdirSync(attachmentDir);
+    const first = join(attachmentDir, 'a.txt');
+    const second = join(attachmentDir, 'b.png');
+    writeFileSync(first, 'alpha');
+    writeFileSync(second, 'beta');
+    const stdout = JSON.stringify({
+      sessionId: 'session-1',
+      messages: [
+        { messageId: 'om_one', attachments: [{ path: first, name: 'a.txt', type: 'file' }] },
+        { messageId: 'om_two', attachments: [{ path: second, name: 'b.png', type: 'image' }] },
+      ],
+      errors: [], requestedCount: 2, total: 2, incomplete: false,
+    });
+    const packaged = quotedAttachments(stdout, { SESSION_DATA_DIR: dataDir });
+    expect(packaged.attachments).toHaveLength(2);
+    expect(packaged.attachments?.map(item => item.placeholder)).toEqual([
+      'botmux-session-tool://attachment/0',
+      'botmux-session-tool://attachment/1',
+    ]);
+    const rewritten = JSON.parse(packaged.stdout);
+    expect(rewritten.messages[0].attachments[0].path).toBe(packaged.attachments![0]!.placeholder);
+    expect(rewritten.messages[1].attachments[0].path).toBe(packaged.attachments![1]!.placeholder);
+    expect(packaged.stdout).not.toContain(dataDir);
+  });
+
+  it('rejects batch attachments outside the attachment root and caps the count across messages', () => {
+    const dataDir = root();
+    const attachmentDir = join(dataDir, 'attachments');
+    mkdirSync(attachmentDir);
+    const outside = join(dataDir, 'secret.txt');
+    writeFileSync(outside, 'no');
+    const escapeStdout = JSON.stringify({
+      messages: [{ messageId: 'om_one', attachments: [{ path: outside, name: 'secret.txt', type: 'file' }] }],
+    });
+    expect(() => quotedAttachments(escapeStdout, { SESSION_DATA_DIR: dataDir }))
+      .toThrow('escaped the BotMux attachment root');
+
+    const items = Array.from({ length: 9 }, (_, index) => {
+      const path = join(attachmentDir, `f-${index}.txt`);
+      writeFileSync(path, 'x');
+      return { path, name: `f-${index}.txt`, type: 'file' as const };
+    });
+    const overCapStdout = JSON.stringify({
+      messages: [
+        { messageId: 'om_one', attachments: items.slice(0, 4) },
+        { messageId: 'om_two', attachments: items.slice(4) },
+      ],
+    });
+    expect(() => quotedAttachments(overCapStdout, { SESSION_DATA_DIR: dataDir }))
+      .toThrow('more than 8 attachments');
+  });
+
   it('preserves a failed quoted command instead of replacing its error with packaging failure', async () => {
     const { ctx, stdout, paths } = quotedFixture([1]);
     rmSync(paths[0]!);
