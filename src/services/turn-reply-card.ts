@@ -377,9 +377,15 @@ export class TurnReplyCardStore {
 
       const render = () => {
         const visibleRecord = hideUndeliveredFinal && !record.finalDelivered ? { ...record, finalCard: undefined } : record;
-        const body = io.render(visibleRecord.displayRetired && visibleRecord.finalCard && visibleRecord.phase === 'ambiguous'
-          ? { ...visibleRecord, phase: 'completed' } : visibleRecord);
-        return record.omitImages ? omitReplyCardImages(body) : body;
+        const shown: TurnReplyCardRecord = visibleRecord.displayRetired && visibleRecord.finalCard && visibleRecord.phase === 'ambiguous'
+          ? { ...visibleRecord, phase: 'completed' } : visibleRecord;
+        const finish = (body: string) => record.omitImages ? omitReplyCardImages(body) : body;
+        const body = finish(io.render(shown));
+        // The「下一步」row is optional chrome, sized before the transport adds
+        // its own (the on-call control): when only the row makes the card too
+        // big, leave it off rather than move the answer into an attachment.
+        if (!shown.nextStep || turnReplyCardRequestBytes(body, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES) return body;
+        return finish(io.render({ ...shown, nextStep: undefined }));
       };
       // The display can retire before this turn ends (a newer turn replaced
       // it, a push failed, the channel was switched off, or a restart lost it).
