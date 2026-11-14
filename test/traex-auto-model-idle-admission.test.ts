@@ -239,7 +239,13 @@ describe('idle auto-model input after a transient admission refusal', () => {
       scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
       Object.assign(scope, {
         cliLifetimeNonce: 1, logError: vi.fn(), KEY_TO_ANSI: { Enter: '\r' },
-        sendTuiKeySequence, submitTuiTextInput, strictInputHandle: (backend: unknown) => backend,
+        sendTuiKeySequence, strictInputHandle: (backend: unknown) => backend,
+        // bun:test 的假定时器接不住导入 ESM 模块异步续体里调度的 setTimeout
+        // （跨模块边界时该定时器既不被 advance 触发也不按墙钟触发，用例挂到超时），
+        // 注入无定时器的 pause，与 tui-input-delivery.test.ts 的做法一致；
+        // 真实写入、追踪代理与失效计数路径全部保留。
+        submitTuiTextInput: (options: Parameters<typeof submitTuiTextInput>[0]) =>
+          submitTuiTextInput({ ...options, pause: async () => {} }),
         bindSessionObservation: (callback: unknown) => callback,
         noteClaudeBridgeTurnStarted: vi.fn(), publishScreenStatus: vi.fn(),
         writtenInputs: { takeSubmitted: () => undefined }, armSessionRenameIdleTimeout: vi.fn(),
