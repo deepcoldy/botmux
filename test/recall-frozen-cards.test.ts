@@ -466,6 +466,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       // 24th arg: per-chat substitute card control — unavailable for this fixture.
       undefined,
       false,
+      // 26th arg: captured Codex App native-stop target — absent for this Claude fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

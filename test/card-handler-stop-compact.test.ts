@@ -70,6 +70,7 @@ const sendWorkerSessionInputMock = vi.fn();
 const sendKimiCacheExpiryAutoCompactSettingMock = vi.fn(() => true);
 const isSessionTransferringMock = vi.fn(() => false);
 const sessionAcceptsDirectCommandMock = vi.fn(() => true);
+const interruptCodexAppTurnMock = vi.fn(async () => 'stale_turn' as const);
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const { supportsIdleAutoCompact } = await vi.importActual<typeof import('../src/core/idle-auto-compact.js')>('../src/core/idle-auto-compact.js');
@@ -96,6 +97,8 @@ vi.mock('../src/core/worker-pool.js', async () => {
   setSessionReasoningEffort: vi.fn(() => 'saved'),
   sessionReasoningControl: vi.fn(() => ({ choices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] })),
   updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
+  codexAppStopCardTarget: vi.fn(() => undefined),
+  interruptCodexAppTurn: (...args: any[]) => interruptCodexAppTurnMock(...(args as [])),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
   sendWorkerSessionInput: (...args: any[]) => sendWorkerSessionInputMock(...args),
@@ -182,6 +185,7 @@ import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/typ
 import type { Session } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
+import { codexAppStopCardTarget } from '../src/core/worker-pool.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -249,6 +253,10 @@ beforeEach(() => {
   isSessionTransferringMock.mockReset();
   isSessionTransferringMock.mockReturnValue(false);
   sessionAcceptsDirectCommandMock.mockReset().mockReturnValue(true);
+  interruptCodexAppTurnMock.mockReset();
+  interruptCodexAppTurnMock.mockResolvedValue('stale_turn');
+  vi.mocked(codexAppStopCardTarget).mockReset();
+  vi.mocked(codexAppStopCardTarget).mockReturnValue(undefined);
   vi.mocked(canOperate).mockReset();
   vi.mocked(canOperate).mockReturnValue(true);
 });
@@ -323,11 +331,28 @@ describe('stop_turn card action', () => {
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
   });
 
-  it('refuses codex-app (App Runner has no PTY input channel)', async () => {
+  it('returns a stale-turn toast for codex-app when no interrupt target is captured', async () => {
     const ds = makeDs({ sessionOverrides: { cliId: 'codex-app' } });
     const result = await handleCardAction(actionData('stop_turn'), depsWith(ds), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
-    expect(result.toast.content).toContain('不支持卡片停止');
+    expect(result.toast.content).toContain('当前没有可中断的这一轮');
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+    expect(interruptCodexAppTurnMock).not.toHaveBeenCalled();
+  });
+
+  it('routes codex-app stop through the native interrupt path for the captured target', async () => {
+    interruptCodexAppTurnMock.mockResolvedValue('delivered');
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex-app' } });
+    ds.codexAppInterruptTarget = { generation: 'gen', turnEpoch: 7, replyTurnId: 'om_running' };
+    ds.streamCardNonce = 'nonce-7';
+    vi.mocked(codexAppStopCardTarget).mockReturnValue('gen:7');
+    const data = actionData('stop_turn');
+    data.context.open_message_id = ds.streamCardId;
+    data.action.value.card_nonce = 'nonce-7';
+    data.action.value.codex_app_stop_target = 'gen:7';
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('success');
+    expect(interruptCodexAppTurnMock).toHaveBeenCalledWith(ds, ds.codexAppInterruptTarget);
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
   });
 
