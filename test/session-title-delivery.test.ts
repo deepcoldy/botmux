@@ -164,6 +164,8 @@ describe('automatic session titles at input delivery boundaries', () => {
     const afterFork = disk(ds);
     const workerTitleEvents: any[] = [];
     if (cli === 'codex') {
+      let generationStarted!: () => void;
+      const generationReady = new Promise<void>(resolve => { generationStarted = resolve; });
       // Execute the actual worker title-sync component. Only native transport
       // and semantic generation are controlled dependencies; generation fails
       // after its real 30s timeout window, so no canonical-fixing event arrives.
@@ -172,10 +174,11 @@ describe('automatic session titles at input delivery boundaries', () => {
         nativeSessionTitleCurrentGenerationResume: true, nativeSessionTitleSyncAbortControllers: new Set(),
         applyCodexNativeSessionTitle: vi.fn(async () => true), createCliAdapterSync: () => ({ resolvedBin: process.execPath }),
         codexNativeTitleEnv: () => ({}), registerNativeTitleForceClose() {},
-        generateCodexAppThreadTitle: async () => { await new Promise(resolve => setTimeout(resolve, 30000)); return undefined; },
+        generateCodexAppThreadTitle: async () => { generationStarted(); await new Promise(resolve => setTimeout(resolve, 30000)); return undefined; },
         buildBotmuxLarkNativeSessionTitle, send: message => workerTitleEvents.push(message), log() {} };
       const syncTitle = loadWorkerFunction('syncFreshCodexNativeSessionTitle', titleScope);
       const done = syncTitle('native_probe_thread');
+      await generationReady;
       await vi.advanceTimersByTimeAsync(31000);
       await done;
       expect(titleScope.applyCodexNativeSessionTitle).toHaveBeenCalled();

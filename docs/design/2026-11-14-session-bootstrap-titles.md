@@ -7,3 +7,5 @@ On the first meaningful continuation, the canonical list title is updated for bo
 Existing truncated oncall bootstrap titles can display the known group name without rewriting old rows. List/table views show real attention reasons and use known activity timestamps, falling back to last message time when necessary. Unknown flags do not become blockers.
 
 Validation should cover configuration changes and replay, manual intervention during title generation, failed persistence/restart, queued/rejected continuations, and late native results. UI output must use sample data in review screenshots.
+
+Legacy resumed sessions without a known native title keep the CLI's existing title. Empty title-generation prompts remain absent in the launch payload. Dashboard publication after an accepted input is best-effort: an observer error cannot turn accepted input into retryable activation failure; a failed metadata commit leaves the previous launch configuration intact.

@@ -15523,10 +15523,14 @@ function finishPreparedInputTitle(ds: DaemonSession, update: ReturnType<typeof a
   if (!update) return;
   if (ds.initConfig && update.plan.nativeTitle !== undefined) {
     ds.initConfig.nativeSessionTitle = update.plan.nativeTitle;
-    ds.initConfig.nativeSessionTitlePrompt = update.plan.nativePrompt;
+    if (update.plan.nativePrompt === undefined) delete ds.initConfig.nativeSessionTitlePrompt;
+    else ds.initConfig.nativeSessionTitlePrompt = update.plan.nativePrompt;
   }
-  if (update.changed) dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
-    patch: { title: ds.session.title, titleSource: ds.session.titleSource, titleUpdatedAt: ds.session.titleUpdatedAt } } });
+  if (update.changed) {
+    try { dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
+      patch: { title: ds.session.title, titleSource: ds.session.titleSource, titleUpdatedAt: ds.session.titleUpdatedAt } } }); }
+    catch (error) { logger.warn(`[${tag(ds)}] Accepted title dashboard publication failed: ${error instanceof Error ? error.message : String(error)}`); }
+  }
 }
 
 function commitAcceptedInputTitle(ds: DaemonSession, plan: AutomaticSessionTitlePlan | undefined): boolean {
@@ -15535,10 +15539,6 @@ function commitAcceptedInputTitle(ds: DaemonSession, plan: AutomaticSessionTitle
   try { sessionStore.updateSession(ds.session); }
   catch (error) {
     Object.assign(ds.session, update.previous);
-    if (ds.initConfig && plan?.nativeTitle !== undefined) {
-      ds.initConfig.nativeSessionTitle = update.previous.nativeSessionTitle;
-      ds.initConfig.nativeSessionTitlePrompt = undefined;
-    }
     // The input already has an owner. A metadata error must never invite a duplicate send.
     logger.warn(`[${tag(ds)}] Accepted input title persistence failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
@@ -17741,7 +17741,8 @@ function forkWorkerPrepared(
   const initTitlePlan = prepareInputTitle(ds, promptPayload, agentCfg.cliId, !resume && !ds.session.cliSessionId);
   let nativeSessionTitle: string | undefined = initTitlePlan?.nativeTitle;
   let nativeSessionTitlePrompt: string | undefined = initTitlePlan?.nativePrompt;
-  if (!nativeSessionTitle && supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)) {
+  if (!nativeSessionTitle && supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)
+    && ((!resume && !ds.session.cliSessionId) || ds.session.nativeSessionTitle)) {
     nativeSessionTitle = ds.session.nativeSessionTitle || ds.session.title;
   }
   // Claude Code blocks on the interactive folder-trust dialog the first time
