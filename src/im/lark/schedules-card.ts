@@ -20,6 +20,7 @@
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
+import { scheduleSupportLines } from '../../core/schedule-followup.js';
 import type {
   ScheduleCardTaskInput,
   ScheduleDetailDto,
@@ -418,6 +419,7 @@ export function buildSchedulesDetailCard(
     ? t('card.dashboard.schedules.detail.enabled.active', undefined, opts.locale)
     : t('card.dashboard.schedules.detail.enabled.paused', undefined, opts.locale);
   const infoLines: string[] = [];
+  infoLines.push(...scheduleSupportLines(detail.raw, opts.locale).map(escapeLarkMd));
   infoLines.push(
     t('card.dashboard.schedules.detail.name_label', { name: escapeLarkMd(detail.name) }, opts.locale),
   );
