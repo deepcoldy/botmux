@@ -265,6 +265,7 @@ export function recoveryCauseI18nKey(code: string | undefined): string {
 export function recoveryOutcomeI18nKey(record: Pick<OrdinaryRecoveryNoticeRecord, 'errorCode' | 'recoveryStatus' | 'continuations' | 'stopReason'>): string {
   if (record.errorCode === 'recovery_outcome_unverified') return 'card.recovery_failed.outcome.unverified';
   if (record.errorCode === 'recovery_off') return 'card.recovery_failed.outcome.off';
+  if (record.errorCode === 'recovery_superseded_by_schedule') return 'card.recovery_failed.outcome.superseded_by_schedule';
   if (record.errorCode === 'recovery_queued_unrecovered') return 'card.recovery_failed.outcome.queued';
   if (record.errorCode === 'recovery_restart_unverified' || record.errorCode === 'recovery_dispatch_interrupted') {
     return 'card.recovery_failed.outcome.interrupted';

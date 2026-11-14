@@ -10032,6 +10032,69 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     });
   });
 
+  it('a scheduled fire that takes over a continuation wait gives the waiting turn its failure card; the fire keeps its own recovery', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'review it', 'om_task')).toBe(true);
+    ackInput(worker, 'om_task');
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_task', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true, providerRetryAtMs: Date.now() + 120_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    const recoveryCards = () => sessionReply.mock.calls
+      .filter(call => (call as unknown[])[2] === 'interactive')
+      .map(call => JSON.parse((call as unknown[])[1] as string))
+      .filter(card => card.type === 'recovery-failed');
+    expect(recoveryCards()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: SCHEDULED_TURN, status: 'running' }));
+    expect(recoveryCards()).toEqual([expect.objectContaining({ logicalTurnId: 'om_task' })]);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({
+      outcomeKey: 'card.recovery_failed.outcome.superseded_by_schedule',
+      task: 'review it',
+    }));
+
+    // The fire, failing too while the provider is down, is continued as itself.
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN, status: 'failed',
+      errorCode: 'provider_server_error', retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: SCHEDULED_TURN, status: 'backoff' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sentMessages(worker).filter((message: any) => message.turnId?.startsWith('schedule:abcdef12:')
+      && message.turnId !== SCHEDULED_TURN)).toHaveLength(1);
+    expect(recoveryCards()).toHaveLength(1);
+  });
+
+  it('a scheduled fire taking over a Codex capacity backoff stays as quiet as before', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, providerRecovery: { enabled: true } }));
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn(), loadScheduledTaskForIdentity });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_capacity');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    ackInput(worker, 'om_capacity');
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => { callback?.(null); return true; });
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    sessionReply.mockClear();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe(SCHEDULED_TURN);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     armSilentScheduledTurn(ds, SCHEDULED_TURN);

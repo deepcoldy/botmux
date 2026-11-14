@@ -1805,6 +1805,7 @@ export const messages: Record<string, string> = {
   'card.recovery_failed.outcome.queued': '未自动续跑（当时正在自动恢复上一条消息）',
   'card.recovery_failed.outcome.not_started': '未自动续跑',
   'card.recovery_failed.outcome.off': '未自动续跑（暂态故障自动续跑未开启）',
+  'card.recovery_failed.outcome.superseded_by_schedule': '等待自动续跑期间定时任务开始执行，这一轮没有再自动续跑',
   'card.recovery_failed.title_off': '⚠️ {cliName} 没能完成这条消息',
   'card.recovery_failed.field_provider_eta': '**上游预计恢复**：{eta}',
   'card.recovery_failed.off_hint': '<font color=\'grey\'>想让它在这类故障后自动接着做：在 Dashboard 打开「暂态故障自动续跑」（全局或按 Bot）。</font>',

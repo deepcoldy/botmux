@@ -1799,6 +1799,7 @@ export const messages: Record<string, string> = {
   'card.recovery_failed.outcome.queued': 'not continued automatically (the previous message was being recovered at the time)',
   'card.recovery_failed.outcome.not_started': 'not continued automatically',
   'card.recovery_failed.outcome.off': 'not continued (auto-continue after provider failures is off)',
+  'card.recovery_failed.outcome.superseded_by_schedule': 'a scheduled task started while this turn waited to be continued, so it was not continued',
   'card.recovery_failed.title_off': '⚠️ {cliName} could not finish this message',
   'card.recovery_failed.field_provider_eta': '**Provider expects recovery at**: {eta}',
   'card.recovery_failed.off_hint': '<font color=\'grey\'>To have it carry on by itself after such failures, turn on "Auto-continue after provider failures" in the Dashboard (globally or per bot).</font>',

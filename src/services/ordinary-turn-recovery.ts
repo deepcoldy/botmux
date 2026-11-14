@@ -33,6 +33,11 @@ const MAX_QUEUED_RETRY_INPUTS = 8;
  *  it gets a failure notice instead of being forgotten. */
 export const RECOVERY_QUEUED_UNRECOVERED = 'recovery_queued_unrecovered';
 
+/** Error code of a failed turn whose continuation wait was taken over by a
+ *  scheduled fire (one slot per session): it is not continued, and gets its
+ *  failure card. A human message taking over stays silent, as before. */
+export const RECOVERY_SUPERSEDED_BY_SCHEDULE = 'recovery_superseded_by_schedule';
+
 /** Error code of a retryable failure that was not continued because automatic
  *  continuation is switched off (`continuationsEnabled`): it settles at once
  *  and raises the failure notice. */
