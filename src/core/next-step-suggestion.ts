@@ -10,8 +10,9 @@
  * A late fact for an older turn is ignored: with type-ahead the next turn can
  * already be admitted, and its card — not the older one — is the last card.
  *
- * All Lark writes for one session run one at a time, so a removal queued by a
- * new turn always lands after an insert still in flight. State is in memory:
+ * All Lark writes for one session run one at a time, and a row is recorded as
+ * possibly shown before its write is sent, so a removal queued by a new turn
+ * always lands after an insert still in flight — or one whose outcome is unknown. State is in memory:
  * after a daemon restart an earlier row is not removed when the next turn
  * starts (its signed button still expires and still checks permissions).
  */
@@ -227,7 +228,6 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
     state.shown = { turnId, card, text: desired, confirmed: false };
     await card.publish(next);
     state.shown.confirmed = true;
-    if (state.turnId !== turnId || !sameCard(state.card, card)) await removeShown(ds, state, io);
     return;
   }
   const { messageId } = card;
@@ -252,6 +252,4 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
     await io.insert(ds, cardId, messageId, placement.placement, element, sequence, writeUuid(messageId, 'insert', sequence));
   }
   state.shown.confirmed = true;
-  // The turn may have moved on while this write was in flight.
-  if (state.turnId !== turnId || !sameCard(state.card, card)) await removeShown(ds, state, io);
 }
