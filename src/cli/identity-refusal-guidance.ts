@@ -36,6 +36,14 @@ const GUIDANCE: Record<IdentityRefusalReason, { cause: string; next: string }> =
     cause: '会话当前按单快照身份模式运行，与本包装脚本使用的进程证明模式不一致。',
     next: '发 /restart 让包装脚本与会话模式重新对齐。不是授权问题，不用重新授权。',
   },
+  as_not_speaker: {
+    cause: 'BOTMUX_AS 指定的人不是本轮的发言人。',
+    next: 'BOTMUX_AS 只能填本轮发言人的 open_id（见提示词里列出的发言人或 <sender> 标签）。',
+  },
+  as_unavailable: {
+    cause: '该 bot 不允许替其他发言人执行命令（开关未开，或本轮是无人值守、后台任务等没有发言人的运行），命令未执行。',
+    next: '不要指定 BOTMUX_AS，直接运行命令，将以发起本轮的人的身份执行。',
+  },
   identity_material_unavailable: {
     cause: '已证明是当前轮次，但 daemon 没有这一轮的身份材料（尚未准备、已被回收，或 daemon 刚重启）。',
     next: '重发一条消息开启新轮次后重试；连续出现再发 /login status 查看授权状态。',

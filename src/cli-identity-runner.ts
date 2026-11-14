@@ -1,11 +1,12 @@
 import { parseArgs } from 'node:util';
 import { CurrentExecutionIdentityError, resolveCurrentExecutionIdentity } from './cli/current-execution.js';
+import { IDENTITY_ROUTE_TOOLS } from './services/trigger-user-auth.js';
 import { identityRefusalLines } from './cli/identity-refusal-guidance.js';
 
-// Governed tools plus the Codebase CLI companion that mirrors bytedcli's
-// identity; kept in sync with CODEBASE_COMPANION_TOOL in core/cli-identity.ts
+// Governed tools plus the Codebase and Bits CLI companions that mirror bytedcli's
+// identity; kept in sync with the companion tools in core/cli-identity.ts
 // (a compile-entry test pins the runner wiring end to end).
-const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'codebase'] as const;
+const IDENTITY_TOOLS = IDENTITY_ROUTE_TOOLS;
 
 let requestedTool = 'tool';
 
@@ -24,7 +25,7 @@ async function main(): Promise<void> {
   }
   const execution = await resolveCurrentExecutionIdentity({
     ipcPort: Number(values['ipc-port']), sessionId: values['session-id'], larkAppId: values['app-id'],
-    tool: tool!,
+    tool: tool!, as: process.env.BOTMUX_AS || undefined,
   });
   // The daemon proved the caller's lineage and returns the identity env
   // ASSIGNMENTS themselves. Print only the body for the wrapper to eval. The

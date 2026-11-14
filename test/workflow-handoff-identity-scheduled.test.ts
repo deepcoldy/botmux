@@ -36,8 +36,8 @@ const SCHEDULED_TURN = `schedule:${TASK_ID}:12345678-1234-1234-1234-123456789abc
 const HUMAN_TURN = 'om_owner_message';
 const OWNER = 'ou_task_owner';
 const BOTS = [
-  { larkAppId: MAIN, name: 'main', cliId: 'claude-code', workingDir: '/tmp', triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'none' } },
-  { larkAppId: 'cli_doc', name: 'doc', cliId: 'claude-code', workingDir: '/tmp', triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'none' } },
+  { larkAppId: MAIN, name: 'main', cliId: 'claude-code', workingDir: '/tmp', triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] } },
+  { larkAppId: 'cli_doc', name: 'doc', cliId: 'claude-code', workingDir: '/tmp', triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] } },
 ] as any[];
 
 const dirs: string[] = [];

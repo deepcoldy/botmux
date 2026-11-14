@@ -15548,12 +15548,17 @@ async function cmdAuth(rest: string[]): Promise<void> {
       }
       const provider = parsed.command === 'request' ? parsed.provider : undefined;
       const tenant = parsed.command === 'request' ? parsed.tenant : undefined;
-      const authBody = provider ? { provider, ...(tenant ? { tenant } : {}) }
-        : parsed.command === 'request'
-          ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
-          : { requestId: parsed.requestId };
-      // A provider request may start a device login and send a DM before it answers.
-      const requestTimeout = Math.min(provider ? 60_000 : 10_000, Math.max(1, remaining));
+      const unattendedRequest = parsed.command === 'request' && parsed.unattended === true;
+      const authBody = {
+        ...(provider ? { provider, ...(tenant ? { tenant } : {}), ...(unattendedRequest ? { unattended: true } : {}) }
+          : parsed.command === 'request'
+            ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
+            : { requestId: parsed.requestId }),
+        // The speaker this call acts for (see BOTMUX_AS); the daemon accepts only a speaker of the current turn.
+        ...(process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}),
+      };
+      // A request may start a device login, or ask the platform to send a card, before it answers.
+      const requestTimeout = Math.min(parsed.command === 'request' ? 60_000 : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {

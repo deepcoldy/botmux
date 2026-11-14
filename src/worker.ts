@@ -68,7 +68,7 @@ import { join, basename, dirname, delimiter, relative, extname } from 'node:path
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
-import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { tokenStoreProtection, capabilityOn, larkUserNative } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -1713,7 +1713,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
         : undefined);
     if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
-      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, userNative: larkUserNative(cfg.triggerUserAuth) });
     for (const key of protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy)) delete engineEnv[key];
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
@@ -7008,7 +7008,7 @@ function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const policyCapability = sandboxPolicyCapability ?? randomBytes(32).toString('hex');
-  const activeIdentity = activeTurnAuthority.identity();
+  const activeIdentity = { ...activeTurnAuthority.identity(), speakers: activeTurnAuthority.speakers() };
   const authorityTurnId = activeIdentity.turnId ?? currentBotmuxTurnId;
   const authorityDispatchAttempt = activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt;
   const authorityLinkRefMode = currentBotmuxLinkRefMode;
@@ -7099,12 +7099,13 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     const execution = capability.turnId
       ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
       : undefined;
-    publishedOriginContractScope = binding && execution
+    publishedOriginContractScope = binding?.runtime && execution
       ? { bindingId: binding.bindingId, executionId: execution.executionId }
       : undefined;
     const explicitOrigin = binding?.runtime
       ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
       : undefined;
+    if (scope && !explicitOrigin) return true;
     pendingManagedTurnOriginScope = explicitOrigin;
     try {
     send({
@@ -7115,6 +7116,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(activeIdentity.turnId ? {
         trustedCaller: activeIdentity.caller ?? null,
         identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
+        ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
       } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
@@ -25512,7 +25514,7 @@ async function spawnCliBody(
         delete env.BOTMUX_LARK_TOOL_BINDING;
         if (cfg.larkToolBinding !== false) {
           prepareLarkToolEnv({ env, dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
-            sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+            sessionId, appId: cfg.larkAppId, brand: cfg.brand, userNative: larkUserNative(cfg.triggerUserAuth) });
         }
         const pinned = resolveChildBotsConfig(cfg.loadedBotsConfigPath, cfg.loadedBotsConfigProvenance);
         if (pinned) env.BOTS_CONFIG = pinned;
@@ -27178,7 +27180,7 @@ async function spawnCliBody(
     // governed — that is the exact condition under which installGitAskpass
     // writes the file, and pointing GIT_ASKPASS at a missing path would break
     // git prompts rather than fall back.
-    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('bytedcli')) {
+    if (capabilityOn(cfg.triggerUserAuth, 'bytecloud')) {
       identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
     }
   }
@@ -27451,7 +27453,7 @@ async function spawnCliBody(
       : undefined,
     { canonicalPaths: sandboxRequested });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
-    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested });
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested, userNative: larkUserNative(cfg.triggerUserAuth) });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the
     // allowlist sandbox the agent runs as the same OS user as botmux and can

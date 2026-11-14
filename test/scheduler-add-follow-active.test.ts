@@ -41,6 +41,7 @@ const PARAMS = {
   rootMessageId: 'om_origin',
   executionPosition: 'topic' as const,
   larkAppId: TEST_APP,
+  owner: { kind: 'ownerless' as const },
 };
 
 async function freshImport() {
@@ -97,6 +98,7 @@ describe('scheduler.addTask — task position (dedicated per-task topic)', () =>
     chatId: 'oc_test_chat',
     executionPosition: 'task' as const,
     larkAppId: TEST_APP,
+    owner: { kind: 'ownerless' as const },
   };
 
   it('creates a rootless task-position task bound to thread scope without requiring a root', async () => {
@@ -150,7 +152,7 @@ describe('scheduler.addTask — task position (dedicated per-task topic)', () =>
     })).toThrow('topic_title_owner_unavailable');
     expect(() => scheduler.addTask({
       ...TASK_PARAMS,
-      ownerOpenId: 'ou_owner123',
+      owner: { kind: 'human', openId: 'ou_owner123' },
       topicTitle: `${'x'.repeat(140)}${'{{owner}}'.repeat(6)}`,
     })).toThrow('topic_title_rendered_too_long');
   });

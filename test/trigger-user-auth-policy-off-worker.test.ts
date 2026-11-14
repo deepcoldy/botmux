@@ -65,7 +65,7 @@ function spawnWorker(root: string, fakeBin: string, sessionId: string, triggerUs
     turnId: 'opening-turn',
     larkAppId: 'cli_policyoffworker',
     larkAppSecret: 'secret',
-    ...(triggerUserAuth ? { triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' } } : {}),
+    ...(triggerUserAuth ? { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } : {}),
   } satisfies DaemonToWorker);
   return { child, logs, messages };
 }

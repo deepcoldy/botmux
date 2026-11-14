@@ -26,7 +26,14 @@ export interface BackgroundExecutionRegistration {
 }
 
 export function backgroundCredentialPolicyKey(bot: BotConfig): string {
-  return computeInputHash({ triggerUserAuth: bot.triggerUserAuth ?? null,
+  // `fallback` was part of the parsed policy until it became inert. Hashing the
+  // stored legacy value (default included) keeps a pre-upgrade registration
+  // valid for a config that was not edited since. Capability order is irrelevant.
+  const { legacyFallback, capabilities, ...rest } = bot.triggerUserAuth ?? {} as Partial<NonNullable<BotConfig['triggerUserAuth']>>;
+  const triggerUserAuth = bot.triggerUserAuth
+    ? { ...rest, fallback: legacyFallback ?? 'bot-identity', ...(capabilities ? { capabilities: [...capabilities].sort() } : {}) }
+    : null;
+  return computeInputHash({ triggerUserAuth,
     larkToolBinding: bot.larkToolBinding ?? true, apiOnly: bot.apiOnly ?? false });
 }
 

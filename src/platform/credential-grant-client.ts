@@ -213,7 +213,7 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
  *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
  *  that trickles bytes never trips it, and without the abort the retry would
  *  leave the first request still running against the platform. */
-function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -273,6 +273,9 @@ async function requestCredentialGrantInner(
     sessionId: req.sessionId,
     ...(req.turnId ? { turnId: req.turnId } : {}),
     machineId: binding.machineId,
+    // A platform that predates machine consent ignores the field and keeps
+    // answering `not_teammate` for a sender outside the owner's teams.
+    machineConsent: true,
     // A platform that predates regional tokens ignores the field (it reads
     // only the fields it knows) and answers with the default token alone.
     ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: BYTEDCLI_GRANT_REGIONS } : {}),
@@ -342,8 +345,8 @@ export function describeCredentialGrantFailure(f: CredentialGrantFailure): strin
     case 'unbound': return 'machine is not bound to a platform';
     case 'network': return `network: ${f.error}`;
     case 'not_authorized': return `not authorized on platform (${f.error})`;
-    case 'consent_missing': return 'authorized on platform but no consent for this team';
-    case 'not_teammate': return 'sender and machine owner share no team';
+    case 'consent_missing': return 'platform has no usable authorization for this person on this machine';
+    case 'not_teammate': return 'platform only issues to the machine owner or a teammate of theirs';
     case 'forbidden': return `forbidden (${f.status} ${f.error})`;
     case 'not_deployed': return `platform has no credential-grant endpoint (${f.status})`;
     case 'rate_limited': return `rate limited (${f.status})`;

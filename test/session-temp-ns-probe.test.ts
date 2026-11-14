@@ -105,7 +105,7 @@ function publishAndRunArgv(): string[] {
     `  { tool: 'bytedcli', cloudJwt: 'jwt-probe', openId: 'ou_alice' }, 'single');`,
     `const wrapper = ${JSON.stringify(join(dir, 'published-wrapper'))};`,
     `writeFileSync(wrapper, renderIdentityWrapper('bytedcli', '/bin/true', 'single'));`,
-    `spawnSync('/bin/sh', [wrapper], { env: { ...process.env, SESSION_DATA_DIR: ${JSON.stringify(join(dir, 'data'))}, BOTMUX_SESSION_ID: ${JSON.stringify(SESSION)} } });`,
+    `spawnSync('/bin/sh', [wrapper, 'x'], { env: { ...process.env, SESSION_DATA_DIR: ${JSON.stringify(join(dir, 'data'))}, BOTMUX_SESSION_ID: ${JSON.stringify(SESSION)} } });`,
     `process.stdout.write('RUN_OK\\n');`,
   ].join('\n'));
   const { command, prefixArgs } = tsRunnerPrefix();
@@ -144,7 +144,7 @@ describe('session temp layout created by the identity wrapper (#2574)', () => {
       'set -e',
       'umask 022',
       `SESSION_DATA_DIR=${JSON.stringify(join(dir, 'data'))} BOTMUX_SESSION_ID=${SESSION} \\`,
-      `  PATH=/usr/bin:/bin HOME=${JSON.stringify(process.env.HOME!)} /bin/sh ${JSON.stringify(wrapper)}`,
+      `  PATH=/usr/bin:/bin HOME=${JSON.stringify(process.env.HOME!)} /bin/sh ${JSON.stringify(wrapper)} x`,
       `printf 'hub=%s\\n' "$(stat -c %a /tmp/bm$(id -u))"`,
       `printf 'inner=%s\\n' "$(stat -c %a /tmp/bm$(id -u)/probe)"`,
     ].join('\n');
@@ -166,7 +166,7 @@ describe('session temp layout created by the identity wrapper (#2574)', () => {
       'umask 022',
       `cd ${JSON.stringify(repoRoot)}`,
       `SESSION_DATA_DIR=${JSON.stringify(join(dir, 'data'))} BOTMUX_SESSION_ID=${SESSION} \\`,
-      `  PATH=/usr/bin:/bin HOME=${JSON.stringify(process.env.HOME!)} /bin/sh ${JSON.stringify(wrapper)}`,
+      `  PATH=/usr/bin:/bin HOME=${JSON.stringify(process.env.HOME!)} /bin/sh ${JSON.stringify(wrapper)} x`,
       `HOME=${JSON.stringify(process.env.HOME!)} ${bootArgv().map(a => JSON.stringify(a)).join(' ')}`,
     ].join('\n');
 

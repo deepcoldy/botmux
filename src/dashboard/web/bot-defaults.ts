@@ -137,7 +137,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
   {
     id: 'grant',
@@ -428,14 +428,19 @@ export type BotDefaultsRow = {
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
-    fallback: 'bot-identity' | 'none';
+    tools?: Array<'lark-cli' | 'bytedcli'>;
+    /** Per-capability switches. The daemon fills it for stored tools-only configs. */
+    capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
+    /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
+    legacyCapabilities?: boolean;
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;
+    /** One command can run as another speaker of a multi-person turn. Absent = off. */
+    allowSpeakerSwitch?: boolean;
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;

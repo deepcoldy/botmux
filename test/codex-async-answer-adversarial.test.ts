@@ -5,6 +5,8 @@ import { productionFunction, productionClass, delivery, deliveryIsCurrent } from
 import { beginReplyTargetTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
+import { isUnattendedIdentityTurnId } from '../src/core/workflow-event-turn.js';
+import { clearRestoredLapses, unattendedTask } from '../src/core/capability-authorization.js';
 import { recallProvenIdentityContent, forgetProvenIdentityContent } from '../src/core/cli-identity.js';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -202,6 +204,7 @@ describe('correlated async answer adversarial production probes', () => {
     Object.assign(scope, {
       config: { session: { dataDir: dir } }, getBot: () => ({ config: botConfig }),
       pickTurnReplyTarget, dispatchCallerFromReply, publishTurnCliIdentity,
+      isUnattendedIdentityTurnId, clearRestoredLapses, unattendedTask,
       beginReplyTargetTurn, identityPublicationConflicted: () => false,
       identityModelForPublication: () => 'proven', localeForBot: () => 'en',
       triggerUserAuthEnabledFor: () => true, streamingCardDisabledFor: () => false,

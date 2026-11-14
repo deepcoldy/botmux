@@ -24,12 +24,12 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -79,7 +79,9 @@ import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { messageMentionsBot, type MessageResource } from '../im/lark/message-parser.js';
-import type { ResolvedSender } from '../im/lark/identity-cache.js';
+import { getIdentity, type ResolvedSender } from '../im/lark/identity-cache.js';
+import { capabilityOn } from '../services/trigger-user-auth.js';
+import { isSerialGroupInput } from './trusted-session-controller.js';
 import {
   activeSessionKey,
   sessionKey,
@@ -1298,6 +1300,7 @@ function credentialBoundaryForPrompt(
   chatId: string | undefined,
   resume: boolean,
   locale?: Locale,
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
   if (!larkAppId) return '';
   try {
@@ -1307,8 +1310,36 @@ function credentialBoundaryForPrompt(
       managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
       locale,
       sessionIsNoTransport(larkAppId, chatId),
+      speakers,
     );
   } catch { return ''; }
+}
+
+/**
+ * The people of the running turn once `sender`'s message joins it, when that is more than one
+ * and the session can run a call as a chosen speaker (proven identity model, a per-person
+ * capability on). From the daemon's own speaker set plus the sender, who is not in it yet.
+ */
+export function turnSpeakersForPrompt(
+  larkAppId: string | undefined, sessionId: string, sender: ResolvedSender | undefined,
+): Array<{ openId: string; name?: string }> | undefined {
+  if (!larkAppId || config.crossPrincipalInterruption) return undefined;
+  let ds: ReturnType<typeof findActiveBySessionId>;
+  try {
+    const policy = getBot(larkAppId).config.triggerUserAuth;
+    if (policy?.allowSpeakerSwitch !== true
+      || !(capabilityOn(policy, 'lark-user') || capabilityOn(policy, 'bytecloud'))) return undefined;
+    ds = findActiveBySessionId(sessionId);
+    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return undefined;
+    // A serial group queues each message as its own turn: nobody merges into someone else's turn.
+    if (isSerialGroupInput(ds, { requestLarkAppId: larkAppId, senderType: 'user' })) return undefined;
+  } catch { return undefined; }
+  const openIds = (ds.managedTurnOrigin?.speakers ?? []).map(s => s.openId);
+  if (sender?.type === 'user' && sender.openId) openIds.push(sender.openId);
+  const people = [...new Set(openIds)];
+  return people.length > 1
+    ? people.map(openId => ({ openId, name: (sender?.openId === openId ? sender.name : undefined) ?? getIdentity(larkAppId, openId)?.name }))
+    : undefined;
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
@@ -1922,12 +1953,15 @@ function buildFollowUpBlocks(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
-  if (noTransport && !skipSessionId) {
+  {
     const session = sessionStore.getSession(sessionId);
     const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
-    if (managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
-      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale);
+    const speakers = turnSpeakersForPrompt(opts?.larkAppId, sessionId, opts?.sender);
+    if (noTransport && !skipSessionId && managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
+      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale, speakers);
       if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
+    } else if (speakers) {
+      blocks.push({ key: 'credentials', text: buildTurnSpeakersBlock(speakers, opts?.locale) });
     }
   }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });

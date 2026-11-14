@@ -113,6 +113,38 @@ const hangingGrants = () => {
 };
 const later = (ms = TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) => vi.setSystemTime(Date.now() + ms);
 
+describe('unattended turns', () => {
+  const SCHEDULED = 'schedule:abc12345:11111111-1111-1111-1111-111111111111';
+  const prepareUnattended = () => publishTurnCliIdentity({
+    botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: SCHEDULED, storageModel: 'proven',
+  });
+  const retryUnattended = () => retryTransientTurnIdentity({
+    sessionDataDir: dir, sessionId: SESSION, turnId: SCHEDULED, tool: 'bytedcli', botConfig: config,
+  });
+  const now = () => recallProvenIdentityContent(dir, SESSION, SCHEDULED, 'bytedcli') ?? '';
+
+  it('a definite not_authorized is published as the unattended refusal and never re-armed', async () => {
+    responses = [NOT_AUTHORIZED];
+    await prepareUnattended();
+    expect(now()).toContain('[reason=unattended]');
+    await retryUnattended();
+    expect(grantCalls).toBe(1);
+  });
+
+  it('an outage is re-asked; when the answer is not_authorized it becomes the unattended refusal and stays', async () => {
+    responses = [NETWORK_DOWN, NOT_AUTHORIZED];
+    await prepareUnattended();
+    expect(now()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    await retryUnattended();
+    expect(grantCalls).toBe(2);
+    expect(now()).toContain('[reason=unattended]');
+    expect(now()).not.toContain('https://');
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS + 1);
+    await retryUnattended();
+    expect(grantCalls).toBe(2);
+  });
+});
+
 describe('transient platform refusal within a turn', () => {
   it('a later call in the same turn re-asks the platform and gets the grant', async () => {
     responses = [NETWORK_DOWN, GRANTED];
@@ -177,7 +209,7 @@ describe('transient platform refusal within a turn', () => {
     later();
     await retry();
     expect(grantCalls).toBe(2);
-    expect(current()).toContain('https://platform.example.test/credentials');
+    expect(current()).toContain('[reason=platform_not_authorized]');
     later(); // the outage pace no longer applies
     await retry();
     expect(grantCalls).toBe(2);
@@ -194,7 +226,8 @@ describe('not authorized yet within a turn (#3312)', () => {
     responses = [NOT_AUTHORIZED, GRANTED];
     const out = await prepare();
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
-    expect(current()).toContain('https://platform.example.test/credentials');
+    expect(current()).toContain('[reason=platform_not_authorized]');
+    expect(current()).not.toContain('https://');
     // The refusal was itself just asked: no re-ask before the spacing has passed.
     await retry();
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS - 1);
@@ -208,6 +241,26 @@ describe('not authorized yet within a turn (#3312)', () => {
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
     await retry();
     expect(grantCalls).toBe(2); // recovered: nothing more to ask
+  });
+
+  it('a forced re-ask skips the spacing once: the platform just said nothing is missing', async () => {
+    responses = [CONSENT_MISSING, GRANTED];
+    await prepare();
+    await retryTransientTurnIdentity({
+      sessionDataDir: dir, sessionId: SESSION, turnId: TURN, tool: 'bytedcli', botConfig: config, force: true,
+    });
+    expect(grantCalls).toBe(2);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+
+  it('a forced re-ask that still finds the same refusal keeps pacing the following ones', async () => {
+    responses = [NOT_AUTHORIZED];
+    await prepare();
+    await retryTransientTurnIdentity({
+      sessionDataDir: dir, sessionId: SESSION, turnId: TURN, tool: 'bytedcli', botConfig: config, force: true,
+    });
+    await retry();
+    expect(grantCalls).toBe(2);
   });
 
   it('keeps the same refusal while they have not authorized, and stops after a bounded number of re-asks', async () => {
@@ -229,7 +282,7 @@ describe('not authorized yet within a turn (#3312)', () => {
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
     await retry();
     expect(current()).not.toBe(notAuthorized);
-    expect(current()).toContain('consent=1');
+    expect(current()).toContain('[reason=platform_consent_missing]');
     later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
     await retry();
     expect(grantCalls).toBe(3);
@@ -536,5 +589,41 @@ describe('transient platform refusal within a turn: concurrency and policy', () 
     later();
     await retry();
     expect(grantCalls).toBe(1);
+  });
+});
+
+describe('the Meego switch on the retry path', () => {
+  const recovered = async (capabilities: string[]) => {
+    responses = [NETWORK_DOWN, GRANTED];
+    const botConfig = {
+      ...config,
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities, credentialSource: 'platform' }),
+    };
+    await publishTurnCliIdentity({
+      botConfig, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: TURN, storageModel: 'proven',
+    });
+    await retry(botConfig);
+    return current();
+  };
+
+  it('meego off: the recovered platform grant carries no Meego store', async () => {
+    const body = await recovered(['bytecloud']);
+    expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+    expect(body).not.toContain('BOTMUX_MEEGO_HOME');
+  });
+
+  it('the live policy decides: Meego switched off during the wait leaves no Meego store', async () => {
+    responses = [NETWORK_DOWN, GRANTED];
+    const on = { ...config, triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['bytecloud', 'meego'], credentialSource: 'platform' }) };
+    await publishTurnCliIdentity({
+      botConfig: on, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: TURN, storageModel: 'proven',
+    });
+    await retry(on, () => parseTriggerUserAuthConfig({ enabled: true, capabilities: ['bytecloud'], credentialSource: 'platform' }));
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+    expect(current()).not.toContain('BOTMUX_MEEGO_HOME');
+  });
+
+  it('meego on: the recovered platform grant carries the person\'s Meego store', async () => {
+    expect(await recovered(['bytecloud', 'meego'])).toContain('BOTMUX_MEEGO_HOME=');
   });
 });

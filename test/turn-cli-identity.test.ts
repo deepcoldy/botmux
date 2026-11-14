@@ -30,6 +30,8 @@ vi.mock('../src/utils/user-token.js', () => ({
   // rejects the module at link time. Any new user-token import from
   // cli-identity has to be added here too.
   isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
+  // capability-authorization 的 lark 本地登录态检查拉入此命名导出；vitest 容忍缺导出、bun link 期拒绝，本测试不走该路径。
+  userTokenAuthState: vi.fn(() => ({ state: 'unknown' })),
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
@@ -41,6 +43,11 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
     completeToken: 'tok-auto',
   })),
+  // capability-authorization 经 describeBytedcliAuth、meego-auth 经 parseEnvelope/runBytedcliInHome 拉入这些命名导出；
+  // vitest 容忍 mock 缺导出、bun 在 link 期拒绝（同上方 user-token 的处理），本测试不走这些路径。
+  describeBytedcliAuth: vi.fn(async () => ({ state: 'unknown' })),
+  parseEnvelope: vi.fn(() => null),
+  runBytedcliInHome: vi.fn(async () => ({ ok: false, stdout: '', stderr: 'runBytedcliInHome is not mocked in this test' })),
 }));
 
 // lark-cli per-person HOME (device-code). The turn resolver is scripted per
@@ -52,9 +59,13 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
   pendingLarkCliChallenge: vi.fn((openId: string) => pendingChallenges.has(openId) ? { deviceCode: 'dc' } : null),
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+  // capability-authorization 的本地登录态检查拉入此命名导出；vitest 容忍缺导出、bun link 期拒绝，本测试不走该路径。
+  describeLarkCliAuth: vi.fn(() => ({ state: 'unknown' })),
 }));
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
+const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
+const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
@@ -233,7 +244,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   });
 
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
-    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+    const config = botConfig({ enabled: true, tools: ['lark-cli'] });
     const outcomes = await publish(config, BOB);
     expect(identityBody('lark-cli')).toContain('飞书');
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
@@ -274,14 +285,14 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     // Someone refused for lack of authorization usually has no stored name, so
     // the nameless path is the common one — it must read as a sentence, not
     // print a raw open_id back at the person.
-    expect(body).not.toContain(ALICE);
+    expect(body.replace(/BOTMUX_IDENTITY_OPEN_ID='[^']*'/, '')).not.toContain(ALICE);
     expect(body).toContain('你自己');
   });
 
   it('uses the stored name when we actually know it', async () => {
     const { lookupAuthorizedUserName } = await import('../src/utils/user-token.js');
     vi.mocked(lookupAuthorizedUserName).mockReturnValueOnce('孙晓雪');
-    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+    const config = botConfig({ enabled: true, tools: ['lark-cli'] });
     await publish(config, ALICE);
     expect(identityBody('lark-cli')).toContain('孙晓雪');
   });
@@ -322,7 +333,7 @@ describe('publishTurnCliIdentity — turn stamping', () => {
   });
 
   it('stamps the turn on a refusal too', async () => {
-    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+    const config = botConfig({ enabled: true, tools: ['lark-cli'] });
     await publish(config, BOB, 'turn-B');
     const body = identityBody('lark-cli', 'turn-B');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
@@ -578,7 +589,8 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en',
+      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',
@@ -655,6 +667,24 @@ describe('target daemon consumes signed message authority', () => {
   }
   const firstScheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
   const nextScheduledTurn = 'schedule:a1b2c3d4:23456789-1234-1234-1234-123456789abc';
+
+  it('an unattended external turn whose person has credentials again ends its lapse: the next lapse is a new notice', async () => {
+    __resetUnattendedNoticesForTest();
+    const h = await targetHarness();
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) });
+    h.ds.session.replyTargets.trg_x1 = { senderOpenId: ALICE, rootMessageId: 'om_root', updatedAt: new Date().toISOString() };
+    const send = vi.fn(async () => undefined);
+    const lapse = () => deliverUnattendedLapse({
+      appId: APP, taskId: SESSION, taskName: 'x', openId: ALICE, locale: 'zh', sendDirect: send,
+      entries: [{ provider: 'bytedcli', url: 'https://cloud.example.test/auth' }],
+    });
+    await lapse(); await lapse();
+    expect(send).toHaveBeenCalledTimes(1);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    await h.prepare('trg_x1');
+    await lapse();
+    expect(send).toHaveBeenCalledTimes(2);
+  });
 
   it.each(['bytedcli', 'lark-cli'] as const)('publishes creator credentials and executes the %s wrapper on every scheduled turn', async tool => {
     const h = await targetHarness();

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { deliverAuthLink } from '../src/core/auth-link-delivery.js';
+import { deliverAuthLink, directOrEphemeral } from '../src/core/auth-link-delivery.js';
 import { t } from '../src/i18n/index.js';
 
 const LINK = 'https://accounts.example/device/verify?user_code=ABCD';
@@ -87,5 +87,27 @@ describe('deliverAuthLink', () => {
     expect(await deliverAuthLink({ privateChat: false, openId: undefined, text: LINK, ...h, locale: 'zh' })).toBe('dm_failed');
     expect(h.sendDirect).not.toHaveBeenCalled();
     expect(h.inPlace.join('')).not.toContain(LINK);
+  });
+});
+
+describe('directOrEphemeral', () => {
+  it('sends a direct message when it can be delivered', async () => {
+    const direct = vi.fn(async () => 'om_dm');
+    const card = vi.fn(async () => 'om_card');
+    await directOrEphemeral(direct, card)('ou_a', LINK);
+    expect(direct).toHaveBeenCalledWith('ou_a', LINK);
+    expect(card).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a card only that person sees when the direct message fails', async () => {
+    const card = vi.fn(async () => 'om_card');
+    await directOrEphemeral(async () => { throw new Error('230013'); }, card)('ou_a', LINK);
+    expect(card).toHaveBeenCalledWith('ou_a', expect.stringContaining(LINK));
+  });
+
+  it('throws when neither can be sent, or no card is possible', async () => {
+    const down = async () => { throw new Error('down'); };
+    await expect(directOrEphemeral(down, down)('ou_a', LINK)).rejects.toThrow('down');
+    await expect(directOrEphemeral(down)('ou_a', LINK)).rejects.toThrow('down');
   });
 });

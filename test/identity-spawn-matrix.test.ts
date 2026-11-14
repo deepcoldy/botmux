@@ -224,7 +224,7 @@ d('F3 seven-cell identity model matrix', () => {
         const env: NodeJS.ProcessEnv = { PATH: `${join(root, 'fakebin')}:/usr/bin:/bin` };
         prepareTriggerUserCliEnv(
           env, dataDir, 'matrix-session',
-          { enabled: true, tools: ['bytedcli'], fallback: 'none' },
+          { enabled: true, tools: ['bytedcli'] },
           () => {}, model,
           model === 'proven' ? { appId: 'cli_matrix', ipcPort: 1 } : undefined,
         );

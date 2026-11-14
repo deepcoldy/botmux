@@ -250,9 +250,9 @@ export async function resolveLoopbackPeerProcesses(input: {
  * the attested engine, not an old user command. Never recognize it from argv
  * alone: require a direct attested Codex parent and the release sibling exe. */
 function isNativeCodexToolHost(
-  pid: number, parent: number, procRoot: string, trustedRootPids: ReadonlySet<number>,
+  pid: number, parent: number, procRoot: string, trustedRootPids: ReadonlySet<number>, codexCli: boolean,
 ): boolean {
-  if (!trustedRootPids.has(parent)) return false;
+  if (!trustedRootPids.has(parent) && !(codexCli && isNativeCodexProcess(parent, procRoot, trustedRootPids))) return false;
   try {
     const parentExe = readlinkSync(join(procRoot, String(parent), 'exe'));
     const hostExe = readlinkSync(join(procRoot, String(pid), 'exe'));
@@ -266,35 +266,68 @@ function isNativeCodexToolHost(
   }
 }
 
+/** In a Codex session whose CLI root is a launcher above the native Codex
+ * binary, the binary is a pre-existing child of the trusted root and a new tool
+ * descends from it. Only a Codex session's root can have that child: under any
+ * other CLI a direct child named `codex` is an old tool. A root that is itself
+ * the native binary never vouches for a nested codex. The App-mode
+ * `codex app-server` engine is excluded: it must be attested by signed state
+ * before its tools count. */
+function isNativeCodexProcess(
+  pid: number, procRoot: string, trustedRootPids: ReadonlySet<number>,
+): boolean {
+  try {
+    const fields = procStatFieldsAfterComm(readFileSync(join(procRoot, String(pid), 'stat'), 'utf8'));
+    const argv = readFileSync(join(procRoot, String(pid), 'cmdline'), 'utf8').split('\0');
+    const parent = Number(fields?.[1]);
+    return !!fields && trustedRootPids.has(parent)
+      && argv[1] !== 'app-server'
+      && basename(readlinkSync(join(procRoot, String(parent), 'exe'))) !== 'codex'
+      && basename(readlinkSync(join(procRoot, String(pid), 'exe'))) === 'codex';
+  } catch {
+    return false;
+  }
+}
+
 function peerBelongsToCurrentTurn(input: {
   peer: ProcessIdentity;
   trustedRootPids: ReadonlySet<number>;
   procRoot: string;
   preexistingProcessIdentities: ReadonlySet<string>;
+  /** The session runs the Codex CLI. */
+  codexCli: boolean;
+  onRefusal?: (reason: string) => void;
 }): boolean {
-  if (input.procRoot === '/proc' && process.platform !== 'linux') return false;
+  const stop = (reason: string) => { input.onRefusal?.(`lineage walk stopped: ${reason}`); return false; };
+  if (input.procRoot === '/proc' && process.platform !== 'linux') return stop('platform unsupported');
   let pid = input.peer.pid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     if (input.trustedRootPids.has(pid)) return true;
     try {
-      const fields = procStatFieldsAfterComm(readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8'));
-      if (!fields) return false;
+      const stat = readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8');
+      const comm = () => JSON.stringify(stat.slice(stat.indexOf('(') + 1, stat.lastIndexOf(')')));
+      const fields = procStatFieldsAfterComm(stat);
+      if (!fields) return stop(`pid ${pid} has an unparseable stat`);
       const parent = Number(fields[1]);
       const started = fields[PROC_STAT_STARTTIME_INDEX];
-      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return false;
+      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return stop(`pid ${pid} comm ${comm()} has an invalid parent or start time`);
       if (input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
-        // Only traverse the native dispatcher as an ancestor of a new tool.
-        // It cannot itself claim this turn, nor can old tool descendants.
-        if (pid === input.peer.pid
-          || !isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids)
-          || readProcStart(pid, input.procRoot) !== started) return false;
+        // Only traverse the native dispatcher or the native Codex binary as an
+        // ancestor of a new tool. Neither can itself claim this turn, nor can
+        // old tool descendants.
+        if (pid === input.peer.pid) return stop(`pid ${pid} comm ${comm()} is the peer itself and was pre-existing`);
+        if (!isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids, input.codexCli)
+          && !(input.codexCli && isNativeCodexProcess(pid, input.procRoot, input.trustedRootPids))) {
+          return stop(`pid ${pid} comm ${comm()} was pre-existing and is not ${input.codexCli ? 'a native Codex process under a trusted root' : 'the native Codex tool host (the session does not run the Codex CLI)'}`);
+        }
+        if (readProcStart(pid, input.procRoot) !== started) return stop(`pid ${pid} comm ${comm()} changed start time`);
       }
       pid = parent;
     } catch {
-      return false;
+      return stop(`pid ${pid} is unreadable`);
     }
   }
-  return false;
+  return stop(`no trusted root reached, ended at pid ${pid}`);
 }
 
 export type CurrentActorDaemonResult =
@@ -328,6 +361,8 @@ export interface CurrentTurnPeerAttestationInput {
   findSession: (sessionId: string) => DaemonSession | undefined;
   procRoot?: string;
   expectedScheduledTurnId?: string;
+  /** Receives the check that refused the proof; for operator logs only. */
+  onRefusal?: (reason: string) => void;
 }
 
 /**
@@ -358,29 +393,37 @@ export function attestCurrentExecutionLoopbackPeer(
   const scheduledCaller = input.expectedScheduledTurnId
     ? ds?.scheduledTurnCallers?.get(input.expectedScheduledTurnId)
     : undefined;
-  if (!ds || ds.session.status !== 'active'
-    || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
-    || !turnId || generation === undefined
-    || !workerPid || !workerProcStart || ds.worker?.killed === true
-    || attestation?.workerGeneration !== generation
-    || ((cliPid === undefined) !== (cliProcStart === undefined))
+  const refuse = (reason: string): null => { input.onRefusal?.(reason); return null; };
+  if (!ds) return refuse('no session');
+  if (ds.session.status !== 'active') return refuse('session not active');
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })) return refuse('lark transport disabled');
+  if (!turnId || generation === undefined) return refuse('no live turn');
+  if (!workerPid || !workerProcStart || ds.worker?.killed === true) return refuse('worker not live');
+  if (attestation?.workerGeneration !== generation) {
+    return refuse(`attestation generation mismatch (attested ${attestation?.workerGeneration}, live ${generation})`);
+  }
+  if (((cliPid === undefined) !== (cliProcStart === undefined))
     || ((enginePid === undefined) !== (engineProcStart === undefined))
-    || (cliPid === undefined && enginePid === undefined)
-    || !processIdentities || processIdentities.length === 0
-    || !capability
-    || (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0))
-    || (cliPid !== undefined
-      && readProcStart(cliPid, procRoot) !== cliProcStart)
-    || (enginePid !== undefined
-      && readProcStart(enginePid, procRoot) !== engineProcStart)) {
-    return null;
+    || (cliPid === undefined && enginePid === undefined)) {
+    return refuse('no complete cli or engine attestation');
+  }
+  if (!processIdentities || processIdentities.length === 0) return refuse('no turn snapshot');
+  if (!capability) return refuse('no capability');
+  if (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0)) {
+    return refuse('invalid dispatch attempt');
+  }
+  if (cliPid !== undefined && readProcStart(cliPid, procRoot) !== cliProcStart) {
+    return refuse(`cli pid ${cliPid} start mismatch`);
+  }
+  if (enginePid !== undefined && readProcStart(enginePid, procRoot) !== engineProcStart) {
+    return refuse(`engine pid ${enginePid} start mismatch`);
   }
   if (input.expectedScheduledTurnId
     && (!parseScheduledTurnId(input.expectedScheduledTurnId)
       || turnId !== input.expectedScheduledTurnId
       || !scheduledCaller
       || scheduledCaller.requestUserOpenId !== callerOpenId)) {
-    return null;
+    return refuse('scheduled caller mismatch');
   }
   const preexistingProcessIdentities = new Set(processIdentities);
   // The worker reports both roots over its private IPC channel. Binding each
@@ -392,12 +435,17 @@ export function attestCurrentExecutionLoopbackPeer(
     ...(cliPid !== undefined ? [cliPid] : []),
     ...(enginePid !== undefined ? [enginePid] : []),
   ]);
+  const roots = `trusted roots ${[...trustedRootPids].join(',')}`;
   if (!peerBelongsToCurrentTurn({
-      peer: input.peer, trustedRootPids, procRoot,
-      preexistingProcessIdentities,
-    })
-    || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+    peer: input.peer, trustedRootPids, procRoot,
+    preexistingProcessIdentities,
+    codexCli: (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) === 'codex',
+    onRefusal: reason => input.onRefusal?.(`${reason}; ${roots}`),
+  })) {
     return null;
+  }
+  if (readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+    return refuse(`peer pid ${input.peer.pid} start mismatch; ${roots}`);
   }
   return {
     ds, turnId, generation, callerOpenId, capability,

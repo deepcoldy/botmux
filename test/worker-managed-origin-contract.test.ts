@@ -14,7 +14,7 @@ import * as identities from '../src/im/lark/identity-cache.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import * as tokens from '../src/utils/user-token.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
@@ -105,6 +105,29 @@ describe('managed origin publication through the session contract', () => {
     expect(h.ds.managedTurnOrigin).toBeUndefined();
     expect(h.hostEnv.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Dropped managed_turn_origin from current worker turn=\S+ reason=(stale_runtime_scope|execution_scope_unproven)$/));
   });
+  it('republishes the opening turn origin with the runtime once the daemon assigns it', async () => {
+    const h = fixture({ preAdmit: true });
+    const worker = h.controller.bindWorker(7).worker;
+    const opening = h.scope.beginRuntime(); h.controller.reserveBinding(opening.bindingId, worker);
+    h.scope.rememberExecution(h.execution, opening);
+    h.env.currentBotmuxDispatchAttempt = undefined; h.env.retiredTurnIds = new Set();
+    const assigned = loadWorkerMessageHandler('runtime_contract_assigned', h.env);
+    h.scope.run(opening, () => { h.scope.enterTurn(h.execution.turnId); h.env.publishSandboxRelayCapability(); }, h.execution);
+    await h.drain();
+    expect(h.wire.filter(m => m.type === 'managed_turn_origin')).toHaveLength(0);
+    expect(h.ds.managedTurnOrigin).toBeUndefined();
+
+    opening.identity = { backend: 'tmux', physicalId: '100:1000', proof: 'process_start', nativeSessionId: 'opening-native' };
+    const runtime = h.controller.bindRuntime(opening.bindingId, worker, opening.identity).ref;
+    await assigned({ type: 'runtime_contract_assigned', bindingId: opening.bindingId, runtime, mayExecute: true,
+      executions: [h.execution], admissionStates: [{ ref: h.execution, phase: 'queued' }] });
+    await h.drain();
+    const origins = h.wire.filter(m => m.type === 'managed_turn_origin');
+    expect(origins).toHaveLength(1);
+    expect(origins[0].sessionContract.scope.runtime).toEqual(runtime);
+    expect(origins[0].sessionContract.scope.execution).toEqual(h.execution);
+    expect(h.ds.managedTurnOrigin).toMatchObject({ turnId: h.execution.turnId, callerOpenId: 'ou_human' });
+  });
 });
 
 
@@ -185,7 +208,7 @@ it('authorizes the real bound auth-request route from the human origin produced 
   expect(h.ds.managedTurnOrigin?.callerOpenId).toBe('ou_human');
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's1' ? h.ds : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: h.ds.larkAppId, larkAppSecret: 'test-secret',
-    triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_human', type: 'user', source: 'sender', updatedAt: 0 });
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
   const oauth = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://accounts.feishu.cn/oauth/device?user_code=test',

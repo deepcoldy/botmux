@@ -265,6 +265,7 @@ describe('TRAE launcher adversarial lifecycle probes', () => {
         currentBotmuxLinkRefMode: undefined,
         activeTurnAuthority: {
           identity: () => ({ turnId: 'synthetic-turn', dispatchAttempt: 1 }),
+          speakers: () => [],
         },
         parseDaemonIpcPort: () => undefined,
         randomBytes: () => ({ toString: () => 'synthetic-new-token' }),

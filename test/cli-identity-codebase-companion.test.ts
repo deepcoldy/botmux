@@ -72,11 +72,12 @@ describe('companion publication', () => {
     expect(IDENTITY_ENV_KEYS.codebase).toEqual(['CODEBASE_CLI_USER_JWT']);
   });
 
-  it('identityToolsFor adds codebase only when bytedcli is governed, without duplicates', () => {
-    expect(identityToolsFor(['bytedcli', 'bytedcli'])).toEqual(['bytedcli', 'codebase']);
-    expect(identityToolsFor(['lark-cli'])).toEqual(['lark-cli']);
-    expect(identityToolsFor(['bytedcli'])).toEqual(['bytedcli', 'codebase']);
-    expect(identityToolsFor(['lark-cli', 'bytedcli'])).toEqual(['lark-cli', 'bytedcli', 'codebase']);
+  it('identityToolsFor adds the companions only when ByteCloud is governed, without duplicates', () => {
+    expect(identityToolsFor(['bytedcli', 'bytedcli'], new Set(['bytecloud', 'meego']))).toEqual(['bytedcli', 'codebase', 'bitscli']);
+    expect(identityToolsFor(['lark-cli'], new Set(['lark-user']))).toEqual(['lark-cli']);
+    expect(identityToolsFor(['bytedcli'], new Set(['bytecloud']))).toEqual(['bytedcli', 'codebase', 'bitscli']);
+    expect(identityToolsFor(['lark-cli', 'bytedcli'], new Set(['lark-user', 'bytecloud']))).toEqual(['lark-cli', 'bytedcli', 'codebase', 'bitscli']);
+    expect(identityToolsFor(['bytedcli'], new Set(['meego']))).toEqual(['bytedcli']);
     expect(codebaseCompanionOf({ tool: 'bytedcli', cloudJwt: 'c', codeJwt: 'k', openId: 'ou' })).toEqual({ tool: 'codebase', codeJwt: 'k', openId: 'ou' });
   });
 });
@@ -114,7 +115,7 @@ describe('companion wrapper', () => {
     // Same when bytedcli was granted but no Codebase JWT came with it.
     writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud' }, 'single');
     let status2 = 0;
-    try { execFileSync('/bin/sh', [wrapper], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, stdio: ['ignore', 'pipe', 'pipe'] }, 'single'); }
+    try { execFileSync('/bin/sh', [wrapper, 'mr'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e: any) { status2 = e.status; }
     expect(status2).toBe(77);
   });
@@ -128,7 +129,7 @@ describe('companion wrapper', () => {
     }
     const env: NodeJS.ProcessEnv = { PATH: `${fakeBin}:/usr/bin:/bin` };
     const logs: string[] = [];
-    prepareTriggerUserCliEnv(env, dir, SESSION, { enabled: true, tools: ['bytedcli'], fallback: 'none' }, m => logs.push(m), 'single');
+    prepareTriggerUserCliEnv(env, dir, SESSION, { enabled: true, tools: ['bytedcli'] }, m => logs.push(m), 'single');
     const binDir = sessionIdentityBinDir(dir, SESSION);
     expect(identityWrapperInstalled(binDir, 'bytedcli')).toBe(true);
     expect(identityWrapperInstalled(binDir, 'codebase')).toBe(true);
@@ -160,7 +161,7 @@ describe('companion wrapper', () => {
     writeFileSync(real, '#!/bin/sh\nprintf "%s" "$CODEBASE_CLI_USER_JWT"\n', { mode: 0o755 });
     const wrapper = join(dir, 'codebase-proven');
     writeFileSync(wrapper, renderIdentityWrapper('codebase', real, 'proven', [resolver]));
-    const out = execFileSync('/bin/sh', [wrapper], {
+    const out = execFileSync('/bin/sh', [wrapper, 'mr'], {
       encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION },
     });
     expect(out).toBe('proven-code-jwt');

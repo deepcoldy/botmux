@@ -21,11 +21,12 @@ import {
   buildBotmuxSystemPromptText,
   buildManagedLarkToolPromptBlocks,
 } from '../src/adapters/cli/shared-hints.js';
-import { buildNewTopicPrompt, buildFollowUpCliInput } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildFollowUpCliInput, turnSpeakersForPrompt } from '../src/core/session-manager.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 import { t } from '../src/i18n/index.js';
+import * as workerPool from '../src/core/worker-pool.js';
 import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
@@ -53,7 +54,37 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
 
 afterEach(() => stubbedSessions.clear());
 
+describe('the speaker list of a multi-speaker turn follows the bot-level switch', () => {
+  const ds: any = { reportedIdentityModel: { model: 'proven' }, managedTurnOrigin: { speakers: [{ openId: 'ou_a', turnId: 'm1' }] } };
+  const speakersWith = (config: object) => {
+    stubbedBots.set('cli_speakers', { config: { larkAppId: 'cli_speakers', triggerUserAuth: parseTriggerUserAuthConfig(config) } });
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
+    return turnSpeakersForPrompt('cli_speakers', 'sess', { openId: 'ou_b', type: 'user', name: 'B' } as any);
+  };
+  afterEach(() => { stubbedBots.clear(); vi.restoreAllMocks(); });
+  it('lists the speakers when the switch is on and nothing when it is off', () => {
+    expect(speakersWith({ enabled: true, capabilities: ['bytecloud'], allowSpeakerSwitch: true })?.map(s => s.openId)).toEqual(['ou_a', 'ou_b']);
+    expect(speakersWith({ enabled: true, capabilities: ['bytecloud'] })).toBeUndefined();
+  });
+  it('lists nobody in a serial group, where each message is its own turn', () => {
+    const policy = { enabled: true, capabilities: ['bytecloud'], allowSpeakerSwitch: true };
+    stubbedBots.set('cli_speakers', { config: { larkAppId: 'cli_speakers', triggerUserAuth: parseTriggerUserAuthConfig(policy), groupSerialInput: { oc_g: true } } });
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({ ...ds, larkAppId: 'cli_speakers', chatId: 'oc_g', chatType: 'group' });
+    vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
+    expect(turnSpeakersForPrompt('cli_speakers', 'sess', { openId: 'ou_b', type: 'user' } as any)).toBeUndefined();
+  });
+});
+
 describe('buildCredentialBoundaryBlock', () => {
+  it('lists the speakers of a multi-speaker turn with the BOTMUX_AS rule, and nothing for a single speaker', () => {
+    const tools = { ...policy, tools: ['bytedcli' as const] };
+    const several = buildCredentialBoundaryBlock(tools, 'en', false, [{ openId: 'ou_a', name: 'Alice' }, { openId: 'ou_b' }]);
+    expect(several).toContain('Alice (ou_a), ou_b');
+    expect(several).toContain('BOTMUX_AS=');
+    expect(several).toContain('botmux auth wait');
+    expect(buildCredentialBoundaryBlock(tools, 'en', false, [{ openId: 'ou_a' }])).not.toContain('BOTMUX_AS');
+  });
   it.each(['zh', 'en'] as const)('holds only the two safety rules, whatever the tools, in %s', (locale) => {
     const block = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli', 'bytedcli'], gitHost: 'code.example.com' }, locale);
     expect(block.split('\n')).toEqual([
@@ -254,7 +285,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
       config: {
         larkAppId: appId,
         larkToolBinding: true,
-        triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
       },
     });
     try {
@@ -297,7 +328,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
         larkAppId: APP,
         larkToolBinding,
         ...(enabled
-          ? { triggerUserAuth: { enabled: true, tools, fallback: 'bot-identity' } }
+          ? { triggerUserAuth: { enabled: true, tools } }
           : {}),
       },
     });

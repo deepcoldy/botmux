@@ -15,12 +15,13 @@ import * as scheduler from '../src/core/scheduler.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import {
+  backfillOwnerUnionId,
   claimCardLocation,
   createScheduleIdentityClaims,
   resolveScheduledRunIdentity,
   type ScheduleIdentityClaimDeps,
 } from '../src/core/schedule-identity-claim.js';
-import { trustedCallerForScheduledTask } from '../src/core/scheduled-turn-provenance.js';
+import { assertScheduledAuthorityCurrent, trustedCallerForScheduledTask } from '../src/core/scheduled-turn-provenance.js';
 import type { ScheduledTask } from '../src/types.js';
 
 const APP = 'cli_claim';
@@ -29,6 +30,7 @@ const ALICE = { open: 'ou_alice', union: 'on_alice' };
 const BOB = { open: 'ou_bob', union: 'on_bob' };
 const CAROL = { open: 'ou_carol', union: 'on_carol' };
 const PROMPT = '每天早上汇总昨天的线上告警，用 bytedcli 拉取监控大盘，写进周报文档';
+const ALICE_OWNER = { kind: 'human' as const, openId: ALICE.open, unionId: ALICE.union };
 
 let dataDir: string;
 let store: ScheduleAuthorityStore;
@@ -56,7 +58,8 @@ class CardGoneError extends Error {}
 function addTask(extra: Partial<Parameters<typeof scheduler.addTask>[0]> = {}): ScheduledTask {
   return scheduler.addTask({
     id: 'a1b2c3d4', name: '告警日报', schedule: 'every 30m', prompt: PROMPT,
-    workingDir: '/repo', chatId: CHAT, larkAppId: APP, executionPosition: 'top-level', ...extra,
+    workingDir: '/repo', chatId: CHAT, larkAppId: APP, executionPosition: 'top-level',
+    owner: { kind: 'ownerless' }, ...extra,
   });
 }
 
@@ -280,7 +283,7 @@ describe('claim card on a fire without identity', () => {
 
   it('never posts for a task that has a usable identity, or a bot that governs no tool', async () => {
     const h = harness();
-    addTask({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    addTask({ owner: ALICE_OWNER });
     expect((await h.fire()).identity.ok).toBe(true);
     const inert = harness({ tools: [] });
     addTask({ id: 'b1b2c3d4' });
@@ -303,7 +306,7 @@ describe('claim card on a fire without identity', () => {
 
   it('reports a broken card store as a rejection, never by throwing into the turn being prepared', async () => {
     const h = harness();
-    addTask({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    addTask({ owner: ALICE_OWNER });
     h.deps.getCard = () => { throw new Error('database is not open'); };
     const task = authorityTask();
     let restored!: Promise<void>;
@@ -506,7 +509,7 @@ describe('claim card buttons', () => {
   it('does not hand over a task whose creator has meanwhile regained access', async () => {
     const h = harness();
     h.allowed.delete(ALICE.open);
-    const card = await pending(h, { ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    const card = await pending(h, { owner: ALICE_OWNER });
     expect(text(card.card)).toContain(`创建人 <at id=${ALICE.open}></at> 已无权操作本 Bot`);
     h.allowed.add(ALICE.open);
     const result = await h.click('schedule_identity_claim', card.card, BOB, card.messageId);
@@ -521,7 +524,7 @@ describe('claim card buttons', () => {
   it('settles a pending card at the next fire once the creator can act again', async () => {
     const h = harness();
     h.allowed.delete(ALICE.open);
-    await pending(h, { ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    await pending(h, { owner: ALICE_OWNER });
     h.allowed.add(ALICE.open);
     h.tick();
     await h.fire();
@@ -615,7 +618,7 @@ describe('claim card buttons', () => {
 
   it('a hand-made "take over" click cannot claim a task that still has its creator', async () => {
     const h = harness();
-    addTask({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    addTask({ owner: ALICE_OWNER });
     const result = await h.claims.handleCardAction({
       operator: { open_id: BOB.open, union_id: BOB.union },
       action: { value: { action: 'schedule_identity_reclaim', task_id: 'a1b2c3d4', claim_rev: '' } },
@@ -674,5 +677,129 @@ describe('claim card buttons', () => {
     const result = await h.click('schedule_identity_claim', card.card, ALICE, card.messageId);
     expect(result.toast.content).toContain('任务已被删除');
     expect(buttons(result.card.data)).toEqual([]);
+  });
+});
+
+describe('creator union_id backfill', () => {
+  const legacy = { owner: { kind: 'human' as const, openId: ALICE.open } };
+  const backfill = (lookupUnionId: (appId: string, openId: string) => Promise<string | undefined>,
+    task = authorityTask()) => backfillOwnerUnionId({
+    task, larkAppId: APP, lookupUnionId, record: scheduler.recordTaskOwnerUnionId,
+  });
+
+  it('stores the creator union_id so the task runs as the creator without a claim card', async () => {
+    const h = harness();
+    addTask(legacy);
+    expect(authorityTask().ownerUnionId).toBeUndefined();
+    const lookup = vi.fn(async () => ALICE.union);
+    const next = await backfill(lookup);
+    expect(lookup).toHaveBeenCalledWith(APP, ALICE.open);
+    expect(next).toMatchObject({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    expect(authorityTask()).toMatchObject({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    expect((await h.fire()).identity).toEqual({ ok: true, openId: ALICE.open, unionId: ALICE.union, source: 'creator' });
+    expect(h.sent).toEqual([]);
+    const again = vi.fn(async () => ALICE.union);
+    await backfill(again);
+    expect(again).not.toHaveBeenCalled();
+  });
+
+  it('hands the first fire the creator as its trusted caller', async () => {
+    addTask(legacy);
+    const stale = authorityTask();
+    expect(trustedCallerForScheduledTask(stale, APP)).toBeUndefined();
+    const next = await backfill(async () => ALICE.union, stale);
+    expect(trustedCallerForScheduledTask(next, APP)).toMatchObject({
+      requestUserOpenId: ALICE.open, requestUserUnionId: ALICE.union, requestLarkAppId: APP,
+      senderType: 'user', source: 'schedule_creator', taskId: 'a1b2c3d4',
+    });
+  });
+
+  it('leaves the task alone when the union_id cannot be resolved, so the claim card applies', async () => {
+    const h = harness();
+    addTask(legacy);
+    const before = authorityTask();
+    expect(await backfill(async () => undefined)).toEqual(before);
+    expect(authorityTask().ownerUnionId).toBeUndefined();
+    expect((await h.fire()).identity).toMatchObject({ ok: false, reason: 'no_creator' });
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('does not guess for a creator recorded under another app', async () => {
+    addTask({ ...legacy, creatorLarkAppId: 'cli_other' });
+    const lookup = vi.fn(async () => ALICE.union);
+    await backfill(lookup);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(authorityTask().ownerUnionId).toBeUndefined();
+  });
+});
+
+describe('fire admission around the union_id backfill', () => {
+  const RUN = 'run1';
+  const TURN = 'schedule:a1b2c3d4:00000001-0000-4000-8000-000000000000';
+  const legacy = { owner: { kind: 'human' as const, openId: ALICE.open } };
+  const lookup = async () => ALICE.union;
+
+  /** The order the daemon's execute callback follows: backfill, then the
+   *  admission snapshot, then the identity decision and the final check. */
+  async function admit(taskId = 'a1b2c3d4') {
+    await backfillOwnerUnionId({
+      task: authorityTask(taskId), larkAppId: APP, lookupUnionId: lookup, record: scheduler.recordTaskOwnerUnionId,
+    });
+    const authority = store.getRecord(APP, taskId)!;
+    const current = store.getRecord(APP, taskId)!;
+    assertScheduledAuthorityCurrent(authority, current, { runId: RUN });
+    const identity = resolveScheduledRunIdentity(current.task, APP, () => true);
+    assertScheduledAuthorityCurrent(current, store.getRecord(APP, taskId), { runId: RUN, turnId: TURN });
+    return identity;
+  }
+
+  it('lets the first fire of a legacy task run as its creator', async () => {
+    addTask(legacy);
+    store.updateTask(APP, 'a1b2c3d4', t => ({ ...t, lastRunId: RUN }));
+    expect(await admit()).toEqual({ ok: true, openId: ALICE.open, unionId: ALICE.union, source: 'creator' });
+  });
+
+  it('gives every target of one fire the identity', async () => {
+    addTask(legacy);
+    store.updateTask(APP, 'a1b2c3d4', t => ({ ...t, lastRunId: RUN }));
+    const h = harness();
+    await admit();
+    const targets = await Promise.all([h.fire(), h.fire()]);
+    expect(targets.map(t => t.identity.ok)).toEqual([true, true]);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('does not let a different creator open_id or an existing union_id be overwritten', () => {
+    addTask(legacy);
+    expect(scheduler.recordTaskOwnerUnionId('a1b2c3d4', APP, BOB.open, BOB.union)).toBeUndefined();
+    expect(scheduler.recordTaskOwnerUnionId('a1b2c3d4', APP, ALICE.open, ALICE.union)).toBeDefined();
+    expect(scheduler.recordTaskOwnerUnionId('a1b2c3d4', APP, ALICE.open, BOB.union)).toBeUndefined();
+    expect(authorityTask().ownerUnionId).toBe(ALICE.union);
+  });
+});
+
+describe('claim card for a one-shot task', () => {
+  it('is not sent: the task already fired and cannot be re-run', async () => {
+    const h = harness();
+    addTask({ schedule: '30m' });
+    expect(authorityTask().parsed.kind).toBe('once');
+    await h.fire();
+    expect(h.sent).toEqual([]);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toBeUndefined();
+  });
+
+  it('is still sent for a one-shot that keeps retrying until done', async () => {
+    const h = harness();
+    addTask({ schedule: '30m', untilDone: { retryMinutes: 5 } });
+    expect(authorityTask().parsed.kind).toBe('once');
+    await h.fire();
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('is still sent for a recurring task', async () => {
+    const h = harness();
+    addTask();
+    await h.fire();
+    expect(h.sent).toHaveLength(1);
   });
 });

@@ -55,6 +55,7 @@ function createParams(name = 'guarded') {
     workingDir: tempDir,
     chatId: 'oc_precondition_test',
     larkAppId: APP_ID,
+    owner: { kind: 'ownerless' as const },
   };
 }
 

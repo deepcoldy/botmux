@@ -498,7 +498,7 @@ describe('taskAcceptsRecordedCreator', () => {
       targetGeneration: 1, maxTasksPerTurn: 64,
     });
     scheduler.addTask({ id: 'a1b2c3d4', name: 'n', schedule: 'every 1h', prompt: 'p', workingDir: '/repo',
-      chatId: 'oc_chat', larkAppId: APP });
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'ownerless' } });
     expect(scheduler.taskAcceptsRecordedCreator('d1d2d3d4', APP)).toBe(false);
     expect(scheduler.taskAcceptsRecordedCreator('a1b2c3d4', APP)).toBe(true);
     // And the scheduler refuses it outright if a caller tries anyway.
@@ -517,7 +517,7 @@ describe('taskAcceptsRecordedCreator', () => {
       targetGeneration: 1, maxTasksPerTurn: 64,
     });
     scheduler.addTask({ id: 'a1b2c3d4', name: 'n', schedule: 'every 1h', prompt: 'p', workingDir: '/repo',
-      chatId: 'oc_chat', larkAppId: APP, ownerOpenId: 'ou_first', ownerUnionId: 'on_first' });
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' } });
     const reown = (task: any) => ({ ...task, ownerOpenId: 'ou_next', ownerUnionId: 'on_next' });
     store.updateTask(APP, 'a1b2c3d4', reown);
     store.updateTask(APP, 'd1d2d3d4', reown);
@@ -554,7 +554,7 @@ describe('a failed edit does not keep the new creator', () => {
   it('restores who the task runs as, its claim and control columns when the precondition step fails', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
-      ownerOpenId: 'ou_first', ownerUnionId: 'on_first',
+      owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' },
     }, APP, 'printf 1');
     const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
     expect(scheduler.claimTaskRunAs(created.id, APP, claim, null)).toMatchObject({ ok: true });
@@ -577,7 +577,7 @@ describe('a failed edit does not keep the new creator', () => {
   it('also restores the per-task model and reasoning effort the edit changed', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
-      model: 'model-before', reasoningEffort: 'high',
+      model: 'model-before', reasoningEffort: 'high', owner: { kind: 'ownerless' },
     }, APP, 'printf 1');
     scheduleStore.__setScheduleStoreBeforeRenameTestHook(() => {
       scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
@@ -595,6 +595,7 @@ describe('a failed edit does not keep the new creator', () => {
   it('restores from the authority record even when the JSON projection lags behind it', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
+      owner: { kind: 'ownerless' },
     }, APP, 'printf 1');
     const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
     scheduler.claimTaskRunAs(created.id, APP, claim, null);

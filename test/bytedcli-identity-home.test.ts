@@ -127,7 +127,7 @@ describe('bytedcli per-person HOME', () => {
     // Next person in the same session writes into their own directory.
     writeSessionIdentity(dataDir(), SESSION, { tool: 'bytedcli', cloudJwt: 'jwt-b', openId: 'ou_bob' }, 'single');
     const bobHome = bytedcliTurnHome(dataDir(), SESSION, { openId: 'ou_bob' });
-    expect(runWrapper(wrapperPath)).toBe(`${bobHome}|jwt-b|`);
+    expect(runWrapper(wrapperPath, ['x'])).toBe(`${bobHome}|jwt-b|x`);
     expect(existsSync(join(bobHome, '.local/share/bytedcli/data/userinfo.json'))).toBe(true);
   });
 
@@ -137,7 +137,7 @@ describe('bytedcli per-person HOME', () => {
     const envDir = join(dataDir(), 'cli-identity', `${SESSION}.bin`, '.data');
     mkdirSync(envDir, { recursive: true });
     writeFileSync(join(envDir, 'bytedcli.env'), renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'jwt-old' }));
-    expect(runWrapper(wrapperPath)).toBe(`${process.env.HOME}|jwt-old|`);
+    expect(runWrapper(wrapperPath, ['x'])).toBe(`${process.env.HOME}|jwt-old|x`);
   });
 
   it('an inherited BOTMUX_IDENTITY_HOME cannot redirect an identity that carries no HOME', () => {
@@ -148,7 +148,7 @@ describe('bytedcli per-person HOME', () => {
       const wrapperPath = join(dir, `wrapper-${tool}`);
       writeFileSync(wrapperPath, renderIdentityWrapper(tool, stubTool(), 'single'));
       writeFileSync(join(envDir, `${tool}.env`), body);
-      return execFileSync('/bin/sh', [wrapperPath], {
+      return execFileSync('/bin/sh', [wrapperPath, 'x'], {
         encoding: 'utf8',
         env: {
           PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dataDir(), BOTMUX_SESSION_ID: SESSION,

@@ -57,6 +57,7 @@ function create(calendar: string | null = 'demo', extra: Partial<Parameters<type
   return createTaskWithOptionalPrecondition({
     name: 'fixture calendar task', schedule: 'every 1m', prompt: 'fixture prompt',
     workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: calendar ?? undefined,
+    owner: { kind: 'ownerless' },
     repeat: { times: 3, completed: 0 }, ...extra,
   }, APP, { enabled: true, source: { kind: 'inline', script: 'printf 1' } });
 }
@@ -181,7 +182,7 @@ describe('calendar admission before task side effects', () => {
   it('keeps bot ownership and profile isolation', async () => {
     const own = create();
     setScheduleScope(OTHER);
-    const other = addTask({ name: 'other task', schedule: 'every 1m', prompt: 'fixture', workingDir: root, chatId: 'fixture_chat', larkAppId: OTHER, calendar: 'demo' });
+    const other = addTask({ name: 'other task', schedule: 'every 1m', prompt: 'fixture', workingDir: root, chatId: 'fixture_chat', larkAppId: OTHER, calendar: 'demo', owner: { kind: 'ownerless' } });
     setScheduleScope(APP);
     const gate = installGate();
     startScheduler();
@@ -242,7 +243,7 @@ describe('calendar admission before task side effects', () => {
     vi.setSystemTime(new Date(requestedAt));
     const task = addTask({ name: 'durable manual request', schedule, prompt: 'fixture',
       workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: 'cn',
-      repeat: { times: 3, completed: 0 } });
+      repeat: { times: 3, completed: 0 }, owner: { kind: 'ownerless' } });
     const execute = vi.fn(async () => undefined);
     setExecuteCallback(execute);
     startScheduler();
@@ -280,7 +281,7 @@ describe('calendar admission before task side effects', () => {
   it.each(['0 9 * * *', 'every 1m'])('still fast-forwards a stale automatic occurrence for %s', async schedule => {
     vi.setSystemTime(new Date('2026-09-30T04:00:00Z'));
     const task = addTask({ name: 'stale automatic task', schedule, prompt: 'fixture',
-      workingDir: root, chatId: 'fixture_chat', larkAppId: APP });
+      workingDir: root, chatId: 'fixture_chat', larkAppId: APP, owner: { kind: 'ownerless' } });
     updateTask(task.id, { nextRunAt: new Date().toISOString() });
     const execute = vi.fn(async () => undefined);
     setExecuteCallback(execute);
@@ -295,7 +296,7 @@ describe('calendar admission before task side effects', () => {
   it.each(['dashboard', 'cli'])('cancels pending manual intent when paused through %s before resuming on a rest day', async entry => {
     vi.setSystemTime(new Date('2026-09-30T04:00:00Z'));
     const task = addTask({ name: 'pause pending manual task', schedule: '0 9 * * *', prompt: 'fixture',
-      workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: 'cn' });
+      workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: 'cn', owner: { kind: 'ownerless' } });
     const execute = vi.fn(async () => undefined);
     setExecuteCallback(execute);
     expect(requestRunNow(task.id)).toEqual({ ok: true });
@@ -357,7 +358,7 @@ describe('calendar admission before task side effects', () => {
     vi.setSystemTime(new Date('2026-09-30T04:00:00Z'));
     const task = addTask({ name: 'edit pending manual task', schedule: '0 9 * * 1', prompt: 'fixture',
       workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: 'cn',
-      repeat: { times: 3, completed: 0 } });
+      repeat: { times: 3, completed: 0 }, owner: { kind: 'ownerless' } });
     const execute = vi.fn(async () => undefined);
     setExecuteCallback(execute);
     expect(requestRunNow(task.id)).toEqual({ ok: true });
@@ -377,7 +378,7 @@ describe('calendar admission before task side effects', () => {
   });
   it('preserves a valid pending manual request when editing without changing its schedule', async () => {
     const task = addTask({ name: 'edit pending label', schedule: 'every 1m', prompt: 'fixture',
-      workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: 'absent' });
+      workingDir: root, chatId: 'fixture_chat', larkAppId: APP, calendar: 'absent', owner: { kind: 'ownerless' } });
     const execute = vi.fn(async () => undefined);
     setExecuteCallback(execute);
     expect(requestRunNow(task.id)).toEqual({ ok: true });
