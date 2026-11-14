@@ -11,6 +11,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { isWorkflowSidebarEntryUrl } from '../../core/workflow-sidebar-link.js';
+import { NEXT_STEP_ELEMENT_ID } from './next-step-card.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
 import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
@@ -2056,6 +2057,10 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   ) {
     return;
   }
+
+  // The「下一步」row is navigation chrome like the footer: its button is a
+  // stamped botmux callback (dropped below) and its label is not reply text.
+  if (el.element_id === NEXT_STEP_ELEMENT_ID && tag === 'column_set') return;
 
   // Promoted H1/H2 heading widgets: Lark strips `text_size` when a message is
   // read back, so the ATX prefix is rebuilt from the element id (the only

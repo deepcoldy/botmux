@@ -2693,6 +2693,10 @@ export type WorkerToDaemonBase =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number }
+  /** The CLI's own next-input suggestion on an idle screen (Claude Code's
+   *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
+   *  the turn that just ended; the daemon shows it on that turn's last card. */
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
   /** Redacted execution observation for the daemon notification clock only. */
   | { type: 'turn_progress'; turnId: string; dispatchAttempt?: number; stage: import('./services/cli-progress-notice.js').ProgressStage }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.

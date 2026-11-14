@@ -87,6 +87,8 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   displayRetired?: boolean;
   overflowMessageId?: string;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
+  /** The CLI's next-input suggestion shown on a completed turn's card. */
+  nextStep?: import('../im/lark/next-step-card.js').NextStepButton;
 }
 
 export type TurnReplyCardEvent =
@@ -99,6 +101,8 @@ export type TurnReplyCardEvent =
   | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
   | { kind: 'display_retired'; notice: string }
   | { kind: 'refresh' }
+  /** Set or clear the next-step row; valid after the terminal edge too. */
+  | { kind: 'next_step'; nextStep?: import('../im/lark/next-step-card.js').NextStepButton }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
@@ -295,6 +299,9 @@ export class TurnReplyCardStore {
             delete record.disconnected;
           }
         }
+      } else if (event.kind === 'next_step') {
+        if (event.nextStep) record.nextStep = event.nextStep;
+        else delete record.nextStep;
       } else if (event.kind === 'terminal') {
         for (const entry of record.asks ?? []) {
           if (!entry.result && (!event.disconnected || event.orphanAskIds?.includes(entry.ask.askId))) {

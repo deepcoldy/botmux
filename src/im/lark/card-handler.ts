@@ -21,6 +21,7 @@ import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
+import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { messageMentionsBot } from './message-parser.js';
@@ -209,7 +210,7 @@ export interface CardHandlerDeps {
     operatorUnionId?: string;
     payload?: string;
     sig?: string;
-  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  }) => Promise<{ ok: true; chatId: string; anchorId?: string; prompt?: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -1613,6 +1614,12 @@ function buildMenuCloseConfirmCard(ds: DaemonSession, rootId: string, loc: Local
 }
 
 
+/** The suggestion echoed back as plain text: a text message would turn an
+ * `<at …>` tag in it into a real mention. */
+export function nextStepNoticeText(prompt: string): string {
+  return prompt.replace(/<(\/?at\b)/gi, '＜$1');
+}
+
 function cardClickTurnToastKey(reason: string): string {
   switch (reason) {
     case 'expired': return 'card.click_turn.expired';
@@ -2120,7 +2127,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   if (value?.action === 'card_click_turn' && larkAppId) {
     const loc = localeForBot(larkAppId);
-    if (!deps.cardClickTurn) {
+    // A reply card's「下一步」row. Its notice is unsigned and only selects the
+    // acknowledgement below; turning the bot switch off disables earlier rows.
+    const nextStep = value.notice === NEXT_STEP_CLICK_NOTICE;
+    if (!deps.cardClickTurn || (nextStep && getBot(larkAppId).config.replyCardNextStep !== true)) {
       return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
     }
     const accepted = await deps.cardClickTurn({
@@ -2137,8 +2147,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
       afterAck: () => accepted.run().then(async result => {
         const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
-        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
         try {
+          if (nextStep && accepted.anchorId) {
+            // Stays in the session's own thread, like the reply it came from.
+            const notice = failed
+              ? t('card.click_turn.delivery_failed', undefined, loc)
+              : t('card.next_step.started', { text: nextStepNoticeText(accepted.prompt ?? '') }, loc);
+            await deps.sessionReply(accepted.anchorId, notice, 'text', larkAppId);
+            return;
+          }
+          const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
           await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
         } catch (err) {
           logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);

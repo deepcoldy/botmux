@@ -36,6 +36,9 @@ export { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
+import { messageCardContent } from '../im/lark/message-card-content.js';
+import { noteNextStepCard, noteNextStepSuggestion } from './next-step-suggestion.js';
+import { nextStepIo } from './next-step-io.js';
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
@@ -2212,15 +2215,6 @@ function recordTurnTerminalCarrier(
   }
 }
 
-function messageCardContent(detail: any, expectedChatId: string): string | undefined {
-  const message = detail?.items?.[0] ?? detail?.message ?? detail;
-  if (message?.chat_id !== expectedChatId || message?.msg_type !== 'interactive') return undefined;
-  const content = message?.body?.content;
-  if (typeof content === 'string' && content.trim()) return content;
-  if (content && typeof content === 'object') return JSON.stringify(content);
-  return undefined;
-}
-
 async function patchTurnTerminalCarrier(
   ds: DaemonSession,
   messageId: string,
@@ -2231,6 +2225,7 @@ async function patchTurnTerminalCarrier(
   if (!cardJson) return false;
   const footer = buildTurnTerminalFooterPatch(cardJson, kind, localeForBot(ds.larkAppId));
   if (!footer) return false;
+  if (footer.alreadyApplied) return true;
   const cardId = await resolveCardKitId(ds.larkAppId, messageId);
   // Ordinary send cards have no CardKit stream writes. Use one stable operation
   // across retries; a card with a conflicting sequence falls back to the strip
@@ -2240,7 +2235,7 @@ async function patchTurnTerminalCarrier(
     .digest('hex').slice(0, 47)}`;
   await patchCardStreamElement(
     ds.larkAppId, cardId, REPLY_CARD_FOOTER_ELEMENT_ID,
-    footer, 1, uuid, messageId,
+    { content: footer.content }, 1, uuid, messageId,
   );
   return true;
 }
@@ -21070,6 +21065,13 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'prompt_suggestion': {
+        if (!ownsLifecycleMutation()) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        noteNextStepSuggestion(ds, msg.turnId, msg.text, nextStepIo);
+        break;
+      }
+
       case 'screen_update': {
         if (!ownsLifecycleMutation()) break;
         // Wait for worker init, independently of Web Terminal availability.
@@ -23042,8 +23044,16 @@ function setupWorkerHandlers(
         // post-terminal summon would create a bubble nobody ever finishes).
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-          void settleTurnReplyCardTerminal(ds, msg,
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation)
+          const replyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
+          void settleTurnReplyCardTerminal(ds, msg, replyCardSend, ownsLifecycleMutation)
+            .then(() => {
+              if (msg.status !== 'completed') return;
+              noteNextStepCard(ds, msg.turnId, { kind: 'unified', publish: async next => {
+                await updateTurnReplyCard(ds, msg.turnId, { kind: 'next_step', ...(next ? { nextStep: next } : {}) },
+                  replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
+              } }, nextStepIo);
+            })
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
         finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
@@ -23464,7 +23474,14 @@ function setupWorkerHandlers(
                     ds,
                     carrier.messageId,
                     kind,
-                  )) return;
+                  )) {
+                    // The footer receipt is this card's first CardKit write;
+                    // the next-step row only goes on after it.
+                    if (kind === 'completed') {
+                      noteNextStepCard(ds, msg.turnId, { kind: 'legacy', messageId: carrier.messageId }, nextStepIo);
+                    }
+                    return;
+                  }
                   // A marker can outlive a manually replaced/non-card
                   // message. Fall through to the independent strip rather
                   // than retrying a structurally unpatchable payload.

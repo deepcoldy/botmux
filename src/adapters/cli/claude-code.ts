@@ -1,3 +1,4 @@
+import { claudePromptSuggestion } from '../../utils/claude-prompt-suggestion.js';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -1162,6 +1163,8 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    // Every Claude-family variant runs the same TUI and input box.
+    promptSuggestion: claudePromptSuggestion,
     supportsProgramStatus: variant.supportsProgramStatus,
     reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in

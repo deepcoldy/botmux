@@ -17,6 +17,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
   resolveCardKitId: vi.fn(async () => 'card_answer'),
   patchCardStreamElement: vi.fn(async () => {}),
+  insertCardElements: vi.fn(async () => {}),
+  replaceCardElement: vi.fn(async () => {}),
+  deleteCardElement: vi.fn(async () => {}),
   getMessageDetail: vi.fn(async () => ({
     items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
       content: JSON.stringify({ schema: '2.0', body: { elements: [
@@ -44,7 +47,11 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTurnTerminalReceiptCard: vi.fn((kind: string) => JSON.stringify({ kind })),
   buildTurnTerminalFooterPatch: vi.fn((card: string, kind: string) => {
     const footer = JSON.parse(card).body?.elements?.find((e: any) => e.element_id === 'botmux_reply_footer');
-    return footer ? { content: `${footer.content} terminal:${kind}` } : undefined;
+    if (!footer) return undefined;
+    const receipt = ` terminal:${kind}`;
+    return footer.content.endsWith(receipt)
+      ? { content: footer.content, alreadyApplied: true }
+      : { content: `${footer.content}${receipt}`, alreadyApplied: false };
   }),
   getCliDisplayName: vi.fn(() => 'TraeX'),
 }));
@@ -105,7 +112,8 @@ import {
 import { beginFinalOutputDelivery, waitForFinalOutputDeliveryDrain } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
-import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement } from '../src/im/lark/client.js';
+import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement, insertCardElements } from '../src/im/lark/client.js';
+import { nextStepIdle } from '../src/core/next-step-suggestion.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
@@ -292,6 +300,59 @@ describe('independent turn terminal receipt', () => {
       { userCardContent: true },
     );
     expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('does not patch a footer that already carries the receipt (a replayed terminal)', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_replayed');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    vi.mocked(getMessageDetail).mockResolvedValueOnce({
+      items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
+        content: JSON.stringify({ schema: '2.0', body: { elements: [
+          { tag: 'markdown', content: 'answer' },
+          { tag: 'markdown', element_id: 'botmux_reply_footer', content: 'brand terminal:completed' },
+        ] } }),
+      } }],
+    } as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_replayed', messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    await deliver(ds, terminalMsg('om_turn_replayed'));
+    await settle(ds);
+    expect(getMessageDetail).toHaveBeenCalledWith('app_test', 'om_answer_card', { userCardContent: true });
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    // ...and it is not mistaken for an unpatchable card that needs a strip.
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('next-step row on the completed reply card (switch on: %s)', async enabled => {
+    if (enabled) botConfig.replyCardNextStep = true;
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_next');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_next', messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    await deliver(ds, terminalMsg('om_turn_next'));
+    await settle(ds);
+    expect(patchCardStreamElement).toHaveBeenCalledTimes(1);
+    await deliver(ds, { type: 'prompt_suggestion', text: 'CI 绿了就合', turnId: 'om_turn_next' });
+    await nextStepIdle(ds);
+    if (!enabled) {
+      expect(insertCardElements).not.toHaveBeenCalled();
+      return;
+    }
+    expect(insertCardElements).toHaveBeenCalledTimes(1);
+    const [app, cardId, placement, elements, sequence, uuid, messageId] = vi.mocked(insertCardElements).mock.calls[0];
+    expect([app, cardId, messageId]).toEqual(['app_test', 'card_answer', 'om_answer_card']);
+    expect(placement).toEqual({ type: 'insert_before', targetElementId: 'botmux_reply_footer' });
+    expect((elements[0] as any).element_id).toBe('botmux_next_step');
+    expect(JSON.stringify(elements[0])).toContain('CI 绿了就合');
+    // Strictly after the footer receipt's fixed CardKit sequence.
+    expect(sequence).toBeGreaterThan(1);
+    expect(uuid).toMatch(/^nxs_[0-9a-f]{40}$/);
   });
 
   it.each(['progress', 'auxiliary'] as const)(
