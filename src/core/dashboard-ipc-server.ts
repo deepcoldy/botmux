@@ -5339,6 +5339,18 @@ decisionBoardRoute('POST', '/api/decision-board/items/:seq/seen', (service, _req
   jsonRes(res, 200, { ok: true });
 });
 
+decisionBoardRoute('POST', '/api/decision-board/items/:seq/close-in-chat', async (service, req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const submitter = decisionBoardAuthor(body?.submitter);
+  if (seq === null || !submitter || body?.confirmed !== true || !Number.isSafeInteger(body.baseRev)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  }
+  const result = service.closeInChat(seq, body.baseRev as number, submitter);
+  await service.cardsIdle();
+  jsonRes(res, 200, { ok: true, ...result });
+});
+
 decisionBoardRoute('POST', '/api/decision-board/items/:seq/draft', async (service, req, res, params) => {
   const seq = decisionBoardSeq(params.seq);
   const body = await readJsonBody<Record<string, unknown>>(req, 1024 * 1024).catch(() => undefined);

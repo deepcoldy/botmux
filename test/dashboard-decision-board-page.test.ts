@@ -15,6 +15,7 @@ import { StewardSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { BOARD_NAV_STORAGE_KEY, DECISION_BOARD_CHANGED_EVENT, type BoardDetailResponse, type BoardItem } from '../src/dashboard/web/decision-board-model.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { SearchableGroupPicker } from '../src/dashboard/web/searchable-group-picker.js';
+import { ConfirmModalRoot } from '../src/dashboard/web/confirm-modal.js';
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 
 const zh = createDashboardTranslator('zh');
@@ -81,6 +82,122 @@ function detail(seq: number, patch: Partial<BoardDetailResponse> = {}): BoardDet
   };
 }
 
+describe('close item UI', () => {
+  beforeEach(() => {
+    resetBoardNavMemory();
+    vi.stubGlobal('location', { hash: '#/board/cli_a/31', pathname: '/', search: '' });
+    vi.stubGlobal('history', { state: null, replaceState: () => {} });
+  });
+  const action = (name: string) => renderer!.root.find(n => n.type === 'button' && n.props['data-action'] === name);
+  function serve(includeClosed = false) {
+    let closed = false;
+    let draft: any = { seq: 31, author: 'owner', choice: 'B', text: '草稿不能投递', fileIds: [], baseRev: 5, updatedAt: 1 };
+    routes = (url, init) => {
+      if (url.endsWith('/boards')) return json({ ok: true, boards: [{ larkAppId: 'cli_a', botName: '管家', online: true, steward: { enabled: true, ready: true } }] });
+      if (url.includes('/items?')) return json({ ok: true, view: 'decide', steward: { enabled: true, ready: true }, counts: { decide: closed ? 0 : 1, active: 0, all: 1 },
+        items: closed && !includeClosed ? [] : [{ ...boardItem(31, { state: closed ? 'closed' : 'decide' }), links: [], hasDraft: !closed, pendingDecisions: 0, unseen: false }], drafts: closed ? [] : [{ seq: 31, updatedAt: 1 }], batches: [] });
+      if (url.endsWith('/items/31')) return json({ ok: true, ...detail(31, { item: boardItem(31, { state: closed ? 'closed' : 'decide' }), draft,
+        events: closed ? [{ id: 1, seq: 31, at: 1, actor: 'owner', kind: 'state', text: '本人关闭（无需再拍板）', fileIds: [] }] : [] }) });
+      if (url.endsWith('/seen')) return json({ ok: true });
+      if (url.endsWith('/draft')) { draft = { ...draft, ...JSON.parse(String(init.body)) }; return json({ ok: true, draft }); }
+      if (url.endsWith('/close-in-chat')) { closed = true; draft = undefined; return json({ ok: true }); }
+      return json({ ok: false, error: 'unexpected' }, 404);
+    };
+  }
+  it('detail requires confirmation, cancellation does nothing, closure refreshes and disables old decision editor without submit', async () => {
+    serve();
+    await act(async () => { renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 31 })); });
+    await flush();
+    expect(action('close-in-chat').children).toContain('关闭此项');
+    await act(async () => action('close-in-chat').props.onClick());
+    expect(text()).toContain(zh('decisionBoard.closeInChatBody'));
+    expect(calls('POST', '/close-in-chat')).toHaveLength(0);
+    await act(async () => buttonByText(zh('decisionBoard.cancel')).props.onClick());
+    expect(calls('POST', '/close-in-chat')).toHaveLength(0);
+    act(() => renderer!.root.findByType('textarea').props.onChange({ currentTarget: { value: '未保存，也不能投递' } }));
+    await act(async () => action('close-in-chat').props.onClick());
+    await act(async () => action('confirm-close-in-chat').props.onClick());
+    await flush();
+    expect(calls('POST', '/close-in-chat').map(c => c.body)).toEqual([{ baseRev: 5, confirmed: true }]);
+    expect(calls('POST', '/submit')).toEqual([]);
+    expect(calls('PUT', '/draft')).toHaveLength(1);
+    expect(text()).toContain('本人关闭（无需再拍板）');
+    expect(text()).toContain(zh('decisionBoard.closeInChatDone'));
+    expect(renderer!.root.findAllByType('textarea')).toEqual([]);
+    expect(renderer!.root.findAll(n => n.props['data-action'] === 'close-in-chat')).toEqual([]);
+  });
+  it('the all-items summary shows the generic closed status without a decision submission', async () => {
+    serve(true);
+    await act(async () => { renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { appId: 'cli_a', view: 'all' } })); });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(action('close-in-chat').children).toContain('关闭此项');
+    await act(async () => action('close-in-chat').props.onClick());
+    expect(text()).toContain(zh('decisionBoard.closeInChatBody'));
+    await act(async () => action('confirm-close-in-chat').props.onClick());
+    await flush();
+    expect(text()).toContain(zh('decisionBoard.closeInChatDone'));
+    expect(calls('POST', '/submit')).toEqual([]);
+    expect(renderer!.root.findAll(n => n.type === 'button' && n.props['data-action'] === 'close-in-chat')).toEqual([]);
+  });
+  it('summary has a separate close button and refreshes its list after confirmation', async () => {
+    serve();
+    await act(async () => { renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { appId: 'cli_a', view: 'decide' } })); });
+    for (let i = 0; i < 4; i++) await flush();
+    const close = action('close-in-chat');
+    for (let p = close.parent; p; p = p.parent) expect(p.type).not.toBe('a');
+    await act(async () => close.props.onClick());
+    await act(async () => action('confirm-close-in-chat').props.onClick());
+    await flush();
+    expect(calls('POST', '/close-in-chat')).toHaveLength(1);
+    expect(calls('POST', '/submit')).toEqual([]);
+    expect(renderer!.root.findAll(n => n.type === 'button' && n.props['data-action'] === 'close-in-chat')).toEqual([]);
+  });
+});
+
+describe('ended item with a leftover draft', () => {
+  beforeEach(() => {
+    resetBoardNavMemory();
+    vi.stubGlobal('location', { hash: '#/board/cli_a/31', pathname: '/', search: '' });
+    vi.stubGlobal('history', { state: null, replaceState: () => {} });
+  });
+  it.each(['done', 'closed'] as const)('shows the %s item draft read-only and lets the owner clear it', async state => {
+    // 管家改状态不清草稿：详情页不再给编辑器和提交按钮，但草稿要看得到、清得掉，否则一直算在「提交 N 项」里。
+    let draft: any = { seq: 31, author: 'owner', choice: 'B', text: '管家改状态前写的说明', fileIds: [], baseRev: 5, updatedAt: 1 };
+    routes = (url, init) => {
+      const method = init.method ?? 'GET';
+      if (url.endsWith('/items/31') && method === 'GET') {
+        return json({ ok: true, ...detail(31, { item: boardItem(31, { state }), draft, drafts: draft ? [{ seq: 31, updatedAt: 1 }] : [] }) });
+      }
+      if (url.endsWith('/seen')) return json({ ok: true });
+      if (url.endsWith('/items/31/draft') && method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        if (body.choice || body.text.trim() || body.fileIds.length) return json({ ok: false, error: 'item_ended', message: '这一项已处理，不能再保存决定草稿' }, 409);
+        draft = undefined;
+        return json({ ok: true });
+      }
+      return json({ ok: false, error: 'unexpected' }, 404);
+    };
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(React.Fragment, null,
+        React.createElement(ItemDetailView, { appId: 'cli_a', seq: 31 }), React.createElement(ConfirmModalRoot)));
+    });
+    await flush();
+
+    expect(renderer!.root.findAllByType('textarea')).toEqual([]);
+    expect(text()).toContain(zh('decisionBoard.endedDraft'));
+    expect(text()).toContain('管家改状态前写的说明');
+    expect(renderer!.root.findAll(n => n.type === 'button' && textOf(n).includes(zh('decisionBoard.submitThis')))).toEqual([]);
+
+    await act(async () => { buttonByText(zh('decisionBoard.clearDraft')).props.onClick(); });
+    expect(calls('PUT', '/draft')).toEqual([]);
+    await act(async () => { renderer!.root.find(n => n.type === 'button' && n.props.className === 'btn-danger').props.onClick(); });
+    await flush();
+    expect(calls('PUT', '/items/31/draft').map(c => c.body)).toEqual([{ text: '', fileIds: [], baseRev: 5 }]);
+    expect(text()).not.toContain(zh('decisionBoard.endedDraft'));
+    expect(renderer!.root.findAll(n => n.type === 'button' && textOf(n).includes(zh('decisionBoard.clearDraft')))).toEqual([]);
+  });
+});
+
 describe('submit dialog', () => {
   function serveDrafts(): void {
     const details: Record<string, BoardDetailResponse> = {
@@ -141,6 +258,32 @@ describe('submit dialog', () => {
     expect(text()).toContain(zh('decisionBoard.resultFailed', { id: 8, error: zh('decisionBoard.errStewardChatMissing') }));
     expect(renderer!.root.find(n => n.type === 'a' && n.props.href === '#/bot-defaults?bot=cli_a&section=steward')).toBeTruthy();
     expect(buttonByText(zh('decisionBoard.redeliver'))).toBeTruthy();
+  });
+
+  it('lists a leftover draft on an ended item as not submittable and leaves it out of the request', async () => {
+    // 管家把 #1 改成已完成时不清草稿：确认框照样列出它，但不能勾选，请求里只带 #2（带上 #1 服务端会拒掉整批）。
+    const details: Record<string, BoardDetailResponse> = {
+      '/items/1': detail(1, { item: boardItem(1, { state: 'done' }), draft: { seq: 1, author: 'owner', choice: 'B', text: '管家改状态前写的', fileIds: [], baseRev: 5, updatedAt: 11 } }),
+      '/items/2': detail(2, { draft: { seq: 2, author: 'owner', choice: 'A', text: '开关放 Bot 配置页', fileIds: [], baseRev: 4, updatedAt: 22 } }),
+    };
+    routes = (url, init) => {
+      const hit = Object.keys(details).find(k => url.endsWith(`/api/decision-board/cli_a${k}`));
+      if (hit && (init.method ?? 'GET') === 'GET') return json({ ok: true, ...details[hit] });
+      if (url.endsWith('/submit') && init.method === 'POST') {
+        return json({ ok: true, duplicate: false, decisions: [], batch: { id: 9, author: 'local', createdAt: 1, delivery: 'delivered', attempts: 1 } });
+      }
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(SubmitDialog, { appId: 'cli_a', seqs: [1, 2], firstSeq: 1, onClose: vi.fn() }));
+    });
+    await flush();
+
+    const boxes = renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'checkbox');
+    expect(boxes.map(b => [b.props.checked, b.props.disabled])).toEqual([[false, true], [true, false]]);
+    expect(text()).toContain(zh('decisionBoard.endedRow'));
+    await act(async () => { buttonByText(zh('decisionBoard.confirmSubmit', { n: 1 })).props.onClick(); });
+    expect(calls('POST', '/submit').map(c => c.body.items)).toEqual([[{ seq: 2, draftUpdatedAt: 22 }]]);
   });
 
   it('uses a fresh nonce after the server answered with a rejection', async () => {
