@@ -32,7 +32,9 @@
 
 ## 管理动作
 
-`schedule:create` 只允许初始 dispatch turn 执行 `add`。真人当前回合创建的 direct task 天然携带同 Bot、同群的控制者记录；它自己的 scheduled turn 可用 `schedule pause self` / `schedule remove self` 管理当前 task。跨 Bot delegated task 仍必须由宿主额外启用固定的 self-management 能力。各类 self-management 都只允许 pause/remove（until-done 任务另有 done）当前精确 task，不能管理其他 task，也不能 update prompt/目标、resume、force-run 或创建后继任务；每次执行仍重新校验控制者是目标 Bot 管理员和目标群成员。不记录控制者的 direct task（结构条件：两个控制者字段都未记录；例如宿主终端经 daemon HMAC 创建——宿主管理员就是创建者，没有会失效的真人授权）的 scheduled turn 同样可以 pause/remove/done 当前精确 task，跳过这项真人复核；只要记录了任一控制者字段（含空字符串），就照常复核，缺一半按失败处理。其他管理动作继续通过独立 daemon route 验证当前真人管理员；delegated task 的 canonical update 仍拒绝，等待后续显式 rebind 协议。
+`schedule:create` 的跨 Bot 能力仍只允许初始 dispatch turn 执行 `add`。独立的 `childOneShotEnabled` 例外允许真人直接创建或迁移的 direct/legacy task 在自己的已认证 scheduled turn 创建限域 one-shot：同 Bot、同群、当前话题、精确工作目录，默认 24 小时内且每轮 1 个。父控制人每次创建前重新校验为目标 Bot 管理员和群成员；子任务作为 delegated authority 落盘，但 `runScopes=[]`、`selfManage=false`，其 scheduled turn 因 parent kind 已是 delegated 而不能继续创建后继任务。grant 绑定 parent task、精确 scheduled turn 和 canonical request；同请求重放幂等，删除不返还额度。`runEnabled=false` 同时阻止创建和执行这类子任务。
+
+真人当前回合创建的 direct task 天然携带同 Bot、同群的控制者记录；它自己的 scheduled turn 可用 `schedule pause self` / `schedule remove self` 管理当前 task。跨 Bot delegated task 仍必须由宿主额外启用固定的 self-management 能力。各类 self-management 都只允许 pause/remove（until-done 任务另有 done）当前精确 task，不能管理其他 task，也不能 update prompt/目标、resume 或 force-run；除上述显式 one-shot 例外外不能创建后继任务。每次执行仍重新校验控制者是目标 Bot 管理员和目标群成员。不记录控制者的 direct task（结构条件：两个控制者字段都未记录；例如宿主终端经 daemon HMAC 创建——宿主管理员就是创建者，没有会失效的真人授权）的 scheduled turn 同样可以 pause/remove/done 当前精确 task，跳过这项真人复核；只要记录了任一控制者字段（含空字符串），就照常复核，缺一半按失败处理。其他管理动作继续通过独立 daemon route 验证当前真人管理员；delegated task 的 canonical update 仍拒绝，等待后续显式 rebind 协议。
 
 需要“发送最终结果并结束任务”时使用单个 `botmux send --response-kind final --schedule-remove-self`。CLI 只能从当前受认证的 `schedule:<taskId>:<runId>` 推导 task ID，不接受调用方指定；final 投递成功并写入幂等账本后，通过 owning daemon 删除该精确 task，再推进长驻 CLI 的排队 turn。删除失败不得创建或改写另一条 final，结果以结构化 `scheduleSelfCleanup` 返回；原样重试同一命令会复用已投递的 final，只补做自删，已撤销的精确 task 视为幂等成功。
 

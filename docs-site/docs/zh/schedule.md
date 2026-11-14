@@ -422,6 +422,24 @@ BotMux 会先确认结果发出去了，再删除当前任务。如果返回里 
 
 任务的权威记录保存在宿主侧的 SQLite 数据库里，`schedules.json` 只是可重建的副本，手动往里加记录不会让任务生效。所以所有写操作都要送到所属 Bot 的 daemon；daemon 不可用时命令会直接报错，而不是只改 JSON 留下一个永远不跑的任务。
 
+## 高级：定时任务创建一次性子任务
+
+有些两阶段流程需要前一轮在当天稍后回查，例如凌晨汇总后在 18:00 再检查未完成项。管理员可在 Dashboard「全局设置 → 实验性配置」开启「定时任务创建一次性子任务」，或配置：
+
+```json
+{
+  "scheduleDelegation": {
+    "childOneShotEnabled": true,
+    "childOneShotMaxDelayMinutes": 1440,
+    "childOneShotMaxTasksPerTurn": 1
+  }
+}
+```
+
+开启后，已认证的定时轮可以执行普通的 `botmux schedule add <将来时间> <prompt> --topic`。权限只覆盖当前 Bot、当前群、当前话题和完全相同的工作目录；只接受 `once`，默认最远 24 小时、每轮 1 个。`childOneShotMaxDelayMinutes` 最多 7 天，`childOneShotMaxTasksPerTurn` 最多 16。
+
+父任务必须由真人直接创建（或是升级时迁移的同类任务），创建者仍须是 Bot 管理员和群成员。子任务以匿名工具身份运行，不持久化 `lark-cli` / `bytedcli` scope，也不能自管理或继续创建孙任务。目标 Bot 必须对 `lark-cli` 和 `bytedcli` 开启 `triggerUserAuth` 身份隔离，避免复用话题会话时继承旧凭据。同一请求重试返回原任务，不重复占用额度；删除任务不会退回当轮额度。
+
 ## 高级：跨 Bot 委托创建
 
 当真人在 Bot A 的当前回合里明确要 Bot B 建定时任务，A 需要在受管派发里显式申请：
@@ -452,10 +470,13 @@ botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并�
 | `maxTasksPerTurn` | 一个派发回合最多建几个任务，默认 64，上限 1024 |
 | `runScopes` | 委托任务以后每次运行可沿用原真人的哪些个人凭据，目前只有 `bytedcli`，默认空 |
 | `selfManageEnabled` | 委托任务能否在自己的回合里暂停/删除自己，默认关 |
+| `childOneShotEnabled` | 允许定时轮在当前话题创建限域一次性子任务，默认关 |
+| `childOneShotMaxDelayMinutes` | 子任务最远执行时间，默认 1440 分钟，上限 10080 |
+| `childOneShotMaxTasksPerTurn` | 每个定时轮最多创建几个不同子任务，默认 1，上限 16 |
 | `defaultOnDispatchFromBotAppIds` | 这些来源 Bot 的受管派发默认带上 `schedule:create`；单次可用 `--no-delegate schedule:create` 取消 |
 | `botGrants` | 机器人调度授权：按「来源 Bot + 目标 Bot + 群」预先授权，非管理员触发的派单也能以「控制管理员」名义建任务；需同时打开 `createEnabled` |
 
-这几项也可以在 Dashboard 的「全局设置 → 实验性配置」里改（「跨 Bot 委托创建定时任务」「委托任务自管理」「机器人调度授权」）。
+开关也可以在 Dashboard 的「全局设置 → 实验性配置」里改；高级数值上限通过 `config.json` 设置。
 
 使用 `runScopes` 时，来源和目标 Bot 都要开启 `triggerUserAuth`，并让目标 Bot 的 `lark-cli`、`bytedcli` 都走身份隔离：
 

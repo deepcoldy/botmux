@@ -660,7 +660,8 @@ describe('redactSettingsForPublic', () => {
   });
 
   it('hides bot scheduling grants (chats and controller identity) from tokenless settings', () => {
-    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true, selfManageEnabled: false,
+    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true,
+      selfManageEnabled: false, childOneShotEnabled: true,
       grants: [{ id: 'team', sourceAppId: 'cli_a', targetAppIds: ['cli_b'], chatIds: ['oc_secret'],
         controllerUnionId: 'on_controller' }], botOptions: [] } };
     const out = redactSettingsForPublic(settings) as any;

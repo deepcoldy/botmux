@@ -763,18 +763,19 @@ describe('global dashboard config', () => {
     const disk = () => JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
     writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh' }));
     // Turning things off on a host that never had them leaves the file as it was.
-    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false, botGrants: [] });
+    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false,
+      childOneShotEnabled: false, botGrants: [] });
     expect(disk()).toEqual({ lang: 'zh' });
 
-    writeScheduleBotGrantConfig({ createEnabled: true, botGrants: [grant] });
-    expect(disk().scheduleDelegation).toEqual({ createEnabled: true,
+    writeScheduleBotGrantConfig({ createEnabled: true, childOneShotEnabled: true, botGrants: [grant] });
+    expect(disk().scheduleDelegation).toEqual({ createEnabled: true, childOneShotEnabled: true,
       botGrants: [{ ...grant, targetAppIds: ['cli_target'] }] });
 
     // Hand-edited keys this entry does not own survive every write.
     writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: {
       ...disk().scheduleDelegation, runEnabled: false, runScopes: ['bytedcli'], futureKey: 1 } }));
     writeScheduleBotGrantConfig({ selfManageEnabled: true });
-    writeScheduleBotGrantConfig({ createEnabled: false, botGrants: [] });
+    writeScheduleBotGrantConfig({ createEnabled: false, childOneShotEnabled: false, botGrants: [] });
     expect(disk().scheduleDelegation).toEqual({ selfManageEnabled: true, runEnabled: false,
       runScopes: ['bytedcli'], futureKey: 1 });
 
@@ -789,7 +790,9 @@ describe('global dashboard config', () => {
       scheduleDelegation: { createEnabled: true, runEnabled: false,
         defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
         maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
-        selfManageEnabled: true, ignored: true },
+        selfManageEnabled: true, childOneShotEnabled: true,
+        childOneShotMaxDelayMinutes: 99_999,
+        childOneShotMaxTasksPerTurn: 99, ignored: true },
     }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().scheduleDelegation).toEqual({
@@ -799,6 +802,21 @@ describe('global dashboard config', () => {
       maxTasksPerTurn: 128,
       runScopes: ['bytedcli'],
       selfManageEnabled: true,
+      childOneShotEnabled: true,
+      childOneShotMaxDelayMinutes: 7 * 24 * 60,
+      childOneShotMaxTasksPerTurn: 16,
+    });
+  });
+
+  it('uses conservative defaults for enabled scheduled one-shot children', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { childOneShotEnabled: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toMatchObject({
+      childOneShotEnabled: true,
+      childOneShotMaxDelayMinutes: 24 * 60,
+      childOneShotMaxTasksPerTurn: 1,
     });
   });
 

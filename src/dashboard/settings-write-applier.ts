@@ -113,10 +113,11 @@ export interface ResolvedDashboardSettingsView {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation switches and host bot grants. */
+  /** Schedule delegation switches and host bot grants. */
   scheduleBotGrants?: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     ignoredCount?: number;
     botOptions?: Array<{ larkAppId: string; botName: string | null }>;
@@ -306,6 +307,7 @@ export type ApplySettingsWriteError =
   | 'invalid_scheduleBotGrants'
   | 'invalid_scheduleBotGrants_createEnabled'
   | 'invalid_scheduleBotGrants_selfManageEnabled'
+  | 'invalid_scheduleBotGrants_childOneShotEnabled'
   | 'invalid_scheduleBotGrants_grant'
   | 'scheduleBotGrants_duplicate_id'
   | 'scheduleBotGrants_overlap'
@@ -737,7 +739,7 @@ export async function applySettingsWrite(
     }
     const incoming = raw as Record<string, unknown>;
     const next: Parameters<typeof writeScheduleBotGrantConfig>[0] = {};
-    for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+    for (const key of ['createEnabled', 'selfManageEnabled', 'childOneShotEnabled'] as const) {
       if (!(key in incoming)) continue;
       if (typeof incoming[key] !== 'boolean') return { ok: false, error: `invalid_scheduleBotGrants_${key}` };
       next[key] = incoming[key] as boolean;
