@@ -2143,31 +2143,37 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
         && proof.nativeSessionId === (lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId)) {
         nativeSessionId = proof.nativeSessionId;
       }
-    } else if (!nativeSessionId && lastInitConfig?.cliId === 'codex' && !lastInitConfig.existingAppServerEndpoint) {
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'codex'
+      && (typeof codexRpcEngine === 'undefined' || !codexRpcEngine)
+      && !lastInitConfig.existingAppServerEndpoint) {
       // A busy re-attached Codex pane may stay silent until the running turn
       // completes, and can hold internal/subagent rollouts open alongside the
       // user's top-level rollout. Prefer header-verified top-level fd discovery,
-      // falling back to an active owned bridge journal turn when fd headers are
-      // unavailable in unit harnesses.
+      // falling back to an active owned bridge journal turn or a daemon-frozen
+      // resume id only when this exact PID holds that rollout open; a configured
+      // id never proves ownership by itself.
       const liveSid = typeof readCodexLiveSessionId === 'function' ? readCodexLiveSessionId(childPid) : undefined;
       const ownedRollouts = typeof findCodexRolloutSetByPid === 'function' ? findCodexRolloutSetByPid(childPid) : undefined;
-      if (liveSid && (!ownedRollouts || (typeof codexHistorySidIsOwned === 'function'
-        ? codexHistorySidIsOwned(liveSid, ownedRollouts)
-        : ownedRollouts.has(liveSid.toLowerCase())))) {
+      const isOwnedSid = (sid: string): boolean => !ownedRollouts || (typeof codexHistorySidIsOwned === 'function'
+        ? codexHistorySidIsOwned(sid, ownedRollouts)
+        : ownedRollouts.has(sid.toLowerCase()));
+      if (liveSid && isOwnedSid(liveSid)) {
         nativeSessionId = liveSid;
       } else if (ownedRollouts?.size === 1 && typeof findCodexRolloutByPid === 'function') {
         const observed = findCodexRolloutByPid(childPid);
-        const isOwned = observed && (typeof codexHistorySidIsOwned === 'function'
-          ? codexHistorySidIsOwned(observed.cliSessionId, ownedRollouts)
-          : ownedRollouts.has(observed.cliSessionId));
-        if (observed && isOwned) nativeSessionId = observed.cliSessionId;
-      } else if (ownedRollouts && ownedRollouts.size > 1
-        && typeof codexBridgeRolloutPath === 'string'
-        && typeof codexBridgeQueue !== 'undefined' && codexBridgeQueue.peek().length > 0
-        && typeof codexGenerationSessionIdFromRolloutPath === 'function'
-        && typeof codexHistorySidIsOwned === 'function') {
-        const bridgeSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
-        if (bridgeSid && codexHistorySidIsOwned(bridgeSid, ownedRollouts)) nativeSessionId = bridgeSid;
+        if (observed && isOwnedSid(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+      } else if (ownedRollouts && ownedRollouts.size > 1) {
+        if (typeof codexBridgeRolloutPath === 'string'
+          && typeof codexBridgeQueue !== 'undefined' && codexBridgeQueue.peek().length > 0
+          && typeof codexGenerationSessionIdFromRolloutPath === 'function'
+          && typeof codexHistorySidIsOwned === 'function') {
+          const bridgeSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
+          if (bridgeSid && codexHistorySidIsOwned(bridgeSid, ownedRollouts)) nativeSessionId = bridgeSid;
+        }
+        const pinned = lastInitConfig.cliSessionId?.toLowerCase();
+        if (!nativeSessionId && pinned && isOwnedSid(pinned)) {
+          nativeSessionId = pinned;
+        }
       }
     } else if (!nativeSessionId && lastInitConfig?.cliId === 'grok' && typeof findGrokSessionByPid === 'function') {
       nativeSessionId = findGrokSessionByPid(childPid)?.sessionId;
@@ -3568,6 +3574,37 @@ function supportsPostSubmitRenameSessionTitle(cliId: string | undefined): boolea
   return cliId === 'traex';
 }
 let isPromptReady = false;
+/** Monotonic invalidation clock: a queued admission may restore only the
+ * readiness it cleared itself, never a later write, busy event or control. */
+let promptReadinessRevision = 0;
+
+function invalidatePromptReadinessEvidence(): void {
+  promptReadinessRevision++;
+}
+
+/** Track every physical write in a multi-step control input, including keys
+ * after an awaited pause. Read methods retain the original handle's receiver. */
+function readinessTrackedInput(input: PtyHandle): PtyHandle {
+  return new Proxy(input, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== 'function') return value;
+      if (property === 'write' || property === 'sendText'
+        || property === 'sendSpecialKeys' || property === 'pasteText') {
+        return (...args: unknown[]) => {
+          invalidatePromptReadinessEvidence();
+          return Reflect.apply(value, target, args);
+        };
+      }
+      return value.bind(target);
+    },
+  });
+}
+
+function revokePromptReadiness(): void {
+  invalidatePromptReadinessEvidence();
+  isPromptReady = false;
+}
 /** Prompt-ready edges published by markPromptReady(). A backend compares it with
  *  its spawn-time value to tell whether its CLI has shown a confirmed prompt yet. */
 let promptReadyEdges = 0;
@@ -5023,7 +5060,10 @@ async function sendRawCommandLineWithRecoveryFence(
       be,
       () => sendRawCommandLine(be, content, { turnId }),
       undefined,
-      beforeWrite,
+      () => {
+        invalidatePromptReadinessEvidence();
+        beforeWrite?.();
+      },
     );
     if (transaction.recoveryFailureReason) {
       throw new SubmissionWriteError(
@@ -5320,7 +5360,7 @@ async function runStartupCommands(): Promise<boolean> {
     startupCommandsInProgress = false;
   }
   // Commands consumed turns and reset idle; treat the first user prompt fresh.
-  isPromptReady = false;
+  revokePromptReadiness();
   idleDetector?.reset();
   return true;
 }
@@ -5871,7 +5911,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       acknowledgeActivation: !!msg.queuedActivationToken,
       hasFollowUp: !!onFollowUp,
       onAccepted: () => {
-        isPromptReady = false;
+        revokePromptReadiness();
         idleDetector?.reset({ inputCycle: true });
         log(`Passthrough slash command: ${msg.content}`);
       },
@@ -5885,7 +5925,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         activationToken: msg.queuedActivationToken!,
       }),
       onDurableFailure: () => {
-        isPromptReady = false;
+        revokePromptReadiness();
         log('Durable raw activation write rejected; retiring worker generation');
         void sendFatalWorkerErrorAndExit(
           new Error('durable raw activation was not accepted by the backend'),
@@ -7128,6 +7168,14 @@ function completeManagedTurnOriginRevocation(
   if (opts.revokePolicy) sandboxPolicyCapability = null;
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
+    const scope = typeof workerSessionEventScope !== 'undefined' ? workerSessionEventScope : undefined;
+    const binding = scope?.contextBinding() ?? scope?.currentBinding();
+    const execution = turnId
+      ? scope?.executionForTurn(turnId, dispatchAttempt)
+      : undefined;
+    const explicitOrigin = binding?.runtime
+      ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
+      : undefined;
     send({
       type: 'managed_turn_origin_revoked',
       sessionId,
@@ -7138,7 +7186,7 @@ function completeManagedTurnOriginRevocation(
         : {}),
       ...(turnId ? { turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    });
+    }, explicitOrigin);
   }
   unlinkManagedOriginCapabilityFiles();
 }
@@ -7734,7 +7782,7 @@ async function waitForCodexAppEngineRoot(
   codexAppSignedStateObserved = false;
   codexAppInputReady = false;
   codexAppReadyAuthority.beginWork();
-  isPromptReady = false;
+  revokePromptReadiness();
   idleDetector?.reset();
   if (!codexAppProofDeadline.armed) {
     codexAppProofDeadline.arm(() => {
@@ -16010,7 +16058,7 @@ function beginCliWriteCycle(): void {
   // terminal still settles it from the per-read drain.
   idleTranscriptSettle?.cancel();
   beginRuntimeWriteCycle({
-    setPromptReady: ready => { isPromptReady = ready; },
+    setPromptReady: ready => { if (ready) isPromptReady = true; else revokePromptReadiness(); },
     resetIdleDetector: () => { idleDetector?.reset({ inputCycle: true }); },
   });
   // Input is about to reach the CLI: the main agent's turn starts here, before
@@ -16919,9 +16967,11 @@ function exitTmuxScrollMode(): void {
 
 function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | boolean {
   if ('sendSpecialKeys' in target && TMUX_KEY_MAP[key]) {
+    invalidatePromptReadinessEvidence();
     return (target as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
   }
   if (PTY_SEQ_MAP[key]) {
+    invalidatePromptReadinessEvidence();
     target.write(PTY_SEQ_MAP[key]);
     return true;
   }
@@ -17370,7 +17420,7 @@ function preemptActiveTurnForNewMessage(
       if (pendingMessages[i].turnId === activeTurnId) pendingMessages.splice(i, 1);
     }
     emitTurnTerminal(activeTurnId, 'cancelled', 'preempted_by_user_message', dispatchAttempt);
-    isPromptReady = false;
+    revokePromptReadiness();
     idleDetector?.reset();
     tuiPromptBlocking = false;
   })();
@@ -17390,9 +17440,10 @@ async function handleTuiKeysDirect(
   isFinal: boolean,
 ): Promise<boolean> {
   if (keys.length === 0 || nativeSessionForkPending()) return false;
+  invalidatePromptReadinessEvidence();
   try {
     const delivered = await sendTuiKeySequence(
-      targetBackend,
+      readinessTrackedInput(targetBackend),
       keys,
       KEY_TO_ANSI,
       { isCurrent: () => backend === targetBackend && !nativeSessionForkPending() },
@@ -17408,8 +17459,9 @@ async function handleTuiKeysDirect(
 
   if (isFinal) {
     tuiPromptBlocking = false;
-    if (isPromptReady) {
-      isPromptReady = false;
+    const wasPromptReady = isPromptReady;
+    revokePromptReadiness();
+    if (wasPromptReady) {
       idleDetector?.reset();
     }
   }
@@ -17497,7 +17549,7 @@ async function flushPendingInjections(): Promise<void> {
       if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
@@ -17542,7 +17594,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
     const transaction = await runAmbiguousSubmissionTransaction(
       targetBackend,
       () => submitTuiTextInput({
-        target: strictInputHandle(targetBackend),
+        target: readinessTrackedInput(strictInputHandle(targetBackend)),
         keys,
         text,
         keyToAnsi: KEY_TO_ANSI,
@@ -17556,6 +17608,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
         },
       }),
       delivered => delivered,
+      invalidatePromptReadinessEvidence,
     );
     if (transaction.recoveryFailureReason) {
       throw new SubmissionWriteError(
@@ -17582,8 +17635,9 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
 
   // Clear blocking only after navigation and adapter submission both succeed.
   tuiPromptBlocking = false;
-  if (isPromptReady) {
-    isPromptReady = false;
+  const wasPromptReady = isPromptReady;
+  revokePromptReadiness();
+  if (wasPromptReady) {
     idleDetector?.reset();
   }
   return true;
@@ -17910,7 +17964,11 @@ async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void): 
   try {
     return await runAfterAmbiguousSubmissionWrites(
       target,
-      () => backend === target && write(adapterInputHandle(target)) !== false,
+      () => {
+        if (backend !== target) return false;
+        invalidatePromptReadinessEvidence();
+        return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+      },
     );
   } catch (err: any) {
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
@@ -18624,6 +18682,7 @@ function handleVisibleStartupInteraction(data: string): boolean {
   setTimeout(() => {
     if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
     try {
+      if (backend) invalidatePromptReadinessEvidence();
       if (backend && 'sendSpecialKeys' in backend) {
         (backend as any).sendSpecialKeys('Enter');
       } else {
@@ -19000,7 +19059,7 @@ async function handleTrustedCodexAppMarker(
       codexAppSignedStateObserved = false;
       codexAppInputReady = false;
       codexAppReadyAuthority.beginWork();
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       if (!codexAppProofDeadline.armed) {
         codexAppProofDeadline.arm(() => {
@@ -19036,7 +19095,7 @@ async function handleTrustedCodexAppMarker(
       renderer?.markNewTurn();
     }
     if (state.busy) {
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       if (codexAppInputReady) queueMicrotask(() => { void flushPending(); });
     } else {
@@ -19110,7 +19169,7 @@ async function handleTrustedCodexAppMarker(
         return false;
       }
       codexAppReadyAuthority.beginWork();
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
     }
     return true;
@@ -19649,7 +19708,7 @@ function armPostTerminalInputFence(): void {
     || currentPostTerminalInputFence()) return;
   postTerminalInputFence = { backend, generation: cliSpawnGeneration };
   const revokedPublishedReady = isPromptReady;
-  isPromptReady = false;
+  revokePromptReadiness();
   // The composer can redraw and go quiet BEFORE the terminal reaches the
   // rollout: screen-idle already published readiness, so the detector is idle
   // and the transcript's fireIdle() is a no-op, while the bridge poller only
@@ -21084,7 +21143,7 @@ function markPromptReady(): void {
       spawnArgvInitialPromptBusy = false;
       spawnArgvNeedsWorkingSeed = false;
       // Stay non-ready so the next genuine end-of-turn idle is a real edge.
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       // force: rate-limit banner must not rewrite synthetic working → limited
       publishScreenStatus('working', { force: true });
@@ -21109,7 +21168,7 @@ function markPromptReady(): void {
       // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
       // spawn-argv branch above) so the genuine end-of-turn idle after the
       // background work settles is still a real, re-fireable edge.
-      isPromptReady = false;
+      revokePromptReadiness();
       idleDetector?.reset();
       publishScreenStatus('working');
       log(`Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`);
@@ -21790,7 +21849,7 @@ async function detectBareShellLaunch(): Promise<boolean> {
   // Injection-first flushes can enter while isPromptReady is still true. Make
   // this a real busy/blocked transition so a later PTY-ready event re-enters
   // markPromptReady instead of being swallowed by its duplicate-ready guard.
-  isPromptReady = false;
+  revokePromptReadiness();
   idleDetector?.reset();
   log(trampolined
     ? `Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
@@ -21973,7 +22032,11 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
   const targetRenderer = renderer;
   const revision = backendScreenRevision;
   const gridRevision = observedPaneGridRevision;
+  const readinessRevision = promptReadinessRevision;
+  const webInputGeneration = webTerminalInputGeneration;
   const current = () => backend === target && cliSpawnGeneration === generation
+    && promptReadinessRevision === readinessRevision
+    && webTerminalInputGeneration === webInputGeneration
     && traexAutoModelController === controller && controller?.currentTurnId() === poolTurnId
     && controller?.currentModel() === poolModel && controller?.awaitingModelActivity() === awaitingActivity
     && currentBotmuxTurnId === turnId && pendingMessages[0] === item
@@ -22457,13 +22520,22 @@ async function flushPending(): Promise<void> {
       }
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       const admissionHead = pendingMessages[0]!;
+      const admissionBackend = backend;
+      const admissionGeneration = cliSpawnGeneration;
+      const admissionReadinessRevision = promptReadinessRevision;
+      const admissionWebInputGeneration = webTerminalInputGeneration;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(admissionHead))) {
-        // A continuation deadline or refusal can abandon the head while its
-        // viewport read is in flight. That refusal judged a removed input, not
-        // the screen: keep the readiness this flush found, or the independent
-        // successor waits for a composer edge a static replacement never paints.
-        if (pendingMessages[0] !== admissionHead) keepPromptReadyAfterHold();
+        // No input was written by this refusal. Restore the readiness that
+        // beginCliWriteCycle cleared, including when the same head is retained:
+        // otherwise the retry stops at the independent-turn reset gate and a
+        // static composer never produces the new idle edge it waits for. The
+        // retry still rechecks admission; never carry readiness to a replacement
+        // backend, generation, or a later input/busy cycle while capture was in flight.
+        if (backend === admissionBackend && cliSpawnGeneration === admissionGeneration
+          && promptReadinessRevision === admissionReadinessRevision
+          && webTerminalInputGeneration === admissionWebInputGeneration
+          && !cliRestartInProgress) keepPromptReadyAfterHold();
         break;
       }
       const continuation = pendingMessages[0]!.traexAutoModelContinuation;
@@ -23967,8 +24039,9 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
   detector.onBusy(bindSessionObservation(() => {
     // The CLI went back to work while an idle edge was still settling.
     idleTranscriptSettle?.cancel();
-    if (!isPromptReady) return;
-    isPromptReady = false;
+    const wasPromptReady = isPromptReady;
+    revokePromptReadiness();
+    if (!wasPromptReady) return;
     log(`Explicit busy marker detected — ${label}`);
     noteClaudeBridgeTurnStarted();
     publishScreenStatus('working', { force: true });
@@ -24777,7 +24850,7 @@ async function spawnCliBody(
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     }));
@@ -24838,7 +24911,7 @@ async function spawnCliBody(
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     }));
@@ -24902,7 +24975,7 @@ async function spawnCliBody(
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
     }));
@@ -30473,7 +30546,7 @@ async function spawnCliBody(
         });
       } else if (status === 'working') {
         transcriptSettle.cancel();
-        isPromptReady = false;
+        revokePromptReadiness();
         idleDetector?.reset();
       }
     }));
@@ -30698,7 +30771,7 @@ async function spawnCliBody(
     });
     if (codexAutoUpgrade) {
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       if (codexAutoUpgrade.stage === 'restoring') {
         codexAutoUpgrade.reject?.(new Error(`Replacement Codex exited before readiness (${code ?? signal})`));
       }
@@ -30869,7 +30942,7 @@ async function spawnCliBody(
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
     }
     backend = null;
-    isPromptReady = false;
+    revokePromptReadiness();
     setCaptureIdentity(undefined, undefined);
     currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
@@ -31311,7 +31384,7 @@ function killCli(opts: {
     sandboxCleanup = null;
   }
   sandboxTreeOutlivesWorker = false;
-  isPromptReady = false;
+  revokePromptReadiness();
   forceClearSessionRenameInFlight();
   if (!opts.preservePending) {
     pendingMessages.length = 0;
@@ -37208,8 +37281,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'prompt_submitted': {
-      if (isPromptReady) {
-        isPromptReady = false;
+      const wasPromptReady = isPromptReady;
+      revokePromptReadiness();
+      if (wasPromptReady) {
         idleDetector?.reset();
         log('User prompt submitted via hook — publishing working state');
         // Web 终端/沙箱 hook 直提路径无 managed turn；显式 clearTurnId 避免携带
@@ -37693,7 +37767,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       } catch { /* best-effort */ }
       stopOwnedSessionScope('suspend');
       backend = null;
-      isPromptReady = false;
+      revokePromptReadiness();
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
       // outbox + pre-created deny-mask mountpoints) intact across the suspension
       // (on resume, prepareDirectSandbox re-binds over the SAME tree). So we stop

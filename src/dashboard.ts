@@ -135,6 +135,8 @@ import {
   sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleUsageAnalyticsApi } from './dashboard/usage-analytics-api.js';
+import { createUsageAnalytics } from './services/usage-analytics.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
 import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
 import { handleFeedbackExtensionApi } from './dashboard/feedback-extension-api.js';
@@ -459,6 +461,7 @@ const dashboardAutostart = createDashboardAutostartController({
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const queryDashboardUsage = createUsageAnalytics();
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
@@ -1307,11 +1310,12 @@ interface ResolvedDashboardSettings {
   noVisibleOutputHint: boolean;
   /** Experimental cross-principal turn isolation (XPI). Default OFF. */
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation: the two default-off switches and the
-   *  host bot grants. Private for anonymous read-only viewers. */
+  /** Schedule delegation switches and host bot grants. Private for anonymous
+   *  read-only viewers. */
   scheduleBotGrants: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     /** Hand-edited entries the reader dropped; a save would not keep them. */
     ignoredCount: number;
@@ -1974,6 +1978,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     scheduleBotGrants: {
       createEnabled: global.scheduleDelegation?.createEnabled === true, // default OFF
       selfManageEnabled: global.scheduleDelegation?.selfManageEnabled === true, // default OFF
+      childOneShotEnabled: global.scheduleDelegation?.childOneShotEnabled === true, // default OFF
       grants: global.scheduleDelegation?.botGrants ?? [],
       ignoredCount: ignoredScheduleBotGrantCount(),
       botOptions: scheduleBotGrantBotOptions(),
@@ -4720,6 +4725,8 @@ const server = createServer(async (req, res) => {
       }
       return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
     }
+
+    if (await handleUsageAnalyticsApi(req, res, url, { canManageHost: authed, query: queryDashboardUsage })) return;
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
       await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });

@@ -35,6 +35,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       'settings.codexNotifier',
       'settings.noVisibleOutputHint',
       'settings.crossPrincipalInterruption',
+      'settings.scheduleChildOneShot',
       'settings.scheduleDelegationCreate',
       'settings.scheduleDelegationSelfManage',
       'settings.scheduleBotGrants',

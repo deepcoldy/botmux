@@ -24,6 +24,7 @@ import { toast } from './toast.js';
 import { botDefaultsHref } from './bot-defaults.js';
 import {
   BoardRequestError,
+  closeBoardItemInChat,
   boardFileUrl,
   fetchBoardItem,
   fetchBoardItems,
@@ -66,6 +67,7 @@ import {
   checkBoardImages,
   draftFromServer,
   draftNeedsReview,
+  isBoardItemEnded,
   isDraftEmpty,
   itemChatView,
   knownHint,
@@ -466,14 +468,16 @@ export function SubmitDialog(props: {
         {candidates.length === 0 ? <p className="dboard-empty-line">{tr('decisionBoard.submitDialogEmpty')}</p> : (
           <ul className="dboard-submit-list">
             {candidates.map(c => {
-              const checked = !excluded.has(c.seq);
+              // 已结束的项上留下的草稿：列出来让人知道，但不能勾选提交（服务端会拒掉整批）。
+              const ended = isBoardItemEnded(c.state);
+              const checked = !excluded.has(c.seq) && !ended;
               return (
                 <li key={c.seq} className={checked ? undefined : 'is-excluded'}>
                   <label>
                     <input
                       type="checkbox"
                       checked={checked}
-                      disabled={phase === 'submitting'}
+                      disabled={phase === 'submitting' || ended}
                       onChange={event => {
                         const on = event.currentTarget.checked;
                         setExcluded(current => {
@@ -487,7 +491,8 @@ export function SubmitDialog(props: {
                       <span className="dboard-submit-item-head">
                         <span className="dboard-seq">#{c.seq}</span>
                         <strong>{c.title}</strong>
-                        {c.stale ? <span className="dboard-flag-warn">{tr('decisionBoard.staleRow')}</span> : null}
+                        {ended ? <span className="dboard-flag-warn">{tr('decisionBoard.endedRow')}</span>
+                          : c.stale ? <span className="dboard-flag-warn">{tr('decisionBoard.staleRow')}</span> : null}
                       </span>
                       <span className="dboard-submit-item-choice">
                         {c.choice
@@ -599,7 +604,58 @@ function BatchList(props: { appId: string; batches: BoardBatch[]; now: number; o
 
 // ─── 汇总页 ─────────────────────────────────────────────────────────────────
 
-function BoardRow(props: { appId: string; item: BoardListResponse['items'][number]; now: number }) {
+/** 待拍板 / 待验收的事项 owner 可以直接关闭（不生成决定）。 */
+function closableInChat(state: BoardState): boolean {
+  return state === 'decide' || state === 'accept';
+}
+
+function CloseInChatButton(props: {
+  appId: string; item: Pick<BoardItem, 'seq' | 'rev' | 'state'>; disabled?: boolean;
+  beforeClose?(): Promise<unknown>; onChanged(): void;
+}) {
+  const tr = useT();
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [error, setError] = useState('');
+  if (!closableInChat(props.item.state)) return null;
+  async function closeOnly(): Promise<void> {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      // Settle autosave before clearing this item's draft; never submit it.
+      await props.beforeClose?.();
+      await closeBoardItemInChat(props.appId, props.item.seq, props.item.rev);
+      setOpen(false);
+      props.onChanged();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+  return <>
+    <button type="button" className="dboard-text-btn" disabled={props.disabled || busy}
+      data-action="close-in-chat" onClick={() => setOpen(true)}>{tr('decisionBoard.closeInChat')}</button>
+    <ModalDialog open={open} className="confirm-modal-dialog" aria-label={tr('decisionBoard.closeInChatTitle')}
+      backdropClose={!busy} onRequestClose={() => { if (!busy) setOpen(false); }}>
+      <div className="confirm-modal-card">
+        <h3 className="confirm-modal-title">{tr('decisionBoard.closeInChatTitle')}</h3>
+        <p className="confirm-modal-message">{tr('decisionBoard.closeInChatBody')}</p>
+        {error ? <p className="confirm-modal-message dboard-error-line" role="alert">{error}</p> : null}
+        <div className="confirm-modal-footer">
+          <button type="button" className="btn-cancel" disabled={busy} onClick={() => setOpen(false)}>{tr('decisionBoard.cancel')}</button>
+          <button type="button" className="btn-danger" disabled={busy} data-action="confirm-close-in-chat" onClick={() => void closeOnly()}>{tr('decisionBoard.closeInChatConfirm')}</button>
+        </div>
+      </div>
+    </ModalDialog>
+  </>;
+}
+
+function BoardRow(props: { appId: string; item: BoardListResponse['items'][number]; now: number; onChanged(): void }) {
   const tr = useT();
   const { item } = props;
   const asking = item.state === 'decide' || item.state === 'accept';
@@ -615,6 +671,7 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
             <span className="dboard-seq">#{item.seq}</span>
             <strong>{item.title}</strong>
           </span>
+          {item.state === 'closed' ? <span className="dboard-row-ask">{tr('decisionBoard.closeInChatDone')}</span> : null}
           {asking && (question || item.recommend) ? (
             <span className="dboard-row-ask">
               {question ? <>{tr('decisionBoard.askShort')}{question}</> : null}
@@ -637,6 +694,7 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
         </span>
       </a>
       <span className="dboard-row-join">
+        <CloseInChatButton appId={props.appId} item={item} onChanged={props.onChanged} />
         {chat.primary ? <JoinChatLink link={chat.primary} className="dboard-join-btn">{tr('decisionBoard.joinChat')}</JoinChatLink> : null}
       </span>
     </li>
@@ -806,7 +864,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
           {list ? (
             items.length ? (
               <ul className={`dboard-list${listLoading ? ' is-loading' : ''}`}>
-                {items.map(item => <BoardRow key={item.seq} appId={activeAppId} item={item} now={now} />)}
+                {items.map(item => <BoardRow key={item.seq} appId={activeAppId} item={item} now={now} onChanged={() => setReloadTick(n => n + 1)} />)}
               </ul>
             ) : (
               <p className="dboard-empty-line">
@@ -1340,7 +1398,8 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
 
   const { item } = detail;
   const now = Date.now();
-  const hasAsk = !!item.question?.trim() || item.options.length > 0;
+  const ended = isBoardItemEnded(item.state);
+  const hasAsk = !ended && (!!item.question?.trim() || item.options.length > 0);
   const ownDraft = !!editor.saved || !isDraftEmpty(editor.draft);
   const scope = submitScope(detail.drafts, seq, ownDraft);
   const stale = draftNeedsReview(editor.saved, item);
@@ -1366,6 +1425,14 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
+      {/* 包一层块容器：.page 是 grid，按钮直接做格子会被拉满整行（文字居中、整行都能点到）。 */}
+      {closableInChat(item.state) ? (
+        <div>
+          <CloseInChatButton appId={appId} item={item} disabled={uploads.length > 0}
+            beforeClose={() => editor.flush()} onChanged={() => { editor.reset(null); void load({ resetDraft: true }); }} />
+        </div>
+      ) : null}
+      {item.state === 'closed' ? <p className="dboard-detail-meta" role="status">{tr('decisionBoard.closeInChatDone')}</p> : null}
       <HintBanner hint={item.hint} />
       <TaskHintChip hint={detail.taskHint} banner />
       <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />
@@ -1410,7 +1477,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         </section>
       ) : null}
 
-      <section className="dboard-block dboard-decision">
+      {!ended ? <section className="dboard-block dboard-decision">
         <h2 className="dboard-block-title">
           {tr('decisionBoard.decisionTitle')}
           <small>{tr('decisionBoard.decisionHint')}</small>
@@ -1500,7 +1567,25 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
           </div>
         </div>
         <ItemNav neighbors={neighbors} busy={navigating} onGo={target => void goTo(target)} placement="bottom" />
-      </section>
+      </section> : null}
+
+      {ended && ownDraft ? (
+        // 管家改成已完成 / 已关闭时不清草稿：这份草稿不能再提交，也不能再改，只给看和清空，
+        // 否则它会一直算在「提交 N 项」里，且在详情页上清不掉。
+        <section className="dboard-block dboard-decision" data-ended-draft="">
+          <h2 className="dboard-block-title">{tr('decisionBoard.decisionTitle')}</h2>
+          <p className="dboard-warn">{tr('decisionBoard.endedDraft')}</p>
+          {editor.draft.choice ? <p>{tr('decisionBoard.choiceLabel', { key: editor.draft.choice })}</p> : null}
+          {editor.draft.text.trim() ? <p className="dboard-submit-item-text">{editor.draft.text}</p> : null}
+          {editor.draft.fileIds.length ? <p className="dboard-muted">{tr('decisionBoard.imagesN', { n: editor.draft.fileIds.length })}</p> : null}
+          <div className="dboard-decision-foot">
+            <SaveStatus editor={editor} />
+            <div className="dboard-decision-actions">
+              <button type="button" data-action="clear-ended-draft" onClick={() => void clearDraft()}>{tr('decisionBoard.clearDraft')}</button>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       <section className="dboard-block dboard-history">
         <h2 className="dboard-block-title">{tr('decisionBoard.historyTitle')}</h2>

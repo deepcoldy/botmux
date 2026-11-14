@@ -9169,6 +9169,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (rest.includes('--calendar-day-type') && !calendarDayType) throw new Error('--calendar-day-type requires workday or restday');
     const { normalizeCalendarDayType } = await import('./services/work-calendar.js');
     const normalizedDayType = normalizeCalendarDayType(calendarDayType);
+    // Do not manufacture a work-calendar option when the caller supplied no
+    // calendar flags. `normalizeCalendarDayType(undefined)` returns the runtime
+    // default (`workday`), but serializing that default makes a plain `--topic`
+    // child look like it requested calendar expansion at the daemon boundary.
+    // Keep an explicitly supplied day type so the daemon can still reject an
+    // invalid `--calendar-day-type restday` without a calendar.
+    const scheduleCalendarFields = {
+      ...(calendar !== undefined ? { calendar } : {}),
+      ...(calendar !== undefined || calendarDayType !== undefined
+        ? { calendarDayType: normalizedDayType }
+        : {}),
+    };
     const model = argValue(rest, '--model')?.trim();
     if (rest.includes('--model') && !model) {
       console.error('--model 需要一个模型 id，例如 --model gpt-5.6-sol。');
@@ -9292,8 +9304,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               silent,
               model,
               reasoningEffort,
-              calendar,
-              calendarDayType: normalizedDayType,
+              ...scheduleCalendarFields,
               ...(wantsFollowActive ? { followActive: true } : {}),
               ...(topicTitle ? { topicTitle } : {}),
               ...untilDoneFields,
@@ -9307,8 +9318,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         if (response) {
           const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
           if (!response.ok || body.ok !== true || !body.task) {
+            const daemonMessage = scheduleIpcErrorMessage(body.error);
+            // A live owning daemon can make a more specific, authority-backed
+            // decision than the CLI's preliminary creator probe. Preserve the
+            // probe error only for unrecognized / legacy daemon responses; in
+            // particular, a delegated child must surface the explicit
+            // no-grandchildren or per-turn quota refusal.
+            if (daemonMessage) throw new Error(daemonMessage);
             if (creatorAuthError) throw creatorAuthError;
-            throw new Error(scheduleIpcErrorMessage(body.error) ?? body.detail ?? body.error ?? `HTTP ${response.status}`);
+            throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
           }
           task = body.task;
         }
@@ -9326,8 +9344,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
             executionPosition, larkAppId, silent, model, reasoningEffort,
             deliver,
-            calendar,
-            calendarDayType: normalizedDayType,
+            ...scheduleCalendarFields,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
             ...(runAs ? { runAs } : {}),

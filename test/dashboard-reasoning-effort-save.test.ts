@@ -48,7 +48,7 @@ async function renderStored(): Promise<void> {
       bot: { ...bot, agentSelectionKey: bot.cliId } as BotDefaultsRow,
       sessionFallback: bot.cliId!,
       cliState: {
-        options: [{ id: bot.cliId!, label: bot.cliId!, modelChoices: [flash, 'minimax/MiniMax-M3'] }],
+        options: [{ id: bot.cliId!, label: bot.cliId!, modelChoices: [bot.model!, flash, 'minimax/MiniMax-M3'] }],
         ttadkModelDefault: '',
         ttadkModelSuggestions: [],
       },
@@ -112,6 +112,7 @@ describe('Dashboard reasoning effort save and reload', () => {
     ['minimax', `${flash}#thinking`],
     ['zcode', 'grok-4.6'],
     ['remote-runner', 'gpt-6-astra'],
+    ['doubao', 'GPT-6.1 Sol'],
   ])('preserves an untouched %s effort through the real save handler (%s)', async (cliId, model) => {
     await setup(cliId, model, 'high');
     await save();
@@ -132,6 +133,24 @@ describe('Dashboard reasoning effort save and reload', () => {
     expect(stored().reasoningEffort).toBe('max');
     await renderStored();
     expect(effortPicker().props.value).toBe('max');
+    act(() => effortPicker().props.onChange(''));
+    await save();
+    expect(stored()).not.toHaveProperty('reasoningEffort');
+    expect(loadBotConfigs()[0]!.reasoningEffort).toBeUndefined();
+  });
+
+  it('saves Doubao max to disk, reloads it and preserves it on an unchanged save', async () => {
+    await setup('doubao', 'GPT-6.1 Sol');
+    expect(effortPicker().props.options.map((option: { value: string }) => option.value))
+      .toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+    act(() => effortPicker().props.onChange('max'));
+    await save();
+    expect(stored()).toMatchObject({ cliId: 'doubao', model: 'GPT-6.1 Sol', reasoningEffort: 'max' });
+    expect(loadBotConfigs()[0]).toMatchObject({ model: 'GPT-6.1 Sol', reasoningEffort: 'max' });
+    await renderStored();
+    expect(effortPicker().props.value).toBe('max');
+    await save();
+    expect(stored().reasoningEffort).toBe('max');
     act(() => effortPicker().props.onChange(''));
     await save();
     expect(stored()).not.toHaveProperty('reasoningEffort');

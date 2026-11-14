@@ -426,6 +426,24 @@ BotMux first confirms the result was delivered, then deletes the current task. I
 
 The authoritative task records live in a host-side SQLite database; `schedules.json` is only a rebuildable copy, and hand-adding records there won't make a task run. So every write goes to the owning bot's daemon. If the daemon is unavailable the command fails loudly, instead of editing only the JSON and leaving a task that never runs.
 
+## Advanced: one-shot child tasks from scheduled runs
+
+Some two-stage workflows need a later same-day check, such as collecting data overnight and reviewing unfinished items at 18:00. An administrator can enable **Scheduled one-shot child tasks** under **Global Settings → Experimental**, or configure:
+
+```json
+{
+  "scheduleDelegation": {
+    "childOneShotEnabled": true,
+    "childOneShotMaxDelayMinutes": 1440,
+    "childOneShotMaxTasksPerTurn": 1
+  }
+}
+```
+
+An authenticated scheduled turn may then use the ordinary `botmux schedule add <future-time> <prompt> --topic` command. Authority is limited to the same bot, chat, current topic and exact working directory. Only `once` schedules are accepted; the defaults are within 24 hours and one child per turn. `childOneShotMaxDelayMinutes` is capped at 7 days and `childOneShotMaxTasksPerTurn` at 16.
+
+The parent must be a human-created direct task (or its migrated equivalent), and its controller must still be a bot administrator and chat member. The child runs with anonymous tool authority: it persists no `lark-cli` / `bytedcli` scopes, cannot self-manage, and cannot create descendants. The target bot must enable `triggerUserAuth` isolation for both `lark-cli` and `bytedcli`, preventing a reused topic session from inheriting stale credentials. Retrying the same request returns the original task without consuming another slot; deleting a task does not return the turn quota.
+
 ## Advanced: cross-bot delegated creation
 
 When a human explicitly asks Bot A, in the current turn, to have Bot B create a scheduled task, A must request the capability on the managed dispatch:
@@ -456,10 +474,13 @@ The host must also turn it on in `~/.botmux/config.json` (off by default):
 | `maxTasksPerTurn` | Max tasks per dispatch turn; default 64, max 1024 |
 | `runScopes` | Personal credentials a delegated task may reuse on later runs; currently only `bytedcli`; empty by default |
 | `selfManageEnabled` | Whether delegated tasks may pause/remove themselves from their own runs; off by default |
+| `childOneShotEnabled` | Allow a scheduled turn to create a scoped one-shot child in its current topic; off by default |
+| `childOneShotMaxDelayMinutes` | Maximum child delay; default 1440 minutes, max 10080 |
+| `childOneShotMaxTasksPerTurn` | Maximum distinct children per scheduled turn; default 1, max 16 |
 | `defaultOnDispatchFromBotAppIds` | Managed dispatches from these source bots request `schedule:create` by default; opt out per dispatch with `--no-delegate schedule:create` |
 | `botGrants` | Bot scheduling grants: pre-authorize by "source bot + target bots + chats", so dispatches not triggered by an admin can still create tasks on behalf of a "controller admin"; requires `createEnabled` |
 
-These are also editable in the Dashboard under **Global Settings → Experimental** (**Cross-bot delegated scheduled tasks**, **Delegated task self-management**, **Bot scheduling grants**).
+The switches are also editable in the Dashboard under **Global Settings → Experimental**; advanced numeric limits are configured in `config.json`.
 
 With `runScopes`, both the source and target bots must enable `triggerUserAuth`, and the target bot must route both `lark-cli` and `bytedcli` through identity isolation:
 

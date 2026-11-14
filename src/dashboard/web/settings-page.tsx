@@ -96,10 +96,11 @@ interface DashboardSettings {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
-  /** scheduleDelegation.createEnabled / selfManageEnabled / botGrants. */
+  /** scheduleDelegation switches / botGrants. */
   scheduleBotGrants: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     ignoredCount: number;
     botOptions: ScheduleBotGrantBotOption[];
@@ -275,6 +276,7 @@ function parseSettings(s: any): DashboardSettings {
     scheduleBotGrants: {
       createEnabled: s?.scheduleBotGrants?.createEnabled === true,
       selfManageEnabled: s?.scheduleBotGrants?.selfManageEnabled === true,
+      childOneShotEnabled: s?.scheduleBotGrants?.childOneShotEnabled === true,
       grants: Array.isArray(s?.scheduleBotGrants?.grants) ? s.scheduleBotGrants.grants : [],
       ignoredCount: Number.isSafeInteger(s?.scheduleBotGrants?.ignoredCount)
         ? Math.max(0, s.scheduleBotGrants.ignoredCount)
@@ -874,7 +876,8 @@ function SettingsPage() {
   );
 }
 
-type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>;
+type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'],
+  'createEnabled' | 'selfManageEnabled' | 'childOneShotEnabled' | 'grants'>>;
 
 /** PUT body for the bot-grant entry. A list write names the list it was edited
  *  from, so the server can refuse it (and the page re-reads) when that is no
@@ -1132,6 +1135,14 @@ export function SettingsBody(props: {
             checked={settings.crossPrincipalInterruption}
             disabled={dis || savingKey === 'crossPrincipalInterruption'}
             onChange={value => saveBoolean('crossPrincipalInterruption', value)}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleChildOneShot')}
+            dataAction="toggle-schedule-child-one-shot"
+            help={tr('settings.scheduleChildOneShotHelp')}
+            checked={settings.scheduleBotGrants.childOneShotEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ childOneShotEnabled: value }); }}
           />
           <ToggleRow
             title={tr('settings.scheduleDelegationCreate')}

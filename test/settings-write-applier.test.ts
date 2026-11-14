@@ -1228,10 +1228,12 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it('writes the switches and the whole grant list through the bot-grant writer', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ scheduleBotGrants: {
-      createEnabled: true, selfManageEnabled: false, grants: [grant], baseGrants: [] } }, deps);
+      createEnabled: true, selfManageEnabled: false, childOneShotEnabled: true,
+      grants: [grant], baseGrants: [] } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({
-      createEnabled: true, selfManageEnabled: false, botGrants: [grant] });
+      createEnabled: true, selfManageEnabled: false, childOneShotEnabled: true,
+      botGrants: [grant] });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -1244,6 +1246,7 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it.each([
     [{ createEnabled: 'yes' }, 'invalid_scheduleBotGrants_createEnabled'],
     [{ selfManageEnabled: 1 }, 'invalid_scheduleBotGrants_selfManageEnabled'],
+    [{ childOneShotEnabled: 'yes' }, 'invalid_scheduleBotGrants_childOneShotEnabled'],
     [{}, 'invalid_scheduleBotGrants'],
     [{ grants: 'team' }, 'invalid_scheduleBotGrants_grant'],
     // An app-scoped open_id is never a cross-app controller identity.

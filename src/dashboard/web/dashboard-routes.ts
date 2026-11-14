@@ -115,6 +115,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),
   pageRoute('monitor-room', '#/monitor-room', () => import('./monitor-room.js'), 'renderMonitorRoomPage', true),
   pageRoute('insights', '#/insights', () => import('./insights-page.js'), 'renderInsightsPage'),
+  pageRoute('usage', '#/usage', () => import('./usage-page.js'), 'renderUsagePage'),
   pageRoute('feedback', '#/feedback', () => import('./feedback-page.js'), 'renderFeedbackPage'),
   pageRoute('terminal', '#/terminal', () => import('./terminal-page.js'), 'renderTerminalPage'),
 ];
