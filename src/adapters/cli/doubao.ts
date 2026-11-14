@@ -10,15 +10,16 @@ import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { doubaoTrajectoryPathForSession, drainDoubaoTranscript } from '../../services/doubao-transcript.js';
 
 import { delay } from '../../utils/timing.js';
+import { DOUBAO_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 
 /** Doubao session ids are decimal snowflakes (`38450922917357570`). `--resume`
  *  with anything else fails at the IM layer (`Invalid request parameters` /
  *  `IM request failed`), so only this shape is ever passed through. */
 const DOUBAO_SESSION_ID = /^\d{10,24}$/;
 
-/** `--effort` values accepted by doubao 2.31 (`none|minimal|low|medium|high|xhigh|max`).
+/** `--effort` values accepted by doubao 2.36 (`none|minimal|low|medium|high|xhigh|max`).
  *  botmux's `ultra` has no equivalent and is dropped rather than failing the launch. */
-const DOUBAO_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const DOUBAO_EFFORTS = new Set(DOUBAO_REASONING_EFFORTS);
 
 /**
  * Busy footer drawn directly above the composer while a turn runs:

@@ -81,6 +81,15 @@ describe('doubao buildArgs', () => {
     expect(adapter.resumeRequiresCliSessionId).toBe(true);
   });
 
+  it('passes GPT-6.1 Sol and max on both fresh launch and precise cold resume', () => {
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    const options = { sessionId: 's', disableCliBypass: true, model: 'GPT-6.1 Sol', reasoningEffort: 'max' as const };
+    expect(adapter.buildArgs({ ...options, resume: false }))
+      .toEqual(['--model', 'GPT-6.1 Sol', '--effort', 'max']);
+    expect(adapter.buildArgs({ ...options, resume: true, resumeSessionId: SID }))
+      .toEqual(['--model', 'GPT-6.1 Sol', '--effort', 'max', '--resume', SID]);
+  });
+
   it('prints a local resume command only for a native id', () => {
     const adapter = createDoubaoAdapter('/bin/doubao');
     expect(adapter.buildResumeCommand?.({ sessionId: 's', cliSessionId: SID })).toBe(`doubao --resume ${SID}`);

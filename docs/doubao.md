@@ -160,7 +160,7 @@ JSON
 - **模型启动报错**：在原生 `/model` 确认可用显示名；移除 `model` 验证默认模型。自动模型探测失败时可能退回静态候选，候选不代表账号一定有权限。
 - **终端答完但 HTTP 没结果**：检查是不是旧 Botmux 构建，原生日志是否可读、Session ID 是否捕获、CLI 是否改变了落盘格式。不要通过手工改写日志来伪造完成。
 - **无法恢复**：核对账号、原生记录与 ID；换机器/换 HOME/删记录后不保证恢复。新建会话比猜测其他会话 ID 更安全。
-- **思考等级**：适配器内部接受 `low/medium/high/xhigh/max`，但当前 Bot 配置加载和 `/effort` 能力登记未开放 Doubao；不要依赖 `bots.json.reasoningEffort` 生效。`ultra` 无映射，原生 `none/minimal` 也未暴露为 Bot 配置选项。
+- **思考等级**：Bot 默认思考强度（Dashboard「Agent 配置」或 `bots.json.reasoningEffort`）和话题指令头 `/t /effort <档位>` 支持 `low/medium/high/xhigh/max`，新会话启动时以 `--effort` 传给 Doubao CLI。档位不区分模型，实际效果由所选模型决定。`ultra` 没有对应档位，写了会被忽略；原生 `none/minimal` 也不作为 Bot 配置选项。
 - **停止后没收到回答 / 回答串到下一轮**：经卡片 ⏹ 或 `/stop` 停止时，与打断几乎同时写出的迟到终态不会补发，可在 Web 终端查看或重新提问，不属于丢消息。若是用 **Web 终端物理 Esc**、或在**轮次运行中按卡片 Esc 快捷键**打断后出现回答错位（这两个按键不经过 Botmux 停止通道），请在**发送下一条消息之前**补点一次卡片 ⏹ 或发 `/stop` 对齐队列；若已经发出下一条消息，就不要再补点（会结算到新轮），直接继续对话即可。
 - **未声明支持**：既有终端 `/adopt` 的 Doubao 专用转写桥接、会话 fork、纯模型零工具（model-only）接口，以及所有原生审批/异常终态。原生 `-p` 会运行 Agent，不等于 model-only。
 - **验证范围**：已实测 macOS 的 PTY/tmux 输入、Esc 打断、精确恢复、真实 worker IPC 和 core-only HTTP 最终回复/重启续聊。Linux 路径逻辑有覆盖，但 Linux 原生运行与 bwrap 文件沙箱未实机验收；飞书客户端实际卡片/点击体验不能由本机 HTTP 测试替代。
