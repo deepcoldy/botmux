@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { policyFromConfig, resolveIdentity } from '../src/core/identity-policy.js';
 import { backgroundCredentialPolicyKey } from '../src/core/background-execution-policy.js';
+import { t } from '../src/i18n/index.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import {
   renderIdentityWrapper, writeSessionIdentity, prepareTriggerUserCliEnv, sessionIdentityBinDir,
@@ -36,24 +37,19 @@ describe('policyFromConfig', () => {
 });
 
 describe('resolveIdentity credential-source table', () => {
-  // [source, platformBound, platformGrant, localLogin] => decision
-  const MATRIX: Array<[TriggerUserAuthCredentialSource, boolean, boolean | 'unavailable', boolean, object]> = [
+  // [source, platformBound, platformGrant, localLogin] => decision; `local` is never bound.
+  const MATRIX: Array<[TriggerUserAuthCredentialSource, boolean, boolean, boolean, object]> = [
     ['local', false, false, true, { kind: 'person', source: 'local' }],
     ['local', false, false, false, { kind: 'needs-auth', entry: 'private-link' }],
-    // `local` never consults the platform, even when a grant would exist.
-    ['local', true, true, false, { kind: 'needs-auth', entry: 'platform-page' }],
     ['auto', false, false, true, { kind: 'person', source: 'local' }],
     ['auto', false, false, false, { kind: 'needs-auth', entry: 'private-link' }],
     ['auto', true, true, true, { kind: 'person', source: 'platform' }],
     ['auto', true, true, false, { kind: 'person', source: 'platform' }],
     ['auto', true, false, true, { kind: 'needs-auth', entry: 'platform-page' }],
-    ['auto', true, 'unavailable', true, { kind: 'needs-auth', entry: 'platform-page' }],
     ['auto', true, false, false, { kind: 'needs-auth', entry: 'platform-page' }],
-    ['auto', true, 'unavailable', false, { kind: 'needs-auth', entry: 'platform-page' }],
     ['platform', false, false, true, { kind: 'needs-auth', entry: 'platform-page' }],
     ['platform', true, true, false, { kind: 'person', source: 'platform' }],
     ['platform', true, false, true, { kind: 'needs-auth', entry: 'platform-page' }],
-    ['platform', true, 'unavailable', true, { kind: 'needs-auth', entry: 'platform-page' }],
   ];
 
   it('follows the table', () => {
@@ -164,6 +160,27 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
     expect(r.out).toBe('');
   });
 
+  it('bytecloud off, meego on: the browser-session login saves into the HOME the meego calls use', () => {
+    publishPerson({ cloudJwt: '', meegoOnly: true });
+    writeFileSync(join(meegoHome(), '.meegle', 'credentials.enc'), 'x');
+    const wrapper = bytedcliWrapper({ bytecloud: true });
+    const login = run(wrapper, ['auth', 'login', '--session', '--feishu']);
+    const meego = run(wrapper, ['meego', 'workitem', 'list']);
+    expect(login.status).toBe(0);
+    expect(login.out).toContain(`HOME=${personHome()} `);
+    expect(login.out).toContain('ARGS=auth login --session --feishu');
+    expect(meego.out).toContain(`HOME=${personHome()} `);
+    expect(run(wrapper, ['auth', 'status']).out).toBe(native('auth status'));
+  });
+
+  it('bytecloud off, meego on: an unattended browser-session login is refused without running', () => {
+    publishPerson({ cloudJwt: '', meegoOnly: true, turnId: 'schedule:abc:11111111-1111-1111-1111-111111111111' });
+    const r = run(bytedcliWrapper({ bytecloud: true }), ['auth', 'login', '--session-method', 'feishu']);
+    expect(r.status).toBe(77);
+    expect(r.out).toBe('');
+    expect(r.err).toContain('无人值守');
+  });
+
   describe.each(['bitscli', 'bits-cli'])('%s', name => {
     const bitsProbe = `printf "HOME=%s AIME=%s CLOUD=%s CODE=%s AMBIENT=%s ARGS=%s" "$HOME" "\${AIME_USER_CLOUD_JWT:-}" "\${CLOUD_JWT:-}" "\${CODEBASE_CLI_USER_JWT:-}" "\${BITS_TOKEN:-}\${USER_CLOUD_JWT:-}\${AGENTBUDDY_USER_CLOUD_JWT:-}\${FLUX_USER_JWT:-}\${BYTECLOUD_CLI_API_JWT_TOKEN_CN:-}\${CLOUD_JWT_CREATED_AT:-}\${CODEBASE_CLI_USER_PAT:-}\${CODEBASE_CLI_APP_ID:-}\${CODEBASE_CLI_APP_SECRET:-}" "$*"`;
     const install = () => {
@@ -220,7 +237,8 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
     // The wrapper path is shared, so each call installs the variant it needs.
     const meegoNative = (args: string[]) => run(bytedcliWrapper({ meego: true }), args);
     const byteCloudNative = (args: string[]) => run(bytedcliWrapper({ bytecloud: true }), args);
-    for (const lead of [['-dj'], ['--color'], ['--tls1.2'], ['--no-auto-upgrade'], ['--http-trace-file', 'meego'], ['--http-proxy', 'x', '--no-color'], ['--']]) {
+    for (const lead of [['-dj'], ['--color'], ['--tls1.2'], ['--no-auto-upgrade'], ['--http-trace-file', 'meego'], ['--http-proxy', 'x', '--no-color'], ['--'],
+      ['--cloud-site', 'cn'], ['--ai-auth-subject', 'x'], ['--ai-auth-app-key', 'x']]) {
       // meego off: a meego call is native however it is written.
       const m = [...lead, 'meego', 'workitem'];
       if (lead[0] !== '--http-trace-file') expect(meegoNative(m).out).toBe(native(m.join(' ')));
@@ -411,6 +429,82 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
       expect(r.status).toBe(77);
       expect(r.out).toBe('');
       expect(botmuxCalls()).toContain('auth request --provider bytedcli');
+    });
+
+    describe('a help flag that is the value of an option before it cannot hide a login', () => {
+      const unattended = { turnId: 'schedule:abc:11111111-1111-1111-1111-111111111111' };
+      it('meego login --max-wait-ms -h asks botmux for the Meego login and never runs the real one', () => {
+        publishPerson();
+        const r = run(bytedcliWrapper({}), ['meego', 'login', '--max-wait-ms', '-h'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.out).toBe('');
+        expect(r.err).toContain('BOTMUX-SAYS');
+        expect(botmuxCalls()).toBe('auth request --provider meego\n');
+      });
+      it('auth login --session --username -h runs the browser-session login under the person HOME', () => {
+        publishPerson();
+        const r = run(bytedcliWrapper({}), ['auth', 'login', '--session', '--feishu', '--username', '-h'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status).toBe(0);
+        expect(r.out).toContain(`HOME=${personHome()} `);
+        expect(botmuxCalls()).toBe('');
+      });
+      it.each([
+        [['meego', 'login', '--max-wait-ms', '-h']],
+        [['auth', 'login', '--session', '--feishu', '--username', '-h']],
+      ])('unattended %j is refused with exit 77 and nothing real runs', args => {
+        publishPerson(unattended);
+        const r = run(bytedcliWrapper({}), args, { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.out).toBe('');
+        expect(r.err).toContain('无人值守');
+      });
+    });
+
+    it('lark-cli: a platform refusal answered ready (0) runs the same call with the new identity', () => {
+      const wrapper = join(dir, 'lark-cli');
+      writeFileSync(wrapper, renderIdentityWrapper('lark-cli', realBinary('lark-cli'), 'single'));
+      const ready = mkdtempSync(join(tmpdir(), 'botmux-ready-'));
+      writeSessionIdentity(ready, 'sess', { tool: 'lark-cli', appId: 'cli_a', userAccessToken: 'u-tok', turnId: 't1', openId: 'ou_1' }, 'single');
+      writeSessionIdentity(dir, 'sess', { tool: 'lark-cli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: 'botmux: 平台没有签发 [reason=platform_not_authorized]' }, 'single');
+      const bin = fakeBotmux(0);
+      writeFileSync(join(bin, 'botmux'), `#!/bin/sh\ncp "${join(ready, 'cli-identity/sess.bin/.data/lark-cli.env')}" "${join(dir, 'cli-identity/sess.bin/.data/lark-cli.env')}"\necho "$*" >> "${join(dir, 'botmux.calls')}"\nexit 0\n`, { mode: 0o755 });
+      const r = run(wrapper, ['contact', '+get-user'], { PATH: `${bin}:/usr/bin:/bin` });
+      rmSync(ready, { recursive: true, force: true });
+      expect(r.status).toBe(0);
+      expect(r.out).toContain('ARGS=contact +get-user');
+      expect(botmuxCalls()).toBe('auth request --provider lark-cli\n');
+    });
+
+    it.each(['zh', 'en'] as const)('botmux unreachable: the published platform refusal (%s) promises no card and names /login', locale => {
+      for (const key of ['trigger_user_auth.denied_platform_login', 'trigger_user_auth.denied_platform_consent']) {
+        const message = `${t(key, { tool: 'lark-cli', provider: 'Lark' }, locale)}\n[reason=platform_not_authorized]`;
+        writeSessionIdentity(dir, 'sess', { tool: 'lark-cli', mode: 'denied', turnId: 't1', openId: 'ou_1', message }, 'single');
+        const wrapper = join(dir, 'lark-cli');
+        writeFileSync(wrapper, renderIdentityWrapper('lark-cli', realBinary('lark-cli'), 'single'));
+        const r = run(wrapper, ['contact', '+get-user'], { PATH: `${fakeBotmux(1)}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.err).toContain('/login');
+        expect(r.err).toContain('[reason=platform_not_authorized]');
+        expect(r.err).not.toMatch(/会让平台机器人|has the platform bot send/);
+      }
+    });
+
+    it('bitscli: no identity token is on the command line of any process the wrapper starts', () => {
+      const log = join(dir, 'argv.log');
+      const bin = join(dir, 'argv-bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'env'), `#!/bin/sh\necho "env $*" >> "${log}"\nexec /usr/bin/env "$@"\n`, { mode: 0o755 });
+      const real = join(dir, 'real-bitscli.sh');
+      writeFileSync(real, `#!/bin/sh\necho "bitscli $*" >> "${log}"\nprintf 'AIME=%s' "$AIME_USER_CLOUD_JWT"\n`, { mode: 0o755 });
+      const wrapper = join(dir, 'bitscli');
+      writeFileSync(wrapper, renderIdentityWrapper('bitscli', real, 'single'));
+      mkdirSync(personHome(), { recursive: true });
+      writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', cloudJwt: 'person-jwt', codeJwt: 'person-code', home: personHome(), openId: 'ou_1' }, 'single');
+      const r = run(wrapper, ['devops', 'x'], { PATH: `${bin}:/usr/bin:/bin` });
+      expect(r.out).toBe('AIME=person-jwt');
+      const argv = readFileSync(log, 'utf8');
+      expect(argv).toContain('bitscli devops x');
+      expect(argv).not.toMatch(/person-jwt|person-code/);
     });
 
     it.each([

@@ -25,8 +25,9 @@ export function capabilityOfTool(tool: IdentityRouteTool): TriggerUserAuthCapabi
 }
 
 export interface Availability {
+  /** Always false for the `local` source, which never consults the platform. */
   platformBound: boolean;
-  platformGrant: boolean | 'unavailable';
+  platformGrant: boolean;
   localLogin: boolean;
 }
 
@@ -42,7 +43,7 @@ export type IdentityDecision =
  */
 export function resolveIdentity(source: TriggerUserAuthCredentialSource, availability: Availability): IdentityDecision {
   const { platformBound, platformGrant, localLogin } = availability;
-  if (source !== 'local' && platformBound && platformGrant === true) return { kind: 'person', source: 'platform' };
-  if ((source === 'local' || (source === 'auto' && !platformBound)) && localLogin) return { kind: 'person', source: 'local' };
-  return { kind: 'needs-auth', entry: platformBound || source === 'platform' ? 'platform-page' : 'private-link' };
+  if (platformBound) return platformGrant ? { kind: 'person', source: 'platform' } : { kind: 'needs-auth', entry: 'platform-page' };
+  if (source === 'platform') return { kind: 'needs-auth', entry: 'platform-page' };
+  return localLogin ? { kind: 'person', source: 'local' } : { kind: 'needs-auth', entry: 'private-link' };
 }

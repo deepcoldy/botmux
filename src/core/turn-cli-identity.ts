@@ -453,7 +453,7 @@ async function gatherCredentials(
     ? await resolveIdentityFor(tool, botConfig, openId) : null;
   const decision = resolveIdentity(source, {
     platformBound,
-    platformGrant: granted ? true : platform?.state === 'unavailable' ? 'unavailable' : false,
+    platformGrant: granted,
     localLogin: !!local,
   });
   return { platform, local, decision };

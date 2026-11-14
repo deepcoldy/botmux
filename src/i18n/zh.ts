@@ -789,8 +789,8 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_howto_status': 'botmux: 想确认自己是否已授权，可发 /login status。',
   // 中心化平台来源（triggerUserAuth.credentialSource = auto/platform 且本机已绑定）：
   // 拒绝文案指向平台凭据页，不再让人在本机扫码。
-  'trigger_user_auth.denied_platform_login': 'botmux: 这一步要用你本人的 {tool}（{provider}）权限，而你还没有在中心化平台授权，命令未执行。botmux 会让平台机器人私聊发你一张授权卡片；不要转述链接，也不要替人登录。授权后重试即可，不授权这一步不会执行，也不会用机器人或别人的身份代跑。',
-  'trigger_user_auth.denied_platform_consent': 'botmux: 你还没有在中心化平台授权 {tool}（{provider}），或还没允许这台机器使用，命令未执行。botmux 会让平台机器人私聊发你一张授权卡片，在卡片里点授权后重试即可；不要转述链接。',
+  'trigger_user_auth.denied_platform_login': 'botmux: 这一步要用你本人的 {tool}（{provider}）权限，而你还没有在中心化平台授权，命令未执行。没收到授权卡片的话，本人给 bot 发 /login。不要转述链接，也不要替人登录。授权后重试即可，不授权这一步不会执行，也不会用机器人或别人的身份代跑。',
+  'trigger_user_auth.denied_platform_consent': 'botmux: 你还没有在中心化平台授权 {tool}（{provider}），或还没允许这台机器使用，命令未执行。没收到授权卡片的话，本人给 bot 发 /login。在授权卡片里点授权后重试即可；不要转述链接。',
   'auth_link.platform_title': '🔐 本轮任务需要你本人授权。请在中心化平台的授权页完成（飞书用户身份和 ByteCloud 都在这一页，只发给你本人，请勿转发）：',
   'auth_link.platform_footer': '授权后回到原会话让我重试即可。',
   'trigger_user_auth.denied_unattended_unreachable': 'botmux: 无人值守的运行：任务执行人对 {capability} 的授权缺失，命令未执行。botmux 没法私下联系到这位执行人（私聊和仅本人可见的卡片都发不出去），授权入口没有送达。请把 TA 加入本机器人的可用范围，之后任务会再次运行；不会在这里发起授权。',
