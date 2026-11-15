@@ -1,4 +1,5 @@
 import { sessionDelegatedSlashCommands } from './remote-runner-slash.js';
+import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
@@ -3910,6 +3911,8 @@ export async function handleCommand(
         // (same post-acceptance pattern as the daemon's live-worker path).
         markRetryAttempt(ds.session);
         rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+        // The retry is this session's latest turn now: retire the previous card's rows.
+        noteReplyCardTurnStarted(ds, retryTurnId);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));

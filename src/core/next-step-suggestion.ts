@@ -18,6 +18,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
+import { serializeCardWrite } from './card-element-writes.js';
 import {
   buildNextStepElement,
   nextStepPlacement,
@@ -92,23 +93,6 @@ function stateFor(ds: DaemonSession): State {
   return state;
 }
 
-/** CardKit requires a strictly increasing sequence per card across all of its
- * element writes. The footer receipt uses 1; a seconds clock keeps later
- * writes above it and increasing across daemon restarts, and the in-memory
- * floor separates writes within the same second. */
-const SEQUENCE_EPOCH_MS = Date.UTC(2026, 0, 1);
-const lastSequences = new Map<string, number>();
-const LAST_SEQUENCES_MAX = 512;
-
-export function nextCardSequence(messageId: string, now: number): number {
-  const clock = Math.max(2, Math.floor((now - SEQUENCE_EPOCH_MS) / 1000));
-  const sequence = Math.max(clock, (lastSequences.get(messageId) ?? 0) + 1);
-  lastSequences.delete(messageId);
-  lastSequences.set(messageId, sequence);
-  while (lastSequences.size > LAST_SEQUENCES_MAX) lastSequences.delete(lastSequences.keys().next().value!);
-  return sequence;
-}
-
 function writeUuid(messageId: string, operation: string, sequence: number): string {
   return `nxs_${createHash('sha256').update(`${messageId}\0${operation}\0${sequence}`).digest('hex').slice(0, 40)}`;
 }
@@ -179,8 +163,8 @@ async function removeRow(ds: DaemonSession, shown: Shown, io: NextStepIo): Promi
   }
   const { messageId } = shown.card;
   const cardId = shown.cardId ?? await io.cardId(ds, messageId);
-  const sequence = nextCardSequence(messageId, io.now());
-  await io.remove(ds, cardId, messageId, sequence, writeUuid(messageId, 'remove', sequence));
+  await serializeCardWrite(messageId, io.now, sequence =>
+    io.remove(ds, cardId, messageId, sequence, writeUuid(messageId, 'remove', sequence)));
 }
 
 /** Removal targets only the card it was placed on, so a failure never blocks
@@ -245,11 +229,9 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
   }
   // Recorded before the write, for the same reason as above.
   state.shown = { turnId, card, text: desired, cardId, confirmed: false };
-  const sequence = nextCardSequence(messageId, io.now());
-  if (placement.kind === 'present') {
-    await io.replace(ds, cardId, messageId, element, sequence, writeUuid(messageId, 'replace', sequence));
-  } else {
-    await io.insert(ds, cardId, messageId, placement.placement, element, sequence, writeUuid(messageId, 'insert', sequence));
-  }
+  const write = placement;
+  await serializeCardWrite(messageId, io.now, sequence => write.kind === 'present'
+    ? io.replace(ds, cardId, messageId, element, sequence, writeUuid(messageId, 'replace', sequence))
+    : io.insert(ds, cardId, messageId, write.placement, element, sequence, writeUuid(messageId, 'insert', sequence)));
   state.shown.confirmed = true;
 }

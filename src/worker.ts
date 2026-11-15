@@ -40,6 +40,8 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher } from './utils/prompt-suggestion-publisher.js';
+import { CliRecapObserver, RECAP_MODEL_SYSTEM_PROMPT, TurnRecapRecorder } from './services/turn-recap.js';
+import { recapModelLaunchFor, runRecapModel, type RecapModelLaunch } from './services/turn-recap-runner.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -9344,6 +9346,16 @@ let bridgeLiveCliStartedAtMs: number | undefined;
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
+/** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
+ *  turn they recap. */
+const cliRecapObserver = new CliRecapObserver();
+/** What each turn did, for its「本轮回顾」: every activity entry counts here,
+ *  unlike the capped CoT buffer below. Sent just before a completed terminal. */
+const turnRecapRecorder = new TurnRecapRecorder();
+/** How to run the optional model recap for the current CLI: its own binary
+ *  and env, recorded at spawn. Undefined when the adapter has none or the CLI
+ *  is not a plain local one (sandbox, read isolation, wrapper, adopt). */
+let recapModelLaunch: RecapModelLaunch | undefined;
 /** Codex collaboration sub-agents spawned during live ingest. Their quota
  *  failures land in their own rollouts and reach the parent only as tool
  *  results, so they are tailed separately and fed into the same structured
@@ -9432,6 +9444,7 @@ let thinkingLastEmitMs = 0;
  */
 function cotEntryWithoutSentinel(entry: CotEntry): CotEntry | null {
   if (entry.kind !== 'text') return entry;
+  if (typeof entry.text !== 'string') return null;
   const stripped = stripTrailingBridgeSentinelLine(entry.text);
   if (stripped.trim().length === 0) return null;
   return stripped === entry.text ? entry : { kind: 'text', text: stripped };
@@ -9449,6 +9462,16 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
       stage: last.kind === 'tool_call' ? 'tool_started'
       : last.kind === 'tool_result' ? 'tool_returned' : 'model_output' });
   }
+  // Adopt mode keeps the literal token: the adopted CLI does not know botmux
+  // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
+  // the reply card shows it verbatim. Stripping it from the bubble alone would
+  // make the two messages of one turn contradict each other.
+  const adoptMode = lastInitConfig?.adoptMode === true;
+  const kept = adoptMode ? [...entries] : entries.flatMap(entry => {
+    const withoutSentinel = cotEntryWithoutSentinel(entry);
+    return withoutSentinel ? [withoutSentinel] : [];
+  });
+  turnRecapRecorder.observe(turn, kept);
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
@@ -9468,16 +9491,9 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     }
     return;
   }
-  // Adopt mode keeps the literal token: the adopted CLI does not know botmux
-  // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
-  // the reply card shows it verbatim. Stripping it from the bubble alone would
-  // make the two messages of one turn contradict each other.
-  const adoptMode = lastInitConfig?.adoptMode === true;
-  for (const entry of entries) {
-    const kept = adoptMode ? entry : cotEntryWithoutSentinel(entry);
-    if (!kept) continue;
-    thinkingEntries.push(kept);
-    thinkingTotalChars += cotEntryChars(kept);
+  for (const entry of kept) {
+    thinkingEntries.push(entry);
+    thinkingTotalChars += cotEntryChars(entry);
   }
   scheduleThinkingEmit();
 }
@@ -11676,12 +11692,22 @@ function bridgeIngest(): void {
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
+  const cliRecap = cliRecapObserver.observe(result.events,
+    { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt }, Date.now());
+  if (cliRecap) send({ type: 'cli_recap', ...cliRecap });
   claudeTranscriptTurnEnd.observe(result.events);
   if (claudeTranscriptTurnEnd.endedForMs() !== undefined) scheduleStaleProgramStatusCheck();
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
+}
+
+/** One optional「本轮回顾」model recap for the daemon. */
+async function answerRecapRequest(requestId: string, prompt: string): Promise<void> {
+  const launch = recapModelLaunch;
+  const outcome = launch ? await runRecapModel(launch, prompt) : { error: 'unavailable for this CLI' };
+  send({ type: 'recap_result', requestId, ...outcome });
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit
@@ -27854,6 +27880,21 @@ async function spawnCliBody(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
+  // The optional「本轮回顾」model recap: the same binary and env, outside any terminal.
+  recapModelLaunch = recapModelLaunchFor({
+    recapModel: cliAdapter.recapModel,
+    systemPrompt: RECAP_MODEL_SYSTEM_PROMPT,
+    bin: spawnBin,
+    env: { ...childEnv, ...perBotInjectEnv },
+    cwd: cfg.workingDir,
+    backend: effectiveBackendType,
+    sandboxed: sandboxRequested,
+    readIsolated: !!isolationBotHome,
+    wrapped: !!cfg.wrapperCli,
+    adopted: !!cfg.adoptMode,
+    credentialIsolated: credentialIsolationGate.required,
+  });
+
   // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
   // (applyWrapperCliLaunch). Strip any value inherited from the daemon's own
   // env first so a daemon launched under `cjadk feishu` (which exports it)
@@ -35090,6 +35131,10 @@ function emitTurnTerminal(
     ...(status !== 'completed' && Number.isFinite(providerTiming?.lastSuccessAtMs)
       ? { providerLastSuccessAtMs: providerTiming!.lastSuccessAtMs } : {}),
   };
+  // The「本轮回顾」material first: the daemon reads it when the terminal lands.
+  const recapInput = status === 'completed'
+    ? turnRecapRecorder.input({ turnId, dispatchAttempt }, lastInitConfig?.workingDir) : undefined;
+  if (recapInput) send({ type: 'recap_input', turnId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...recapInput });
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
     scope.reportContinuationFailure(continuationFailure, () => {
@@ -37180,6 +37225,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'goal_update_ack': {
       if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
+      break;
+    }
+
+    case 'recap_request': {
+      void answerRecapRequest(msg.requestId, msg.prompt);
       break;
     }
 

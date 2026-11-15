@@ -12,6 +12,7 @@ import {
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { isWorkflowSidebarEntryUrl } from '../../core/workflow-sidebar-link.js';
 import { NEXT_STEP_ELEMENT_ID } from './next-step-card.js';
+import { TURN_RECAP_ELEMENT_ID } from './turn-recap-card.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
 import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
@@ -2061,6 +2062,9 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // The「下一步」row is navigation chrome like the footer: its button is a
   // stamped botmux callback (dropped below) and its label is not reply text.
   if (el.element_id === NEXT_STEP_ELEMENT_ID && tag === 'column_set') return;
+  // The「本轮回顾」panel restates the turn for a person who stepped away; a
+  // bot reading the card gets the reply itself, not a summary of it.
+  if (el.element_id === TURN_RECAP_ELEMENT_ID && tag === 'collapsible_panel') return;
 
   // Promoted H1/H2 heading widgets: Lark strips `text_size` when a message is
   // read back, so the ATX prefix is rebuilt from the element id (the only

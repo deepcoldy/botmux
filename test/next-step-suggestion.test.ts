@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { nextCardSequence } from '../src/core/card-element-writes.js';
 import {
-  nextCardSequence,
   nextStepIdle,
   noteNextStepCard,
   noteNextStepSuggestion,
