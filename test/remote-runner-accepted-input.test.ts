@@ -35,6 +35,21 @@ describe('host accepted input finalization', () => {
     expect(followup.linkRefs?.mode).toBe('enabled');
   });
 
+  it('does not import unrelated CLI sidecars or controller flags from accepted input', () => {
+    const oversized: CliTurnPayload = { ...command, codexAppInput: { text: 'unrelated sidecar' },
+      nativeSessionTitle: 'unrelated title', codexAppSteerable: true,
+      trustedController: { ...caller, requestUserOpenId: 'ou_other_controller' } };
+    const payload = buildFollowUpCliInput('decorated task', 'accepted-session', {
+      acceptedInput: oversized, cliId: 'remote-runner', larkAppId: 'cli_accepted',
+    });
+    expect(payload.content).toBe(command.content);
+    expect(payload.trustedCaller).toEqual(caller);
+    expect(payload.codexAppInput).toBeUndefined();
+    expect(payload.nativeSessionTitle).toBeUndefined();
+    expect(payload.codexAppSteerable).toBeUndefined();
+    expect(payload.trustedController).toBeUndefined();
+  });
+
   it('keeps local refork payloads unchanged when no accepted input exists', () => {
     const ds = remoteSession();
     ds.session.cliId = 'codex';

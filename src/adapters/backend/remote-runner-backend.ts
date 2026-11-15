@@ -33,7 +33,7 @@ import {
   type RemoteRunnerSessionToolResult,
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
-import { normalizeDelegatedSlashCommand, type RemoteRunnerConfig } from './remote-runner-config.js';
+import type { RemoteRunnerConfig } from './remote-runner-config.js';
 import { sessionChildEnvWithInject } from '../../core/session-env.js';
 
 type PendingRequest = {
@@ -118,7 +118,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private activeTurnId: string | null = null;
   private activeTurnHostContext: RemoteRunnerTurnHostContext = {};
   private activeTurnAccepted = false;
-  private activeBindingTurn = false;
+  private readonly enforceFinalBindingCommit: boolean;
   private ready = false;
   private killed = false;
   private closing = false;
@@ -171,6 +171,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     private readonly sessionId: string,
     initialState?: RemoteRunnerBackendState,
   ) {
+    this.enforceFinalBindingCommit = (config.delegatedSlashCommands?.length ?? 0) > 0;
     this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_BASE_CAPABILITIES;
     this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 15_000);
     this.operationTimeoutMs = boundedTimeout(config.operationTimeoutMs, 30_000);
@@ -272,11 +273,6 @@ export class RemoteRunnerBackend implements SessionBackend {
       };
     }
     this.activeTurnId = input.turnId;
-    // The delegated lane supplies exact slash bytes, unlike ordinary enveloped
-    // prompts. The provider's frozen opt-in policy limits this state contract;
-    // ordinary providers keep their existing lineage publication behavior.
-    const bindingCommand = normalizeDelegatedSlashCommand(input.content.split(/\s+/, 1)[0]);
-    this.activeBindingTurn = !!bindingCommand && this.config.delegatedSlashCommands?.includes(bindingCommand) === true;
     this.activeTurnHostContext = { ...(input.linkRefMode ? { linkRefMode: input.linkRefMode } : {}),
       ...(input.sessionOrigin ? { sessionOrigin: structuredClone(input.sessionOrigin) } : {}) };
     this.activeTurnAccepted = false;
@@ -716,10 +712,10 @@ export class RemoteRunnerBackend implements SessionBackend {
         return;
       }
       // Validate the entire final before publishing either durable state or usage.
-      // A malformed usage report must not leave a failed adopt partially bound.
+      // A malformed usage report must not leave a failed turn partially bound.
       const usage = event.usage ? normalizeRemoteRunnerUsageReport(event.usage) : undefined;
       const invalidUsage = !!event.usage && (!usage || usage.generation !== (event.state ?? this.state)?.generation);
-      if (this.activeBindingTurn && invalidUsage) {
+      if (this.enforceFinalBindingCommit && invalidUsage) {
         this.failProtocol('remote runner emitted usage for an invalid backend generation');
         return;
       }
@@ -813,9 +809,6 @@ export class RemoteRunnerBackend implements SessionBackend {
         return;
       }
       this.activeTurnId = event.recoveredTurn.turnId;
-      // v1 recovery omits original content. On opted-in providers conservatively
-      // protect business state for the recovered turn until its validated final.
-      this.activeBindingTurn = (this.config.delegatedSlashCommands?.length ?? 0) > 0;
       this.activeTurnHostContext = {};
       this.recoveredTurnHostContextPending = true;
       this.deferredRecoveredEvents = [];
@@ -1062,7 +1055,6 @@ export class RemoteRunnerBackend implements SessionBackend {
   private finishActiveTurn(): void {
     const turnId = this.activeTurnId;
     this.activeTurnId = null;
-    this.activeBindingTurn = false;
     this.activeTurnHostContext = {};
     this.activeTurnAccepted = false;
     this.activeTurnRequestId = null;
@@ -1101,7 +1093,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     // Business bindings are a provider-session invariant, including idle gaps
     // and late events after a turn settles. Compute lineage may still advance
     // independently as long as it preserves the committed business snapshot.
-    if ((this.config.delegatedSlashCommands?.length ?? 0) > 0 && this.state && !finalBindingCommit
+    if (this.enforceFinalBindingCommit && this.state && !finalBindingCommit
         && (state.agentThreadId !== this.state.agentThreadId
           || !isDeepStrictEqual(state.providerState, this.state.providerState))) {
       this.failProtocol('delegated slash binding changes must be published in final.state');

@@ -108,7 +108,7 @@ import {
   type VcMeetingPushEventType,
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
-import type { CliTurnPayload, Session, VcMeetingImTurnOrigin } from '../../types.js';
+import type { AcceptedCommandInput, Session, VcMeetingImTurnOrigin } from '../../types.js';
 import { sessionKey } from '../../core/types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
@@ -3072,7 +3072,7 @@ export interface RoutingContext {
   /** An already-authorized effort command re-enters ordinary task admission. */
   effortTaskReentry?: true;
   /** Host-accepted structured input; never populated from message metadata. */
-  acceptedInput?: CliTurnPayload;
+  acceptedInput?: AcceptedCommandInput;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */

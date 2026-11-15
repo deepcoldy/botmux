@@ -1,5 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { RemoteRunnerTestHarness } from './helpers/remote-runner-harness.js';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RemoteRunnerBackend } from '../src/adapters/backend/remote-runner-backend.js';
@@ -9,11 +9,9 @@ import { buildNewTopicCliInput } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 
-const children: RemoteRunnerBackend[] = [];
-const dirs: string[] = [];
+const harness = new RemoteRunnerTestHarness();
 afterEach(() => {
-  for (const backend of children.splice(0)) backend.kill();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  harness.dispose();
   vi.restoreAllMocks();
 });
 
@@ -29,8 +27,7 @@ function runtime(): DaemonSession {
 }
 
 function startProvider(mode: string) {
-  const dir = mkdtempSync(join(tmpdir(), 'botmux-delegated-review-'));
-  dirs.push(dir);
+  const dir = harness.root();
   const fixture = join(dir, 'provider.mjs');
   const release = join(dir, 'release');
   const seen = join(dir, 'seen.jsonl');
@@ -57,10 +54,7 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line', li
 });`);
   const backend = new RemoteRunnerBackend({ expectedProvider: 'review', operationTimeoutMs: 1000,
     delegatedSlashCommands: ['/adopt', '/detach'] }, 'review-session');
-  children.push(backend);
-  const ready = new Promise<void>(resolve => backend.onReady(resolve));
-  backend.spawn(process.execPath, [fixture], { cwd: process.cwd(), cols: 80, rows: 24,
-    env: { ...process.env } as Record<string, string> });
+  const ready = harness.spawn(backend, fixture);
   return { backend, ready, release, commands: () => readFileSync(seen, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
 }
 
@@ -133,13 +127,9 @@ describe('delegated slash abnormal-boundary review', () => {
     const next = new RemoteRunnerBackend({ expectedProvider: 'reference' }, 'review-session', {
       version: 1, provider: 'reference', generation: 1, remoteSessionId: 'reference:review-session', agentThreadId: 'committed',
     });
-    children.push(next);
-    const nextReady = new Promise<void>(resolve => next.onReady(resolve));
     const restoredStates: RemoteRunnerBackendState[] = [];
     next.onBackendState(state => restoredStates.push(state));
-    next.spawn(process.execPath, ['examples/remote-runner/reference-runner.mjs'], { cwd: process.cwd(), cols: 80, rows: 24,
-      env: { ...process.env } as Record<string, string> });
-    await nextReady;
+    await harness.spawn(next, 'examples/remote-runner/reference-runner.mjs');
     expect(restoredStates.at(-1)?.agentThreadId).toBe('committed');
   });
 });

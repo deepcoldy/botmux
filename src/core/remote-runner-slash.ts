@@ -1,7 +1,7 @@
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import type { BotConfig } from '../bot-registry.js';
-import type { CliTurnPayload, Session, TrustedCaller } from '../types.js';
+import type { AcceptedCommandInput, Session, TrustedCaller } from '../types.js';
 import { t, localeForBot } from '../i18n/index.js';
 import { resolveDelegatedSlashCommands } from './delegated-slash.js';
 import type { SlashRouteDecision } from './command-router.js';
@@ -38,7 +38,7 @@ export async function admitDelegatedSlashTurn(
     larkAppId: string;
     reply: (text: string) => Promise<unknown>;
   },
-): Promise<CliTurnPayload | undefined> {
+): Promise<AcceptedCommandInput | undefined> {
   const locale = localeForBot(context.larkAppId);
   const denial = !context.authorized
     ? t('daemon.cmd_allowed_users_only', { cmd: decision.cmd }, locale)
@@ -58,7 +58,7 @@ export async function admitDelegatedSlashTurn(
  * task as the opening and admit the current payload as its exact FIFO successor. */
 export function queuedOpeningHasTail(
   session: Pick<Session, 'queued' | 'queuedPrompt' | 'queuedActivationTail'>,
-  acceptedInput?: CliTurnPayload,
+  acceptedInput?: AcceptedCommandInput,
 ): boolean {
   return !!(session.queued && session.queuedPrompt
     && ((session.queuedActivationTail?.length ?? 0) > 0 || acceptedInput));

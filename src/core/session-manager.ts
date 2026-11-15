@@ -73,7 +73,7 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
-import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import type { AcceptedCommandInput, ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
@@ -1697,7 +1697,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     substituteTrigger?: SubstituteTrigger;
-    acceptedInput?: CliTurnPayload;
+    acceptedInput?: AcceptedCommandInput;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -1852,7 +1852,7 @@ type FollowUpOpts = {
   chatId?: string;
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
-  acceptedInput?: CliTurnPayload;
+  acceptedInput?: AcceptedCommandInput;
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
@@ -2171,7 +2171,7 @@ function finalizeCliTurnInput(
   payload: CliTurnPayload,
   userText: string,
   opts: {
-    acceptedInput?: CliTurnPayload;
+    acceptedInput?: AcceptedCommandInput;
     cliId?: string;
     linkRefMode?: LinkRefMode;
     linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
@@ -2184,7 +2184,8 @@ function finalizeCliTurnInput(
   // shared LinkRefs finalization below, including when no CLI envelope is needed.
   if (opts?.acceptedInput) {
     if (opts.cliId !== 'remote-runner') throw new Error('Accepted provider input cannot cross into a different CLI');
-    payload = { ...payload, ...opts.acceptedInput };
+    payload = { ...payload, content: opts.acceptedInput.content,
+      ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
     userText = opts.acceptedInput.content;
   }
   // Builders only describe explicitly model-visible sources. They do not read
@@ -2418,7 +2419,7 @@ export function buildReforkCliInput(
     locale?: Locale;
     sender?: ResolvedSender;
     substituteTrigger?: SubstituteTrigger;
-    acceptedInput?: CliTurnPayload;
+    acceptedInput?: AcceptedCommandInput;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;

@@ -326,3 +326,5 @@ provider 按现有协议先 ACK `status: busy`，可发 `progress`，最后发 `
 启用下放的 provider 会话在 turn 之间同样保护已提交业务绑定；迟到的 `lineage_changed` 不能更新 `agentThreadId` 或选择状态。初始化/恢复 ready 可回填已提交快照，有效 final 可提交业务变更；计算资源 lineage 仍可在保持业务快照相等时递增 generation，JSON 对象键序变化不视为业务变更。reference runner 的普通首轮绑定也在 final.state 发布。
 
 无历史的 command scratch 只有在没有持久 provider 快照时才按无绑定处理；已经启动过 provider、保留 remoteBackendState 的空首轮/恢复记录仍是已有会话，不因此拒绝 detach。该判定只用于下放路由，不改变原 /resume 的空壳恢复口径。
+
+绑定提交约束由 provider 启动时的 opt-in 政策统一决定，普通消息和下放命令的 final 都先验证 usage 再发布绑定；不再维护逐 turn 的绑定命令标记。已接纳控制输入的类型只包含 content 与 trustedCaller，不能借此覆盖其它 CLI sidecar 或控制元数据。

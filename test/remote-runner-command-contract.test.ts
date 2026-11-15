@@ -1,5 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { RemoteRunnerTestHarness } from './helpers/remote-runner-harness.js';
+import { writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RemoteRunnerBackend } from '../src/adapters/backend/remote-runner-backend.js';
@@ -15,29 +15,15 @@ import { createLinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import type { LinkRefDiagnostic } from '../src/services/link-ref-types.js';
 import * as sessionStore from '../src/services/session-store.js';
 
-const roots: string[] = [];
-const children: RemoteRunnerBackend[] = [];
+const harness = new RemoteRunnerTestHarness();
 afterEach(() => {
-  for (const backend of children.splice(0)) backend.kill();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  harness.dispose();
   vi.restoreAllMocks();
 });
-function temporaryRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-command-contract-'));
-  roots.push(root);
-  return root;
-}
-function spawn(backend: RemoteRunnerBackend, path: string): Promise<void> {
-  children.push(backend);
-  const ready = new Promise<void>(done => backend.onReady(done));
-  backend.spawn(process.execPath, [path], { cwd: process.cwd(), cols: 80, rows: 24,
-    env: { ...process.env } as Record<string, string> });
-  return ready;
-}
 
 describe('delegated command end-to-end contract', () => {
   it.each(['final', 'failure'])('rejects idle lineage after %s without overwriting the committed binding', async terminal => {
-    const provider = join(temporaryRoot(), 'late-provider.mjs');
+    const provider = join(harness.root(), 'late-provider.mjs');
     writeFileSync(provider, `import readline from 'node:readline';
 const emit=e=>process.stdout.write(JSON.stringify({protocol:'botmux.remote-runner',version:1,...e})+'\\n');
 let state={version:1,provider:'late',generation:1,remoteSessionId:'compute',agentThreadId:'old'};
@@ -56,7 +42,7 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',lin
     const states: string[] = [];
     backend.onBackendState(state => { if (state.agentThreadId) states.push(state.agentThreadId); });
     const exited = new Promise<void>(done => backend.onExit(() => done()));
-    await spawn(backend, provider);
+    await harness.spawn(backend, provider);
     await backend.submitTurn({ turnId: 'bind', content: '/adopt alpha' });
     await exited;
     expect(backend.getBackendState()?.agentThreadId).toBe(terminal === 'final' ? 'committed' : 'old');
@@ -69,7 +55,7 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',lin
     vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
     const caller = { requestUserOpenId: 'ou_operator', requestLarkAppId: 'cli_command_contract', senderType: 'user' as const };
     const diagnostics: LinkRefDiagnostic[] = [];
-    const runtime = createLinkRefRuntime(temporaryRoot(), { onDiagnostic: event => diagnostics.push(event) });
+    const runtime = createLinkRefRuntime(harness.root(), { onDiagnostic: event => diagnostics.push(event) });
     try {
       const ds = { larkAppId: 'cli_command_contract', session: { sessionId: 'wire-command', cliId: 'remote-runner',
         backendType: 'remote-runner', status: 'active' } } as DaemonSession;
@@ -90,7 +76,7 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',lin
       const backend = new RemoteRunnerBackend({ expectedProvider: 'reference', delegatedSlashCommands: ['/detach'] }, 'wire-command', {
         version: 1, provider: 'reference', generation: 1, remoteSessionId: 'reference:wire-command', agentThreadId: 'reference-thread:alpha',
       });
-      await spawn(backend, resolve('examples/remote-runner/reference-runner.mjs'));
+      await harness.spawn(backend, resolve('examples/remote-runner/reference-runner.mjs'));
       const final = new Promise<string>(done => backend.onTurnFinal(done));
       await backend.submitTurn({ turnId: 'unbind', content: prepared.content, trustedCaller: prepared.trustedCaller });
       await final;
@@ -126,7 +112,7 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',lin
 
 
 it('allows compute lineage changes with equal business JSON in a different key order', async () => {
-  const provider = join(temporaryRoot(), 'compute-provider.mjs');
+  const provider = join(harness.root(), 'compute-provider.mjs');
   writeFileSync(provider, `import readline from 'node:readline';
 const emit=e=>process.stdout.write(JSON.stringify({protocol:'botmux.remote-runner',version:1,...e})+'\\n');
 readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',line=>{
@@ -143,7 +129,7 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',lin
     backend.onBackendState(state => { if (state.generation === 2) done(); });
     backend.onExit(() => reject(new Error('Valid compute lineage was rejected')));
   });
-  await spawn(backend, provider);
+  await harness.spawn(backend, provider);
   await advanced;
   expect(backend.getBackendState()).toMatchObject({ generation: 2, remoteSessionId: 'compute:new', agentThreadId: 'bound' });
 });
