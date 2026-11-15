@@ -14,7 +14,8 @@ import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE, executeRiffHostTool, parseRiffHos
   RIFF_HOST_MAX_ATTACHMENT_BYTES, RIFF_HOST_MAX_BYTES,
   type RiffHostContext, type RiffHostBinding } from '../src/services/riff-host-tools.js';
 import { quotedAttachments, QuotedAttachmentLimitError } from '../src/services/remote-runner-session-tool.js';
-import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments } from '../src/cli/riff-host-tools.js';
+import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments,
+  type RiffHostHttpResponse } from '../src/cli/riff-host-tools.js';
 import { assertCardPatchChat } from '../src/cli/card-dispatch.js';
 
 const roots: string[] = [], servers: Server[] = [];
@@ -604,11 +605,16 @@ describe('Riff host client failure reporting', () => {
   });
 
   it('names the transport error code without the private address when the endpoint never answers', async () => {
-    const closed = createServer();
-    await new Promise<void>(resolve => closed.listen(0, '127.0.0.1', resolve));
-    const port = (closed.address() as { port: number }).port;
-    await new Promise<void>(resolve => closed.close(() => resolve()));
-    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}/api/riff-host-tools`), request()));
+    // The transport is injected instead of probing a closed ephemeral port: a
+    // port that was just released can be re-bound by a concurrent process before
+    // the client connects, which turned this case into a 404 from a stranger
+    // server instead of ECONNREFUSED (flaky on busy CI shards). The error shape
+    // mirrors what node:http hands the client for a refused loopback connect.
+    const port = 61234;
+    const refused = async (): Promise<RiffHostHttpResponse> => {
+      throw Object.assign(new Error(`connect ECONNREFUSED 127.0.0.1:${port}`), { code: 'ECONNREFUSED' });
+    };
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}/api/riff-host-tools`), request(), refused));
     expect(message).toMatch(/^riff_host_transport_unknown \(ECONNREFUSED\); do not repeat automatically — /);
     expect(message).toContain('riff.hostToolsUrl');
     expect(message).not.toContain(String(port));
