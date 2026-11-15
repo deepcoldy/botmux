@@ -261,7 +261,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 - `remoteSessionId` 表示当前计算资源，`agentThreadId` 表示 Agent 对话血缘；二者不能合并。计算资源过期后，provider 可以提升 `generation`、更换 `remoteSessionId`，同时保留 `agentThreadId`。
 - 同一 generation 不得更换 `remoteSessionId`，generation 不得倒退；BotMux 会拒绝违反单调性的状态。
 - `providerState` 是最多 64 KiB、深度受限的普通 JSON。它可以保存恢复定位信息，但不得保存任何凭据。
-- provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。
+- provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。启用 `delegatedSlashCommands` 的 Bot 另有更严格的约束，见下文「按 Bot 下放」。
 - 普通 daemon/worker 重启发送 `resumeMode: "reattach"`（省略时同义），允许接管仍存活的远端资源；用户显式关闭后点击恢复发送 `resumeMode: "rebuild"`，provider 必须新建远端资源并在 `ready` 中推进 `generation`。Node worker 或其 Remote Runner backend 在新的 ready state 落盘前退出时，BotMux 会在远端 lineage 未变化的前提下把逻辑 Session 恢复为 closed，并回收仅剩的本地 worker；若 lineage 已变化则保持保护状态并要求显式对账，不能伪装成恢复成功。
 
 ## 关闭与进程退出
@@ -323,7 +323,7 @@ provider 按现有协议先 ACK `status: busy`，可发 `progress`，最后发 `
 
 下放命令的 LinkRefs 使用内部 `registry-only` 展示政策：仍登记链接、冻结模式并保存来源，但不把 `<botmux_link_refs>` 等模型说明追加到 `turn.content`，包括经过持久队列和重启恢复后。普通对话沿用原有 companion 注入。
 
-启用下放的 provider 会话在 turn 之间同样保护已提交业务绑定；迟到的 `lineage_changed` 不能更新 `agentThreadId` 或选择状态。初始化/恢复 ready 可回填已提交快照，有效 final 可提交业务变更；计算资源 lineage 仍可在保持业务快照相等时递增 generation，JSON 对象键序变化不视为业务变更。reference runner 的普通首轮绑定也在 final.state 发布。
+启用下放的 provider 会话在 turn 之间同样保护已提交业务绑定：除 `ready` 与有效 `final` 外，`lineage_changed` 以及 cancel/detach/reattach 的 `status` 所带状态，其 `agentThreadId` 与整个 `providerState` 都必须与已提交快照深度相等（只允许 `generation`、`remoteSessionId` 等计算资源字段变化），否则宿主按协议错误终止 provider。因此启用后不要再用 `lineage_changed` 更新 `providerState` 里的任何字段（包括恢复定位信息），改在 `final.state` 中提交。初始化/恢复 ready 可回填已提交快照，有效 final 可提交业务变更；计算资源 lineage 仍可在保持业务快照相等时递增 generation，JSON 对象键序变化不视为业务变更。reference runner 的普通首轮绑定也在 final.state 发布。
 
 无历史的 command scratch 只有在没有持久 provider 快照时才按无绑定处理；已经启动过 provider、保留 remoteBackendState 的空首轮/恢复记录仍是已有会话，不因此拒绝 detach。该判定只用于下放路由，不改变原 /resume 的空壳恢复口径。
 

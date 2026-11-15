@@ -5216,4 +5216,88 @@ describe('delegated slash lifecycle guards', () => {
     expect(send).not.toHaveBeenCalled();
     expect(repliedKey('cmd.detach.not_adopted')).toBe(true);
   });
+  it.each([true, false])('treats a history-less restored row as bound only with a provider snapshot (snapshot=%s)', async snapshot => {
+    const root = 'om_delegated_restored_' + snapshot;
+    const ds = seedThreadSession(root, 'restored');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    if (snapshot) {
+      ds.session.remoteBackendState = { version: 1, provider: 'reference', generation: 1,
+        remoteSessionId: 'remote:1', agentThreadId: 'reference-thread:alpha' };
+    }
+    ds.workingDir = '/tmp';
+    await handleThreadReply(makeEventData('om_restored_detach_' + snapshot, '/detach', root),
+      makeCtx(root, 'om_restored_detach_' + snapshot));
+    if (snapshot) {
+      await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+      expect(mocks.forkWorker.mock.calls[0]![1]).toMatchObject({ content: '/detach' });
+      expect(repliedKey('cmd.remote_runner.no_binding')).toBe(false);
+    } else {
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(repliedKey('cmd.remote_runner.no_binding')).toBe(true);
+    }
+  });
+  const remoteSeed = (root: string) => {
+    const ds = seedThreadSession(root, 'remote binding');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.workingDir = '/tmp';
+    return ds;
+  };
+  it('stages delegated adopt as the durable opening of a bare pending repo selection', async () => {
+    const root = 'om_delegated_repo_bare';
+    const ds = remoteSeed(root);
+    ds.pendingRepo = true;
+    ds.pendingPrompt = '';
+    await handleThreadReply(makeEventData('om_repo_bare_adopt', '/ADOPT  reference-thread:alpha', root),
+      makeCtx(root, 'om_repo_bare_adopt'));
+    expect(ds.pendingAcceptedInput).toMatchObject({ content: '/ADOPT  reference-thread:alpha',
+      trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) });
+    expect(ds.session.pendingRepoSetup?.acceptedInput).toMatchObject({ content: '/ADOPT  reference-thread:alpha' });
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+  it('queues delegated detach behind an existing pending repo opening as an exact tail', async () => {
+    const root = 'om_delegated_repo_tail';
+    const ds = remoteSeed(root);
+    ds.pendingRepo = true;
+    ds.pendingPrompt = 'EXISTING_OPENING';
+    await handleThreadReply(makeEventData('om_repo_tail_detach', '/disconnect', root), makeCtx(root, 'om_repo_tail_detach'));
+    expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({ turnId: 'om_repo_tail_detach',
+      cliInput: expect.objectContaining({ content: '/disconnect',
+        trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) }) })]);
+    expect(ds.pendingAcceptedInput).toBeUndefined();
+  });
+  it('queues delegated detach behind a reserved initial start as an exact tail', async () => {
+    const root = 'om_delegated_initial_tail';
+    const ds = remoteSeed(root);
+    ds.initialStartPending = true;
+    ds.pendingPrompt = 'OPENING_IN_PREPARATION';
+    await handleThreadReply(makeEventData('om_initial_tail_detach', '/detach', root), makeCtx(root, 'om_initial_tail_detach'));
+    await vi.waitFor(() => expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({
+      turnId: 'om_initial_tail_detach', cliInput: expect.objectContaining({ content: '/detach' }) })]));
+  });
+  it('sends delegated adopt as the exact opening of a live empty-start worker', async () => {
+    const root = 'om_delegated_live_opening';
+    const ds = remoteSeed(root);
+    const send = vi.fn(() => true);
+    ds.worker = { killed: false, send } as any;
+    ds.cliReady = true;
+    ds.session.initialUserTurnPending = true;
+    await handleThreadReply(makeEventData('om_live_opening_adopt', '/ADOPT  reference-thread:alpha', root),
+      makeCtx(root, 'om_live_opening_adopt'));
+    const inputs = send.mock.calls.map(call => (call as unknown[])[0] as any).filter(message => message.type === 'message');
+    expect(inputs.map(message => message.content)).toEqual(['/ADOPT  reference-thread:alpha']);
+    expect(inputs[0].trustedCaller).toMatchObject({ requestUserOpenId: OWNER, requestLarkAppId: APP });
+  });
+  it('re-forks a suspended empty-start provider with delegated adopt as its exact opening', async () => {
+    const root = 'om_delegated_refork_opening';
+    const ds = remoteSeed(root);
+    ds.session.initialUserTurnPending = true;
+    ds.session.remoteBackendState = { version: 1, provider: 'reference', generation: 1, remoteSessionId: 'remote:1' };
+    await handleThreadReply(makeEventData('om_refork_opening_adopt', '/ADOPT  reference-thread:alpha', root),
+      makeCtx(root, 'om_refork_opening_adopt'));
+    await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    expect(mocks.forkWorker.mock.calls[0]![1]).toMatchObject({ content: '/ADOPT  reference-thread:alpha',
+      trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) });
+  });
 });

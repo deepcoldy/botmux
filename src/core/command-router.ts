@@ -111,10 +111,10 @@ export interface SlashRouteInput {
   sessionIsCommandScratch?: boolean;
   /** A persisted backend runtime is real session evidence even before the first conversation turn. */
   sessionHasBackendState?: boolean;
-  /** 当前 bot 有效插件声明的飞书指令：指令名 → pluginId（两个插件同名时为 null，执行段 fail closed）。
-   *  缺省 = 无插件指令，判定与改造前逐字一致。 */
   /** Precomputed opt-in set, empty unless the effective backend is remote-runner. */
   delegatedCommands?: ReadonlySet<string>;
+  /** 当前 bot 有效插件声明的飞书指令：指令名 → pluginId（两个插件同名时为 null，执行段 fail closed）。
+   *  缺省 = 无插件指令，判定与改造前逐字一致。 */
   pluginCommands?: ReadonlyMap<string, string | null>;
 }
 
@@ -135,8 +135,10 @@ export type SlashRouteDecision =
   | { kind: 'passthrough'; cmd: string; content: string; delivery: 'cold_start' | 'to_session' }
   /** botmux 自己的命令，带无会话时的会话政策。 */
   | { kind: 'daemon'; cmd: string; content: string; sessionPolicy: 'sessionless' | 'existing_only' | 'precreate' | 'existing' }
-  /** 插件声明的飞书指令：不建会话、不进 CLI，由入口转给插件服务。pluginId 为 null = 同名冲突。 */
+  /** Remote Runner 显式下放的会话绑定命令：入口授权后带原文走普通结构化 turn。
+   *  unbound = 无会话的 detach，直接回复无绑定，不建会话、不启动 provider。 */
   | { kind: 'delegated_turn'; cmd: string; content: string; sessionPolicy: 'precreate' | 'existing' | 'unbound' }
+  /** 插件声明的飞书指令：不建会话、不进 CLI，由入口转给插件服务。pluginId 为 null = 同名冲突。 */
   | { kind: 'plugin'; cmd: string; content: string; pluginId: string | null }
   /** runtime 级联（PR-3）：≥1 条透传命令行 + 可选正文，按书写顺序逐条等 CLI 空闲后送出（§6）。 */
   | { kind: 'cascade'; items: CascadeItem[] }

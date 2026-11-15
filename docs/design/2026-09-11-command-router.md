@@ -231,7 +231,6 @@ type SessionPhase =
 **有意变化**（必须写进 PR 描述，按 PR 归属）：
 
 | 变化 | 今天 | 之后 | 理由 | PR |
-| 显式启用 remote-runner 的 `/adopt`、`/detach`、`/disconnect` | daemon 原生处理 | 独立 `delegated_turn`，仍过 grant / daemon 权限；adopt 普通 turn 冷启动，detach 无会话不启动，primary 拒绝 detach；其它输入完全不变 | provider 管理业务绑定，固定白名单、默认关闭；不复用 forward/raw input | #3469 |
 |---|---|---|---|---|
 | `/resume [id]` | 未注册，整条当未知命令转发给 CLI | 无会话（相位 `none`，或现有会话只是命令空壳 `sessionIsCommandScratch`；`closed` 臂是防御性的，两条入口关闭即删注册项、当前不可达）时由 schema 的 `claimWithoutSessionOnly` 认领为 sessionless daemon 命令（`permission: 'talk'`，有对话权限即可）：恢复本锚点最近关闭的会话，或把别处的已关闭会话复制（cold fork）到这里；有会话时与今天逐字一致（自定义透传照常透传，否则未知命令转发）。不进全局 daemon 集合 | 会话群关闭后改为默认开新会话，需要一个不翻聊天记录的恢复入口；有会话时保留 CLI 原生 `/resume` | session-group 新会话 |
 | `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 |  #1880（接纳前刷新按人身份；等待期间单槽可被新消息覆盖） |
@@ -252,6 +251,7 @@ type SessionPhase =
 | chat 模式群里的 `/tw` `/th` | 主干：不是 `/t` 头部，不强制开话题（落进群会话） | 与 `/t` 同：强制开新话题；触发 API 里同为保留命令（`FORCE_TOPIC_COMMANDS`） | 同上 | rebase 2026-09-16 |
 | 已有会话的话题里发 `/tw 干活` | 主干：当普通输入送进 CLI（`/tw` 成为字面文本） | 回「指令头只在新话题第一条生效」 | `topicHeaderDeclaresSpec` 计入 lifecycle | rebase 2026-09-16 |
 | 当前 bot 有效插件声明的 `/xxx`（如 `/work-bind`） | `unknown_slash`，作为普通消息转给 CLI | `plugin` 决策：不建会话、不进 CLI，转给插件服务；内置名、固定透传名与 bot 有效透传集同名时仍按原判定 | 插件需要确定性的群内入口；`pluginCommands` 缺省为空时判定逐字不变（差分测试守护） | 2026-10-14 `docs/design/2026-10-14-plugin-slash-commands.md` |
+| 显式启用 remote-runner 的 `/adopt`、`/detach`、`/disconnect` | daemon 原生处理 | 独立 `delegated_turn`，仍过 grant / daemon 权限；adopt 普通 turn 冷启动，detach 无会话不启动，primary 拒绝 detach；其它输入完全不变 | provider 管理业务绑定，固定白名单、默认关闭；不复用 forward/raw input | #3469 |
 
 ## 10. 验证
 

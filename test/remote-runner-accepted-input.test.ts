@@ -50,6 +50,17 @@ describe('host accepted input finalization', () => {
     expect(payload.trustedController).toBeUndefined();
   });
 
+  it('refuses to splice accepted provider input into any other CLI', () => {
+    for (const cliId of ['codex', 'claude-code', undefined] as const) {
+      expect(() => buildFollowUpCliInput('decorated message', 'accepted-session', {
+        acceptedInput: command, cliId, larkAppId: 'cli_accepted',
+      })).toThrow(/different CLI/);
+    }
+    expect(() => buildNewTopicCliInput('decorated message', 'accepted-session', 'codex',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { acceptedInput: command, larkAppId: 'cli_accepted' })).toThrow(/different CLI/);
+  });
+
   it('keeps local refork payloads unchanged when no accepted input exists', () => {
     const ds = remoteSession();
     ds.session.cliId = 'codex';

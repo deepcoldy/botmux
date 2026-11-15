@@ -27729,6 +27729,10 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       });
       return !ctx.acceptedInput;
     }
+    // Unlike daemon-management commands, `/sessions` is a read-only view of
+    // metadata already visible in this group. Authorize it at canTalk level so
+    // ordinary permitted members can use the MVP without a per-bot downgrade
+    // list, while keeping every other daemon command on canOperate by default.
     if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       // `/sessions` is group-level, sessionless UI. In a regular group whose
       // conversation mode is `new-topic`, routing has already rewritten this
