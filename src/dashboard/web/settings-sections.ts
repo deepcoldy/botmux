@@ -35,6 +35,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       'settings.codexNotifier',
       'settings.noVisibleOutputHint',
       'settings.crossPrincipalInterruption',
+      'settings.scheduleChildOneShot',
       'settings.scheduleDelegationCreate',
       'settings.scheduleDelegationSelfManage',
       'settings.scheduleBotGrants',
@@ -48,6 +49,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-worktree', module: 'settings.moduleGeneral', section: 'settings.sectionWorktree', fields: ['settings.worktreeRoot'] },
   { id: 'settings-schedule', module: 'settings.moduleGeneral', section: 'settings.sectionSchedule', fields: ['settings.scheduleTimeZone', 'settings.sessionCleanupEnable', 'settings.sessionCleanupArchiveCodex'] },
   { id: 'settings-prompt-cache', module: 'settings.moduleGeneral', section: 'settings.sectionPromptCache', fields: ['promptCache.ttl', 'promptCache.keepalive'] },
+  { id: 'settings-provider-recovery', module: 'settings.moduleGeneral', section: 'settings.sectionProviderRecovery', fields: ['providerRecovery.enabled', 'providerRecovery.maxWaitMinutes'] },
   // 表格型区块在「通用设置」的瀑布流之后单独占满一行，所以排在通用设置最后。
   { id: 'settings-session-env', module: 'settings.moduleGeneral', section: 'sessionEnv.sectionTitle', fields: ['sessionEnv.tmuxTitle'] },
   { id: 'settings-vc', module: 'settings.moduleMeeting', section: 'settings.sectionVcMeetingAgent', fields: ['settings.vcMeetingAgent'] },

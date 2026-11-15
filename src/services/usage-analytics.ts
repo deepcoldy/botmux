@@ -3,6 +3,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { defaultLedgerDir } from './usage-ledger.js';
+import { emptyUsageMetrics, usageBreakdown, UsageMetricsAccumulator } from './usage-metrics.js';
 import type { UsageGroup, UsageQuery, UsageReport, UsageSession, UsageTotals } from '../dashboard/usage-types.js';
 
 const DAY = 86400000;
@@ -119,11 +120,14 @@ function dateBucket(formatter: Intl.DateTimeFormat, ms: number): string {
 export async function queryUsageLedger(queryInput: UsageQuery, options: { ledgerDir?: string; now?: Date } = {}): Promise<UsageReport> {
   const query = validateUsageQuery(queryInput);
   const from = instant(query.from), to = instant(query.to);
+  const snapshotAt = (options.now ?? new Date()).getTime();
+  const rateEnd = Math.min(to, snapshotAt);
+  const metrics = new UsageMetricsAccumulator();
   const dir = options.ledgerDir ?? defaultLedgerDir();
-  const report: UsageReport = { query, generatedAt: (options.now ?? new Date()).toISOString(),
-    summary: emptyUsageTotals(), trend: [], bots: [], models: [], sessions: [], sessionCount: 0,
+  const report: UsageReport = { query, generatedAt: new Date(snapshotAt).toISOString(),
+    summary: emptyUsageTotals(), metrics: emptyUsageMetrics(new Date(rateEnd).toISOString()), trend: [], bots: [], models: [], sessions: [], sessionCount: 0,
     options: { bots: [], models: [] }, coverage: { ledgerMissing: false, filesRead: 0, invalidRecords: 0,
-      duplicateRecords: 0, firstRecordAt: null, lastRecordAt: null } };
+      duplicateRecords: 0, futureRecords: 0, firstRecordAt: null, lastRecordAt: null } };
   let names: string[];
   try { names = await readdir(dir); }
   catch (error) {
@@ -162,6 +166,7 @@ export async function queryUsageLedger(queryInput: UsageQuery, options: { ledger
         if (delta === 'ownership') continue;
         if (!delta) { report.coverage.invalidRecords++; continue; }
         if (delta.ts < from || delta.ts >= to) continue;
+        if (delta.ts > snapshotAt) { report.coverage.futureRecords++; continue; }
         // Include bot in the dedup key to preserve independent daemon partitions.
         const key = `${delta.bot}\0${delta.recordId}`;
         if (seen.has(key)) { report.coverage.duplicateRecords++; continue; }
@@ -170,6 +175,7 @@ export async function queryUsageLedger(queryInput: UsageQuery, options: { ledger
         if (delta.model) modelOptions.add(delta.model);
         if ((query.bot && delta.bot !== query.bot) || (query.model && delta.model !== query.model)) continue;
         add(report.summary, delta);
+        metrics.add(delta);
         add(group(trend, dateBucket(formatter, delta.ts)), delta);
         add(group(bots, delta.bot), delta);
         add(group(models, delta.model), delta);
@@ -194,8 +200,11 @@ export async function queryUsageLedger(queryInput: UsageQuery, options: { ledger
   }
   const ranked = <T extends UsageGroup>(values: Iterable<T>): T[] => [...values].sort((a, b) => b.totalTokens - a.totalTokens || a.id.localeCompare(b.id));
   report.trend = [...trend.values()].sort((a, b) => a.id.localeCompare(b.id));
-  report.bots = ranked(bots.values()); report.models = ranked(models.values());
+  const elapsedMinutes = Math.max(0, (rateEnd - from) / 60000);
+  report.bots = ranked(bots.values()).map(row => usageBreakdown(row, elapsedMinutes));
+  report.models = ranked(models.values()).map(row => usageBreakdown(row, elapsedMinutes));
   report.sessions = ranked(sessions.values()).slice(0, 100); report.sessionCount = sessions.size;
+  report.metrics = metrics.finish(report.summary, report.sessionCount, from, rateEnd);
   report.options = { bots: [...botOptions].sort(), models: [...modelOptions].sort() };
   report.coverage.firstRecordAt = first === null ? null : new Date(first).toISOString();
   report.coverage.lastRecordAt = last === null ? null : new Date(last).toISOString();

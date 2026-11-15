@@ -1,6 +1,9 @@
 export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 /** Common verified effort levels honored by both Antigravity terminal and ACP. */
 export const ANTIGRAVITY_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high'];
+/** Doubao's model-independent CLI flag accepts these BotMux levels; the
+ * selected provider decides how to honour them. `ultra` is rejected by the CLI. */
+export const DOUBAO_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
@@ -88,7 +91,7 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax'
+    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax' || cliId === 'doubao'
     // ZCode's per-model levels are declared in its own provider catalog and can
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
@@ -135,6 +138,7 @@ export function reasoningEffortsForCliModel(
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'antigravity') return ANTIGRAVITY_REASONING_EFFORTS;
+  if (cliId === 'doubao') return DOUBAO_REASONING_EFFORTS;
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);

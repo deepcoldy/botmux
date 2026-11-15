@@ -237,6 +237,15 @@ describe('redactSchedulesForPublic', () => {
     expect(input[0].preconditionScript).toBe('cat /host/private && echo 1');
   });
 
+  it('drops the until-done completion note but keeps the follow-up state, without mutating the input', () => {
+    const untilDone = { status: 'done', attempts: 2, doneAt: '2026-11-14T08:00:00Z', doneNote: '客户工单已关闭' };
+    const input = [{ id: 'sch2', name: '跟进', untilDone, notify: ['expired'], runStats: { consecutiveFailures: 0 } }];
+    const [row] = redactSchedulesForPublic(input) as any[];
+    expect(row.untilDone).toEqual({ status: 'done', attempts: 2, doneAt: '2026-11-14T08:00:00Z' });
+    expect(row).toMatchObject({ notify: ['expired'], runStats: { consecutiveFailures: 0 } });
+    expect(input[0].untilDone.doneNote).toBe('客户工单已关闭');
+  });
+
   it('tolerates malformed shapes without throwing', () => {
     expect(redactSchedulesForPublic([])).toEqual([]);
     expect(redactSchedulesForPublic([null] as unknown[])).toEqual([null]);
@@ -660,7 +669,8 @@ describe('redactSettingsForPublic', () => {
   });
 
   it('hides bot scheduling grants (chats and controller identity) from tokenless settings', () => {
-    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true, selfManageEnabled: false,
+    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true,
+      selfManageEnabled: false, childOneShotEnabled: true,
       grants: [{ id: 'team', sourceAppId: 'cli_a', targetAppIds: ['cli_b'], chatIds: ['oc_secret'],
         controllerUnionId: 'on_controller' }], botOptions: [] } };
     const out = redactSettingsForPublic(settings) as any;

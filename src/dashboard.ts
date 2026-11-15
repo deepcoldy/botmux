@@ -1310,11 +1310,12 @@ interface ResolvedDashboardSettings {
   noVisibleOutputHint: boolean;
   /** Experimental cross-principal turn isolation (XPI). Default OFF. */
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation: the two default-off switches and the
-   *  host bot grants. Private for anonymous read-only viewers. */
+  /** Schedule delegation switches and host bot grants. Private for anonymous
+   *  read-only viewers. */
   scheduleBotGrants: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     /** Hand-edited entries the reader dropped; a save would not keep them. */
     ignoredCount: number;
@@ -1348,6 +1349,8 @@ interface ResolvedDashboardSettings {
   workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
+  /** Machine-wide automatic continuation after provider failures; null = not configured (off). */
+  providerRecovery: import('./services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退）。 */
   sessionCleanup: {
@@ -1977,6 +1980,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     scheduleBotGrants: {
       createEnabled: global.scheduleDelegation?.createEnabled === true, // default OFF
       selfManageEnabled: global.scheduleDelegation?.selfManageEnabled === true, // default OFF
+      childOneShotEnabled: global.scheduleDelegation?.childOneShotEnabled === true, // default OFF
       grants: global.scheduleDelegation?.botGrants ?? [],
       ignoredCount: ignoredScheduleBotGrantCount(),
       botOptions: scheduleBotGrantBotOptions(),
@@ -2008,6 +2012,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
+    providerRecovery: global.providerRecovery ?? null,
     multiTopic: {
       enabled: global.multiTopic?.enabled !== false, // default ON
       taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF

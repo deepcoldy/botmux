@@ -5339,6 +5339,18 @@ decisionBoardRoute('POST', '/api/decision-board/items/:seq/seen', (service, _req
   jsonRes(res, 200, { ok: true });
 });
 
+decisionBoardRoute('POST', '/api/decision-board/items/:seq/close-in-chat', async (service, req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const submitter = decisionBoardAuthor(body?.submitter);
+  if (seq === null || !submitter || body?.confirmed !== true || !Number.isSafeInteger(body.baseRev)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  }
+  const result = service.closeInChat(seq, body.baseRev as number, submitter);
+  await service.cardsIdle();
+  jsonRes(res, 200, { ok: true, ...result });
+});
+
 decisionBoardRoute('POST', '/api/decision-board/items/:seq/draft', async (service, req, res, params) => {
   const seq = decisionBoardSeq(params.seq);
   const body = await readJsonBody<Record<string, unknown>>(req, 1024 * 1024).catch(() => undefined);
@@ -7486,6 +7498,16 @@ export interface ScheduleRow {
   lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
+  /** until-done state, run ledger and owner notification settings. They feed
+   *  the shared schedule support summary (schedule-followup) on the Dashboard
+   *  and Lark cards; without them the wire row renders the wrong stop
+   *  condition ("stops after one run") and never shows failure counts. The
+   *  anonymous public board still strips `ownerOpenId` via
+   *  redactSchedulesForPublic. */
+  untilDone?: ScheduledTask['untilDone'];
+  runStats?: ScheduledTask['runStats'];
+  notify?: ScheduledTask['notify'];
+  ownerOpenId?: ScheduledTask['ownerOpenId'];
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
@@ -7683,6 +7705,10 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     lastStatus: t.lastStatus,
     lastError: t.lastError,
     repeat: t.repeat,
+    untilDone: t.untilDone,
+    runStats: t.runStats,
+    notify: t.notify,
+    ownerOpenId: t.ownerOpenId,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
     followActive: t.followActive === true ? true : undefined,
@@ -10353,6 +10379,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
+    providerRecovery: (() => { try { return getBot(cachedLarkAppId).config.providerRecovery ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -12034,6 +12061,21 @@ botConfigPutRoute<{ promptCache?: unknown }>('/api/bot-prompt-cache', 'promptCac
     return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
   },
   respond: value => ({ ok: true, promptCache: value ?? null }),
+});
+
+// Per-bot automatic continuation after transient provider failures. Body
+// `{ providerRecovery?: { enabled?, maxWaitMinutes? } | null }`: null/缺省 → 删除本 bot
+// 覆盖，回落全局 config.json `providerRecovery`（都没配 = 关闭）。daemon 实时读取：
+// 新轮次立即按新值，关闭时正在等待的续跑收尾并发通知。
+botConfigPutRoute<{ providerRecovery?: unknown }>('/api/bot-provider-recovery', 'providerRecovery', {
+  notBound: NOT_BOUND_BODY.okFalse,
+  normalize: (body, spec) => {
+    if (body.providerRecovery === null || body.providerRecovery === undefined) return fieldOk(null);
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.providerRecovery));
+    if (!parsed.ok && parsed.reason === 'empty') return fieldOk(null);
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, providerRecovery: value ?? null }),
 });
 
 botConfigPutRoute<{ feedback?: unknown }>('/api/bot-feedback', 'feedback', {
