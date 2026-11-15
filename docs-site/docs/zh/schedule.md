@@ -438,7 +438,7 @@ BotMux 会先确认结果发出去了，再删除当前任务。如果返回里 
 
 开启后，已认证的定时轮可以执行普通的 `botmux schedule add <将来时间> <prompt> --topic`。权限只覆盖当前 Bot、当前群、当前话题和完全相同的工作目录；只接受 `once`，默认最远 24 小时、每轮 1 个。`childOneShotMaxDelayMinutes` 最多 7 天，`childOneShotMaxTasksPerTurn` 最多 16。
 
-父任务必须由真人直接创建（或是升级时迁移的同类任务），创建者仍须是 Bot 管理员和群成员。子任务以匿名工具身份运行，不持久化 `lark-cli` / `bytedcli` scope，也不能自管理或继续创建孙任务。目标 Bot 必须对 `lark-cli` 和 `bytedcli` 开启 `triggerUserAuth` 身份隔离，避免复用话题会话时继承旧凭据。同一请求重试返回原任务，不重复占用额度；删除任务不会退回当轮额度。
+父任务必须由真人直接创建（或是升级时迁移的同类任务），创建者仍须是 Bot 管理员和群成员。子任务只会在当前精确回合把这个已验证控制人作为 `lark-cli` / `bytedcli` 工具身份及 `botmux actor current` 的执行人；持久化任务仍没有 owner，因此 workflow 和 schedule 变更继续被拒绝。子任务不能自管理，也不能继续创建孙任务；调用方不能另行指定 owner。普通跨 Bot 委托任务仍保持匿名。目标 Bot 必须对 `lark-cli` 和 `bytedcli` 开启 `triggerUserAuth` 身份隔离，避免复用话题会话时继承旧凭据。同一请求重试返回原任务，不重复占用额度；删除任务不会退回当轮额度。
 
 ## 高级：跨 Bot 委托创建
 

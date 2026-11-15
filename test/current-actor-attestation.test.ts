@@ -157,8 +157,52 @@ describe('daemon current actor attestation', () => {
         openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
       }),
       procRoot,
-      expectedScheduledTurnId: SCHEDULED_TURN_ID,
     })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('proves an ownerless schedule child tool actor without creating a workflow caller', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    delete ds.managedTurnOrigin.callerOpenId;
+    ds.scheduledTurnCallers = undefined;
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    const request = () => resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    });
+
+    await expect(request()).resolves.toMatchObject({ ok: true });
+    expect(ds.managedTurnOrigin.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+
+    ds.scheduledToolActors = undefined;
+    await expect(request()).resolves.toEqual({
+      ok: false, error: 'current_actor_unverified',
+    });
+
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => {
+        ds.scheduledToolActors = undefined;
+        return { openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com' };
+      },
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
   });
 
   it('rejects a missing, different, or cleaned-up scheduled turn', async () => {

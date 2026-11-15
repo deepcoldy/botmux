@@ -977,6 +977,50 @@ describe('target daemon consumes signed message authority', () => {
     await h.run(turnId);
     expect(identityBody('bytedcli', turnId))
       .toContain('scheduled-original-user');
+    expect(h.ds.scheduledToolActors).toBeUndefined();
+  });
+
+  it('publishes an ownerless schedule child controller only as the exact-turn tool actor', async () => {
+    const h = await targetHarness();
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = {
+      id: 'a1b2c3d4', chatId: 'oc_chat', ownerOpenId: undefined, ownerUnionId: undefined,
+    };
+    const authority = {
+      kind: 'delegated', state: 'active', task,
+      grantId: 'schedule-child:cli_app:parent01:schedule:parent01:run-1',
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    let currentAuthority = authority;
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => currentAuthority };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true } });
+    h.scopeValues.authorizeDelegatedScheduleRun = vi.fn(async () => ({
+      task, targetOpenId: 'ou_alice_target', usesControllerToolActor: true,
+    }));
+    const publication = vi.fn(async () => []);
+    h.scopeValues.publishTurnCliIdentity = publication;
+    h.scopeValues.noteSenderUnionId = vi.fn();
+    h.scopeValues.noteScheduledIdentityRestored = vi.fn();
+
+    await h.run(turnId);
+
+    expect(publication).toHaveBeenCalledWith(expect.objectContaining({
+      senderOpenId: 'ou_alice_target', turnId,
+    }));
+    expect(publication.mock.calls[0]![0]).not.toHaveProperty('delegatedIdentity');
+    expect(h.ds.scheduledToolActors?.get(turnId)).toEqual({
+      openId: 'ou_alice_target', unionId: 'on_alice',
+    });
+    expect(task.ownerOpenId).toBeUndefined();
+    expect(task.ownerUnionId).toBeUndefined();
+
+    publication.mockImplementationOnce(async () => {
+      currentAuthority = { ...authority, state: 'paused' };
+      return [];
+    });
+    await expect(h.run(turnId)).rejects.toThrow();
+    expect(h.ds.scheduledToolActors).toBeUndefined();
   });
 
   it.each(['signed kickoff', 'delegated scheduled turn'] as const)(

@@ -8524,6 +8524,9 @@ describe('managed turn authority worker generations', () => {
     const ds = makeDs();
     forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
     const worker = forkMock.mock.results.at(-1)!.value;
+    ds.scheduledToolActors = new Map([[scheduledTurnId, {
+      openId: 'ou_tool_actor', unionId: 'on_tool_actor',
+    }]]);
     expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
 
     worker.emit('message', {
@@ -8574,6 +8577,7 @@ describe('managed turn authority worker generations', () => {
     });
     await Promise.resolve();
     expect(ds.scheduledTurnCallers).toBeUndefined();
+    expect(ds.scheduledToolActors).toBeUndefined();
   });
 
   it('does not bind a scheduled creator to a different worker turn', () => {

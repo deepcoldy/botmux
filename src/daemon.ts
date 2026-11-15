@@ -4817,6 +4817,8 @@ async function prepareDelegatedScheduledTurnIdentity(
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
   if (authority.kind !== 'delegated') return false;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
   const assertCurrent = () => assertScheduledAuthorityCurrent(authority,
     scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId });
   const authorized = await authorizeDelegatedScheduleRun(
@@ -4825,18 +4827,44 @@ async function prepareDelegatedScheduledTurnIdentity(
     { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
       assertAuthorityCurrent: assertCurrent },
   );
-  await publishTurnCliIdentity({
-    botConfig: getBot(ds.larkAppId).config,
-    sessionDataDir: config.session.dataDir,
-    sessionId: ds.session.sessionId,
-    senderOpenId: undefined,
-    delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
-    locale: localeForBot(ds.larkAppId),
-    turnId,
-    storageModel: identityModelForPublication(ds),
-    privateChat: ds.chatType === 'p2p',
-  });
-  assertCurrent();
+  if (authorized.usesControllerToolActor) {
+    const identity: Extract<ScheduledRunIdentity, { ok: true }> = {
+      ok: true,
+      openId: authorized.targetOpenId,
+      unionId: authority.controlUnionId!,
+      source: 'creator',
+    };
+    noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+    noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: identity.openId,
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertCurrent();
+    (ds.scheduledToolActors ??= new Map()).set(turnId, {
+      openId: identity.openId,
+      unionId: identity.unionId,
+    });
+  } else {
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: undefined,
+      delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertCurrent();
+  }
   return true;
 }
 
@@ -10028,6 +10056,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       maxTasksPerTurn: scheduledChildMaxTasksPerTurn
         ?? readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
         ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+      controllerBoundToolIdentity: scheduledChildParent !== undefined,
     });
     if (!result.ok) {
       const error = scheduledChildParent && result.error === 'grant_task_limit'

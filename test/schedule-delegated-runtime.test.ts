@@ -31,9 +31,51 @@ describe('delegated schedule runtime authorization', () => {
     await expect(authorizeDelegatedScheduleRun(task, authority, input)).resolves.toEqual({
       task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
       targetOpenId: 'ou_user_target',
+      usesControllerToolActor: false,
     });
     expect(input.resolveTargetOpenId).toHaveBeenCalledWith('on_user');
     expect(input.listChatMemberOpenIds).toHaveBeenCalledWith('oc_chat');
+  });
+
+  it('publishes the exact controller only as the tool actor of an ownerless bounded child', async () => {
+    const childTask = {
+      ...task,
+      ownerOpenId: undefined,
+      ownerUnionId: undefined,
+    };
+    const childAuthority: ScheduleAuthorityRecord = {
+      ...authority,
+      task: childTask,
+      grantId: 'schedule-child:cli_target:parent01:schedule:parent01:run-1',
+      credentialOpenId: 'ou_user_target',
+      runScopes: [],
+      selfManage: false,
+    };
+    await expect(authorizeDelegatedScheduleRun(childTask, childAuthority, deps()))
+      .resolves.toEqual({
+        task: childTask,
+        targetOpenId: 'ou_user_target',
+        usesControllerToolActor: true,
+      });
+
+    await expect(authorizeDelegatedScheduleRun(childTask, {
+      ...childAuthority,
+      grantId: 'dispatch:delivery-1:cli_target',
+    }, deps())).resolves.toEqual({
+      task: { ...childTask, ownerOpenId: undefined, ownerUnionId: undefined },
+      targetOpenId: 'ou_user_target',
+      usesControllerToolActor: false,
+    });
+
+    const ownedChildTask = {
+      ...childTask,
+      ownerOpenId: 'ou_user_target',
+      ownerUnionId: 'on_user',
+    };
+    await expect(authorizeDelegatedScheduleRun(ownedChildTask, {
+      ...childAuthority,
+      task: ownedChildTask,
+    }, deps())).resolves.toMatchObject({ usesControllerToolActor: false });
   });
 
   it.each([

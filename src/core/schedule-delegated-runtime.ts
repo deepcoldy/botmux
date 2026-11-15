@@ -19,6 +19,28 @@ export interface DelegatedScheduleRuntimeDependencies {
 export interface AuthorizedDelegatedScheduleRun {
   task: ScheduledTask;
   targetOpenId: string;
+  usesControllerToolActor: boolean;
+}
+
+/** A same-topic one-shot child keeps delegated lifecycle limits (no descendants
+ * or self-management), but may publish the direct parent's controller as an
+ * exact-turn tool actor. The task itself stays ownerless, so workflow and
+ * schedule mutation authority remain unavailable. Generic cross-bot delegated
+ * tasks remain anonymous. All fields come from the host authority store; no
+ * request body can nominate this identity. */
+export function delegatedScheduleUsesControllerToolActor(
+  task: ScheduledTask,
+  authority: ScheduleAuthorityRecord,
+): boolean {
+  return authority.kind === 'delegated'
+    && authority.grantId?.startsWith('schedule-child:') === true
+    && !!authority.controlOpenId
+    && !!authority.controlUnionId
+    && authority.credentialOpenId === authority.controlOpenId
+    && authority.runScopes.length === 0
+    && authority.selfManage === false
+    && task.ownerOpenId === undefined
+    && task.ownerUnionId === undefined;
 }
 
 async function revalidateController(
@@ -85,7 +107,12 @@ export async function authorizeDelegatedScheduleRun(
   const targetOpenId = await revalidateController(task, authority, deps);
   deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
-  return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
+  const usesControllerToolActor = delegatedScheduleUsesControllerToolActor(task, authority);
+  return {
+    task: usesControllerToolActor ? task : { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
+    targetOpenId,
+    usesControllerToolActor,
+  };
 }
 
 export async function authorizeScheduleSelfManage(

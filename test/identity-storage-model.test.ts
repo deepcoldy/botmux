@@ -272,6 +272,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
       managedTurnOrigin: undefined,
       pendingRawTurnId: undefined,
       scheduledTurnCallers: undefined,
+      scheduledToolActors: undefined,
       silentScheduledTurns: undefined,
       ...extra,
     };
@@ -319,6 +320,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
   it('retains scheduled, recovery and continuation turns', () => {
     const ds = dsWith({
       scheduledTurnCallers: new Map([['schedule:1:uuid', {}]]),
+      scheduledToolActors: new Map([['schedule:2:uuid', { openId: 'ou_actor', unionId: 'on_actor' }]]),
       session: {
         deferredScheduleRun: { turnId: 'turn-deferred' },
         ordinaryTurnRecovery: { currentTurnId: 'turn-recovery' },
@@ -326,11 +328,11 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
         codexAppDispatchLedger: [],
       } as any,
     });
-    for (const t of ['schedule:1:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
+    for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       publish(t); releaseActiveIdentityTurn(dir, SESSION, t);
     }
     expect(collectSessionTurnGarbage(ds).sort()).toEqual([]);
-    for (const t of ['schedule:1:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
+    for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       expect(recallProvenIdentityContent(dir, SESSION, t, 'bytedcli')).toBeDefined();
     }
   });
