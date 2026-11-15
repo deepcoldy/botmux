@@ -102,6 +102,8 @@ describe('command schema ↔ /help 文案', () => {
       // pre-routing / dispatcher 层命令（与 test/slash-commands-doc-sync.test.ts 的 PREROUTING_COMMANDS 同源）
       'help.topic', 'help.summary', 'help.reply_mode', 'help.introduce', 'help.invite', 'help.grant', 'help.revoke',
       'help.workflow_run', 'help.workflow_cancel', 'help.tabs',
+      // remote-runner 下放开启时条件替换 /adopt、/detach 原生帮助，命令本身仍在 schema（#3469/#3481）
+      'help.remote_runner_adopt', 'help.remote_runner_detach',
     ]);
     for (const key of used) {
       if (/^help\.heading_/.test(key)) continue; // 节标题

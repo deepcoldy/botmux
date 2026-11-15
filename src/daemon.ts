@@ -30476,6 +30476,10 @@ async function handleThreadReplyAdmitted(
     // pendingSender for the deferred spawn.
     const autoCreateSender = await getThreadSender();
     setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
+    // Hoisted for the same reason as promptContent/parsed below: the isolated
+    // newDs-literal eval in test/new-topic-lark-caller.test.ts only binds
+    // locals, never the RoutingContext, so it cannot see a bare `ctx` reference.
+    const autoCreateAcceptedInput = ctx.acceptedInput;
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -30494,7 +30498,7 @@ async function handleThreadReplyAdmitted(
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
-      pendingAcceptedInput: ctx.acceptedInput,
+      pendingAcceptedInput: autoCreateAcceptedInput,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
