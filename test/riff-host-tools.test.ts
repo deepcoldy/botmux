@@ -620,6 +620,30 @@ describe('Riff host client failure reporting', () => {
     expect(message).not.toContain(String(port));
   });
 
+  it('keeps the code of a real transport failure and hides the address', async () => {
+    // The injected case above pins the classification; this one runs the real
+    // client, so the code must survive its own error path. The listener stays
+    // bound for the whole case (no released port another process could take)
+    // and drops each connection after reading the request.
+    const dropped: string[] = [];
+    const s = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.headers['x-riff-host-token'] === token) dropped.push(req.method!);
+        res.socket?.destroy();
+      });
+    });
+    servers.push(s);
+    await new Promise<void>(resolve => s.listen(0, '127.0.0.1', resolve));
+    const port = (s.address() as { port: number }).port;
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}${RIFF_HOST_TOOLS_ROUTE}`), request()));
+    expect(message).toMatch(/^riff_host_transport_unknown \(ECONNRESET\); do not repeat automatically — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain(String(port));
+    // The command went out once; the retries only asked for its outcome.
+    expect(dropped).toEqual(['POST', 'GET', 'GET']);
+  });
+
   it('still completes a normal running → completed exchange through the direct client', async () => {
     let polls = 0;
     const worker = await endpoint(req => req.method === 'POST'
