@@ -3071,6 +3071,8 @@ export interface RoutingContext {
   cascadeBodyReentry?: true;
   /** An already-authorized effort command re-enters ordinary task admission. */
   effortTaskReentry?: true;
+  /** Authorized provider-owned slash turn; never populated from message metadata. */
+  delegatedSlashContent?: string;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */

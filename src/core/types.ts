@@ -340,6 +340,7 @@ export interface DaemonSession {
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
   pendingCodexAppText?: string;
+  pendingDelegatedSlashContent?: string;
   /** Trusted, Botmux-authored instructions held out of the visible Codex App
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;

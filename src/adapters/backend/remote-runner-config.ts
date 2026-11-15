@@ -4,6 +4,8 @@ import {
 } from './remote-runner-protocol.js';
 
 export interface RemoteRunnerConfig {
+  /** Opt-in daemon commands delivered as structured turns; /disconnect normalizes to /detach. */
+  delegatedSlashCommands?: Array<'/adopt' | '/detach'>;
   /** Optional provider name pin verified during the hello handshake. */
   expectedProvider?: string;
   /** Capabilities the provider must advertise before BotMux sends start/resume. */
@@ -32,6 +34,7 @@ export function normalizeRemoteRunnerConfig(value: unknown): RemoteRunnerConfig 
   }
   const raw = value as Record<string, unknown>;
   const allowed = new Set([
+    'delegatedSlashCommands',
     'expectedProvider',
     'requiredCapabilities',
     'handshakeTimeoutMs',
@@ -39,6 +42,18 @@ export function normalizeRemoteRunnerConfig(value: unknown): RemoteRunnerConfig 
   ]);
   const unknown = Object.keys(raw).filter(key => !allowed.has(key));
   if (unknown.length > 0) throw new Error(`remoteRunner contains unsupported field(s): ${unknown.join(', ')}`);
+
+  let delegatedSlashCommands: RemoteRunnerConfig['delegatedSlashCommands'];
+  if (raw.delegatedSlashCommands !== undefined) {
+    if (!Array.isArray(raw.delegatedSlashCommands)) {
+      throw new Error('remoteRunner.delegatedSlashCommands must be an array');
+    }
+    const commands = raw.delegatedSlashCommands.map(normalizeDelegatedSlashCommand);
+    if (commands.some(command => command === null)) {
+      throw new Error('remoteRunner.delegatedSlashCommands only accepts /adopt, /detach, /disconnect');
+    }
+    delegatedSlashCommands = [...new Set(commands)] as NonNullable<RemoteRunnerConfig['delegatedSlashCommands']>;
+  }
 
   let expectedProvider: string | undefined;
   if (raw.expectedProvider !== undefined) {
@@ -72,9 +87,29 @@ export function normalizeRemoteRunnerConfig(value: unknown): RemoteRunnerConfig 
   const handshakeTimeoutMs = optionalTimeout(raw.handshakeTimeoutMs, 'handshakeTimeoutMs');
   const operationTimeoutMs = optionalTimeout(raw.operationTimeoutMs, 'operationTimeoutMs');
   return {
+    ...(delegatedSlashCommands ? { delegatedSlashCommands } : {}),
     ...(expectedProvider ? { expectedProvider } : {}),
     ...(requiredCapabilities ? { requiredCapabilities } : {}),
     ...(handshakeTimeoutMs !== undefined ? { handshakeTimeoutMs } : {}),
     ...(operationTimeoutMs !== undefined ? { operationTimeoutMs } : {}),
   };
+}
+
+/** Fixed allowlist, intentionally independent from arbitrary passthrough commands. */
+export function normalizeDelegatedSlashCommand(value: unknown): '/adopt' | '/detach' | null {
+  if (typeof value !== 'string') return null;
+  const token = value.trim().toLowerCase();
+  if (token === '/adopt') return '/adopt';
+  if (token === '/detach' || token === '/disconnect') return '/detach';
+  return null;
+}
+
+/** Callers resolve the frozen/live backend before entering the pure router. */
+export function resolveDelegatedSlashCommands(
+  config: RemoteRunnerConfig | undefined,
+  backendType: string | undefined,
+): ReadonlySet<string> {
+  if (backendType !== 'remote-runner') return new Set();
+  return new Set((config?.delegatedSlashCommands ?? [])
+    .map(normalizeDelegatedSlashCommand).filter((cmd): cmd is '/adopt' | '/detach' => cmd !== null));
 }

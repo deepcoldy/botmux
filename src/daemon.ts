@@ -1,3 +1,4 @@
+import { resolveDelegatedSlashCommands } from './adapters/backend/remote-runner-config.js';
 import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
@@ -7772,6 +7773,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnId = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingDelegatedSlashContent = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingChatContext = undefined;
@@ -22293,6 +22295,8 @@ function buildReservedInitialInput(
       whiteboardId: ds.session.whiteboardId,
       substituteTrigger: ds.pendingSubstituteTrigger,
       codexAppText: ds.pendingCodexAppText,
+      delegatedSlashContent: ds.pendingDelegatedSlashContent,
+      trustedCaller: ds.pendingTrustedCaller,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -22329,6 +22333,7 @@ function buildReservedInitialInput(
 function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingPrompt = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingDelegatedSlashContent = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingAttachments = undefined;
@@ -27354,6 +27359,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingTurnId: replyAnchorId,
     pendingTrustedCaller: trustedCaller,
     pendingCodexAppText: codexAppVisibleText,
+    pendingDelegatedSlashContent: ctx.delegatedSlashContent,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -27666,6 +27672,8 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    delegatedCommands: resolveDelegatedSlashCommands(botCfg.remoteRunner,
+      resolvePairedSpawnBackendType(botCfg.cliId, undefined, botCfg.backendType, config.daemon.backendType)),
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
   });
   if (slashDecision.kind === 'plugin') {
@@ -27710,6 +27718,25 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType)) {
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      if (slashDecision.cmd !== '/adopt' && coordinationModeIsPrimary()) {
+        await invocationDeps.sessionReply(anchor, tr('cmd.detach.primary_unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      if (slashDecision.sessionPolicy === 'unbound') {
+        await invocationDeps.sessionReply(anchor, tr('cmd.remote_runner.no_binding', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      // Continue through ordinary turn admission, spawn and the durable FIFO.
+      // This marker carries the authorized command bytes across prompt construction;
+      // neither this path nor queue flushing reclassifies it as a daemon command.
+      ctx.delegatedSlashContent = commandContent;
+      return false;
     }
     // Unlike daemon-management commands, `/sessions` is a read-only view of
     // metadata already visible in this group. Authorize it at canTalk level so
@@ -30095,6 +30122,8 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          delegatedSlashContent: ctx.delegatedSlashContent,
+          trustedCaller: threadTrustedCaller,
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
@@ -30205,6 +30234,7 @@ async function handleThreadReplyAdmitted(
         ds.pendingTurnId = parsed.messageId;
         ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
+        ds.pendingDelegatedSlashContent = ctx.delegatedSlashContent;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
@@ -30242,6 +30272,8 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          delegatedSlashContent: ctx.delegatedSlashContent,
+          trustedCaller: threadTrustedCaller,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
@@ -30473,6 +30505,7 @@ async function handleThreadReplyAdmitted(
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
+      pendingDelegatedSlashContent: ctx.delegatedSlashContent,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -30771,6 +30804,8 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            delegatedSlashContent: ctx.delegatedSlashContent,
+            trustedCaller: threadTrustedCaller,
             codexAppApplicationContext,
             codexAppMessageContext,
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
@@ -30801,6 +30836,8 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          delegatedSlashContent: ctx.delegatedSlashContent,
+          trustedCaller: threadTrustedCaller,
           codexAppApplicationContext,
           codexAppMessageContext,
           solo: ds.soloSession,
@@ -31043,6 +31080,8 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            delegatedSlashContent: ctx.delegatedSlashContent,
+            trustedCaller: threadTrustedCaller,
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,
@@ -31215,6 +31254,8 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: reforkCodexApp.text,
+          delegatedSlashContent: queuedHasDurableTail ? ds.pendingDelegatedSlashContent : ctx.delegatedSlashContent,
+          trustedCaller: queuedHasDurableTail ? ds.pendingTrustedCaller : threadTrustedCaller,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -31239,6 +31280,8 @@ async function handleThreadReplyAdmitted(
         sender: queuedHasDurableTail ? undefined : reforkSender,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
         codexAppText: reforkCodexApp.text,
+        delegatedSlashContent: queuedHasDurableTail ? ds.pendingDelegatedSlashContent : ctx.delegatedSlashContent,
+        trustedCaller: queuedHasDurableTail ? ds.pendingTrustedCaller : threadTrustedCaller,
         codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
         codexAppMessageContext: reforkCodexApp.messageContext,
         turnId: parsed.messageId,
@@ -31557,6 +31600,9 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
         && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
       hasAttachments: resources.length > 0,
+      delegatedCommands: resolveDelegatedSlashCommands(getBot(larkAppId).config.remoteRunner,
+        existingDs?.initConfig?.backendType ?? resolvePairedSpawnBackendType(passthroughCliId,
+          existingDs?.session.backendType, getBot(larkAppId).config.backendType, config.daemon.backendType)),
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
@@ -31726,6 +31772,25 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType)) {
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      if (slashDecision.cmd !== '/adopt' && coordinationModeIsPrimary()) {
+        await invocationDeps.sessionReply(anchor, tr('cmd.detach.primary_unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      if (slashDecision.sessionPolicy === 'unbound') {
+        await invocationDeps.sessionReply(anchor, tr('cmd.remote_runner.no_binding', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      // Continue through ordinary turn admission, spawn and the durable FIFO.
+      // This marker carries the authorized command bytes across prompt construction;
+      // neither this path nor queue flushing reclassifies it as a daemon command.
+      ctx.delegatedSlashContent = commandContent;
+      return false;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       const botSender = isBotSenderType || isForeignBotSender;

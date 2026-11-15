@@ -874,6 +874,8 @@ export async function commitRepoSelection(
               whiteboardId: ds.session.whiteboardId,
               substituteTrigger: ds.pendingSubstituteTrigger,
               codexAppText: ds.pendingCodexAppText,
+              delegatedSlashContent: ds.pendingDelegatedSlashContent,
+              trustedCaller: ds.pendingTrustedCaller,
               codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
               codexAppMessageContext: ds.pendingCodexAppMessageContext,
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -953,6 +955,7 @@ export async function commitRepoSelection(
       if (emptyStart) markInitialUserTurnPending(ds);
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
+      ds.pendingDelegatedSlashContent = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
       ds.pendingChatContext = undefined;

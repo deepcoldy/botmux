@@ -288,3 +288,33 @@ printf '%s\n' \
 ```
 
 它用于协议联调和测试，不是生产远端执行器。
+
+## 按 Bot 下放 `/adopt`、`/detach`
+
+默认仍由 daemon 处理这些命令。仅在明确选择 remote-runner 后端的 Bot 上配置：
+
+```json
+{ "remoteRunner": { "delegatedSlashCommands": ["/adopt", "/detach"] } }
+```
+
+字段缺省或空数组关闭下放；只接受 `/adopt`、`/detach`、`/disconnect`，不接受其它 daemon 命令。配置归一化会去重并把 `/disconnect` 收敛成 `/detach`，启用任一写法即启用两个别名。命令正文保留调用时的大小写、参数和内部空格；路由仍按普通 slash 规则剥前导提及、去首尾空白，讨论文本/命令列表不作为指令截获。已有会话按冻结的后端判断，不随 Bot 的 CLI 切换而改变。
+
+下放只改变执行通道。两个消息入口先执行 grant 限制和 `canRunDaemonCommand`（默认 canOperate，允许 `canTalkDaemonCommands` 按条降级），并保留 `acceptSlashFromBots`。随后复用普通消息的配额、spawn、结构化输入和 FIFO；忙时排队的是已授权的完整 turn，出队不再分类。`/help` 和 `/list-slash-command` 按有效后端与实际启用项显示 provider 语义。
+
+无会话 `/adopt` 可像普通消息一样启动 provider，等 ready 后提交首个 turn。无会话 `/detach` / `/disconnect` 直接回复无绑定，不创建会话、不启动 provider。primary 协调模式下两种 detach 写法均拒绝。provider 拒绝、ACK 超时、协议错误沿现有 turn 失败通道明确报错，不回落 daemon 的原生命令处理。
+
+### Provider 契约
+
+v1 wire format 不变，不增加协议命令。用户面的下放命令是 `turn.content`，调用者与普通 turn 共用宿主认证的 `trustedCaller`，例如：
+
+```json
+{"protocol":"botmux.remote-runner","version":1,"type":"turn","requestId":"turn:1","turnId":"om_request","content":"/adopt reference-thread:alpha","trustedCaller":{"requestUserOpenId":"ou_caller","requestLarkAppId":"cli_example","senderType":"user"}}
+```
+
+provider 按现有协议先 ACK `status: busy`，可发 `progress`，最后发 `final`（可带完整 `state`）。绑定关系只能在 `final.state` 发布；不要在中间的 `status.state` 或 `lineage_changed` 提前发布业务绑定。沿用 generation 防护：计算资源替换需递增 generation，旧 turn / 旧 generation 不能修改新绑定。`state` 是完整快照，解绑须省略 `agentThreadId`，不能用空字符串；`providerState` 同样必须提交完整的新值，不包含凭据。
+
+多轮选择可在第一次 `/adopt` 的 `final.state.providerState` 保存候选或选择令牌，并在结果正文列出 `/adopt <target>`；后续 turn 根据该状态校验选择，再通过 `final.state.agentThreadId` 提交绑定。重启后 provider 用 `resume.state` 恢复选择上下文和绑定，不依赖本机进程内变量。并发的选择按现有 FIFO 逐轮处理。
+
+下放版 `/detach` / `/disconnect` **只解除 provider 管理的业务绑定**，来源 Agent 保留，BotMux 会话行也保留以接收下一条 `/adopt`。没有绑定时以正常 `final` 返回明确的“无绑定”结果，宿主不清理本地会话。绝不能把它映射到协议 `cancel`（关闭），也不能触发协议 `detach`（宿主关停时可恢复的事务，与 `reattach` 配对）。原生 shared-adopt 的断桥语义继续适用于未启用下放的 Bot。
+
+`examples/remote-runner/reference-runner.mjs` 可直接运行：`/adopt` 列出 alpha/beta，`/adopt reference-thread:alpha` 绑定，`/disconnect` 解绑，重复解绑返回无绑定。候选集保存在 `providerState.adoptCandidates`，只在 `final` 回传业务变更。

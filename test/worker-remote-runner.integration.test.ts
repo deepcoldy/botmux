@@ -902,3 +902,75 @@ input.on('line', line => {
     );
   });
 });
+
+describe('delegated slash worker FIFO', () => {
+  it('delivers exact authenticated adopt/detach turns in order while the provider is busy', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-delegated-fifo-'));
+    tempDirs.push(root);
+    const commandsPath = join(root, 'commands.jsonl');
+    const releasePath = join(root, 'release-first-final');
+    const provider = join(root, 'provider.mjs');
+    // The real reference provider handles the contract; hold its first final
+    // at a controllable transport boundary so successor admission overlaps it.
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+const write = process.stdout.write.bind(process.stdout);
+process.stdin.on('data', data => fs.appendFileSync(${JSON.stringify(commandsPath)}, data));
+process.stdout.write = (data, ...args) => {
+  const event = JSON.parse(String(data));
+  if (event.type === 'final' && event.turnId === 'om_adopt_1') {
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releasePath)})) return;
+      clearInterval(timer); write(data, ...args);
+    }, 5);
+    return true;
+  }
+  return write(data, ...args);
+};
+await import(${JSON.stringify(resolve('examples/remote-runner/reference-runner.mjs'))});
+`);
+    chmodSync(provider, 0o755);
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_delegated', larkAppSecret: 'secret',
+      cliId: 'remote-runner', backendType: 'remote-runner', cliPathOverride: provider,
+      remoteRunner: { delegatedSlashCommands: ['/adopt', '/detach'] } }]));
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'), env: {
+      ...process.env, HOME: root, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: botsPath,
+      BOTMUX_SESSION_ID: 'sid-delegated', LARK_APP_ID: 'cli_delegated', LARK_APP_SECRET: 'secret',
+    }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    const caller = { requestUserOpenId: 'ou_operator', requestLarkAppId: 'cli_delegated', senderType: 'user' as const };
+    const commands = () => existsSync(commandsPath)
+      ? readFileSync(commandsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+    child.send({ type: 'init', sessionId: 'sid-delegated', chatId: 'oc_delegated', rootMessageId: 'om_root',
+      workingDir: root, cliId: 'remote-runner', cliPathOverride: provider, backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'reference', delegatedSlashCommands: ['/adopt', '/detach'] },
+      prompt: '/ADOPT  reference-thread:alpha', turnId: 'om_adopt_1', trustedCaller: caller,
+      larkAppId: 'cli_delegated', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    await waitFor(() => commands().some(command => command.type === 'turn'), () => logs.join(''));
+    child.send({ type: 'message', content: '/DISCONNECT', turnId: 'om_detach_2', trustedCaller: caller } satisfies DaemonToWorker);
+    child.send({ type: 'message', content: '/adopt reference-thread:beta', turnId: 'om_adopt_3', trustedCaller: caller } satisfies DaemonToWorker);
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
+    expect(commands().filter(command => command.type === 'turn')).toHaveLength(1);
+    writeFileSync(releasePath, 'go');
+    await waitFor(() => messages.some(message => message.type === 'turn_terminal'
+      && message.turnId === 'om_adopt_3' && message.status === 'completed'),
+    () => `FIFO did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`);
+    const turns = commands().filter(command => command.type === 'turn');
+    expect(turns.map(command => ({ content: command.content, turnId: command.turnId, trustedCaller: command.trustedCaller }))).toEqual([
+      { content: '/ADOPT  reference-thread:alpha', turnId: 'om_adopt_1', trustedCaller: caller },
+      { content: '/DISCONNECT', turnId: 'om_detach_2', trustedCaller: caller },
+      { content: '/adopt reference-thread:beta', turnId: 'om_adopt_3', trustedCaller: caller },
+    ]);
+    expect(commands().some(command => ['cancel', 'detach', 'terminal_input'].includes(command.type))).toBe(false);
+    const states = messages.filter(message => message.type === 'remote_backend_state');
+    expect(states.some(message => message.type === 'remote_backend_state' && !message.state.agentThreadId)).toBe(true);
+    expect(states.at(-1)).toMatchObject({ state: { agentThreadId: 'reference-thread:beta' } });
+  });
+});

@@ -738,6 +738,7 @@ export function buildSlashListCard(
     cliName: string;
     builtin: string[];
     adapterDefaults?: string[];
+    delegatedCommands?: string[];
     custom: string[];
     discovered: { name: string; description?: string }[];
     workingDir: string;
@@ -749,6 +750,16 @@ export function buildSlashListCard(
   const { cliName, builtin, adapterDefaults = [], custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
   const asCode = (cmds: string[]) => cmds.map((c) => `\`${c}\``).join('  ');
   const elements: any[] = [];
+  if (params.delegatedCommands?.length) {
+    const commands = params.delegatedCommands;
+    elements.push({ tag: 'markdown', content: [
+      `**${t('slashlist.part_delegated', undefined, locale)}**`,
+      asCode(commands.flatMap(cmd => cmd === '/detach' ? [cmd, '/disconnect'] : [cmd])),
+      ...(commands.includes('/adopt') ? [t('help.remote_runner_adopt', undefined, locale)] : []),
+      ...(commands.includes('/detach') ? [t('help.remote_runner_detach', undefined, locale)] : []),
+    ].join('\n') });
+    elements.push({ tag: 'hr' });
+  }
 
   // ① 固定放行（内置透传白名单）
   elements.push({

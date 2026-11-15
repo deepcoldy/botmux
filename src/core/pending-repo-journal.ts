@@ -46,6 +46,10 @@ export function stagePendingRepoSetup(
     ...(args.branch ? { branch: args.branch } : {}),
     ...(args.reuseExisting !== undefined ? { reuseExisting: args.reuseExisting } : {}),
     ...(args.targetSubdir ? { targetSubdir: args.targetSubdir } : {}),
+    ...(ds.pendingDelegatedSlashContent !== undefined ? {
+      delegatedSlashContent: ds.pendingDelegatedSlashContent,
+      ...(ds.pendingTrustedCaller ? { delegatedSlashCaller: structuredClone(ds.pendingTrustedCaller) } : {}),
+    } : {}),
     ...(ds.pendingCodexAppText !== undefined ? { codexAppText: ds.pendingCodexAppText } : {}),
     ...(ds.pendingCodexAppApplicationContext
       ? { codexAppApplicationContext: ds.pendingCodexAppApplicationContext }
@@ -103,6 +107,10 @@ export function restorePendingRepoRuntime(ds: DaemonSession): boolean {
   ds.pendingPrompt = setup.prompt;
   ds.pendingRawInput = setup.rawInput;
   ds.pendingCodexAppText = setup.codexAppText;
+  ds.pendingDelegatedSlashContent = setup.delegatedSlashContent;
+  if (setup.delegatedSlashContent !== undefined) {
+    ds.pendingTrustedCaller = setup.delegatedSlashCaller ? structuredClone(setup.delegatedSlashCaller) : undefined;
+  }
   ds.pendingCodexAppApplicationContext = setup.codexAppApplicationContext;
   ds.pendingCodexAppMessageContext = setup.codexAppMessageContext;
   ds.pendingAttachments = setup.attachments?.map(attachment => ({ ...attachment }));

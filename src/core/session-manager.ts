@@ -271,6 +271,8 @@ async function resumeRestoredPendingRepoSetup(
         promptInjection: sessionPromptInjection(ds),
         substituteTrigger: ds.pendingSubstituteTrigger,
         codexAppText: ds.pendingCodexAppText,
+        delegatedSlashContent: ds.pendingDelegatedSlashContent,
+        trustedCaller: ds.pendingTrustedCaller,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
         // This recovery completes the original fresh pending-repo launch.
@@ -1696,6 +1698,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     substituteTrigger?: SubstituteTrigger;
+    delegatedSlashContent?: string;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -1724,6 +1727,10 @@ export function buildNewTopicCliInput(
     workflowNodeSession?: boolean;
   },
 ): CliTurnPayload {
+  if (cliId === 'remote-runner' && opts?.delegatedSlashContent !== undefined) {
+    return { content: opts.delegatedSlashContent, ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+  }
+
   opts = {
     ...opts,
     promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId),
@@ -1850,6 +1857,7 @@ type FollowUpOpts = {
   chatId?: string;
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
+  delegatedSlashContent?: string;
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
@@ -2202,6 +2210,10 @@ export function buildFollowUpCliInput(
   sessionId: string,
   opts?: FollowUpOpts,
 ): CliTurnPayload {
+  if (opts?.cliId === 'remote-runner' && opts?.delegatedSlashContent !== undefined) {
+    return { content: opts.delegatedSlashContent, ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+  }
+
   opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   const background = backgroundForInput(sessionId, opts.cliId, opts);
   if (background) opts = {
@@ -2405,6 +2417,8 @@ export function buildReforkCliInput(
     locale?: Locale;
     sender?: ResolvedSender;
     substituteTrigger?: SubstituteTrigger;
+    delegatedSlashContent?: string;
+    trustedCaller?: CliTurnPayload['trustedCaller'];
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -2442,6 +2456,8 @@ export function buildReforkCliInput(
     linkRefSourceType: opts?.linkRefSourceType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
+    delegatedSlashContent: opts?.delegatedSlashContent,
+    trustedCaller: opts?.trustedCaller,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,
     solo: ds.soloSession,
@@ -5757,6 +5773,8 @@ async function forkOrShowRepoCard(
       whiteboardId: ds.session.whiteboardId,
       promptInjection: sessionPromptInjection(ds),
       codexAppText: ds.pendingCodexAppText,
+      delegatedSlashContent: ds.pendingDelegatedSlashContent,
+      trustedCaller: ds.pendingTrustedCaller,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -5843,6 +5861,7 @@ async function forkOrShowRepoCard(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     ds.pendingCodexAppText = undefined;
+    ds.pendingDelegatedSlashContent = undefined;
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;

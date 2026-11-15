@@ -5075,3 +5075,121 @@ describe('runtime passthrough cascade (PR-3)', () => {
     expect(raws()[0].turnId).toBe('om_casc_4');
   });
 });
+
+describe('remote-runner delegated slash production ingress (#3469)', () => {
+  const GUEST = 'ou_delegated_guest';
+  function remoteBot(extra: Record<string, unknown> = {}) {
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'remote-runner',
+      backendType: 'remote-runner', allowedUsers: [OWNER], defaultWorkingDir: '/tmp',
+      remoteRunner: { delegatedSlashCommands: ['/adopt', '/detach'] }, ...extra });
+    bot.resolvedAllowedUsers = [OWNER];
+    return bot;
+  }
+  beforeEach(() => { resetRouteTestState(); remoteBot(); });
+
+  for (const route of ['new-topic', 'thread'] as const) {
+    const invoke = (text: string, id: string, sender = OWNER) => {
+      const data = makeEventData(id, text, route === 'thread' ? `root_${id}` : undefined);
+      data.sender.sender_id.open_id = sender;
+      const ctx = makeCtx(route === 'thread' ? `root_${id}` : id, id);
+      return route === 'thread' ? handleThreadReply(data, ctx) : handleNewTopic(data, ctx);
+    };
+    it(`${route}: cold-starts adopt as an exact authenticated structured turn`, async () => {
+      await invoke('/ADOPT  reference-thread:alpha', `om_delegated_${route}`);
+      await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+      const call = mocks.forkWorker.mock.calls[0]!;
+      expect(call[1]).toMatchObject({ content: '/ADOPT  reference-thread:alpha' });
+      const ds = call[0];
+      expect(ds.session.source).not.toBe('external');
+      expect(ds.session.lastTrustedCaller ?? ds.pendingTrustedCaller ?? (call[1] as any).trustedCaller
+        ?? (call[2] as any)?.trustedCaller ?? (call[3] as any)?.trustedCaller).toBeDefined();
+      expect(mocks.forkAdoptWorker).not.toHaveBeenCalled();
+    });
+    it.each(['/detach', '/disconnect'])(`${route}: %s without a session creates no provider or session`, async text => {
+      await invoke(text, `om_unbound_${route}_${text.slice(1)}`);
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(activeSessions.size).toBe(0);
+      expect(repliedKey('cmd.remote_runner.no_binding')).toBe(true);
+    });
+    it(`${route}: keeps canOperate authorization even though delivery is a turn`, async () => {
+      remoteBot({ globalGrants: [GUEST] });
+      await invoke('/adopt alpha', `om_denied_${route}`, GUEST);
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(repliedKey('daemon.cmd_allowed_users_only', { cmd: '/adopt' })).toBe(true);
+    });
+    it(`${route}: allows explicit canTalk downgrade but grant restriction remains first`, async () => {
+      remoteBot({ globalGrants: [GUEST], canTalkDaemonCommands: ['/adopt'], restrictGrantCommands: true });
+      await invoke('/adopt alpha', `om_grant_block_${route}`, GUEST);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(repliedKey('cmd.grant_restricted', { cmd: '/adopt' })).toBe(true);
+      remoteBot({ globalGrants: [GUEST], canTalkDaemonCommands: ['/adopt'] });
+      await invoke('/adopt alpha', `om_downgrade_${route}`, GUEST);
+      await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    });
+  }
+
+  it('preserves detach/disconnect text and caller on a live worker without closing the local row', async () => {
+    const root = 'om_delegated_live';
+    const ds = seedThreadSession(root, 'remote binding');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = { version: 1, provider: 'reference', generation: 1,
+      remoteSessionId: 'remote:1', agentThreadId: 'reference-thread:alpha' };
+    ds.workingDir = '/tmp';
+    const send = vi.fn(() => true);
+    ds.worker = { killed: false, send } as any;
+    ds.cliReady = true;
+    for (const [i, text] of ['/disconnect', '/adopt reference-thread:beta'].entries()) {
+      await handleThreadReply(makeEventData(`om_live_delegated_${i}`, text, root), makeCtx(root, `om_live_delegated_${i}`));
+    }
+    const inputs = send.mock.calls.map(([message]) => message).filter(message => message.type === 'message');
+    expect(inputs.map(message => message.content)).toEqual(['/disconnect', '/adopt reference-thread:beta']);
+    expect(inputs[0].trustedCaller).toMatchObject({ requestUserOpenId: OWNER, requestLarkAppId: APP });
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.remoteBackendState.agentThreadId).toBe('reference-thread:alpha');
+    expect(mocks.closeWorkerPoolSession).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('delegated slash lifecycle guards', () => {
+  beforeEach(() => {
+    resetRouteTestState();
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'remote-runner',
+      backendType: 'remote-runner', allowedUsers: [OWNER], defaultWorkingDir: '/tmp',
+      remoteRunner: { delegatedSlashCommands: ['/adopt', '/detach'] } });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+  it.each(['new-topic', 'thread'])('rejects delegated detach in primary mode at %s ingress', async route => {
+    const coordination = await import('../src/services/durable-coordination-runtime.js');
+    const primary = vi.spyOn(coordination, 'coordinationModeIsPrimary').mockReturnValue(true);
+    try {
+      const root = 'om_primary_delegated_' + route;
+      const ds = seedThreadSession(root, 'primary');
+      ds.session.cliId = 'remote-runner';
+      ds.session.backendType = 'remote-runner';
+      const send = vi.fn();
+      ds.worker = { killed: false, send } as any;
+      const data = makeEventData('om_primary_msg_' + route, '/disconnect', route === 'thread' ? root : undefined);
+      if (route === 'thread') await handleThreadReply(data, makeCtx(root, 'om_primary_msg_' + route));
+      else await handleNewTopic(data, makeCtx('om_primary_msg_' + route, 'om_primary_msg_' + route));
+      expect(send).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(mocks.closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(repliedKey('cmd.detach.primary_unsupported')).toBe(true);
+    } finally { primary.mockRestore(); }
+  });
+  it('uses the frozen backend when the bot default changes', async () => {
+    const root = 'om_delegated_frozen';
+    const ds = seedThreadSession(root, 'local');
+    ds.session.cliId = 'claude-code';
+    ds.session.backendType = 'tmux';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    await handleThreadReply(makeEventData('om_frozen_detach', '/detach', root), makeCtx(root, 'om_frozen_detach'));
+    expect(send).not.toHaveBeenCalled();
+    expect(repliedKey('cmd.detach.not_adopted')).toBe(true);
+  });
+});

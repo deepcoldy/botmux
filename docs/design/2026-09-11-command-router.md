@@ -231,6 +231,7 @@ type SessionPhase =
 **有意变化**（必须写进 PR 描述，按 PR 归属）：
 
 | 变化 | 今天 | 之后 | 理由 | PR |
+| 显式启用 remote-runner 的 `/adopt`、`/detach`、`/disconnect` | daemon 原生处理 | 独立 `delegated_turn`，仍过 grant / daemon 权限；adopt 普通 turn 冷启动，detach 无会话不启动，primary 拒绝 detach；其它输入完全不变 | provider 管理业务绑定，固定白名单、默认关闭；不复用 forward/raw input | #3469 |
 |---|---|---|---|---|
 | `/resume [id]` | 未注册，整条当未知命令转发给 CLI | 无会话（相位 `none`，或现有会话只是命令空壳 `sessionIsCommandScratch`；`closed` 臂是防御性的，两条入口关闭即删注册项、当前不可达）时由 schema 的 `claimWithoutSessionOnly` 认领为 sessionless daemon 命令（`permission: 'talk'`，有对话权限即可）：恢复本锚点最近关闭的会话，或把别处的已关闭会话复制（cold fork）到这里；有会话时与今天逐字一致（自定义透传照常透传，否则未知命令转发）。不进全局 daemon 集合 | 会话群关闭后改为默认开新会话，需要一个不翻聊天记录的恢复入口；有会话时保留 CLI 原生 `/resume` | session-group 新会话 |
 | `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 |  #1880（接纳前刷新按人身份；等待期间单槽可被新消息覆盖） |
@@ -469,3 +470,7 @@ master 上同样红，见 §16.2）。
 - **dispatcher 层的 pre-routing 命令进表**：`/reply-mode` `/grant` `/tabs` 等在切面 1 之前判定，与 daemon 命令不是一个层；若要统一，是另一份设计。
 - **dogfood**：§15 末尾的清单不变，第一件仍是级联的 3s 忙态宽限对 `/model` 是否合适。
 
+
+### Remote Runner 下放（#3469）
+
+`delegatedCommands` 与 passthrough 集一样由两条入口按有效后端预算，router 不读配置。固定白名单的别名在配置阶段归一，decision 保留原始 cmd/content 以沿用授权及原文 turn。入口完成 grant 和 canRunDaemonCommand 后，带宿主 marker 走普通输入接纳；构造 payload 时只替换 content 为已授权原文，FIFO 不重新分类。pending-repo journal 保留 marker，恢复后仍是同一条结构化命令。该路径不调用原生 adopt/detach handler 或协议 cancel/detach。
