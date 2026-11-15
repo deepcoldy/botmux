@@ -280,12 +280,14 @@ import {
 import { findOnlineDaemon, listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { ensureBotChatGrantMatrix } from '../cli/exact-chat-grant-client.js';
 import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import { HOST_POST_MAX_BODY_BYTES, HOST_POST_PATH, hostPostRequest } from './host-post-request.js';
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { updateMessage, sendUserMessage, sendEphemeralCard } from '../im/lark/client.js';
+import { updateMessage, sendUserMessage, sendEphemeralCard, isCurrentBotInChat, lookupMessageChatId } from '../im/lark/client.js';
 import { deliverAuthLink, type AuthLinkDelivery } from './auth-link-delivery.js';
 import { AUTH_PROVIDERS, PROVIDER_LABEL, deliverProviderLink, platformAuthLink, requestProviderAuth, type AuthProvider, type ProviderAuthResult } from './provider-auth-request.js';
+import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
 import { completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, startBytedcliLogin } from '../services/bytedcli-auth.js';
@@ -9209,6 +9211,35 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
     jsonRes(res, 502, { error: String(e) });
   }
 }));
+
+ipcRoute('POST', HOST_POST_PATH, requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson(req, res, HOST_POST_MAX_BODY_BYTES);
+  if (body === BAD_JSON) return;
+  const parsed = hostPostRequest.safeParse(body);
+  if (!parsed.success) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const { larkAppId, text, ...target } = parsed.data;
+  const { chatId, rootMessageId, userOpenId } = target;
+  // Discovery can race an IPC port being reused. The bound Bot must match.
+  if (larkAppId !== cachedLarkAppId) return jsonRes(res, 409, { ok: false, error: 'bot_mismatch' });
+  if (getBot(larkAppId).config.apiOnly) return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  try {
+    if (chatId && !await isCurrentBotInChat(larkAppId, chatId)) {
+      return jsonRes(res, 403, { ok: false, error: 'bot_not_in_chat' });
+    }
+    if (rootMessageId) {
+      const actualChatId = await lookupMessageChatId(larkAppId, rootMessageId, { timeoutMs: 10_000 });
+      if (!actualChatId) return jsonRes(res, 404, { ok: false, error: 'topic_not_visible' });
+      if (actualChatId !== chatId) return jsonRes(res, 409, { ok: false, error: 'topic_chat_mismatch' });
+    }
+    const messageId = userOpenId !== undefined ? await sendUserMessage(larkAppId, userOpenId, text)
+      : rootMessageId ? await replyMessage(larkAppId, rootMessageId, text, 'text', true, undefined, { chatId })
+      : await sendMessage(larkAppId, chatId, text);
+    return jsonRes(res, 200, { ok: true, larkAppId, ...target, messageId });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: 'lark_request_failed', providerCode: extractLarkBusinessCode(error) });
+  }
+}, NOT_BOUND_BODY.okFalse));
 
 /**
  * Request-bound send (see services/request-bound-group-send.ts): body exactly

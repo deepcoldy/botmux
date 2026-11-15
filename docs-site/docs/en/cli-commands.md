@@ -173,6 +173,20 @@ botmux term-link [id]
 
 Gets a writable Web terminal for a session. The link isn't printed in the terminal; the daemon sends it to the bot owner as a private card (only you can see it in a group; in topics or direct chats it falls back to a direct message). You can omit `id` when there's only one active session. See [Web Terminal](/en/web-terminal).
 
+## Post a message from a host shell
+
+CI jobs, alerting systems, and external agents can use `botmux post` to deliver text they already have. Select a running bot by App ID and provide a destination. The command needs no session ID and starts no AI session.
+
+```bash
+botmux post --bot cli_xxx --chat-id oc_xxx --text "Build complete"
+botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
+printf '%s\n' "Manual action required" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
+```
+
+Run the command in a trusted host shell with access to the local Botmux daemon. The bot must already be in the group. For a topic, supply its group ID and root message ID (`om_…`). For a direct message, use the recipient's `open_id` in the sending bot's app scope. Lark must allow that bot to reach the recipient. Use `--text` or `--text-file` for up to 8192 UTF-8 bytes.
+
+On success, stdout contains one JSON line with `ok`, `larkAppId`, the destination, and Lark's `messageId`. On failure, stderr contains a JSON error and the exit status is 2 for invalid arguments or 1 for a delivery error.
+
 ## Dashboard login link
 
 ```bash

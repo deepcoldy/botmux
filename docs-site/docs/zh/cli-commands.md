@@ -173,6 +173,20 @@ botmux term-link [id]
 
 获取会话的可写 Web 终端。链接不会打印在终端里，而是由 daemon 以私密卡片发给机器人主人（群里只有你能看到，话题或单聊里退回私聊发送）。只有一个活跃会话时可以省略 `id`。详见 [Web 终端](/web-terminal)。
 
+## 从宿主 shell 主动发消息
+
+CI、告警系统和外部 Agent 可以用 `botmux post` 把已有内容作为飞书文本发送。指定运行中的 Bot App ID 和收件位置即可，无需会话 ID 或启动 AI 会话。
+
+```bash
+botmux post --bot cli_xxx --chat-id oc_xxx --text "构建完成"
+botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
+printf '%s\n' "需要人工处理" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
+```
+
+命令在有权访问本机 Botmux daemon 的宿主 shell 中运行。群消息要求 Bot 已入群。话题使用所属群 ID 和根消息 ID（`om_…`）。私聊使用发送 Bot 应用视角下的用户 `open_id`，接收人须在应用可见范围内。正文可用 `--text` 或 `--text-file`，上限为 8192 个 UTF-8 字节。
+
+成功时 stdout 输出一行 JSON，包含 `ok`、`larkAppId`、收件位置和飞书返回的 `messageId`。失败时 stderr 输出 JSON 错误，退出码为 2（参数无效）或 1（投递失败）。
+
 ## Dashboard 登录链接
 
 ```bash
