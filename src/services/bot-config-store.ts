@@ -167,6 +167,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
+  { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
   { key: 'summaryMemoryPath', configKey: 'summaryMemoryPath', kind: 'string', effect: 'immediate', clearable: true, hint: '/summary 记忆文件路径，支持相对当前项目根目录或绝对路径；unset 回 summary.md' },
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },

@@ -119,7 +119,7 @@ export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
-): { content: string } | undefined {
+): { content: string; alreadyApplied: boolean } | undefined {
   let card: any;
   try { card = JSON.parse(cardJson); } catch { return undefined; }
   if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
@@ -127,9 +127,13 @@ export function buildTurnTerminalFooterPatch(
   if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
     return undefined;
   }
-  return { content: appendTurnTerminalReceiptToFooter(
+  const content = appendTurnTerminalReceiptToFooter(
     footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
-  ) };
+  );
+  // The append is idempotent, so an unchanged footer already carries this
+  // receipt (a replayed terminal). Re-sending its fixed CardKit sequence would
+  // only conflict with later element writes on the same card.
+  return { content, alreadyApplied: content === footer.content };
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
@@ -142,7 +146,7 @@ export function contextCompactThreshold(): number {
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions', 'replyCardNextStep'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
   { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];

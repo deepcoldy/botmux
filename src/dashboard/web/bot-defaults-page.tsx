@@ -661,6 +661,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     goalStatusCard: body.goalStatusCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
+    replyCardNextStep: body.replyCardNextStep,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -6000,6 +6001,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
+  const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6017,10 +6019,11 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setGoalStatusCard(bot.goalStatusCard === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
+    setNextStep(bot.replyCardNextStep === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6298,6 +6301,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = replyActions;
                 setReplyActions(checked);
                 void savePatch({ replyCardActions: checked }, 'reply-actions', () => setReplyActions(previous));
+              }}
+            />
+            <ToggleRow
+              checked={nextStep}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-next-step"
+              title={tr('botDefaults.replyCardNextStep')}
+              description={tr('botDefaults.replyCardNextStepDescription')}
+              help={tr('botDefaults.replyCardNextStepHelp')}
+              onChange={checked => {
+                const previous = nextStep;
+                setNextStep(checked);
+                void savePatch({ replyCardNextStep: checked }, 'reply-next-step', () => setNextStep(previous));
               }}
             />
           </div>

@@ -166,9 +166,29 @@ vi.mock('../src/core/ordinary-recovery-retry.js', () => ({
   handleOrdinaryRecoveryRetryClick: (...a: any[]) => recoveryRetryClickMock(...a),
 }));
 
+// The「下一步」row's card writes, recorded instead of sent.
+const nextStepWrites: string[] = [];
+vi.mock('../src/core/next-step-io.js', () => ({ nextStepIo: {
+  enabled: () => true,
+  locale: () => 'zh',
+  issue: (_ds: unknown, prompt: string) => ({ payload: prompt, sig: 'sig' }),
+  readCard: async () => JSON.stringify({ schema: '2.0', body: { elements: [
+    { tag: 'markdown', content: 'answer' },
+    { tag: 'markdown', element_id: 'botmux_reply_footer', content: 'signature' },
+  ] } }),
+  cardId: async (_ds: unknown, messageId: string) => `card_${messageId}`,
+  insert: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`insert ${messageId}`); },
+  replace: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`replace ${messageId}`); },
+  remove: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`remove ${messageId}`); },
+  now: () => Date.now(),
+  warn: () => {},
+} }));
+
 // ─── Imports (after mocks) ────────────────────────────────────────────────
 
 import { handleCardAction } from '../src/im/lark/card-handler.js';
+import { nextStepIdle, noteNextStepCard, noteNextStepSuggestion, noteNextStepTurnStarted } from '../src/core/next-step-suggestion.js';
+import { nextStepIo } from '../src/core/next-step-io.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
@@ -662,4 +682,24 @@ describe('/quote cold admission', () => {
     expect(ds.currentTurnId).toBeUndefined();
     expect(ds.streamCardPending).not.toBe(true);
   });
+  it.each([['live', { killed: false }], ['cold', null]] as const)(
+    'moves the「下一步」row from the previous turn\'s card to the quote turn (%s worker)', async (_kind, worker) => {
+      const ds = makeDs({ worker: worker as any });
+      ds.lastScreenStatus = 'idle';
+      nextStepWrites.length = 0;
+      noteNextStepTurnStarted(ds, 'om_turn_before', nextStepIo);
+      noteNextStepCard(ds, 'om_turn_before', { kind: 'legacy', messageId: 'om_card_before' }, nextStepIo);
+      noteNextStepSuggestion(ds, 'om_turn_before', '继续', nextStepIo);
+      await nextStepIdle(ds);
+      expect(nextStepWrites).toEqual(['insert om_card_before']);
+      await handleCardAction(event(), depsWith(ds), LARK_APP_ID);
+      expect(ds.currentTurnId).toBe('om_quote_click');
+      await nextStepIdle(ds);
+      expect(nextStepWrites).toEqual(['insert om_card_before', 'remove om_card_before']);
+      // The quote turn is the latest one: its own card gets its row.
+      noteNextStepCard(ds, 'om_quote_click', { kind: 'legacy', messageId: 'om_card_quote' }, nextStepIo);
+      noteNextStepSuggestion(ds, 'om_quote_click', '合码', nextStepIo);
+      await nextStepIdle(ds);
+      expect(nextStepWrites).toEqual(['insert om_card_before', 'remove om_card_before', 'insert om_card_quote']);
+    });
 });

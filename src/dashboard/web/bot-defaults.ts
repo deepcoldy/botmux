@@ -166,7 +166,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
+      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
@@ -488,6 +488,7 @@ export type BotDefaultsRow = {
   goalStatusCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
+  replyCardNextStep?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;

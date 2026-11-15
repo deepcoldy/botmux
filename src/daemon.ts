@@ -555,6 +555,8 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
+import { noteNextStepTurnStarted } from './core/next-step-suggestion.js';
+import { nextStepIo } from './core/next-step-io.js';
 import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
@@ -6713,6 +6715,8 @@ function runIdleAutoCompact(): void {
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   noteTurnStarted(ds, turnId);
+  // The previous turn's「下一步」row stops being the last card's.
+  noteNextStepTurnStarted(ds, turnId, nextStepIo);
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
@@ -31132,6 +31136,11 @@ async function handleThreadReplyAdmitted(
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
+    // A suspended/exited worker is the usual way back to a session, so this
+    // turn must also take the「下一步」row off the previous turn's card;
+    // otherwise that row stays clickable and this turn's own row is refused
+    // as belonging to an older turn.
+    noteNextStepTurnStarted(ds, parsed.messageId, nextStepIo);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -32619,6 +32628,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
+      noteNextStepTurnStarted(ds, turnId, nextStepIo);
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors

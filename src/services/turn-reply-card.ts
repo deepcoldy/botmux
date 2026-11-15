@@ -87,6 +87,8 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   displayRetired?: boolean;
   overflowMessageId?: string;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
+  /** The CLI's next-input suggestion shown on a completed turn's card. */
+  nextStep?: import('../im/lark/next-step-card.js').NextStepButton;
 }
 
 export type TurnReplyCardEvent =
@@ -99,6 +101,8 @@ export type TurnReplyCardEvent =
   | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
   | { kind: 'display_retired'; notice: string }
   | { kind: 'refresh' }
+  /** Set or clear the next-step row; valid after the terminal edge too. */
+  | { kind: 'next_step'; nextStep?: import('../im/lark/next-step-card.js').NextStepButton }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
@@ -295,6 +299,9 @@ export class TurnReplyCardStore {
             delete record.disconnected;
           }
         }
+      } else if (event.kind === 'next_step') {
+        if (event.nextStep) record.nextStep = event.nextStep;
+        else delete record.nextStep;
       } else if (event.kind === 'terminal') {
         for (const entry of record.asks ?? []) {
           if (!entry.result && (!event.disconnected || event.orphanAskIds?.includes(entry.ask.askId))) {
@@ -370,9 +377,15 @@ export class TurnReplyCardStore {
 
       const render = () => {
         const visibleRecord = hideUndeliveredFinal && !record.finalDelivered ? { ...record, finalCard: undefined } : record;
-        const body = io.render(visibleRecord.displayRetired && visibleRecord.finalCard && visibleRecord.phase === 'ambiguous'
-          ? { ...visibleRecord, phase: 'completed' } : visibleRecord);
-        return record.omitImages ? omitReplyCardImages(body) : body;
+        const shown: TurnReplyCardRecord = visibleRecord.displayRetired && visibleRecord.finalCard && visibleRecord.phase === 'ambiguous'
+          ? { ...visibleRecord, phase: 'completed' } : visibleRecord;
+        const finish = (body: string) => record.omitImages ? omitReplyCardImages(body) : body;
+        const body = finish(io.render(shown));
+        // The「下一步」row is optional chrome, sized before the transport adds
+        // its own (the on-call control): when only the row makes the card too
+        // big, leave it off rather than move the answer into an attachment.
+        if (!shown.nextStep || turnReplyCardRequestBytes(body, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES) return body;
+        return finish(io.render({ ...shown, nextStep: undefined }));
       };
       // The display can retire before this turn ends (a newer turn replaced
       // it, a push failed, the channel was switched off, or a restart lost it).

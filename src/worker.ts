@@ -39,6 +39,7 @@ import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import { PromptSuggestionPublisher } from './utils/prompt-suggestion-publisher.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -23704,6 +23705,8 @@ function startScreenUpdates(): void {
   // Last Claude permission dialog already notified (dedup by projection text;
   // cleared when the dialog leaves the screen so the next one notifies again).
   let lastClaudeActionPrompt = '';
+  // The CLI's own next-input suggestion (adapters with promptSuggestion only).
+  const promptSuggestions = new PromptSuggestionPublisher();
   // PTY-activity watermark of the last tick that actually captured. The screen
   // normally reaches us only through onPtyData (it updates lastPtyActivityAtMs
   // and feeds the renderer in the same place), so when this hasn't advanced the
@@ -23795,9 +23798,11 @@ function startScreenUpdates(): void {
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
           // from tmux every tick. This eliminates the accumulated-buffer drift
           // that produced duplicated/staircase text in 'text' display mode.
-          const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true });
+          const suggestionReader = cliAdapter?.promptSuggestion;
+          const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
           if (pipeText) {
             content = pipeText.content;
+            if (suggestionReader && pipeText.cells) promptSuggestions.observe(suggestionReader(pipeText.cells), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
             // Geometry is part of the frame: the same ANSI re-wrapped on a
             // resized pane renders different text.
             const hash = `${pipeText.cols}x${pipeText.rows}:${pipeText.ansi}`;
@@ -23813,6 +23818,7 @@ function startScreenUpdates(): void {
             const snap = renderer.snapshot();
             content = snap.content;
             changed = snap.changed;
+            if (suggestionReader) promptSuggestions.observe(suggestionReader(renderer.viewportCells()), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
           } else {
             return null;
           }
@@ -23865,6 +23871,10 @@ function startScreenUpdates(): void {
           lastClaudeActionPrompt = '';
         }
       }
+      const suggestion = promptSuggestions.take(usageAware.status, {
+        turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
+      if (suggestion) send({ type: 'prompt_suggestion', ...suggestion });
       // A Monitor's deadline can pass with no transcript record to re-read on,
       // and a stop can land in a transcript the bridge does not follow.
       settleBackgroundTasksFromSiblings();
