@@ -1176,7 +1176,13 @@ function prepareAdmittedLinkRefPayload(input: {
   }
   const runtime = getLinkRefRuntime();
   if (!runtime) {
-    return { payload: { ...input.payload, linkRefs: { mode } }, mode };
+    return {
+      payload: { ...input.payload, linkRefs: {
+        mode,
+        ...(input.payload.linkRefs?.presentation ? { presentation: input.payload.linkRefs.presentation } : {}),
+      } },
+      mode,
+    };
   }
   return {
     payload: prepareLinkRefTurnPayload({
@@ -1216,6 +1222,7 @@ function freezeDeferredLinkRefPayload(input: {
       ...input.payload,
       linkRefs: {
         mode,
+        ...(input.payload.linkRefs?.presentation ? { presentation: input.payload.linkRefs.presentation } : {}),
         ...(input.payload.linkRefs?.sources
           ? { sources: input.payload.linkRefs.sources }
           : {}),

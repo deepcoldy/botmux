@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { logger } from '../../utils/logger.js';
@@ -1097,9 +1098,12 @@ export class RemoteRunnerBackend implements SessionBackend {
         return false;
       }
     }
-    if (this.activeBindingTurn && !finalBindingCommit
-        && (state.agentThreadId !== this.state?.agentThreadId
-          || JSON.stringify(state.providerState) !== JSON.stringify(this.state?.providerState))) {
+    // Business bindings are a provider-session invariant, including idle gaps
+    // and late events after a turn settles. Compute lineage may still advance
+    // independently as long as it preserves the committed business snapshot.
+    if ((this.config.delegatedSlashCommands?.length ?? 0) > 0 && this.state && !finalBindingCommit
+        && (state.agentThreadId !== this.state.agentThreadId
+          || !isDeepStrictEqual(state.providerState, this.state.providerState))) {
       this.failProtocol('delegated slash binding changes must be published in final.state');
       return false;
     }

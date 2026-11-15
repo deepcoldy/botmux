@@ -148,7 +148,8 @@ input.on('line', line => {
       }
       if (!state.agentThreadId) {
         state = { ...state, agentThreadId: `reference-thread:${command.turnId}` };
-        emit({ type: 'lineage_changed', state });
+        // Business binding is published with final.state, including an ordinary
+        // first message on a Bot that opted into delegated slash commands.
       }
       emit({ type: 'progress', turnId: command.turnId, content: `reference: ${command.content}` });
       screen = `reference: ${command.content}`;

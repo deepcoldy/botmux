@@ -109,6 +109,8 @@ export interface SlashRouteInput {
    *  与 isDisposableCommandScratch 不同）。只影响「仅无会话时认领」的命令（`/resume`）：空壳不算
    *  会话。缺省 = 不是空壳。 */
   sessionIsCommandScratch?: boolean;
+  /** A persisted backend runtime is real session evidence even before the first conversation turn. */
+  sessionHasBackendState?: boolean;
   /** 当前 bot 有效插件声明的飞书指令：指令名 → pluginId（两个插件同名时为 null，执行段 fail closed）。
    *  缺省 = 无插件指令，判定与改造前逐字一致。 */
   /** Precomputed opt-in set, empty unless the effective backend is remote-runner. */
@@ -205,7 +207,7 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
 
   const delegated = normalizeDelegatedSlashCommand(cmd);
   if (delegated && input.delegatedCommands?.has(delegated)) {
-    const hasSession = phaseHasSession(input.phase) && input.phase !== 'closed';
+    const hasSession = phaseHasSession(input.phase) && input.phase !== 'closed' && (!input.sessionIsCommandScratch || input.sessionHasBackendState === true);
     return { kind: 'delegated_turn', cmd, content,
       sessionPolicy: hasSession ? 'existing' : delegated === '/adopt' ? 'precreate' : 'unbound' };
   }

@@ -31572,6 +31572,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       context: 'thread',
       phase: deriveSessionPhase(existingDs),
       sessionIsCommandScratch: !!existingDs && isResumeRecoveryPlaceholder(existingDs),
+      sessionHasBackendState: existingDs?.session.remoteBackendState !== undefined,
       passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
       coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
       senderIsBot: isBotSenderType || isForeignBotSender,

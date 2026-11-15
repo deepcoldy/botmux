@@ -320,3 +320,9 @@ provider 按现有协议先 ACK `status: busy`，可发 `progress`，最后发 `
 `examples/remote-runner/reference-runner.mjs` 可直接运行：`/adopt` 列出 alpha/beta，`/adopt reference-thread:alpha` 绑定，`/disconnect` 解绑，重复解绑返回无绑定。候选集保存在 `providerState.adoptCandidates`，只在 `final` 回传业务变更。
 
 实现隔离：未启用下放的 Bot 保持原有路由与输入身份。Remote Runner 的串行刷新和 final-only 绑定守卫同样受该 provider 启动配置的下放开关限制；普通 PTY/tmux/riff/mojo/codex-app 输入不携带 acceptedInput，沿用原来的构造与持久化分支。
+
+下放命令的 LinkRefs 使用内部 `registry-only` 展示政策：仍登记链接、冻结模式并保存来源，但不把 `<botmux_link_refs>` 等模型说明追加到 `turn.content`，包括经过持久队列和重启恢复后。普通对话沿用原有 companion 注入。
+
+启用下放的 provider 会话在 turn 之间同样保护已提交业务绑定；迟到的 `lineage_changed` 不能更新 `agentThreadId` 或选择状态。初始化/恢复 ready 可回填已提交快照，有效 final 可提交业务变更；计算资源 lineage 仍可在保持业务快照相等时递增 generation，JSON 对象键序变化不视为业务变更。reference runner 的普通首轮绑定也在 final.state 发布。
+
+无历史的 command scratch 只有在没有持久 provider 快照时才按无绑定处理；已经启动过 provider、保留 remoteBackendState 的空首轮/恢复记录仍是已有会话，不因此拒绝 detach。该判定只用于下放路由，不改变原 /resume 的空壳恢复口径。

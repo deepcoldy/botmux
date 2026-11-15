@@ -2197,6 +2197,7 @@ function finalizeCliTurnInput(
     ...payload,
     linkRefs: {
       mode,
+      ...(opts?.acceptedInput ? { presentation: 'registry-only' as const } : {}),
       sources: initialLinkRefSources({
         userText,
         userSourceType: opts?.linkRefSourceType,

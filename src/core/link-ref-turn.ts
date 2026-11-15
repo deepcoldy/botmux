@@ -97,6 +97,7 @@ export function prepareLinkRefTurnPayload(input: {
       ? {
           ...input.payload,
           linkRefs: {
+            ...input.payload.linkRefs,
             mode: input.mode,
             sources: materializeAttachmentSources(input.payload.linkRefs.sources),
           },
