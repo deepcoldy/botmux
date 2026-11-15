@@ -13336,10 +13336,11 @@ export function startIpcServer(opts: {
     // server.close() only stops accepting: its callback waits for every already
     // accepted socket to finish. A request whose body we abandoned (the 413
     // early return resumes the request and answers without reading the rest)
-    // leaves such a socket behind on Bun, which then never completes the
-    // handshake and keeps close() pending forever — a test that awaits close()
-    // hangs, and so would daemon teardown. Destroy the tracked sockets first so
-    // shutdown is bounded, mirroring listen-with-probe's release path.
+    // can leave such a socket behind — on Bun 1.4.4 that socket never finishes,
+    // so close() stays pending forever. That stalls a test awaiting close() and,
+    // via the daemon's teardown call, shutdown itself. Closing every connection
+    // before the listener makes shutdown bounded; listen-with-probe's release
+    // path tears sockets down for the same reason.
     close: () => new Promise<void>(r => {
       server.closeAllConnections?.();
       server.close(() => r());
