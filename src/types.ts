@@ -2096,6 +2096,9 @@ export interface CliTurnPayload {
   rerouteEnvelope?: CrossPrincipalInterruptionMessage;
 }
 
+/** Exact provider control text plus the host-authenticated caller; no CLI sidecars. */
+export type AcceptedCommandInput = Pick<CliTurnPayload, 'content' | 'trustedCaller'>;
+
 /** Exact ordered successor retained behind an adapter-ACKed activation. */
 export interface QueuedActivationTailEntry {
   id: string;
@@ -2111,6 +2114,7 @@ export interface QueuedActivationTailEntry {
  * this record after restart; the record is cleared only with the activation
  * journal's adapter-level ACK. */
 export interface PendingRepoSetup {
+  acceptedInput?: AcceptedCommandInput;
   mode: 'picker' | 'auto_worktree';
   linkRefMode?: import('./services/link-ref-types.js').LinkRefMode;
   prompt: string;
