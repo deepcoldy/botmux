@@ -14344,7 +14344,29 @@ function codexBridgeIngest(opts: {
     && !structuredBridgeIs('antigravity')
     && hasAssistantFinal) {
     idleDetector?.fireIdle();
+  } else if (opts.signalIdle === false
+    && !structuredBridgeIs('antigravity')
+    && hasAssistantFinal) {
+    // A caller that must not raise the idle edge inside its own critical
+    // section (a flush's post-terminal fence check, an interrupt drain) can
+    // still be the drain that consumes the turn's final. The watcher/poller
+    // then finds nothing new, so the idle signal it would have raised is owed
+    // here: a prompt-ready edge rejected while that turn was open has nothing
+    // else to re-drive it once the composer sits still (a queued follow-up
+    // stays stranded). Deliver it after the caller unwinds, to the same CLI.
+    deferFinalIdleSignal();
   }
+}
+
+/** The idle signal of a final consumed by a non-signalling drain, raised on
+ *  the next tick for the CLI generation that wrote it. fireIdle is idempotent. */
+function deferFinalIdleSignal(): void {
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  setImmediate(() => {
+    if (!target || backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress) return;
+    idleDetector?.fireIdle();
+  });
 }
 
 /** Background tasks a structured drainer reported (Grok's updates.jsonl, see
