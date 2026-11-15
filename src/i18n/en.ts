@@ -1041,6 +1041,8 @@ export const messages: Record<string, string> = {
   'config.label.privateCard': 'Private snapshot card',
   'config.label.replyCardActions': 'Reply card action menu',
   'config.label.replyCardNextStep': 'Reply card next-step button',
+  'config.label.replyCardRecap': 'Reply card turn recap',
+  'config.label.replyCardRecapModel': 'Turn recap by a small model',
   'config.label.autoStartOnGroupJoin': 'Auto-start on join',
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
   'config.label.chatManagerEnabled': 'Group manager (default responder)',
