@@ -27,7 +27,10 @@ export const MAX_SCHEDULE_RUN_LOG_ERROR_BYTES = 2 * 1024;
 export type ScheduleRunTrigger = 'scheduler' | 'dashboard';
 export type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'calendar_skipped' | 'error';
 export type ScheduleRunPrecondition = 'not_checked' | 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
-export type ScheduleRunTargetOutcome = 'model_dispatched' | 'error';
+/** Per-target dispatch fact. `deferred` means this target's input was held
+ *  behind a managed-runtime handoff; it is not a run-log terminal state and
+ *  the run's own outcome stays unset until every target settles. */
+export type ScheduleRunTargetOutcome = 'model_dispatched' | 'deferred' | 'error';
 
 export interface ScheduleRunTargetResult {
   chatId: string;
@@ -88,7 +91,7 @@ const PRECONDITIONS = new Set<ScheduleRunPrecondition>([
   'skipped',
   'error',
 ]);
-const TARGET_OUTCOMES = new Set<ScheduleRunTargetOutcome>(['model_dispatched', 'error']);
+const TARGET_OUTCOMES = new Set<ScheduleRunTargetOutcome>(['model_dispatched', 'deferred', 'error']);
 
 function assertNonEmpty(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0) {

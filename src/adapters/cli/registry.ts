@@ -371,6 +371,20 @@ export function resolveCommandReal(cmd: string): string {
 }
 
 /**
+ * The UPDATABLE install entry: what `resolveCommand` found, without collapsing
+ * the last alias.
+ *
+ * Use this for anything that must keep observing the operator-selected entry
+ * across time (the TRAE install watcher / runtime gate). `resolveCommandReal`
+ * freezes the path to the release leaf that happened to be current at call
+ * time, so a later `current -> releases/B` switch becomes invisible. Paths that
+ * are actually handed to a spawner still need `resolveCommandReal`.
+ */
+export function resolveCommandEntry(cmd: string): string {
+  return resolveCommand(cmd);
+}
+
+/**
  * Locate an executable the way `execvp` will at spawn time: an absolute path is
  * checked directly, a bare name is searched across the current process's PATH.
  * Returns the resolved absolute path, or null when nothing runnable is found.

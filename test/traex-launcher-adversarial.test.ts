@@ -165,6 +165,9 @@ function makeWorkerFixture(options: {
         },
       }),
     publishLocalProcessAttestation: vi.fn((_pid: number) => true),
+    // The PR's shared-cache lease is attached from the same ownership rewiring
+    // this harness slices; the real closure lives outside the sliced boundary.
+    attachTraexLeaseCli: vi.fn((_pid: number) => {}),
     observeCursorCliSessionId: vi.fn(),
     observeAntigravityCliSessionId: vi.fn(),
     observeZcodeCliSessionId: vi.fn(),

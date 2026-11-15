@@ -113,6 +113,12 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
   const fake = join(root, 'fake-traex');
   writeFileSync(fake, `#!${nodeTsRunnerPrefix().command}
 const fs = require('node:fs');
+// The managed TRAE handoff materialises a snapshot copy of this launcher and
+// probes its hook-trust support with \`--version\` before the real spawn. Answer
+// that probe like a CLI so it is never recorded as a model launch.
+if (process.argv.includes('--version') || process.argv.includes('-V')) {
+  process.stdout.write('traex 0.212.1\\n'); process.exit(0);
+}
 if (process.argv[2] === 'debug') {
   fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: 'debug/models' }) + '\\n');
   process.stdout.write(JSON.stringify({ models: [] })); process.exit(0);

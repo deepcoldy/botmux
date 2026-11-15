@@ -11,7 +11,15 @@ import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunAsClaim } from '../types.js';
+import type {
+  ScheduledTask,
+  ParsedSchedule,
+  ScheduleDeferredTargetState,
+  ScheduleExecutionPosition,
+  ScheduleNotifyEvent,
+  ScheduleRunAsClaim,
+  ScheduledTaskDeferredContext,
+} from '../types.js';
 import { parseScheduleRunAsClaim } from './schedule-run-as.js';
 import {
   completeUntilDone,
@@ -375,6 +383,8 @@ function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: st
       if (task.lastRunId !== runId) return;
       return settleUntilDoneSkip({ ...task, lastRunAt: new Date().toISOString(), lastStatus: 'skipped',
         lastError: undefined, lastDeliveryError: undefined,
+        // Terminal settlement: a parked run never survives a skip.
+        deferredRun: undefined,
         runStats: recordRunOutcome(task.runStats, 'skipped'),
         ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) }, runId, Date.now());
     });
@@ -410,6 +420,8 @@ function markRuntimeCalendarBlocked(
         lastCalendarCheck: check,
         lastError: undefined,
         lastDeliveryError: undefined,
+        // Terminal settlement: a parked run never survives a calendar skip.
+        deferredRun: undefined,
         runStats: recordRunOutcome(task.runStats, 'skipped'),
       };
     }
@@ -424,6 +436,8 @@ function markRuntimeCalendarBlocked(
       lastCalendarCheck: check,
       lastError: check.reason,
       lastDeliveryError: undefined,
+      // Terminal settlement: a parked run never survives a calendar error.
+      deferredRun: undefined,
       failureAlertSent: (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined,
       runStats: tracking.runStats,
     };
@@ -464,6 +478,23 @@ function markRuntimeRun(
   let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
+    const deferred = task.deferredRun;
+    if (!success && runId !== undefined && deferred?.runId === runId && deferredRunHasUnsettledTargets(deferred)) {
+      // The run is still owed targets (waiting / dispatching / ambiguous). A
+      // failed retry attempt must not settle it: keep the parked identity and
+      // retry clock, record no run outcome and consume no repeat/once. An
+      // ambiguous target in particular must never take the still-waiting
+      // targets' ownership down with it.
+      return {
+        ...task,
+        lastStatus: 'deferred',
+        lastError: error,
+        deferredRun: {
+          ...deferred,
+          retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+        },
+      };
+    }
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
@@ -497,6 +528,10 @@ function markRuntimeRun(
         : (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined,
       repeat,
       runStats: tracking.runStats,
+      // Terminal settlement: the parked run (if any) has now finished. Keeping
+      // `deferredRun` here would let the retry clock re-claim the same runId and
+      // account a second execution/repeat for one logical run.
+      deferredRun: undefined,
       ...(consumedByRun ? { enabled: false, disabledReason: 'once_completed', nextRunAt: undefined } : {}),
     };
     // Until-done tasks are not consumed by a run (one-shot or failed): they
@@ -513,6 +548,15 @@ function recordDispatchOutcome(
   outcome: ScheduledTaskPreconditionOutcome | void,
 ): void {
   const current = runtimeTask(task.id);
+  // A late result from a superseded run must not settle (or announce) the run
+  // that currently owns the task. The deferred retry path keeps the same runId,
+  // so this only drops outcomes from genuinely older runs. A row without a
+  // recorded run id cannot prove supersession, so it is settled as before.
+  if (current?.lastRunId && current.lastRunId !== context.runId) return;
+  // `deferred` is a waiting state, not an outcome: the daemon already parked
+  // the run and will re-claim it once the runtime handoff clears. Never record
+  // success, a run-log terminal state, or repeat/once completion here.
+  if (outcome === 'deferred') return;
   if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId) {
     // A very short model turn can fail its send before dispatch returns.
     // Keep that failure; only account for the dispatch that just completed.
@@ -523,6 +567,8 @@ function recordDispatchOutcome(
       const paused = value.enabled === false && value.disabledReason === 'manual';
       const dispatched = { ...value, repeat,
         lastStatus: 'error' as const,
+        // This dispatch settled the logical run; a parked retry must not replay it.
+        deferredRun: undefined,
         deliveryFailureState: value.deliveryFailureState
           ? { ...value.deliveryFailureState, previousStatus: 'ok' as const, previousConsecutiveFailures: 0 }
           : undefined,
@@ -537,6 +583,14 @@ function recordDispatchOutcome(
       id: task.id, runAt: Date.now(), status: 'error', error: current.lastDeliveryError } });
     return;
   }
+  // A success callback is not an acceptance fact: fork return only means the
+  // worker process was started. Settle only once every target's exact turn has
+  // been proven accepted by the worker; otherwise keep the run parked so no
+  // success log/notification/once-repeat accounting happens early. Skips are
+  // terminal and do not dispatch, so they are not gated here.
+  if (outcome !== 'skipped'
+    && current?.deferredRun
+    && !deferredRunFullyAccepted(current.deferredRun)) return;
   const status = outcome === 'skipped' ? 'skipped' : 'ok';
   if (status === 'skipped') {
     let nextRunAt: string | undefined;
@@ -557,6 +611,532 @@ function recordDispatchOutcome(
     body: { id: task.id, runAt: Date.now(), status },
   });
   emitScheduleFiredHook(task, status);
+}
+
+// ─── Deferred runs (managed-runtime handoff) ────────────────────────────────
+//
+// A deferred run is NOT a run-log outcome and never carries `finishedAt`. It
+// keeps the claimed run identity (runId, per-target turn ids, effective extra
+// prompt) in task runtime state so a retry re-enters the same logical run. The
+// scheduler owns these mutations so both the legacy JSON projection and the
+// authority SQLite row are updated consistently.
+
+export interface DeferredRunParkInput {
+  runId: string;
+  detail: string;
+  additionalPrompt?: string;
+  precondition?: 'none' | 'disabled' | 'passed';
+  /** Target chat ids with their current ownership state. A target that was
+   *  already dispatched is kept as `dispatched` and must never be replayed;
+   *  `held` means a worker owns it and is waiting in its start gate. */
+  targets: Record<string, ScheduleDeferredTargetState>;
+  /** Exact turns already owned by a worker at the start gate. */
+  heldTargets?: Record<string, string>;
+  /** Exact turns already accepted by their worker. */
+  acceptedTargets?: Record<string, string>;
+  targetTurnIds?: Record<string, string>;
+}
+
+/** Execution inputs a deferred run freezes at admission time. */
+const DEFERRED_CONTEXT_KEYS: ReadonlyArray<keyof ScheduledTaskDeferredContext> = [
+  'prompt', 'workingDir', 'chatId', 'chatIds', 'rootMessageId', 'chatType',
+  'scope', 'executionPosition', 'topicTitle', 'larkAppId', 'creatorChatId',
+  'creatorRootMessageId', 'creatorLarkAppId', 'ownerOpenId', 'ownerUnionId',
+  'runAsClaim', 'model', 'reasoningEffort', 'silent', 'deliver', 'followActive',
+];
+
+/** Snapshot the execution-relevant fields of the task row. */
+export function freezeDeferredContext(task: ScheduledTask): ScheduledTaskDeferredContext {
+  const context = {} as ScheduledTaskDeferredContext;
+  for (const key of DEFERRED_CONTEXT_KEYS) {
+    const value = (task as any)[key];
+    if (value === undefined) continue;
+    (context as any)[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return context;
+}
+
+/** Overlay the frozen inputs onto a claimed task so a retry runs exactly what
+ *  the original attempt accepted, regardless of edits made while parked. */
+function overlayDeferredContext(task: ScheduledTask, context: ScheduledTaskDeferredContext): ScheduledTask {
+  const next = { ...task };
+  for (const key of DEFERRED_CONTEXT_KEYS) {
+    const value = (context as any)[key];
+    if (value === undefined) delete (next as any)[key];
+    else (next as any)[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return next;
+}
+
+/** A parked run may only be settled once every target has actually been
+ *  dispatched. Waiting/dispatching targets are still owed; an ambiguous target
+ *  needs a human decision and must never be silently dropped with the run. */
+function deferredRunHasUnsettledTargets(deferred: NonNullable<ScheduledTask['deferredRun']> | undefined): boolean {
+  if (!deferred) return false;
+  return Object.values(deferred.targets).some(state => state !== 'dispatched');
+}
+
+/** Every target must be dispatched AND carry the worker's acceptance fact for
+ *  its exact turn. A missing acceptance (fork return only) is never success. */
+function deferredRunFullyAccepted(deferred: NonNullable<ScheduledTask['deferredRun']>): boolean {
+  const entries = Object.entries(deferred.targets);
+  if (entries.length === 0) return false;
+  return entries.every(([chatId, state]) => {
+    if (state !== 'dispatched') return false;
+    if (deferred.heldTargets?.[chatId]) return false;
+    const accepted = deferred.acceptedTargets?.[chatId];
+    if (!accepted) return false;
+    const turn = deferred.targetTurnIds?.[chatId];
+    return turn === undefined || turn === accepted;
+  });
+}
+
+/** Park the claimed run behind a runtime handoff. Reuses `since` when the same
+ *  run defers again. Never touches nextRunAt: the occurrence was consumed by
+ *  the original claim. */
+export function parkDeferredRun(
+  id: string,
+  context: ScheduleExecutionContext,
+  input: DeferredRunParkInput,
+): boolean {
+  let parked = false;
+  mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== context.runId) return;
+    const existing = task.deferredRun?.runId === context.runId ? task.deferredRun : undefined;
+    parked = true;
+    // A retry reports the current state of every target, but a turn id is a
+    // durable identity: keep the one already persisted for a target the retry
+    // did not mention instead of minting a replacement.
+    const targetTurnIds: Record<string, string> = {
+      ...(existing?.targetTurnIds ?? {}),
+      ...(input.targetTurnIds ?? {}),
+    };
+    for (const chatId of Object.keys(targetTurnIds)) {
+      if (!(chatId in input.targets)) delete targetTurnIds[chatId];
+    }
+    // Ownership bookkeeping survives a re-park, and an ACCEPTED exact turn is
+    // monotonic: a caller that captured `parked` before an await cannot restore
+    // `held`/`waiting` over an acceptance that landed while it awaited. Input
+    // ownership claims are advisory and only count when their turn matches the
+    // durable turn id for that chat.
+    const heldTargets: Record<string, string> = { ...(existing?.heldTargets ?? {}) };
+    const acceptedTargets: Record<string, string> = { ...(existing?.acceptedTargets ?? {}) };
+    for (const [chatId, turnId] of Object.entries(input.heldTargets ?? {})) {
+      if (targetTurnIds[chatId] === turnId) heldTargets[chatId] = turnId;
+    }
+    for (const [chatId, turnId] of Object.entries(input.acceptedTargets ?? {})) {
+      if (targetTurnIds[chatId] === turnId) acceptedTargets[chatId] = turnId;
+    }
+    for (const chatId of Object.keys(heldTargets)) {
+      if (!(chatId in input.targets)) delete heldTargets[chatId];
+    }
+    for (const chatId of Object.keys(acceptedTargets)) {
+      if (!(chatId in input.targets)) delete acceptedTargets[chatId];
+    }
+    const targets: Record<string, ScheduleDeferredTargetState> = { ...input.targets };
+    for (const [chatId, turnId] of Object.entries(acceptedTargets)) {
+      if (targetTurnIds[chatId] === turnId) {
+        targets[chatId] = 'dispatched';
+        delete heldTargets[chatId];
+      } else {
+        // An acceptance for a different turn says nothing about this one.
+        delete acceptedTargets[chatId];
+      }
+    }
+    return {
+      ...task,
+      lastStatus: 'deferred',
+      deferredRun: {
+        runId: context.runId,
+        since: existing?.since ?? new Date().toISOString(),
+        reason: 'traex_runtime',
+        detail: input.detail || existing?.detail || 'managed TRAE runtime handoff',
+        ...(input.additionalPrompt ?? existing?.additionalPrompt
+          ? { additionalPrompt: input.additionalPrompt ?? existing?.additionalPrompt } : {}),
+        ...(input.precondition ?? existing?.precondition
+          ? { precondition: input.precondition ?? existing?.precondition } : {}),
+        retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+        targets,
+        ...(Object.keys(heldTargets).length > 0 ? { heldTargets } : {}),
+        ...(Object.keys(acceptedTargets).length > 0 ? { acceptedTargets } : {}),
+        ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
+        // Freeze once: an edit made while parked must not change the prompt or
+        // routing the remaining targets were admitted for.
+        context: existing?.context ?? freezeDeferredContext(task),
+      },
+    };
+  });
+  if (parked) {
+    const parkedTask = runtimeTask(id);
+    dashboardEventBus.publish({
+      type: 'schedule.updated',
+      body: { id, patch: { lastStatus: 'deferred', deferredRun: parkedTask?.deferredRun } },
+    });
+  }
+  return parked;
+}
+
+/** A parked run must not wait forever behind a runtime handoff. Past this bound
+ *  it settles as one failed run instead of silently never firing. */
+export const TRAEX_DEFERRED_RUN_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * Terminally settle a parked run that can no longer progress (ambiguous target,
+ * worker exit, or the handoff timeout).
+ *
+ * One exit for every stuck case: clear the parked identity so `markRuntimeRun`
+ * cannot re-park it, record the failed run once (failure accounting + at most
+ * one alert), write one run-log error, and publish one fired event. The next
+ * occurrence is already armed by the original claim; one-shots are disabled by
+ * `markRuntimeRun`. A second call for the same run is a no-op.
+ */
+export function settleParkedRunOnce(
+  id: string,
+  runId: string,
+  reason: string,
+  appId?: string,
+): boolean {
+  const before = runtimeTask(id, appId);
+  const deferred = before?.deferredRun;
+  if (!before || !deferred || deferred.runId !== runId) return false;
+  let cleared = false;
+  mutateRuntimeTask(id, task => {
+    if (task.deferredRun?.runId !== runId) return;
+    cleared = true;
+    return { ...task, deferredRun: undefined };
+  }, appId);
+  if (!cleared) return false;
+  const result = markRuntimeRun(id, false, reason, undefined, runId);
+  const settled = runtimeTask(id, appId);
+  if (!settled) return true;
+  if (result.crossedFailureThreshold) {
+    emitFailureAlertIfNeeded(settled, result);
+  } else if (failureAlert && settled.failureAlertSent !== true) {
+    // A stuck run is an operational fault on its own: alert once even before
+    // the normal consecutive-failure streak reaches its threshold. The same
+    // watermark keeps the alert single-shot for this streak.
+    try {
+      failureAlert(settled, result.consecutiveFailures ?? 1, reason);
+      mutateRuntimeTask(id, task => ({ ...task, failureAlertSent: true }), appId);
+    } catch (error) {
+      logger.warn(`[scheduler] Deferred-run failure alert failed for ${id}: ${String(error)}`);
+    }
+  }
+  const scope = settled.larkAppId ?? appId ?? scheduleStore.getScheduleScope();
+  if (scope) {
+    try {
+      appendScheduleRunLog({
+        id: runId,
+        taskId: id,
+        trigger: 'scheduler',
+        outcome: 'error',
+        precondition: deferred.precondition ?? 'not_checked',
+        startedAt: deferred.since,
+        finishedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - Date.parse(deferred.since)),
+        additionalPrompt: !!deferred.additionalPrompt,
+        errorCode: 'deferred_unsettled',
+        error: reason,
+      }, scope);
+    } catch (error) {
+      logger.warn(`[scheduler] Deferred run log unavailable for ${id}: ${String(error)}`);
+    }
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id, runAt: Date.now(), status: 'error', error: reason },
+  });
+  emitScheduleFiredHook(settled, 'error', reason);
+  return true;
+}
+
+/** Persist `dispatching` immediately before the target's IPC send. A crash in
+ *  this state becomes `ambiguous` on restart (never auto-replayed).
+ *
+ *  This is also the first external effect of a fresh run: there is no parked
+ *  record yet, so the marker must create the full deferred run (targets, frozen
+ *  execution context, retry clock) in the same write. Returning false means the
+ *  write did not land and the caller MUST NOT send. */
+export function markDeferredTargetDispatching(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  let changed = false;
+  try {
+    mutateRuntimeTask(id, task => {
+      if (task.lastRunId !== runId) return;
+      const existing = task.deferredRun?.runId === runId ? task.deferredRun : undefined;
+      const targets: Record<string, ScheduleDeferredTargetState> = existing
+        ? { ...existing.targets }
+        : Object.fromEntries(
+            scheduleStore.effectiveScheduleChatIds(task).map(cid => [cid, 'waiting' as const]),
+          );
+      if (!(chatId in targets)) return;
+      if (targets[chatId] === 'dispatched' || targets[chatId] === 'ambiguous') return;
+      if (existing?.acceptedTargets?.[chatId] === turnId) return;
+      targets[chatId] = 'dispatching';
+      changed = true;
+      return {
+        ...task,
+        deferredRun: {
+          runId,
+          since: existing?.since ?? new Date().toISOString(),
+          reason: 'traex_runtime',
+          detail: existing?.detail ?? 'managed TRAE runtime handoff',
+          ...(existing?.additionalPrompt ? { additionalPrompt: existing.additionalPrompt } : {}),
+          ...(existing?.precondition ? { precondition: existing.precondition } : {}),
+          retryAt: existing?.retryAt ?? new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+          targets,
+          ...(existing?.heldTargets && Object.keys(existing.heldTargets).length > 0
+            ? { heldTargets: existing.heldTargets }
+            : {}),
+          ...(existing?.acceptedTargets && Object.keys(existing.acceptedTargets).length > 0
+            ? { acceptedTargets: existing.acceptedTargets }
+            : {}),
+          targetTurnIds: { ...(existing?.targetTurnIds ?? {}), [chatId]: turnId },
+          context: existing?.context ?? freezeDeferredContext(task),
+        },
+      };
+    }, appId);
+  } catch (error) {
+    logger.warn(`[scheduler] failed to persist deferred dispatching for ${id}/${chatId}: ${error}`);
+    return false;
+  }
+  return changed;
+}
+
+/**
+ * A worker start gate is waiting for a scheduled turn.
+ *
+ * This is NOT "not yet dispatched": the worker already owns the exact turn and
+ * is waiting inside its gate. It must therefore neither settle success nor be
+ * re-dispatched by a retry.
+ *
+ * - Still-parked run: mark the target `held` (excluded from re-dispatch).
+ * - Already-settled run: the fork was accounted as success before the worker
+ *   reported the wait. Reverse that settlement (repeat/once accounting and the
+ *   auto-completed flag) and reopen the run as deferred, with the target
+ *   `waiting` + `heldTargets` so the retry reuses the same turn.
+ */
+export function noteWorkerRuntimeDeferred(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  let changed = false;
+  mutateRuntimeTask(id, task => {
+    const deferred = task.deferredRun;
+    if (!deferred || deferred.runId !== runId) return;
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return;
+    // A late gate-wait notification cannot revoke an acceptance that already
+    // landed for the same exact turn.
+    if (deferred.acceptedTargets?.[chatId] === turnId) return;
+    const state = deferred.targets[chatId];
+    if (state !== 'dispatching' && state !== 'dispatched'
+      && state !== 'waiting' && state !== 'held') return;
+    changed = true;
+    const { [chatId]: _accepted, ...restAccepted } = deferred.acceptedTargets ?? {};
+    void _accepted;
+    return {
+      ...task,
+      lastStatus: 'deferred' as const,
+      deferredRun: {
+        ...deferred,
+        retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+        targets: { ...deferred.targets, [chatId]: 'held' as const },
+        heldTargets: { ...(deferred.heldTargets ?? {}), [chatId]: turnId },
+        ...(Object.keys(restAccepted).length > 0
+          ? { acceptedTargets: restAccepted }
+          : { acceptedTargets: undefined }),
+      },
+    };
+  }, appId);
+  return changed;
+}
+
+/** Record that a target's input was handed to a worker (fork/queue ownership)
+ *  but not yet accepted. It must not settle or be re-dispatched. */
+export function markDeferredTargetHeld(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, runId, appId, deferred => {
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    // An exact acceptance is monotonic: a slower fork-accounting callback must
+    // not downgrade it back to held.
+    if (deferred.acceptedTargets?.[chatId] === turnId) return undefined;
+    const state = deferred.targets[chatId];
+    if (state !== 'dispatching' && state !== 'dispatched') return undefined;
+    return {
+      ...deferred,
+      targets: { ...deferred.targets, [chatId]: 'held' as const },
+      heldTargets: { ...(deferred.heldTargets ?? {}), [chatId]: turnId },
+    };
+  });
+}
+
+/** Record the worker's acceptance fact for the exact turn. This is the only
+ *  transition that may later settle a target as success. */
+export function markDeferredTargetAccepted(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, runId, appId, deferred => {
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    const { [chatId]: _held, ...restHeld } = deferred.heldTargets ?? {};
+    void _held;
+    return {
+      ...deferred,
+      targets: { ...deferred.targets, [chatId]: 'dispatched' as const },
+      acceptedTargets: { ...(deferred.acceptedTargets ?? {}), [chatId]: turnId },
+      ...(Object.keys(restHeld).length > 0 ? { heldTargets: restHeld } : { heldTargets: undefined }),
+    };
+  });
+}
+
+/**
+ * The worker accepted the exact turn it was holding at the gate. Clear the
+ * held marker and record the target as dispatched; the next retry then settles
+ * the run exactly once (no second send).
+ */
+export function noteWorkerRuntimeAccepted(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  return markDeferredTargetAccepted(id, runId, chatId, turnId, appId);
+}
+
+/** Restart recovery: a `dispatching` target may or may not have reached the
+ *  worker, so it becomes `ambiguous` and is never replayed automatically. */
+export function recoverDeferredRunOnStartup(
+  id: string,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, undefined, appId, deferred => {
+    let changed = false;
+    const targets = { ...deferred.targets };
+    const heldTargets = deferred.heldTargets ? { ...deferred.heldTargets } : undefined;
+    const acceptedTargets = deferred.acceptedTargets ? { ...deferred.acceptedTargets } : undefined;
+    for (const [chatId, state] of Object.entries(targets)) {
+      // An exact acceptance is the strongest fact and survives restart.
+      const acceptedTurn = acceptedTargets?.[chatId];
+      if (acceptedTurn && deferred.targetTurnIds?.[chatId] === acceptedTurn) {
+        if (state !== 'dispatched' || heldTargets?.[chatId] !== undefined) {
+          targets[chatId] = 'dispatched';
+          if (heldTargets) delete heldTargets[chatId];
+          changed = true;
+        }
+        continue;
+      }
+      // `dispatching` may or may not have reached the worker. `held` DID reach
+      // it, but a daemon restart cannot prove the worker still survives, so
+      // neither may be auto-replayed or settled as success. Any target named in
+      // `heldTargets` is held regardless of its visible state.
+      if (state === 'dispatching' || state === 'held' || heldTargets?.[chatId] !== undefined) {
+        targets[chatId] = 'ambiguous';
+        if (heldTargets) delete heldTargets[chatId];
+        if (acceptedTargets) delete acceptedTargets[chatId];
+        changed = true;
+      }
+    }
+    if (!changed) return undefined;
+    return {
+      ...deferred,
+      targets,
+      ...(heldTargets && Object.keys(heldTargets).length > 0
+        ? { heldTargets }
+        : { heldTargets: undefined }),
+      ...(acceptedTargets && Object.keys(acceptedTargets).length > 0
+        ? { acceptedTargets }
+        : { acceptedTargets: undefined }),
+      retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+    };
+  });
+}
+
+/** Set (or clear) the earliest retry time for the parked run. */
+export function rearmDeferredRun(
+  id: string,
+  runId: string,
+  retryAt: string | undefined,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, runId, appId, deferred => ({
+    ...deferred,
+    ...(retryAt ? { retryAt } : { retryAt: undefined }),
+  }));
+}
+
+function mutateDeferredTarget(
+  id: string,
+  runId: string | undefined,
+  appId: string | undefined,
+  mutate: (deferred: NonNullable<ScheduledTask['deferredRun']>) => NonNullable<ScheduledTask['deferredRun']> | undefined,
+): boolean {
+  let changed = false;
+  mutateRuntimeTask(id, task => {
+    const deferred = task.deferredRun;
+    if (!deferred) return;
+    if (runId !== undefined && deferred.runId !== runId) return;
+    const next = mutate(deferred);
+    if (!next) return;
+    changed = true;
+    return { ...task, deferredRun: next };
+  }, appId);
+  return changed;
+}
+
+/** Atomically claim the parked run for a retry without advancing nextRunAt. */
+export function claimDeferredRunForDispatch(
+  id: string,
+  runId: string,
+  appId?: string,
+): { ok: true; task: ScheduledTask } | { ok: false; error: string } {
+  if (!authorityStore) {
+    return scheduleStore.claimDeferredRun(id, runId, appId);
+  }
+  let result: { ok: true; task: ScheduledTask } | { ok: false; error: string } =
+    { ok: false, error: 'not_deferred' };
+  mutateRuntimeTask(id, task => {
+    if (task.lastStatus === 'running') {
+      result = { ok: false, error: 'already_running' };
+      return;
+    }
+    if (!task.deferredRun) {
+      result = { ok: false, error: 'not_deferred' };
+      return;
+    }
+    if (task.deferredRun.runId !== runId) {
+      result = { ok: false, error: 'run_mismatch' };
+      return;
+    }
+    const manualRunRequested = task.manualRunRequested;
+    const claimed: ScheduledTask = { ...task, lastStatus: 'running', lastRunId: runId,
+      lastError: undefined, lastDeliveryError: undefined };
+    delete claimed.manualRunRequested;
+    // Re-enter the exact accepted run: overlay the frozen inputs so edits made
+    // while parked cannot change this retry's prompt, identity or routing.
+    const restored = task.deferredRun.context
+      ? overlayDeferredContext(claimed, task.deferredRun.context)
+      : claimed;
+    result = { ok: true, task: { ...restored, manualRunRequested } };
+    return restored;
+  }, appId);
+  return result;
 }
 
 /** Correct a dispatched execution, without consuming repeats or scheduling a retry.
@@ -1011,8 +1591,52 @@ async function tick(): Promise<void> {
   lastTickTz = tz;
 
   for (const task of tasks) {
-    if (!task.enabled && !task.manualRunRequested) continue;
     if (!taskBelongsToThisDaemon(task)) continue;
+    // A parked run is retried on its own clock, independently of enabled /
+    // nextRunAt: the occurrence was already consumed and must settle exactly
+    // once. It reuses the stored runId so a retry cannot mint a second run.
+    if (task.deferredRun) {
+      const deferred = task.deferredRun;
+      // Single bounded exit: a handoff that never clears must not leave the
+      // occurrence parked forever with no settlement and no alert.
+      const since = Date.parse(deferred.since);
+      if (Number.isFinite(since) && now - since >= TRAEX_DEFERRED_RUN_TIMEOUT_MS) {
+        settleParkedRunOnce(
+          task.id,
+          deferred.runId,
+          `scheduled run stayed parked behind a TRAE runtime handoff for ${Math.round((now - since) / 60_000)} minutes`,
+          task.larkAppId,
+        );
+        continue;
+      }
+      // A parked run only retries while the task is still allowed to run: a
+      // person pausing it must not be overridden by the retry clock. The
+      // manual authorization minted for the original claim keeps a
+      // disabled-at-claim task alive for this same run.
+      const eligible = task.enabled || task.manualRunRequested
+        || task.manualRunAuthorization?.runId === deferred.runId;
+      if (!eligible) continue;
+      if (task.lastStatus === 'running') continue;
+      if (!task.manualRunRequested && deferred.retryAt && now < Date.parse(deferred.retryAt)) continue;
+      const retryContext: ScheduleExecutionContext = {
+        runId: deferred.runId,
+        trigger: task.manualRunRequested ? 'dashboard' : 'scheduler',
+        startedAt: new Date().toISOString(),
+      };
+      const claim = claimDeferredRunForDispatch(task.id, deferred.runId);
+      if (!claim.ok) {
+        if (claim.error !== 'already_running') {
+          logger.warn(`[scheduler] deferred retry for ${task.id} not admitted: ${claim.error}`);
+        }
+        continue;
+      }
+      const claimedTask = claim.task;
+      if (claimedTask.manualRunRequested) retryContext.trigger = 'dashboard';
+      logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) retrying parked run ${deferred.runId}`);
+      runClaimedExecution(claimedTask, retryContext);
+      continue;
+    }
+    if (!task.enabled && !task.manualRunRequested) continue;
 
     // An until-done task past its deadline gets its closing run now, whatever
     // its regular schedule says (see schedule-until-done.ts).
@@ -1142,39 +1766,49 @@ async function tick(): Promise<void> {
     }
     logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
 
-    if (executeCallback) {
-      const taskId = claimedTask.id;
-      executeCallback(claimedTask, executionContext)
-        .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
-        .catch(err => {
-          logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
-          const runResult = markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
-          const freshTask = runtimeTask(taskId) ?? claimedTask;
-          emitFailureAlertIfNeeded(freshTask, runResult);
-          cleanupIfTaskWasAutoRemoved(claimedTask);
-          dashboardEventBus.publish({
-            type: 'schedule.fired',
-            body: {
-              id: taskId,
-              runAt: Date.now(),
-              status: 'error',
-              error: err instanceof Error ? err.message : String(err),
-            },
-          });
-          emitScheduleFiredHook(claimedTask, 'error', err);
-        });
-    } else {
-      // 回调缺失本身是持续故障：阈值 crossed 时同样要告警，不能把水印静默落库。
-      const runResult = markRuntimeRun(
-        claimedTask.id,
-        false,
-        'scheduler execute callback is not initialised',
-        undefined,
-        executionContext.runId,
-      );
-      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
-    }
+    runClaimedExecution(claimedTask, executionContext);
   }
+}
+
+/** Dispatch one already-claimed run and route its outcome into settlement.
+ *  Shared by the normal tick and the deferred-retry branch so both paths use
+ *  the same error/failure-alert/event behaviour. */
+function runClaimedExecution(
+  claimedTask: ScheduledTask,
+  executionContext: ScheduleExecutionContext,
+): void {
+  if (executeCallback) {
+    const taskId = claimedTask.id;
+    executeCallback(claimedTask, executionContext)
+      .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
+      .catch(err => {
+        logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
+        const runResult = markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
+        const freshTask = runtimeTask(taskId) ?? claimedTask;
+        emitFailureAlertIfNeeded(freshTask, runResult);
+        cleanupIfTaskWasAutoRemoved(claimedTask);
+        dashboardEventBus.publish({
+          type: 'schedule.fired',
+          body: {
+            id: taskId,
+            runAt: Date.now(),
+            status: 'error',
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+        emitScheduleFiredHook(claimedTask, 'error', err);
+      });
+    return;
+  }
+  // 回调缺失本身是持续故障：阈值 crossed 时同样要告警，不能把水印静默落库。
+  const runResult = markRuntimeRun(
+    claimedTask.id,
+    false,
+    'scheduler execute callback is not initialised',
+    undefined,
+    executionContext.runId,
+  );
+  emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
 }
 
 /**
@@ -1219,7 +1853,32 @@ function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): vo
 export function startScheduler(): void {
   const startupTasks = runtimeTasks();
   for (const task of startupTasks) {
-    if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
+    if (!taskBelongsToThisDaemon(task)) continue;
+    if (task.deferredRun) {
+      // A parked run survives a restart: it is a waiting state, not an
+      // interrupted failure. `dispatching` targets may or may not have reached
+      // the worker, so they become `ambiguous` and are never auto-replayed;
+      // `waiting` targets keep their exact-once retry. The run stays parked
+      // under the same runId so recovery cannot mint a second run.
+      const recovered = recoverDeferredRunOnStartup(task.id);
+      if (task.lastStatus === 'running') {
+        // Daemon died between the retry claim and dispatch. Put it back into
+        // the waiting state and give the new daemon a settling window.
+        mutateRuntimeTask(task.id, current => current.lastRunId === task.lastRunId
+          ? { ...current, lastStatus: 'deferred' }
+          : undefined);
+        rearmDeferredRun(
+          task.id,
+          task.deferredRun.runId,
+          new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+        );
+      }
+      if (recovered) {
+        logger.warn(`[scheduler] Task "${task.name}" (${task.id}) had an in-flight deferred target; marked ambiguous`);
+      }
+      continue;
+    }
+    if (task.lastStatus !== 'running') continue;
     // 重启把在途任务对账为失败时，水印也可能在这一步跨过阈值——必须补发告警，
     // 否则 failureAlertSent 已落库而私信永不发出，此后持续真失败也不再 crossed。
     const runResult = markRuntimeRun(
@@ -1752,6 +2411,24 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   if (closingRetryAt && Date.now() < Date.parse(closingRetryAt)) {
     return { ok: false, error: 'closing_retry_window' };
   }
+  // A parked run owns the task's consumed occurrence. Run-now must retry that
+  // same logical run (same runId and per-target turn ids) instead of minting a
+  // new one — a new runId would replay targets that were already dispatched.
+  if (task.deferredRun) {
+    const deferred = task.deferredRun;
+    const claim = claimDeferredRunForDispatch(id, deferred.runId);
+    if (!claim.ok) return { ok: false, error: claim.error };
+    const claimedTask = claim.task;
+    const executionContext: ScheduleExecutionContext = {
+      runId: deferred.runId,
+      trigger: 'dashboard',
+      startedAt: new Date().toISOString(),
+    };
+    claimedTask.lastCalendarCheck = manualCalendarCheck(claimedTask);
+    if (claimedTask.lastCalendarCheck) recordRuntimeCalendarCheck(id, claimedTask.lastCalendarCheck);
+    dispatchClaimedRun(claimedTask, executionContext);
+    return { ok: true };
+  }
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
   const executionContext = createExecutionContext('dashboard');
@@ -1775,9 +2452,17 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   }
   claimedTask.lastCalendarCheck = manualCalendarCheck(claimedTask);
   if (claimedTask.lastCalendarCheck) recordRuntimeCalendarCheck(id, claimedTask.lastCalendarCheck);
-  // Don't block the caller — fire on next tick. `Promise.resolve().then`
-  // coerces a synchronous throw from executeCallback into a rejection so the
-  // error path always runs and we don't leak a 500 to the IPC client.
+  dispatchClaimedRun(claimedTask, executionContext);
+  return { ok: true };
+}
+
+/** Fire an already-claimed run without blocking the IPC caller. A synchronous
+ *  throw from the callback is coerced into a rejection so the error path always
+ *  runs and the client never sees a 500. */
+function dispatchClaimedRun(
+  claimedTask: ScheduledTask,
+  executionContext: ScheduleExecutionContext,
+): void {
   void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
@@ -1787,12 +2472,11 @@ export function runNow(id: string): { ok: boolean; error?: string } {
       cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
-        body: { id, runAt: Date.now(), status: 'error', error: msg },
+        body: { id: claimedTask.id, runAt: Date.now(), status: 'error', error: msg },
       });
       emitScheduleFiredHook(claimedTask, 'error', err);
     },
   );
-  return { ok: true };
 }
 
 /**
