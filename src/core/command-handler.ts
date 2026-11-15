@@ -1,4 +1,4 @@
-import { resolveDelegatedSlashCommands } from '../adapters/backend/remote-runner-config.js';
+import { sessionDelegatedSlashCommands } from './remote-runner-slash.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
@@ -3316,8 +3316,7 @@ export async function handleCommand(
                   whiteboardId: current.session.whiteboardId,
                   substituteTrigger: current.pendingSubstituteTrigger,
                   codexAppText: current.pendingCodexAppText,
-                  delegatedSlashContent: current.pendingDelegatedSlashContent,
-                  trustedCaller: current.pendingTrustedCaller,
+                  acceptedInput: current.pendingAcceptedInput,
                   codexAppApplicationContext: current.pendingCodexAppApplicationContext,
                   codexAppMessageContext: current.pendingCodexAppMessageContext,
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
@@ -3391,7 +3390,7 @@ export async function handleCommand(
             publishAttentionPatch(current);
             current.pendingPrompt = undefined;
             current.pendingCodexAppText = undefined;
-            current.pendingDelegatedSlashContent = undefined;
+            current.pendingAcceptedInput = undefined;
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
@@ -7058,9 +7057,7 @@ export async function handleCommand(
           : [];
         const mcpServers = listMcpServerNames(workingDir);
 
-        const delegatedCommands = [...resolveDelegatedSlashCommands(botCfg?.remoteRunner,
-          ds?.initConfig?.backendType ?? resolvePairedSpawnBackendType(effectiveCliId,
-            ds?.session.backendType, botCfg?.backendType, config.daemon.backendType))];
+        const delegatedCommands = [...sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType)];
         const card = buildSlashListCard(
           { delegatedCommands, cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
@@ -7078,10 +7075,7 @@ export async function handleCommand(
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
-        const delegatedCommands = resolveDelegatedSlashCommands(botCfg?.remoteRunner,
-          ds?.initConfig?.backendType ?? resolvePairedSpawnBackendType(
-            ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? 'claude-code',
-            ds?.session.backendType, botCfg?.backendType, config.daemon.backendType));
+        const delegatedCommands = sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType);
         const help = [
           t('help.heading_session', undefined, loc),
           ...(['codex', 'codex-app'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? '')

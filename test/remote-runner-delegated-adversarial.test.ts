@@ -23,7 +23,7 @@ function runtime(): DaemonSession {
       title: 'review', status: 'active', createdAt: '2026-01-01T00:00:00Z', cliId: 'remote-runner', backendType: 'remote-runner' },
     worker: null, workerPort: null, workerToken: null, larkAppId: 'cli_review', chatId: 'oc_review',
     chatType: 'group', scope: 'thread', spawnedAt: 1, cliVersion: 'review', lastMessageAt: 1, hasHistory: false,
-    pendingPrompt: '/adopt alpha', pendingDelegatedSlashContent: '/adopt alpha', pendingTurnId: 'om_adopt',
+    pendingPrompt: '/adopt alpha', pendingAcceptedInput: { content: '/adopt alpha', trustedCaller: { requestUserOpenId: 'ou_actor', requestLarkAppId: 'cli_review', senderType: 'user' } }, pendingTurnId: 'om_adopt',
     pendingTrustedCaller: { requestUserOpenId: 'ou_actor', requestLarkAppId: 'cli_review', senderType: 'user' },
   } as DaemonSession;
 }
@@ -73,7 +73,7 @@ describe('delegated slash abnormal-boundary review', () => {
     expect(restorePendingRepoRuntime(restored)).toBe(true);
     const payload = buildNewTopicCliInput(restored.pendingPrompt!, restored.session.sessionId, 'remote-runner',
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
-      { delegatedSlashContent: restored.pendingDelegatedSlashContent, trustedCaller: restored.pendingTrustedCaller });
+      { acceptedInput: restored.pendingAcceptedInput, trustedCaller: restored.pendingTrustedCaller });
     expect(payload.content).toBe('/adopt alpha');
     expect(payload.trustedCaller).toEqual(ds.pendingTrustedCaller);
   });
@@ -86,9 +86,9 @@ describe('delegated slash abnormal-boundary review', () => {
     stagePendingRepoSetup(ds, { mode: 'picker', turnId: 'om_adopt', linkRefMode: 'disabled' });
     expect(() => persistPendingRepoCardMessageId(ds, 'om_picker')).toThrow('card persistence unavailable');
     expect(ds.session.pendingRepoSetup?.repoCardMessageId).toBeUndefined();
-    const restored = { ...runtime(), session: persisted, pendingDelegatedSlashContent: undefined };
+    const restored = { ...runtime(), session: persisted, pendingAcceptedInput: undefined };
     expect(restorePendingRepoRuntime(restored)).toBe(true);
-    expect(restored.pendingDelegatedSlashContent).toBe('/adopt alpha');
+    expect(restored.pendingAcceptedInput?.content).toBe('/adopt alpha');
     expect(restored.repoCardMessageId).toBeUndefined();
   });
 

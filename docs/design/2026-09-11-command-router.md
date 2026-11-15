@@ -473,4 +473,4 @@ master 上同样红，见 §16.2）。
 
 ### Remote Runner 下放（#3469）
 
-`delegatedCommands` 与 passthrough 集一样由两条入口按有效后端预算，router 不读配置。固定白名单的别名在配置阶段归一，decision 保留原始 cmd/content 以沿用授权及原文 turn。入口完成 grant 和 canRunDaemonCommand 后，带宿主 marker 走普通输入接纳；构造 payload 时只替换 content 为已授权原文，FIFO 不重新分类。pending-repo journal 保留 marker，恢复后仍是同一条结构化命令。该路径不调用原生 adopt/detach handler 或协议 cancel/detach。
+`delegatedCommands` 与 passthrough 集一样由两条入口按有效后端预算，router 不读配置。固定白名单的别名在配置阶段归一，decision 保留原始 cmd/content 以沿用授权及原文 turn。入口完成 grant 和 canRunDaemonCommand 后，带宿主 acceptedInput payload 走普通输入接纳；统一收尾保留原文、可信调用者与 LinkRefs，FIFO 不重新分类。pending-repo journal 以一个可选 payload 字段原子保存已接纳输入，恢复后仍是同一条结构化命令。既有待办 head 与下放命令 tail 分开，避免覆盖。两个入口共用授权执行政策与 help 的配置求值；活 provider 冻结启动配置，无活 worker 时按下次 spawn 的 live 配置。该路径不调用原生 adopt/detach handler 或协议 cancel/detach。

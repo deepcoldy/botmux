@@ -22238,6 +22238,9 @@ async function flushPending(): Promise<void> {
   if (!isPromptReady && pendingMessages.length === 0) return;
   if (!isPromptReady && !typeAheadAllowed) return;
 
+  const serialRemoteTurns = effectiveBackendType === 'remote-runner'
+    && ((lastInitConfig?.backendConfig as import('./adapters/backend/remote-runner-config.js').RemoteRunnerConfig | undefined)
+      ?.delegatedSlashCommands?.length ?? 0) > 0;
   isFlushing = true;
   const promptReadyAtFlushStart = isPromptReady;
   let itemsWrittenInThisFlush = 0;
@@ -23345,7 +23348,7 @@ async function flushPending(): Promise<void> {
       // Remote Runner ACKs admission before its final. Its structured turn lane
       // is serial, so a second item in this drain must wait for onTaskDone to
       // re-arm readiness; batching here would reject and lose the FIFO tail.
-      if (effectiveBackendType === 'remote-runner' && result?.submitted !== false) break;
+      if (serialRemoteTurns && result?.submitted !== false) break;
       if (queuedPostSubmitNativeTitle) break;
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
@@ -23375,6 +23378,13 @@ async function flushPending(): Promise<void> {
   } finally {
     if (cliSubmissionInFlight) settleSubmission(cliSubmissionInFlight.item);
     isFlushing = false;
+    // A fast provider final can restore readiness while the flush mutex is
+    // held. Consume that terminal edge after release, once, so the next exact
+    // FIFO turn cannot be stranded. A blocked flush writes zero items and never
+    // schedules itself again.
+    if (serialRemoteTurns && itemsWrittenInThisFlush > 0 && isPromptReady && pendingMessages.length > 0) {
+      queueMicrotask(() => { void flushPending(); });
+    }
     // A write that failed or stopped the batch skipped the post-write re-drive.
     if (promptReadyDeferred) redriveRejectedStructuredReady();
     // The owner may have arrived while an earlier asynchronous write held the

@@ -1,4 +1,4 @@
-import { normalizeDelegatedSlashCommand } from '../adapters/backend/remote-runner-config.js';
+import { normalizeDelegatedSlashCommand } from './delegated-slash.js';
 /**
  * 命令路由器 —— 斜杠命令的**分类层**（设计 docs/design/2026-09-11-command-router.md R1 / §5）。
  *

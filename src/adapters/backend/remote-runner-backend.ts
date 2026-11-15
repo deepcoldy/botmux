@@ -272,9 +272,10 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     this.activeTurnId = input.turnId;
     // The delegated lane supplies exact slash bytes, unlike ordinary enveloped
-    // prompts. Recognize the fixed business operations even when delegation was
-    // enabled after this provider process started; routing owns authorization.
-    this.activeBindingTurn = normalizeDelegatedSlashCommand(input.content.split(/\s+/, 1)[0]) !== null;
+    // prompts. The provider's frozen opt-in policy limits this state contract;
+    // ordinary providers keep their existing lineage publication behavior.
+    const bindingCommand = normalizeDelegatedSlashCommand(input.content.split(/\s+/, 1)[0]);
+    this.activeBindingTurn = !!bindingCommand && this.config.delegatedSlashCommands?.includes(bindingCommand) === true;
     this.activeTurnHostContext = { ...(input.linkRefMode ? { linkRefMode: input.linkRefMode } : {}),
       ...(input.sessionOrigin ? { sessionOrigin: structuredClone(input.sessionOrigin) } : {}) };
     this.activeTurnAccepted = false;
@@ -716,11 +717,16 @@ export class RemoteRunnerBackend implements SessionBackend {
       // Validate the entire final before publishing either durable state or usage.
       // A malformed usage report must not leave a failed adopt partially bound.
       const usage = event.usage ? normalizeRemoteRunnerUsageReport(event.usage) : undefined;
-      if (event.usage && (!usage || usage.generation !== (event.state ?? this.state)?.generation)) {
+      const invalidUsage = !!event.usage && (!usage || usage.generation !== (event.state ?? this.state)?.generation);
+      if (this.activeBindingTurn && invalidUsage) {
         this.failProtocol('remote runner emitted usage for an invalid backend generation');
         return;
       }
       if (event.state && !this.applyState(event.state, true)) return;
+      if (invalidUsage) {
+        this.failProtocol('remote runner emitted usage for an invalid backend generation');
+        return;
+      }
       if (usage) this.usageCb?.(usage);
       // `outbound_message_final` is a bilateral terminal-delivery contract:
       // once the host has a verified delivered receipt, the provider's later

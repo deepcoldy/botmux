@@ -2109,8 +2109,7 @@ export interface QueuedActivationTailEntry {
  * this record after restart; the record is cleared only with the activation
  * journal's adapter-level ACK. */
 export interface PendingRepoSetup {
-  delegatedSlashContent?: string;
-  delegatedSlashCaller?: TrustedCaller;
+  acceptedInput?: CliTurnPayload;
   mode: 'picker' | 'auto_worktree';
   linkRefMode?: import('./services/link-ref-types.js').LinkRefMode;
   prompt: string;

@@ -297,9 +297,9 @@ printf '%s\n' \
 { "remoteRunner": { "delegatedSlashCommands": ["/adopt", "/detach"] } }
 ```
 
-字段缺省或空数组关闭下放；只接受 `/adopt`、`/detach`、`/disconnect`，不接受其它 daemon 命令。配置归一化会去重并把 `/disconnect` 收敛成 `/detach`，启用任一写法即启用两个别名。命令正文保留调用时的大小写、参数和内部空格；路由仍按普通 slash 规则剥前导提及、去首尾空白，讨论文本/命令列表不作为指令截获。已有会话按冻结的后端判断，不随 Bot 的 CLI 切换而改变。
+字段缺省或空数组关闭下放；只接受 `/adopt`、`/detach`、`/disconnect`，不接受其它 daemon 命令。配置归一化会去重并把 `/disconnect` 收敛成 `/detach`，启用任一写法即启用两个别名。命令正文保留调用时的大小写、参数和内部空格；路由仍按普通 slash 规则剥前导提及、去首尾空白，讨论文本/命令列表不作为指令截获。已有会话按冻结的后端判断，不随 Bot 的 CLI 切换而改变。活跃 provider 保持启动时的下放配置，修改在下次 provider 启动生效；路由和帮助展示共用这一口径。
 
-下放只改变执行通道。两个消息入口先执行 grant 限制和 `canRunDaemonCommand`（默认 canOperate，允许 `canTalkDaemonCommands` 按条降级），并保留 `acceptSlashFromBots`。随后复用普通消息的配额、spawn、结构化输入和 FIFO；忙时排队的是已授权的完整 turn，出队不再分类。`/help` 和 `/list-slash-command` 按有效后端与实际启用项显示 provider 语义。
+下放只改变执行通道。两个消息入口先执行 grant 限制和 `canRunDaemonCommand`（默认 canOperate，允许 `canTalkDaemonCommands` 按条降级），并保留 `acceptSlashFromBots`。随后复用普通消息的配额、spawn、结构化输入和 FIFO；已授权内容与可信调用者封装在同一个 acceptedInput payload 中，仍经过统一 LinkRefs 收尾。待办激活时保留原任务为 head，下放命令作为独立 tail；忙时排队的是已授权的完整 turn，出队不再分类。`/help` 和 `/list-slash-command` 按有效后端与实际启用项显示 provider 语义。
 
 无会话 `/adopt` 可像普通消息一样启动 provider，等 ready 后提交首个 turn。无会话 `/detach` / `/disconnect` 直接回复无绑定，不创建会话、不启动 provider。primary 协调模式下两种 detach 写法均拒绝。provider 拒绝、ACK 超时、协议错误沿现有 turn 失败通道明确报错，不回落 daemon 的原生命令处理。
 
@@ -318,3 +318,5 @@ provider 按现有协议先 ACK `status: busy`，可发 `progress`，最后发 `
 下放版 `/detach` / `/disconnect` **只解除 provider 管理的业务绑定**，来源 Agent 保留，BotMux 会话行也保留以接收下一条 `/adopt`。没有绑定时以正常 `final` 返回明确的“无绑定”结果，宿主不清理本地会话。绝不能把它映射到协议 `cancel`（关闭），也不能触发协议 `detach`（宿主关停时可恢复的事务，与 `reattach` 配对）。原生 shared-adopt 的断桥语义继续适用于未启用下放的 Bot。
 
 `examples/remote-runner/reference-runner.mjs` 可直接运行：`/adopt` 列出 alpha/beta，`/adopt reference-thread:alpha` 绑定，`/disconnect` 解绑，重复解绑返回无绑定。候选集保存在 `providerState.adoptCandidates`，只在 `final` 回传业务变更。
+
+实现隔离：未启用下放的 Bot 保持原有路由与输入身份。Remote Runner 的串行刷新和 final-only 绑定守卫同样受该 provider 启动配置的下放开关限制；普通 PTY/tmux/riff/mojo/codex-app 输入不携带 acceptedInput，沿用原来的构造与持久化分支。

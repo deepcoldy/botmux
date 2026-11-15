@@ -271,8 +271,7 @@ async function resumeRestoredPendingRepoSetup(
         promptInjection: sessionPromptInjection(ds),
         substituteTrigger: ds.pendingSubstituteTrigger,
         codexAppText: ds.pendingCodexAppText,
-        delegatedSlashContent: ds.pendingDelegatedSlashContent,
-        trustedCaller: ds.pendingTrustedCaller,
+        acceptedInput: ds.pendingAcceptedInput,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
         // This recovery completes the original fresh pending-repo launch.
@@ -1698,7 +1697,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     substituteTrigger?: SubstituteTrigger;
-    delegatedSlashContent?: string;
+    acceptedInput?: CliTurnPayload;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -1727,10 +1726,6 @@ export function buildNewTopicCliInput(
     workflowNodeSession?: boolean;
   },
 ): CliTurnPayload {
-  if (cliId === 'remote-runner' && opts?.delegatedSlashContent !== undefined) {
-    return { content: opts.delegatedSlashContent, ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
-  }
-
   opts = {
     ...opts,
     promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId),
@@ -1772,7 +1767,7 @@ export function buildNewTopicCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return withInitialLinkRefSources({ content: ptyText }, userMessage, { ...opts, attachments });
+      return finalizeCliTurnInput({ content: ptyText }, userMessage, { ...opts, attachments, cliId });
     }
     // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
   }
@@ -1783,10 +1778,10 @@ export function buildNewTopicCliInput(
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
-    return withInitialLinkRefSources(
+    return finalizeCliTurnInput(
       { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
       userMessage,
-      { ...opts, attachments },
+      { ...opts, attachments, cliId },
     );
   }
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
@@ -1806,7 +1801,7 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
-  return withInitialLinkRefSources({
+  return finalizeCliTurnInput({
     content,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -1827,7 +1822,7 @@ export function buildNewTopicCliInput(
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
       attachments,
     }),
-  }, userMessage, { ...opts, attachments });
+  }, userMessage, { ...opts, attachments, cliId });
 }
 
 /**
@@ -1857,7 +1852,7 @@ type FollowUpOpts = {
   chatId?: string;
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
-  delegatedSlashContent?: string;
+  acceptedInput?: CliTurnPayload;
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
@@ -2172,10 +2167,12 @@ export function promptHookRunsInCli(target: PromptHookTarget): boolean {
   return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
-function withInitialLinkRefSources(
+function finalizeCliTurnInput(
   payload: CliTurnPayload,
   userText: string,
   opts: {
+    acceptedInput?: CliTurnPayload;
+    cliId?: string;
     linkRefMode?: LinkRefMode;
     linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
     sharedGroupContext?: string;
@@ -2183,6 +2180,13 @@ function withInitialLinkRefSources(
     attachments?: LarkAttachment[];
   } | undefined,
 ): CliTurnPayload {
+  // Host-accepted structured input owns its exact content and caller. Keep the
+  // shared LinkRefs finalization below, including when no CLI envelope is needed.
+  if (opts?.acceptedInput) {
+    if (opts.cliId !== 'remote-runner') throw new Error('Accepted provider input cannot cross into a different CLI');
+    payload = { ...payload, ...opts.acceptedInput };
+    userText = opts.acceptedInput.content;
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2210,10 +2214,6 @@ export function buildFollowUpCliInput(
   sessionId: string,
   opts?: FollowUpOpts,
 ): CliTurnPayload {
-  if (opts?.cliId === 'remote-runner' && opts?.delegatedSlashContent !== undefined) {
-    return { content: opts.delegatedSlashContent, ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
-  }
-
   opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   const background = backgroundForInput(sessionId, opts.cliId, opts);
   if (background) opts = {
@@ -2250,7 +2250,7 @@ export function buildFollowUpCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return withInitialLinkRefSources(
+      return finalizeCliTurnInput(
         { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
         content,
         opts,
@@ -2260,7 +2260,7 @@ export function buildFollowUpCliInput(
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
-    return withInitialLinkRefSources(
+    return finalizeCliTurnInput(
       { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
       content,
       opts,
@@ -2283,7 +2283,7 @@ export function buildFollowUpCliInput(
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId);
   const mentionBlock = renderMentionBlock(opts.mentions);
-  return withInitialLinkRefSources({
+  return finalizeCliTurnInput({
     content: legacyContent,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -2417,8 +2417,7 @@ export function buildReforkCliInput(
     locale?: Locale;
     sender?: ResolvedSender;
     substituteTrigger?: SubstituteTrigger;
-    delegatedSlashContent?: string;
-    trustedCaller?: CliTurnPayload['trustedCaller'];
+    acceptedInput?: CliTurnPayload;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -2456,8 +2455,7 @@ export function buildReforkCliInput(
     linkRefSourceType: opts?.linkRefSourceType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
-    delegatedSlashContent: opts?.delegatedSlashContent,
-    trustedCaller: opts?.trustedCaller,
+    acceptedInput: opts?.acceptedInput,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,
     solo: ds.soloSession,
@@ -5773,8 +5771,7 @@ async function forkOrShowRepoCard(
       whiteboardId: ds.session.whiteboardId,
       promptInjection: sessionPromptInjection(ds),
       codexAppText: ds.pendingCodexAppText,
-      delegatedSlashContent: ds.pendingDelegatedSlashContent,
-      trustedCaller: ds.pendingTrustedCaller,
+      acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -5861,7 +5858,7 @@ async function forkOrShowRepoCard(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     ds.pendingCodexAppText = undefined;
-    ds.pendingDelegatedSlashContent = undefined;
+    ds.pendingAcceptedInput = undefined;
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;

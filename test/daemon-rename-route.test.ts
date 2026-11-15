@@ -5130,6 +5130,30 @@ describe('remote-runner delegated slash production ingress (#3469)', () => {
     });
   }
 
+  it('preserves a queued backlog head and appends delegated adopt as its exact successor', async () => {
+    const root = 'om_delegated_backlog';
+    const ds = seedThreadSession(root, 'backlog');
+    Object.assign(ds.session, { cliId: 'remote-runner', backendType: 'remote-runner',
+      queued: true, queuedPrompt: 'EXISTING_BACKLOG_TASK' });
+    ds.workingDir = '/tmp';
+    mocks.forkWorker.mockImplementationOnce((current: any) => {
+      current.worker = { killed: false, send: vi.fn() };
+      current.session.queuedActivationPending = true;
+      current.session.queuedActivationToken = 'delegated-backlog-head';
+      return true;
+    });
+    await handleThreadReply(makeEventData('om_backlog_adopt', '/adopt reference-thread:alpha', root),
+      makeCtx(root, 'om_backlog_adopt'));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]![1].content).toContain('EXISTING_BACKLOG_TASK');
+    expect(mocks.forkWorker.mock.calls[0]![1].content).not.toContain('/adopt reference-thread:alpha');
+    expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({
+      turnId: 'om_backlog_adopt',
+      cliInput: expect.objectContaining({ content: '/adopt reference-thread:alpha',
+        trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) }),
+    })]);
+  });
+
   it('preserves detach/disconnect text and caller on a live worker without closing the local row', async () => {
     const root = 'om_delegated_live';
     const ds = seedThreadSession(root, 'remote binding');
