@@ -27,6 +27,7 @@ import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { readProviderRecoveryConfig, type ProviderRecoveryConfig } from './services/provider-recovery-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
 import {
@@ -343,6 +344,11 @@ export interface GlobalConfig {
    *  `promptCache` in bots.json overrides it field by field
    *  (services/prompt-cache-policy.ts). */
   promptCache?: PromptCacheConfig;
+  /** Automatic continuation after a transient model-provider failure (Claude
+   *  Code). Machine-level, default OFF, managed from the Dashboard; a bot's own
+   *  `providerRecovery` in bots.json overrides it field by field
+   *  (services/provider-recovery-policy.ts). */
+  providerRecovery?: ProviderRecoveryConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -1099,6 +1105,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (sessionCleanup) out.sessionCleanup = sessionCleanup;
   const promptCache = readPromptCacheConfig(raw.promptCache);
   if (promptCache) out.promptCache = promptCache;
+  const providerRecovery = readProviderRecoveryConfig(raw.providerRecovery);
+  if (providerRecovery) out.providerRecovery = providerRecovery;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);

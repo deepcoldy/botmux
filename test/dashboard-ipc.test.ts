@@ -6977,6 +6977,10 @@ describe('GET /api/schedules', () => {
     const previousScope = scheduleStore.getScheduleScope();
     scheduleStore.setScheduleScope('cli_ipc_test_bot002');
     try {
+    // Deadline stays relative to the wall clock: `addTask` validates it against
+    // Date.now() (`until_done_deadline_past`), so an absolute literal would make
+    // this case start failing the moment real time passes it.
+    const deadline = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
     const add = scheduler.addTask({
       name: '等待上游实例完成',
       schedule: '1m',
@@ -6987,7 +6991,7 @@ describe('GET /api/schedules', () => {
       executionPosition: 'topic',
       rootMessageId: 'om_schedule_followup_root',
       chatType: 'topic_group',
-      untilDone: { retryMinutes: 5, deadline: '2026-11-15T00:00:00Z' },
+      untilDone: { retryMinutes: 5, deadline },
       notify: ['failing', 'expired'],
       ownerOpenId: 'ou_schedule_owner',
     });
@@ -7000,7 +7004,7 @@ describe('GET /api/schedules', () => {
     expect(res.status).toBe(200);
     const row = (await res.json()).schedules.find((s: any) => s.id === add.id);
     expect(row).toMatchObject({
-      untilDone: { status: 'open', attempts: 0, retryMinutes: 5, deadline: '2026-11-15T00:00:00.000Z' },
+      untilDone: { status: 'open', attempts: 0, retryMinutes: 5, deadline },
       runStats: { consecutiveFailures: 2 },
       notify: ['failing', 'expired'],
       ownerOpenId: 'ou_schedule_owner',

@@ -14,6 +14,7 @@ import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { formatClockTime } from '../../utils/clock-time.js';
 import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
@@ -27,7 +28,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { modelPinText } from '../../core/model-pin.js';
-import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import { BACKGROUND_WAIT_TEMPLATE, RECOVERY_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import type { SubstituteCardControl } from './substitute-card-control.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
@@ -742,6 +743,7 @@ export function buildSlashListCard(
     cliName: string;
     builtin: string[];
     adapterDefaults?: string[];
+    delegatedCommands?: string[];
     custom: string[];
     discovered: { name: string; description?: string }[];
     workingDir: string;
@@ -753,6 +755,16 @@ export function buildSlashListCard(
   const { cliName, builtin, adapterDefaults = [], custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
   const asCode = (cmds: string[]) => cmds.map((c) => `\`${c}\``).join('  ');
   const elements: any[] = [];
+  if (params.delegatedCommands?.length) {
+    const commands = params.delegatedCommands;
+    elements.push({ tag: 'markdown', content: [
+      `**${t('slashlist.part_delegated', undefined, locale)}**`,
+      asCode(commands.flatMap(cmd => cmd === '/detach' ? [cmd, '/disconnect'] : [cmd])),
+      ...(commands.includes('/adopt') ? [t('help.remote_runner_adopt', undefined, locale)] : []),
+      ...(commands.includes('/detach') ? [t('help.remote_runner_detach', undefined, locale)] : []),
+    ].join('\n') });
+    elements.push({ tag: 'hr' });
+  }
 
   // ① 固定放行（内置透传白名单）
   elements.push({
@@ -978,8 +990,23 @@ export interface ActivityCardLabel {
   progressAgeSeconds?: number;
 }
 
-/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
+/** 普通轮次因暂态模型服务故障中断、自动续跑正在等上游恢复（续跑处于 backoff）。
+ *  只对 idle 生效（CLI 停在提示符上），卡头显示「⏳ 上游暂不可用 · 预计 HH:MM 自动续跑」，
+ *  免得「等待输入」让人以为任务卡死。`due`：预定时间已到（CLI 忙或正在提交），显示「即将」。 */
+export interface RecoveryWaitCardLabel {
+  recoveryAt: number;
+  due?: boolean;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}、{@link RecoveryWaitCardLabel}，
+ *  或 {@link BackgroundWaitCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel | RecoveryWaitCardLabel;
+
+/** 续跑等待标签；仅当状态为 idle 时有值。 */
+function recoveryWaitLabel(status: StreamStatus, label: boolean | StreamCardLabel | undefined): RecoveryWaitCardLabel | undefined {
+  if (status !== 'idle' || !label || typeof label !== 'object' || !('recoveryAt' in label)) return undefined;
+  return Number.isFinite(label.recoveryAt) ? label : undefined;
+}
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -1006,6 +1033,12 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  const recoveryWait = recoveryWaitLabel(status, idleLabel);
+  if (recoveryWait) {
+    return recoveryWait.due
+      ? t('card.status.recovery_wait_due', undefined, locale)
+      : t('card.status.recovery_wait', { at: formatClockTime(recoveryWait.recoveryAt, locale) }, locale);
+  }
   if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
     if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
     if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
@@ -1178,6 +1211,7 @@ export function buildStreamingCard(
   };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
   const backgroundWait = backgroundWaitCount(status, silentIdle) !== undefined;
+  const recoveryWait = recoveryWaitLabel(status, silentIdle) !== undefined;
 
   const elements: any[] = [];
 
@@ -1484,7 +1518,9 @@ export function buildStreamingCard(
     extraConfig: { update_multi: true },
     header: cardHeader(
       `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}`,
-      backgroundWait ? BACKGROUND_WAIT_TEMPLATE : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+      backgroundWait ? BACKGROUND_WAIT_TEMPLATE
+        : recoveryWait ? RECOVERY_WAIT_TEMPLATE
+          : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     ),
     elements,
   });
@@ -2199,6 +2235,9 @@ export interface TurnFailedCardOpts {
   task?: string;
   /** Auto-continuation count, when a recovery ladder ran and gave up. */
   continuations?: number;
+  /** The provider's own recovery time, when its error named one: the card
+   *  says when continuing makes sense. */
+  providerRetryAt?: Date;
   /** Retry affordance, decided by `turnRetryOffer` — the handler enforces the
    *  same policy, so `none` must not render a button. */
   retryOffer: TurnRetryOffer;
@@ -2261,6 +2300,9 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
     lines.push(t('card.turn_failed.field_continuations', {
       count: String(o.continuations),
     }, locale));
+  }
+  if (o.providerRetryAt) {
+    lines.push(t('card.turn_failed.provider_eta', { eta: formatClockTime(o.providerRetryAt.getTime(), locale) }, locale));
   }
 
   const elements: any[] = [
@@ -2349,6 +2391,14 @@ export interface RecoveryFailedCardOpts {
   /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
   outcomeKey: string;
   continuations: number;
+  /** Window-paced recovery that stopped on its window: the window's end, the
+   *  provider's own retry time if known, and the window length in minutes —
+   *  rendered into the outcome line and a short "why it stopped" note. */
+  recoveryWindow?: { endsAt: Date; minutes: number; providerRetryAt?: Date; followsCache?: boolean };
+  /** Automatic continuation is switched off: the failure was not continued.
+   *  The card says so (title, how to turn it on) and names the provider's own
+   *  recovery time when it gave one. */
+  continuationOff?: { providerRetryAt?: Date };
   /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
   errorCodes: string[];
   task?: string;
@@ -2384,6 +2434,11 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
   const lines: string[] = [];
   if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
   lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.continuationOff?.providerRetryAt) {
+    lines.push(t('card.recovery_failed.field_provider_eta', {
+      eta: formatClockTime(o.continuationOff.providerRetryAt.getTime(), locale),
+    }, locale));
+  }
   if (o.task) {
     lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
   }
@@ -2393,7 +2448,12 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     }, locale));
   }
   lines.push(t('card.recovery_failed.field_recovery', {
-    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+    outcome: t(o.outcomeKey, {
+      count: String(o.continuations),
+      ...(o.recoveryWindow ? { windowEnd: formatClockTime(o.recoveryWindow.endsAt.getTime(), locale) } : {}),
+      ...(o.recoveryWindow?.providerRetryAt
+        ? { eta: formatClockTime(o.recoveryWindow.providerRetryAt.getTime(), locale) } : {}),
+    }, locale),
   }, locale));
   const codes = [...new Set(o.errorCodes.filter(Boolean))]
     .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
@@ -2405,6 +2465,16 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     { tag: 'markdown', content: lines.join('\n') },
     { tag: 'hr' },
   ];
+  if (o.continuationOff) {
+    elements.push({ tag: 'markdown', content: t('card.recovery_failed.off_hint', undefined, locale) });
+  }
+  if (o.recoveryWindow) {
+    elements.push({
+      tag: 'markdown',
+      content: t(o.recoveryWindow.followsCache ? 'card.recovery_failed.window_hint_cache' : 'card.recovery_failed.window_hint',
+        { minutes: String(o.recoveryWindow.minutes) }, locale),
+    });
+  }
   const advice = o.retry.kind === 'available'
     ? t('card.recovery_failed.retry_hint', undefined, locale)
     : o.retry.kind === 'continue_legacy'
@@ -2471,7 +2541,8 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
   if (actions.length > 0) elements.push({ tag: 'action', actions });
 
   return JSON.stringify(wideCard({
-    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    header: cardHeader(t(o.continuationOff ? 'card.recovery_failed.title_off' : 'card.recovery_failed.title',
+      { cliName: plainTitle(o.cliName) }, locale), 'red'),
     elements,
   }));
 }

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { logger } from '../../utils/logger.js';
@@ -117,6 +118,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private activeTurnId: string | null = null;
   private activeTurnHostContext: RemoteRunnerTurnHostContext = {};
   private activeTurnAccepted = false;
+  private readonly enforceFinalBindingCommit: boolean;
   private ready = false;
   private killed = false;
   private closing = false;
@@ -169,6 +171,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     private readonly sessionId: string,
     initialState?: RemoteRunnerBackendState,
   ) {
+    this.enforceFinalBindingCommit = (config.delegatedSlashCommands?.length ?? 0) > 0;
     this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_BASE_CAPABILITIES;
     this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 15_000);
     this.operationTimeoutMs = boundedTimeout(config.operationTimeoutMs, 30_000);
@@ -599,7 +602,7 @@ export class RemoteRunnerBackend implements SessionBackend {
         && ready.state.generation <= this.state.generation) {
       throw new Error('remote runner rebuild did not advance the backend generation');
     }
-    if (!this.applyState(ready.state)) throw new Error('remote runner ready state is invalid');
+    if (!this.applyState(ready.state, true)) throw new Error('remote runner ready state is invalid');
     this.ready = true;
     this.readyCb?.();
   }
@@ -708,15 +711,20 @@ export class RemoteRunnerBackend implements SessionBackend {
         this.failProtocol('remote runner emitted final before a host operation result was returned');
         return;
       }
-      if (event.state && !this.applyState(event.state)) return;
-      if (event.usage) {
-        const usage = normalizeRemoteRunnerUsageReport(event.usage);
-        if (!usage || usage.generation !== this.state?.generation) {
-          this.failProtocol('remote runner emitted usage for an invalid backend generation');
-          return;
-        }
-        this.usageCb?.(usage);
+      // Validate the entire final before publishing either durable state or usage.
+      // A malformed usage report must not leave a failed turn partially bound.
+      const usage = event.usage ? normalizeRemoteRunnerUsageReport(event.usage) : undefined;
+      const invalidUsage = !!event.usage && (!usage || usage.generation !== (event.state ?? this.state)?.generation);
+      if (this.enforceFinalBindingCommit && invalidUsage) {
+        this.failProtocol('remote runner emitted usage for an invalid backend generation');
+        return;
       }
+      if (event.state && !this.applyState(event.state, true)) return;
+      if (invalidUsage) {
+        this.failProtocol('remote runner emitted usage for an invalid backend generation');
+        return;
+      }
+      if (usage) this.usageCb?.(usage);
       // `outbound_message_final` is a bilateral terminal-delivery contract:
       // once the host has a verified delivered receipt, the provider's later
       // final event settles lifecycle only. Rejected/unknown outbound attempts
@@ -1064,7 +1072,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     settle?.();
   }
 
-  private applyState(value: RemoteRunnerBackendState): boolean {
+  private applyState(value: RemoteRunnerBackendState, finalBindingCommit = false): boolean {
     const state = normalizeRemoteRunnerBackendState(value);
     if (!state || (this.provider && state.provider !== this.provider)) {
       this.failProtocol('remote runner emitted invalid or foreign backend state');
@@ -1081,6 +1089,15 @@ export class RemoteRunnerBackend implements SessionBackend {
         this.failProtocol('remote runner changed or cleared remote session without advancing generation');
         return false;
       }
+    }
+    // Business bindings are a provider-session invariant, including idle gaps
+    // and late events after a turn settles. Compute lineage may still advance
+    // independently as long as it preserves the committed business snapshot.
+    if (this.enforceFinalBindingCommit && this.state && !finalBindingCommit
+        && (state.agentThreadId !== this.state.agentThreadId
+          || !isDeepStrictEqual(state.providerState, this.state.providerState))) {
+      this.failProtocol('delegated slash binding changes must be published in final.state');
+      return false;
     }
     const generationAdvanced = this.state !== undefined && state.generation > this.state.generation;
     this.state = state;

@@ -876,6 +876,9 @@ import {
   takeSessionPreviewTarget,
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
+import { formatClockTime } from '../utils/clock-time.js';
+import { botProviderRecoveryPolicy, providerRecoveryPacing } from './provider-recovery-config.js';
+import { PROVIDER_RETRY_HINT_MAX_AHEAD_MS } from '../services/provider-retry-hint.js';
 import { publishAttentionPatch, publishClosedSessionPatch, raiseDaemonAttention } from './session-activity.js';
 import { isOrdinaryImTurnId } from './ordinary-im-turn.js';
 import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
@@ -888,7 +891,9 @@ import {
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
   noteOrdinaryTurnRecoveryCliIdle,
+  ordinaryTurnRecoveryArmed,
   ordinaryTurnRecoveryHandlesTerminal,
+  RECOVERY_SUPERSEDED_BY_SCHEDULE,
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
   type OrdinaryTurnRetryInput,
@@ -1182,7 +1187,13 @@ function prepareAdmittedLinkRefPayload(input: {
   }
   const runtime = getLinkRefRuntime();
   if (!runtime) {
-    return { payload: { ...input.payload, linkRefs: { mode } }, mode };
+    return {
+      payload: { ...input.payload, linkRefs: {
+        mode,
+        ...(input.payload.linkRefs?.presentation ? { presentation: input.payload.linkRefs.presentation } : {}),
+      } },
+      mode,
+    };
   }
   return {
     payload: prepareLinkRefTurnPayload({
@@ -1222,6 +1233,7 @@ function freezeDeferredLinkRefPayload(input: {
       ...input.payload,
       linkRefs: {
         mode,
+        ...(input.payload.linkRefs?.presentation ? { presentation: input.payload.linkRefs.presentation } : {}),
         ...(input.payload.linkRefs?.sources
           ? { sources: input.payload.linkRefs.sources }
           : {}),
@@ -2162,6 +2174,15 @@ export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined 
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
+  // A failed turn whose automatic continuation waits for the provider: the CLI
+  // sits at its prompt, but 「等待输入」 would read as a hang. Claude's
+  // `providerRecovery` only — Codex capacity recovery keeps its card as it was.
+  const recovery = ds.session.ordinaryTurnRecovery;
+  if (ds.lastScreenStatus === 'idle' && recovery?.status === 'backoff' && recovery.nextAttemptAt !== undefined
+    && ordinaryTurnRecoveryArmed(ds.session) && sessionCliId(ds, getBot(ds.larkAppId).config) === 'claude-code'
+    && sessionProviderRecoveryPolicy(ds).enabled) {
+    return { recoveryAt: recovery.nextAttemptAt, ...(recovery.nextAttemptAt <= Date.now() ? { due: true } : {}) };
+  }
   const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
   return streamCardExecutionLabel(cliId, sessionExecutionActivity(ds)) ?? idleCardLabel(ds);
 }
@@ -2592,6 +2613,8 @@ function ordinaryTurnRecoveryEligible(
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
   const cliId = sessionCliId(ds, botCfg);
+  // Claude's turns are always tracked; whether a failure is continued is the
+  // separate, opt-in `providerRecovery` switch (read live by the coordinator).
   return (cliId === 'claude-code' || (codexCapacityRecoveryCli(cliId) && botCfg.codexCapacityRecovery === true && !ds.adoptedFrom && !ds.session.adoptedFrom))
     && ds.session.status === 'active'
     && !isSharedAdoptSession(ds)
@@ -2643,11 +2666,30 @@ function ordinaryTurnRecoveryWarning(
   if (codexCapacityRecoveryCli(cliId) && state.status === 'exhausted') {
     return tr('worker.codex_capacity_recovery_stopped', { cliName }, locale);
   }
+  if (state.status === 'exhausted' && state.stopReason) {
+    const windowParams = {
+      cliName,
+      count: String(state.continuationsStarted),
+      windowNote: ordinaryRecoveryWindowNote(state, locale),
+      windowEnd: state.windowEndsAt !== undefined ? formatClockTime(state.windowEndsAt, locale) : '-',
+      eta: state.providerRetryAt !== undefined ? formatClockTime(state.providerRetryAt, locale) : '-',
+    };
+    return tr(`worker.ordinary_recovery_${state.stopReason}`, windowParams, locale);
+  }
   if (state.status === 'exhausted' && state.continuationsStarted >= 2) {
-    return tr('worker.ordinary_recovery_exhausted', { cliName }, locale);
+    return tr('worker.ordinary_recovery_exhausted', { cliName, count: String(state.continuationsStarted) }, locale);
   }
   if (state.lastErrorCode === 'recovery_disabled') {
-    return tr('worker.ordinary_recovery_disabled', { cliName }, locale);
+    return tr(codexCapacityRecoveryCli(cliId) ? 'worker.ordinary_recovery_disabled' : 'worker.ordinary_recovery_disabled_auto',
+      { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_off') {
+    return tr('worker.ordinary_recovery_off', {
+      cliName,
+      eta: state.providerRetryAt !== undefined
+        ? tr('worker.ordinary_recovery_waiting_eta', { eta: formatClockTime(state.providerRetryAt, locale) }, locale)
+        : '',
+    }, locale);
   }
   if (state.lastErrorCode === 'recovery_enqueue_failed') {
     return tr('worker.ordinary_recovery_enqueue_failed', { cliName }, locale);
@@ -2688,6 +2730,7 @@ function buildSessionTurnFailedCard(
     reason?: string;
     continuations?: number;
     retryable?: boolean;
+    providerRetryAt?: Date;
   },
 ): string {
   const botCfg = getBot(ds.larkAppId).config;
@@ -2713,12 +2756,124 @@ function buildSessionTurnFailedCard(
     failedAt: new Date(),
     ...(failedTurn?.userPrompt !== undefined ? { task: failedTurn.userPrompt } : {}),
     ...(opts.continuations !== undefined ? { continuations: opts.continuations } : {}),
+    ...(opts.providerRetryAt ? { providerRetryAt: opts.providerRetryAt } : {}),
     retryOffer: offer,
     ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
     ...(mentionOpenId ? { mentionOpenId } : {}),
     terminalUrl: readableTerminalUrlFor(ds),
     locale: localeForBot(ds.larkAppId),
   });
+}
+
+/** `providerRecovery` for this session: the bot's live switch and wait, the
+ *  default wait following the prompt-cache lifetime this session's CLI was
+ *  actually started with (frozen at spawn; the bot's current setting only
+ *  before the first spawn). */
+function sessionProviderRecoveryPolicy(ds: DaemonSession): ReturnType<typeof botProviderRecoveryPolicy> {
+  const botCfg = getBot(ds.larkAppId).config;
+  return ds.initConfig
+    ? botProviderRecoveryPolicy(botCfg, ds.initConfig.promptCacheTtl ?? null)
+    : botProviderRecoveryPolicy(botCfg);
+}
+
+/** How the window was explained to people: by the prompt cache when its
+ *  length is the 1-hour cache's, plainly otherwise. */
+function ordinaryRecoveryWindowNote(
+  window: { windowMinutes?: number; windowFollowsCache?: true },
+  locale: ReturnType<typeof localeForBot>,
+): string {
+  return tr(window.windowFollowsCache ? 'worker.ordinary_recovery_window_note_cache' : 'worker.ordinary_recovery_window_note',
+    { minutes: String(window.windowMinutes ?? '-') }, locale);
+}
+
+/** One plain notice per logical turn when a continuation is scheduled far
+ *  enough out that the chat would otherwise read as a hang: what is wrong,
+ *  when it continues by itself, until when it keeps trying. Informational and
+ *  fire-once (a late copy after the recovery moved on would only confuse);
+ *  the live status card keeps showing the current time. */
+function notifyOrdinaryTurnRecoveryWaiting(
+  ds: DaemonSession,
+  state: NonNullable<Session['ordinaryTurnRecovery']>,
+  botCfg = getBot(ds.larkAppId).config,
+): void {
+  if (state.status !== 'backoff' || state.nextAttemptAt === undefined) return;
+  const locale = localeForBot(ds.larkAppId);
+  const content = tr('worker.ordinary_recovery_waiting', {
+    cliName: sessionCliDisplayName(ds, botCfg),
+    eta: state.providerRetryAt !== undefined
+      ? tr('worker.ordinary_recovery_waiting_eta', { eta: formatClockTime(state.providerRetryAt, locale) }, locale)
+      : '',
+    at: formatClockTime(state.nextAttemptAt, locale),
+    windowEnd: state.windowEndsAt !== undefined ? formatClockTime(state.windowEndsAt, locale) : '-',
+    windowNote: ordinaryRecoveryWindowNote(state, locale),
+  }, locale);
+  const logicalTurnId = state.logicalTurnId;
+  const stillWaiting = (): boolean => ordinaryTurnRecoveryStillOwnsSession(ds)
+    && ds.session.ordinaryTurnRecovery?.logicalTurnId === logicalTurnId
+    && ds.session.ordinaryTurnRecovery.status === 'backoff';
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(ds),
+    content,
+    'text',
+    ds.larkAppId,
+    logicalTurnId,
+    {
+      uuid: randomUUID(),
+      sourceSessionId: ds.session.sessionId,
+      beforeWrite: () => {
+        if (!stillWaiting()) throw new Error('Recovery is no longer waiting');
+      },
+    },
+  ).catch(err => {
+    logger.warn(`[${tag(ds)}] Recovery waiting notice not delivered: ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
+/** A turn typed into the CLI itself (web terminal): the bridge mints
+ *  `local-<uuid>` for a user line that matched no delivered message. A
+ *  background wake is `local-headless-*`, a built-in scheduled fire
+ *  `scheduled-*`. (A prompt-cache keep-alive is typed the same way, which is
+ *  why none is sent while a continuation waits.) */
+function isTerminalTypedTurnId(turnId: string): boolean {
+  return turnId.startsWith('local-') && !turnId.startsWith('local-headless-');
+}
+
+/** Someone answered from the web terminal (a typed turn just completed) while
+ *  a continuation waited for the provider: they took over, so the wait is
+ *  cancelled exactly as a new Feishu message cancels it. Only a pending wait —
+ *  a running continuation or a settled failure is left as it is. Driven by the
+ *  turn's terminal: the worker forwards no reply for a typed turn. */
+function cancelOrdinaryRecoveryWaitForTerminalTurn(ds: DaemonSession, turnId: string): void {
+  if (ds.session.ordinaryTurnRecovery?.status !== 'backoff') return;
+  try {
+    cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
+    logger.info(`[${tag(ds)}] Recovery wait cancelled by a web-terminal turn ${turnId.substring(0, 16)}`);
+  } catch (err) {
+    logger.error(`[${tag(ds)}] Could not cancel the recovery wait: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** The live status card shows 「⏳ 上游暂不可用 · 预计 HH:MM 自动续跑」 while a
+ *  continuation waits (see streamCardLabel); PATCH it whenever that wait
+ *  starts, moves or ends. */
+const ordinaryRecoveryWaitCardKeys = new WeakMap<DaemonSession, string>();
+function refreshOrdinaryRecoveryWaitCard(ds: DaemonSession): void {
+  const state = ds.session.ordinaryTurnRecovery;
+  const key = state?.status === 'backoff' && state.nextAttemptAt !== undefined ? String(state.nextAttemptAt) : '';
+  if ((ordinaryRecoveryWaitCardKeys.get(ds) ?? '') === key) return;
+  ordinaryRecoveryWaitCardKeys.set(ds, key);
+  try {
+    scheduleActiveRuntimePatch(ds);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] Recovery wait card patch failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** A worker-reported provider retry time worth showing: still ahead, and
+ *  within the hint horizon (services/provider-retry-hint.ts). */
+function upcomingProviderRetryAt(ms: number | undefined, now = Date.now()): Date | undefined {
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > now && ms <= now + PROVIDER_RETRY_HINT_MAX_AHEAD_MS
+    ? new Date(ms) : undefined;
 }
 
 function notifyOrdinaryTurnRecoveryFailure(
@@ -2976,6 +3131,17 @@ export function buildOrdinaryRecoveryNoticeCard(
     causeKey: recoveryCauseI18nKey(record.causeErrorCode ?? record.errorCode),
     outcomeKey: recoveryOutcomeI18nKey(record),
     continuations: record.continuations,
+    ...(record.errorCode === 'recovery_off' ? {
+      continuationOff: record.providerRetryAt !== undefined ? { providerRetryAt: new Date(record.providerRetryAt) } : {},
+    } : {}),
+    ...(record.stopReason && record.windowEndsAt !== undefined ? {
+      recoveryWindow: {
+        endsAt: new Date(record.windowEndsAt),
+        minutes: record.windowMinutes ?? 0,
+        ...(record.windowFollowsCache ? { followsCache: true } : {}),
+        ...(record.providerRetryAt !== undefined ? { providerRetryAt: new Date(record.providerRetryAt) } : {}),
+      },
+    } : {}),
     errorCodes: [record.causeErrorCode, record.errorCode].filter((code): code is string => !!code),
     ...(record.task ? { task: record.task } : {}),
     failedAt: new Date(record.createdAt),
@@ -3055,16 +3221,35 @@ export function ensureOrdinaryTurnRecoveryAttached(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
-  if (!ordinaryTurnRecoveryEligible(ds, botCfg)) {
-    disposeIneligibleOrdinaryTurnRecovery(ds, botCfg);
-    return false;
-  }
   // Re-arm the runtime silent registry from the persisted recovery state BEFORE
   // the timer is re-armed: an overdue backoff fires on the next tick, and the
   // enqueue below (plus every terminal-time suppression gate) reads that
-  // registry by exact turn id. Idempotent, so repeated attach calls are fine.
+  // registry by exact turn id. Also when recovery is no longer eligible (e.g.
+  // switched off): a silent turn's late output stays silent either way.
+  // Idempotent, so repeated attach calls are fine.
   for (const turnId of ordinaryTurnRecoverySilentTurnIds(ds.session.ordinaryTurnRecovery)) {
     if (!isSilentScheduledTurn(ds, turnId)) armSilentScheduledTurn(ds, turnId);
+  }
+  // Failure cards already owed are delivered whether or not recovery may run
+  // now (it may have been switched off since the failure).
+  const resumeOwedNotices = (): void => {
+    // The failed state and its notice record are two writes: a process that
+    // died between them left the notice owed but unrecorded — re-create it.
+    // Pre-upgrade states carry no marker (the old code already sent theirs).
+    const settled = ds.session.ordinaryTurnRecovery;
+    if (settled?.failureNoticeOwed && settled.warningDispatched
+      && !(ds.session.ordinaryRecoveryNotices ?? []).some(entry => entry.logicalTurnId === settled.logicalTurnId)) {
+      enqueueOrdinaryRecoveryNotice(ds, settled, botCfg);
+    }
+    // A failure card that could not reach Feishu before a restart (or before
+    // this worker generation) continues from its persisted next attempt;
+    // delivered/abandoned records stay inert.
+    ordinaryRecoveryNoticeOutbox.resume(ordinaryRecoveryNoticeHost(ds));
+  };
+  if (!ordinaryTurnRecoveryEligible(ds, botCfg)) {
+    disposeIneligibleOrdinaryTurnRecovery(ds, botCfg);
+    resumeOwedNotices();
+    return false;
   }
   const onRecoveryError = (err: unknown): void => {
     logger.error(`[${tag(ds)}] Recovery persistence failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3083,6 +3268,17 @@ export function ensureOrdinaryTurnRecoveryAttached(
       resumeRecoveryOnRestore: false,
       backoffMs: [15_000, 45_000],
     } : {
+      // Window-paced: wait for the provider's own retry time when its error
+      // names one, otherwise back off up to minutes; stop once the prompt
+      // cache of the last answered request would have expired (11-13: a
+      // gateway said "available at 11:10:16Z" and the fixed 2s/8s ladder gave
+      // up at 11:09, leaving the task half-done).
+      pacing: () => providerRecoveryPacing(sessionProviderRecoveryPolicy(ds)),
+      // Opt-in (`providerRecovery`, global or per bot), read at every
+      // decision: off, a failure is not continued — it settles at once with
+      // the failure card; switched off during a wait, the wait is dropped.
+      continuationsEnabled: () => sessionProviderRecoveryPolicy(ds).enabled,
+      notifyWaiting: state => notifyOrdinaryTurnRecoveryWaiting(ds, state, botCfg),
       // Claude keeps a running recovery across newer input, so a continuation
       // whose terminal is lost would otherwise own the slot forever. Once the
       // CLI has been idle this long with no terminal for it, settle failed.
@@ -3093,6 +3289,9 @@ export function ensureOrdinaryTurnRecoveryAttached(
       isCliBusy: () => ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing'
         || ds.lastScreenStatus === 'stalled' || ds.lastScreenStatus === 'limited'
         || ds.usageLimit?.limited === true,
+      // A due continuation does not type into a CLI someone else is driving.
+      isCliOccupied: () => ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing'
+        || ds.lastScreenStatus === 'stalled',
       // A type-ahead follow-up that fails while the earlier turn's recovery is
       // in flight gets its own durable failure card — the same failures the
       // fallback card would have announced, without its single-shot delivery.
@@ -3115,7 +3314,10 @@ export function ensureOrdinaryTurnRecoveryAttached(
       return timer;
     },
     cancel: timer => clearTimeout(timer),
-    persist: () => sessionStore.updateSession(ds.session),
+    persist: () => {
+      sessionStore.updateSession(ds.session);
+      refreshOrdinaryRecoveryWaitCard(ds);
+    },
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
     prepare: dispatch => {
       if (isCodexAppCliId(sessionCliId(ds, botCfg)) && !parseScheduledTurnId(dispatch.logicalTurnId)) {
@@ -3181,18 +3383,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
     },
     warn: state => notifyOrdinaryTurnRecoveryFailure(ds, state, botCfg),
   });
-  // The failed state and its notice record are two writes: a process that
-  // died between them left the notice owed but unrecorded — re-create it.
-  // Pre-upgrade states carry no marker (the old code already sent theirs).
-  const settled = ds.session.ordinaryTurnRecovery;
-  if (settled?.failureNoticeOwed && settled.warningDispatched
-    && !(ds.session.ordinaryRecoveryNotices ?? []).some(entry => entry.logicalTurnId === settled.logicalTurnId)) {
-    enqueueOrdinaryRecoveryNotice(ds, settled, botCfg);
-  }
-  // A failure card that could not reach Feishu before a restart (or before
-  // this worker generation) continues from its persisted next attempt;
-  // delivered/abandoned records stay inert.
-  ordinaryRecoveryNoticeOutbox.resume(ordinaryRecoveryNoticeHost(ds));
+  resumeOwedNotices();
   const restored = ds.session.ordinaryTurnRecovery;
   if (restored?.alertSentAt
     && (restored.status === 'exhausted' || restored.status === 'attention_required')) {
@@ -15404,6 +15595,13 @@ function recordAdmittedOrdinaryUserTurn(
   if (isOrdinaryRecoveryTurnId(turnId)) {
     try {
       if (opts.beginRecovery) {
+        // A scheduled fire takes over the slot of a failed turn still waiting
+        // for its continuation. Nobody took that turn over, and its notice
+        // promised a time: it gets its failure card instead of vanishing.
+        const waiting = ds.session.ordinaryTurnRecovery;
+        const supersededWait = waiting?.status === 'backoff' && waiting.logicalTurnId !== turnId
+          && parseScheduledTurnId(turnId) !== null && sessionCliId(ds, getBot(ds.larkAppId).config) === 'claude-code'
+          ? structuredClone(waiting) : undefined;
         // Freeze the fire's silent attribute onto the logical turn now: the
         // scheduler arms the runtime registry before dispatch, so it is readable
         // here, and only the persisted copy survives a restart. The exact input
@@ -15414,6 +15612,17 @@ function recordAdmittedOrdinaryUserTurn(
         });
         recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
           && state.currentTurnId === turnId;
+        if (supersededWait && recoveryBookkeepingSucceeded) {
+          try {
+            enqueueOrdinaryRecoveryNotice(ds, {
+              ...supersededWait, status: 'attention_required', nextAttemptAt: undefined,
+              lastErrorCode: RECOVERY_SUPERSEDED_BY_SCHEDULE, alertSentAt: Date.now(), warningDispatched: true,
+            });
+          } catch (err) {
+            logger.error(`[${tag(ds)}] Could not record the notice of a recovery wait a scheduled fire took over: `
+              + `${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
       } else {
         const state = cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
         recoveryBookkeepingSucceeded = state?.status === 'cancelled'
@@ -23072,6 +23281,10 @@ function setupWorkerHandlers(
           ds.failedIdleTurnId = undefined;
           if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
         }
+        if (msg.status === 'completed' && isTerminalTypedTurnId(msg.turnId)
+          && sessionCliId(ds, botCfg) === 'claude-code') {
+          cancelOrdinaryRecoveryWaitForTerminalTurn(ds, msg.turnId);
+        }
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
@@ -23278,6 +23491,7 @@ function setupWorkerHandlers(
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
                 ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
+                ...(upcomingProviderRetryAt(msg.providerRetryAtMs) ? { providerRetryAt: upcomingProviderRetryAt(msg.providerRetryAtMs) } : {}),
               }),
             });
           } catch (err) {

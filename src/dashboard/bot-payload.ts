@@ -272,6 +272,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
+    providerRecovery: j?.providerRecovery && typeof j.providerRecovery === 'object' ? j.providerRecovery : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,

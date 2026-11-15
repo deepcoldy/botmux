@@ -1,3 +1,4 @@
+import { sessionDelegatedSlashCommands } from './remote-runner-slash.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
@@ -3315,6 +3316,7 @@ export async function handleCommand(
                   whiteboardId: current.session.whiteboardId,
                   substituteTrigger: current.pendingSubstituteTrigger,
                   codexAppText: current.pendingCodexAppText,
+                  acceptedInput: current.pendingAcceptedInput,
                   codexAppApplicationContext: current.pendingCodexAppApplicationContext,
                   codexAppMessageContext: current.pendingCodexAppMessageContext,
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
@@ -3388,6 +3390,7 @@ export async function handleCommand(
             publishAttentionPatch(current);
             current.pendingPrompt = undefined;
             current.pendingCodexAppText = undefined;
+            current.pendingAcceptedInput = undefined;
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
@@ -7054,8 +7057,9 @@ export async function handleCommand(
           : [];
         const mcpServers = listMcpServerNames(workingDir);
 
+        const delegatedCommands = [...sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType)];
         const card = buildSlashListCard(
-          { cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
+          { delegatedCommands, cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
         );
         await sessionReply(rootId, card, 'interactive');
@@ -7071,6 +7075,7 @@ export async function handleCommand(
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
+        const delegatedCommands = sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType);
         const help = [
           t('help.heading_session', undefined, loc),
           ...(['codex', 'codex-app'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? '')
@@ -7124,11 +7129,11 @@ export async function handleCommand(
           t('help.schedule_formats', undefined, loc),
           '',
           t('help.heading_adopt', undefined, loc),
-          t('help.adopt', undefined, loc),
-          t('help.adopt_pane', undefined, loc),
-          t('help.adopt_orca', undefined, loc),
+          ...(delegatedCommands.has('/adopt')
+            ? [t('help.remote_runner_adopt', undefined, loc)]
+            : [t('help.adopt', undefined, loc), t('help.adopt_pane', undefined, loc), t('help.adopt_orca', undefined, loc)]),
           t('help.resume', { cliName }, loc),
-          t('help.detach', undefined, loc),
+          t(delegatedCommands.has('/detach') ? 'help.remote_runner_detach' : 'help.detach', undefined, loc),
           '',
           t('help.heading_collab', undefined, loc),
           t('help.introduce', undefined, loc),

@@ -12408,6 +12408,11 @@ function emitReadyTurns(opts: {
       continue;
     }
     if (outcome && outcome.status !== 'completed') {
+      const providerTiming = {
+        ...(outcome.status === 'failed' && outcome.retryAtMs !== undefined ? { retryAtMs: outcome.retryAtMs } : {}),
+        ...(turn.terminalProviderLastSuccessAtMs !== undefined
+          ? { lastSuccessAtMs: turn.terminalProviderLastSuccessAtMs } : {}),
+      };
       emitTurnTerminal(
         turn.turnId,
         outcome.status,
@@ -12417,6 +12422,8 @@ function emitReadyTurns(opts: {
         outcome.retryable,
         undefined,
         turn.terminalErrorDetail,
+        undefined,
+        Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
       );
       continue;
     }
@@ -14338,7 +14345,29 @@ function codexBridgeIngest(opts: {
     && !structuredBridgeIs('antigravity')
     && hasAssistantFinal) {
     idleDetector?.fireIdle();
+  } else if (opts.signalIdle === false
+    && !structuredBridgeIs('antigravity')
+    && hasAssistantFinal) {
+    // A caller that must not raise the idle edge inside its own critical
+    // section (a flush's post-terminal fence check, an interrupt drain) can
+    // still be the drain that consumes the turn's final. The watcher/poller
+    // then finds nothing new, so the idle signal it would have raised is owed
+    // here: a prompt-ready edge rejected while that turn was open has nothing
+    // else to re-drive it once the composer sits still (a queued follow-up
+    // stays stranded). Deliver it after the caller unwinds, to the same CLI.
+    deferFinalIdleSignal();
   }
+}
+
+/** The idle signal of a final consumed by a non-signalling drain, raised on
+ *  the next tick for the CLI generation that wrote it. fireIdle is idempotent. */
+function deferFinalIdleSignal(): void {
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  setImmediate(() => {
+    if (!target || backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress) return;
+    idleDetector?.fireIdle();
+  });
 }
 
 /** Background tasks a structured drainer reported (Grok's updates.jsonl, see
@@ -22302,6 +22331,9 @@ async function flushPending(): Promise<void> {
   if (!isPromptReady && pendingMessages.length === 0) return;
   if (!isPromptReady && !typeAheadAllowed) return;
 
+  const serialRemoteTurns = effectiveBackendType === 'remote-runner'
+    && ((lastInitConfig?.backendConfig as import('./adapters/backend/remote-runner-config.js').RemoteRunnerConfig | undefined)
+      ?.delegatedSlashCommands?.length ?? 0) > 0;
   isFlushing = true;
   const promptReadyAtFlushStart = isPromptReady;
   let itemsWrittenInThisFlush = 0;
@@ -23415,6 +23447,10 @@ async function flushPending(): Promise<void> {
         // worker/daemon crash can never silently consume the opening turn.
         acknowledgeQueuedActivation(item);
       }
+      // Remote Runner ACKs admission before its final. Its structured turn lane
+      // is serial, so a second item in this drain must wait for onTaskDone to
+      // re-arm readiness; batching here would reject and lose the FIFO tail.
+      if (serialRemoteTurns && result?.submitted !== false) break;
       if (queuedPostSubmitNativeTitle) break;
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
@@ -23444,6 +23480,13 @@ async function flushPending(): Promise<void> {
   } finally {
     if (cliSubmissionInFlight) settleSubmission(cliSubmissionInFlight.item);
     isFlushing = false;
+    // A fast provider final can restore readiness while the flush mutex is
+    // held. Consume that terminal edge after release, once, so the next exact
+    // FIFO turn cannot be stranded. A blocked flush writes zero items and never
+    // schedules itself again.
+    if (serialRemoteTurns && itemsWrittenInThisFlush > 0 && isPromptReady && pendingMessages.length > 0) {
+      queueMicrotask(() => { void flushPending(); });
+    }
     // A write that failed or stopped the batch skipped the post-write re-drive.
     if (promptReadyDeferred) redriveRejectedStructuredReady();
     // The owner may have arrived while an earlier asynchronous write held the
@@ -34985,6 +35028,9 @@ function emitTurnTerminal(
    *  and clipped below, before it leaves the worker. */
   errorDetail?: string,
   continuationFailure?: RuntimeExecutionContinuationFailure,
+  /** Non-completed terminals only: the provider's retry hint and the last
+   *  request it answered (see the turn_terminal fields of the same names). */
+  providerTiming?: { retryAtMs?: number; lastSuccessAtMs?: number },
 ): void {
   if (!sessionId || !turnId) return;
   if (workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(turnId, dispatchAttempt)) return;
@@ -35039,6 +35085,10 @@ function emitTurnTerminal(
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
     ...diagnostics,
+    ...(status !== 'completed' && Number.isFinite(providerTiming?.retryAtMs)
+      ? { providerRetryAtMs: providerTiming!.retryAtMs } : {}),
+    ...(status !== 'completed' && Number.isFinite(providerTiming?.lastSuccessAtMs)
+      ? { providerLastSuccessAtMs: providerTiming!.lastSuccessAtMs } : {}),
   };
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
