@@ -13333,7 +13333,17 @@ export function startIpcServer(opts: {
     });
     return {
     port,
-    close: () => new Promise<void>(r => server.close(() => r())),
+    // server.close() only stops accepting: its callback waits for every already
+    // accepted socket to finish. A request whose body we abandoned (the 413
+    // early return resumes the request and answers without reading the rest)
+    // leaves such a socket behind on Bun, which then never completes the
+    // handshake and keeps close() pending forever — a test that awaits close()
+    // hangs, and so would daemon teardown. Destroy the tracked sockets first so
+    // shutdown is bounded, mirroring listen-with-probe's release path.
+    close: () => new Promise<void>(r => {
+      server.closeAllConnections?.();
+      server.close(() => r());
+    }),
   };
   });
 }
