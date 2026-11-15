@@ -95,6 +95,26 @@ const EMPTY_COMPOSER_HINTS = new Set([
   'Will this algorithm scale well?',
 ]);
 
+/** Match only the live composer, never a pasted-content example in history.
+ * A collapsed chip is usable only together with the worker's unchanged
+ * external-input generation: its character count alone is not ownership. */
+export function traexComposerHoldsInput(screen: string, input: string): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
+  if (composer < 0 || !input.trim()) return false;
+  for (let end = composer + 1; end < rows.length; end++) {
+    const empty = [...rows.slice(0, composer), '❯', ...rows.slice(end)].join('\n');
+    if (!traexRestoredComposerReady(empty)) continue;
+    const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
+      .join('\n').trim();
+    const chip = /^\[Pasted Content (\d+) chars?\]$/i.exec(body);
+    if (chip) return Number(chip[1]) === Array.from(input).length;
+    return body.replace(/\s/g, '') === input.replace(/\s/g, '');
+  }
+  return false;
+}
+
 /**
  * Fresh 0.211 startup and resume can paint an initialized composer without
  * the old model/directory banner. Only the bottom input surface and its

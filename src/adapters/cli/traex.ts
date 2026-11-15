@@ -373,8 +373,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   const resolvedBin = (): string => (cachedBin ??= resolveCommand(rawBin));
   let launchNotice: CliLaunchNotice | undefined;
+  const pressSubmit = (pty: PtyHandle): boolean => {
+    try {
+      if (pty.sendSpecialKeys) return pty.sendSpecialKeys('Enter') !== false;
+      pty.write('\r');
+      return true;
+    } catch {
+      return false;
+    }
+  };
   return {
     id: 'traex',
+    pressComposerSubmit: pressSubmit,
     // Native /goal starts work and can cold-start an empty topic.
     defaultPassthroughCommands: ['/goal'],
     // codex_core-based TUI: hook-review flow + legacy-data migration picker.
@@ -518,13 +528,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
       const trySendEnter = (): boolean => {
-        try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
-          return true;
-        } catch {
-          return false;
-        }
+        if (context?.submitGuard && !context.submitGuard.current()) return false;
+        return pressSubmit(pty);
       };
 
       // Submit confirmation polls the global submit log history.jsonl, NOT the

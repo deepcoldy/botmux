@@ -123,6 +123,9 @@ export interface CodexPendingTurn {
    *  began. This closes the race where screen-ready arrives while writeInput
    *  is still polling history, before it can return `submitted: true`. */
   submitVerificationStartedAtMs?: number;
+  /** The worker still owns an ambiguous draft in this CLI generation. Keep
+   * its exact fingerprint for a later manual submit, without claiming success. */
+  inputDeliveryQuarantined?: true;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
   /** Explicit transcript terminal semantics. Undefined keeps the historical
@@ -510,6 +513,7 @@ export class CodexBridgeQueue {
       // The CLI holds this input in its own queue (input_queued); its user
       // record will start it, or cli_settled restarts the lease.
       if (head.cliQueuedAtMs !== undefined) break;
+      if (head.inputDeliveryQuarantined) break;
 
       // An authoritative adapter/history check can legitimately outlive the
       // shorter attribution lease. Do not prune under that in-flight await;
@@ -632,6 +636,12 @@ export class CodexBridgeQueue {
     if (!turn || !turn.rpcActive) return false;
     turn.rpcActive = undefined;
     return true;
+  }
+
+  setInputDeliveryQuarantined(turnId: string, quarantined: boolean, dispatchAttempt?: number): void {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (turn) turn.inputDeliveryQuarantined = quarantined ? true : undefined;
   }
 
   /** Start bounded adapter/history verification before awaiting writeInput. */
