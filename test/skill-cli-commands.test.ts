@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 
 import { runSkillSessionCommand } from '../src/core/skills/cli-session-command.js';
 import { writeSessionSkillManifest } from '../src/core/skills/manifest-store.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -187,5 +188,91 @@ describe('botmux skill session command', () => {
     const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'absent' });
     expect(res.code).toBe(2);
     expect(res.stderr).toContain('manifest not found');
+  });
+});
+
+describe('botmux skill under the doubao sbox shell (no BOTMUX_SESSION_ID)', () => {
+  let dataDir: string;
+  let skillDir: string;
+  const NATIVE_ID = '38450000000000001';
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'botmux-skill-doubao-'));
+    skillDir = mkdtempSync(join(tmpdir(), 'botmux-skill-doubao-dir-'));
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    write(join(skillDir, 'SKILL.md'), '# Deploy');
+    writeSessionSkillManifest({
+      sessionId: 's1',
+      cliId: 'doubao',
+      workingDir: '/repo',
+      policyMode: 'priority',
+      prioritySkills: [{
+        id: 'deploy',
+        name: 'deploy',
+        description: 'Deploy services',
+        tags: [],
+        rootDir: skillDir,
+        entrypoint: 'SKILL.md',
+        source: { type: 'user', root: skillDir },
+        priorityReason: 'bot:include',
+      }],
+      diagnostics: [],
+      generatedAt: '2026-06-14T00:00:00.000Z',
+    });
+    seedPersistedSessionRows(dataDir, 'cli_capture_a', {
+      s1: { sessionId: 's1', status: 'active', cliId: 'doubao', cliSessionId: NATIVE_ID },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(skillDir, { recursive: true, force: true });
+  });
+
+  it('resolves the session from MCP_VM_CONVERSATION_ID', () => {
+    const result = runSkillSessionCommand(['show', 'deploy'], { MCP_VM_CONVERSATION_ID: NATIVE_ID });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('# Deploy');
+  });
+
+  it('fails closed for an unknown native conversation id', () => {
+    const result = runSkillSessionCommand(['show', 'deploy'], { MCP_VM_CONVERSATION_ID: '38450000000000002' });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('missing BOTMUX_SESSION_ID');
+  });
+
+  it('rejects a malformed conversation id instead of probing the store', () => {
+    const result = runSkillSessionCommand(['show', 'deploy'], { MCP_VM_CONVERSATION_ID: 'not-a-snowflake' });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('missing BOTMUX_SESSION_ID');
+  });
+
+  it('fails closed when the native id is bound to two botmux sessions', () => {
+    seedPersistedSessionRows(dataDir, 'cli_capture_b', {
+      s2: { sessionId: 's2', status: 'active', cliId: 'doubao', cliSessionId: NATIVE_ID },
+    });
+    const result = runSkillSessionCommand(['show', 'deploy'], { MCP_VM_CONVERSATION_ID: NATIVE_ID });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('missing BOTMUX_SESSION_ID');
+  });
+
+  it('fails closed when an active peer row is malformed', () => {
+    seedPersistedSessionRows(dataDir, 'cli_capture_b', {
+      s2: { sessionId: null, status: 'active', cliId: 'doubao', cliSessionId: NATIVE_ID },
+    });
+
+    const result = runSkillSessionCommand(['show', 'deploy'], { MCP_VM_CONVERSATION_ID: NATIVE_ID });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('missing BOTMUX_SESSION_ID');
+  });
+
+  it('keeps an explicit BOTMUX_SESSION_ID authoritative and never consults the native id', () => {
+    const result = runSkillSessionCommand(['show', 'deploy'], {
+      BOTMUX_SESSION_ID: 's1',
+      MCP_VM_CONVERSATION_ID: '99999999999999999',
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('# Deploy');
   });
 });

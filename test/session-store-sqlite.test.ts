@@ -10,7 +10,7 @@
  * Run:  bunx vitest run test/session-store-sqlite.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'fs';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'path';
@@ -56,6 +56,7 @@ import {
   listActiveSessionIdsAcrossStores,
   listSessionsStrict,
   readSessionsByRoots,
+  findActiveSessionIdByCliSessionId,
   SessionStoreSqliteUnavailableError,
   SessionStoreUnmigratedError,
 } from '../src/services/session-store.js';
@@ -653,5 +654,123 @@ describe('readSessionsByRoots (dispatch task-tree narrow read)', () => {
     seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { rootMessageId: 'om_r1' }) });
     expect(readSessionsByRoots(new Set(), { dataDir: tempDir })).toEqual([]);
     expect(readSessionsByRoots(new Set(['om_nope']), { dataDir: tempDir })).toEqual([]);
+  });
+});
+
+describe('findActiveSessionIdByCliSessionId (doubao sbox reverse lookup)', () => {
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'propagates an unsearchable peer directory instead of ignoring its duplicate owner',
+    () => {
+      seedPersistedSessionRows(tempDir, 'appA', {
+        s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+      });
+      seedPersistedSessionRows(tempDir, 'appB', {
+        s2: row('s2', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+      });
+      const peer = join(tempDir, 'session-stores', 'appB');
+      chmodSync(peer, 0);
+      try {
+        expect(() => findActiveSessionIdByCliSessionId({
+          cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+        })).toThrow();
+      } finally {
+        chmodSync(peer, 0o700);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32').each(['directory', 'database'])(
+    'propagates a dangling peer %s symlink instead of returning a partial inventory',
+    (kind) => {
+      seedPersistedSessionRows(tempDir, 'appA', {
+        s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+      });
+      const peer = join(tempDir, 'session-stores', 'appB');
+      if (kind === 'database') mkdirSync(peer);
+      symlinkSync(join(tempDir, 'missing'), kind === 'database' ? join(peer, 'sessions.db') : peer);
+      expect(() => findActiveSessionIdByCliSessionId({
+        cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+      })).toThrow();
+    },
+  );
+
+  it('ignores a legitimate peer directory that has not created a database yet', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    mkdirSync(join(tempDir, 'session-stores', 'appPending'));
+    expect(findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toBe('s1');
+  });
+
+  it('maps a native id back to its unique active botmux session across stores', () => {
+    seedPersistedSessionRows(tempDir, 'appCaptureA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appCaptureB', {
+      s2: row('s2', { cliId: 'doubao', cliSessionId: '38450000000000002' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBe('s1');
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000002', dataDir: tempDir })).toBe('s2');
+  });
+
+  it('does not match rows of another cliId even with the same native id', () => {
+    seedPersistedSessionRows(tempDir, 'appCodex', {
+      c1: row('c1', { cliId: 'codex', cliSessionId: '38450000000000001' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBeUndefined();
+  });
+
+  it('fails closed when two active doubao sessions share the native id (misbinding)', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      s2: row('s2', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBeUndefined();
+  });
+
+  it('rejects an incomplete active inventory instead of silently dropping a malformed peer', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      s2: row('s2', { sessionId: null, cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+
+    expect(() => findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toThrow(/malformed active session row/);
+  });
+
+  it('propagates an unreadable store directory instead of treating it as an empty inventory', () => {
+    const dataDir = join(tempDir, 'unreadable-inventory');
+    mkdirSync(dataDir);
+    writeFileSync(join(dataDir, 'session-stores'), 'not a directory');
+
+    expect(() => findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir,
+    })).toThrow();
+  });
+
+  it('rejects duplicate active rows even when they contain the same botmux session id', () => {
+    const shared = row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' });
+    seedPersistedSessionRows(tempDir, 'appA', { s1: shared });
+    seedPersistedSessionRows(tempDir, 'appB', { s1: shared });
+
+    expect(findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toBeUndefined();
+  });
+
+  it('ignores closed rows and unknown or empty ids', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      closed1: row('closed1', { cliId: 'doubao', cliSessionId: '38450000000000001', status: 'closed' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBeUndefined();
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '99999999999999999', dataDir: tempDir })).toBeUndefined();
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '  ', dataDir: tempDir })).toBeUndefined();
   });
 });
