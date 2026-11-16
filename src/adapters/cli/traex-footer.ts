@@ -104,7 +104,7 @@ const EMPTY_COMPOSER_HINTS = new Set([
  */
 export function traexRestoredComposerReady(
   screen: string,
-  opts: { resumedSession?: boolean } = {},
+  opts: { resumedSession?: boolean; requireThreadReady?: boolean } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -151,6 +151,12 @@ export function traexRestoredComposerReady(
   const warningOnlyRow = new RegExp(`^[ \\t]*${warningIndicator}[ \\t]*$`);
   const warningOnlyFooter = warningOnlyRow.test(footer[footer.length - 1]!);
   const shortcutOnlyFooter = footer.length === 1 && (hintOnlyRow.test(footer[0]!) || warningOnlyFooter);
+  // A fresh 0.214.1 TUI paints this provisional surface BEFORE its app-server
+  // thread/start response. It accepts paste then, but drops Enter; the draft
+  // survives once initialization finishes. The general restoration predicate
+  // keeps its legacy hint/notice support. Only the native first-input fence
+  // requires either a resolved model footer or a separately observed idle.
+  if (opts.requireThreadReady && (repositoryNotice || shortcutOnlyFooter)) return false;
   // A working directory wider than the pane truncates the model/context row
   // with a U+2026 ellipsis before the Context cell can render. Such a row
   // still contains the native ` · ` cell separator and ends on the

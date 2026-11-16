@@ -690,6 +690,7 @@ import {
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { programStatusBlockHoldsTypeAhead, programStatusEnabledForLaunch, startupIdleReportScreenAdmits } from './core/program-status-gate.js';
+import { shouldFenceTraexStartupInput, traexStartupInputReady } from './core/traex-startup-input.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
 import {
@@ -3246,6 +3247,15 @@ let spawnArgvSubmissionEvidence: {
 } | undefined;
 let idleDetector: IdleDetector | null = null;
 let programStatusStream: ProgramStatusFramingStream | null = null;
+/** Armed only for a fresh, version-verified TraeX terminal process. Unlike
+ * awaitingFirstPrompt, a screen/timeout ready edge must not retire this fence. */
+let traexNativeStartupInputPending = false;
+let traexNativeStartupHoldLogged = false;
+/** Thread initialization and the first queued write have separate ownership. */
+let traexFirstInputAdmissionPending = false;
+let traexStartupRendererWebInputGeneration = -1;
+let traexStartupRendererScreenRevision = -1;
+let traexStartupRendererDrain: object | undefined;
 
 function shouldEnableProgramStatus(
   cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
@@ -4276,6 +4286,8 @@ let lastPtyOutputAtMs = 0;
 let lastWebTerminalInputAtMs = 0;
 /** Monotonic count of those forwards (timestamps can collide within a millisecond). */
 let webTerminalInputGeneration = 0;
+/** Native screen revision before the latest direct Web input. */
+let webTerminalInputBackendScreenRevision = 0;
 /** webTerminalInputGeneration at the latest SessionStart boundary. */
 let webTerminalInputGenerationAtBoundary = 0;
 /** webTerminalInputGeneration when this CLI generation's IdleDetector was built. */
@@ -4289,6 +4301,7 @@ let webTerminalSubmitGeneration = 0;
 function noteWebTerminalInput(data: string): void {
   lastWebTerminalInputAtMs = Date.now();
   webTerminalInputGeneration++;
+  webTerminalInputBackendScreenRevision = backendScreenRevision;
   if (terminalInputSubmits(data)) {
     lastWebTerminalSubmitAtMs = lastWebTerminalInputAtMs;
     webTerminalSubmitGeneration++;
@@ -15774,6 +15787,65 @@ function observeRestoredStartupHistoryOnScreen(): boolean {
   return true;
 }
 
+function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
+  if (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending) return false;
+  // Snapshot/read-only backends and RPC engines retain their existing input
+  // contracts. This fence is for a local terminal this worker launched.
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  if (!backend || (cliRestartInProgress && !replacementSpawnInProgress)) return true;
+  const webInputUnchanged = webTerminalInputGeneration === webTerminalInputGenerationAtSpawn;
+  if (!webInputUnchanged) {
+    // An old empty footer is not proof about the composer after human input.
+    // OSC-only reports do not advance this screen revision. Wait for actual
+    // screen data and settle its renderer behind the current Web epoch.
+    if (backendScreenRevision === webTerminalInputBackendScreenRevision
+      || Date.now() - lastWebTerminalInputAtMs < READY_FLUSH_SETTLE_MS) return true;
+    if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
+      || traexStartupRendererScreenRevision !== backendScreenRevision) {
+      if (!traexStartupRendererDrain && renderer) {
+        const token = {};
+        const target = backend;
+        const observedRenderer = renderer;
+        const generation = cliSpawnGeneration;
+        const revision = backendScreenRevision;
+        const inputGeneration = webTerminalInputGeneration;
+        traexStartupRendererDrain = token;
+        void observedRenderer.writeAndFlush('').then(() => {
+          if (traexStartupRendererDrain !== token || backend !== target || renderer !== observedRenderer
+            || cliSpawnGeneration !== generation || backendScreenRevision !== revision
+            || webTerminalInputGeneration !== inputGeneration
+            || (cliRestartInProgress && !replacementSpawnInProgress)) return;
+          traexStartupRendererWebInputGeneration = inputGeneration;
+          traexStartupRendererScreenRevision = revision;
+          markPromptReady();
+          void flushPending();
+        }).catch(() => {}).finally(() => {
+          if (traexStartupRendererDrain === token) traexStartupRendererDrain = undefined;
+        });
+      }
+      return true;
+    }
+  }
+  let screen = screenOverride ?? '';
+  if (screenOverride === undefined) {
+    try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return true; }
+  }
+  if (!traexStartupInputReady({
+    screen,
+    readyPattern: cliAdapter?.readyPattern,
+    nativeState: idleDetector?.lastProgramStatusReport(),
+    webInputUnchanged: webInputUnchanged
+      || (traexStartupRendererWebInputGeneration === webTerminalInputGeneration
+        && traexStartupRendererScreenRevision === backendScreenRevision),
+    blockingOwner: hookReviewInputHold || !!heldStuckPage(),
+  })) return true;
+  if (traexNativeStartupInputPending) {
+    traexNativeStartupInputPending = false;
+    log('TraeX native startup input readiness verified');
+  }
+  return false;
+}
+
 /**
  * TraeX 0.211 paints the composer with cursor positioning, so its prompt need
  * not have a newline in the PTY byte stream. Fresh startup also need not emit
@@ -15805,7 +15877,8 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
         || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
         || Date.now() - lastPtyOutputAtMs < 2_000) return;
       let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
-      if (!screen || !adapter?.startupReadyFromHistory?.(screen)) {
+      if (!screen || !adapter?.startupReadyFromHistory?.(screen)
+        || traexNativeStartupInputIsPending(screen)) {
         // A tmux CLI can draw its footer before pipe-pane attaches. Later
         // cursor-only redraws leave the renderer nonempty but incomplete, so
         // waiting for more stream bytes can strand a ready pane until 90s.
@@ -15816,7 +15889,8 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
         if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
           || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
           || Date.now() - lastPtyOutputAtMs < 2_000) return;
-        if (!screen || !adapter?.startupReadyFromHistory?.(screen)) return;
+        if (!screen || !adapter?.startupReadyFromHistory?.(screen)
+          || traexNativeStartupInputIsPending(screen)) return;
         log(`${cliName()} initialized composer recovered from native tmux viewport`);
       }
       if (detector?.observeStartupHistory(screen)) {
@@ -20855,6 +20929,14 @@ function markPromptReady(): void {
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
   if (idleDetector?.isStartupPending()) return;
+  if (traexNativeStartupInputIsPending()) {
+    if (!traexNativeStartupHoldLogged) {
+      traexNativeStartupHoldLogged = true;
+      log('Holding TraeX first input until native thread initialization is ready');
+    }
+    idleDetector?.reset();
+    return;
+  }
   // TraeX 0.211 cursor-paints its composer: the byte-stream readyPattern
   // accepts a rule-joined prompt even while the model cell still reads
   // "loading" or the surface owns an unsent draft. Such a match is tagged
@@ -22201,6 +22283,10 @@ function promotePendingHumanInterruption(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  const guardTraexFirstAdmission = traexFirstInputAdmissionPending || traexNativeStartupInputPending;
+  const firstAdmissionWebInputGeneration = webTerminalInputGeneration;
+  const firstAdmissionBackend = backend;
+  const firstAdmissionGeneration = cliSpawnGeneration;
   if (nativeSessionForkPending()) return;
   // Codex model-migration picker guard (startup only): the single admission
   // point runs before every other guard, so they are all evaluated after its
@@ -22208,6 +22294,9 @@ async function flushPending(): Promise<void> {
   // await before it is set). Nothing below re-reads the screen for the picker.
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (idleDetector?.isStartupPending()) return;
+  // Type-ahead arrivals bypass markPromptReady; keep the same first-input
+  // evidence fence before any literal write or dequeue.
+  if (traexNativeStartupInputIsPending()) return;
   // destroySession() may be asynchronous while `backend` still references the
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
@@ -22369,6 +22458,17 @@ async function flushPending(): Promise<void> {
   // back for the hold's re-check to reach them on a screen that stays silent.
   const keepPromptReadyAfterHold = (): void => {
     if (promptReadyAtFlushStart && itemsWrittenInThisFlush === 0) isPromptReady = true;
+  };
+  const holdFirstAdmissionAfterWebInput = (): void => {
+    openingInputBoxSettled = false;
+    keepPromptReadyAfterHold();
+    // One redrive per revoked lease, not a poll loop. The next flush still
+    // requires current empty-composer evidence and owns a new Web epoch.
+    const retry = setTimeout(() => {
+      if (backend === firstAdmissionBackend && cliSpawnGeneration === firstAdmissionGeneration
+        && !cliRestartInProgress) void flushPending();
+    }, READY_FLUSH_SETTLE_MS);
+    retry.unref?.();
   };
   let promptReadyDeferred = false;
   // The write of `item` settled: prompts on screen belong to the CLI again
@@ -22554,6 +22654,10 @@ async function flushPending(): Promise<void> {
     }
     let holdDrainForPreferredReset = false;
     while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset) {
+      if (guardTraexFirstAdmission && webTerminalInputGeneration !== firstAdmissionWebInputGeneration) {
+        holdFirstAdmissionAfterWebInput();
+        break;
+      }
       // A prior awaited write may have crossed a control-socket reconnect.
       if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) break;
       // The first item passed the prompt/model gate before beginCliWriteCycle
@@ -22650,6 +22754,12 @@ async function flushPending(): Promise<void> {
         // IPC handler can drop the head): start over with the head there is
         // now — through the gates above, then a fresh look.
         if (held === undefined || pendingMessages[0] !== head) continue;
+      }
+      // Opening/model/question checks above can all await. A changed Web
+      // epoch revokes this first-write lease before dequeue, never after paste.
+      if (guardTraexFirstAdmission && webTerminalInputGeneration !== firstAdmissionWebInputGeneration) {
+        holdFirstAdmissionAfterWebInput();
+        break;
       }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
@@ -23306,6 +23416,8 @@ async function flushPending(): Promise<void> {
       } finally {
         settleSubmission(item, result?.submitted === true);
       }
+      if (guardTraexFirstAdmission && result?.submitted === true
+        && webTerminalInputGeneration === firstAdmissionWebInputGeneration) traexFirstInputAdmissionPending = false;
       if (isCodexAppCliId(lastInitConfig?.cliId)
         && item.turnId
         && result?.submitted !== false) {
@@ -24828,6 +24940,12 @@ async function spawnCliBody(
   // Early mount based on cfg.cliId before cliAdapter is instantiated for this generation
   // (necessary for adopt mode which wires onPtyData before the normal spawn sequence).
   programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter, { quiet: true }) ? new ProgramStatusFramingStream() : null;
+  traexNativeStartupInputPending = false;
+  traexNativeStartupHoldLogged = false;
+  traexFirstInputAdmissionPending = false;
+  traexStartupRendererWebInputGeneration = -1;
+  traexStartupRendererScreenRevision = -1;
+  traexStartupRendererDrain = undefined;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
@@ -25138,6 +25256,14 @@ async function spawnCliBody(
   } else if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
   }
+  traexNativeStartupInputPending = shouldFenceTraexStartupInput({
+    cliId: cfg.cliId,
+    programStatusEnabled: programStatusStream !== null,
+    resume: cfg.resume,
+    adoptMode: cfg.adoptMode,
+    remoteViewer: !!remoteWsUrl,
+  });
+  traexFirstInputAdmissionPending = traexNativeStartupInputPending;
   const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
@@ -29804,6 +29930,8 @@ async function spawnCliBody(
   // A late same-named pane was reused, so the relay never ran to consume its plan.
   if (actuallyReattachedPersistent) programStatusRelayPlanCleanup?.();
   if (actuallyReattachedPersistent) lastSpawnArgvDurableInitialPrompt = false;
+  if (actuallyReattachedPersistent) traexNativeStartupInputPending = false;
+  if (actuallyReattachedPersistent) traexFirstInputAdmissionPending = false;
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
   // has returned we know whether a FRESH generation was actually established.
@@ -31088,6 +31216,7 @@ async function spawnCliBody(
   // markNewTurn() sets a clean baseline at the current cursor position so only
   // content written *after* this point appears in the card.
   const firstPromptBackend = backend;
+  const firstPromptGeneration = cliSpawnGeneration;
   let requestedAidenResumeRedraw = false;
   // A trust / sign-in / update dialog is waiting for a human. Never force the
   // queue into it (pasted text can even answer it: Grok's trust dialog takes a
@@ -31132,7 +31261,8 @@ async function spawnCliBody(
     firstPromptInputBoxWatch.unref?.();
   };
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean, pickerAdmitted = false): void => {
-    if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    if (!awaitingFirstPrompt || backend !== firstPromptBackend || cliSpawnGeneration !== firstPromptGeneration
+      || (cliRestartInProgress && !replacementSpawnInProgress)) return;
     if (holdFirstPromptForStartupBlocker(elapsedMs, forced)) return;
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
@@ -31178,6 +31308,20 @@ async function spawnCliBody(
       } else {
         log(`WARN First prompt hard timeout — ${cliName()} startup readiness unconfirmed; keeping ${pendingMessages.length} input(s) queued`);
         send({ type: 'user_notify', message: `${cliName()} 启动超过 90 秒仍未确认就绪${startupUpgradeHint()}；消息已保留在队列中，尚未提交。请检查终端中的加载状态或待处理对话框。`, turnId: currentBotmuxTurnId });
+      }
+      return;
+    }
+    if (traexNativeStartupInputIsPending()) {
+      const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      log(`First prompt timeout — TraeX startup input admission unconfirmed; keeping ${pendingMessages.length} input(s) queued`);
+      if (remainingMs > 0) {
+        const waitMs = Math.min(FIRST_PROMPT_STARTUP_RECHECK_MS, remainingMs);
+        const timer = setTimeout(() => releaseFirstPromptTimeout(elapsedMs + waitMs,
+          elapsedMs + waitMs >= FIRST_PROMPT_HARD_TIMEOUT_MS), waitMs);
+        timer.unref?.();
+      } else {
+        send({ type: 'user_notify', turnId: currentBotmuxTurnId,
+          message: 'TRAE 首次输入超过 90 秒仍未确认可安全投递；未在超时处强制提交或重发消息。请检查终端状态，不要重发原任务。' });
       }
       return;
     }
@@ -31398,6 +31542,12 @@ function killCli(opts: {
   idleDetector = null;
   programStatusStream?.reset();
   programStatusStream = null;
+  traexNativeStartupInputPending = false;
+  traexNativeStartupHoldLogged = false;
+  traexFirstInputAdmissionPending = false;
+  traexStartupRendererWebInputGeneration = -1;
+  traexStartupRendererScreenRevision = -1;
+  traexStartupRendererDrain = undefined;
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   stopStructuredStartGraceRecheck();
