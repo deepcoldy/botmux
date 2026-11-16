@@ -548,6 +548,23 @@ describe('daemon current actor attestation', () => {
       expect(attest()).toBeNull();
     });
 
+    it('refuses a native codex spawned by a non-root intermediate process under a trusted root', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      // A node launcher (98) is a direct child of the trusted root (99) but is
+      // not itself a root. A native codex (105) it spawned is only traversable
+      // when its OWN parent is a trusted root (isNativeCodexProcess's
+      // trustedRootPids.has(parent) guard); merely having a trusted grandparent
+      // must not let it through.
+      writeProc(procRoot, 98, 99, '980');
+      symlinkSync('/usr/bin/node', join(procRoot, '98', 'exe'));
+      writeProc(procRoot, 105, 98, '1050');
+      symlinkSync('/release/bin/codex', join(procRoot, '105', 'exe'));
+      writeFileSync(join(procRoot, '105', 'cmdline'), 'codex\0');
+      writeProc(procRoot, 106, 105, '3000');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('105:1050');
+      expect(attest(106, '3000')).toBeNull();
+    });
+
     it('refuses a nested codex below a native codex root and reports the stop', () => {
       const { procRoot, ds, attest } = launcherFixture();
       ds.localProcessAttestation.cliPid = 100;
