@@ -321,13 +321,16 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
     const ds = dsWith({
       scheduledTurnCallers: new Map([['schedule:1:uuid', {}]]),
       scheduledToolActors: new Map([['schedule:2:uuid', { openId: 'ou_actor', unionId: 'on_actor' }]]),
-      session: {
+      // sessionExtra (not session:) so the default sessionId survives: with a
+      // replaced session object the retention set is never matched against the
+      // material's session and every row below would assert vacuously.
+      sessionExtra: {
         deferredScheduleRun: { turnId: 'turn-deferred' },
         ordinaryTurnRecovery: { currentTurnId: 'turn-recovery' },
         readonlyTaskContinuation: { currentTurnId: 'turn-continuation' },
         codexAppDispatchLedger: [],
-      } as any,
-    });
+      },
+    } as any);
     for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       publish(t); releaseActiveIdentityTurn(dir, SESSION, t);
     }

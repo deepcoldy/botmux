@@ -8580,6 +8580,23 @@ describe('managed turn authority worker generations', () => {
     expect(ds.scheduledToolActors).toBeUndefined();
   });
 
+  it('clears scheduled caller and exact-turn tool actor state when the worker exits', async () => {
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.scheduledToolActors = new Map([[scheduledTurnId, {
+      openId: 'ou_tool_actor', unionId: 'on_tool_actor',
+    }]]);
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+    expect(ds.scheduledToolActors?.size).toBe(1);
+
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+    expect(ds.scheduledToolActors).toBeUndefined();
+  });
+
   it('does not bind a scheduled creator to a different worker turn', () => {
     const ds = makeDs();
     forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);

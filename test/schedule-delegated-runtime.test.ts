@@ -108,6 +108,14 @@ describe('delegated schedule runtime authorization', () => {
     };
     await expect(authorizeDelegatedScheduleRun(paused.task, paused, { ...deps(), allowCompletedOnce: true }))
       .rejects.toThrow('schedule authority state is paused');
+    // A completed row without the auto-completion marker (manual disable or a
+    // malformed projection) is not the admitted one-shot replay either.
+    const completedWithoutMarker: ScheduleAuthorityRecord = {
+      ...authority, state: 'completed', task: { ...once, enabled: false },
+    };
+    await expect(authorizeDelegatedScheduleRun(completedWithoutMarker.task, completedWithoutMarker,
+      { ...deps(), allowCompletedOnce: true }))
+      .rejects.toThrow('schedule authority state is completed');
   });
 
   it('fails closed when identity resolution or membership changes', async () => {
