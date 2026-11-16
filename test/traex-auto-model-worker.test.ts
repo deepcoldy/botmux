@@ -714,7 +714,10 @@ exec "$real" "$@"
       };
       phase('slow');
       phase('refuse');
-      expect(Number(readFileSync(countFile, 'utf8'))).toBe(2);
+      // The refused first connect forced at least one retry. A real cold start
+      // that itself overruns the client wall may add a probe-confirmed attempt,
+      // so only the lower bound is load-independent.
+      expect(Number(readFileSync(countFile, 'utf8'))).toBeGreaterThanOrEqual(2);
     } catch (err) {
       bodyError = err;
     } finally {
@@ -772,11 +775,15 @@ exec "$real" "$@"
     let tmuxBin = '';
     let bodyError: unknown;
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    // One second past the helper's own client wall, so this always overruns
+    // whatever COLD_TMUX_NEW_SESSION_TIMEOUT_MS is rather than pinning the
+    // shim to a hard-coded 6s that silently stops triggering a timeout.
+    const overrunSleepSec = COLD_TMUX_NEW_SESSION_TIMEOUT_MS / 1000 + 1;
     const writeShim = (mode: 'timeout-present' | 'duplicate-unconfirmed', socket: string) => {
       writeFileSync(countFile, '0');
       // timeout-present: the real client forks the server and builds the
-      // session in the background while the shim sleeps past the 5s client
-      // wall, so spawnSync sees ETIMEDOUT although the session comes alive.
+      // session in the background while the shim sleeps past the client wall,
+      // so spawnSync sees ETIMEDOUT although the session comes alive.
       // duplicate-unconfirmed: the first create answers "duplicate session"
       // with no server on the socket yet, so the has-session probe can only be
       // unconfirmed; only the retry is allowed to create.
@@ -800,7 +807,7 @@ printf '%s' "$n" > "$count_file"
 if [ "$n" = 1 ]; then
   if [ "$mode" = "timeout-present" ]; then
     "$real" "$@" &
-    sleep 6
+    sleep ${overrunSleepSec}
     exit 0
   fi
   echo "duplicate session: test" >&2
@@ -814,20 +821,29 @@ exec "$real" "$@"
       tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
       process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
       // Phase 1: the killed client already built the session. The has-session
-      // probe must confirm it and return without a second new-session.
+      // probe must confirm it and return without a second new-session. Warm the
+      // server first on a generous wall outside the helper, so the background
+      // create below is a warm create and stays ahead of the client wall even
+      // on a starved runner.
       const presentSocket = `cold-present-${process.pid}-${Date.now()}`;
       sockets.push(presentSocket);
+      execFileSync(tmuxBin, ['-L', presentSocket, 'new-session', '-d', '-s', 'warm'], {
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
       writeShim('timeout-present', presentSocket);
       startColdTmuxSession(presentSocket, ['new-session', '-d', '-s', 'test']);
       expect(Number(readFileSync(countFile, 'utf8'))).toBe(1);
       execFileSync(tmuxBin, ['-L', presentSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
       // Phase 2: a duplicate answer while no server answers the probe is
-      // unconfirmed, so the helper retries and the second create succeeds.
+      // unconfirmed, so the helper retries and the second create succeeds. A
+      // cold start that itself overruns the wall may add more attempts, so only
+      // the lower bound is load-independent.
       const duplicateSocket = `cold-duplicate-${process.pid}-${Date.now()}`;
       sockets.push(duplicateSocket);
       writeShim('duplicate-unconfirmed', duplicateSocket);
       startColdTmuxSession(duplicateSocket, ['new-session', '-d', '-s', 'test']);
-      expect(Number(readFileSync(countFile, 'utf8'))).toBe(2);
+      expect(Number(readFileSync(countFile, 'utf8'))).toBeGreaterThanOrEqual(2);
       execFileSync(tmuxBin, ['-L', duplicateSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
     } catch (err) {
       bodyError = err;
