@@ -110,6 +110,7 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
   const release = join(root, 'release');
   const crash = join(root, 'crash');
   const replacementExit = join(root, 'replacement-exit');
+  const removeCliAfterCatalog = join(root, 'remove-cli-after-catalog');
   if (exitFirstReplacement) writeFileSync(replacementExit, '1');
   writeFileSync(rolloutPath, '');
   writeFileSync(historyPath, '');
@@ -132,7 +133,15 @@ if (process.argv[2] === 'app-server') {
       if (request.method === 'initialize') process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');
       if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'timeout') continue;
       if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'failure') process.exit(1);
-      if (request.method === 'model/list') process.stdout.write(JSON.stringify({ id: request.id, result: {
+      if (request.method === 'model/list') {
+        // This helper is already running and can still return a valid catalog.
+        // Remove only the future launch target BEFORE writing the response:
+        // the reader may terminate its helper as soon as that response arrives.
+        if (fs.existsSync(${JSON.stringify(removeCliAfterCatalog)})) {
+          fs.unlinkSync(${JSON.stringify(removeCliAfterCatalog)});
+          fs.unlinkSync(__filename);
+        }
+        process.stdout.write(JSON.stringify({ id: request.id, result: {
         data: fs.existsSync(${JSON.stringify(launches)}) && ${JSON.stringify(preflight?.catalogAfterStart)} !== undefined
           ? ${JSON.stringify(preflight?.catalogAfterStart?.map(id => ({ id })))}
           : ${JSON.stringify(preflight?.catalogModels ? preflight.catalogModels.map(id => ({ id })) : loadData ? [
@@ -141,6 +150,7 @@ if (process.argv[2] === 'app-server') {
           { id: 'last', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 50 : 120 } }, supportedReasoningEfforts: [{ reasoningEffort: 'xhigh' }, { reasoningEffort: 'max' }] },
           { id: 'outside', businessMetadata: { load: { load_percent: 0 } } },
         ] : [{ id: 'core' }, { id: 'backup' }, { id: 'last' }])}, nextCursor: null } }) + '\\n');
+      }
     }
   });
 } else {
@@ -238,7 +248,9 @@ process.stdin.on('data', chunk => {
           ...(failed ? { error } : {}) });
         idle();
       }, 1200);
-    } else if (successorAfterReset || (${JSON.stringify(withContract)} && model !== 'core')) {
+    } else if (successorAfterReset || (${JSON.stringify(withContract || restoreWithoutBanner)} && model !== 'core')) {
+      // A recovered composer in the startup-recovery scenario proceeds to
+      // healthy work. A second capacity queue belongs to separate pool tests.
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
     } else if (${JSON.stringify(activityMode === 'delayed-first-queue')} && model === 'core') {
       // Native submission is acknowledged before its first activity repaint.
@@ -461,6 +473,6 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
         sessionCommand: { version: 2, execution } }) } : {}) };
     child.send(message);
   };
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake,
+  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake, removeCliAfterCatalog,
     sendInput, controller, hostErrors, terminalDeliveries, noticeDeliveries, options, entry, ds, poolConfigPath };
 }

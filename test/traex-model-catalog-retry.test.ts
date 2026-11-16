@@ -9,11 +9,18 @@ describe('bounded TraeX catalog flow', () => {
   it('retries at 30-second intervals and stops after three failed reads', async () => {
     vi.useFakeTimers();
     const read = vi.fn(async () => null);
-    const done = readTraexCatalogWithRetry({ read, isCurrent: () => true });
+    const wait = vi.fn((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+    const done = readTraexCatalogWithRetry({ read, isCurrent: () => true, wait });
+    // Establish the first failed-read boundary before advancing the clock.
+    // Bun need not drain that promise before moving fake time by 29,999ms.
+    await read.mock.results[0]!.value;
+    expect(wait).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(29_999);
     expect(read).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(read).toHaveBeenCalledTimes(2);
+    await read.mock.results[1]!.value;
+    expect(wait).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(await done).toBeNull();
     expect(read).toHaveBeenCalledTimes(3);

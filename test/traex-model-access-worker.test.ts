@@ -97,8 +97,10 @@ describe('model access recovery Worker boundary', () => {
     expect(f.scope.rememberTraexModelLoadSnapshot).not.toHaveBeenCalled();
     expect(f.controller.currentModel()).toBe(models[0]);
     expect(f.controller.runtimeState('native').modelAccessRecovery?.blockedModels).toEqual([models[0]]);
-    f.resolve(loads()); await vi.advanceTimersByTimeAsync(0);
-    expect(f.scope.restartCliProcess).toHaveBeenCalledOnce();
+    const freshLoads = loads();
+    f.resolve(freshLoads);
+    await vi.waitFor(() => expect(f.scope.restartCliProcess).toHaveBeenCalledOnce());
+    expect(f.scope.rememberTraexModelLoadSnapshot).toHaveBeenCalledExactlyOnceWith(freshLoads);
     expect(f.controller.currentModel()).toBe(models[1]);
   });
   it('continues an active access search when the next model reports confirmed quota exhaustion', async () => {

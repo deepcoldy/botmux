@@ -1135,11 +1135,12 @@ describe('Worker read-only capacity query', () => {
       expect(h.read).toHaveBeenCalledOnce();
       vi.setSystemTime(15_000); h.observe('queue');
       expect(h.read).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
+      // Catalog reconciliation adds another async boundary. Advancing zero
+      // timer milliseconds is not proof that that promise chain has settled.
+      await vi.waitFor(() => expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
         expect.objectContaining({ turnId: 'turn', toModel: 'backup' }),
         { resumeCurrentTurn: true },
-      );
+      ));
     } finally { vi.useRealTimers(); }
   });
 });
