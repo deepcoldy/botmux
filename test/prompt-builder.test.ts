@@ -103,6 +103,7 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
   sweepDeadPidMarkers: vi.fn(),
