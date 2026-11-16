@@ -578,7 +578,7 @@ describe('scheduled turn one-shot child creation', () => {
       realScheduler.addTask({
         id: parentTaskId, name: 'parent', schedule: '0 0 * * *', prompt: 'parent',
         workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic',
-        larkAppId: 'cli_target', ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+        larkAppId: 'cli_target', owner: { kind: 'human' as const, openId: 'ou_user_target', unionId: 'on_user' },
       });
       const h = childHarness();
       h.scope.scheduleAuthorityStore = store;
