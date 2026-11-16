@@ -42,6 +42,7 @@ import { isLocale } from '../i18n/types.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig, type ProviderRecoveryConfig } from '../services/provider-recovery-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
 import { isValidTimeZone } from '../utils/timezone.js';
@@ -113,10 +114,11 @@ export interface ResolvedDashboardSettingsView {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation switches and host bot grants. */
+  /** Schedule delegation switches and host bot grants. */
   scheduleBotGrants?: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     ignoredCount?: number;
     botOptions?: Array<{ larkAppId: string; botName: string | null }>;
@@ -139,6 +141,9 @@ export interface ResolvedDashboardSettingsView {
   /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
    *  null = not configured (off). Bots override it field by field. */
   promptCache: PromptCacheConfig | null;
+  /** Machine-wide automatic continuation after transient provider failures;
+   *  null = not configured (off). Bots override it field by field. */
+  providerRecovery: ProviderRecoveryConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
@@ -306,6 +311,7 @@ export type ApplySettingsWriteError =
   | 'invalid_scheduleBotGrants'
   | 'invalid_scheduleBotGrants_createEnabled'
   | 'invalid_scheduleBotGrants_selfManageEnabled'
+  | 'invalid_scheduleBotGrants_childOneShotEnabled'
   | 'invalid_scheduleBotGrants_grant'
   | 'scheduleBotGrants_duplicate_id'
   | 'scheduleBotGrants_overlap'
@@ -320,6 +326,7 @@ export type ApplySettingsWriteError =
   | 'invalid_workflow_nodeExecutor'
   | 'invalid_workflow_handoffIdentity'
   | 'invalid_promptCache'
+  | 'invalid_providerRecovery'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
   | 'invalid_sessionCleanup_archiveCodex'
@@ -737,7 +744,7 @@ export async function applySettingsWrite(
     }
     const incoming = raw as Record<string, unknown>;
     const next: Parameters<typeof writeScheduleBotGrantConfig>[0] = {};
-    for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+    for (const key of ['createEnabled', 'selfManageEnabled', 'childOneShotEnabled'] as const) {
       if (!(key in incoming)) continue;
       if (typeof incoming[key] !== 'boolean') return { ok: false, error: `invalid_scheduleBotGrants_${key}` };
       next[key] = incoming[key] as boolean;
@@ -883,6 +890,17 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_promptCache' };
     }
     deps.mergeGlobalConfig({ promptCache: next ?? null });
+    touched = true;
+  }
+
+  if ('providerRecovery' in obj) {
+    // Whole-block replacement like promptCache; null clears the machine-wide
+    // default (off). Same strict normalizer as the per-bot layer.
+    let next: ProviderRecoveryConfig | undefined;
+    try { next = normalizeProviderRecoveryConfig(obj.providerRecovery); } catch {
+      return { ok: false, error: 'invalid_providerRecovery' };
+    }
+    deps.mergeGlobalConfig({ providerRecovery: next ?? null });
     touched = true;
   }
 

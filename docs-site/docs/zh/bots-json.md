@@ -102,7 +102,7 @@
 | `displayName` | Dashboard 里显示的备注名。只影响 Dashboard 展示，不改飞书里的应用名 |
 | `cliId` | 用哪个 CLI，默认 `claude-code`。可选值见[多 CLI 适配器](/adapters)。`gemini` 已下线：还写着 `"gemini"` 的 bot 会拒绝启动，并提示改成 `"antigravity"` |
 | `model` | 启动 CLI 用的模型名（比如 `claude --model opus`）；不填就用 CLI 自己的默认值。同一种 CLI 的多个 bot 可以跑不同模型。每次启动或恢复会话时都按当前配置取值，所以改完后，没设群级模型的老会话下次恢复时也会用新模型 |
-| `reasoningEffort` | 新会话默认的思考强度，取值 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`。支持的 CLI：Claude Code、Codex、Codex App、TraeX、Grok、Kimi、ZCode、`remote-runner`。会按 CLI 和模型的能力校验，不支持的组合会被忽略。例如 Kimi 只在模型是 `kimi-code/k3` 或 `kimi-code/k3-256k` 时生效，且只有 `low` / `high` / `max` 三档；Claude 的 Haiku 模型不支持思考强度 |
+| `reasoningEffort` | 新会话默认的思考强度，取值 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`。支持的 CLI：Claude Code、Codex、Codex App、TraeX、Grok、Kimi、ZCode、Doubao、`remote-runner`。会按 CLI 和模型的能力校验，不支持的组合会被忽略。例如 Kimi 只在模型是 `kimi-code/k3` 或 `kimi-code/k3-256k` 时生效，且只有 `low` / `high` / `max` 三档；Claude 的 Haiku 模型不支持思考强度 |
 | `groupDefaultModels` | 按群设置新话题的默认模型，目前支持 Codex 和 Claude Code。见下方[群级新话题默认模型](#group-default-models) |
 | `serviceTier` | 仅 Codex：新会话的速度档位 `default` / `priority` / `ultrafast`；不填沿用 Codex 自己的配置 |
 | `codexProfile` | 仅 Codex：使用的 Codex 配置 profile 名，可在 Dashboard 扫描选择 |
@@ -114,6 +114,7 @@
 | `cliConfigDir` | 仅 Claude Code：用 `CLAUDE_CONFIG_DIR=<目录>` 启动，设置、登录态和会话记录都来自这个目录。只影响新会话 |
 | `disableCliBypass` | 设为 `true` 时不自动追加 `--yolo`、`--dangerously-*` 这类免审批参数 |
 | `promptCache` | 仅 Claude Code：提示缓存的有效期和空闲保活，例如 `{"ttl":"1h","keepalive":{"enabled":true}}`。没写的字段沿用全局设置，默认关闭 |
+| `providerRecovery` | 仅 Claude Code：模型服务暂时出错时自动续跑，例如 `{"enabled":true,"maxWaitMinutes":30}`。没写的字段沿用全局设置，默认关闭。说明见[全局设置：暂态故障自动续跑](/global-settings#provider-recovery) |
 | `skillInjection` | botmux 自带 skill 怎么交给 CLI：`prompt`（按会话注入）、`global`（装进 CLI 全局 skill 目录）、`off`。不填时跟随全局设置，全局默认是 `prompt`。见 [Skill](/skill-cli) |
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |

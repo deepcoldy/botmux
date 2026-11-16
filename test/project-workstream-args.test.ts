@@ -35,4 +35,72 @@ describe('project workstream CLI actions', () => {
     expect(parseProjectArgs('workstream', ['grant'])).toMatchObject({ ok: true, workstream: { action: 'grant' } });
     expect(parseProjectArgs('workstream', ['status'])).toMatchObject({ ok: true, workstream: { action: 'status' } });
   });
+  it('parses attach --claim-owner and confirm card action while rejecting --claim-owner + --grant', () => {
+    expect(parseProjectArgs('workstream', [
+      'attach', '--root', 'om_task', '--source-session', 'worker-session',
+      '--source-app', 'cli_worker', '--title', '认领无主任务', '--claim-owner',
+    ])).toMatchObject({
+      ok: true,
+      workstream: {
+        action: 'attach',
+        rootMessageId: 'om_task',
+        sourceSessionId: 'worker-session',
+        sourceLarkAppId: 'cli_worker',
+        title: '认领无主任务',
+        claimOwner: true,
+      },
+    });
+    expect(parseProjectArgs('workstream', [
+      'attach', '--root', 'om_task', '--source-session', 'worker-session',
+      '--source-app', 'cli_worker', '--claim-owner', '--grant', 'abcd',
+    ])).toMatchObject({ ok: false });
+    expect(parseProjectArgs('workstream', [
+      'attach', '--root', 'om_task', '--source-session', 'worker-session',
+      '--source-app', 'cli_worker', '--claim-owner=true',
+    ])).toMatchObject({ ok: false });
+    expect(parseProjectArgs('workstream', [
+      'confirm', '--root', 'om_task', '--source-session', 'worker-session',
+      '--source-app', 'cli_worker', '--title', '待确认任务',
+    ])).toMatchObject({
+      ok: true,
+      workstream: {
+        action: 'confirm',
+        rootMessageId: 'om_task',
+        sourceSessionId: 'worker-session',
+        sourceLarkAppId: 'cli_worker',
+        title: '待确认任务',
+      },
+    });
+  });
+  it('allows attach without --title for server-side auto-title fallback while rejecting explicit generic/overlong titles', () => {
+    expect(parseProjectArgs('workstream', [
+      'attach', '--root', 'om_task', '--source-session', 'worker-session', '--source-app', 'cli_worker',
+    ])).toMatchObject({
+      ok: true,
+      workstream: {
+        action: 'attach',
+        rootMessageId: 'om_task',
+        sourceSessionId: 'worker-session',
+        sourceLarkAppId: 'cli_worker',
+        title: undefined,
+      },
+    });
+    for (const bad of ['子任务', '子项目', '字'.repeat(25)]) {
+      expect(parseProjectArgs('workstream', [
+        'attach', '--root', 'om_task', '--source-session', 'worker-session', '--source-app', 'cli_worker', '--title', bad,
+      ])).toMatchObject({ ok: false });
+    }
+    expect(parseProjectArgs('workstream', [
+      'rename', '--root', 'om_task', '--source-session', 'worker-session', '--source-app', 'cli_worker', '--title', '精炼后的具体任务名',
+    ])).toMatchObject({
+      ok: true,
+      workstream: {
+        action: 'rename',
+        rootMessageId: 'om_task',
+        sourceSessionId: 'worker-session',
+        sourceLarkAppId: 'cli_worker',
+        title: '精炼后的具体任务名',
+      },
+    });
+  });
 });

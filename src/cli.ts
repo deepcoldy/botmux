@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { sendCompletionHintKey } from './services/send-completion-hint.js';
 import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
@@ -6945,7 +6946,10 @@ async function cmdProject(argv: string[]): Promise<void> {
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
   botmux project workstream inspect --root <om_root> --source-app <cli_app> --source-session <id>
   botmux project workstream attach --root <om_root> --source-app <cli_app> --source-session <id>
-                                  --title <24字内标题> [--purpose <说明>] [--revision <n>] [--grant <id>]
+                                  --title <24字内标题> [--purpose <说明>] [--revision <n>]
+                                  [--grant <id> | --claim-owner]
+  botmux project workstream confirm --root <om_root> --source-app <cli_app> --source-session <id>
+                                   [--title <24字内标题>] [--purpose <说明>]
   botmux project workstream rename --root <om_root> --title <24字内标题>
   botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
   botmux project workstream status [--root <om_root>]
@@ -6990,9 +6994,10 @@ async function cmdProject(argv: string[]): Promise<void> {
     'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
   );
   if ('workstream' in parsed) {
-    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; result?: unknown; grantId?: string };
+    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; hint?: string; result?: unknown; grantId?: string };
     if (!response.ok || !result.ok) {
-      console.error(`workstream 操作失败: ${result.error ?? response.status}`);
+      const hintLine = typeof result.hint === 'string' && result.hint ? `\n提示: ${result.hint}` : '';
+      console.error(`workstream 操作失败: ${result.error ?? response.status}${hintLine}`);
       process.exitCode = 1;
     } else console.log(JSON.stringify(result.result ?? result, null, 2));
     return;
@@ -9165,6 +9170,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (rest.includes('--calendar-day-type') && !calendarDayType) throw new Error('--calendar-day-type requires workday or restday');
     const { normalizeCalendarDayType } = await import('./services/work-calendar.js');
     const normalizedDayType = normalizeCalendarDayType(calendarDayType);
+    // Do not manufacture a work-calendar option when the caller supplied no
+    // calendar flags. `normalizeCalendarDayType(undefined)` returns the runtime
+    // default (`workday`), but serializing that default makes a plain `--topic`
+    // child look like it requested calendar expansion at the daemon boundary.
+    // Keep an explicitly supplied day type so the daemon can still reject an
+    // invalid `--calendar-day-type restday` without a calendar.
+    const scheduleCalendarFields = {
+      ...(calendar !== undefined ? { calendar } : {}),
+      ...(calendar !== undefined || calendarDayType !== undefined
+        ? { calendarDayType: normalizedDayType }
+        : {}),
+    };
     const model = argValue(rest, '--model')?.trim();
     if (rest.includes('--model') && !model) {
       console.error('--model 需要一个模型 id，例如 --model gpt-5.6-sol。');
@@ -9186,18 +9203,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
-    // Default to group top-level: a schedule created inside a topic session
-    // (including an adopted one) must not pin its results to that topic.
-    // --topic opts in explicitly; p2p sessions keep the legacy inference.
-    const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
-      ? 'new-topic'
-      : wantsTopLevel
-        ? 'top-level'
-        : wantsTopic || wantsFollowActive
-          ? 'topic'
-          : cur?.chatType === 'p2p'
-            ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
-            : 'top-level';
+    const placement = scheduleCreatePlacement({
+      newTopic: wantsNewTopic, topLevel: wantsTopLevel, topic: wantsTopic,
+      followActive: wantsFollowActive, untilDone: rest.includes('--until-done'),
+      chatId, currentChatId: cur?.chatId, currentChatType: cur?.chatType, currentScope: cur?.scope, rootMessageId,
+    });
+    const executionPosition = placement.position;
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
       console.error(wantsFollowActive
@@ -9288,8 +9299,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               silent,
               model,
               reasoningEffort,
-              calendar,
-              calendarDayType: normalizedDayType,
+              ...scheduleCalendarFields,
               ...(wantsFollowActive ? { followActive: true } : {}),
               ...(topicTitle ? { topicTitle } : {}),
               ...untilDoneFields,
@@ -9303,8 +9313,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         if (response) {
           const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
           if (!response.ok || body.ok !== true || !body.task) {
+            const daemonMessage = scheduleIpcErrorMessage(body.error);
+            // A live owning daemon can make a more specific, authority-backed
+            // decision than the CLI's preliminary creator probe. Preserve the
+            // probe error only for unrecognized / legacy daemon responses; in
+            // particular, a delegated child must surface the explicit
+            // no-grandchildren or per-turn quota refusal.
+            if (daemonMessage) throw new Error(daemonMessage);
             if (creatorAuthError) throw creatorAuthError;
-            throw new Error(scheduleIpcErrorMessage(body.error) ?? body.detail ?? body.error ?? `HTTP ${response.status}`);
+            throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
           }
           task = body.task;
         }
@@ -9322,8 +9339,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
             executionPosition, larkAppId, silent, model, reasoningEffort,
             deliver,
-            calendar,
-            calendarDayType: normalizedDayType,
+            ...scheduleCalendarFields,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
             ...(runAs ? { runAs } : {}),
@@ -9358,6 +9374,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
+    if (placement.inferredFollowup) console.log('   跟进落点: 当前问题的原话题（显式 --top-level / --new-topic 可覆盖）');
+    for (const line of scheduleSupportLines(task, 'zh').slice(1)) console.log(`   ${line}`);
     if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     if (task.untilDone) {
@@ -14950,16 +14968,36 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
+    const attachmentTrackingErrors: string[] = [];
+    let replyDeliveryId: string | undefined;
     if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
-      ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
-      ));
+      const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+      const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
+      if (files.length || videoAttachments.length) {
+        try {
+          replyDeliveryId = deliveryStore.begin(appId, messageId, targetChatId, [
+            ...files.map(path => ({ path, type: 'file' as const })),
+            ...videoAttachments.map(video => ({ path: video.videoPath, type: 'media' as const })),
+          ]);
+        } catch (error) { attachmentTrackingErrors.push(error instanceof Error ? error.message : String(error)); }
+      }
+      const onResult = replyDeliveryId ? (index: number, outcome: { messageId: string } | { failed: true }) =>
+        deliveryStore.record(appId, messageId, targetChatId, replyDeliveryId!, index, outcome) : undefined;
+      const fileResult = await sendFileAttachments(
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect, onResult }, appId, files,
+      );
+      attachmentMessageIds = fileResult.sent;
+      failedAttachments = fileResult.failed;
+      attachmentTrackingErrors.push(...(fileResult.trackingErrors ?? []).map(item => item.error));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect,
+          onResult: onResult ? (index, outcome) => onResult(files.length + index, outcome) : undefined }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+      attachmentTrackingErrors.push(...(videoResult.trackingErrors ?? []).map(item => item.error));
     }
+    for (const error of attachmentTrackingErrors) console.error(`⚠️ 正文/附件关联记录未完整保存（已发送的消息请勿重发）: ${error}`);
     // Attachments are independent Lark messages posted after the main reply
     // card. Record the actual bottom-most carrier so terminal auto mode never
     // PATCHes an earlier card and leaves a file/voice/custom carrier below it
@@ -15096,6 +15134,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         : {}),
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
+      ...(replyDeliveryId ? { replyDeliveryId } : {}),
+      ...(attachmentTrackingErrors.length ? { attachmentTrackingErrors } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),

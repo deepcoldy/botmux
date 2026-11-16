@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { t } from '../src/i18n/index.js';
 
 const mocks = vi.hoisted(() => ({ request: vi.fn(), create: vi.fn(), reply: vi.fn(), patch: vi.fn(), upload: vi.fn() }));
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
@@ -33,6 +34,11 @@ import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 import { drainTraexRollout } from '../src/services/traex-transcript.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { composeRowFromActive } from '../src/core/dashboard-rows.js';
+import { markSessionActivity } from '../src/core/session-activity.js';
+import { normalizeExecutionActivity } from '../src/core/execution-activity.js';
+import { sessionLastActivityAt } from '../src/dashboard/web/sessions.js';
 
 const APP = 'cli_background_wait_card';
 const oldDataDir = config.session.dataDir;
@@ -186,10 +192,110 @@ describe('activity-triggered refresh boundaries', () => {
   });
 });
 
+describe('Dashboard execution activity patches', () => {
+  /** Rows as the Dashboard store holds them: snapshot, then every SSE patch merged over it after a JSON round trip. */
+  function dashboardRow(): { current: () => Record<string, any>; stop: () => void } {
+    let row: Record<string, any> = JSON.parse(JSON.stringify(composeRowFromActive(ds, { includeTokenUsage: false })));
+    const stop = dashboardEventBus.subscribe((event: any) => {
+      if (event.type !== 'session.update' || event.body.sessionId !== ds.session.sessionId) return;
+      row = { ...row, ...JSON.parse(JSON.stringify(event.body.patch)) };
+    });
+    return { current: () => row, stop };
+  }
+  /** Returns the execution start the worker reported (waitFor advances a faked clock). */
+  async function startTurn(turnId: string): Promise<number> {
+    ds.currentTurnId = turnId;
+    markSessionActivity(ds, Date.now());
+    const startedAtMs = Date.now();
+    await worker.listeners('message')[0]({ type: 'capture_identity', revision: Date.now(), turnId, dispatchAttempt: 1 });
+    await worker.listeners('message')[0]({ type: 'turn_execution_started', turnId, dispatchAttempt: 1, startedAtMs });
+    await worker.listeners('message')[0]({ type: 'screen_update', content: 'screen', status: 'working', turnId });
+    await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+    return startedAtMs;
+  }
+  async function settle(turnId: string): Promise<void> {
+    await worker.listeners('message')[0]({ type: 'screen_update', content: 'screen', status: 'idle', turnId });
+    await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+  }
+
+  it('replaces a settled turn\'s observation instead of carrying it into the next turn', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    ds.lastScreenStatus = 'idle';
+    const view = dashboardRow();
+    try {
+      const turnOneStart = await startTurn('om_turn');
+      vi.setSystemTime(Date.now() + 30_000);
+      expect(view.current().executionActivity?.startedAtMs).toBe(turnOneStart);
+      await settle('om_turn');
+      expect(view.current().executionActivity ?? null).toBeNull();
+      vi.setSystemTime(Date.now() + 600_000);
+      const turnTwoStart = await startTurn('om_turn_2');
+      vi.setSystemTime(turnTwoStart + 5_000);
+      expect(view.current().executionActivity?.startedAtMs).toBe(turnTwoStart);
+      // The row was measured at the turn start; the live view advances it with the render clock.
+      expect(normalizeExecutionActivity(view.current().executionActivity, Date.now())).toMatchObject({ elapsedSeconds: 5 });
+    } finally { view.stop(); vi.useRealTimers(); }
+  });
+
+  it('picks up the turn start when the working edge arrived before it', async () => {
+    ds.lastScreenStatus = 'idle';
+    const view = dashboardRow();
+    try {
+      ds.currentTurnId = 'om_turn';
+      await worker.listeners('message')[0]({ type: 'capture_identity', revision: 1, turnId: 'om_turn', dispatchAttempt: 1 });
+      await worker.listeners('message')[0]({ type: 'screen_update', content: 'screen', status: 'working', turnId: 'om_turn' });
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(view.current().executionActivity).toMatchObject({ phase: 'unknown', source: 'unavailable' });
+      const startedAtMs = Date.now();
+      await worker.listeners('message')[0]({ type: 'turn_execution_started', turnId: 'om_turn', dispatchAttempt: 1, startedAtMs });
+      expect(view.current().executionActivity).toMatchObject({ source: 'turn-start', startedAtMs });
+    } finally { view.stop(); }
+  });
+
+  it('keeps lastMessageAt on the last routed input while the CLI reports progress (display time follows progress)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'traex', replyCardMode: 'legacy' });
+    ds.session.cliId = 'traex';
+    ds.lastScreenStatus = 'idle';
+    const view = dashboardRow();
+    try {
+      await startTurn('om_turn');
+      const inputAt = Date.parse(ds.session.lastMessageAt!);
+      vi.setSystemTime(Date.now() + 45_000);
+      await worker.listeners('message')[0]({ type: 'turn_progress', turnId: 'om_turn', dispatchAttempt: 1, stage: 'tool_started' });
+      expect(view.current().executionActivity).toMatchObject({ phase: 'tool', lastProgressAtMs: Date.now() });
+      expect(view.current().lastMessageAt).toBe(inputAt);
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).lastMessageAt).toBe(inputAt);
+      // The 「最近」/「更新于」 display reads the separate activity time, which does follow progress.
+      expect(sessionLastActivityAt(view.current())).toBe(Date.now());
+      expect(sessionLastActivityAt(composeRowFromActive(ds, { includeTokenUsage: false }) as any)).toBe(Date.now());
+    } finally { view.stop(); vi.useRealTimers(); }
+  });
+
+  it('does not count the write itself as the last execution activity', async () => {
+    ds.lastScreenStatus = 'idle';
+    await startTurn('om_turn');
+    const activity = composeRowFromActive(ds, { includeTokenUsage: false }).executionActivity;
+    expect(activity).toMatchObject({ phase: 'unknown', source: 'turn-start' });
+    expect(activity).not.toHaveProperty('lastProgressAtMs');
+  });
+
+  it.each(['streaming', 'footer', 'off'] as const)('leaves a non-Trae card on the plain working header (usage %s)', async usageDisplay => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', replyCardMode: 'legacy', usageDisplay });
+    ds.lastScreenStatus = 'idle';
+    await startTurn('om_turn');
+    expect(composeRowFromActive(ds, { includeTokenUsage: false }).executionActivity).toMatchObject({ source: 'turn-start' });
+    expect(streamCardLabel(ds)).toBeUndefined();
+    expect(patchedHeaders().at(-1)).toContain(t('card.status.working', undefined, 'zh'));
+    if (usageDisplay !== 'streaming') expect(usageRefreshShouldRun(ds)).toBe(false);
+  });
+});
+
 describe('background-wait label on the live card', () => {
   it('keeps current capture tuples intact and rejects superseded or mismatching activity', async () => {
     ds.session.cliId = 'traex'; ds.currentTurnId = 'om_turn';
-    const execution = { startedAtMs: Date.now() - 1000, workerGeneration: ds.workerGeneration!, stage: 'tool_started' as const };
+    type Execution = NonNullable<DaemonSession['replyExecutionStarts']> extends Map<string, infer V> ? V : never;
+    const execution: Execution = { startedAtMs: Date.now() - 1000, workerGeneration: ds.workerGeneration!, stage: 'tool_started' };
     ds.replyExecutionStarts = new Map([
       [JSON.stringify(['om_turn', 1]), execution],
       [JSON.stringify(['om_turn', 2]), { ...execution, stage: 'tool_returned' }],

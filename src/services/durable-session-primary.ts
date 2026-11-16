@@ -369,6 +369,60 @@ function mergePrimaryProjection(
   } as unknown as DurableJson;
 }
 
+/**
+ * Hand a closed canonical row to a same-anchor successor that reaches the lane
+ * before any inbound admission. mergePrimaryProjection already lets a brand-new
+ * logical Session follow a deliberately closed one at the same anchor, but only
+ * once a message is admitted for it. The /repo switch closes the predecessor
+ * and forks the replacement from a command or card path that never admits a
+ * message, so the replacement's first contract checkpoint is the earliest
+ * write that can claim the row. Returns undefined, so the caller keeps failing
+ * closed, unless the current row is the exact closed predecessor recorded at
+ * creation and the successor itself is active. Acquiring a new lease after a
+ * pause does not authorize replacing a later session, even if it is now closed.
+ *
+ * The predecessor's control history is bound to its sessionId and is dropped.
+ * The envelope requires an admission, so the predecessor's latest one stays as
+ * the only entry: it names a message this anchor already admitted under the
+ * predecessor, so no successor turn resolves output through it, and the
+ * successor's first admission appends its own.
+ */
+export function successorPrimarySessionValue(
+  current: DurableSessionRecord | undefined,
+  successor: Session,
+): DurableJson | undefined {
+  const value = object(current?.value);
+  const predecessor = object(value?.session);
+  const proof = successor.durablePrimaryPredecessor;
+  // Screen before the strict parse: a row that is not a closed predecessor is
+  // rejected by the caller exactly as before, whatever else is wrong with it.
+  if (!current
+      || value?.type !== 'botmux.session.primary'
+      || predecessor?.status !== 'closed'
+      || !proof
+      || predecessor.sessionId !== proof.sessionId
+      || !Number.isSafeInteger(proof.contractRevision) || proof.contractRevision < 0
+      || predecessor.sessionId === successor.sessionId
+      || successor.status !== 'active') {
+    return undefined;
+  }
+  const parsed = parseDurablePrimarySessionRecord(current);
+  // A resumed and closed-again predecessor has the same id but belongs to a
+  // later lifecycle; an old candidate must not inherit that new close.
+  if ((parsed.session.sessionRuntimeContract?.session.revision ?? 0) !== proof.contractRevision) return undefined;
+  if (primarySessionIdentity(successor, parsed.session.larkAppId).sessionKey !== current.sessionKey) {
+    throw new Error(`durable primary successor Session does not belong to ${current.sessionKey}`);
+  }
+  const next: DurablePrimarySessionProjection = {
+    version: DURABLE_PRIMARY_SESSION_VERSION,
+    type: 'botmux.session.primary',
+    session: cloneSession(successor),
+    admission: parsed.admission,
+    admissions: [parsed.admission],
+  };
+  return next as unknown as DurableJson;
+}
+
 /** Commit one completed control result and the resulting full Session snapshot. */
 export async function commitDurableLarkSessionControl(input: {
   facade: DurableSessionFacade;

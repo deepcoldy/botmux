@@ -37,6 +37,7 @@ import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
@@ -529,9 +530,8 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
-  /** Partition-scoped ByteCloud JWTs; the wrapper swaps one in by `--site`.
-   *  A call whose site needs a region missing here is refused, never sent
-   *  with the default token (see {@link bytedcliRegionalSelection}). */
+  /** Partition-scoped ByteCloud JWTs selected by `--site`. The default JWT
+   *  also serves `cn` when it claims the CN partition. */
   regionalCloudJwts?: Partial<Record<BytedcliRegion, string>>;
   /** Who was asked for {@link regionalCloudJwts}; only shapes the refusal
    *  text for a missing region. See {@link BytedcliRegionalJwtSource}. */
@@ -623,16 +623,16 @@ const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
 const MEEGO_HOME_VAR = 'BOTMUX_MEEGO_HOME';
 
 /**
- * ByteCloud JWTs are partition-scoped: a cn token is refused by i18n services
- * (`invalid jwt token ... partition i18n`). The daemon mints one per region and
+ * ByteCloud JWTs are partition-scoped. The daemon mints one per region and
  * the bytedcli wrapper picks the one matching the call's `--site` (or
  * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
  */
-export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx';
+export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx' | 'cn';
 const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
   i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
   i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
   tx: 'BOTMUX_IDENTITY_CLOUD_JWT_TX',
+  cn: 'BOTMUX_IDENTITY_CLOUD_JWT_CN',
 };
 /** `--site` values (bytedcli 0.178) grouped by the JWT region each one uses,
  *  measured by minting with every site. Sites not listed keep the default. */
@@ -643,6 +643,7 @@ const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
   // bmq / apm argos log / cloud-ticket, which all request an i18n-bd JWT.
   i18nbd: ['i18n', 'i18n-bd', 'us-ttpbd'],
   tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts'],
+  cn: ['cn'],
 };
 /** bytedcli's CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187). Aliases of a
  *  site without a regional token need no entry in the case below. */
@@ -753,13 +754,9 @@ function bytedcliSiteTrim(siteVar: string): string[] {
 /**
  * Shell lines selecting the regional ByteCloud JWT for this call's site.
  *
- * A call whose GLOBAL site is in a region the identity holds no token for is
- * REFUSED. Sending the default (cn) token there cannot work — the partition
- * rejects it (HTTP 401, read by the person as "not logged in") or bytedcli
- * skips it for the other site's login, which a per-person scratch HOME does not
- * have — and it would hide which ticket is actually missing. Commands that
- * never use that partition's token run as before (see
- * {@link BYTEDCLI_REGION_FREE_FN}).
+ * A call whose global site requires a missing partition token reports that
+ * partition before invoking bytedcli. Help and commands with their own
+ * credentials can still run (see {@link BYTEDCLI_REGION_FREE_FN}).
  *
  * The global site is read the way bytedcli 0.191 reads it: from the root
  * options only — it enables positional options, so a `--site` after the
@@ -880,6 +877,9 @@ export function renderIdentityEnv(identity: CliIdentity): string {
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    if (!identity.regionalCloudJwts?.cn && jwtClaims(identity.cloudJwt)?.region === 'cn') {
+      pairs.push([BYTEDCLI_REGIONAL_JWT_VARS.cn, identity.cloudJwt]);
+    }
     for (const [region, jwt] of Object.entries(identity.regionalCloudJwts ?? {})) {
       const key = BYTEDCLI_REGIONAL_JWT_VARS[region as BytedcliRegion];
       if (key && jwt) pairs.push([key, jwt]);

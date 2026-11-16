@@ -270,6 +270,53 @@ describe('session application identity route', () => {
     expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(tokens.resolveUserToken).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
+  it.each(['linux', 'darwin'] as const)(
+    'serves an ownerless schedule child through its exact-turn tool actor only on %s', async platform => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    session.managedTurnOrigin = {
+      ...session.managedTurnOrigin,
+      turnId,
+      preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`],
+    };
+    delete session.managedTurnOrigin.callerOpenId;
+    session.scheduledTurnCallers = undefined;
+    session.scheduledToolActors = new Map([[turnId, {
+      openId: 'ou_sender', unionId: 'on_sender',
+    }]]);
+
+    const response = await request('user');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      appId: 'cli_bound', mode: 'user', credential: 'bound-user-token',
+    });
+    expect(session.managedTurnOrigin.callerOpenId).toBeUndefined();
+    expect(session.scheduledTurnCallers).toBeUndefined();
+  });
+  it.each(['linux', 'darwin'] as const)(
+    'rejects when an ownerless child tool actor changes during credential resolution on %s', async platform => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    session.managedTurnOrigin = {
+      ...session.managedTurnOrigin,
+      turnId,
+      preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`],
+    };
+    delete session.managedTurnOrigin.callerOpenId;
+    session.scheduledToolActors = new Map([[turnId, {
+      openId: 'ou_sender', unionId: 'on_sender',
+    }]]);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      session.scheduledToolActors = undefined;
+      return 'late-token';
+    });
+
+    const response = await request('user');
+
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('late-token');
+  });
   it('uses each document turn author’s own grant without a normal message reply target', async () => {
     session.session = {
       sessionId: 'tool-session', status: 'active', ownerOpenId: 'ou_owner',

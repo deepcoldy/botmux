@@ -22,6 +22,10 @@ export type StreamStatusTemplate = typeof STREAM_STATUS_TEMPLATE_MAP[keyof typeo
  *  icon set; one colour keeps the label looking the same over either. */
 export const BACKGROUND_WAIT_TEMPLATE = 'wathet';
 
+/** Header for 「⏳ 上游暂不可用 · 预计 HH:MM 自动续跑」: the session is `idle`
+ *  underneath, but green would read as "done, waiting for you". */
+export const RECOVERY_WAIT_TEMPLATE = 'orange';
+
 export const STREAM_STATUS_TEMPLATE_ICON: Record<StreamStatusTemplate, string> = {
   yellow: '🟡',
   blue: '🔵',

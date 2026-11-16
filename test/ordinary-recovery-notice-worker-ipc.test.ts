@@ -42,9 +42,15 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   getCliDisplayName: () => 'Claude',
 }));
 
+// One shared, mutable bot config (read lazily, so the hoisted mock factory
+// does not touch it before this module body runs).
+const sharedBotConfig = (): { providerRecovery: { enabled: boolean } } & Record<string, unknown> =>
+  ((globalThis as any).__ordinaryRecoveryNoticeBotConfig ??= {
+    larkAppId: 'cli_app', larkAppSecret: 'secret', cliId: 'claude-code', providerRecovery: { enabled: true },
+  });
 vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({
-    config: { larkAppId: 'cli_app', larkAppSecret: 'secret', cliId: 'claude-code' },
+    config: sharedBotConfig(),
     resolvedAllowedUsers: [],
     botOpenId: 'ou_bot',
     botName: 'TestBot',
@@ -313,6 +319,22 @@ describe('recovery failure notice via the real worker IPC handlers', () => {
     const cardSessions = recoveryCardMock.mock.calls.map(([opts]) => opts.sessionId);
     expect(cardSessions.filter(id => id === owed.sessionId)).toHaveLength(1);
     expect(cardSessions.filter(id => id === legacy.sessionId)).toHaveLength(0);
+  });
+
+  it('still delivers an owed card after a restart once auto-continue has been switched off', async () => {
+    const owed = stuckSession(Date.now());
+    Object.assign(owed.ordinaryTurnRecovery, {
+      status: 'attention_required', lastErrorCode: 'recovery_outcome_unverified',
+      warningDispatched: true, alertSentAt: Date.now(), failureNoticeOwed: true,
+    });
+    sharedBotConfig().providerRecovery = { enabled: false };
+    try {
+      wire(owed);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(recoveryCardMock.mock.calls.map(([opts]) => opts.sessionId).filter(id => id === owed.sessionId)).toHaveLength(1);
+    } finally {
+      sharedBotConfig().providerRecovery = { enabled: true };
+    }
   });
 
   it('a user stop on the Claude session cancels the in-flight continuation: no failure card afterwards', async () => {

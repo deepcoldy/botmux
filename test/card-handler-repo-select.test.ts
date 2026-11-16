@@ -10,6 +10,7 @@
  * Run:  pnpm vitest run test/card-handler-repo-select.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as primaryContracts from '../src/core/session-contract-primary.js';
 
 // ─── Mocks (before importing the module under test) ───────────────────────
 
@@ -1045,6 +1046,7 @@ describe('repo select card — plain switch', () => {
     expect(ds.session.sessionId).toMatch(/^uuid-new-/);
     expect(ds.workingDir).toBe('/repos/beta');
     expect(ds.session.workingDir).toBe('/repos/beta');
+    expect(ds.session.durablePrimaryPredecessor).toBeUndefined();
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('');
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已切换');
@@ -1059,6 +1061,40 @@ describe('repo select card — plain switch', () => {
     expect(closedCard).not.toContain('beta');
     expect(ds.repoCardMessageId).toBeUndefined();
     expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+  });
+
+  it('persists the primary predecessor before starting the replacement worker', async () => {
+    const registration = vi.spyOn(primaryContracts, 'sessionContractPrimary').mockReturnValue({} as never);
+    try {
+      const ds = makeDs();
+      const predecessor = { sessionId: ds.session.sessionId, contractRevision: 7 };
+      // Closing the contract is what produces the revision the replacement
+      // may take over; the open contract is still behind it.
+      ds.session.sessionRuntimeContract = { session: { revision: predecessor.contractRevision - 1 } } as never;
+      const close = vi.mocked(closeWorkerPoolSession).getMockImplementation()!;
+      vi.mocked(closeWorkerPoolSession).mockImplementationOnce(async (...args) => {
+        // The close's final checkpoint mirrors onto whichever record is
+        // current, which may be a same-id object swapped in while it ran.
+        ds.session = { ...ds.session,
+          sessionRuntimeContract: { session: { revision: predecessor.contractRevision } } as never };
+        return close(...args);
+      });
+      const { deps } = makeDeps(ds);
+      let persisted: typeof ds.session.durablePrimaryPredecessor;
+      const observedAtFork: Array<typeof persisted> = [];
+      vi.mocked(updateSession).mockImplementationOnce(session => {
+        persisted = session.durablePrimaryPredecessor;
+      });
+      vi.mocked(forkWorker).mockImplementationOnce(() => {
+        observedAtFork.push(persisted);
+      });
+
+      await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledOnce();
+      expect(observedAtFork).toEqual([predecessor]);
+      expect(ds.session.durablePrimaryPredecessor).toEqual(predecessor);
+    } finally { registration.mockRestore(); }
   });
 
   it('keeps the old ZMX session and repo card active when authoritative teardown is refused', async () => {

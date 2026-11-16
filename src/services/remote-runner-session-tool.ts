@@ -21,6 +21,13 @@ const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_ATTACHMENTS = 8;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+export class QuotedAttachmentLimitError extends Error {
+  constructor(readonly actualBytes: number, readonly limitBytes: number) {
+    super(`quoted attachments exceed the transfer limit: ${actualBytes} bytes > ${limitBytes} bytes`);
+    this.name = 'QuotedAttachmentLimitError';
+  }
+}
+
 export interface RemoteRunnerSessionToolHostContext {
   sessionId: string;
   turnId: string;
@@ -114,6 +121,7 @@ export function remoteRunnerSessionToolArgs(
 export function quotedAttachments(
   stdout: string,
   env: NodeJS.ProcessEnv,
+  maxAttachmentBytes = MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES,
 ): { stdout: string; attachments?: RemoteRunnerSessionToolAttachment[] } {
   let parsed: unknown;
   try {
@@ -159,8 +167,8 @@ export function quotedAttachments(
       throw new Error('quoted attachment escaped the BotMux attachment root');
     }
     totalBytes += info.size;
-    if (totalBytes > MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES) {
-      throw new Error('quoted attachments exceed the Remote Runner transfer limit');
+    if (totalBytes > maxAttachmentBytes) {
+      throw new QuotedAttachmentLimitError(totalBytes, maxAttachmentBytes);
     }
     const placeholder = `botmux-session-tool://attachment/${index}`;
     item.path = placeholder;

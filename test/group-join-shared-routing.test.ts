@@ -711,6 +711,31 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker.mock.calls[0]?.[1].content).not.toContain('<botmux_group_join');
   });
 
+  it('persists the awaiting-content title marker for an ordinary join, but not for a forced opening', async () => {
+    const { daemon, registry, types, sessionStore } = modules;
+    for (const appId of ['app_join_title', 'app_forced_title']) {
+      registry.registerBot({
+        larkAppId: appId,
+        larkAppSecret: 's',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+        autoStartOnGroupJoin: true,
+        autoStartOnGroupJoinPrompt: '处理群内未完成请求',
+        defaultWorkingDir: tempDir(`repo-${appId}`),
+        regularGroupReplyMode: 'chat',
+      });
+    }
+    await daemon.__testOnly_handleBotAdded('oc_join_title', 'ou_owner', 'app_join_title');
+    await daemon.__testOnly_handleBotAdded('oc_forced_title', 'ou_owner', 'app_forced_title', { forcePrompt: '处理人工领取的问题' });
+    const row = (chatId: string, appId: string) => {
+      const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+      expect(ds).toBeDefined();
+      return sessionStore.readSessionRowFromDisk(ds!.session.sessionId, 'test-app');
+    };
+    expect(row('oc_join_title', 'app_join_title')?.nativeSessionTitleAwaitingContent).toBe(true);
+    expect(row('oc_forced_title', 'app_forced_title')?.nativeSessionTitleAwaitingContent).toBeUndefined();
+  });
+
   it('配置 autoStartOnGroupJoinSeed 时 shared 锚点发送自定义文案', async () => {
     const { daemon, registry } = modules;
     const appId = 'app_join_shared_seed';

@@ -61,6 +61,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     workflow: { enabled: true },
     sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
     promptCache: null,
+    providerRecovery: null,
     multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -1228,10 +1229,12 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it('writes the switches and the whole grant list through the bot-grant writer', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ scheduleBotGrants: {
-      createEnabled: true, selfManageEnabled: false, grants: [grant], baseGrants: [] } }, deps);
+      createEnabled: true, selfManageEnabled: false, childOneShotEnabled: true,
+      grants: [grant], baseGrants: [] } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({
-      createEnabled: true, selfManageEnabled: false, botGrants: [grant] });
+      createEnabled: true, selfManageEnabled: false, childOneShotEnabled: true,
+      botGrants: [grant] });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -1244,6 +1247,7 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it.each([
     [{ createEnabled: 'yes' }, 'invalid_scheduleBotGrants_createEnabled'],
     [{ selfManageEnabled: 1 }, 'invalid_scheduleBotGrants_selfManageEnabled'],
+    [{ childOneShotEnabled: 'yes' }, 'invalid_scheduleBotGrants_childOneShotEnabled'],
     [{}, 'invalid_scheduleBotGrants'],
     [{ grants: 'team' }, 'invalid_scheduleBotGrants_grant'],
     // An app-scoped open_id is never a cross-app controller identity.
@@ -1384,6 +1388,23 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
     }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
+  });
+});
+
+describe('applySettingsWrite providerRecovery', () => {
+  it('writes a normalized block and clears it with null', async () => {
+    const deps = makeDeps();
+    expect((await applySettingsWrite({ providerRecovery: { enabled: true, maxWaitMinutes: 30 } }, deps)).ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ providerRecovery: { enabled: true, maxWaitMinutes: 30 } });
+    expect((await applySettingsWrite({ providerRecovery: null }, deps)).ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenLastCalledWith({ providerRecovery: null });
+  });
+
+  it('rejects out-of-range values instead of silently falling back to defaults', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ providerRecovery: { enabled: true, maxWaitMinutes: 999 } }, deps))
+      .toEqual({ ok: false, error: 'invalid_providerRecovery' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });
 
