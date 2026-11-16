@@ -57,7 +57,7 @@ function fixture() {
     env[name] = loadWorkerPoolFunction(name, env);
   }
   const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: eventScope });
-  const gatewayEnv = { ...env, sessionController: controller, contractWorker: producer, ds, worker, sameWorker, contractTerminalStatus,
+  const gatewayEnv = { ...env, sessionController: controller, contractWorker: producer, workerGeneration: 1, ds, worker, sameWorker, contractTerminalStatus,
     cb: { onTurnTerminal: vi.fn() },
     ownsWorkerSession: () => ds.worker === worker,
     isSessionTransferring: () => false, managedAuxUiSuppressed: () => true, finalizeCotMessage: vi.fn(),
@@ -173,6 +173,21 @@ describe('ordinary IM delivery through the strict session contract', () => {
     if (invalid === 'missing') delete message.sessionContract;
     await s.handle(message); expect(s.pending.size).toBe(1);
     expect(s.env.recordWorkerCommittedTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(['valid', 'session', 'sequence', 'execution'])('records a retiring commit for an untracked turn only with envelope proof: %s', async variant => {
+    // A Codex turn outside the delivery tracker (doc-watch, approval, ...) ACKs
+    // its commit after submission. Suspend keeps the contract worker, so the
+    // ACK can drain after ds.worker detached; the retire notice must see it.
+    const s = fixture(); const execution = s.controller.admitInput('doc-watch-1763290000000-abcdefgh');
+    const message = s.receipt('turn_input_committed', { turnId: execution.turnId, sessionCommand: { execution } });
+    s.ds.worker = null;
+    if (variant === 'session') message.sessionContract.session.sessionId = 'foreign';
+    if (variant === 'sequence') message.sessionContract.eventId = 'foreign';
+    if (variant === 'execution') message.sessionContract.scope.execution.executionId = 'foreign';
+    await s.handle(message);
+    if (variant === 'valid') expect(s.env.recordWorkerCommittedTurn).toHaveBeenCalledExactlyOnceWith(s.worker, execution.turnId);
+    else expect(s.env.recordWorkerCommittedTurn).not.toHaveBeenCalled();
   });
 
   it.each(['completed', 'failed', 'ambiguous', 'cancelled'])('uses only verified successful terminal evidence if the commit was lost: %s', async status => {

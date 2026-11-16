@@ -1,6 +1,6 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
-import { sameWorker, sameRuntime, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
+import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import {
   compareLaunchedInstall,
@@ -24362,8 +24362,22 @@ function setupWorkerHandlers(
     // Settle only this child's frozen input admission; never grant it access
     // to the replacement's runtime, cards, execution state or delivery record.
     if (ds.worker !== worker && msg.type === 'turn_input_committed') {
+      const execution = metadata?.scope.execution;
       if (metadata && sameWorker(metadata.producer, contractWorker)
-        && msg.dispatchAttempt === metadata.scope.execution?.dispatchAttempt) {
+        && msg.dispatchAttempt === execution?.dispatchAttempt) {
+        // The commit is this child's exact fact for its own retire notice,
+        // whether or not a delivery record tracks the turn (e.g. a Codex
+        // doc-watch / approval turn whose ACK follows submission). Record it
+        // only behind the same envelope proof the gateway applies.
+        if (execution && execution.turnId === msg.turnId && metadata.version === 2
+          && metadata.producer.generation === workerGeneration
+          && metadata.session.appId === sessionController.ref.appId
+          && metadata.session.sessionId === sessionController.ref.sessionId
+          && Number.isSafeInteger(metadata.sequence) && metadata.sequence >= 1
+          && metadata.eventId === `${contractWorker.workerId}:${metadata.sequence}`
+          && sameExecution(sessionController.store.execution(sessionController.ref, execution.executionId)?.ref, execution)) {
+          recordWorkerCommittedTurn(worker, msg.turnId);
+        }
         completeWorkerOrdinaryImDelivery(worker, msg.turnId, metadata);
       }
       return;

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
-import { contractTerminalStatus, executionObserverSupported } from '../../src/services/session-contract.js';
+import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
@@ -15,6 +15,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
+  if (key === 'sameExecution') return sameExecution;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
