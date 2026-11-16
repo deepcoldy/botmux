@@ -6,6 +6,9 @@ export interface GroupCreationDefaults {
   tag?: string;
   /** `name` renders the group name; `logo` reuses the session-group logo gradient. */
   avatar?: GroupAvatarMode;
+  /** `/g <text>` is a task by default: the chat is named from it and this
+   *  bot starts a session there. `false` keeps `/g <text>` a plain group name. */
+  autoStart?: boolean;
 }
 
 const AVATAR_MODES: readonly GroupAvatarMode[] = ['name', 'logo', 'off'];
@@ -14,7 +17,7 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('groupCreation must be an object');
   const v = value as Record<string, unknown>;
   for (const key of Object.keys(v)) {
-    if (!['agents', 'tag', 'avatar'].includes(key)) throw new Error(`Unknown groupCreation option: ${key}`);
+    if (!['agents', 'tag', 'avatar', 'autoStart'].includes(key)) throw new Error(`Unknown groupCreation option: ${key}`);
   }
   const out: GroupCreationDefaults = {};
   if (v.agents !== undefined) {
@@ -32,15 +35,21 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
     if (!AVATAR_MODES.includes(v.avatar as GroupAvatarMode)) throw new Error('avatar must be name, logo or off');
     out.avatar = v.avatar as GroupAvatarMode;
   }
+  if (v.autoStart !== undefined) {
+    if (typeof v.autoStart !== 'boolean') throw new Error('autoStart must be true or false');
+    out.autoStart = v.autoStart;
+  }
   return out;
 }
 
 export interface GroupCreationArgs extends GroupCreationDefaults {
   name: string;
+  /** Every line left after removing the options: the task unless `autoStart` is false. */
+  body: string;
   roleProfileId?: string;
 }
 
-type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile';
+type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile' | 'start';
 
 /** Discriminated union — value flags only declare `apply`, opt-out flags only
  *  declare `clear`. Keeps every spec truthful about what it supports. */
@@ -67,6 +76,7 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
     kind: 'value', key: 'role-profile',
     apply(bag, value) { bag.roleProfileId = value; },
   },
+  'no-start': { kind: 'optOut', key: 'start', clear(bag) { bag.autoStart = false; } },
 };
 
 /**
@@ -173,7 +183,8 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
 
   const roleProfileId = typeof bag.roleProfileId === 'string' ? bag.roleProfileId : undefined;
   delete bag.roleProfileId;
-  return { ...parseGroupCreationDefaults(bag), name: firstLine, roleProfileId };
+  const parsed = parseGroupCreationDefaults(bag);
+  return { ...parsed, name: firstLine, body: body.trim(), roleProfileId };
 }
 
 /** What /g should do beyond creating the chat, derived from the parsed args. */

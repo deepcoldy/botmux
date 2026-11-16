@@ -77,6 +77,8 @@ describe('MULTILINE_COMMANDS 豁免（§9 补测）', () => {
     const { parseSlashCommandInvocation } = await import('../src/core/command-router.js');
     expect(parseSlashCommandInvocation('/role set\n# 角色\n你是一个 reviewer')).toEqual({ cmd: '/role', content: '/role set\n# 角色\n你是一个 reviewer' });
     expect(parseSlashCommandInvocation('/role set\n/清单')).toBeNull();
+    // /g 的任务可以跨行。
+    expect(parseSlashCommandInvocation('/g 修复价格\n第二行细节')).toEqual({ cmd: '/g', content: '/g 修复价格\n第二行细节' });
   });
 });
 

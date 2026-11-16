@@ -252,6 +252,7 @@ type SessionPhase =
 | 已有会话的话题里发 `/tw 干活` | 主干：当普通输入送进 CLI（`/tw` 成为字面文本） | 回「指令头只在新话题第一条生效」 | `topicHeaderDeclaresSpec` 计入 lifecycle | rebase 2026-09-16 |
 | 当前 bot 有效插件声明的 `/xxx`（如 `/work-bind`） | `unknown_slash`，作为普通消息转给 CLI | `plugin` 决策：不建会话、不进 CLI，转给插件服务；内置名、固定透传名与 bot 有效透传集同名时仍按原判定 | 插件需要确定性的群内入口；`pluginCommands` 缺省为空时判定逐字不变（差分测试守护） | 2026-10-14 `docs/design/2026-10-14-plugin-slash-commands.md` |
 | 显式启用 remote-runner 的 `/adopt`、`/detach`、`/disconnect` | daemon 原生处理 | 独立 `delegated_turn`，仍过 grant / daemon 权限；adopt 普通 turn 冷启动，detach 无会话不启动，primary 拒绝 detach；其它输入完全不变 | provider 管理业务绑定，固定白名单、默认关闭；不复用 forward/raw input | #3469 |
+| 多行的 `/g` `/group`（第二行起非空） | 多行拒掉，整条当纯文本转给当前会话 CLI | 识别为 `/group`（`multiline`）：默认全文是任务；`--no-start` 时仍只取首个非空行作群名 | `/g` 的任务需要跨行；首行带 `<…>` 或后续行以 `/` 开头仍按讨论文字处理 | 2026-11-13 `/g` 带任务开工 |
 
 ## 10. 验证
 

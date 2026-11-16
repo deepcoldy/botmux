@@ -7029,6 +7029,21 @@ const commandDeps: CommandHandlerDeps = {
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
+  // `/g <task>` hands its text to a new CLI session: same talk check,
+  // prompt.submit gate and quota charge as a normal message, before the
+  // group exists (a refusal must leave no external side effect).
+  admitTaskPrompt: ({ larkAppId, message, anchor, content }) => enforceMessageQuotaForCliInput(
+    larkAppId,
+    message.chatId ?? anchor,
+    message.senderId,
+    message.messageId,
+    anchor,
+    message.senderUnionId,
+    undefined,
+    message.chatType,
+    false,
+    { promptContent: content },
+  ),
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing

@@ -51,7 +51,11 @@ describe('command schema ↔ 冻结的 legacy 集合', () => {
   it('SESSIONLESS / EXISTING_SESSION_ONLY / MULTILINE 逐字相等', () => {
     expect(sorted(withoutIntentional(SESSIONLESS_DAEMON_COMMANDS))).toEqual(sorted(ORACLE_SESSIONLESS_DAEMON_COMMANDS));
     expect(sorted(withoutIntentional(EXISTING_SESSION_ONLY_DAEMON_COMMANDS))).toEqual(sorted(ORACLE_EXISTING_SESSION_ONLY_DAEMON_COMMANDS));
-    expect(sorted(withoutIntentional(MULTILINE_COMMANDS))).toEqual(sorted(ORACLE_MULTILINE_COMMANDS));
+    // 有意变化（设计文档 §9）：/g 的任务正文可以跨行。
+    const intentionalMultiline = new Set(['/group', '/g']);
+    expect(sorted(new Set([...withoutIntentional(MULTILINE_COMMANDS)].filter(c => !intentionalMultiline.has(c)))))
+      .toEqual(sorted(ORACLE_MULTILINE_COMMANDS));
+    for (const c of intentionalMultiline) expect(MULTILINE_COMMANDS.has(c), c).toBe(true);
   });
   it('子集关系与不相交关系（command-trigger 的 reservedCommandKind 依赖它）', () => {
     for (const c of SESSIONLESS_DAEMON_COMMANDS) expect(DAEMON_COMMANDS.has(c), c).toBe(true);

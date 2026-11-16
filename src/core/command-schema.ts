@@ -150,7 +150,8 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/context-sharing', sessionPolicy: 'sessionless', help: ['help.context_sharing'],
     notes: '群级后台上下文开关；严格 owner/allowedUsers 闸，不创建或唤醒会话',
   },
-  { name: '/group', aliases: ['/g'], sessionPolicy: 'sessionless', help: ['help.group'] },
+  // 多行：`/g <任务>` 的正文是任务，可以跨行；普通 /g 仍只取首个非空行作群名。
+  { name: '/group', aliases: ['/g'], sessionPolicy: 'sessionless', multiline: true, help: ['help.group'] },
   { name: '/relay', sessionPolicy: 'default', help: ['help.relay', 'help.relay_create'] },
   { name: '/quote', sessionPolicy: 'existingOnly', help: ['help.quote'] },
   { name: '/fork', sessionPolicy: 'existingOnly', multiline: true, help: ['help.fork'] },
