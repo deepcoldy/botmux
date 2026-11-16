@@ -57,6 +57,7 @@ describe('requestCredentialGrant', () => {
     expect(calls[0]!.opts.headers.authorization).toBe('Bearer mt-secret');
     expect(calls[0]!.body).toEqual({
       unionId: 'on_alice', tool: 'lark-cli', appId: 'cli_bot', sessionId: 'sess-1', turnId: 'om_turn', machineId: 'm-1',
+      machineConsent: true,
     });
     expect(platformCredentialsUrl({ binding: BINDING })).toBe('https://platform.example.test/credentials');
   });

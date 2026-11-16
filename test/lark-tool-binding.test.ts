@@ -266,4 +266,18 @@ describe('managed lark-cli binding', () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
+  it('the guidance of a binding whose --as user is native never sends the agent to botmux auth request', () => {
+    for (const locale of ['en', 'zh']) {
+      for (const headless of [false, true]) {
+        const text = larkToolPrompt('cli_native', locale, headless, true);
+        expect(text).not.toContain('--scope');
+        expect(text).not.toMatch(/unavailable|不可用/);
+      }
+    }
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin' };
+    prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-native', appId: 'cli_native', userNative: true });
+    expect(larkToolPromptFromEnv('en', env)).not.toContain('--scope');
+    prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-person', appId: 'cli_native' });
+    expect(larkToolPromptFromEnv('en', env)).toContain('--scope');
+  });
 });

@@ -19,7 +19,7 @@ const authority: ScheduleAuthorityRecord = {
 const deps = () => ({
   runEnabled: true,
   hostRunScopes: ['bytedcli'] as const,
-  triggerUserAuthTools: ['lark-cli', 'bytedcli'] as const,
+  triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] as const },
   adminOpenIds: ['ou_user_target'],
   resolveTargetOpenId: vi.fn(async () => 'ou_user_target'),
   listChatMemberOpenIds: vi.fn(async () => ['ou_user_target']),
@@ -80,7 +80,9 @@ describe('delegated schedule runtime authorization', () => {
 
   it.each([
     [{ runEnabled: false }, 'revoked by host policy'],
-    [{ triggerUserAuthTools: ['bytedcli'] }, 'requires triggerUserAuth isolation'],
+    [{ triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }, 'requires triggerUserAuth isolation'],
+    [{ triggerUserAuth: { enabled: true, tools: [], capabilities: ['lark-user', 'meego'] } },
+      'requires triggerUserAuth isolation'],
     [{ hostRunScopes: [] }, 'run scope is no longer allowed'],
     [{ adminOpenIds: [] }, 'no longer an allowed bot operator'],
   ])('fails closed before dispatch for %o', async (patch, message) => {
@@ -116,6 +118,12 @@ describe('delegated schedule runtime authorization', () => {
     await expect(authorizeDelegatedScheduleRun(completedWithoutMarker.task, completedWithoutMarker,
       { ...deps(), allowCompletedOnce: true }))
       .rejects.toThrow('schedule authority state is completed');
+  });
+
+  it('accepts a capabilities policy that isolates lark-user and bytecloud', async () => {
+    await expect(authorizeDelegatedScheduleRun(task, authority, {
+      ...deps(), triggerUserAuth: { enabled: true, tools: [], capabilities: ['lark-user', 'bytecloud'] },
+    })).resolves.toMatchObject({ targetOpenId: 'ou_user_target' });
   });
 
   it('fails closed when identity resolution or membership changes', async () => {

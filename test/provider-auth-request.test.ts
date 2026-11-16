@@ -26,6 +26,7 @@ beforeEach(() => {
   deps = {
     requestMeegoLogin: vi.fn(async () => meego),
     bytedcliAuthorized: vi.fn(async () => false as boolean | 'unknown'),
+    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none'),
     beginBytedcliLogin: vi.fn(async () => ({ authUrl: BYTED_URL })),
     deliver: vi.fn(async () => delivery),
     now: () => clock,
@@ -61,6 +62,16 @@ describe('requestProviderAuth — Meego', () => {
     clock += LINK_RESEND_MS;
     expect((await ask('meego')).status).toBe('delivered');
     expect(deps.deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('refusals that arrive while the link is still going out do not send it again', async () => {
+    let release!: () => void;
+    deps.deliver.mockImplementationOnce(() => new Promise<AuthLinkDelivery>(resolve => { release = () => resolve('dm'); }));
+    const first = ask('meego');
+    expect((await ask('meego')).status).toBe('pending');
+    release();
+    expect((await first).status).toBe('delivered');
+    expect(deps.deliver).toHaveBeenCalledTimes(1);
   });
 
   it('a new link (the old one expired) goes out at once', async () => {
@@ -159,5 +170,30 @@ describe('requestProviderAuth — ByteCloud', () => {
     await ask('meego');
     expect((await ask('bytedcli')).status).toBe('delivered');
     expect(deps.deliver).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => {
+  it('tells the agent to retry now when the running turn adopted the login', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'adopted' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('ready');
+    expect(r.message).toContain('直接重试');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('keeps the next-turn wording when the turn cannot adopt it', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'none' as const);
+    expect((await ask('bytedcli')).message).toContain('下一轮');
+  });
+
+  it('says no login is needed when the turn already holds the person\'s identity', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'already' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('ready');
+    expect(r.message).toContain('不需要再登录');
   });
 });

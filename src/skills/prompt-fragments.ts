@@ -257,6 +257,10 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     label: '凭证：stderr 已附授权链接时', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
   {
+    key: 'ai.credentials.turn_speakers', block: 'credentials', stage: 'followup', kind: 'placeholder', placeholders: ['speakers'],
+    label: '凭证：本轮多人发言时按人选择身份（BOTMUX_AS）', gateLabel: '仅 trigger-user 鉴权会话且本轮有多位发言人',
+  },
+  {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
     label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },

@@ -66,6 +66,7 @@ describe('auth request arguments', () => {
     expect(providerAuthExitCode(true, 'ready')).toBe(0);
     for (const status of ['delivered', 'pending', 'undeliverable']) expect(providerAuthExitCode(true, status)).toBe(3);
     expect(providerAuthExitCode(true, 'unavailable')).toBe(4);
+    for (const status of ['undelivered', 'platform_undelivered']) expect(providerAuthExitCode(true, status)).toBe(5);
     expect(providerAuthExitCode(false, 'refused')).toBe(3);
     expect(providerAuthExitCode(false, undefined)).toBe(1);
     expect(providerAuthExitCode(true, 'something-new')).toBe(1);
@@ -332,5 +333,13 @@ describe('auth request CLI', () => {
     expect(invalid.stderr).toContain('未知或重复参数: --user');
     expect(invalid.stderr).not.toContain('用法:');
     expect(requests).toHaveLength(0);
+  });
+});
+
+describe('auth request --unattended', () => {
+  it('is a provider-only flag', () => {
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego', '--unattended'])).toMatchObject({ provider: 'meego', unattended: true });
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego'])).not.toHaveProperty('unattended');
+    expect(() => parseAuthRequestArgs(['request', '--unattended'])).toThrow(/--provider/);
   });
 });
