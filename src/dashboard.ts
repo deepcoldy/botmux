@@ -16,6 +16,7 @@ import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.j
 import { createHostPluginMarket, PluginMarketError } from './dashboard/plugin-market.js';
 import { pluginRecordHash } from './core/plugins/mutation-guard.js';
 import { withPluginServiceLock } from './core/plugins/service-manager.js';
+import { assertPluginPrerequisitesReady } from './core/plugins/prerequisites.js';
 import { createConfigApi } from './core/plugins/runtime.js';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
@@ -2991,6 +2992,7 @@ async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Pro
       invalidateGlobalConfigCache();
       const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
       assertPluginBindingTransition(pluginId, enabled, current);
+      if (enabled) await assertPluginPrerequisitesReady(pluginId);
       if (enabled) materializePlugin(pluginId);
       const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
       mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
@@ -3018,6 +3020,7 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
         { plugins: defaults },
       );
       assertPluginBindingTransition(pluginId, enabled, effective);
+      if (enabled) await assertPluginPrerequisitesReady(pluginId);
       if (enabled) materializePlugin(pluginId);
       const next = updateBotPluginOverride(current, pluginId, enabled);
       if (next.length > 0) entry.plugins = next;

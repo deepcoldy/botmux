@@ -21116,6 +21116,8 @@ async function cmdPlugin(args: string[]): Promise<void> {
       if (!pluginRegistryCache.plugins[pluginId]) throw new Error(`plugin_not_installed:${pluginId}`);
       const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
       if (enable) {
+        const { assertPluginPrerequisitesReady } = await import('./core/plugins/prerequisites.js');
+        await assertPluginPrerequisitesReady(pluginId);
         if (botSelector) {
           updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
         } else {
