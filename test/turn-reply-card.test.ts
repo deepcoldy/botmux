@@ -413,6 +413,45 @@ describe('one reply card per turn', () => {
     expect(store.read(key)!.lastCard).toContain('答'.repeat(50));
   });
 
+  it('drops the recap panel before the next-step row when chrome added after fitting would overflow the answer', async () => {
+    const next = { text: 'CI 绿了就合', payload: 'p', sig: 's' };
+    const markdown = '本轮改了终端渲染，测试已过。'.repeat(8);
+    // Like the on-call control: attached by the transport to a card that
+    // buildTurnReplyCard already sized, and larger than the panel.
+    const control = { tag: 'column_set', element_id: 'botmux_oncall_group', columns: [{ tag: 'column', elements: [
+      { tag: 'markdown', content: '人'.repeat(600) },
+    ] }] };
+    const withControl = (card: string) => {
+      const parsed = JSON.parse(card);
+      parsed.body.elements.push(control);
+      return JSON.stringify(parsed);
+    };
+    io.render = record => withControl(buildTurnReplyCard(record, presentation));
+    io.sendOverflow = vi.fn(async () => 'om_file');
+    await store.update(key, { kind: 'start' }, io);
+    // The largest answer whose card still fits with the control and the row on.
+    const fits = (text: string) => (['working', 'completed'] as const).every(phase => turnReplyCardRequestBytes(
+      io.render({ ...store.read(key)!, phase, finalCard: finalEvent(text).card, finalText: text, nextStep: next }),
+      input.chatId) <= TURN_REPLY_CARD_MAX_BYTES);
+    let answer = '';
+    for (const chunk of [4096, 1024, 256, 64, 16, 4, 1]) {
+      while (fits(answer + '答'.repeat(chunk))) answer += '答'.repeat(chunk);
+    }
+    await store.update(key, finalEvent(answer), io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    await store.update(key, { kind: 'next_step', nextStep: next }, io);
+    expect(store.read(key)!.lastCard).toContain('botmux_next_step');
+    // Sized on its own, the card still has room for the panel...
+    expect(buildTurnReplyCard({ ...store.read(key)!, recap: { markdown } }, presentation)).toContain('botmux_turn_recap');
+    await store.update(key, { kind: 'recap', markdown }, io);
+    // ...but with the control on it would not fit: the panel goes first, the row stays.
+    expect(io.sendOverflow).not.toHaveBeenCalled();
+    expect(store.read(key)?.overflowMessageId).toBeUndefined();
+    expect(store.read(key)!.lastCard).not.toContain('botmux_turn_recap');
+    expect(store.read(key)!.lastCard).toContain('botmux_next_step');
+    expect(store.read(key)!.lastCard).toContain('答'.repeat(50));
+  });
+
   it('recovers an undelivered final and its existing overflow attachment without uploading again', async () => {
     await store.update(key, { kind: 'start' }, io);
     io.sendOverflow = vi.fn(async () => 'om_file');

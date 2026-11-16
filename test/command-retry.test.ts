@@ -294,6 +294,7 @@ import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session, FailedTurnRecord } from '../src/types.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { noteCliRecap, noteRecapCard, noteRecapTurnStarted, recapIdle, type RecapIo } from '../src/core/turn-recap-state.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -420,6 +421,33 @@ describe('/retry command', () => {
     expect(turnId).toEqual(expect.any(String));
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('takes the「本轮回顾」over from the previous turn', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const cancelled: string[] = [];
+    const published: string[] = [];
+    const io: RecapIo = {
+      enabled: () => true, modelEnabled: () => true, showFacts: () => true, locale: () => 'zh',
+      readCard: async () => undefined, cardId: async () => 'card', insert: async () => {}, replace: async () => {},
+      modelRecap: async () => undefined,
+      setTimer: () => () => { cancelled.push('model wait'); },
+      now: () => Date.now(), warn: () => {},
+    };
+    const input = { facts: { files: ['src/a.ts'], commands: 0 }, modelPrompt: 'PROMPT' };
+    noteRecapTurnStarted(ds, 'om_turn_done');
+    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, input, io);
+    await recapIdle(ds);
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+    const retryTurnId = sendWorkerInput.mock.calls[0][2] as string;
+    expect(cancelled).toEqual(['model wait']);
+    noteRecapCard(ds, retryTurnId, { kind: 'unified', publish: async markdown => { published.push(markdown); } }, input, io);
+    noteCliRecap(ds, retryTurnId, '重试这一轮的回顾', io);
+    await recapIdle(ds);
+    expect(published.at(-1)).toContain('重试这一轮的回顾');
   });
 
   it('routes a new retry turn to the failed topic even after another topic becomes current', async () => {

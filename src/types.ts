@@ -2145,6 +2145,8 @@ export interface CodexAppEffortResult {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
+  /** One small-model recap of `prompt`, answered by recap_result. */
+  | { type: 'recap_request'; requestId: string; prompt: string }
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
@@ -2701,6 +2703,15 @@ export type WorkerToDaemonBase =
    *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
    *  the turn that just ended; the daemon shows it on that turn's last card. */
   | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  /** The CLI's own recap of the session (Claude Code's transcript away
+   *  summary), written while idle after a turn; turnId is that turn. */
+  | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }
+  /** What a completed turn did (「本轮回顾」), sent just before its terminal:
+   *  facts and the latest activity, recorded apart from the capped CoT buffer. */
+  | { type: 'recap_input'; turnId: string; dispatchAttempt?: number } & import('./services/turn-recap.js').RecapTurnInput
+  /** Answer to a recap_request: the recap, or why none was made. */
+  | { type: 'recap_result'; requestId: string; text?: string; error?: string;
+      costUsd?: number; inputTokens?: number; outputTokens?: number }
   /** Redacted execution observation for the daemon notification clock only. */
   | { type: 'turn_progress'; turnId: string; dispatchAttempt?: number; stage: import('./services/cli-progress-notice.js').ProgressStage }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.

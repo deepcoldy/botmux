@@ -1038,6 +1038,8 @@ export const messages: Record<string, string> = {
   'config.label.privateCard': '私有快照卡',
   'config.label.replyCardActions': '回复卡操作菜单',
   'config.label.replyCardNextStep': '回复卡下一步按钮',
+  'config.label.replyCardRecap': '回复卡本轮回顾',
+  'config.label.replyCardRecapModel': '本轮回顾小模型补写',
   'config.label.autoStartOnGroupJoin': '进群即开工',
   'config.label.autoStartOnNewTopic': '新话题即开工',
   'config.label.chatManagerEnabled': '群负责人（默认接待者）',
