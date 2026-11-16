@@ -763,6 +763,117 @@ exec "$real" "$@"
     }
   });
 
+  it.skipIf(!privateTmuxColdStartAvailable)('recognizes a session a timed-out client already built, and retries a duplicate while the probe is unconfirmed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'auto-admission-cold-'));
+    const countFile = join(root, 'new-session-count');
+    const shim = join(root, 'tmux');
+    const originalPath = process.env.PATH;
+    const sockets: string[] = [];
+    let tmuxBin = '';
+    let bodyError: unknown;
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const writeShim = (mode: 'timeout-present' | 'duplicate-unconfirmed', socket: string) => {
+      writeFileSync(countFile, '0');
+      // timeout-present: the real client forks the server and builds the
+      // session in the background while the shim sleeps past the 5s client
+      // wall, so spawnSync sees ETIMEDOUT although the session comes alive.
+      // duplicate-unconfirmed: the first create answers "duplicate session"
+      // with no server on the socket yet, so the has-session probe can only be
+      // unconfirmed; only the retry is allowed to create.
+      writeFileSync(shim, `#!/bin/sh
+real=${quote(tmuxBin)}
+count_file=${quote(countFile)}
+mode=${quote(mode)}
+is_new=0
+for arg in "$@"; do
+  if [ "$arg" = "new-session" ]; then
+    is_new=1
+    break
+  fi
+done
+if [ "$is_new" != 1 ]; then
+  exec "$real" "$@"
+fi
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s' "$n" > "$count_file"
+if [ "$n" = 1 ]; then
+  if [ "$mode" = "timeout-present" ]; then
+    "$real" "$@" &
+    sleep 6
+    exit 0
+  fi
+  echo "duplicate session: test" >&2
+  exit 1
+fi
+exec "$real" "$@"
+`);
+      chmodSync(shim, 0o755);
+    };
+    try {
+      tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
+      process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+      // Phase 1: the killed client already built the session. The has-session
+      // probe must confirm it and return without a second new-session.
+      const presentSocket = `cold-present-${process.pid}-${Date.now()}`;
+      sockets.push(presentSocket);
+      writeShim('timeout-present', presentSocket);
+      startColdTmuxSession(presentSocket, ['new-session', '-d', '-s', 'test']);
+      expect(Number(readFileSync(countFile, 'utf8'))).toBe(1);
+      execFileSync(tmuxBin, ['-L', presentSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
+      // Phase 2: a duplicate answer while no server answers the probe is
+      // unconfirmed, so the helper retries and the second create succeeds.
+      const duplicateSocket = `cold-duplicate-${process.pid}-${Date.now()}`;
+      sockets.push(duplicateSocket);
+      writeShim('duplicate-unconfirmed', duplicateSocket);
+      startColdTmuxSession(duplicateSocket, ['new-session', '-d', '-s', 'test']);
+      expect(Number(readFileSync(countFile, 'utf8'))).toBe(2);
+      execFileSync(tmuxBin, ['-L', duplicateSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
+    } catch (err) {
+      bodyError = err;
+    } finally {
+      const cleanupFailures: Error[] = [];
+      const keep = (resource: string, err: unknown) => {
+        const detail = tmuxThrownText(err).reason || (err instanceof Error ? err.message : String(err));
+        cleanupFailures.push(new Error(`failed to release ${resource}: ${detail}`, {
+          cause: err instanceof Error ? err : undefined,
+        }));
+      };
+      try {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+      } catch (err) {
+        keep('PATH', err);
+      }
+      for (const socket of sockets) {
+        const resource = `tmux socket ${socket}`;
+        try {
+          if (!tmuxBin) throw new Error('real tmux binary was not resolved');
+          execFileSync(tmuxBin, ['-L', socket, 'kill-server'], {
+            encoding: 'utf8',
+            timeout: 2_000,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+        } catch (err) {
+          if (!coldStartKillReleased(err)) keep(resource, err);
+        }
+      }
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch (err) {
+        keep(root, err);
+      }
+      const failures = [...(bodyError === undefined ? [] : [bodyError]), ...cleanupFailures];
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(
+          failures,
+          failures.map(failure => failure instanceof Error ? failure.message : String(failure)).join('\n'),
+        );
+      }
+    }
+  });
+
   it('holds follow-ups through the resumed continuation until its first model activity', async () => {
     const { traexCapacityQueueVisible, traexModelProgressVisible } = await import('../src/adapters/cli/traex.js');
     const h = harness();
