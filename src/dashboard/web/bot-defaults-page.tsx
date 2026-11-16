@@ -662,6 +662,8 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
     replyCardNextStep: body.replyCardNextStep,
+    replyCardRecap: body.replyCardRecap,
+    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -6002,6 +6004,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
+  const [recap, setRecap] = useState(bot.replyCardRecap === true);
+  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6020,10 +6024,12 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
     setNextStep(bot.replyCardNextStep === true);
+    setRecap(bot.replyCardRecap === true);
+    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6314,6 +6320,32 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = nextStep;
                 setNextStep(checked);
                 void savePatch({ replyCardNextStep: checked }, 'reply-next-step', () => setNextStep(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recap}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-recap"
+              title={tr('botDefaults.replyCardRecap')}
+              description={tr('botDefaults.replyCardRecapDescription')}
+              help={tr('botDefaults.replyCardRecapHelp')}
+              onChange={checked => {
+                const previous = recap;
+                setRecap(checked);
+                void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recapModel}
+              disabled={busy !== null || !recap}
+              dataAction="toggle-reply-card-recap-model"
+              title={tr('botDefaults.replyCardRecapModel')}
+              description={tr('botDefaults.replyCardRecapModelDescription')}
+              help={tr('botDefaults.replyCardRecapModelHelp')}
+              onChange={checked => {
+                const previous = recapModel;
+                setRecapModel(checked);
+                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>

@@ -233,6 +233,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     replyCardNextStep: j?.replyCardNextStep === true,
+    replyCardRecap: j?.replyCardRecap === true,
+    replyCardRecapModel: j?.replyCardRecapModel === true,
     cotEnabled: normalizeCotEnabled(j),
     replyCardShowTools: j?.replyCardShowTools !== false,
     replyCardNativeCot: j?.replyCardNativeCot === true,

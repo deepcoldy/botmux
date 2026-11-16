@@ -22,8 +22,7 @@ import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
-import { noteNextStepTurnStarted } from '../../core/next-step-suggestion.js';
-import { nextStepIo } from '../../core/next-step-io.js';
+import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { messageMentionsBot } from './message-parser.js';
@@ -2578,8 +2577,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
-    // Like beginNewTurn: the previous turn's「下一步」row comes off.
-    noteNextStepTurnStarted(ds, turnId, nextStepIo);
+    // Like beginNewTurn: the previous turn's「下一步」row and「本轮回顾」panel are retired.
+    noteReplyCardTurnStarted(ds, turnId);
     ds.currentTurnTitle = topicTitle.slice(0, 50);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
@@ -4251,6 +4250,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return;
       }
       rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -4422,6 +4423,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
       rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4516,6 +4519,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const retryReceipt = markRetryAttempt(ds.session);
       holdPurgeClickRollback(ds, retryTurnId, { ...(retryReceipt ? { receipt: retryReceipt } : {}), restoreTurnState });
       rememberLastCliInput(ds, failedTurn.userPrompt, continueInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
