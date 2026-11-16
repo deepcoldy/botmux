@@ -10,6 +10,7 @@ import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { SessionController } from '../src/core/session-controller.js';
 
 /**
@@ -46,7 +47,9 @@ function harness(opts: { markerPath?: string } = {}) {
     thinkingTurn: undefined,
     sandboxRelayCapability: null,
     completeManagedTurnOriginRevocation: vi.fn(),
-    terminalReleasesDurableTurn: () => false,
+    terminalReleasesDurableTurn,
+    durableTurnInFlight: false,
+    inflightInputs: { onTurnComplete: vi.fn() },
     remoteRunnerRecoveredTurnInFlight: false,
     flushPending: vi.fn(),
     queueMicrotask: (fn: () => void) => fn(),
@@ -193,6 +196,29 @@ describe('turn terminal releases the active turn authority', () => {
 
     expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
     expect(h.retiredTurnIds.has('om_absorbed')).toBe(true);
+  });
+
+  it('releases the durable in-flight barrier before a consumed queued turn takes over', () => {
+    const h = harness();
+    const microtasks: Array<() => void> = [];
+    h.queueMicrotask = (fn: () => void) => { microtasks.push(fn); };
+    h.durableTurnInFlight = true;
+    h.setCaptureIdentity('om_B', 1);
+    h.markActiveTurnStarted({ turnId: 'om_B', dispatchAttempt: 1 });
+    h.queuedTypeAheadTurns.push({ turnId: 'om_C', inputConsumed: true });
+
+    h.emitTurnTerminal('om_B', 'completed', undefined, 1);
+
+    // The deferred advance must not swap the capture tuple before the durable
+    // release block inside emitTurnTerminal compares it against the terminal.
+    expect(h.durableTurnInFlight).toBe(false);
+    expect(h.inflightInputs.onTurnComplete).toHaveBeenCalledTimes(1);
+    expect(h.currentBotmuxTurnId).toBe('om_B');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+
+    for (const fn of microtasks.splice(0)) fn();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+    expect(h.currentBotmuxTurnId).toBe('om_C');
   });
 
   it('frees an authority still held by a turn whose terminal already went out', () => {
