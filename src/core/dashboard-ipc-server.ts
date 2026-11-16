@@ -9064,7 +9064,7 @@ ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, re
   } finally { res.off('close', onClose); }
 }, NOT_BOUND_BODY.okFalse));
 
-/** Generic plugin operation: an explicit scope prevents unrelated personal-group removal. */
+/** Generic plugin operation: managedLabels must be explicit — an array limits removal, null clears all normal groups; omitted is rejected. */
 ipcRoute('PUT', '/api/groups/:chatId/feed-groups', requireBoundBot(async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
