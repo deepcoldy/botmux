@@ -64,7 +64,7 @@ afterEach(() => {
 const MAIN = 'cli_main';
 const OWNER = 'ou_owner_in_main';
 const BOTS = [
-  { larkAppId: MAIN, name: 'main', cliId: 'claude-code', workingDir: '/tmp', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } },
+  { larkAppId: MAIN, name: 'main', cliId: 'claude-code', workingDir: '/tmp', triggerUserAuth: { enabled: true, tools: ['lark-cli'] } },
   { larkAppId: 'cli_doc', name: 'doc', cliId: 'codex', workingDir: '/tmp' },
 ] as any[];
 const GROUP_TOPIC: RunChatBinding = { larkAppId: MAIN, chatId: 'oc_group', chatType: 'group', rootMessageId: 'om_root', ownerOpenId: OWNER };

@@ -39,7 +39,7 @@ beforeEach(() => {
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 function policy(tools: TriggerUserAuthTool[]): TriggerUserAuthConfig {
-  return { enabled: true, tools, fallback: 'bot-identity', credentialSource: 'local' };
+  return { enabled: true, tools, credentialSource: 'local' };
 }
 
 /** One worker spawn of the session: the same two calls, in the same order, as

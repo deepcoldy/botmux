@@ -1357,7 +1357,6 @@
     "test/platform-refusal-reason.test.ts": 0.01,
     "test/platform-team-store.test.ts": 0.02,
     "test/platform-team-trust.test.ts": 0.05,
-    "test/platform-teammate.test.ts": 0.01,
     "test/platform-tunnel-data-bridge.test.ts": 5.74,
     "test/platform-unbind-revocation.test.ts": 0.01,
     "test/plugin-card-action-gateway.integration.test.ts": 2.13,
