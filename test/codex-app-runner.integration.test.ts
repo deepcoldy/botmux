@@ -3872,6 +3872,45 @@ describe('Codex App native stop', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('keeps a timed-out stop in force when the interrupted terminal arrives late', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-interrupt-late-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    control.turnInterrupt = true;
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'operator-interrupt-late', control.bootstrap.path);
+    const send = (id: string) => harness.child.stdin.write(
+      `${CONTROL_PREFIX}${encodeRunnerInput(id, { text: id }, id, true)}\r`);
+    const target = (id: string) => control.markers.find(m => m.kind === 'interrupt_target' && m.payload.replyTurnId === id)?.payload;
+    const receipt = (id: string) => control.markers.find(m => m.kind === 'interrupt_result' && m.payload.requestId === id)?.payload;
+    const turnMethods = () => readRequests(logPath).map(r => r.method)
+      .filter(method => method === 'turn/start' || method === 'turn/steer' || method === 'turn/interrupt');
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      send('om_root');
+      await waitFor(harness, () => !!target('om_root'));
+      control.interrupt('stop-late', target('om_root')!.turnEpoch);
+      // No response within the runner's RPC timeout, yet the server is aborting the turn.
+      await waitFor(harness, () => receipt('stop-late')?.status === 'delivery_failed');
+      send('om_follow');
+      await waitFor(harness, () => !!target('om_follow'));
+      // The unconfirmed stop still holds the turn: no steer into it, and its late
+      // interrupted terminal settles as cancelled instead of a partial answer.
+      expect(turnMethods()).toEqual(['turn/start', 'turn/interrupt', 'turn/start']);
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_root', content: '', errorCode: 'cancelled' }),
+      ]);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe('Codex App live reasoning effort', () => {

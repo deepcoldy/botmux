@@ -630,6 +630,16 @@ function handle(request) {
       return;
     }
     const { threadId, turnId } = activeTurn;
+    if (behavior === 'operator-interrupt-late') {
+      // Never answer the request, but abort the turn after the runner's 8s RPC
+      // timeout: the stop reached the server even though no response arrived.
+      setTimeout(() => {
+        if (activeTurn?.turnId !== turnId) return;
+        activeTurn = undefined;
+        notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
+      }, 10_000);
+      return;
+    }
     if (behavior === 'operator-interrupt-steer') {
       // Acknowledge first and report the interrupted terminal later, like an
       // app-server that is still aborting tools. The turn stays steerable on
@@ -665,7 +675,7 @@ function handle(request) {
     return;
   }
   if (request.method === 'turn/steer') {
-    if (behavior === 'operator-interrupt-steer') {
+    if (behavior === 'operator-interrupt-steer' || behavior === 'operator-interrupt-late') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
         return;
