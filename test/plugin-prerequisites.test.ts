@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
@@ -20,6 +20,28 @@ function fixture(required: boolean, entry?: string) {
   writeFileSync(join(source, 'dist/package.json'), '{"type":"module"}');
   if (entry) writeFileSync(join(source, 'dist/prerequisites/index.mjs'), entry);
   return source;
+}
+
+function waitForInstalledMarker(marker: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const watcher = watch(join(home, '.botmux'), check);
+    const timer = setTimeout(() => finish(new Error('Install callback did not publish its complete readiness handshake')), 5000);
+    function finish(error?: Error) {
+      clearTimeout(timer);
+      watcher.close();
+      if (error) reject(error); else resolve();
+    }
+    function check() {
+      try {
+        if (JSON.parse(readFileSync(marker, 'utf8')).installed === true) finish();
+      } catch {
+        // The file can be absent or only partially written at the rename event.
+      }
+    }
+    watcher.on('error', finish);
+    // Covers publication before the watcher was registered as well as later changes.
+    check();
+  });
 }
 
 describe('explicit plugin prerequisites', () => {
@@ -45,13 +67,15 @@ describe('explicit plugin prerequisites', () => {
         const record = JSON.parse(readFileSync(join(home,'plugins-registry.json'),'utf8')).plugins.prepared;
         const identity = createHash('sha256').update(JSON.stringify(record)).digest('hex');
         if(identity !== process.env.BOTMUX_PLUGIN_INSTALL_RECORD) throw Error('revoked');
+        // Model a cold callback that progresses beyond vi.waitFor's former one-second window.
+        await new Promise(resolve => setTimeout(resolve,1200));
         writeFileSync(marker,JSON.stringify({ready:false,installed:true}));
       } else console.log(existsSync(marker) ? readFileSync(marker,'utf8') : '{"ready":false}');
     `);
     const result = installLocalPlugin(source);
     expect(result.record.contributions?.prerequisites?.entry).toBeDefined();
     const marker = join(home, '.botmux/prepared.json');
-    await vi.waitFor(() => expect(existsSync(marker)).toBe(true));
+    await waitForInstalledMarker(marker);
     expect(existsSync(join(home, '.botmux/.dashboard-token'))).toBe(false);
     const registry = readFileSync(join(home, '.botmux/plugins-registry.json'), 'utf8');
     await expect(assertPluginPrerequisitesReady('prepared')).rejects.toThrow();

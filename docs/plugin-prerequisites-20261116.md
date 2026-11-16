@@ -33,14 +33,15 @@ FERRY 网关插件（`@xinna/botmux-plugin-ferry-gateway`，独立 npm 包，不
 | `src/dashboard/web/plugin-page.tsx` | +59/-2 | 新增 `PluginManagementSurface`：同源动态导入插件导出的 `management` 组件，挂在原开关上方；前置未就绪时置灰所有"关闭态"开关，已开启的开关仍允许关闭 |
 | `src/dashboard/web/plugin-market.css` | +6 | 前置状态行样式与移动端适配，不改动原有控件样式 |
 
-### 2.2 新增文件（4 个）
+### 2.2 新增协议与验证文件
 
-| 文件 | 行数 | 作用 |
-| --- | --- | --- |
-| `src/core/plugins/prerequisites.ts` | 62 | 核心：安装回调 `prepareInstalledPlugin` 与启用检查 `assertPluginPrerequisitesReady` |
-| `test/plugin-prerequisites.test.ts` | 71 | 6 个用例：普通插件零影响、安装即准备、无 Dashboard token、启用前新鲜检查、入口缺失失败等 |
-| `test/plugin-integrated-management.test.ts` | 19 | 7 个用例：内嵌管理组件只接受显式 `version:1 + placement:'before-scope-controls' + Component 函数`，其他形态一律返回 null |
-| `scripts/verify-ferry-install-prerequisites.ts` | 47 | 隔离 HOME 的端到端验证脚本（经 `scripts/fenced-run.ts` 运行），PATH 中无 Node/npm 时插件仍能自备运行时 |
+| 文件 | 作用 |
+| --- | --- |
+| `src/core/plugins/prerequisites.ts` | 核心：安装回调 `prepareInstalledPlugin` 与启用检查 `assertPluginPrerequisitesReady` |
+| `test/plugin-prerequisites.test.ts` | 普通插件零影响、安装即准备、无 Dashboard token、启用前新鲜检查、入口缺失失败；安装回调用完整结果握手，不以固定一秒轮询推断完成 |
+| `test/plugin-prerequisites-adversarial.test.ts` | 人工中途改变就绪状态、提交后的准备失败、周期与长检查交叠及入口缺失的真实组件异常回归 |
+| `test/plugin-integrated-management.test.ts` | 内嵌管理组件只接受显式 `version:1 + placement:'before-scope-controls' + Component 函数`，其他形态一律返回 null |
+| `scripts/verify-ferry-install-prerequisites.ts` | 隔离 HOME 的端到端验证脚本（经 `scripts/fenced-run.ts` 运行），PATH 中无 Node/npm 时插件仍能自备运行时 |
 
 ## 3. 怎么改的（机制链路）
 
