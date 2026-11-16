@@ -104,6 +104,59 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
     expect(h.scope.inputDeliveryQuarantine).toBeNull();
   });
 
+  it('with no known native session id, only a positively owned receipt can release the quarantine', async () => {
+    const h = harness();
+    // Fresh session: the native session id is learned only after the first
+    // owned receipt, so at arm time there is no expected id to bind against.
+    h.scope.lastInitConfig = { cliId: 'traex' };
+    await warnAndDrop(h);
+    const original = h.scope.inputDeliveryQuarantine;
+    // A sibling's same-text history line: the traex recheck can prove submit
+    // but not ownership, and returns no session id. With no expected id to
+    // match, ownershipProven is the ONLY guard against a false release.
+    h.recheck.mockResolvedValue({ submitted: true });
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.scope.inputDeliveryQuarantine).toBe(original);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    // An unowned candidate id is equally insufficient without an expected id.
+    h.recheck.mockResolvedValue({ submitted: true, cliSessionId: 'sibling-session' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBe(original);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    // The first positively owned receipt (freshly learned id) unlocks the queue.
+    h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true, cliSessionId: 'freshly-learned-sid' });
+    h.scope.cliAdapter.writeInput.mockResolvedValue({ submitted: true });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.armPostTerminalInputFence).toHaveBeenCalledTimes(1);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+    expect(h.scope.cliAdapter.writeInput.mock.calls[1][1]).toBe('next input');
+  });
+
+  it.each(['backend', 'generation', 'restart', 'replacement', 'native-session'] as const)(
+    'rejects an otherwise-valid owned receipt after %s change', async change => {
+      const h = harness(); await warnAndDrop(h);
+      let resolve!: (result: SubmitRecheckResult) => void;
+      h.recheck.mockImplementation(() => new Promise(done => { resolve = done; }));
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(resolve).toBeTypeOf('function');
+      const original = h.scope.inputDeliveryQuarantine;
+      if (change === 'backend') h.scope.backend = {};
+      if (change === 'generation') h.scope.cliSpawnGeneration++;
+      if (change === 'restart') h.scope.cliRestartInProgress = true;
+      if (change === 'replacement') h.scope.inputDeliveryQuarantine = { ...original, dispatchAttempt: 2 };
+      if (change === 'native-session') h.scope.lastInitConfig.cliSessionId = 'new-session';
+      const current = h.scope.inputDeliveryQuarantine;
+      // A receipt that passes every recheck-LAYER filter (owned, id matches the
+      // arm-time session): the isCurrent fence is the only thing that may reject.
+      resolve({ submitted: true, ownershipProven: true, cliSessionId: 'owned-session' });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(h.scope.inputDeliveryQuarantine).toBe(current);
+      expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+      expect(h.scope.armPostTerminalInputFence).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(['backend', 'generation', 'restart', 'replacement', 'native-session'] as const)(
     'fences an awaited receipt across %s changes', async change => {
       const h = harness(); await warnAndDrop(h);
