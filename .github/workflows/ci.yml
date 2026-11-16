@@ -283,6 +283,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Only image download is retried. The glibc build and binary smoke still
+      # execute once, so their deterministic failures cannot be retried away.
+      - name: Pull the glibc builder image with network retries
+        run: node scripts/ci-net-retry.mjs docker pull quay.io/pypa/manylinux_2_28_x86_64:latest
+
       - name: Build and smoke on the supported glibc 2.28 floor
         # node-pty is compiled on the build host. ubuntu-latest raised the embedded
         # native to GLIBC_2.34, even though Node 22 and Bun still run on 2.28.
