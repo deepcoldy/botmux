@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../src/services/sqlite-compat.js';
@@ -53,7 +53,8 @@ describe('Antigravity model identity and accounting', () => {
 
   it('does not let a zero-token model-only metadata row hide the cost of priced execution', () => {
     add(main, 100); add('unknown-runtime-model', 0);
-    expect(estimateCostCny(usage(), { usdCny: 1, overrides: { models: { [main]: { input: 2, output: 1 } } } })).toBeCloseTo(0.0002);
+    // Explicit precision: the default (|diff| < 0.005) also accepts null at this magnitude.
+    expect(estimateCostCny(usage(), { usdCny: 1, overrides: { models: { [main]: { input: 2, output: 1 } } } })).toBeCloseTo(0.0002, 12);
   });
   it('shows the native display model on both card kinds while preserving the worker execution ID for usage', () => {
     add(main, 100, 'Gemini Orchestrator');
@@ -77,7 +78,8 @@ describe('Antigravity model identity and accounting', () => {
     } } })!;
     expect(record.model).toBe('');
     expect(record.models).toMatchObject([{ model: worker, inputTokens: 20 }, { model: main, inputTokens: 100 }]);
-    expect(record.costCny).toBeCloseTo(0.00022);
+    expect(record.costCny).toBeCloseTo(0.00022, 12);
+    expect(record.models?.map(row => row.costCny)).toEqual([expect.closeTo(0.00002, 12), expect.closeTo(0.0002, 12)]);
     const all = await query();
     expect(all.summary.inputTokens).toBe(120);
     expect(all.summary.records).toBe(1);
@@ -85,7 +87,7 @@ describe('Antigravity model identity and accounting', () => {
     const filtered = await query(worker);
     expect(filtered.summary.inputTokens).toBe(20);
     expect(filtered.sessions[0].inputTokens).toBe(20);
-    expect(filtered.summary.costCny).toBeCloseTo(0.00002);
+    expect(filtered.summary.costCny).toBeCloseTo(0.00002, 12);
 
     add(main, 50);
     expect(recordSessionUsage({ ...args(), usage: usage() })).toMatchObject({ model: main, inputTokens: 50,
@@ -102,6 +104,16 @@ describe('Antigravity model identity and accounting', () => {
     add(worker, 10);
     expect(recordSessionUsage({ ...args(), usage: usage() })).toMatchObject({ model: worker, inputTokens: 10,
       models: [{ model: worker, inputTokens: 10 }] });
+  });
+
+  it('recovers exact model baselines from the ledger when the next snapshot after the lost state already grew', () => {
+    add(main, 100); add(worker, 20);
+    recordSessionUsage({ ...args(), usage: usage() });
+    unlinkSync(join(args().ledgerDir, 'state-test.json'));
+    __resetUsageLedgerMemoryForTest();
+    add(main, 7); add(worker, 3);
+    expect(recordSessionUsage({ ...args(), usage: usage() })).toMatchObject({ model: '', inputTokens: 10,
+      models: [{ model: worker, inputTokens: 3 }, { model: main, inputTokens: 7 }] });
   });
 
   it('classifies the legacy migration interval as unknown instead of assigning old totals to one model', () => {
@@ -130,7 +142,8 @@ describe('Antigravity model identity and accounting', () => {
     add(main, 100); add(worker, 20);
     anchorSessionUsage({ ...args(), usage: usage() });
     add(worker, 10);
-    expect(recordSessionUsage({ ...args(), usage: usage() })?.inputTokens).toBe(10);
+    expect(recordSessionUsage({ ...args(), usage: usage() })).toMatchObject({ model: worker, inputTokens: 10,
+      models: [{ model: worker, inputTokens: 10 }] });
     db.exec('DELETE FROM gen_metadata'); idx = 0;
     add(main, 10);
     expect(recordSessionUsage({ ...args(), usage: usage() })).toBeNull();
@@ -175,5 +188,22 @@ describe('Antigravity model identity and accounting', () => {
     expect(record.model).toBe('');
     expect(record.inputTokens).toBe(10);
     expect(record.modelTotals).toHaveLength(2);
+  });
+
+  it('rejects persisted model breakdowns that do not conserve the record totals', async () => {
+    const dir = join(root, 'ledger'); mkdirSync(dir, { recursive: true });
+    const line = (recordId: string, models: unknown) => JSON.stringify({ v: 2, inputTokenSemantics: 'uncached', recordId,
+      ts: '2026-11-16T10:00:00.000Z', sessionId: 'audit', larkAppId: 'test', model: '', models,
+      inputTokens: 30, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 });
+    const row = (model: string, inputTokens: number) => ({ model, inputTokens, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 });
+    appendFileSync(join(dir, 'usage-2026-11-16.jsonl'), [
+      line('short', [row(main, 10), row(worker, 10)]),
+      line('duplicate', [row(main, 15), row(main, 15)]),
+      line('exact', [row(main, 20), row(worker, 10)]),
+    ].join('\n') + '\n');
+    const report = await query();
+    expect(report.coverage.invalidRecords).toBe(2);
+    expect(report.summary).toMatchObject({ records: 1, inputTokens: 30 });
+    expect(report.models.map(group => [group.id, group.inputTokens])).toEqual([[main, 20], [worker, 10]]);
   });
 });
