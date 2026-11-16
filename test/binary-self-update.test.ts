@@ -38,6 +38,7 @@ import {
 } from '../src/core/binary-install-shape.js';
 import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary, applyStandaloneUpdate } from '../src/core/binary-self-update.js';
 import { parseUpdateTarget } from '../src/core/update-check.js';
+import { standaloneSleep } from './helpers/standalone-sleep.js';
 import type { BinaryUpdateProgress } from '../src/core/binary-self-update.js';
 import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation, verifyBinaryRestartTarget } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
@@ -1111,13 +1112,18 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
    * holding, `replaceStandaloneBinary` would need a different strategy — so pin
    * the fact rather than only the code that relies on it.
    */
-  it('OS FACT: in-place write on a running executable is ETXTBSY; rename is not', () => {
+  // A sleep that still runs when renamed to `live`: a copy of uutils' multicall
+  // /bin/sleep (e.g. Ubuntu 26.04) exits at once, and (a) below would then
+  // accept the write for the wrong reason.
+  const sleepBin = standaloneSleep();
+  if (!sleepBin.path) console.warn(`[binary-self-update] OS FACT case will SKIP: ${sleepBin.reason}`);
+  it.skipIf(!sleepBin.path)('OS FACT: in-place write on a running executable is ETXTBSY; rename is not', () => {
     const dir = tmp();
     const bin = join(dir, 'live');
     // A real ELF, not a shell script: the kernel only holds the text lock for a
     // mapped executable. (Measured: a #!/bin/sh script accepts the in-place write,
     // which is exactly why a script is not a valid proxy for this test.)
-    execFileSync('cp', ['/bin/sleep', bin]);
+    execFileSync('cp', [sleepBin.path!, bin]);
     chmodSync(bin, 0o755);
     const child = spawnSync('sh', ['-c', `"${bin}" 2 & echo $!; sleep 0.4`], { encoding: 'utf-8' });
     expect(child.status).toBe(0);
