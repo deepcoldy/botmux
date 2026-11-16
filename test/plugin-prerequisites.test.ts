@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { assertPluginPrerequisitesReady } from '../src/core/plugins/prerequisites.js';
+import { isBunRuntime } from './helpers/ts-runner.js';
 
 let home: string;
 afterEach(() => { vi.unstubAllEnvs(); if (home) rmSync(home, { recursive: true, force: true }); });
@@ -91,5 +92,26 @@ describe('explicit plugin prerequisites', () => {
       if(process.argv[2] === 'check') console.log(${JSON.stringify(value)});
     `));
     await expect(assertPluginPrerequisitesReady('prepared')).rejects.toThrow();
+  });
+
+  // BUN_BE_BUN is a bootstrap switch for the compiled binary: only Bun itself
+  // reads it, so the preload contract can only be observed under the Bun runtime.
+  it.runIf(isBunRuntime())('removes the BUN_BE_BUN bootstrap switch before plugin code runs', async () => {
+    vi.stubEnv('BUN_BE_BUN', '1');
+    const source = fixture(true, `
+      import {writeFileSync} from 'node:fs';
+      import {join} from 'node:path';
+      import {homedir} from 'node:os';
+      const leaked = process.env.BUN_BE_BUN !== undefined;
+      if(process.argv[2] === 'installed') {
+        if(leaked) throw Error('bootstrap env leaked into installed callback');
+        writeFileSync(join(homedir(),'.botmux','prepared.json'),JSON.stringify({ready:true,installed:true}));
+      } else {
+        console.log(leaked ? '{"ready":false,"message":"bootstrap env leaked"}' : '{"ready":true}');
+      }
+    `);
+    installLocalPlugin(source);
+    await waitForInstalledMarker(join(home, '.botmux', 'prepared.json'));
+    await expect(assertPluginPrerequisitesReady('prepared')).resolves.toBeUndefined();
   });
 });

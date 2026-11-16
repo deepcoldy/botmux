@@ -66,7 +66,7 @@ FERRY 网关插件（`@xinna/botmux-plugin-ferry-gateway`，独立 npm 包，不
 
 - 用 `spawn(process.execPath, [entry, 'installed'], { detached: true, stdio: 'ignore' })` 独立进程执行，不阻塞安装返回；
 - 注入 `BOTMUX_PLUGIN_INSTALL_RECORD`（插件记录的 SHA-256 摘要）作为安装上下文标识，插件侧可校验是否仍对应当前安装记录；它不是通用管理令牌，也不提供对同一系统用户恶意进程的认证隔离；
-- 清理继承的安装授权；编译态执行外部 `.mjs` 入口时设置 `BUN_BE_BUN=1`，保证子进程按 Bun 解释器运行；
+- 清理继承的安装授权；编译态执行外部 `.mjs` 入口时设置 `BUN_BE_BUN=1`，保证子进程按 Bun 解释器运行；该变量只是启动开关，通过与插件服务相同的 `--preload`（`ensurePluginServicePreload()`）在插件代码执行前移除，避免插件嵌套调用 botmux 时误入 Bun CLI；
 - 启动失败只 `console.warn`，安装保持已提交状态——后续 `check` 不通过时开关仍然打不开，不会出现"装坏了还能开"。
 
 ### 3.3 启用时：三条写入路径统一 fail-closed
