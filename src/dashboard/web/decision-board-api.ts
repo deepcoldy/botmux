@@ -74,6 +74,10 @@ export function fetchBoardItem(appId: string, seq: number): Promise<BoardDetailR
   return call<BoardDetailResponse>(`${appPath(appId)}/items/${seq}`);
 }
 
+export async function closeBoardItemInChat(appId: string, seq: number, baseRev: number): Promise<void> {
+  await call(`${appPath(appId)}/items/${seq}/close-in-chat`, jsonInit('POST', { baseRev, confirmed: true }));
+}
+
 export async function markBoardItemSeen(appId: string, seq: number): Promise<void> {
   await call(`${appPath(appId)}/items/${seq}/seen`, { method: 'POST', headers: controlCsrfHeaders() });
 }

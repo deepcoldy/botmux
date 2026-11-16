@@ -1,7 +1,9 @@
+import type { TurnSpeaker } from './turn-speakers.js';
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
   CliTurnPayload,
+  AcceptedCommandInput,
   ChatContext,
   CotEntry,
   Session,
@@ -351,6 +353,7 @@ export interface DaemonSession {
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
   pendingCodexAppText?: string;
+  pendingAcceptedInput?: AcceptedCommandInput;
   /** Trusted, Botmux-authored instructions held out of the visible Codex App
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
@@ -510,6 +513,8 @@ export interface DaemonSession {
     completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
+    /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
+    lastDashboardPublishedAtMs?: number;
   }>;
   /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
    * Values are receipt epoch milliseconds, also fencing older legacy starts
@@ -671,6 +676,11 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact-turn controller identity exposed only to tool credential publication
+   * and `botmux actor current` for a bounded schedule child. Unlike
+   * scheduledTurnCallers, this does not authorize workflow or schedule
+   * mutations and is never persisted. */
+  scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
@@ -952,6 +962,9 @@ export interface DaemonSession {
     identityTurnId?: string;
     dispatchAttempt?: number;
     trustedCaller?: TrustedCaller | null;
+    /** Humans whose messages are in the running turn, in order of their latest
+     * message (the last one spoke last). Worker-reported, never CLI-supplied. */
+    speakers?: TurnSpeaker[];
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the

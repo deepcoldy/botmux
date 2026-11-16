@@ -17,7 +17,7 @@ import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sa
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import { normalizeHerdrBackendConfig, resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { normalizeRemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
-import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from './trigger-user-auth.js';
 import { sharedBotSandboxAdvice, type SharedBotSandboxAdvice } from '../core/shared-bot-sandbox-advice.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
@@ -52,6 +52,7 @@ import { normalizeFeedbackPresentation } from './feedback-presentation.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy } from './no-progress-notify-policy.js';
 import { normalizePromptCacheConfig } from './prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig } from './provider-recovery-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 import {
   notifyPinStreamingCardChanged,
@@ -166,6 +167,9 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
+  { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
+  { key: 'replyCardRecap', configKey: 'replyCardRecap', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「本轮回顾」on|off，默认关闭：在本轮最后一张回复卡签名上方放一个默认折叠的面板，列出改了哪些文件、跑了哪些命令；CLI 自己写出回顾时（Claude Code 空闲几分钟后写进 transcript 的离开总结）原地补上，不额外调用模型' },
+  { key: 'replyCardRecapModel', configKey: 'replyCardRecapModel', kind: 'boolean', effect: 'immediate', clearable: false, hint: '「本轮回顾」小模型补写 on|off，默认关闭，需同时开 replyCardRecap：本轮结束 6 分钟仍没有 CLI 自带回顾时，用会话自己的 Claude Code 凭证调一次 haiku 写回顾（实测每次约 $0.001–0.002）；沙盒/读隔离会话不调用，其它 CLI 不支持' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
   { key: 'summaryMemoryPath', configKey: 'summaryMemoryPath', kind: 'string', effect: 'immediate', clearable: true, hint: '/summary 记忆文件路径，支持相对当前项目根目录或绝对路径；unset 回 summary.md' },
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
@@ -182,6 +186,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'suppressDeliveredFinalFailureNotice', configKey: 'suppressDeliveredFinalFailureNotice', kind: 'boolean', effect: 'next-session', clearable: true, hint: '实验性：已送达 final 后不再补发失败通知 on|off（默认 off）：同一轮同一次尝试已带回执送达显式 final 后，结构化转写（Codex 等）收尾失败只记日志、不再发「模型连接失败」；信任该 final，不比对事后续写文本；执行状态仍为失败；下个 worker 启动生效' },
   { key: 'noProgressNotify', configKey: 'noProgressNotify', kind: 'json', effect: 'immediate', clearable: true, hint: '无进展提醒：Codex CLI 可用 {"cliEnabled":true} 显式开启（下一个 worker 生效，默认 5/15 分钟提醒，无自动重试）；Codex App（#1162）：{"enabled":false} 仅静默 Lark 推送（看板 stalled 状态与 requires_attention 保留，立即生效）；{"timeoutMs":300000} 调整阈值（整数 10000–3600000ms，默认 90000，下一个 worker 进程生效，不影响对账超时）；unset 回默认' },
   { key: 'promptCache', configKey: 'promptCache', kind: 'json', effect: 'immediate', clearable: true, hint: 'Claude Code 提示缓存：{"ttl":"1h","keepalive":{"enabled":true,"idleMinutes":54,"maxPings":2,"activeHours":"10:00-23:00","minContextTokens":50000}}；逐字段覆盖全局 promptCache，未设的字段继承全局；ttl 下个会话生效，保活立即生效；unset 回落全局' },
+  { key: 'providerRecovery', configKey: 'providerRecovery', kind: 'json', effect: 'immediate', clearable: true, hint: 'Claude Code 暂态模型服务故障后自动续跑（默认关）：{"enabled":true,"maxWaitMinutes":30}；开启后按上游给的恢复时间排期、读不到就退避，最长从最后一次成功请求算起 maxWaitMinutes 分钟（1–240，未设时 1 小时提示缓存为 55、否则 15）；关闭时失败直接发失败卡；逐字段覆盖全局 providerRecovery，unset 回落全局' },
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
@@ -209,12 +214,12 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
-  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后，勾选的能力用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"capabilities":["lark-user","bytecloud","meego"]}：lark-user=飞书用户身份（lark-cli --as user），bytecloud=ByteCloud（bytedcli、codebase、git push、bitscli / bits-cli，同一个开关），meego=Meego（仅 bytedcli meego，独立的 meegle 命令不受管）；bytecloud / meego 未列出时对应命令保持原生，直接用本机登录态；非法取值会被拒绝保存。省略 capabilities 时按 tools 推导（lark-cli→lark-user，bytedcli→bytecloud+meego；tools 也省略=全部）。未授权时命令一律拒绝（拒绝消息里会附授权入口，授权一次后重试即可），不会用 bot 或任何人的身份代跑；旧配置里的 fallback 字段会被忽略。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 allowSpeakerSwitch（默认 false）：设为 true 后，多人话题里可在某一条命令前加 BOTMUX_AS=<open_id> 让这一条命令用本轮另一位发言人的账号。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
   { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
-  { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
+  { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs/delegatedSlashCommands）；delegatedSlashCommands 仅允许 /adopt、/detach、/disconnect（默认关闭，下次 provider 启动生效）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
   { key: 'herdr', configKey: 'herdr', kind: 'json', effect: 'next-session', clearable: true, hint: 'herdr 后端放置配置 JSON，仅 backendType=herdr 时生效，字段全部可选：sessionName（宿主 Herdr 会话名，默认 botmux，指向别的会话时该会话必须已在运行）/placement（workspace=每话题新工作区，默认｜tab=目标工作区新开 Tab｜split=目标 Tab 分屏）/workspace（目标工作区 id 或标签）/tab（目标 Tab id 或标签）/splitDirection（right，默认｜down）/chatTypes（group/p2p 数组，缺省对所有会话生效）；非法字段会被拒绝，空对象或 unset 清除' },
 ];
 
@@ -667,7 +672,13 @@ async function applyConfigFieldInternal(
       } else if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
     } else if (spec.kind === 'json') {
-      entry[spec.configKey] = effective as any;
+      if (spec.configKey === 'triggerUserAuth') {
+        // `tools` is derived from `capabilities`, and `legacyFallback` is only
+        // for the background-job key of an unedited config: neither is stored.
+        const { legacyFallback: _legacy, ...stored } = effective as TriggerUserAuthConfig;
+        if (stored.capabilities) delete (stored as Partial<TriggerUserAuthConfig>).tools;
+        entry[spec.configKey] = stored as any;
+      } else entry[spec.configKey] = effective as any;
     } else {
       entry[spec.configKey] = effective;
     }
@@ -1062,7 +1073,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_provider_recovery: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1194,6 +1205,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
             const policy = normalizePromptCacheConfig(parsed);
             return policy ? { ok: true, value: policy } : { ok: false, reason: 'empty' };
           } catch (error) { return { ok: false, reason: `invalid_prompt_cache: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
+        if (spec.configKey === 'providerRecovery') {
+          try {
+            const policy = normalizeProviderRecoveryConfig(parsed);
+            return policy ? { ok: true, value: policy } : { ok: false, reason: 'empty' };
+          } catch (error) { return { ok: false, reason: `invalid_provider_recovery: ${error instanceof Error ? error.message : String(error)}` }; }
         }
         if (spec.configKey === 'noProgressNotify') {
           try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }

@@ -97,7 +97,6 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.schedules.detail.owner_label',
   'card.dashboard.schedules.detail.next_label',
   'card.dashboard.schedules.detail.last_label',
-  'card.dashboard.schedules.detail.status_label',
   'card.dashboard.schedules.detail.repeat_label',
   'card.dashboard.schedules.detail.prompt_label',
   'card.dashboard.schedules.detail.next_runs_header',

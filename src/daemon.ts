@@ -1,3 +1,4 @@
+import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
 import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
@@ -554,6 +555,7 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
+import { noteReplyCardTurnStarted } from './core/reply-card-turn-start.js';
 import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
@@ -646,7 +648,7 @@ import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secr
 import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
 import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
-import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import { clearSingleIdentityArtifacts, forgetProvenIdentityContent, recallProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
@@ -665,7 +667,8 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { assertScheduledAuthorityCurrent, authorizeScheduledTurn, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { validateScheduleChildOneShot } from './core/schedule-child-one-shot.js';
 import {
   prepareScheduledRecoveryRun,
   reconcileScheduledDelivery,
@@ -677,8 +680,11 @@ import {
   type ScheduledSendSettlement,
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
-import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
-import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
+import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
+import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
+import { isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
+import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
+import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -713,7 +719,7 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -4577,7 +4583,7 @@ function delegatedScheduleRuntimeDeps(appId: string) {
   return {
     runEnabled: schedulePolicy?.runEnabled !== false,
     hostRunScopes: schedulePolicy?.runScopes ?? [],
-    triggerUserAuthTools: triggerPolicy?.enabled === true ? triggerPolicy.tools : [],
+    triggerUserAuth: triggerPolicy,
     validateBotGrant: (record: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord) =>
       assertScheduleBotGrantActive(record, readGlobalConfig().scheduleDelegation),
     adminOpenIds: getDashboardAdminOpenIds(appId),
@@ -4687,6 +4693,21 @@ async function handleIdentityDecisionFlip(
   }
 }
 
+/** Proven identity material lives only in daemon memory, so a turn that was
+ *  executing when the daemon restarted has none once its re-attached worker
+ *  republishes the turn's origin. Before this daemon has published anything
+ *  for the session, prepare that turn again through the entry its original
+ *  publication used: the schedule authority for a scheduled run, the
+ *  session's reply target for a human message. */
+async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
+    || identityStorageModelForDaemonSession(ds) !== 'proven'
+    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId))
+    || !identityDecisionTurnIsLive(ds, turnId)) return;
+  const replay = prepareTurnCliIdentity(ds, turnId);
+  if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
+}
+
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (identityPublicationConflicted(ds)) return;
   if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
@@ -4719,7 +4740,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
     noteScheduledIdentityRestored(ds, task, turnId, identity);
   } else noteScheduledIdentityGap(ds, task, turnId, identity);
-  await publishTurnCliIdentity({
+  const outcomes = await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -4729,6 +4750,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  if (senderOpenId) clearRestoredLapses({ appId: ds.larkAppId, taskId, openId: senderOpenId, outcomes });
   assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
     { turnId, allowCompleted: true });
 }
@@ -4813,26 +4835,57 @@ async function prepareDelegatedScheduledTurnIdentity(
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
   if (authority.kind !== 'delegated') return false;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  // Same rule as the owner path: a one-shot is completed as soon as its turn
+  // is dispatched, so a replay or recovery of that admitted turn must still
+  // resolve (the scheduler admission refuses any new run of a completed task).
   const assertCurrent = () => assertScheduledAuthorityCurrent(authority,
-    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId });
+    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId, allowCompleted: true });
   const authorized = await authorizeDelegatedScheduleRun(
     authority.task,
     authority,
     { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
-      assertAuthorityCurrent: assertCurrent },
+      allowCompletedOnce: true, assertAuthorityCurrent: assertCurrent },
   );
-  await publishTurnCliIdentity({
-    botConfig: getBot(ds.larkAppId).config,
-    sessionDataDir: config.session.dataDir,
-    sessionId: ds.session.sessionId,
-    senderOpenId: undefined,
-    delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
-    locale: localeForBot(ds.larkAppId),
-    turnId,
-    storageModel: identityModelForPublication(ds),
-    privateChat: ds.chatType === 'p2p',
-  });
-  assertCurrent();
+  if (authorized.usesControllerToolActor) {
+    const identity: Extract<ScheduledRunIdentity, { ok: true }> = {
+      ok: true,
+      openId: authorized.targetOpenId,
+      unionId: authority.controlUnionId!,
+      source: 'creator',
+    };
+    noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+    noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: identity.openId,
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertCurrent();
+    (ds.scheduledToolActors ??= new Map()).set(turnId, {
+      openId: identity.openId,
+      unionId: identity.unionId,
+    });
+  } else {
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: undefined,
+      delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertCurrent();
+  }
   return true;
 }
 
@@ -4905,20 +4958,26 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       + `result=${delegatedIdentity.denialReason ?? 'delegated'}`,
     );
   }
-  await publishTurnCliIdentity({
+  const turnSenderOpenId = delegationBlocked
+    || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
+    || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
+    ? undefined : reply?.senderOpenId;
+  const outcomes = await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
-    senderOpenId: delegationBlocked
-      || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
-      || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
-      ? undefined : reply?.senderOpenId,
+    senderOpenId: turnSenderOpenId,
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  // An external or workflow turn is unattended too: credentials in force end its lapse.
+  if (turnSenderOpenId && !delegatedIdentity && isUnattendedIdentityTurnId(turnId)) {
+    clearRestoredLapses({ appId: ds.larkAppId, openId: turnSenderOpenId, outcomes,
+      taskId: unattendedTask(ds.larkAppId, ds.session.sessionId, turnId, localeForBot(ds.larkAppId)).taskId });
+  }
 
   // NO chat notice here.
   //
@@ -6711,6 +6770,8 @@ function runIdleAutoCompact(): void {
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   noteTurnStarted(ds, turnId);
+  // The previous turn's「下一步」row stops being the last card's.
+  noteReplyCardTurnStarted(ds, turnId);
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
@@ -7772,6 +7833,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnId = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingAcceptedInput = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingChatContext = undefined;
@@ -9669,7 +9731,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     // the task's creator identity only if that person may operate this bot
     // now; every fire re-checks the same admission.
     const { runAs, ownerOpenId: _ownerOpenId, ownerUnionId: _ownerUnionId, ...hostTask } = task;
-    let runAsOwner: { ownerOpenId: string; ownerUnionId: string; creatorLarkAppId: string } | undefined;
+    let runAsOwner: scheduler.ScheduleOwner = { kind: 'ownerless' };
     if (runAs !== undefined) {
       if (!selfDaemonLarkAppId || typeof runAs !== 'string'
         || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
@@ -9683,10 +9745,15 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });
       }
-      runAsOwner = { ownerOpenId: openId, ownerUnionId: unionId, creatorLarkAppId: selfDaemonLarkAppId };
+      runAsOwner = { kind: 'human', openId, unionId };
     }
     try {
-      const created = scheduler.addTask({ ...hostTask, ...runAsOwner, ...untilDoneParams });
+      const created = scheduler.addTask({
+        ...hostTask,
+        owner: runAsOwner,
+        ...(runAsOwner.kind === 'human' ? { creatorLarkAppId: selfDaemonLarkAppId } : {}),
+        ...untilDoneParams,
+      });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     } catch (error) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
@@ -9755,6 +9822,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
   let botGrantHolds: (() => boolean) | undefined;
+  let scheduledChildParent: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord | undefined;
+  let scheduledChildParsed: ReturnType<typeof scheduler.parseSchedule> | undefined;
+  let scheduledChildMaxTasksPerTurn: number | undefined;
   const caller = scheduleCallerForTurn(ds, turnId);
   const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
@@ -9765,6 +9835,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
   }
   const direct = directHuman || providerActor;
+  const scheduledParentTaskId = parseScheduledTurnId(turnId);
   const capability = ds.managedTurnOrigin.capability;
   try {
     if (directHuman) {
@@ -9776,6 +9847,67 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       controlOpenId = remoteRunnerControllerOpenId;
       controlUnionId = await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined;
       grantId = `provider-actor:${sessionId}:${turnId}`;
+    } else if (scheduledParentTaskId) {
+      const rawWorkingDir = ds.workingDir ?? ds.session.workingDir;
+      let sessionWorkingDir: string | undefined;
+      try { sessionWorkingDir = rawWorkingDir ? realpathSync(rawWorkingDir) : undefined; }
+      catch { sessionWorkingDir = undefined; }
+      const parent = scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId);
+      if (!parent) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      let parsed: ReturnType<typeof scheduler.parseSchedule>;
+      try { parsed = scheduler.parseSchedule(task.schedule); }
+      catch {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_requires_once' });
+      }
+      const childDecision = validateScheduleChildOneShot({
+        policy: readGlobalConfig().scheduleDelegation,
+        parent,
+        task,
+        parsed,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        rootMessageId: expectedRoot,
+        workingDir: sessionWorkingDir ?? '',
+        nowMs: Date.now(),
+      });
+      if (!childDecision.ok) {
+        return jsonRes(res, 403, { ok: false, error: childDecision.error });
+      }
+      const parentAuth = authorizeScheduledTurn({
+        turnId,
+        sessionLarkAppId: ds.larkAppId,
+        sessionChatId: ds.chatId,
+        loadTask: (appId, taskId) => readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
+        isOwnerAllowed: (appId, ownerOpenId) => getDashboardAdminOpenIds(appId).includes(ownerOpenId),
+        isScheduledTurnLive: liveTurnId => ds.scheduledTurnCallers?.has(liveTurnId) === true,
+      });
+      if ('error' in parentAuth
+        || parentAuth.ownerOpenId !== parent.controlOpenId
+        || parent.task.ownerUnionId !== parent.controlUnionId) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      const resolved = await resolveTargetAppOpenId(ds.larkAppId, parent.controlUnionId!);
+      if (resolved.status !== 'resolved' || resolved.openId !== parent.controlOpenId) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
+      if (!targetTriggerPolicy?.enabled
+        || !capabilityOn(targetTriggerPolicy, 'lark-user') || !capabilityOn(targetTriggerPolicy, 'bytecloud')) {
+        return jsonRes(res, 403, {
+          ok: false,
+          error: 'schedule_child_one_shot_identity_isolation_required',
+        });
+      }
+      scheduledChildParent = parent;
+      scheduledChildParsed = parsed;
+      scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+      controlOpenId = parent.controlOpenId;
+      controlUnionId = parent.controlUnionId;
+      grantId = `schedule-child:${ds.larkAppId}:${scheduledParentTaskId}:${turnId}`;
+      sourceMessageId = turnId;
+      sourceSessionId = sessionId;
     } else {
       if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
@@ -9819,12 +9951,11 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         if (!botGrantHolds()) return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
       }
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
-      if (!targetTriggerPolicy?.enabled
-        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+      if (!capabilityOn(targetTriggerPolicy, 'lark-user') || !capabilityOn(targetTriggerPolicy, 'bytecloud')) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
       }
       if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)
-        || !targetTriggerPolicy.tools.includes(scope))) {
+        || !capabilityOn(targetTriggerPolicy, capabilityOfTool(scope)))) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
       }
       if (capability.allowSelfManage === true && targetPolicy?.selfManageEnabled !== true) {
@@ -9860,6 +9991,36 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (botGrantHolds && !botGrantHolds()) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
     }
+    if (scheduledChildParent && scheduledChildParsed) {
+      try {
+        assertScheduledAuthorityCurrent(
+          scheduledChildParent,
+          scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId!),
+          { turnId, allowCompleted: true },
+        );
+      } catch {
+        return jsonRes(res, 409, { ok: false, error: 'schedule_child_one_shot_authority_changed' });
+      }
+      const rawWorkingDir = ds.workingDir ?? ds.session.workingDir;
+      let sessionWorkingDir: string | undefined;
+      try { sessionWorkingDir = rawWorkingDir ? realpathSync(rawWorkingDir) : undefined; }
+      catch { sessionWorkingDir = undefined; }
+      const childDecision = validateScheduleChildOneShot({
+        policy: readGlobalConfig().scheduleDelegation,
+        parent: scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId!),
+        task,
+        parsed: scheduledChildParsed,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        rootMessageId: expectedRoot,
+        workingDir: sessionWorkingDir ?? '',
+        nowMs: Date.now(),
+      });
+      if (!childDecision.ok) {
+        return jsonRes(res, 403, { ok: false, error: childDecision.error });
+      }
+      scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+    }
     const baseParams = {
       name: task.name.trim(),
       schedule: task.schedule,
@@ -9888,13 +10049,14 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       let created;
       try {
         created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
-          ownerOpenId: controlOpenId, ownerUnionId: controlUnionId }, {
+          owner: { kind: 'human', openId: controlOpenId, unionId: controlUnionId } }, {
           // turnId is the live managed origin read above — never the request body.
           directTurn: {
             turnId,
             maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
               ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
           },
+          creatingTurn: { sessionId: ds.session.sessionId, turnId },
         });
       } catch (error) {
         if (error instanceof Error && error.message === 'schedule_direct_task_limit') {
@@ -9923,13 +10085,18 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       sourceSessionId,
       targetTurnId: turnId,
       targetGeneration: generation,
-      maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+      maxTasksPerTurn: scheduledChildMaxTasksPerTurn
+        ?? readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
         ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+      controllerBoundToolIdentity: scheduledChildParent !== undefined,
     });
     if (!result.ok) {
+      const error = scheduledChildParent && result.error === 'grant_task_limit'
+        ? 'schedule_child_one_shot_task_limit'
+        : result.error;
       return jsonRes(res, result.error === 'grant_task_limit' ? 403 : 409, {
         ok: false,
-        error: result.error,
+        error,
       });
     }
     return jsonRes(res, result.replay ? 200 : 201, { ok: true, task: result.task, replay: result.replay });
@@ -22293,6 +22460,7 @@ function buildReservedInitialInput(
       whiteboardId: ds.session.whiteboardId,
       substituteTrigger: ds.pendingSubstituteTrigger,
       codexAppText: ds.pendingCodexAppText,
+      acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -22329,6 +22497,7 @@ function buildReservedInitialInput(
 function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingPrompt = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingAcceptedInput = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingAttachments = undefined;
@@ -27043,7 +27212,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (await executeNewTopicSlash({
     ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
     senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
-    forceTopic, forceTopicMode, botCfg,
+    forceTopic, forceTopicMode, botCfg, trustedCaller,
   })) return;
 
   // A setup-only `/t` must still pass the same talk-permission recheck as any
@@ -27354,6 +27523,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingTurnId: replyAnchorId,
     pendingTrustedCaller: trustedCaller,
     pendingCodexAppText: codexAppVisibleText,
+    pendingAcceptedInput: ctx.acceptedInput,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -27644,10 +27814,12 @@ interface NewTopicSlashContext {
   forceTopic: Extract<ReturnType<typeof parseTopicHeader>, { ok: true }> | null;
   forceTopicMode: 'default' | 'here' | 'worktree';
   botCfg: ReturnType<typeof getBot>['config'];
+  trustedCaller?: TrustedCaller;
 }
 
 async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
+  ctx.acceptedInput = undefined;
   // Intercept daemon commands in new topics (no session needed for some commands)
   // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
   // command when this bot opts in (default on). When off, fall through to
@@ -27666,6 +27838,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    delegatedCommands: sessionDelegatedSlashCommands(botCfg, undefined, config.daemon.backendType),
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
   });
   if (slashDecision.kind === 'plugin') {
@@ -27710,6 +27883,16 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
+        authorized: canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType),
+        primary: coordinationModeIsPrimary(),
+        caller: slash.trustedCaller,
+        larkAppId,
+        reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+      });
+      return !ctx.acceptedInput;
     }
     // Unlike daemon-management commands, `/sessions` is a read-only view of
     // metadata already visible in this group. Authorize it at canTalk level so
@@ -28372,6 +28555,10 @@ async function handleBotAdded(
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    // An ordinary join opens with the bootstrap, not a user question. Persist the
+    // awaiting-content marker at birth so naming starts from the first accepted
+    // content even if a later title write fails (forced openings carry a real task).
+    if (!forced) session.nativeSessionTitleAwaitingContent = true;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -29574,7 +29761,7 @@ async function handleThreadReplyAdmitted(
     ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent,
     routingChatId: ctxChatId, chatType: ctxChatType, chatId: threadChatId,
     senderOpenId: threadSenderOpenId, senderUnionId: threadSenderUnionId, teamTrustUnionId: threadTeamTrustUnionId,
-    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender,
+    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender, trustedCaller: threadTrustedCaller,
   })) return;
 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
@@ -30095,6 +30282,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
@@ -30205,6 +30393,7 @@ async function handleThreadReplyAdmitted(
         ds.pendingTurnId = parsed.messageId;
         ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
+        ds.pendingAcceptedInput = ctx.acceptedInput;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
@@ -30242,6 +30431,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
@@ -30455,6 +30645,10 @@ async function handleThreadReplyAdmitted(
     // pendingSender for the deferred spawn.
     const autoCreateSender = await getThreadSender();
     setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
+    // Hoisted for the same reason as promptContent/parsed below: the isolated
+    // newDs-literal eval in test/new-topic-lark-caller.test.ts only binds
+    // locals, never the RoutingContext, so it cannot see a bare `ctx` reference.
+    const autoCreateAcceptedInput = ctx.acceptedInput;
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -30473,6 +30667,7 @@ async function handleThreadReplyAdmitted(
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
+      pendingAcceptedInput: autoCreateAcceptedInput,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -30771,6 +30966,7 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            acceptedInput: ctx.acceptedInput,
             codexAppApplicationContext,
             codexAppMessageContext,
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
@@ -30801,6 +30997,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           codexAppMessageContext,
           solo: ds.soloSession,
@@ -31000,6 +31197,11 @@ async function handleThreadReplyAdmitted(
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
+    // A suspended/exited worker is the usual way back to a session, so this
+    // turn must also take the「下一步」row off the previous turn's card;
+    // otherwise that row stays clickable and this turn's own row is refused
+    // as belonging to an older turn.
+    noteReplyCardTurnStarted(ds, parsed.messageId);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -31043,6 +31245,7 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            acceptedInput: ctx.acceptedInput,
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,
@@ -31154,8 +31357,7 @@ async function handleThreadReplyAdmitted(
     // behind its unopened N. Appending this inbound to N would overtake those
     // persisted entries. Keep N exact and append the current turn after the
     // existing tail before starting the activation journal.
-    const queuedHasDurableTail = queuedDashboardTurn
-      && (ds.session.queuedActivationTail?.length ?? 0) > 0;
+    const queuedHasDurableTail = queuedOpeningHasTail(ds.session, ctx.acceptedInput);
     if (queuedHasDurableTail) await stageCurrentBehindQueuedActivation();
     const reforkContent = queuedDashboardTurn && !queuedHasDurableTail
       ? `${ds.session.queuedPrompt}\n\n${promptContent}`
@@ -31215,6 +31417,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: reforkCodexApp.text,
+          acceptedInput: queuedHasDurableTail ? ds.pendingAcceptedInput : ctx.acceptedInput,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -31239,6 +31442,7 @@ async function handleThreadReplyAdmitted(
         sender: queuedHasDurableTail ? undefined : reforkSender,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
         codexAppText: reforkCodexApp.text,
+        acceptedInput: queuedHasDurableTail ? ds.pendingAcceptedInput : ctx.acceptedInput,
         codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
         codexAppMessageContext: reforkCodexApp.messageContext,
         turnId: parsed.messageId,
@@ -31497,6 +31701,7 @@ async function handleThreadReplyAdmitted(
  * 推迟、透传送进已有会话。返回 true 表示已处理，入口应直接 return。
  */
 interface ThreadSlashContext {
+  trustedCaller?: TrustedCaller;
   ctx: RoutingContext;
   data: any;
   larkAppId: string;
@@ -31522,6 +31727,7 @@ interface ThreadSlashContext {
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  ctx.acceptedInput = undefined;
   if (ctx.effortTaskReentry) return false;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
@@ -31548,6 +31754,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       context: 'thread',
       phase: deriveSessionPhase(existingDs),
       sessionIsCommandScratch: !!existingDs && isResumeRecoveryPlaceholder(existingDs),
+      sessionHasBackendState: existingDs?.session.remoteBackendState !== undefined,
       passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
       coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
       senderIsBot: isBotSenderType || isForeignBotSender,
@@ -31557,6 +31764,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
         && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
       hasAttachments: resources.length > 0,
+      delegatedCommands: sessionDelegatedSlashCommands(getBot(larkAppId).config, existingDs, config.daemon.backendType),
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
@@ -31726,6 +31934,16 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
+        authorized: canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType),
+        primary: coordinationModeIsPrimary(),
+        caller: slash.trustedCaller,
+        larkAppId,
+        reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+      });
+      return !ctx.acceptedInput;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       const botSender = isBotSenderType || isForeignBotSender;
@@ -32471,6 +32689,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
+      noteReplyCardTurnStarted(ds, turnId);
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
@@ -34119,6 +34338,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // handler — no unhandledRejection, and failures stay replayable.
       void handleIdentityDecisionFlip(ds, context).catch(error => {
         logger.error(`[trigger-user-auth] identity decision handler failed for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    },
+    onManagedTurnOrigin(ds, turnId) {
+      void restoreTurnCliIdentity(ds, turnId).catch(error => {
+        logger.error(`[trigger-user-auth] turn identity restore failed for ${ds.session.sessionId} turn=${turnId}: ${error instanceof Error ? error.message : String(error)}`);
       });
     },
     onCliExit(ds, context) {
@@ -36011,6 +36235,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] main-wake cold-attach failed: ${err instanceof Error ? err.message : String(err)}`);
   });
 
+  // The person a task runs as is present now and is not later: every creation route offers them what unattended runs will need.
+  // When the creating route holds the live turn of that same person, what the turn published says what they lack.
+  scheduler.setScheduleCreatedObserver((task, creatingTurn) => {
+    const appId = task.larkAppId ?? task.creatorLarkAppId;
+    const runnerOpenId = task.ownerOpenId;
+    if (!runnerOpenId || !appId) return;
+    const ds = creatingTurn ? findActiveBySessionId(creatingTurn.sessionId) : undefined;
+    const sameTurn = !!ds && ds.larkAppId === appId && ds.managedTurnOrigin?.callerOpenId === runnerOpenId
+      && ds.managedTurnOrigin.turnId === creatingTurn!.turnId
+      && identityStorageModelForDaemonSession(ds) === 'proven';
+    const identityTurnId = ds?.managedTurnOrigin?.identityTurnId ?? creatingTurn?.turnId;
+    void offerAuthorizationAtCreation({
+      botConfig: getBot(appId).config, openId: runnerOpenId,
+      locale: localeForBot(appId), sendDirect: privateNoticeSender(appId, task),
+      ...(sameTurn ? { published: tool => recallProvenIdentityContent(config.session.dataDir, creatingTurn!.sessionId, identityTurnId!, tool) } : {}),
+    });
+  });
+
   // Opt-in owner notifications (`schedule add --notify`); target and wording
   // are decided in schedule-until-done.ts. An unavailable transport must throw
   // (not return): the scheduler persists the once-per-streak marker only after
@@ -36032,6 +36274,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // missing larkAppId falls through to bot-0 as a legacy fallback).
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
+    if (scheduleAuthorityStore?.getRecord(effectiveAppId, task.id)?.state === 'active') {
+      try {
+        if (getBot(effectiveAppId).config.triggerUserAuth?.enabled) {
+          task = await backfillOwnerUnionId({
+            task,
+            larkAppId: effectiveAppId,
+            lookupUnionId: async (appId, openId) => {
+              const found = await resolveUnionIdFromOpenIdStrict(appId, openId);
+              return found.status === 'resolved' ? found.unionId : undefined;
+            },
+            record: scheduler.recordTaskOwnerUnionId,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[scheduler] owner union_id backfill skipped for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const authority = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
     if (!authority) {
       throw new Error('schedule authority record missing; refusing unregistered task');
@@ -36348,6 +36607,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         projectCardRuntimeSync.notify(source.chatId);
       })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
+    if (findActiveBySessionId(event.sessionId)?.session.projectImportPending) {
+      void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+    }
   });
   // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
   // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。

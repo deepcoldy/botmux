@@ -251,6 +251,7 @@ type SessionPhase =
 | chat 模式群里的 `/tw` `/th` | 主干：不是 `/t` 头部，不强制开话题（落进群会话） | 与 `/t` 同：强制开新话题；触发 API 里同为保留命令（`FORCE_TOPIC_COMMANDS`） | 同上 | rebase 2026-09-16 |
 | 已有会话的话题里发 `/tw 干活` | 主干：当普通输入送进 CLI（`/tw` 成为字面文本） | 回「指令头只在新话题第一条生效」 | `topicHeaderDeclaresSpec` 计入 lifecycle | rebase 2026-09-16 |
 | 当前 bot 有效插件声明的 `/xxx`（如 `/work-bind`） | `unknown_slash`，作为普通消息转给 CLI | `plugin` 决策：不建会话、不进 CLI，转给插件服务；内置名、固定透传名与 bot 有效透传集同名时仍按原判定 | 插件需要确定性的群内入口；`pluginCommands` 缺省为空时判定逐字不变（差分测试守护） | 2026-10-14 `docs/design/2026-10-14-plugin-slash-commands.md` |
+| 显式启用 remote-runner 的 `/adopt`、`/detach`、`/disconnect` | daemon 原生处理 | 独立 `delegated_turn`，仍过 grant / daemon 权限；adopt 普通 turn 冷启动，detach 无会话不启动，primary 拒绝 detach；其它输入完全不变 | provider 管理业务绑定，固定白名单、默认关闭；不复用 forward/raw input | #3469 |
 
 ## 10. 验证
 
@@ -469,3 +470,7 @@ master 上同样红，见 §16.2）。
 - **dispatcher 层的 pre-routing 命令进表**：`/reply-mode` `/grant` `/tabs` 等在切面 1 之前判定，与 daemon 命令不是一个层；若要统一，是另一份设计。
 - **dogfood**：§15 末尾的清单不变，第一件仍是级联的 3s 忙态宽限对 `/model` 是否合适。
 
+
+### Remote Runner 下放（#3469）
+
+`delegatedCommands` 与 passthrough 集一样由两条入口按有效后端预算，router 不读配置。固定白名单的别名在配置阶段归一，decision 保留原始 cmd/content 以沿用授权及原文 turn。入口完成 grant 和 canRunDaemonCommand 后，带宿主 acceptedInput payload 走普通输入接纳；统一收尾保留原文、可信调用者与 LinkRefs，FIFO 不重新分类。pending-repo journal 以一个可选 payload 字段原子保存已接纳输入，恢复后仍是同一条结构化命令。既有待办 head 与下放命令 tail 分开，避免覆盖。两个入口共用授权执行政策与 help 的配置求值；活 provider 冻结启动配置，无活 worker 时按下次 spawn 的 live 配置。该路径不调用原生 adopt/detach handler 或协议 cancel/detach。

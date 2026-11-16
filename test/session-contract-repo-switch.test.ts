@@ -79,7 +79,8 @@ function laneFacade() {
   } as never, (sessionId: string) => { fences.push(sessionId); });
   return {
     lanes, writes, fences,
-    /** sessionStore persisting a record into its anchor's primary lane. */
+    /** Put a record into its anchor's primary lane, i.e. the state after the
+     * record reached it through an admission or its first checkpoint. */
     seed: (session: any) => {
       lanes.set(keyOf(session), { type: 'botmux.session.primary', session: structuredClone(session) });
     },
@@ -103,8 +104,11 @@ let previousDataDir: string;
 let opened: SessionController[];
 
 /** The /repo switch as card-handler / command-handler perform it: swap a
- * replacement record into the same DaemonSession object, persist it into the
- * shared anchor lane, then forkWorker resolves the controller again. */
+ * replacement record into the same DaemonSession object, then forkWorker
+ * resolves the controller again. The switch itself admits no message, so the
+ * replacement only reaches the shared anchor lane through its own first
+ * checkpoint (test/session-contract-primary-successor.test.ts covers that
+ * against the real durable store); seeding it here starts from that state. */
 function repoSwitch(ds: DaemonSession, primary?: ReturnType<typeof laneFacade>) {
   const previous = ds.session;
   ds.session = makeSession('session-b', previous.scope as Scope) as DaemonSession['session'];
@@ -173,6 +177,36 @@ describe('controller cache across the /repo same-object session replacement', ()
     expect(ds.session.status).toBe('active');
     expect(ds.session.sessionLifecycle).not.toBe('closed');
   });
+
+  it.each(SCOPES.flatMap(scope => (['refresh', 'flushPrimary'] as const).map(callback => ({ scope, callback }))))(
+    'ignores predecessor $callback before resolving the replacement controller on the $scope lane',
+    async ({ scope, callback }) => {
+      const ds = makeDs('session-a', scope);
+      const primary = laneFacade();
+      primary.seed(ds.session);
+      const first = controllerForSession(ds, true)!;
+      opened.push(first);
+      closeSessionContract(first);
+
+      // Pause the switch before controllerForSession can detach the predecessor:
+      // only the live session-id comparison can reject this late callback.
+      ds.session = makeSession('session-b', scope) as DaemonSession['session'];
+      primary.seed(ds.session);
+      const replacement = structuredClone(ds.session);
+      const replacementLane = structuredClone(primary.lane(ds.session));
+
+      await first[callback]();
+
+      // Check the whole record, including lifecycle, revision, status and the
+      // runtime checkpoint, so an old projection cannot hide behind an active
+      // status or an unchanged durable lane.
+      expect(ds.session).toStrictEqual(replacement);
+      expect(primary.lane(ds.session)).toStrictEqual(replacementLane);
+      expect(primary.writes).toHaveLength(0);
+      expect(primary.fences).toEqual([]);
+      expect(first.store.read(first.ref)!.lifecycle).toBe('closed');
+    },
+  );
 
   it.each(SCOPES)('never checkpoints the closed predecessor onto the shared %s anchor lane', async scope => {
     const ds = makeDs('session-a', scope);

@@ -81,6 +81,7 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     codexAppApplicationContext:undefined,codexAppMessageContext:undefined,attachments:[],
     substituteTrigger:undefined,shouldSendSubstituteControlCard:false,
     autoCreateSender:{openId:'ou_real_sender',type:'user'},codexAppSteerable:false,
+    autoCreateAcceptedInput:undefined,
     ownerOpenId:'ou_real_sender',
     threadTrustedCaller:verifiedCaller,
   }) : newTopic({

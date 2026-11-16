@@ -13,6 +13,33 @@ import { toast } from './toast.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { matchesStatusFilter, SESSION_STATUS_FILTERS } from './session-task-view.js';
+import { hasManualSessionTitle, isBootstrapDisplayTitle } from '../../core/session-title-content.js';
+
+export function sessionDisplayTitle(row: Record<string, any>): string {
+  const title = String(row.title ?? '').trim();
+  if (!hasManualSessionTitle(row as { titleSource?: string; nativeSessionTitleUserDefined?: boolean }) && isBootstrapDisplayTitle(title)) {
+    return chatDisplayTitle(row) || title;
+  }
+  return title;
+}
+
+export function sessionLastActivityAt(row: Record<string, any>): number | undefined {
+  const times = [row.lastActivityAt, row.lastMessageAt].map(value => {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : typeof value === 'string' ? Date.parse(value) : NaN;
+  }).filter(value => Number.isFinite(value) && value > 0);
+  return times.length ? Math.max(...times) : undefined;
+}
+
+export function sessionSupportReason(row: Record<string, any>, translate: typeof t = t): string {
+  if (typeof row.agentAttention?.reason === 'string' && row.agentAttention.reason.trim()) return row.agentAttention.reason;
+  if (row.agentAttention) return translate('sessions.board.signalAgent');
+  if (row.pendingRepo === true) return translate('sessions.board.signalRepo');
+  if (row.tuiPromptActive === true) return translate('sessions.board.signalPrompt');
+  if (row.status === 'limited') return translate('sessions.board.signalLimited');
+  if (row.status === 'stalled') return translate('sessions.board.signalStalled');
+  return '';
+}
 
 export function resumeErrorMessage(reason: unknown, translate: typeof t = t): string {
   if (reason === 'workspace_retired') return translate('sessions.resumeWorkspaceRetired');

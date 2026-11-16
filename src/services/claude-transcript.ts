@@ -19,6 +19,8 @@ import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+// provider-retry-hint 同样零依赖（只用语言内建）。
+import { parseProviderRetryAtMs } from './provider-retry-hint.js';
 
 /** Read the session identity published by one live Claude Code process. */
 export function readClaudeSessionMeta(
@@ -542,7 +544,15 @@ export class ClaudeModelFallbackTracker {
  * retryable only when its bounded text matches a verified transient signature. */
 export type ClaudeTerminalOutcome =
   | { status: 'completed' }
-  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | {
+    status: 'failed';
+    errorCode: string;
+    retryable: boolean;
+    /** Retryable failures only: when the provider's own error text says the
+     *  request may be retried (gateway "available at", Retry-After, "try
+     *  again in 30s"). Absent when it names no usable time. */
+    retryAtMs?: number;
+  }
   | { status: 'ambiguous'; errorCode: string; retryable: false }
   | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
 
@@ -552,6 +562,16 @@ function normalizedApiErrorCode(ev: TranscriptEvent): string {
 
 function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
+}
+
+/** Attach the provider's own "retry at" to a retryable failure. Relative hints
+ *  are anchored at the record's timestamp, not at whenever it is read. */
+function withProviderRetryHint(
+  ev: TranscriptEvent,
+  outcome: { status: 'failed'; errorCode: string; retryable: true },
+): Extract<ClaudeTerminalOutcome, { status: 'failed' }> {
+  const retryAtMs = parseProviderRetryAtMs(apiErrorMessageText(ev), eventTimeMs(ev) ?? Date.now());
+  return retryAtMs === undefined ? outcome : { ...outcome, retryAtMs };
 }
 
 /** Model placeholder Claude Code writes on assistant records no model produced. */
@@ -623,12 +643,12 @@ export function classifyClaudeTerminalEvent(
       return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
     }
     if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
-      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true });
     }
     if (code === 'server_error'
       || (typeof status === 'number' && status >= 500 && status <= 599)
       || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
-      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_server_error', retryable: true });
     }
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }

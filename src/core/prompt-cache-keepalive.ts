@@ -58,6 +58,10 @@ export function promptCacheKeepaliveIneligibility(ds: DaemonSession): string | u
   // Background tasks report back into the conversation on their own; a
   // keep-alive turn would only interleave with them.
   if (ds.backgroundTaskCount) return 'background_tasks';
+  // A failed turn waits for the provider and its continuation refreshes the
+  // cache. A keep-alive turn finishing in that wait would read as someone
+  // taking over in the web terminal, and cancel the continuation.
+  if (ds.session.ordinaryTurnRecovery?.status === 'backoff') return 'recovery_wait';
   return undefined;
 }
 

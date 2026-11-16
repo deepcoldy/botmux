@@ -195,6 +195,8 @@ export function readCardClickTurnClaims(
 
 export interface CardClickNonceConsume {
   consume(nonce: string, exp: number, now: number): 'ok' | 'replayed' | 'expired';
+  /** Undo a consume whose turn provably never reached the session. */
+  release?(nonce: string): void;
 }
 
 /** Persistent single-use nonce file. Expired entries are dropped; a used nonce
@@ -226,6 +228,14 @@ export class CardClickNonceStore implements CardClickNonceConsume {
         throw err;
       }
       return 'ok';
+    });
+  }
+
+  release(nonce: string): void {
+    this.withLock(() => {
+      this.reload();
+      if (!this.used.delete(nonce)) return;
+      this.persist();
     });
   }
 

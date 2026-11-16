@@ -48,6 +48,7 @@ import { WORKER_EXIT_RUNTIME_RETIRED } from '../src/core/retired-runtime-exit.js
 import { preferredManagedTmuxSocket } from '../src/adapters/backend/tmux-socket.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
+import { describeNativeIdentityChain } from './helpers/native-identity-chain.js';
 import type { DaemonSession } from '../src/core/types.js';
 import {
   claudeHarnessRunnable as runnable,
@@ -205,9 +206,25 @@ describe.skipIf(!runnable)('late runtime identity and worker retirement', () => 
 
   async function cancelDuringIdentity() {
     const session = await controlBeforeIdentity('cancel');
-    const { controller, g, operation } = session;
-    await g.waitFor(() => !!controller.store.runtime(controller.ref)?.identity?.nativeSessionId,
-      'the late native identity to reach the daemon');
+    const { controller, g, h, operation } = session;
+    try {
+      await g.waitFor(() => !!controller.store.runtime(controller.ref)?.identity?.nativeSessionId,
+        'the late native identity to reach the daemon');
+    } catch (error) {
+      // Re-throw with a failure-time breakdown of every link in the native
+      // identity chain (#3455) so the next red run shows where it broke
+      // (gate -> pid-state record -> worker IPC -> daemon store) instead of
+      // only the generic wait timeout.
+      throw new Error([
+        (error as Error).message,
+        describeNativeIdentityChain({
+          pidStateGate: h.pidStateGate,
+          claudeDir: h.claudeDir,
+          runtimeIdentity: controller.store.runtime(controller.ref)?.identity,
+          messages: g.messages,
+        }),
+      ].join('\n'));
+    }
     expect(controller.store.runtime(controller.ref)?.phase).not.toBe('retiring');
     expect(controller.store.read(controller.ref)?.activeOperationId).toBe(operation);
     expect(contractReadiness(controller.store.read(controller.ref)!, controller.store.runtime(controller.ref)).cliReady).toBe(false);
