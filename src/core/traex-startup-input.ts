@@ -33,7 +33,7 @@ export function traexStartupInputReady(evidence: TraexStartupInputEvidence): boo
     || evidence.nativeState === 'clear') return false;
   if (evidence.webInputUnchanged
     && (evidence.nativeState === 'idle' || evidence.nativeState === 'done')
-    && traexRestoredComposerReady(evidence.screen)
+    && traexRestoredComposerReady(evidence.screen, { nativeIdleReported: true })
     && startupIdleReportScreenAdmits(evidence.screen, evidence.readyPattern)) return true;
   // MCP startup may report working AFTER the native thread is initialized;
   // its resolved empty composer still accepts queued input. Do not turn that

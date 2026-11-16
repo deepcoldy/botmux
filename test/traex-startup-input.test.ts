@@ -40,6 +40,23 @@ describe('native thread readiness is distinct from a provisional input box', () 
     expect(ready(RESOLVED.replace('GPT-6-Astra', 'loading'))).toBe(false);
   });
 
+  it('accepts an unknown status footer only after native idle and below an empty composer rule', () => {
+    const unknown = SHORTCUT.replace('? for shortcuts', 'ⓘ Plan mode · new footer layout');
+    expect(traexRestoredComposerReady(unknown)).toBe(false);
+    expect(ready(unknown)).toBe(false);
+    expect(ready(unknown, { nativeState: 'working' })).toBe(false);
+    for (const nativeState of ['idle', 'done'] as const) {
+      expect(ready(unknown, { nativeState })).toBe(true);
+      expect(ready(unknown, { nativeState, webInputUnchanged: false })).toBe(false);
+      expect(ready(unknown, { nativeState, blockingOwner: true })).toBe(false);
+      expect(ready(unknown.replace('Ask TRAE CLI to do anything', 'unsent draft'), { nativeState })).toBe(false);
+      expect(ready(unknown.replace('❯ Ask TRAE CLI to do anything\n', '❯ Ask TRAE CLI to do anything\n  draft continuation\n'), { nativeState })).toBe(false);
+      expect(ready(unknown.replace('❯ Ask TRAE CLI to do anything\n──────────────────────────────────────────────────────────\n',
+        '❯ Ask TRAE CLI to do anything\n'), { nativeState })).toBe(false);
+      expect(ready(`Sign in to TraeCode CLI\n${unknown}`, { nativeState })).toBe(false);
+    }
+  });
+
   it('does not treat other native states or a blocking owner as idle evidence', () => {
     for (const nativeState of ['working', 'blocked', 'error', 'clear'] as const) {
       expect(ready(SHORTCUT, { nativeState })).toBe(false);
