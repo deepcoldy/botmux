@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { assertPluginPrerequisitesReady } from '../src/core/plugins/prerequisites.js';
 
@@ -13,12 +13,17 @@ writeFileSync(join(home, 'bots.json'), '[]');
 writeFileSync(join(home, 'config.json'), '{}');
 // Even Node/npm are absent from PATH; the installed plugin must prepare its own runtime.
 process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+delete process.env.FERRY_CLOUD_CLI_JWT;
+delete process.env.FERRY_HOME;
+delete process.env.FERRY_PORT;
 process.env.FERRY_BYTECLOUD_SITE = 'cn';
 process.env.FERRY_AUTH_TIMEOUT_MS = '3000';
 process.env.npm_config_userconfig = join(homedir(), '.npmrc');
 process.env.npm_config_cache = join(homedir(), '.npm-cache');
 process.env.npm_config_prefix = join(homedir(), '.npm-global');
-const source = join(import.meta.dirname, '../../source/gateway');
+assert.ok(process.argv[2], 'Pass the extracted plugin package directory as the first argument');
+const source = resolve(process.argv[2]);
+assert.ok(existsSync(join(source, 'package.json')), 'Plugin package directory must contain package.json');
 const installed = installLocalPlugin(source);
 assert.equal(installed.record.manifest.prerequisites, true);
 const path = join(home, 'plugins/gateway-acceleration/private/setup-job.json');
