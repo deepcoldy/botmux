@@ -135,6 +135,7 @@ const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWo
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   sendWorkerInput,
   forkWorker,
   killWorker,
