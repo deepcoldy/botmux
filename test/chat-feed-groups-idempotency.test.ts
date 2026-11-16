@@ -82,6 +82,15 @@ describe('feed-group host idempotency', () => {
     await vi.advanceTimersByTimeAsync(99);
     expect(external.calls.filter(path => path === '/open-apis/im/v1/groups')).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
+    // bun:test 先触发整个 fake-time 推进窗口再交还控制，且不在定时器回调间排空
+    // 微任务：链上那个 100ms 定时器可能在时钟走到之后才被调度，单纯排空微任务
+    // 推不动时钟。waitFor 在两个 runner 下都会交替推进 fake 时钟并排空微任务，
+    // 未落定的 Promise 也不能直接交给 expect(...).resolves —— bun 原生 resolves
+    // 匹配器在 fake timers 下会绕过用例超时，把整个进程挂死。
+    let settled = 0;
+    void closing.then(() => { settled += 1; });
+    void selecting.then(() => { settled += 1; });
+    await vi.waitFor(() => { expect(settled).toBe(2); }, { timeout: 1_000, interval: 25 });
     await expect(closing).resolves.toEqual({ ok: true, chatId, label: null });
     await expect(selecting).resolves.toEqual({ ok: true, chatId, label: 'p0' });
     expect([...external.membership]).toEqual(['second']);
