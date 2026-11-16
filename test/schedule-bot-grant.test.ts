@@ -16,7 +16,7 @@ const record = (): ScheduleAuthorityRecord => ({
   task: { id: 'task', larkAppId: 'cli_child', chatId: 'oc_team', rootMessageId: 'om_topic' } as any,
 });
 const deps = () => ({
-  runEnabled: true, hostRunScopes: [], triggerUserAuthTools: ['lark-cli', 'bytedcli'] as const,
+  runEnabled: true, hostRunScopes: [], triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] as const },
   adminOpenIds: ['ou_admin_child'], resolveTargetOpenId: async () => 'ou_admin_child',
   listChatMemberOpenIds: async () => ['ou_admin_child'],
   validateBotGrant: (r: ScheduleAuthorityRecord) => assertScheduleBotGrantActive(r, policy),

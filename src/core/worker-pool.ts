@@ -1414,6 +1414,9 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
   ) => void | Promise<void>;
+  /** The current worker published the live origin of `turnId`, an execution
+   *  the session contract admitted and has not terminated. */
+  onManagedTurnOrigin?: (ds: DaemonSession, turnId: string) => void;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
@@ -1825,6 +1828,7 @@ function retainedIdentityTurns(ds: DaemonSession): Set<string> | 'all' {
   add(ds.session.queuedActivationTurnId);
   add(ds.pendingRawTurnId);
   for (const turnId of ds.scheduledTurnCallers?.keys() ?? []) add(turnId);
+  for (const turnId of ds.scheduledToolActors?.keys() ?? []) add(turnId);
   for (const turnId of ds.silentScheduledTurns?.keys() ?? []) add(turnId);
   add(ds.session.deferredScheduleRun?.turnId);
   add(ds.session.ordinaryTurnRecovery?.currentTurnId);
@@ -15684,9 +15688,11 @@ function rememberScheduledTurnCaller(
 }
 
 function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || !ds.scheduledTurnCallers) return;
-  ds.scheduledTurnCallers.delete(turnId);
-  if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
+  if (!turnId) return;
+  ds.scheduledTurnCallers?.delete(turnId);
+  if (ds.scheduledTurnCallers?.size === 0) ds.scheduledTurnCallers = undefined;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
@@ -24053,12 +24059,18 @@ function setupWorkerHandlers(
               ? { trustedCaller: previousOrigin.trustedCaller }
               : {}),
           ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
+          ...(msg.speakers?.length ? { speakers: msg.speakers } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }
             : {}),
         };
         ensureAutomaticTaskContinuationLease(ds, botCfg);
+        const admitted = sessionController?.admittedExecution();
+        if (admitted && admitted.turnId === identityTurnId
+          && !['succeeded', 'failed', 'cancelled'].includes(sessionController!.store.execution(sessionController!.ref, admitted.executionId)!.phase)) {
+          cb.onManagedTurnOrigin?.(ds, admitted.turnId);
+        }
         break;
       }
 
@@ -24641,6 +24653,7 @@ function setupWorkerHandlers(
       ds.workerCardViewToken = null;
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
+      ds.scheduledToolActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {

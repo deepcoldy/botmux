@@ -167,7 +167,7 @@ describe('the two models are mutually exclusive per session', () => {
     writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
     writeSessionIdentity(dir, SESSION, aliceBy('turn-B'), 'single');
     const dataDir = sessionIdentityDataDir(dir, SESSION);
-    expect(readdirSync(dataDir).filter(name => name.endsWith('.env')).sort()).toEqual(['bytedcli.env', 'codebase.env']);
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.env')).sort()).toEqual(['bitscli.env', 'bytedcli.env', 'codebase.env']);
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     expect(readdirSync(dataDir).some(name => name.endsWith('.env'))).toBe(false);
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');
@@ -272,6 +272,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
       managedTurnOrigin: undefined,
       pendingRawTurnId: undefined,
       scheduledTurnCallers: undefined,
+      scheduledToolActors: undefined,
       silentScheduledTurns: undefined,
       ...extra,
     };
@@ -319,18 +320,22 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
   it('retains scheduled, recovery and continuation turns', () => {
     const ds = dsWith({
       scheduledTurnCallers: new Map([['schedule:1:uuid', {}]]),
-      session: {
+      scheduledToolActors: new Map([['schedule:2:uuid', { openId: 'ou_actor', unionId: 'on_actor' }]]),
+      // sessionExtra (not session:) so the default sessionId survives: with a
+      // replaced session object the retention set is never matched against the
+      // material's session and every row below would assert vacuously.
+      sessionExtra: {
         deferredScheduleRun: { turnId: 'turn-deferred' },
         ordinaryTurnRecovery: { currentTurnId: 'turn-recovery' },
         readonlyTaskContinuation: { currentTurnId: 'turn-continuation' },
         codexAppDispatchLedger: [],
-      } as any,
-    });
-    for (const t of ['schedule:1:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
+      },
+    } as any);
+    for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       publish(t); releaseActiveIdentityTurn(dir, SESSION, t);
     }
     expect(collectSessionTurnGarbage(ds).sort()).toEqual([]);
-    for (const t of ['schedule:1:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
+    for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       expect(recallProvenIdentityContent(dir, SESSION, t, 'bytedcli')).toBeDefined();
     }
   });

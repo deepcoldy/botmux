@@ -151,7 +151,7 @@ setInterval(()=>{},1000);
       headless: headless ? { id: headlessId, source: 'cli' } : undefined,
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
       larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', locale: 'zh', larkToolBinding: true,
-      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] },
       env: { PATH: `${botBin}:${process.env.PATH}` } });
     const deadline = Date.now() + WORKER_RESULT_WAIT_MS;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));

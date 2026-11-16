@@ -73,7 +73,7 @@ describe.skipIf(process.platform !== 'linux')('registered background HOME lifecy
     const wrapper=join(homedir(),'wrapper');
     writeFileSync(wrapper, identity.renderIdentityWrapper('bytedcli', tool, 'single'));
     identity.writeSessionIdentity(data, session, grant, 'single');
-    assert.equal(execFileSync('/bin/sh',[wrapper], {encoding:'utf8',env:{PATH:process.env.PATH,HOME:homedir(),SESSION_DATA_DIR:data,BOTMUX_SESSION_ID:session}}), 'original-person|job-jwt|' + jobHome);
+    assert.equal(execFileSync('/bin/sh',[wrapper,'x'], {encoding:'utf8',env:{PATH:process.env.PATH,HOME:homedir(),SESSION_DATA_DIR:data,BOTMUX_SESSION_ID:session}}), 'original-person|job-jwt|' + jobHome);
   `));
 
   it.each(['revoke', 'expiry', 'dead-root', 'pause', 'task-revoke'])(
