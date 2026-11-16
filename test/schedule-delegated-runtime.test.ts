@@ -88,6 +88,28 @@ describe('delegated schedule runtime authorization', () => {
       .rejects.toThrow(message);
   });
 
+  it('re-resolves an admitted completed one-shot only when the caller is re-preparing that turn', async () => {
+    const once = { ...task, parsed: { kind: 'once' as const, runAt: '2026-11-16T12:00:00.000Z', display: 'once' } };
+    const completed: ScheduleAuthorityRecord = {
+      ...authority, state: 'completed',
+      task: { ...once, enabled: false, disabledReason: 'once_completed' },
+    };
+    await expect(authorizeDelegatedScheduleRun(completed.task, completed, deps()))
+      .rejects.toThrow('schedule authority state is completed');
+    await expect(authorizeDelegatedScheduleRun(completed.task, completed, { ...deps(), allowCompletedOnce: true }))
+      .resolves.toMatchObject({ targetOpenId: 'ou_user_target' });
+    // The live controller check still applies to the re-preparation.
+    await expect(authorizeDelegatedScheduleRun(completed.task, completed, {
+      ...deps(), allowCompletedOnce: true, adminOpenIds: [],
+    })).rejects.toThrow('no longer an allowed bot operator');
+    // A person's pause is not an auto-completion.
+    const paused: ScheduleAuthorityRecord = {
+      ...authority, state: 'paused', task: { ...once, enabled: false, disabledReason: 'manual' },
+    };
+    await expect(authorizeDelegatedScheduleRun(paused.task, paused, { ...deps(), allowCompletedOnce: true }))
+      .rejects.toThrow('schedule authority state is paused');
+  });
+
   it('fails closed when identity resolution or membership changes', async () => {
     await expect(authorizeDelegatedScheduleRun(task, authority, {
       ...deps(), resolveTargetOpenId: async () => undefined,

@@ -4819,13 +4819,16 @@ async function prepareDelegatedScheduledTurnIdentity(
   if (authority.kind !== 'delegated') return false;
   ds.scheduledToolActors?.delete(turnId);
   if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  // Same rule as the owner path: a one-shot is completed as soon as its turn
+  // is dispatched, so a replay or recovery of that admitted turn must still
+  // resolve (the scheduler admission refuses any new run of a completed task).
   const assertCurrent = () => assertScheduledAuthorityCurrent(authority,
-    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId });
+    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId, allowCompleted: true });
   const authorized = await authorizeDelegatedScheduleRun(
     authority.task,
     authority,
     { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
-      assertAuthorityCurrent: assertCurrent },
+      allowCompletedOnce: true, assertAuthorityCurrent: assertCurrent },
   );
   if (authorized.usesControllerToolActor) {
     const identity: Extract<ScheduledRunIdentity, { ok: true }> = {

@@ -1023,6 +1023,43 @@ describe('target daemon consumes signed message authority', () => {
     expect(h.ds.scheduledToolActors).toBeUndefined();
   });
 
+  it('keeps an ownerless child\'s controller tool actor when its cold-started turn is replayed after the one-shot completed', async () => {
+    // A child fired into a fresh or restored session publishes under the
+    // single default; the new worker then reports proven. The one-shot was
+    // already marked completed when its turn was dispatched, so the replay of
+    // that admitted turn must still resolve the controller (owner path parity).
+    const h = await targetHarness();
+    const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP, enabled: true,
+      parsed: { kind: 'once', runAt: '2026-11-16T12:00:00.000Z' } };
+    const authority = {
+      kind: 'delegated', state: 'active', task,
+      grantId: 'schedule-child:cli_bot:parent01:schedule:parent01:run-1',
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    let current: any = authority;
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => current };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true } });
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }) });
+    h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+    (h.scopeValues as any).authorizeDelegatedScheduleRun = authorizeDelegatedScheduleRun;
+    Object.assign(h.ds.session, { status: 'active' });
+    h.ds.worker = { killed: false };
+    h.ds.reportedModel = 'single';
+    await h.prepare(turnId);
+    expect(h.ds.lastPublishedIdentityModel).toBe('single');
+
+    current = { ...authority, state: 'completed',
+      task: { ...task, enabled: false, disabledReason: 'once_completed' } };
+    h.ds.reportedModel = 'proven';
+    await h.flip({ model: 'proven', flipped: true, turnId });
+
+    expect(h.ds.lastIdentityDecisionRepublish).toEqual({ model: 'proven', turnId, ok: true });
+    expect(h.ds.scheduledToolActors?.get(turnId)).toEqual({ openId: 'ou_alice_target', unionId: 'on_alice' });
+  });
+
   it.each(['signed kickoff', 'delegated scheduled turn'] as const)(
     'asks the platform with the union_id the daemon verified for a %s, with the contact API down',
     async kind => {
