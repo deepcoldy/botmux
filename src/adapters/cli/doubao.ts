@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { closeSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
+import { closeSync, openSync, readdirSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
@@ -59,7 +59,14 @@ export function doubaoSessionRoots(dataRoot: string | undefined = doubaoDataRoot
   try { accounts = readdirSync(agentMode); } catch { return []; }
   return accounts
     .map(uid => join(agentMode, uid, 'workspace', '.sessions'))
-    .filter(dir => { try { return statSync(dir).isDirectory(); } catch { return false; } });
+    .filter(dir => {
+      try { return statSync(dir).isDirectory(); }
+      catch (error) {
+        // Retain unreadable candidates so the assignment scan can refuse an
+        // incomplete inventory, while genuinely absent account stores stay out.
+        return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+      }
+    });
 }
 
 function readTail(path: string, maxBytes: number, size: number): string {
@@ -78,6 +85,81 @@ export function doubaoSubmitFingerprint(content: string): string | undefined {
   return last ? last.slice(-200) : undefined;
 }
 
+/** Ownership is a standalone envelope line, before per-turn context or user
+ *  payload. Inline examples of the tag in routing instructions are not owners. */
+const SESSION_ID_MARKER_RE = /^[\t \ufeff]*<session_id>([^<\s]+)<\/session_id>[\t ]*\r?$/m;
+const SESSION_PAYLOAD_START_RE = /^[\t \ufeff]*<(?:role|summary_memory|whiteboard|chat_context_policy|chat_context|botmux_group_join|user_message)(?=[\s>])/m;
+
+/** Owning botmux session id parsed from a submitted prompt envelope, or
+ *  undefined for an envelope-less (zero-injection) submit. */
+export function doubaoSessionMarkerFromContent(content: string): string | undefined {
+  const match = SESSION_ID_MARKER_RE.exec(content);
+  if (match) {
+    const prefix = content.slice(0, match.index);
+    if (SESSION_PAYLOAD_START_RE.test(prefix)) return undefined;
+    // assignment.md appends turns. Only the first request's envelope can
+    // establish ownership; a later turn may merely quote another session.
+    if ((prefix.match(/^## \[[^\]\r\n]+\] /gm)?.length ?? 0) > 1) return undefined;
+  }
+  return match?.[1]?.trim() || undefined;
+}
+
+/** Minimum prefix read for short envelopes. Long routing / identity blocks
+ *  expand this window from the submitted prefix, without reading the entire
+ *  user payload or resumed assignment history. */
+const SESSION_MARKER_HEAD_BYTES = 8192;
+
+function readHead(path: string, maxBytes: number, size: number): string {
+  const length = Math.min(size, maxBytes);
+  if (length === 0) return '';
+  const buf = Buffer.alloc(length);
+  const fd = openSync(path, 'r');
+  try { readSync(fd, buf, 0, length, 0); } finally { closeSync(fd); }
+  return buf.toString('utf-8');
+}
+
+/** Walk every account's `.sessions`, visiting assignment.md files modified at
+ *  or after `sinceMs`. The session dir's own mtime is not bumped by the nested
+ *  append, so freshness is checked on the assignment file itself. */
+function forEachDoubaoAssignment(
+  roots: readonly string[],
+  sinceMs: number,
+  visit: (sid: string, assignment: string, st: Stats) => void,
+): boolean {
+  let complete = true;
+  for (const root of roots) {
+    let sessions: string[];
+    try { sessions = readdirSync(root); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+      continue;
+    }
+    for (const sid of sessions) {
+      if (!DOUBAO_SESSION_ID.test(sid)) continue;
+      const agentsDir = join(root, sid, 'agents');
+      let agents: string[];
+      try {
+        agents = readdirSync(agentsDir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+        continue;
+      }
+      for (const agent of agents) {
+        const assignment = join(agentsDir, agent, 'system', 'assignment.md');
+        try {
+          const st = statSync(assignment);
+          if (st.mtimeMs < sinceMs) continue;
+          visit(sid, assignment, st);
+        } catch (error) {
+          // Missing / racing writers are retried by the poll; unreadable peers
+          // prevent proving uniqueness and must not narrow the inventory.
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+        }
+      }
+    }
+  }
+  return complete;
+}
+
 /**
  * Find the native session that just received `content`.
  *
@@ -86,8 +168,16 @@ export function doubaoSubmitFingerprint(content: string): string | undefined {
  * `## [<ts>] 需求` followed by the prompt) at submit time, including large
  * bracketed pastes the composer collapsed into `[Pasted text #n]`. The shared
  * `.sessions` root also holds every other doubao/Doubao-desktop session of the
- * account, so a candidate must both be written after `sinceMs` AND contain this
- * prompt's fingerprint. Ambiguity (two matches) yields undefined rather than a
+ * account.
+ *
+ * Two tiers, because concurrent cold starts in one account can submit prompts
+ * whose last-line fingerprints are byte-identical (a fixed routing suffix):
+ *   1. When the prompt envelope embeds `<session_id>{botmux id}</session_id>`,
+ *      match that unique marker at the assignment HEAD — it identifies the
+ *      owning botmux session even when fingerprints collide.
+ *   2. A zero-injection submit carries no envelope, so fall back to the legacy
+ *      tail fingerprint.
+ * Either way, ambiguity (not exactly one match) yields undefined rather than a
  * guess: a wrong id would later `--resume` a sibling conversation.
  */
 export function findDoubaoSessionForSubmit(
@@ -95,33 +185,32 @@ export function findDoubaoSessionForSubmit(
   sinceMs: number,
   roots: readonly string[] = doubaoSessionRoots(),
 ): string | undefined {
+  const marker = doubaoSessionMarkerFromContent(content);
+  if (marker) {
+    const markerLine = SESSION_ID_MARKER_RE.exec(content)!;
+    const prefixBytes = Buffer.byteLength(
+      content.slice(0, markerLine.index + markerLine[0].length),
+      'utf-8',
+    );
+    // Match the bounded-read allowance used by the tail path: leave room for
+    // assignment headings and native formatting before the submitted marker.
+    const headBytes = Math.max(SESSION_MARKER_HEAD_BYTES, prefixBytes * 2 + 4096);
+    const matches = new Set<string>();
+    const complete = forEachDoubaoAssignment(roots, sinceMs, (sid, assignment, st) => {
+      // A sibling's user payload may quote this marker. Only its first marker
+      // identifies the owner of the assignment's initial envelope.
+      if (doubaoSessionMarkerFromContent(readHead(assignment, headBytes, st.size)) === marker) matches.add(sid);
+    });
+    return complete && matches.size === 1 ? [...matches][0] : undefined;
+  }
   const fingerprint = doubaoSubmitFingerprint(content);
   if (!fingerprint) return undefined;
   const window = Buffer.byteLength(content, 'utf-8') * 2 + 4096;
   const matches = new Set<string>();
-  for (const root of roots) {
-    let sessions: string[];
-    try { sessions = readdirSync(root); } catch { continue; }
-    for (const sid of sessions) {
-      if (!DOUBAO_SESSION_ID.test(sid)) continue;
-      const agentsDir = join(root, sid, 'agents');
-      let agents: string[];
-      try {
-        // Cheap pre-filter: the session dir's own mtime is not bumped by the
-        // nested append, so stat the agents dir entries instead.
-        agents = readdirSync(agentsDir);
-      } catch { continue; }
-      for (const agent of agents) {
-        const assignment = join(agentsDir, agent, 'system', 'assignment.md');
-        try {
-          const st = statSync(assignment);
-          if (st.mtimeMs < sinceMs) continue;
-          if (readTail(assignment, window, st.size).includes(fingerprint)) matches.add(sid);
-        } catch { /* missing / racing writer */ }
-      }
-    }
-  }
-  return matches.size === 1 ? [...matches][0] : undefined;
+  const complete = forEachDoubaoAssignment(roots, sinceMs, (sid, assignment, st) => {
+    if (readTail(assignment, window, st.size).includes(fingerprint)) matches.add(sid);
+  });
+  return complete && matches.size === 1 ? [...matches][0] : undefined;
 }
 
 /**

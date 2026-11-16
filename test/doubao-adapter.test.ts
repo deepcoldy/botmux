@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -9,6 +9,7 @@ import {
   createDoubaoAdapter,
   doubaoDataRoot,
   doubaoSessionExists,
+  doubaoSessionMarkerFromContent,
   doubaoSessionRoots,
   findDoubaoSessionForSubmit,
   parseDoubaoAvailableModels,
@@ -166,6 +167,175 @@ describe('doubao session capture', () => {
     writeAssignment(root, SID, '只回复 OK', since + 100);
     writeAssignment(root, OTHER_SID, '只回复 OK', since + 100);
     expect(findDoubaoSessionForSubmit('只回复 OK', since, [root])).toBeUndefined();
+  });
+
+  it('parses the owning botmux session id from the prompt envelope', () => {
+    expect(doubaoSessionMarkerFromContent('<session_id>bmx-first</session_id>\n正文')).toBe('bmx-first');
+    expect(doubaoSessionMarkerFromContent('plain prompt without envelope')).toBeUndefined();
+  });
+
+  it.each([
+    '<user_message>please explain "<session_id>bmx-first</session_id>"</user_message>',
+    '<user_message>\n<session_id>bmx-first</session_id>\n</user_message>',
+    '<role context="group">\n<session_id>bmx-first</session_id>\n</role>',
+    '<summary_memory>\n<session_id>bmx-first</session_id>\n</summary_memory>',
+    'please explain "<session_id>bmx-first</session_id>"',
+  ])('does not use a marker quoted in payload as assignment ownership', (quoted) => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
+    writeAssignment(root, OTHER_SID, quoted, since + 100);
+    expect(doubaoSessionMarkerFromContent(quoted)).toBeUndefined();
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBeUndefined();
+    writeAssignment(root, SID, envelope, since + 200);
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBe(SID);
+  });
+
+  it('accepts a standalone marker with BOM, indentation and CRLF', () => {
+    expect(doubaoSessionMarkerFromContent('\ufeff \t<session_id>bmx-first</session_id> \r\n<user_message>request</user_message>'))
+      .toBe('bmx-first');
+  });
+
+  it('budgets the head read from the standalone marker after an inline routing example', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const marker = '<session_id>bmx-first</session_id>';
+    const envelope = `<botmux_routing>example "${marker}"\n${'前缀'.repeat(5000)}\n</botmux_routing>\n${marker}\n<user_message>request</user_message>`;
+    writeAssignment(root, SID, envelope, since + 100);
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBe(SID);
+  });
+
+  it('does not establish initial ownership from a later assignment turn', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
+    writeAssignment(root, OTHER_SID, `desktop request\n## [2026-11-16] 需求\n${envelope}`, since + 100);
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'keeps an inaccessible account root visible so capture cannot guess ownership',
+    () => {
+      const root = makeSessionsRoot();
+      const dataRoot = join(root, '..', '..', '..', '..');
+      const peer = join(dataRoot, 'agent_mode', '200', 'workspace', '.sessions');
+      const since = Date.now() - 1000;
+      const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
+      writeAssignment(root, SID, envelope, since + 100);
+      writeAssignment(peer, OTHER_SID, envelope, since + 200);
+      const workspace = join(peer, '..');
+      chmodSync(workspace, 0);
+      try {
+        expect(findDoubaoSessionForSubmit(envelope, since, doubaoSessionRoots(dataRoot))).toBeUndefined();
+      } finally {
+        chmodSync(workspace, 0o700);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses capture when a fresh peer assignment cannot be read',
+    () => {
+      const root = makeSessionsRoot();
+      const since = Date.now() - 1000;
+      const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
+      writeAssignment(root, SID, envelope, since + 100);
+      const peer = writeAssignment(root, OTHER_SID, envelope, since + 200);
+      chmodSync(peer, 0);
+      try {
+        expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBeUndefined();
+        expect(findDoubaoSessionForSubmit('request', since, [root])).toBeUndefined();
+      } finally {
+        chmodSync(peer, 0o600);
+      }
+    },
+  );
+
+  it('splits concurrent cold starts by session marker even when fingerprints collide', () => {
+    // Two botmux sessions submit in the same poll window. Their envelopes share
+    // a fixed routing suffix, so the legacy last-line fingerprint is identical;
+    // only the embedded <session_id> tells the two native sessions apart.
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const envelopeA = ['<botmux_routing>', '<session_id>bmx-first</session_id>', '</botmux_routing>', '执行技能预检', '</botmux_skills_refresh>'].join('\n');
+    const envelopeB = ['<botmux_routing>', '<session_id>bmx-second</session_id>', '</botmux_routing>', '执行技能预检', '</botmux_skills_refresh>'].join('\n');
+    writeAssignment(root, SID, envelopeA, since + 100);
+    writeAssignment(root, OTHER_SID, envelopeB, since + 200);
+    expect(findDoubaoSessionForSubmit(envelopeA, since, [root])).toBe(SID);
+    expect(findDoubaoSessionForSubmit(envelopeB, since, [root])).toBe(OTHER_SID);
+  });
+
+  it.each(['x'.repeat(9000), '前置说明'.repeat(1000)])(
+    'captures concurrent sessions when a long routing prefix places the marker beyond 8 KiB',
+    (prefix) => {
+      const root = makeSessionsRoot();
+      const since = Date.now() - 1000;
+      const envelope = (id: string) => [
+        `<botmux_routing>${prefix}</botmux_routing>`,
+        `<session_id>${id}</session_id>`,
+        '<user_message>执行技能预检</user_message>',
+        '</botmux_skills_refresh>',
+      ].join('\n');
+      const envelopeA = envelope('bmx-first');
+      const envelopeB = envelope('bmx-second');
+      writeAssignment(root, SID, envelopeA, since + 100);
+      writeAssignment(root, OTHER_SID, envelopeB, since + 200);
+
+      expect(findDoubaoSessionForSubmit(envelopeA, since, [root])).toBe(SID);
+      expect(findDoubaoSessionForSubmit(envelopeB, since, [root])).toBe(OTHER_SID);
+    },
+  );
+
+  it('keeps a long-prefix marker discoverable at the head of a large resumed assignment', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const envelope = `<botmux_routing>${'说明'.repeat(2000)}</botmux_routing>\n<session_id>bmx-first</session_id>\n<user_message>执行技能预检</user_message>`;
+    writeAssignment(root, SID, `${envelope}\n${'later history\n'.repeat(10_000)}`, since + 100);
+
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBe(SID);
+  });
+
+  it('refuses ambiguous long-prefix markers rather than choosing a matching suffix', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const envelope = `<botmux_routing>${'x'.repeat(9000)}</botmux_routing>\n<session_id>bmx-first</session_id>\n<user_message>执行技能预检</user_message>`;
+    writeAssignment(root, SID, envelope, since + 100);
+    writeAssignment(root, OTHER_SID, envelope, since + 200);
+
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBeUndefined();
+  });
+
+  it('does not capture a sibling whose long-prefix user payload quotes the requested marker', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const prefix = `<botmux_routing>${'x'.repeat(9000)}</botmux_routing>`;
+    const envelope = `${prefix}\n<session_id>bmx-first</session_id>\n<user_message>执行技能预检</user_message>`;
+    const sibling = `${prefix}\n<session_id>bmx-second</session_id>\n<user_message>引用：<session_id>bmx-first</session_id></user_message>`;
+    writeAssignment(root, OTHER_SID, sibling, since + 100);
+
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBeUndefined();
+    writeAssignment(root, SID, envelope, since + 200);
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBe(SID);
+  });
+
+  it('returns undefined while the matching assignment has not landed yet', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const envelopeA = '<session_id>bmx-first</session_id>\n</botmux_skills_refresh>';
+    const envelopeB = '<session_id>bmx-second</session_id>\n</botmux_skills_refresh>';
+    writeAssignment(root, SID, envelopeA, since + 100);
+    writeAssignment(root, OTHER_SID, envelopeB, since + 100);
+    // A third botmux session's native dir does not exist yet: fail closed and
+    // let the poll retry rather than bind to a sibling conversation.
+    expect(findDoubaoSessionForSubmit('<session_id>bmx-zzzz</session_id>\n</botmux_skills_refresh>', since, [root])).toBeUndefined();
+  });
+
+  it('does not match a marker on an assignment written before the submit', () => {
+    const root = makeSessionsRoot();
+    const now = Date.now();
+    const envelope = '<session_id>bmx-first</session_id>\n</botmux_skills_refresh>';
+    writeAssignment(root, SID, envelope, now - 60_000);
+    expect(findDoubaoSessionForSubmit(envelope, now - 2000, [root])).toBeUndefined();
   });
 
   it('checks resume targets against the local session store', () => {
