@@ -2985,6 +2985,9 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
 }
 
 async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  // The live check runs plugin code for up to 20s. Keep it outside the config
+  // lease: the caller's plugin service lock already pins the registry record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
@@ -2992,7 +2995,6 @@ async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Pro
       invalidateGlobalConfigCache();
       const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
       assertPluginBindingTransition(pluginId, enabled, current);
-      if (enabled) await assertPluginPrerequisitesReady(pluginId);
       if (enabled) materializePlugin(pluginId);
       const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
       mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
@@ -3006,6 +3008,9 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
   if (defaults.includes(pluginId)) throw new Error('请先关闭全局启用，再按 Bot 配置');
+  // Never hold bots.json's cross-process lock (5s waiter budget) across the
+  // plugin's live check (up to 20s); the service lock still pins the record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   return runDurableConfigMutation({
     scope: 'bots',
     path,
@@ -3020,7 +3025,6 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
         { plugins: defaults },
       );
       assertPluginBindingTransition(pluginId, enabled, effective);
-      if (enabled) await assertPluginPrerequisitesReady(pluginId);
       if (enabled) materializePlugin(pluginId);
       const next = updateBotPluginOverride(current, pluginId, enabled);
       if (next.length > 0) entry.plugins = next;
