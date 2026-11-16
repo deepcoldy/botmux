@@ -5089,7 +5089,7 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
  */
 function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
-  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string },
+  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string; usageLimitRecovery?: 'antigravity-ready-composer' },
 ): ScreenStatus {
   const { status, usageLimit, expiredAntigravityQuota, content } = frame;
   const previous = ds.usageLimit;
@@ -5103,7 +5103,9 @@ function resolveUsageAwareScreenStatus(
     // 原生拒绝在窗口内只接受原生工作提示，避免无关 PTY 输出清掉限额。
     const workRecovered = working && (previous.source !== 'antigravity-error-composer'
       || (content && isAntigravityWorkingScreen(content)));
-    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered) {
+    const composerRecovered = frame.usageLimitRecovery === 'antigravity-ready-composer'
+      && sessionCliId(ds, getBot(ds.larkAppId).config) === 'antigravity';
+    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered || composerRecovered) {
       clearUsageLimitState(ds);
       return status;
     }

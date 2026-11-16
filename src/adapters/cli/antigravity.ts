@@ -226,6 +226,13 @@ function readyComposerRowAbove(plain: string): number {
   return end - 1;
 }
 
+/** 正常输入框及快捷键页脚证明旧额度错误已退出；原生错误输入框没有此页脚。
+ * 只检查当前视口尾部，不能用历史里的输入框证明当前状态。 */
+export function isAntigravityReadyComposerScreen(screen: string): boolean {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  return !isAntigravityWorkingScreen(plain) && readyComposerRowAbove(plain) >= 0;
+}
+
 /** Cancellation can leave the transcript at a tool result forever. Accept only
  * the CLI's explicit interruption notice followed immediately by an EMPTY
  * composer and its ready footer at the end of the current viewport. Old notices

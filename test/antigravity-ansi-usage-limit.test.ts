@@ -3,7 +3,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
 function classifier(raw: () => string, cliId = 'antigravity') {
   const capture = vi.fn(raw);
@@ -11,7 +11,7 @@ function classifier(raw: () => string, cliId = 'antigravity') {
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
-    stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit,
+    stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
@@ -155,5 +155,27 @@ describe('raw ANSI tmux quota classification', () => {
     const { classify, capture } = classifier(() => quota + composer, 'traex');
     expect(classify('ordinary output', 'working')).toEqual({ status: 'working' });
     expect(capture).not.toHaveBeenCalled();
+  });
+
+  it.each(['idle', 'working'])('does not re-read a historical refusal at a recovered %s composer', status => {
+    const recovered = quota + `\nError ID: ${id}` + composer
+      + '\n> continue\n\nBOTMUX_NOTHING_TO_SEND\n────\n'
+      + '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\n────\n? for shortcuts';
+    const { classify } = classifier(() => recovered);
+    expect(classify('display snapshot retains old quota', status)).toEqual({
+      status, usageLimitRecovery: 'antigravity-ready-composer',
+    });
+  });
+
+  it('detects a new native refusal after a recovered composer', () => {
+    let screen = quota + `\nError ID: ${id}` + composer;
+    const { classify } = classifier(() => screen);
+    expect(classify('', 'idle').status).toBe('limited');
+    screen += '\nBOTMUX_NOTHING_TO_SEND\n────\n>\n────\n? for shortcuts';
+    expect(classify('', 'idle').usageLimit).toBeUndefined();
+    screen += '\n> next task\n' + quota + '\nError ID: new-episode' + composer;
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-error-composer', relativeResetKey: expect.stringContaining('new-episode'),
+    });
   });
 });

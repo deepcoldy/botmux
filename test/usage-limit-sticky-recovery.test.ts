@@ -478,6 +478,65 @@ describe('usage-limit sticky state self-heal', () => {
     expect(ds.lastScreenStatus).toBe('limited');
   });
 
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('clears restored agy quota on authoritative ready-composer recovery via %s', async type => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_ready', 'quota recovery', 'group', 'chat');
+    session.cliId = 'antigravity';
+    const limit: CliUsageLimitState = { ...rateLimitState(), kind: 'usage', source: 'antigravity-error-composer' };
+    const ds = makeDs({ session, worker, workerPort: 9999, usageLimit: limit });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    restoreUsageLimitRuntimeState(ds);
+    expect(ds.usageLimitRetryTimer).toBeDefined();
+    await dispatch(worker, type === 'screen_update'
+      ? { type, content: 'old quota text in the display snapshot', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' }
+      : { type, imageKey: 'img_recovered', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.usageLimitRetryTimer).toBeUndefined();
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(ds.usageLimit).toBeUndefined();
+    // Recovery is not a permanent exemption: a later native refusal still wins.
+    await dispatch(worker, { type: 'screen_update', content: 'new quota refusal', status: 'limited', usageLimit: limit, usageLimitRecovery: 'antigravity-ready-composer' });
+    expect(ds.lastScreenStatus).toBe('limited');
+    expect(ds.usageLimit).toBeDefined();
+  });
+
+  it('does not apply agy ready-composer recovery to another CLI', async () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_other_cli', 'other CLI quota', 'group', 'chat');
+    session.cliId = 'codex';
+    const ds = makeDs({ session, worker, workerPort: 9999, usageLimit: rateLimitState() });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    await dispatch(worker, { type: 'screen_update', content: '', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    expect(ds.usageLimit).toBeDefined();
+    expect(ds.lastScreenStatus).toBe('limited');
+  });
+
+  it('rolls back a failed recovery write and retries on the next proven recovery frame', async () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_recovery_write', 'quota recovery retry', 'group', 'chat');
+    session.cliId = 'antigravity';
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    await dispatch(worker, { type: 'screen_update', content: 'native error', status: 'limited', usageLimit: { ...rateLimitState(), kind: 'usage', source: 'antigravity-error-composer' } });
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected recovery write failure'); });
+    await expect(dispatch(worker, { type: 'screen_update', content: '', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' })).rejects.toThrow('injected recovery write failure');
+    expect(ds.usageLimit).toBeDefined();
+    expect(ds.usageLimitRetryTimer).toBeDefined();
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeDefined();
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    await dispatch(worker, { type: 'screen_update', content: '', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    expect(ds.usageLimitPersistPending).toBe(false);
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(ds.usageLimit).toBeUndefined();
+  });
+
   it('limited → working(带新鲜 usageLimit) 保持 limited：新鲜判定优先', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, workerPort: 9999 });

@@ -2808,6 +2808,8 @@ export type WorkerToDaemonBase =
    *  person's turn from a local command's own repaint. */
   | { type: 'terminal_input'; submitted: true; at: number }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      /** Worker 已从完整权威视口确认正常输入框，不能由裁剪后的卡片文本推断。 */
+      usageLimitRecovery?: 'antigravity-ready-composer';
       /** Set ONLY on the working frame a Web Terminal / sandbox hook
        *  direct-submit publishes via the worker's clearTurnId path: real new
        *  work that belongs to no managed turn. It explicitly reopens the card
@@ -2885,6 +2887,7 @@ export type WorkerToDaemonBase =
       afterObserved?: boolean }
 
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      usageLimitRecovery?: 'antigravity-ready-composer';
       /** capture_identity revision this frame was captured under (bound before
        *  the first await). Absent only from pre-capture-identity workers. */
       captureRevision?: number }

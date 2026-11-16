@@ -474,7 +474,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -9435,6 +9435,7 @@ type UsageAwareScreen = {
   status: RuntimeScreenStatus | 'limited';
   usageLimit?: CliUsageLimitState;
   expiredAntigravityQuota?: CliUsageLimitState;
+  usageLimitRecovery?: 'antigravity-ready-composer';
 };
 
 function classifyScreenUsageLimit(
@@ -9453,16 +9454,25 @@ function classifyUsageLimitWithNativeEvidence(
 ): UsageAwareScreen {
   if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
+  let nativeViewportCaptured = false;
   if (cliAdapter?.id === 'antigravity' && backend) {
     // Card snapshots intentionally remove input/composer rows. Native error
     // reconciliation requires the full current viewport, not that display text.
-    try { evidence = captureBackendScreen(backend) || content; } catch { /* no stronger evidence */ }
+    try {
+      const viewport = captureBackendScreen(backend);
+      if (viewport) { evidence = viewport; nativeViewportCaptured = true; }
+    } catch { /* no stronger evidence */ }
   }
   if (cliAdapter?.id === 'antigravity') {
     // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    // 正常输入框是当前恢复证据；保留上方历史报错，但不再用它判定本轮限额。
+    // 卡片内容会裁剪输入框，因此显式携带完整权威视口确认的恢复信号。
+    if (nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
+      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
+    }
     let expiredAntigravityQuota: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
       const observed = annotateAntigravityUsageLimit(evidence, state);
