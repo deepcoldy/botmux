@@ -84,14 +84,18 @@ describe('malformed JSON body → 400 bad_json (readJsonBodyOrBadJson)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('scoped classification rejects invalid selections before OAuth and accepts explicit or null-defaulted scopes', async () => {
+  it('scoped classification rejects invalid or missing scopes before OAuth and accepts explicit arrays or explicit null', async () => {
     const endpoint = `http://127.0.0.1:${handle!.port}/api/groups/oc_current/feed-groups`;
     for (const body of [
-      { actorOpenId: 'ou_operator', label: '' },
-      { actorOpenId: 'ou_operator', label: ' P0' },
+      { actorOpenId: 'ou_operator', label: '', managedLabels: null },
+      { actorOpenId: 'ou_operator', label: ' P0', managedLabels: null },
+      { actorOpenId: 'ou_operator', managedLabels: null },
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: ['P1'] },
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: 'P0' },
-      { actorOpenId: 'ou_operator' },
+      // A missing scope must never fall back to clearing every personal group; full cleanup needs an explicit null.
+      { actorOpenId: 'ou_operator', label: 'P0' },
+      { actorOpenId: 'ou_operator', label: null },
+      { actorOpenId: 'ou_operator', label: 'p0' },
     ]) {
       const response = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       expect(response.status).toBe(400);
@@ -99,8 +103,8 @@ describe('malformed JSON body → 400 bad_json (readJsonBodyOrBadJson)', () => {
     }
     for (const body of [
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: ['P0', 'Backlog'] },
-      { actorOpenId: 'ou_operator', label: 'P0' },
-      { actorOpenId: 'ou_operator', label: null },
+      { actorOpenId: 'ou_operator', label: 'P0', managedLabels: null },
+      { actorOpenId: 'ou_operator', label: null, managedLabels: null },
     ]) {
       const accepted = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       expect(accepted.status).toBe(400);
