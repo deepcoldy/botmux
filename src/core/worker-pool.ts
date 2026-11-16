@@ -1,6 +1,6 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
-import { sameWorker, sameRuntime, executionObserverSupported } from '../services/session-contract.js';
+import { sameWorker, sameRuntime, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import {
   compareLaunchedInstall,
@@ -13503,8 +13503,9 @@ function sendOrdinaryImDeliveryTracked(
   // execution rather than acquiring a new one on every transport attempt.
   const controller = controllerForSession(ds);
   if (controller && !controller.acceptsUserInput()) return false;
-  const scoped = controller && message.type === 'message'
-    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(turnId, message.dispatchAttempt) } }
+  const scoped = controller && !message.sessionCommand?.execution
+    ? { ...message, sessionCommand: { ...message.sessionCommand, version: 2 as const,
+      execution: controller.admitInput(turnId, message.dispatchAttempt) } }
     : message;
   const record: OrdinaryImDelivery = {
     key,
@@ -13576,7 +13577,7 @@ function completeOrdinaryImDelivery(
   if (record) clearOrdinaryImDelivery(record);
 }
 
-/** A retiring worker's late COMMIT ACK settles only the deliveries tracked
+/** A worker's proven COMMIT or successful terminal settles only deliveries tracked
  * against that exact worker object. The record's own worker identity is the
  * authority here — deliberately NOT ds.worker/ds.workerGeneration, which have
  * already moved on (suspend nulls the worker; a replacement fork advances the
@@ -13584,9 +13585,22 @@ function completeOrdinaryImDelivery(
  * deliberately excluded: a stale receipt is not settlement-grade — the turn
  * can still die unexecuted with the old worker, and swallowing the pending
  * timers on it would silence the original generation's visible failure. */
-function completeStaleWorkerOrdinaryImDelivery(worker: ChildProcess, turnId: string): void {
+function completeWorkerOrdinaryImDelivery(worker: ChildProcess, turnId: string, context?: WorkerContractContext): void {
   for (const record of pendingOrdinaryImDeliveries.values()) {
     if (record.worker !== worker || record.turnId !== turnId) continue;
+    if (context) {
+      const expected = record.message.sessionCommand?.execution;
+      const actual = context.scope.execution;
+      if (context.version !== 2 || context.session.appId !== record.ds.larkAppId
+        || context.session.sessionId !== record.ds.session.sessionId
+        || context.producer.generation !== record.workerGeneration
+        || !Number.isSafeInteger(context.sequence) || context.sequence < 1
+        || context.eventId !== `${context.producer.workerId}:${context.sequence}`
+        || !expected || !actual || actual.executionId !== expected.executionId
+        || actual.turnId !== expected.turnId || actual.turnId !== turnId
+        || actual.dispatchAttempt !== expected.dispatchAttempt) continue;
+    }
+    recordWorkerCommittedTurn(worker, turnId);
     clearOrdinaryImDelivery(record);
   }
 }
@@ -19828,7 +19842,7 @@ function setupWorkerHandlers(
       // running. Stale workers gain no other authority.
       if (msg.type === 'turn_input_committed') {
         recordWorkerCommittedTurn(worker, msg.turnId);
-        completeStaleWorkerOrdinaryImDelivery(worker, msg.turnId);
+        completeWorkerOrdinaryImDelivery(worker, msg.turnId);
       }
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
       return;
@@ -24344,6 +24358,16 @@ function setupWorkerHandlers(
     // store. It cannot acquire executor control from a new worker envelope.
     if (msg.type === 'final_output_offer') return handleLegacyWorkerMessage(msg);
     const metadata = msg.sessionContract as WorkerContractContext | undefined;
+    // Retirement revokes runtime mutation authority before late ACKs drain.
+    // Settle only this child's frozen input admission; never grant it access
+    // to the replacement's runtime, cards, execution state or delivery record.
+    if (ds.worker !== worker && msg.type === 'turn_input_committed') {
+      if (metadata && sameWorker(metadata.producer, contractWorker)
+        && msg.dispatchAttempt === metadata.scope.execution?.dispatchAttempt) {
+        completeWorkerOrdinaryImDelivery(worker, msg.turnId, metadata);
+      }
+      return;
+    }
     if (msg.type === 'runtime_binding_started' || msg.type === 'runtime_binding' || msg.type === 'runtime_binding_aborted') {
       if (!sessionController.admitsRegistration(msg.type, msg.bindingId, metadata, contractWorker) || ds.worker !== worker) return;
       try {
@@ -24472,6 +24496,13 @@ function setupWorkerHandlers(
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') { logRejected(admission.reason); return; }
     if (admission.kind === 'defer') return;
+    // A verified native success is stronger than a lost input commit ACK.
+    // Ambiguous/failed/cancelled boundaries do not prove queue admission.
+    if ((admission.kind === 'current' || admission.kind === 'historical')
+      && msg.type === 'turn_terminal'
+      && contractTerminalStatus(msg.status, msg.errorCode) === 'succeeded') {
+      completeWorkerOrdinaryImDelivery(worker, msg.turnId, admission.context);
+    }
     if (msg.type === 'final_output') {
       if (msg.sessionOutputOrigin?.scope.execution && msg.sessionOutputOrigin.scope.execution.executionId !== admission.context.scope.execution?.executionId) return;
       if (!recoveredOrigin) msg = { ...msg, sessionOutputOrigin: admission.context };
