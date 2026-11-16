@@ -30,6 +30,16 @@ function add(model: string, inputTokens: number, displayName?: string): void {
 }
 const usage = () => readAntigravityTokenUsage('native', { conversationsDir: root })!.result!;
 const args = () => ({ sessionId: 'audit', cliId: 'antigravity', larkAppId: 'test', ledgerDir: join(root, 'ledger'), now });
+/** Hand-built cumulative snapshot so per-model rows can diverge from the
+ *  monotonic aggregate (vanish/regression), which the additive SQLite fixture
+ *  cannot express. */
+function mixedSnapshot(rows: Array<[string, number]>): any {
+  const models = rows.map(([model, inputTokens]) =>
+    ({ model, inputTokens, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 }));
+  const inputTokens = rows.reduce((sum, [, tokens]) => sum + tokens, 0);
+  return { inputTokens, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0,
+    model: rows.length === 1 ? rows[0][0] : '', models, in: inputTokens, out: 0, turns: 0 };
+}
 const query = (model?: string) => queryUsageLedger({ from: '2026-11-16T00:00:00Z', to: '2026-11-17T00:00:00Z',
   timeZone: 'UTC', ...(model ? { model } : {}) }, { ledgerDir: join(root, 'ledger'), now: new Date('2026-11-16T11:00:00Z') });
 
@@ -141,5 +151,29 @@ describe('Antigravity model identity and accounting', () => {
     scope.cliAdapter.runnerFramedInput = false;
     expect(await handle('runtime', { threadId: 'exact', model: 'untrusted' })).toBe(false);
     expect(published).toHaveLength(1);
+  });
+
+  it('leaves a model-vanish interval unclassified while keeping exact cumulative totals', () => {
+    recordSessionUsage({ ...args(), usage: mixedSnapshot([['model-a', 100], ['model-b', 50]]) });
+    // Aggregate still grows (150→160), so no shrink re-anchor, but model-a
+    // vanished: its 100 tokens cannot be subtracted from model-b's delta.
+    const record = recordSessionUsage({ ...args(), usage: mixedSnapshot([['model-b', 160]]) })!;
+    expect(record.models).toBeUndefined();
+    expect(record.model).toBe('');
+    expect(record.inputTokens).toBe(10);
+    expect(record.modelTotals).toEqual([
+      { model: 'model-b', inputTokens: 160, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 },
+    ]);
+  });
+
+  it('leaves a per-model regression interval unclassified instead of billing the new model for all growth', () => {
+    recordSessionUsage({ ...args(), usage: mixedSnapshot([['model-a', 100]]) });
+    // Aggregate grows 100→110, but model-a alone regressed by 10. Attributing
+    // the whole +10 to the new model-b would overstate it by the regression.
+    const record = recordSessionUsage({ ...args(), usage: mixedSnapshot([['model-a', 90], ['model-b', 20]]) })!;
+    expect(record.models).toBeUndefined();
+    expect(record.model).toBe('');
+    expect(record.inputTokens).toBe(10);
+    expect(record.modelTotals).toHaveLength(2);
   });
 });
