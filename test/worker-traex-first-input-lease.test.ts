@@ -171,4 +171,30 @@ describe('TraeX first-write lease after Web terminal input', () => {
     expect(h.pending()).toBe(false);
     expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
   });
+
+  it('never re-drives a held input from a recheck timer whose spawn generation was replaced', async () => {
+    const h = leaseHarness();
+    h.noteWebInput(FOCUS_OUT);
+    await h.flush();
+    expect(h.scope.traexStartupWebRecheck).toBeDefined();
+    // A restart installs a new CLI generation before the quiet window elapses.
+    h.scope.cliSpawnGeneration++;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.scope.markPromptReady).not.toHaveBeenCalled();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+
+  it('never re-drives a held input from a recheck timer during teardown without a replacement', async () => {
+    const h = leaseHarness();
+    h.noteWebInput(FOCUS_OUT);
+    await h.flush();
+    expect(h.scope.traexStartupWebRecheck).toBeDefined();
+    h.scope.cliRestartInProgress = true;
+    h.scope.replacementSpawnInProgress = false;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.scope.markPromptReady).not.toHaveBeenCalled();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
 });
