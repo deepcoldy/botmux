@@ -664,6 +664,11 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact-turn controller identity exposed only to tool credential publication
+   * and `botmux actor current` for a bounded schedule child. Unlike
+   * scheduledTurnCallers, this does not authorize workflow or schedule
+   * mutations and is never persisted. */
+  scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
