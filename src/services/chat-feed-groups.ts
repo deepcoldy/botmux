@@ -9,17 +9,19 @@ const writes = new AsyncSerialQueue();
 const LEGACY_LABELS = new Set(['p0', 'p1', 'pending', 'watching']);
 const INVALID_LABEL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\ufeff]/u;
 
-/** Validate a generic, bounded scope before any credential or network access. */
-export function isFeedGroupSelection(label: unknown, managedLabels: unknown): managedLabels is string[] {
-  const validName = (name: unknown): name is string => typeof name === 'string'
-    && name.length > 0 && name === name.trim() && Array.from(name).length <= 50 && !INVALID_LABEL.test(name);
+const validLabelName = (name: unknown): name is string => typeof name === 'string'
+  && name.length > 0 && name === name.trim() && Array.from(name).length <= 50 && !INVALID_LABEL.test(name);
+
+/** Validate a generic, bounded scope (or null for all normal groups) before credential or network access. */
+export function isFeedGroupSelection(label: unknown, managedLabels: unknown): managedLabels is string[] | null {
+  if (managedLabels === null) return label === null || validLabelName(label);
   return Array.isArray(managedLabels) && managedLabels.length <= 50
-    && managedLabels.every(validName) && new Set(managedLabels).size === managedLabels.length
-    && (label === null || (validName(label) && managedLabels.includes(label)));
+    && managedLabels.every(validLabelName) && new Set(managedLabels).size === managedLabels.length
+    && (label === null || (validLabelName(label) && managedLabels.includes(label)));
 }
 
 /** Keep the legacy contract only when the caller does not request a scoped operation. */
-function validSelection(label: string | null, managedLabels?: string[]): boolean {
+function validSelection(label: string | null, managedLabels?: string[] | null): boolean {
   return managedLabels === undefined ? label === null || LEGACY_LABELS.has(label) : isFeedGroupSelection(label, managedLabels);
 }
 type FeedGroup = { id: string; name: string };
@@ -67,11 +69,11 @@ function assertItemResult(data: Record<string, unknown>, chatId: string, removin
   if (!alreadyAbsent) throw new Error('feed_group_item_failed');
 }
 
-/** Add the target first, then remove this chat only from the supplied scope (legacy: all). */
-export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: string, label: string | null, managedLabels?: string[]): Promise<void> {
+/** Add the target first, then remove this chat only from the supplied scope (null/undefined: all normal groups). */
+export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: string, label: string | null, managedLabels?: string[] | null): Promise<void> {
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(chatId) || !validSelection(label, managedLabels)) throw new Error('invalid_chat_label');
   if (managedLabels?.length === 0) return;
-  const scope = managedLabels === undefined ? undefined : new Set(managedLabels);
+  const scope = managedLabels == null ? undefined : new Set(managedLabels);
   const directory = await groups(api);
   let target = directory.find(group => group.name === label)?.id;
   if (directory.filter(group => group.name === label).length > 1) throw new Error('ambiguous_feed_group');
@@ -88,7 +90,7 @@ export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: strin
 }
 
 /** Resolve only the command sender's app-scoped OAuth; never borrow the Bot owner's identity. */
-export async function setChatFeedGroup(appId: string, chatId: string, actorOpenId: string, label: string | null, clientSignal?: AbortSignal, managedLabels?: string[]) {
+export async function setChatFeedGroup(appId: string, chatId: string, actorOpenId: string, label: string | null, clientSignal?: AbortSignal, managedLabels?: string[] | null) {
   if (!/^ou_[a-zA-Z0-9]+$/.test(actorOpenId) || !canOperate(appId, chatId, actorOpenId)) {
     return { ok: false as const, error: 'permission_denied' };
   }

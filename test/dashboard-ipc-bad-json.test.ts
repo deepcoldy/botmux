@@ -84,23 +84,28 @@ describe('malformed JSON body → 400 bad_json (readJsonBodyOrBadJson)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('scoped classification rejects missing/out-of-scope selections before OAuth and accepts configured names', async () => {
+  it('scoped classification rejects invalid selections before OAuth and accepts explicit or null-defaulted scopes', async () => {
     const endpoint = `http://127.0.0.1:${handle!.port}/api/groups/oc_current/feed-groups`;
     for (const body of [
-      { actorOpenId: 'ou_operator', label: 'P0' },
+      { actorOpenId: 'ou_operator', label: '' },
+      { actorOpenId: 'ou_operator', label: ' P0' },
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: ['P1'] },
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: 'P0' },
-      // A missing scope must never fall back to the legacy contract, which removes every personal group.
-      { actorOpenId: 'ou_operator', label: null },
-      { actorOpenId: 'ou_operator', label: 'p0' },
+      { actorOpenId: 'ou_operator' },
     ]) {
       const response = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       expect(response.status).toBe(400);
       expect(await response.json()).toEqual({ ok: false, error: 'invalid_chat_label' });
     }
-    const accepted = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ actorOpenId: 'ou_operator', label: 'P0', managedLabels: ['P0', 'Backlog'] }) });
-    expect(await accepted.json()).toEqual({ ok: false, error: 'user_login_required' });
+    for (const body of [
+      { actorOpenId: 'ou_operator', label: 'P0', managedLabels: ['P0', 'Backlog'] },
+      { actorOpenId: 'ou_operator', label: 'P0' },
+      { actorOpenId: 'ou_operator', label: null },
+    ]) {
+      const accepted = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      expect(accepted.status).toBe(400);
+      expect(await accepted.json()).toEqual({ ok: false, error: 'user_login_required' });
+    }
   });
 
   it.each(ROUTES)('%s %s', async (method, path) => {

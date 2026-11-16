@@ -153,4 +153,43 @@ describe('scoped plugin feed groups', () => {
     await expect(replaceChatFeedGroups(client, 'oc_current', 'P1', scope)).rejects.toThrow('join failed');
     expect(client.request.mock.calls.some(call => call[0].includes('remove'))).toBe(false);
   });
+
+  it('clears all normal feed groups including initial bot tags when managedLabels is null', async () => {
+    const client = api([
+      { group_id: 'uncat', name: '未分类事项' },
+      { group_id: 'dev', name: '开发机事项' },
+      { group_id: 'p0', name: 'P0' },
+      { group_id: 'closed', name: '已关闭-开发机' },
+      { group_id: 'rule_group', name: '报警群', type: 'rule' },
+    ]);
+    await replaceChatFeedGroups(client, 'oc_current', 'P0', null);
+    expect(client.request.mock.calls.filter(call => call[1] !== undefined).map(call => call[0])).toEqual([
+      '/open-apis/im/v1/groups/p0/batch_add_item',
+      '/open-apis/im/v1/groups/uncat/batch_remove_item',
+      '/open-apis/im/v1/groups/dev/batch_remove_item',
+      '/open-apis/im/v1/groups/closed/batch_remove_item',
+    ]);
+    client.request.mockClear();
+    await replaceChatFeedGroups(client, 'oc_current', '已关闭-开发机', null);
+    expect(client.request.mock.calls.filter(call => call[1] !== undefined).map(call => call[0])).toEqual([
+      '/open-apis/im/v1/groups/closed/batch_add_item',
+      '/open-apis/im/v1/groups/uncat/batch_remove_item',
+      '/open-apis/im/v1/groups/dev/batch_remove_item',
+      '/open-apis/im/v1/groups/p0/batch_remove_item',
+    ]);
+    client.request.mockClear();
+    await replaceChatFeedGroups(client, 'oc_current', null, null);
+    expect(client.request.mock.calls.filter(call => call[1] !== undefined).map(call => call[0])).toEqual([
+      '/open-apis/im/v1/groups/uncat/batch_remove_item',
+      '/open-apis/im/v1/groups/dev/batch_remove_item',
+      '/open-apis/im/v1/groups/p0/batch_remove_item',
+      '/open-apis/im/v1/groups/closed/batch_remove_item',
+    ]);
+  });
+
+  it.each(['', ' P0', 'invisible\u202ename', 'a'.repeat(51)])('rejects malformed target %s when managedLabels is null before any request', async (badLabel) => {
+    const client = api([]);
+    await expect(replaceChatFeedGroups(client, 'oc_current', badLabel, null)).rejects.toThrow('invalid_chat_label');
+    expect(client.request).not.toHaveBeenCalled();
+  });
 });

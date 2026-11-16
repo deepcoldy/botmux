@@ -9068,12 +9068,12 @@ ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, re
   } finally { res.off('close', onClose); }
 }, NOT_BOUND_BODY.okFalse));
 
-/** Generic plugin operation: an explicit scope prevents unrelated personal-group removal. */
+/** Generic plugin operation: explicit managedLabels limits removal; null/omitted clears all normal groups. */
 ipcRoute('PUT', '/api/groups/:chatId/feed-groups', requireBoundBot(async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
-  const { actorOpenId, label, managedLabels } = body as Record<string, unknown>;
+  const { actorOpenId, label, managedLabels = null } = body as Record<string, unknown>;
   if (typeof actorOpenId !== 'string' || !isFeedGroupSelection(label, managedLabels)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_chat_label' });
   }
