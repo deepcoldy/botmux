@@ -126,6 +126,32 @@ describe('real Bun runner shard execution', () => {
     }
   });
 
+  it('refuses to call an empty shard a green run and leaves its report incomplete', async () => {
+    const dir = fixture({
+      'test/a.test.ts': passing,
+      'test/b.test.ts': passing,
+    });
+    const output = join(dir, 'bun-shard-3.json');
+    const result = await launch(dir, ['--shard=3/4', `--timings-output=${output}`]).completed;
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain('contains no runnable files');
+    const report = JSON.parse(readFileSync(output, 'utf8'));
+    expect(report.complete).toBe(false);
+    expect(report.plannedCount).toBe(0);
+    expect(report.files).toEqual([]);
+  });
+
+  it('fails closed on a truncated timing report without writing merge output', async () => {
+    const dir = fixture({ 'test/pass.test.ts': passing });
+    const artifactDir = join(dir, 'artifacts');
+    mkdirSync(artifactDir, { recursive: true });
+    writeFileSync(join(artifactDir, 'bun-shard-1.json'), '{"complete": true, "files": [');
+    const output = join(artifactDir, 'merged.json');
+    const result = await launch(dir, [artifactDir, '--shards=1', `--output=${output}`], 'merge-bun-test-timings.mjs').completed;
+    expect(result.code, result.output).toBe(1);
+    expect(existsSync(output)).toBe(false);
+  });
+
   it('invalidates old successful evidence before selector startup can fail', async () => {
     const dir = fixture({ 'test/pass.test.ts': passing });
     const output = join(dir, 'bun-shard-1.json');
