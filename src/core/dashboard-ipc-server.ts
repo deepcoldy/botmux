@@ -4477,8 +4477,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || (!detachedForUser && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated))) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
-  // Nobody attends an unattended run: the agent gets a link-free refusal (never the
-  // platform page or an instruction to request scopes), and the person gets the private notice.
+  // Nobody attends an unattended run: the agent gets a refusal with no personal link
+  // or instruction to request scopes (when the platform could not send its card, it names
+  // the generic platform credentials page), and the person gets the private notice.
   // A credential that resolves again ends the lapse, so the next one is a new notice.
   if (isUnattendedIdentityTurnId(identityTurnId ?? turnId) && triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli')) {
     const locale = localeForBot(bot.larkAppId);

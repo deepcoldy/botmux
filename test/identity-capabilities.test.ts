@@ -365,6 +365,22 @@ describe('unattended turns (scheduled and background)', () => {
       expect(send).not.toHaveBeenCalled();
     });
 
+    it('a platform card for other missing scopes is asked for the same day; the same scopes in any order are not', async () => {
+      bindPlatform();
+      const notice = (scopes: string[]) => noticeUnattendedLapse({
+        appId: 'cli_bot', taskId: 't1', taskName: 'nightly', openId: ALICE, locale: 'zh', provider: 'lark-cli', url: null,
+        scopes, sendDirect: send,
+        botConfig: { larkAppId: 'cli_bot', larkToolBinding: true, triggerUserAuth: parseTriggerUserAuthConfig({
+          enabled: true, capabilities: ['lark-user'], credentialSource: 'auto' }) } as any,
+      });
+      expect(await notice(['im:chat:read', 'docx:document'])).toBe('delivered');
+      expect(await notice(['docx:document', 'im:chat:read'])).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(await notice(['calendar:calendar'])).toBe('delivered');
+      expect(platformRequest).toHaveBeenCalledTimes(2);
+      expect(platformRequest.mock.calls[1][0]).toMatchObject({ scopes: ['calendar:calendar'] });
+    });
+
     it('on a platform-bound host Meego is still sent by botmux, without any platform link', async () => {
       bindPlatform();
       bytedcliJwts.clear();

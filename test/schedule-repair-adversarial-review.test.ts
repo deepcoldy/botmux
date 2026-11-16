@@ -196,7 +196,7 @@ describe('schedule repair adversarial overlap probes', () => {
     const scope = { scheduleAuthorityStore: store, parseScheduledTurnId, authorizeDelegatedScheduleRun,
       assertScheduledAuthorityCurrent,
       identityPublicationConflicted: () => false, delegatedScheduleRuntimeDeps: () => ({
-        runEnabled: true, hostRunScopes: ['bytedcli'], triggerUserAuthTools: ['bytedcli', 'lark-cli'],
+        runEnabled: true, hostRunScopes: ['bytedcli'], triggerUserAuth: { enabled: true, tools: ['bytedcli', 'lark-cli'] },
         adminOpenIds: ['ou_user'],
         resolveTargetOpenId: () => new Promise<string>(resolve => setTimeout(() => resolve('ou_user'), 1_000)),
         listChatMemberOpenIds: async () => ['ou_user'],

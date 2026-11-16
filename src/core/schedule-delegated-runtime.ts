@@ -1,7 +1,8 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 import { isManualScheduleRun, isManualScheduledTurn } from './scheduled-turn-provenance.js';
-import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { capabilityOn, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { capabilityOfTool } from './identity-policy.js';
 import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 
 export interface DelegatedScheduleRuntimeDependencies {
@@ -14,7 +15,7 @@ export interface DelegatedScheduleRuntimeDependencies {
   runEnabled: boolean;
   validateBotGrant?: (record: ScheduleAuthorityRecord) => void;
   hostRunScopes: readonly TriggerUserAuthTool[];
-  triggerUserAuthTools: readonly TriggerUserAuthTool[];
+  triggerUserAuth: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | undefined;
   adminOpenIds: readonly string[];
   resolveTargetOpenId: (unionId: string) => Promise<string | undefined>;
   listChatMemberOpenIds: (chatId: string) => Promise<readonly string[]>;
@@ -102,11 +103,11 @@ export async function authorizeDelegatedScheduleRun(
     throw new Error(`schedule authority state is ${authority.state}`);
   }
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
-  if (!TRIGGER_USER_AUTH_TOOLS.every(tool => deps.triggerUserAuthTools.includes(tool))) {
-    throw new Error('delegated schedule requires triggerUserAuth isolation for every identity tool');
+  if (!capabilityOn(deps.triggerUserAuth, 'lark-user') || !capabilityOn(deps.triggerUserAuth, 'bytecloud')) {
+    throw new Error('delegated schedule requires triggerUserAuth isolation for lark-user and bytecloud');
   }
   if (authority.runScopes.some(scope => !deps.hostRunScopes.includes(scope)
-    || !deps.triggerUserAuthTools.includes(scope))) {
+    || !capabilityOn(deps.triggerUserAuth, capabilityOfTool(scope)))) {
     throw new Error('delegated schedule run scope is no longer allowed by host policy');
   }
   if (authority.runScopes.length > 0 && !authority.credentialOpenId) {

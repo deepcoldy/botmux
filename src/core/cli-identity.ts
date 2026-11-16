@@ -1369,7 +1369,7 @@ const ALL_IDENTITY_TOOLS = Object.keys(IDENTITY_ENV_KEYS) as IdentityTool[];
  * The one scan of the wrapped CLI's argv, run once at the top of the wrapper.
  * Sets __botmux_sc_w1 / _w2 (first two operands), _login (a `login` operand that
  * is the first operand or comes right after an `auth` or `meego` operand,
- * whatever options sit between them), _help (the last argument is a help/version
+ * whatever options sit between them), _help (some argument is a help/version
  * flag that cannot be the value of the option before it) and _unknown (an
  * option whose arity is not known: whether the next word is its value cannot be
  * told, so callers treat the call as governed, and a following `login` still
@@ -1382,7 +1382,7 @@ const BYTEDCLI_SCAN_FN: readonly string[] = [
   '__botmux_scan() {',
   '  __botmux_sc_w1=; __botmux_sc_w2=; __botmux_sc_skip=; __botmux_sc_login=; __botmux_sc_websess=; __botmux_sc_help=; __botmux_sc_unknown=; __botmux_sc_end=; __botmux_sc_prev=; __botmux_sc_opt=',
   '  for __botmux_sc_a in "$@"; do',
-  '    __botmux_sc_help=; __botmux_sc_optprev=$__botmux_sc_opt; __botmux_sc_opt=',
+  '    __botmux_sc_optprev=$__botmux_sc_opt; __botmux_sc_opt=',
   '    if [ -n "$__botmux_sc_skip" ]; then __botmux_sc_skip=; continue; fi',
   '    if [ -z "$__botmux_sc_end" ]; then',
   '      case "$__botmux_sc_a" in',

@@ -586,6 +586,18 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
       expect(botmuxCalls()).toBe('');
     });
 
+    it('a help flag anywhere outside an option value makes the call help and requests no login', () => {
+      publishPerson();
+      const cases = [['auth', 'login', '--help', '--json'], ['--help', 'auth', 'login'], ['meego', 'login', '-h'],
+        ['--help'], ['auth', '-h'], ['auth', 'login', '-h']];
+      for (const args of cases) {
+        const r = run(installFor('bytedcli'), args, { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` });
+        expect(r.status, args.join(' ')).toBe(0);
+        expect(r.out).toContain(`ARGS=${args.join(' ')}`);
+      }
+      expect(botmuxCalls()).toBe('');
+    });
+
     it('a word that is an option value is not an operand: --profile login runs the call as the person', () => {
       publishPerson();
       const out = run(installFor('bytedcli'), ['--profile', 'login', 'tce', 'list'], { PATH: `${fakeBotmux(3)}:/usr/bin:/bin` }).out;

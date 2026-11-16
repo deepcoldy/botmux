@@ -4583,7 +4583,7 @@ function delegatedScheduleRuntimeDeps(appId: string) {
   return {
     runEnabled: schedulePolicy?.runEnabled !== false,
     hostRunScopes: schedulePolicy?.runScopes ?? [],
-    triggerUserAuthTools: triggerPolicy?.enabled === true ? triggerPolicy.tools : [],
+    triggerUserAuth: triggerPolicy,
     validateBotGrant: (record: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord) =>
       assertScheduleBotGrantActive(record, readGlobalConfig().scheduleDelegation),
     adminOpenIds: getDashboardAdminOpenIds(appId),

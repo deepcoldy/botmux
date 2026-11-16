@@ -186,7 +186,7 @@ export async function offerAuthorizationAtCreation(args: {
 
 const capabilityOfProvider = (provider: UnattendedProvider) => provider === 'meego' ? 'meego' : capabilityOfTool(provider);
 
-/** Last notice per task, person and provider: what it carried (a link, or the platform card's day) and when. */
+/** Last notice per task, person and provider: what it carried (a link, or the platform card's day and scopes) and when. */
 const lastSent = new Map<string, { marker: string; at: number }>();
 const DAY_MS = 86_400_000;
 const LINK_NOTICE_INTERVAL_MS = 60 * 60_000;
@@ -230,7 +230,8 @@ export function unattendedRefusalText(outcome: UnattendedNoticeOutcome | undefin
  * person lacks and was not just told about. Private to the principal only: a
  * direct message, or a card only they see in the task's chat when that fails;
  * never a plain group message, the agent or a claim card. Per task, person and
- * provider, the platform card is asked for at most once a day, and a link is
+ * provider, the platform card is asked for at most once a day for the same
+ * missing scopes, and a link is
  * sent once, a changed link (the earlier challenge expired) again but at most
  * once an hour. The keys are recorded before the send, so concurrent refusals
  * give one message, and dropped again when nothing reached the person (or the
@@ -243,7 +244,8 @@ export async function deliverUnattendedLapse(args: {
 }): Promise<UnattendedNoticeOutcome> {
   const { appId, taskId, openId, locale, entries } = args;
   const now = Date.now();
-  const marker = (e: AuthorizationEntry) => e.platform ? `platform:${Math.floor(now / DAY_MS)}` : e.url ?? '';
+  const scopesMarker = [...(args.scopes ?? [])].sort().join(',');
+  const marker = (e: AuthorizationEntry) => e.platform ? `platform:${Math.floor(now / DAY_MS)}:${scopesMarker}` : e.url ?? '';
   const keyOf = (e: AuthorizationEntry) => lapseKey(appId, taskId, openId, e.provider);
   const due = entries.filter(e => {
     const last = lastSent.get(keyOf(e));
