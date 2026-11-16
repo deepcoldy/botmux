@@ -428,7 +428,7 @@ import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './serv
 import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { traexRejectedArgument } from './adapters/cli/traex-version.js';
+import { probeTraexHookTrustSupport, traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import {
   readRunningExeIdentity,
@@ -1722,6 +1722,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
+      bypassHookTrust: cfg.cliId === 'traex'
+        && cfg.disableCliBypass !== true
+        && config.bypassCodexHookTrust
+        && probeTraexHookTrustSupport(cliBin).status !== 'unsupported',
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
@@ -37580,6 +37584,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
+      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -37592,6 +37597,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
+      }
+      try {
+        await closeRpcEngine?.stopAndWait();
+      } catch (error) {
+        log(`Local close RPC teardown failed: ${String(error)}`);
+        process.exit(1);
+        return;
       }
       stopOwnedSessionScope('close');
       killCli();
@@ -37969,7 +37981,17 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
+let parentExitShutdown: Promise<void> | undefined;
+
 function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
+  parentExitShutdown ??= shutdownWorkerForParentExitImpl(reason, exitCode).catch(error => {
+    log(`Parent-exit RPC teardown failed: ${String(error)}`);
+    cleanup();
+    process.exit(1);
+  });
+}
+
+async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Promise<void> {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -37986,6 +38008,7 @@ function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
     process.exit(exitCode);
     return;
   }
+  await codexRpcEngine?.stopAndWait();
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
   // this exit (backend.kill() only detaches) and still runs against its
   // per-session tree: the relay outbox is bound into it by inode, and a scratch

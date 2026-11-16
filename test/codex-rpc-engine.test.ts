@@ -5,6 +5,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+import { isLinuxZombie } from '../src/utils/process-identity.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -42,6 +43,154 @@ const owner = (turnId: string, dispatchAttempt?: number) => ({
 });
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
+  it.skipIf(process.platform !== 'linux')('waits for an ordinary tool descendant after its app-server leader exits', async () => {
+    const childFile = join(tmpdir(), `rpc-ordinary-tool-${process.pid}-${Date.now()}`);
+    const sid = `ordinary-tool-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    const engine = makeEngine({ sessionId: sid, env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile } });
+    let leader: number | undefined;
+    let tool: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      expect(readFileSync(`/proc/${tool}/cmdline`, 'utf8')).not.toContain('app-server');
+      await expect(engine.stopAndWait()).resolves.toBe(true);
+      await vi.waitFor(() => expect(isAlive(tool!) && !isLinuxZombie(tool!)).toBe(false));
+      expect(existsSync(marker)).toBe(false);
+      const successor = makeEngine({ sessionId: sid });
+      await successor.start();
+      await successor.stopAndWait();
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 10_000);
+
+  it.skipIf(process.platform !== 'linux')('recovers a retained marker with an ordinary descendant after the leader dies', async () => {
+    const childFile = join(tmpdir(), `rpc-stale-tool-${process.pid}-${Date.now()}`);
+    const sid = `stale-tool-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    const engine = makeEngine({ sessionId: sid, env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile } });
+    let leader: number | undefined;
+    let tool: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      expect(JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]).members
+        .some((member: { pid: number }) => member.pid === tool)).toBe(true);
+      process.kill(leader, 'SIGKILL');
+      await vi.waitFor(() => expect(isAlive(leader!)).toBe(false));
+      expect(existsSync(marker)).toBe(true);
+      const successor = makeEngine({ sessionId: sid });
+      await successor.start();
+      expect(isAlive(tool!) && !isLinuxZombie(tool!)).toBe(false);
+      expect(readFileSync(marker, 'utf8').split('\n')[0]).toBe(String(successor.appServerPid));
+      await successor.stopAndWait();
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 10_000);
+
+  it.skipIf(process.platform !== 'linux')('starts past a legacy marker whose leader died and whose group cannot be verified', async () => {
+    const markerDir = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
+    mkdirSync(markerDir, { recursive: true });
+    const sid = `legacy-orphan-${process.pid}-${Date.now()}`;
+    const marker = join(markerDir, sid + '.pid');
+    const childFile = join(tmpdir(), `legacy-orphan-child-${process.pid}-${Date.now()}`);
+    // A detached leader exits after spawning an ordinary child that inherited
+    // the group: the marker names a dead pid whose group is still alive, and a
+    // legacy marker carries no member identity.
+    const orphan = spawn(process.execPath, ['-e',
+      `const {spawn}=require('node:child_process');const fs=require('node:fs');`
+      + `const c=spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{stdio:'ignore'});`
+      + `fs.writeFileSync(${JSON.stringify(childFile)},String(c.pid));setTimeout(()=>process.exit(0),50);`,
+    ], { detached: true, stdio: 'ignore' });
+    const groupPid = orphan.pid!;
+    let tool: number | undefined;
+    try {
+      await vi.waitFor(() => expect(isAlive(groupPid)).toBe(false));
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      writeFileSync(marker, `${groupPid}\nws://127.0.0.1:1`, { mode: 0o600 });
+
+      const engine = makeEngine({ sessionId: sid });
+      await engine.start();
+      expect(readFileSync(marker, 'utf8').split('\n')[0]).toBe(String(engine.appServerPid));
+      // Unverifiable evidence means "never signal": the orphan survives, but the
+      // session is not permanently blocked from engaging RPC.
+      expect(isAlive(tool!) && !isLinuxZombie(tool!)).toBe(true);
+      await engine.stopAndWait();
+    } finally {
+      try { process.kill(-groupPid, 'SIGKILL'); } catch { /* gone */ }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 15_000);
+
+  it.skipIf(process.platform !== 'linux')('does not fail teardown when a post-start child is outside the recorded identity', async () => {
+    const childFile = join(tmpdir(), `rpc-late-tool-${process.pid}-${Date.now()}`);
+    const sid = `late-tool-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    const engine = makeEngine({
+      sessionId: sid,
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '1500' },
+    });
+    let leader: number | undefined;
+    let tool: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      }, { timeout: 10_000 });
+      const captured = JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]);
+      expect(captured.members.some((member: { pid: number }) => member.pid === tool)).toBe(false);
+      process.kill(leader, 'SIGKILL');
+      await vi.waitFor(() => expect(isAlive(leader!)).toBe(false));
+
+      // A child spawned after the identity snapshot cannot be proven to belong
+      // to this app-server: teardown must fail closed (leave the marker) without
+      // throwing, so the next incarnation can still start.
+      await expect(engine.stopAndWait()).resolves.toBe(false);
+      expect(existsSync(marker)).toBe(true);
+      const successor = makeEngine({ sessionId: sid });
+      await successor.start();
+      expect(readFileSync(marker, 'utf8').split('\n')[0]).toBe(String(successor.appServerPid));
+      await successor.stopAndWait();
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 20_000);
+
+  it('passes the permitted hook-trust flag before the app-server subcommand', async () => {
+    const launches: string[][] = [];
+    const engine = makeEngine({ bypassHookTrust: true }, {
+      spawnProcess(command, args, options) {
+        launches.push([...args]);
+        return spawn(command, args, options);
+      },
+    });
+    await engine.start();
+    expect(launches[0].slice(0, 2)).toEqual(['--dangerously-bypass-hook-trust', 'app-server']);
+    await engine.stopAndWait();
+  });
+
   it('runs a strict app-server with approved auth and identity but no unknown host credential', async () => {
     const { buildSessionChildEnv, botInjectedEnv } = await import('../src/core/env-policy.js');
     const { applySessionOwnerEnv } = await import('../src/utils/child-env.js');
