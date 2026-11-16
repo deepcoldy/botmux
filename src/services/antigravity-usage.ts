@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import type { SessionContextUsage, SessionTokenUsage } from '../core/cost-calculator.js';
+import type { ModelTokenUsage } from './model-token-usage.js';
 
 interface ProtoField {
   wireType: number;
@@ -77,6 +78,8 @@ export interface AntigravityStepUsage {
   cacheReadTokens: number;
   reasoningTokens: number;
   model: string;
+  /** Native user-facing model name, distinct from internal execution IDs. */
+  modelDisplayName?: string;
 }
 
 export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUsage | null {
@@ -90,6 +93,8 @@ export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUs
   const f1Buf = Buffer.isBuffer(f1Raw) ? f1Raw : Buffer.from(f1Raw as Uint8Array);
 
   const f1 = decodeProtoBuffer(f1Buf);
+  const displayName = f1.get(21)?.[0]?.val;
+  const modelDisplayName = displayName instanceof Uint8Array ? Buffer.from(displayName).toString('utf8').trim() : undefined;
   let model = '';
   const modelList = f1.get(19);
   if (modelList && modelList.length > 0 && typeof modelList[0].val === 'object') {
@@ -99,7 +104,8 @@ export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUs
 
   const f4List = f1.get(4);
   if (!f4List || f4List.length === 0 || typeof f4List[0].val !== 'object') {
-    return model ? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, model } : null;
+    return model || modelDisplayName ? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, model,
+      ...(modelDisplayName ? { modelDisplayName } : {}) } : null;
   }
 
   const f4Buf = Buffer.isBuffer(f4List[0].val) ? f4List[0].val : Buffer.from(f4List[0].val as Uint8Array);
@@ -115,6 +121,7 @@ export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUs
     cacheReadTokens,
     reasoningTokens,
     model,
+    ...(modelDisplayName ? { modelDisplayName } : {}),
   };
 }
 
@@ -167,7 +174,11 @@ export function readLatestAntigravityRuntime(
     const rows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16').all() as Array<{ data: unknown }>;
     for (const row of rows) {
       if (!(row.data instanceof Uint8Array)) continue;
-      const model = parseGenMetadataRow(row.data)?.model.trim();
+      const parsed = parseGenMetadataRow(row.data);
+      // f19 is the execution/routing ID; orchestrator calls may end on an
+      // internal worker. f21 is the native display identity for that call.
+      const model = (parsed?.modelDisplayName
+        || (parsed?.model.endsWith('-worker-agy') ? undefined : parsed?.model))?.trim();
       if (model) return { model };
     }
   } catch { /* unavailable/old schema: keep identity unknown */ }
@@ -223,6 +234,7 @@ export function readAntigravityTokenUsage(
     let totalCacheRead = 0;
     let turns = 0;
     let latestModel = '';
+    const models = new Map<string, ModelTokenUsage>();
     let lastStepInput = 0;
     let lastStepCache = 0;
 
@@ -235,6 +247,11 @@ export function readAntigravityTokenUsage(
       if (!parsed) continue;
 
       if (parsed.model) latestModel = parsed.model;
+      const usage = models.get(parsed.model) ?? { model: parsed.model, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 };
+      usage.inputTokens += parsed.inputTokens;
+      usage.outputTokens += parsed.outputTokens;
+      usage.cacheReadTokens += parsed.cacheReadTokens;
+      models.set(parsed.model, usage);
       totalInput += parsed.inputTokens;
       totalOutput += parsed.outputTokens;
       totalCacheRead += parsed.cacheReadTokens;
@@ -264,7 +281,10 @@ export function readAntigravityTokenUsage(
       outputTokens: totalOutput,
       cacheReadTokens: totalCacheRead,
       cacheCreateTokens: 0,
-      model: latestModel,
+      // A mixed aggregate has no single execution model. Preserve each model
+      // for accounting; card identity is read independently above.
+      model: models.size === 1 ? latestModel : '',
+      models: [...models.values()].sort((a, b) => a.model.localeCompare(b.model)),
       turns,
     };
 

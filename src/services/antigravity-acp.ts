@@ -16,6 +16,7 @@ export interface AntigravityAcpOptions {
   effort?: string;
   logFile?: string;
   onSession: (id: string) => void;
+  onRuntime?: (runtime: { model?: string; reasoningEffort?: string }) => void;
   onText?: (text: string) => void;
   onTool?: (title: string) => void;
 }
@@ -49,6 +50,37 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
   let content = '';
   let contentBytes = 0;
   let toolSinceText = false;
+  const earlyUpdates: JsonObject[] = [];
+  let runtime: { model?: string; reasoningEffort?: string } = {};
+  let modelNames = new Map<string, string>();
+  /** Only native current values (never requested launch defaults) establish
+   * runtime identity. This callback is cosmetic and cannot abort a prompt. */
+  const observeRuntime = (state: JsonObject): void => {
+    const next = { ...runtime };
+    const hasCurrentModel = object(state.models) && typeof state.models.currentModelId === 'string';
+    if (object(state.models)) {
+      if (Array.isArray(state.models.availableModels)) {
+        modelNames = new Map(state.models.availableModels.filter(object).flatMap(model =>
+          typeof model.modelId === 'string' ? [[model.modelId, typeof model.name === 'string' ? model.name : model.modelId]] : []));
+      }
+      if (typeof state.models.currentModelId === 'string') {
+        next.model = modelNames.get(state.models.currentModelId) || state.models.currentModelId;
+      }
+    }
+    if (Array.isArray(state.configOptions)) {
+      for (const option of state.configOptions.filter(object)) {
+        if (typeof option.currentValue !== 'string') continue;
+        if (!hasCurrentModel && (option.category === 'model' || option.id === 'model')) {
+          next.model = modelNames.get(option.currentValue) || option.currentValue;
+        } else if (option.category === 'thought_level' || option.id === 'thought_level') {
+          next.reasoningEffort = option.currentValue;
+        }
+      }
+    }
+    if (next.model === runtime.model && next.reasoningEffort === runtime.reasoningEffort) return;
+    runtime = next;
+    try { opts.onRuntime?.({ ...runtime }); } catch { /* metadata must not break execution */ }
+  };
   const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
 
   /** Reject every in-flight RPC exactly once without exposing provider stderr. */
@@ -83,12 +115,29 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
         write({ id: message.id, error: { code: -32601, message: 'Client method unsupported' } });
         throw new Error(`Antigravity ACP requested unsupported client method: ${message.method}`);
       }
-      if (message.method !== 'session/update' || !prompting) return;
+      if (message.method !== 'session/update') return;
+      if (!sessionId) {
+        // A response and notification can share one stdout chunk: Promise
+        // continuations have not bound sessionId while this decoder drains it.
+        // session/load may replay an arbitrarily long text/tool history. It
+        // was ignored before this observer existed and must remain ignored.
+        const params = message.params;
+        if (object(params) && object(params.update) && params.update.sessionUpdate === 'config_option_update') {
+          if (earlyUpdates.length >= 32) earlyUpdates.shift();
+          earlyUpdates.push(message);
+        }
+        return;
+      }
       const params = message.params;
       if (!object(params) || params.sessionId !== sessionId || !object(params.update)) {
         throw new Error('Antigravity ACP session mismatch');
       }
       const update = params.update;
+      if (update.sessionUpdate === 'config_option_update') {
+        observeRuntime(update);
+        return;
+      }
+      if (!prompting) return;
       if (update.sessionUpdate === 'agent_message_chunk') {
         if (!object(update.content) || update.content.type !== 'text' || typeof update.content.text !== 'string') {
           throw new Error('Antigravity ACP invalid message');
@@ -154,12 +203,14 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
       throw new Error('Antigravity ACP native session identity invalid');
     }
     opts.onSession(sessionId);
+    observeRuntime(control);
+    for (const update of earlyUpdates.splice(0)) receive(update);
     // agy's CLI aliases include an effort suffix; ACP exposes those exact IDs
     // through models, while configOptions.model contains only base models.
     let modelApplied = false;
     if (opts.model && object(control.models) && Array.isArray(control.models.availableModels)
       && control.models.availableModels.some(model => object(model) && model.modelId === opts.model)) {
-      await rpc('session/set_model', { sessionId, modelId: opts.model });
+      observeRuntime(await rpc('session/set_model', { sessionId, modelId: opts.model }));
       modelApplied = true;
     }
     for (const [category, selected] of [['model', opts.model], ['thought_level', opts.effort]] as const) {
@@ -170,7 +221,7 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
         || !config.options.some(option => object(option) && option.value === selected)) {
         throw new Error(`Antigravity ACP configuration unavailable: ${category}`);
       }
-      await rpc('session/set_config_option', { sessionId, configId: config.id, value: selected });
+      observeRuntime(await rpc('session/set_config_option', { sessionId, configId: config.id, value: selected }));
     }
     prompting = true;
     const result = await rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text: opts.content }] }, false);
