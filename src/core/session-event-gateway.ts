@@ -31,6 +31,12 @@ export class SessionEventGateway {
     if (context.session.appId !== this.session.appId || context.session.sessionId !== this.session.sessionId || !sameWorker(context.producer, channel)) return { kind: 'reject', reason: 'session_event_channel_mismatch' };
     if (!Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.eventId !== `${channel.workerId}:${context.sequence}`) return { kind: 'reject', reason: 'invalid_session_event_sequence' };
     const state = this.store.read(this.session); if (!state) return { kind: 'reject', reason: 'session_contract_missing' };
+    // Close receipts are control-channel facts, including while closing. The
+    // pool correlates requestId, session, worker and operation before commit;
+    // input/runtime readiness must not discard the ACK it is waiting for.
+    if (['close_result', 'close_abort_result'].includes(type) && sameWorker(state.worker, channel)) {
+      return { kind: 'worker', context };
+    }
     const runtime = context.scope.runtime;
     if (!runtime) {
       if (context.scope.execution) {

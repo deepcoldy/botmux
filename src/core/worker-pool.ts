@@ -8547,6 +8547,7 @@ type RemoteClosePreparation =
         | 'remote_runner_worker_close_failed'
         | 'remote_runner_row_inconsistent'
         | 'remote_runner_worker_missing'
+        | 'remote_runner_worker_not_ready'
         | 'remote_runner_close_reconciliation_required'
         | 'remote_runner_durable_close_failed'
         | 'remote_shutdown_fence_in_progress'
@@ -8582,6 +8583,8 @@ type RemoteClosePreparation =
        * reconciliation for a failure the retry can clear.
        */
       recovery?: 'retryable' | 'uncertain' | 'irreversible';
+      /** Evidence about cancellation, independent of retry policy. */
+      effect?: 'not_dispatched' | 'rejected' | 'unknown';
       taskId?: string;
     };
 
@@ -8707,6 +8710,8 @@ async function prepareLiveRemoteWorkerClose(
     reconcileFenceRequestId?: string;
   } = {},
 ): Promise<RemoteClosePreparation> {
+  const ownsRemoteRunnerClose = backendType === 'remote-runner' ? remoteRunnerCloseAuthority(ds) : undefined;
+  const ownsWorker = remoteRunnerCloseWorkerCurrent(ds);
   const worker = ds.worker;
   if (!worker || worker.killed) {
     return {
@@ -8966,6 +8971,11 @@ async function prepareLiveRemoteWorkerClose(
       finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
   });
+
+  if (ownsRemoteRunnerClose && (!ownsRemoteRunnerClose() || !ownsWorker())) {
+    return { ok: false, error: 'remote_runner_close_reconciliation_required',
+      retryable: false, recovery: 'uncertain', effect: 'unknown' };
+  }
 
   const taskId = backendType === 'remote-runner'
     ? undefined
@@ -9267,8 +9277,9 @@ async function prepareLiveRemoteWorkerClose(
       ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(result.admission ? { admission: result.admission } : {}),
     });
+    let admissionRestored = false;
     if (mayRestore) {
-      await abortLiveRemoteWorkerClose(ds, requestId, {
+      admissionRestored = await abortLiveRemoteWorkerClose(ds, requestId, {
         allowAbsentAfterProvenRestore: matchedCloseResult,
       });
     } else if (ds.remoteCloseState?.requestId === requestId) {
@@ -9295,6 +9306,8 @@ async function prepareLiveRemoteWorkerClose(
         : result.recovery === 'retryable'
           ? 'remote_runner_worker_close_failed'
           : 'remote_runner_close_reconciliation_required',
+      ...(backendType === 'remote-runner'
+        ? { effect: matchedCloseResult && admissionRestored ? 'rejected' as const : 'unknown' as const } : {}),
       retryable: backendType === 'riff' || mayRestore,
       ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(taskId ? { taskId } : {}),
@@ -9309,6 +9322,49 @@ async function prepareLiveRemoteWorkerClose(
   logger.info(`[${tag(ds)}] ${backendType} worker close prepared and remote cancellation confirmed`);
   return { ok: true, ...(taskId ? { taskId } : {}) };
 }
+
+/** Close owns input admission already; workerReady deliberately stays false.
+ * Pin the owner separately from the worker, which a control-only wake may bind. */
+function remoteRunnerCloseAuthority(ds: DaemonSession): () => boolean {
+  const sessionId = ds.session.sessionId;
+  const appId = ds.larkAppId;
+  const controller = controllerForSession(ds);
+  const operationId = controller?.store.read(controller.ref)?.activeOperationId;
+  return () => {
+    if (ds.session.sessionId !== sessionId || ds.larkAppId !== appId
+        || findActiveBySessionId(sessionId) !== ds || isSessionTransferring(ds)
+        || ds.session.status !== 'active') return false;
+    if (!controller) return true;
+    const state = controller.store.read(controller.ref);
+    const operation = controller.operation(operationId);
+    return state?.lifecycle === 'closing' && !!operationId
+      && state.activeOperationId === operationId && operation?.kind === 'close'
+      && (operation.phase === 'applying' || operation.phase === 'uncertain');
+  };
+}
+
+function remoteRunnerCloseWorkerCurrent(ds: DaemonSession): () => boolean {
+  const worker = ds.worker;
+  const generation = closeFenceGeneration(ds);
+  const controller = controllerForSession(ds);
+  const producer = controller?.store.read(controller.ref)?.worker;
+  return () => ds.worker === worker && closeFenceGeneration(ds) === generation
+    && (!controller || sameWorker(producer, controller.store.read(controller.ref)?.worker));
+}
+
+function remoteRunnerCloseWorkerReady(ds: DaemonSession): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed || worker.connected === false
+      || worker.exitCode != null || worker.signalCode != null) return false;
+  const controller = controllerForSession(ds);
+  if (!controller) return ds.workerReady === true;
+  const state = controller.store.read(controller.ref);
+  return state?.workerOnline === true && !!state.worker
+    && state.worker.generation === closeFenceGeneration(ds)
+    && (ds.session.workerGeneration === undefined || ds.session.workerGeneration === state.worker.generation);
+}
+
+const remoteRunnerCloseWakeOperations = new WeakMap<DaemonSession, string>();
 
 type RemoteRunnerExplicitCloseWake = (
   ds: DaemonSession,
@@ -9334,6 +9390,8 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   wakeRequestId: string,
   forkImpl: RemoteRunnerCloseFork = forkWorker,
 ): Promise<boolean> {
+  const ownsControl = remoteRunnerCloseAuthority(ds);
+  if (!ownsControl()) return false;
   if (ds.worker && !ds.worker.killed) {
     // Active-session takeover publishes the local DaemonSession immediately
     // after fork admission, before the replacement worker has necessarily
@@ -9342,13 +9400,13 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     // the exact admitted generation instead of treating mere process existence
     // as control readiness.
     const worker = ds.worker;
+    const ownsWorker = remoteRunnerCloseWorkerCurrent(ds);
     const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (findActiveBySessionId(ds.session.sessionId) !== ds
-          || ds.session.status !== 'active'
+      if (!ownsControl() || !ownsWorker()
           || ds.worker !== worker
           || worker.killed) return false;
-      if (ds.workerReady === true) return true;
+      if (remoteRunnerCloseWorkerReady(ds)) return true;
       await new Promise(resolve => setTimeout(resolve, REMOTE_RUNNER_CLOSE_WAKE_POLL_MS));
     }
     logger.warn(`[${tag(ds)}] Timed out waiting for existing takeover worker readiness`);
@@ -9374,6 +9432,8 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
     if (ds.remoteCloseState?.requestId !== wakeRequestId
         || ds.remoteCloseState.phase !== 'preparing') return false;
     ds.remoteCloseState = undefined;
+    const operationId = controllerForSession(ds)?.operation()?.operationId;
+    if (operationId) remoteRunnerCloseWakeOperations.set(ds, operationId);
     const accepted = forkImpl(ds, '', true, {
       // A close request must not leave a delayed wake callback behind after it
       // has already returned failure. This also disables marginal-memory
@@ -9400,16 +9460,18 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
       + `${err instanceof Error ? err.message : String(err)}`,
     );
     return false;
+  } finally {
+    remoteRunnerCloseWakeOperations.delete(ds);
   }
 
   const worker = ds.worker;
+  const ownsWorker = remoteRunnerCloseWorkerCurrent(ds);
   const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (findActiveBySessionId(ds.session.sessionId) !== ds
-        || ds.session.status !== 'active'
+    if (!ownsControl() || !ownsWorker()
         || ds.worker !== worker
         || worker.killed) return false;
-    if (ds.workerReady === true) {
+    if (remoteRunnerCloseWorkerReady(ds)) {
       logger.info(`[${tag(ds)}] Woke remote runner control worker for explicit close`);
       return true;
     }
@@ -9459,19 +9521,22 @@ async function prepareRemoteRunnerExplicitClose(
   if ((ds && isSharedAdoptSession(ds)) || isSharedAdoptPersistedSession(session)) {
     return { ok: true };
   }
+  const ownsControl = ds ? remoteRunnerCloseAuthority(ds) : () => false;
   if (!stored || stored.status !== 'active') {
     return {
       ok: false,
       error: 'remote_runner_row_inconsistent',
       retryable: true,
+      effect: 'not_dispatched',
     };
   }
-  if (!ds?.worker || ds.worker.killed || ds.workerReady !== true) {
+  if (!ds || !ownsControl() || !remoteRunnerCloseWorkerReady(ds)) {
     if (!ds) {
       return {
         ok: false,
         error: 'remote_runner_worker_missing',
         retryable: true,
+        effect: 'not_dispatched',
       };
     }
     // A live worker may still be in the pre-ready window before its provider
@@ -9485,8 +9550,10 @@ async function prepareRemoteRunnerExplicitClose(
         ok: false,
         error: 'remote_runner_row_inconsistent',
         retryable: true,
+        effect: 'not_dispatched',
       };
     }
+    const ownsExistingWorker = ds.worker && !ds.worker.killed ? remoteRunnerCloseWorkerCurrent(ds) : undefined;
     const wakeRequestId = `remote-runner-wake:${randomUUID()}`;
     if (ds.remoteCloseState) {
       return {
@@ -9512,11 +9579,17 @@ async function prepareRemoteRunnerExplicitClose(
     } finally {
       if (ds.remoteCloseState?.requestId === wakeRequestId) ds.remoteCloseState = undefined;
     }
-    if (!woke || !ds.worker || ds.worker.killed || ds.workerReady !== true) {
+    if (!woke || !ownsControl() || ownsExistingWorker?.() === false || !remoteRunnerCloseWorkerReady(ds)) {
+      const controller = controllerForSession(ds);
+      const state = controller?.store.read(controller.ref);
+      logger.warn(`[${tag(ds)}] Remote runner close preparation failed before dispatch `
+        + `(lifecycle=${state?.lifecycle ?? 'legacy'}, workerOnline=${state?.workerOnline ?? false}, `
+        + `generation=${closeFenceGeneration(ds)}, operation=${state?.activeOperationId ?? 'none'})`);
       return {
         ok: false,
-        error: 'remote_runner_worker_missing',
+        error: ds?.worker ? 'remote_runner_worker_not_ready' : 'remote_runner_worker_missing',
         retryable: true,
+        effect: 'not_dispatched',
       };
     }
   }
@@ -12135,7 +12208,10 @@ export function closeSession(sessionId: string, opts?: Parameters<typeof closeSe
   const pending = contractCloseInFlight.get(key); if (pending) return pending;
   const { operation } = controller.beginControl('close'); controller.controlStarted(operation.operationId);
   const work = controller.flushPrimary().then(() => closeSessionBody(sessionId, opts)).then(async result => {
-    controller.controlResult(operation.operationId, result.ok ? 'confirmed' : result.retryable ? 'uncertain' : 'rejected', undefined, result.ok ? undefined : result.error);
+    controller.controlResult(operation.operationId, result.ok ? 'confirmed'
+      : result.effect === 'not_dispatched' && operation.phase !== 'uncertain' ? 'failed_before_effect'
+      : result.effect === 'rejected' && operation.phase !== 'uncertain' ? 'rejected'
+      : result.effect === 'unknown' || result.recovery === 'uncertain' || result.retryable ? 'uncertain' : 'rejected', undefined, result.ok ? undefined : result.error);
     await controller.flushPrimary();
     return result;
   }, error => { controller.controlResult(operation.operationId, 'uncertain', undefined, String(error)); throw error; });
@@ -18600,6 +18676,11 @@ function forkWorkerPrepared(
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
     initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
+    const closeOperationId = remoteRunnerCloseWakeOperations.get(ds);
+    if (closeOperationId && initMsg.backendType === 'remote-runner' && !initMsg.prompt
+        && !initMsg.turnId && normalizeRemoteRunnerBackendState(initMsg.remoteBackendState)) {
+      initMsg.sessionCommand = { version: 2, operationId: closeOperationId };
+    }
     if (initMsg.turnId) initMsg.sessionCommand = { version: 2, execution: runtimeController.admitInput(initMsg.turnId, initMsg.dispatchAttempt) };
   }
   ds.initConfig = initMsg;
@@ -24349,10 +24430,15 @@ function setupWorkerHandlers(
           await sessionController.flushPrimary();
           const state = sessionController.store.read(sessionController.ref)!;
           if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
+          const closeControl = state.lifecycle === 'closing'
+            && ds.initConfig?.backendType === 'remote-runner' && !ds.initConfig.prompt
+            && !ds.initConfig.turnId && !!normalizeRemoteRunnerBackendState(ds.initConfig.remoteBackendState)
+            && !!msg.operationId && ds.initConfig.sessionCommand?.operationId === msg.operationId
+            && sessionController.operation(msg.operationId)?.kind === 'close';
           worker.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId,
             runtime: sessionController.store.binding(sessionController.ref, msg.bindingId)?.ref,
             mayStart: sessionController.bindingMayStart(msg.bindingId)
-              && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
+              && (closeControl || !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle))
               && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
