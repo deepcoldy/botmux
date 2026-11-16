@@ -13336,11 +13336,17 @@ export function startIpcServer(opts: {
     // server.close() only stops accepting: its callback waits for every already
     // accepted socket to finish. A request whose body we abandoned (the 413
     // early return resumes the request and answers without reading the rest)
-    // can leave such a socket behind — on Bun 1.4.4 that socket never finishes,
-    // so close() stays pending forever. That stalls a test awaiting close() and,
-    // via the daemon's teardown call, shutdown itself. Closing every connection
-    // before the listener makes shutdown bounded; listen-with-probe's release
-    // path tears sockets down for the same reason.
+    // can leave such a socket behind: on Bun 1.4.4, when the client is Bun's
+    // global fetch on a keep-alive connection, it stays open until the runtime
+    // reclaims it about 6 s later, and close() waits all that time (node:http
+    // clients, which every production loopback caller uses, do not leave it).
+    // Tests awaiting close() paid for that; the daemon's teardown does not await
+    // close() and exits explicitly, so shutdown itself was never held up.
+    // Closing every connection before the listener makes close() resolve at
+    // once. It also resets requests still in flight at that moment while their
+    // handlers run on — teardown callers already have to cope with that, since
+    // the daemon can exit mid-request. listen-with-probe's release path tears
+    // sockets down for the same reason.
     close: () => new Promise<void>(r => {
       server.closeAllConnections?.();
       server.close(() => r());

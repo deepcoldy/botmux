@@ -4642,12 +4642,12 @@ describe('PUT /api/bot-ask-option-layout — per-bot ask option layout', () => {
 describe('IPC server shutdown after an abandoned request body', () => {
   it('closes the listener even when a 413 left the rest of a body unread', async () => {
     // `readJsonBody` answers 413 from the declared content-length after resuming
-    // the request without reading it to the end. On Bun that leaves an accepted
-    // socket that never finishes, and server.close() only stops accepting — its
-    // callback waits for such sockets, so close() would never resolve (daemon
-    // teardown stalls; tests that await it hit their timeout). Repeat the round
-    // a few times because the wedge is timing dependent, and bound each close so
-    // a regression fails fast instead of hanging the suite.
+    // the request without reading it to the end. On Bun, with this fetch
+    // keep-alive client, that leaves an accepted socket open until the runtime
+    // reclaims it about 6 s later, and server.close() only stops accepting — its
+    // callback waits for such sockets, so close() sits out those seconds. Repeat
+    // the round a few times because the wedge is timing dependent, and bound each
+    // close well below that reclaim delay so a regression trips it with margin.
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-close-abandoned-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-close-abandoned-app';
@@ -4676,7 +4676,7 @@ describe('IPC server shutdown after an abandoned request body', () => {
         await oversized.text();
         const closed = await Promise.race([
           server.close().then(() => true),
-          new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5_000)),
+          new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2_000)),
         ]);
         expect(closed).toBe(true);
       }
