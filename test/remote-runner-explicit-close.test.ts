@@ -62,9 +62,9 @@ import {
   initWorkerPool,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
-import { spawn } from 'node:child_process';
 import type { DaemonToWorker } from '../src/types.js';
 import { controllerForSession } from '../src/core/session-controller.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 let dataDir: string;
@@ -216,7 +216,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       ...(operation ? { sessionCommand: { version: 2 as const, operationId: operation.operationId } } : {}),
     } satisfies DaemonToWorker;
     ds.initConfig = init;
-    const child = spawn('bun', [resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'), env: { ...process.env, SESSION_DATA_DIR: dataDir,
         BOTS_CONFIG: join(dataDir, 'bots.json'), BOTMUX_SESSION_ID: ds.session.sessionId,
         LARK_APP_ID: 'app', LARK_APP_SECRET: 'test' },
