@@ -52,12 +52,27 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
   let toolSinceText = false;
   const earlyUpdates: JsonObject[] = [];
   let runtime: { model?: string; reasoningEffort?: string } = {};
+  let announced: { model?: string; reasoningEffort?: string } | undefined;
+  /** The launch selection is applied after session/new|load returns that
+   * session's previous (or default) model; announcing before it would publish
+   * an identity this turn never runs on. */
+  let runtimeSettled = false;
+  /** set_model acknowledges with `{}`; its config_option_update follows in a
+   * later frame. Hold the identity until that native echo (or prompt output). */
+  let awaitingSelectionEcho = false;
   let modelNames = new Map<string, string>();
+  const announceRuntime = (): void => {
+    if (!runtimeSettled || awaitingSelectionEcho || (announced && announced.model === runtime.model && announced.reasoningEffort === runtime.reasoningEffort)) return;
+    announced = { ...runtime };
+    try { opts.onRuntime?.({ ...runtime }); } catch { /* metadata must not break execution */ }
+  };
   /** Only native current values (never requested launch defaults) establish
    * runtime identity. This callback is cosmetic and cannot abort a prompt. */
   const observeRuntime = (state: JsonObject): void => {
     const next = { ...runtime };
     const hasCurrentModel = object(state.models) && typeof state.models.currentModelId === 'string';
+    let baseModel: string | undefined;
+    if (object(state.models) || Array.isArray(state.configOptions)) awaitingSelectionEcho = false;
     if (object(state.models)) {
       if (Array.isArray(state.models.availableModels)) {
         modelNames = new Map(state.models.availableModels.filter(object).flatMap(model =>
@@ -71,15 +86,20 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
       for (const option of state.configOptions.filter(object)) {
         if (typeof option.currentValue !== 'string') continue;
         if (!hasCurrentModel && (option.category === 'model' || option.id === 'model')) {
-          next.model = modelNames.get(option.currentValue) || option.currentValue;
+          baseModel = option.currentValue;
         } else if (option.category === 'thought_level' || option.id === 'thought_level') {
           next.reasoningEffort = option.currentValue;
         }
       }
     }
-    if (next.model === runtime.model && next.reasoningEffort === runtime.reasoningEffort) return;
+    if (baseModel !== undefined) {
+      // set_model answers `{}` and the follow-up config_option_update carries
+      // only the base model; the catalogue IDs are `<base>-<thought_level>`.
+      next.model = (next.reasoningEffort ? modelNames.get(`${baseModel}-${next.reasoningEffort}`) : undefined)
+        || modelNames.get(baseModel) || baseModel;
+    }
     runtime = next;
-    try { opts.onRuntime?.({ ...runtime }); } catch { /* metadata must not break execution */ }
+    announceRuntime();
   };
   const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
 
@@ -138,6 +158,7 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
         return;
       }
       if (!prompting) return;
+      if (awaitingSelectionEcho) { awaitingSelectionEcho = false; announceRuntime(); }
       if (update.sessionUpdate === 'agent_message_chunk') {
         if (!object(update.content) || update.content.type !== 'text' || typeof update.content.text !== 'string') {
           throw new Error('Antigravity ACP invalid message');
@@ -210,6 +231,8 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
     let modelApplied = false;
     if (opts.model && object(control.models) && Array.isArray(control.models.availableModels)
       && control.models.availableModels.some(model => object(model) && model.modelId === opts.model)) {
+      // Armed before the request: the echo may share the acknowledgement's frame.
+      awaitingSelectionEcho = true;
       observeRuntime(await rpc('session/set_model', { sessionId, modelId: opts.model }));
       modelApplied = true;
     }
@@ -223,8 +246,12 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
       }
       observeRuntime(await rpc('session/set_config_option', { sessionId, configId: config.id, value: selected }));
     }
+    runtimeSettled = true;
+    announceRuntime();
     prompting = true;
     const result = await rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text: opts.content }] }, false);
+    awaitingSelectionEcho = false;
+    announceRuntime();
     if (result.stopReason !== 'end_turn') throw new Error(`Antigravity ACP turn stopped: ${String(result.stopReason)}`);
     return content;
   } finally {

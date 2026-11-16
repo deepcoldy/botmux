@@ -37,6 +37,15 @@ createInterface({ input: process.stdin }).on('line', line => {
       ].map(value => JSON.stringify(value)).join('\n') + '\n');
     } else send({ id: request.id, result: mode === 'wrong-load' ? { sessionId: 'foreign-session' } : configs });
   }
+  else if (request.method === 'session/set_model' && mode === 'agy-1.5.4') {
+    // Real agy 1.5.4: `{}` acknowledgement, then a base-model-only echo in a later frame.
+    configs.models.currentModelId = request.params.modelId;
+    const effort = configs.configOptions.find(option => option.id === 'effort');
+    effort.currentValue = request.params.modelId.split('-').at(-1);
+    send({ id: request.id, result: {} });
+    setImmediate(() => send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'config_option_update',
+      configOptions: configs.configOptions } } }));
+  }
   else if (['session/set_config_option', 'session/set_model'].includes(request.method)) {
     if (request.method === 'session/set_model') {
       configs.models.currentModelId = request.params.modelId;

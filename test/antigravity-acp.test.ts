@@ -66,6 +66,12 @@ describe('Antigravity ACP transport', () => {
     } }, new AbortController().signal)).resolves.toBe('中文 complete answer');
     expect(runtime.at(-1)).toEqual({ model: 'Gemini Test High', reasoningEffort: 'high' });
   });
+  it('announces only the selection this turn runs on when set_model echoes base-only options later', async () => {
+    const f = fixture('agy-1.5.4');
+    const runtime: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, model: 'gemini-test-high', onRuntime: value => runtime.push(value) }, new AbortController().signal);
+    expect(runtime).toEqual([{ model: 'Gemini Test High', reasoningEffort: 'high' }]);
+  });
   it('delivers long UTF-8 multi-line prompts intact and returns only the final answer', async () => {
     const f = fixture();
     const content = '<user_message>\n' + '中文 😀 line\n'.repeat(2_000) + '</user_message>';
