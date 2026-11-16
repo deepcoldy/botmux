@@ -264,6 +264,16 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
     } satisfies DaemonToWorker);
 
     const promptSubmitted = () => events().some(e => e.kind === 'submit' && e.text === FIRST_PROMPT);
+    // The fake's dialog delay starts at command submission, not worker spawn.
+    // A cold Node loader + first-prompt fallback can consume most of the
+    // notice budget before /effort even reaches the fake (observed on Bun CI).
+    // Give startup its own bounded handshake, then measure dialog/notice waits
+    // from the same event as the fake, without changing production timeouts.
+    await waitFor(
+      () => events().some(e => e.kind === 'submit' && e.text === '/effort max'),
+      60_000,
+      'the startup command submit',
+    );
     if (scenario.hook) {
       if (scenario.awaitDialogPending) {
         // F: the dialog only renders after the hold (dialogDelayMs=24s > 20s
