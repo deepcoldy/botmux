@@ -551,6 +551,24 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('keeps a close left applying by a daemon crash fenced when the retry fails before dispatch', async () => {
+    // The earlier daemon persisted the close as applying and died before any
+    // result: its cancel may already have reached the provider.
+    const first = canonicalFixture();
+    const { operation } = first.controller.beginControl('close');
+    first.controller.controlStarted(operation.operationId);
+    // Restart: a fresh DaemonSession over the same durable contract, no worker.
+    const ds = { ...first.ds, worker: null, remoteCloseState: undefined,
+      initConfig: { backendType: 'remote-runner' } } as unknown as DaemonSession;
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    const controller = controllerForSession(ds, true)!;
+    __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({ ok: false, effect: 'not_dispatched' });
+    expect(controller.store.read(controller.ref)?.lifecycle).toBe('closing');
+    expect(controller.operation(operation.operationId)?.phase).toBe('uncertain');
+    expect(controller.allowsInput()).toBe(false);
+  });
+
   it('uses an empty, non-deferred resume fork for the control-only wake', async () => {
     const { ds } = createFixture(false);
     const fork = vi.fn((

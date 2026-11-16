@@ -12206,11 +12206,15 @@ export function closeSession(sessionId: string, opts?: Parameters<typeof closeSe
   if (!controller || controller.store.read(controller.ref)!.lifecycle === 'closed') return closeSessionBody(sessionId, opts);
   const key = JSON.stringify(controller.ref);
   const pending = contractCloseInFlight.get(key); if (pending) return pending;
-  const { operation } = controller.beginControl('close'); controller.controlStarted(operation.operationId);
+  const { operation, joined } = controller.beginControl('close'); controller.controlStarted(operation.operationId);
+  // A joined close is an earlier attempt that never settled: `uncertain`, or
+  // still `applying` because the daemon died mid-close. Its cancel may have
+  // run, so this attempt's pre-dispatch failure cannot prove "no effect".
+  const freshAttempt = !joined;
   const work = controller.flushPrimary().then(() => closeSessionBody(sessionId, opts)).then(async result => {
     controller.controlResult(operation.operationId, result.ok ? 'confirmed'
-      : result.effect === 'not_dispatched' && operation.phase !== 'uncertain' ? 'failed_before_effect'
-      : result.effect === 'rejected' && operation.phase !== 'uncertain' ? 'rejected'
+      : result.effect === 'not_dispatched' && freshAttempt ? 'failed_before_effect'
+      : result.effect === 'rejected' && freshAttempt ? 'rejected'
       : result.effect === 'unknown' || result.recovery === 'uncertain' || result.retryable ? 'uncertain' : 'rejected', undefined, result.ok ? undefined : result.error);
     await controller.flushPrimary();
     return result;
