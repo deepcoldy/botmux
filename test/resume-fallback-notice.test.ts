@@ -127,6 +127,33 @@ describe('resume fallback delivery policy', () => {
     });
     expect(second.notice).toBeUndefined();
   });
+
+  // A silent scheduled / meeting-driven turn must never surface auxiliary Lark
+  // UI: the report stays structured. This is the gate the worker-pool wiring
+  // feeds from managedAuxUiSuppressed; the old default user_notify path broke
+  // out on it before sending.
+  it('an auxiliary-UI-suppressed turn posts no notice even with real history', () => {
+    const outcome = decideResumeFallbackReport({
+      tier: 'no-exact-id',
+      hasSessionHistory: true,
+      alreadyNotified: false,
+      auxUiSuppressed: true,
+    });
+    expect(outcome.notice).toBeUndefined();
+    expect(outcome.structured.suppressed).toBe('aux-ui-suppressed');
+  });
+
+  it('aux-ui suppression wins over every other gate and stays silent', () => {
+    const outcome = decideResumeFallbackReport({
+      tier: 'probe-missing',
+      hasSessionHistory: true,
+      alreadyNotified: false,
+      lost: false,
+      auxUiSuppressed: true,
+    });
+    expect(outcome.notice).toBeUndefined();
+    expect(outcome.structured.suppressed).toBe('aux-ui-suppressed');
+  });
 });
 
 /**
@@ -215,5 +242,37 @@ describe('handleResumeFallbackReport (daemon handler seam)', () => {
     });
     expect(result.delivered).toBe(false);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('a suppressed turn sends nothing AND keeps the latch for a later visible turn', async () => {
+    const ds = { hasHistory: true, session: { lastCliInput: 'go' }, resumeFreshFallbackNotified: undefined };
+    const send = vi.fn(async () => {});
+    const log = vi.fn();
+
+    const silent = await handleResumeFallbackReport({
+      ds,
+      report: { tier: 'no-exact-id', turnId: 'silent-turn' },
+      auxUiSuppressed: true,
+      send,
+      log,
+    });
+    expect(silent.delivered).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(log.mock.calls[0][0]).toContain('suppressed (aux-ui-suppressed)');
+    // Latch untouched: a silent run must not spend the one warning a human turn
+    // is entitled to.
+    expect(ds.resumeFreshFallbackNotified).toBeUndefined();
+
+    // The next demotion belongs to a normal, visible turn and still delivers.
+    const visible = await handleResumeFallbackReport({
+      ds,
+      report: { tier: 'no-exact-id', turnId: 'human-turn' },
+      auxUiSuppressed: false,
+      send,
+      log,
+    });
+    expect(visible.delivered).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ds.resumeFreshFallbackNotified).toBe(true);
   });
 });

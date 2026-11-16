@@ -22829,6 +22829,16 @@ function setupWorkerHandlers(
           // without booting a daemon. `/restart` refork means a worker-level
           // latch would re-post on every restart, and only the daemon can see
           // the persisted history evidence.
+          // Keep the same auxiliary-UI contract as every other user_notify:
+          // the lifecycle hook fires regardless, but a silent scheduled /
+          // meeting-driven / no-transport turn must never get a Lark message
+          // (and must not spend the one-notice latch a visible turn owns).
+          logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'user_notify',
+            message: msg.message,
+          });
+          const auxUiSuppressed = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
           await handleResumeFallbackReport({
             ds,
             report: {
@@ -22837,6 +22847,7 @@ function setupWorkerHandlers(
               turnId: msg.turnId,
               lost: msg.resumeLost,
             },
+            auxUiSuppressed,
             send: notice => sendTurnNotice(ds, {
               kind: 'user_notify',
               turnId: fallbackTurnId(ds, msg.turnId),

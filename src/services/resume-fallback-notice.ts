@@ -87,6 +87,11 @@ export interface ResumeFallbackDecisionInput extends ResumeFallbackReport {
   hasSessionHistory: boolean;
   /** This session already received its one and only notice. */
   alreadyNotified: boolean;
+  /** The owning turn is auxiliary-UI suppressed (a silent scheduled run, a
+   *  meeting-driven turn, a message-listener session, a no-transport bot). The
+   *  notice then stays in the log and the per-session latch is NOT spent, so a
+   *  later human-visible turn on the same session still gets its one warning. */
+  auxUiSuppressed?: boolean;
 }
 
 export interface ResumeFallbackOutcome {
@@ -95,7 +100,7 @@ export interface ResumeFallbackOutcome {
    *  user-visible notice was already spent. */
   structured: ResumeFallbackReport & {
     kind: 'resume_fallback';
-    suppressed?: 'no-history' | 'nothing-lost' | 'already-notified';
+    suppressed?: 'no-history' | 'nothing-lost' | 'already-notified' | 'aux-ui-suppressed';
     deliveryFailed?: true;
   };
   /** Notice text to post, or undefined when the report must stay in the log. */
@@ -108,6 +113,11 @@ export function decideResumeFallbackReport(input: ResumeFallbackDecisionInput): 
     ...(input.reason ? { reason: input.reason } : {}),
     ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
   };
+  // Transport policy first: a turn whose auxiliary UI is suppressed must never
+  // surface a Lark message, and must not spend the latch a visible turn owns.
+  if (input.auxUiSuppressed) {
+    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'aux-ui-suppressed' } };
+  }
   if (input.lost === false) {
     return { structured: { kind: 'resume_fallback', ...base, suppressed: 'nothing-lost' } };
   }
@@ -123,6 +133,9 @@ export function decideResumeFallbackReport(input: ResumeFallbackDecisionInput): 
 export interface ResumeFallbackHandlerInput {
   ds: ResumeFallbackSessionState;
   report: ResumeFallbackReport;
+  /** See {@link ResumeFallbackDecisionInput.auxUiSuppressed}. When true the
+   *  report is logged only, sends nothing, and does not spend the latch. */
+  auxUiSuppressed?: boolean;
   /** Deliver the one notice. A rejection releases the latch (retryable). */
   send: (notice: string) => Promise<void>;
   /** Structured record for every report, delivered or suppressed. */
@@ -144,11 +157,12 @@ export interface ResumeFallbackHandlerResult {
 export async function handleResumeFallbackReport(
   input: ResumeFallbackHandlerInput,
 ): Promise<ResumeFallbackHandlerResult> {
-  const { ds, report, send, log } = input;
+  const { ds, report, send, log, auxUiSuppressed } = input;
   const outcome = decideResumeFallbackReport({
     ...report,
     hasSessionHistory: sessionHasResumeHistory(ds),
     alreadyNotified: ds.resumeFreshFallbackNotified === true,
+    auxUiSuppressed,
   });
   const fact = `resume fallback → fresh (tier=${outcome.structured.tier}`
     + (outcome.structured.reason ? `, reason: ${outcome.structured.reason}` : '') + ')';
