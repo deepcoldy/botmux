@@ -2084,6 +2084,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2143,6 +2144,7 @@ export function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   return scheduleCardPatch(ds, cardJson);
 }
@@ -2372,6 +2374,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2460,6 +2463,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2548,6 +2552,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -4592,6 +4597,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -6356,6 +6362,7 @@ function reconcilePostedStartingCard(
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -6477,6 +6484,7 @@ async function postTurnStartingStatusCard(
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -6636,6 +6644,7 @@ export async function postFreshStreamingCard(
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -12021,6 +12030,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     false,
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
+    codexAppStopCardTarget(ds),
   );
 }
 
@@ -13918,6 +13928,64 @@ export function sendKimiCacheExpiryAutoCompactSetting(ds: DaemonSession, enabled
 export type ExactTurnInterruptResult =
   | { ok: true; operationId?: string; confirmation?: 'interrupt_delivered' }
   | { ok: false; operationId?: string; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
+
+type CodexAppInterruptStatus = Extract<WorkerToDaemon, { type: 'codex_app_interrupt_result' }>['status'];
+const pendingCodexAppInterrupts = new WeakMap<DaemonSession, {
+  target: string; worker: ChildProcess; result: Promise<CodexAppInterruptStatus>;
+}>();
+
+export function codexAppStopCardTarget(ds: DaemonSession): string | undefined {
+  const target = ds.codexAppInterruptTarget;
+  // A type-ahead card can already display the next input's title while the
+  // runner is still executing the predecessor. Only offer Stop for its turn.
+  const displayedTurnId = ds.streamCardPendingTurnId ?? currentStreamCardDisplayTarget(ds)?.turnId ?? ds.currentTurnId;
+  if (!target || (displayedTurnId && target.replyTurnId !== displayedTurnId)) return undefined;
+  return `${target.generation}:${target.turnEpoch}`;
+}
+
+/** The worker/runner both check the same captured target. Never redirect a
+ * delayed click or stop command to whatever turn starts next. */
+export function interruptCodexAppTurn(
+  ds: DaemonSession,
+  target = ds.codexAppInterruptTarget,
+): Promise<CodexAppInterruptStatus> {
+  const worker = ds.worker;
+  if (!worker || worker.killed || !target || target !== ds.codexAppInterruptTarget
+      || ds.session.status !== 'active' || isSessionTransferring(ds) || isSessionRestartInFlight(ds)) {
+    return Promise.resolve('stale_turn');
+  }
+  const key = `${target.generation}:${target.turnEpoch}`;
+  const pending = pendingCodexAppInterrupts.get(ds);
+  if (pending?.target === key && pending.worker === worker) return pending.result;
+  const requestId = randomUUID();
+  const result = new Promise<CodexAppInterruptStatus>(resolve => {
+    const finish = (status: CodexAppInterruptStatus): void => {
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      resolve(status);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type === 'codex_app_interrupt_result' && msg.requestId === requestId) {
+        finish(ds.worker === worker ? msg.status : 'delivery_failed');
+      }
+    };
+    const onExit = (): void => finish('delivery_failed');
+    const timer = setTimeout(onExit, 10_000);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    try {
+      worker.send({ type: 'codex_app_interrupt', requestId, generation: target.generation, turnEpoch: target.turnEpoch } satisfies DaemonToWorker);
+    } catch {
+      finish('delivery_failed');
+    }
+  }).finally(() => {
+    if (pendingCodexAppInterrupts.get(ds)?.result === result) pendingCodexAppInterrupts.delete(ds);
+  });
+  pendingCodexAppInterrupts.set(ds, { target: key, worker, result });
+  return result;
+}
 
 /** Native settings use their own receipt, without rotating business-turn state. */
 const pendingCodexCliEffort = new WeakSet<DaemonSession>();
@@ -18953,6 +19021,7 @@ function setupWorkerHandlers(
     throw new Error('worker generation reservation changed before IPC setup');
   }
   ds.taskContinuationRpcProof = undefined;
+  ds.codexAppInterruptTarget = undefined;
   // 新 Node worker 代次绑定即作废旧崩溃连胜：上一 worker 代次（OOM/管控死亡、
   // 或 killWorker/retire 后由任务续跑/用户消息拉起的替代进程）锚定的 readyAt
   // 不能连坐新一代——否则新 CLI 在旧 readyAt 的 60s 窗口内第一次永久退出
@@ -19578,6 +19647,23 @@ function setupWorkerHandlers(
                 settlement.seq,
               );
               if (!committed.ok) return false;
+              if (msg.codexAppCancelled && preview.settledEntry.deliverySink === 'http_async') {
+                try {
+                  const interruptedAt = settlement.completedAtMs ?? Date.now();
+                  const recorded = asyncTriggerStore.recordInterruptedStrict(
+                    ds.session.sessionId, msg.turnId, interruptedAt, ds.larkAppId);
+                  const live = ds.asyncTriggerResults?.get(msg.turnId);
+                  if (recorded === 'already_completed') ds.asyncTriggerResults?.delete(msg.turnId);
+                  else if (live && live.status !== 'completed') {
+                    live.status = 'interrupted';
+                    live.interruptedAt = interruptedAt;
+                  }
+                  ds.idempotentAsyncTurns?.delete(msg.turnId);
+                } catch (err) {
+                  logger.error(`[${t}] Failed to persist Codex App interruption: ${String(err)}`);
+                  return false;
+                }
+              }
               if (msg.dispatchAttempt !== undefined) {
                 try {
                   // Durable receivers must not depend on the worker surviving
@@ -19639,7 +19725,7 @@ function setupWorkerHandlers(
             // AFTER the durable FIFO commit so a parked/resolved member can
             // never disagree with the ledger.
             const settledSink = preview.settledEntry.deliverySink;
-            if (msg.disposition === 'steer_superseded'
+            if (msg.disposition === 'steer_superseded' && !msg.codexAppCancelled
               && (settledSink === 'http_async' || settledSink === 'http_wait')) {
               parkSteerFanoutMember(
                 ds,
@@ -19647,7 +19733,7 @@ function setupWorkerHandlers(
                 { turnId: msg.turnId, sink: settledSink },
                 preview.ledger[0]?.turnId,
               );
-            } else if (msg.disposition !== 'steer_superseded') {
+            } else if (msg.disposition !== 'steer_superseded' && !msg.codexAppCancelled) {
               fanOutSteerGroupFinal(ds, settlement.generation, msg.content, Date.now(), msg);
             }
           }
@@ -19853,6 +19939,13 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'codex_app_interrupt_target': {
+        if (!isCodexAppCliId(effectiveCliId)) break;
+        const previous = codexAppStopCardTarget(ds);
+        ds.codexAppInterruptTarget = msg.target;
+        if (codexAppStopCardTarget(ds) !== previous) scheduleActiveRuntimePatch(ds);
+        break;
+      }
       case 'link_ref_register': {
         const runtime = getLinkRefRuntime();
         const result = runtime
@@ -20539,6 +20632,7 @@ function setupWorkerHandlers(
               false,
               substituteCardControlFor(ds),
               ds.keysPanelOpen === true,
+              codexAppStopCardTarget(ds),
             );
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             await updateMessage(restoredAppId, restoredCardId, streamCardJson, { beforeWrite: () => {
@@ -20670,6 +20764,7 @@ function setupWorkerHandlers(
             false,
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
+            codexAppStopCardTarget(ds),
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             restoreFreshReadyPrePostIdentityForRetirement();
@@ -21655,6 +21750,7 @@ function setupWorkerHandlers(
             false,
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
+            codexAppStopCardTarget(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -21792,6 +21888,7 @@ function setupWorkerHandlers(
             false,
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
+            codexAppStopCardTarget(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -21921,6 +22018,7 @@ function setupWorkerHandlers(
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         scheduleCardPatch(ds, cardJson, msg.turnId);
         break;
@@ -22428,6 +22526,7 @@ function setupWorkerHandlers(
               false,
               substituteCardControlFor(ds),
               ds.keysPanelOpen === true,
+              codexAppStopCardTarget(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -22540,6 +22639,7 @@ function setupWorkerHandlers(
               false,
               substituteCardControlFor(ds),
               ds.keysPanelOpen === true,
+              codexAppStopCardTarget(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -24617,6 +24717,7 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    if (ds.worker === worker) ds.codexAppInterruptTarget = undefined;
     if (sessionController && contractWorker) { try { sessionController.workerLost(contractWorker); } catch (error) { logger.warn(`[${t}] Worker loss contract not persisted: ${String(error)}`); } }
     clearInterval(cliNoticeTimer);
     if (ownsLifecycleMutation()) {

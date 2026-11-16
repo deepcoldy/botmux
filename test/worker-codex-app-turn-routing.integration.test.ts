@@ -1432,6 +1432,73 @@ describe('Codex App worker replacement durable handoff', () => {
   }, 45_000);
 });
 
+describe('Codex App worker native stop', () => {
+  it('settles the exact interrupted dispatch and accepts another turn on the same thread', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-interrupt-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const sessionId = replacementSessionId('interrupt');
+    tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'operator-interrupt', logs, messages,
+      (message, child) => {
+        const requestId = message.type === 'codex_app_dispatch_transition' ? message.requestId
+          : message.type === 'final_output' ? message.codexAppSettlement?.requestId : undefined;
+        if (requestId) child.send({ type: 'codex_app_dispatch_persisted', requestId, ok: true } satisfies DaemonToWorker);
+      }, { BOTMUX_TEST_CODEX_APP_RUNNER_PATH: resolve('src/codex-app-runner.ts') });
+    const target = (turnId: string) => messages.find(
+      message => message.type === 'codex_app_interrupt_target' && message.target?.replyTurnId === turnId,
+    ) as Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }> | undefined;
+    const stop = (requestId: string, turnId: string) => {
+      const { generation, turnEpoch } = target(turnId)!.target!;
+      worker.send({ type: 'codex_app_interrupt', requestId, generation, turnEpoch } satisfies DaemonToWorker);
+    };
+    worker.send(replacementInit(sessionId, fakeCodex, 'first task', {
+      backendType: 'pty',
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: 'operator-interrupt' },
+      turnId: 'om_first', codexAppDispatchId: 'dispatch-first',
+      promptCodexAppInput: { text: 'first task', clientUserMessageId: 'om_first' },
+    }));
+    await waitFor(worker, logs, () => !!target('om_first'));
+    stop('first', 'om_first');
+    await waitFor(worker, logs, () => messages.some(
+      message => message.type === 'turn_terminal' && message.turnId === 'om_first' && message.status === 'cancelled',
+    ));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'codex_app_interrupt_result', requestId: 'first', status: 'delivered',
+    }));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'final_output', turnId: 'om_first', content: '', codexAppCancelled: true, suppressDelivery: true,
+      codexAppSettlement: expect.objectContaining({ dispatchId: 'dispatch-first' }),
+    }));
+    worker.send({
+      type: 'message', content: 'next task', turnId: 'om_next', codexAppDispatchId: 'dispatch-next',
+      codexAppInput: { text: 'next task', clientUserMessageId: 'om_next' },
+    } satisfies DaemonToWorker);
+    await waitFor(worker, logs, () => !!target('om_next'));
+    stop('old-card', 'om_first');
+    await waitFor(worker, logs, () => messages.some(
+      message => message.type === 'codex_app_interrupt_result' && message.requestId === 'old-card',
+    ));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'codex_app_interrupt_result', requestId: 'old-card', status: 'stale_turn',
+    }));
+    stop('next', 'om_next');
+    await waitFor(worker, logs, () => messages.some(
+      message => message.type === 'turn_terminal' && message.turnId === 'om_next' && message.status === 'cancelled',
+    ));
+    expect(readRequests(requestLog).filter(request => request.method === 'turn/interrupt').map(request => request.params)).toEqual([
+      { threadId: 'thread-fake', turnId: 'turn-fake-1' },
+      { threadId: 'thread-fake', turnId: 'turn-fake-2' },
+    ]);
+    expect(worker.exitCode).toBeNull();
+  }, 45_000);
+});
+
 describe('Codex App worker live effort', () => {
   it.each([
     ['effort-complete', 'applied', undefined],
