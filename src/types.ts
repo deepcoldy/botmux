@@ -2651,6 +2651,8 @@ export type WorkerToDaemonBase =
     signal: string | null;
     logTail?: string;
     canParkDiagnostic?: boolean;
+    /** Presentation-only evidence that this TraeX generation never reached a prompt. */
+    traexStartupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */

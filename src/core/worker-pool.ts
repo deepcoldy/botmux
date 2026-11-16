@@ -228,7 +228,8 @@ import {
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
-import { buildReplyConsoleUrl } from './dashboard-url.js';
+import { buildDashboardUrl, buildReplyConsoleUrl } from './dashboard-url.js';
+import { fixedTraexUnavailableModelNotice } from '../services/traex-model-unavailable-notice.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
@@ -22563,9 +22564,22 @@ function setupWorkerHandlers(
           const cliName = sessionCliDisplayName(ds, botCfg);
           // 卡片文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃
           // 可能相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
-          const parts = [decision.reason === 'permanent_exit'
+          const unavailableNotice = fixedTraexUnavailableModelNotice({
+            cliId: effectiveCliId,
+            autoModelEnabled: ds.initConfig
+              ? ds.initConfig.traexAutoModel?.enabled === true : botCfg.traexAutoModel?.enabled === true,
+            selectedModel: ds.initConfig?.model ?? botCfg.model,
+            exitCode: msg.code,
+            startupFailure: msg.traexStartupFailure,
+            logTail: msg.logTail ?? stderrRing.render({ maxLines: 10, maxChars: 1500 }),
+            consoleUrl: () => buildReplyConsoleUrl() ?? buildDashboardUrl({
+              host: config.dashboard.externalHost, port: config.dashboard.port,
+            }),
+            locale: loc,
+          });
+          const parts = [unavailableNotice ?? (decision.reason === 'permanent_exit'
             ? tr('worker.crash_permanent_exit_stopped', { cliName, code: msg.code ?? '?' }, loc)
-            : tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
+            : tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc))];
           if (keepDiagnosticWorker) {
             parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
           }
