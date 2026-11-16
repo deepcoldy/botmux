@@ -13,6 +13,7 @@ function coldStartPreflight(controller: TraexAutoModelController, loads = new Ma
     workingDir: '/tmp', model: 'core' };
   const scope: Record<string, any> = {
     traexAutoModelController: controller,
+    lastInitConfig: cfg,
     cliSpawnGeneration: 1, CliSpawnSupersededError,
     traexAutoModelRuntimeEligible: () => true,
     traexAutoModelPreflightEnabled,

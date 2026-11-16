@@ -791,6 +791,9 @@ import {
   readTraexModelLoadSnapshot,
   type TraexModelLoadSnapshot,
 } from './services/traex-model-load.js';
+import { readTraexCatalogWithRetry } from './services/traex-model-catalog-retry.js';
+import { traexAutoModelPolicyKey } from './services/traex-auto-model.js';
+import type { TraexModelPoolPruneResult } from './services/traex-model-pool-prune.js';
 import { readTraexModelQuotas, TRAEX_QUOTA_ERROR_CODE } from './services/traex-quota.js';
 import { TRAEX_MODEL_ACCESS_ERROR_CODE } from './services/traex-model-access.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
@@ -6164,6 +6167,71 @@ function rememberTraexModelLoadSnapshot(snapshot: TraexModelLoadSnapshot | null)
   traexAutoModelReasoningEfforts = new Map(snapshot.reasoningEfforts);
 }
 
+const pendingTraexModelPoolPrunes = new Map<string, {
+  resolve: (result: TraexModelPoolPruneResult) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}>();
+let traexCatalogReadInFlight: { generation: number; abort: AbortController; promise: Promise<TraexModelLoadSnapshot | null> } | undefined;
+let traexCatalogRetryPending: { controller: TraexAutoModelController; generation: number; turnId?: string } | undefined;
+
+async function reconcileTraexModelCatalog(
+  snapshot: TraexModelLoadSnapshot | null,
+  controller: TraexAutoModelController,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  isCurrent: () => boolean,
+  turnId?: string,
+): Promise<boolean> {
+  const available = snapshot?.catalogModels;
+  if (!isCurrent()) return false;
+  if (!available?.size) return true;
+  if (controller.config.models.every(model => available.has(model.toLowerCase()))) {
+    controller.observeModelCatalog(available);
+    return true;
+  }
+  const requestId = randomUUID();
+  const result = await new Promise<TraexModelPoolPruneResult>(resolve => {
+    const timeout = setTimeout(() => {
+      pendingTraexModelPoolPrunes.delete(requestId);
+      resolve({ status: 'failed', removedModels: [] });
+    }, 20_000);
+    pendingTraexModelPoolPrunes.set(requestId, { resolve, timeout });
+    process.send?.({
+      type: 'traex_model_pool_prune', requestId,
+      expectedPolicyKey: traexAutoModelPolicyKey(cfg.traexAutoModel ?? controller.config),
+      availableModels: [...available], ...(turnId ? { turnId } : {}),
+    } satisfies WorkerToDaemon);
+  });
+  if (!isCurrent()) return false;
+  // CAS rejection means the account or user policy changed during the notice.
+  // Do not label an old controller with the new policy, or use the old catalog
+  // for another selection. The next initialized flow owns the manual change.
+  if (result.status === 'superseded') return false;
+  if (result.config && result.status !== 'failed') {
+    controller.observeModelCatalog(available);
+    const removed = controller.config.models.filter(model =>
+      !result.config!.models.some(next => next.toLowerCase() === model.toLowerCase()));
+    controller.markCatalogPruned(removed, result.config);
+    cfg.traexAutoModel = result.config;
+    if (lastInitConfig) lastInitConfig.traexAutoModel = result.config;
+    if (result.config.models.length === 0) {
+      if (turnId) {
+        controller.requestRecoveryStop(turnId);
+        controller.catalogQueryFailed(turnId);
+      }
+      send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
+        message: t('worker.traex_auto_model.catalog_empty') });
+      return false;
+    }
+  }
+  if (result.status === 'failed') {
+    if (turnId) controller.catalogQueryFailed(turnId);
+    send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
+      message: t('worker.traex_auto_model.catalog_persist_failed') });
+    return false;
+  }
+  return true;
+}
+
 function applyTraexAutoModelSettings(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   controller: TraexAutoModelController,
@@ -6266,6 +6334,9 @@ function configureTraexAutoModel(
     && !cfg.existingAppServerEndpoint
     && !cfg.wrapperCli
     && !cfg.cliLaunchMode;
+  if (managedAuto && cfg.traexAutoModel?.models.length === 0) {
+    throw new Error(t('worker.traex_auto_model.catalog_empty'));
+  }
   // Older daemons may send the stored RPC preference rather than the launch
   // mode. Auto owns this managed terminal; normalize before any RPC startup.
   if (managedAuto) {
@@ -6304,30 +6375,69 @@ async function preflightTraexAutoModelBeforeSpawn(
 ): Promise<void> {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()
-    || !traexAutoModelPreflightEnabled(controller.config)
-    || !cfg.prompt || !cfg.turnId
     || options.willReattachPersistent
-    || options.restartCause === 'traex-auto-model'
     || !cliAdapter) return;
 
   const startedAtMs = Date.now();
   let snapshot: TraexModelLoadSnapshot | null = null;
+  const ownerTurnId = cfg.turnId ?? controller.currentTurnId();
+  const current = () => options.spawnGeneration === cliSpawnGeneration && controller === traexAutoModelController
+    && (!ownerTurnId || !controller.recoveryStopped(ownerTurnId))
+    && (controller.currentTurnId() === ownerTurnId || (ownerTurnId !== undefined && controller.currentTurnId() === undefined));
+  const read = () => currentTraexLoadSnapshot(
+    controller.config.preflightTimeoutMs ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS, cfg,
+  );
   try {
-    snapshot = await readTraexModelLoadSnapshot({
-      cliBin: cliAdapter.resolvedBin,
-      cwd: cfg.workingDir,
-      timeoutMs: controller.config.preflightTimeoutMs
-        ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
-      env: {
-        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
-        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
-      },
-    });
+    snapshot = await read();
   } catch (error) {
     log(`TraeX preflight load query failed before spawn: ${String(error)}`);
   }
   if (options.spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+  if (!snapshot) {
+    // Catalog IO is not permission to delete or replace the selected model.
+    // Preserve the existing fail-open launch; retry only while startup/input
+    // is still unresolved, and never interrupt a model that began working.
+    const stillNeeded = () => current()
+      && (!backend || controller.awaitingModelActivity() || controller.capacityCurrentlyBlocking());
+    const token = { controller, generation: options.spawnGeneration, turnId: ownerTurnId };
+    traexCatalogRetryPending = token;
+    send({ type: 'user_notify', ...(cfg.turnId ? { turnId: cfg.turnId } : {}),
+      message: t('worker.traex_auto_model.catalog_query_retry') });
+    void readTraexCatalogWithRetry({ read, isCurrent: stillNeeded, firstReadFailed: true })
+      .then(async result => {
+        if (!stillNeeded()) return;
+        if (result) {
+          if (!await reconcileTraexModelCatalog(result, controller, cfg, stillNeeded, ownerTurnId)) return;
+          rememberTraexModelLoadSnapshot(result);
+          if (ownerTurnId && controller.capacityCurrentlyBlocking()) {
+            const choice = controller.resolveModelLoads(ownerTurnId, result.loads);
+            if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
+          }
+        } else {
+          if (ownerTurnId) controller.catalogQueryFailed(ownerTurnId);
+          send({ type: 'user_notify', ...(ownerTurnId ? { turnId: ownerTurnId } : {}),
+            message: t('worker.traex_auto_model.catalog_query_failed') });
+        }
+      }).catch(error => log(`TraeX deferred catalog cleanup failed: ${String(error)}`))
+      .finally(() => {
+        if (traexCatalogRetryPending === token) traexCatalogRetryPending = undefined;
+        if (ownerTurnId && controller === traexAutoModelController) controller.resolveModelLoads(ownerTurnId, null);
+      });
+    return;
+  }
+  if (!await reconcileTraexModelCatalog(snapshot, controller, cfg, current, cfg.turnId)) {
+    if (cfg.traexAutoModel?.catalogUnavailable) throw new Error(t('worker.traex_auto_model.catalog_empty'));
+    throw new CliSpawnSupersededError();
+  }
   rememberTraexModelLoadSnapshot(snapshot);
+  const catalogChoice = controller.catalogAdmissionDecision(cfg.turnId ?? `catalog-${options.spawnGeneration}`);
+  if (catalogChoice.kind === 'exhausted') throw new Error(t('worker.traex_auto_model.catalog_empty'));
+  if (catalogChoice.kind === 'switch') {
+    controller.commitSwitch(catalogChoice);
+    applyTraexAutoModelSettings(cfg, controller, controller.currentModel());
+  }
+  if (!cfg.prompt || !cfg.turnId || !traexAutoModelPreflightEnabled(controller.config)
+    || options.restartCause === 'traex-auto-model') return;
   const decision = controller.preflightDecision(cfg.turnId, snapshot?.loads ?? null, {
     preferFirstModel: controller.config.reselectPerTurn === true,
   });
@@ -6501,6 +6611,8 @@ function executeTraexAutoModelSwitch(
     message: t(
       action.reason === 'quota_exhausted'
         ? 'worker.traex_auto_model.quota_switch'
+        : action.reason === 'catalog_unavailable'
+          ? 'worker.traex_auto_model.catalog_switch'
         : action.reason === 'new_turn' && traexAutoModelController.config.trigger === 'quota'
           ? 'worker.traex_auto_model.quota_preference'
         : action.reason === 'preflight_available'
@@ -6584,17 +6696,20 @@ function observeTraexAutoModelCapacity(screen: string): void {
     void flushPending();
   }
   if (action.kind === 'load_check') {
+    if (traexCatalogRetryPending?.controller === controller
+      && traexCatalogRetryPending.generation === cliSpawnGeneration
+      && traexCatalogRetryPending.turnId === action.turnId) return;
     const target = backend;
     const generation = cliSpawnGeneration;
     const config = lastInitConfig;
-    void readTraexModelLoadSnapshot({
-      cliBin: cliAdapter!.resolvedBin,
-      cwd: config.workingDir,
-      env: {
-        ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
-        ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
-      },
-    }).then(snapshot => {
+    const current = () => backend === target && generation === cliSpawnGeneration
+      && controller === traexAutoModelController && !cliRestartInProgress
+      && activeTurnAuthority.snapshot()?.turnId === action.turnId
+      && !controller.recoveryStopped(action.turnId) && controller.capacityCurrentlyBlocking();
+    void readTraexCatalogWithRetry({
+      isCurrent: current,
+      read: () => currentTraexLoadSnapshot(TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS, config),
+    }).then(async snapshot => {
       const active = activeTurnAuthority.snapshot();
       if (backend !== target || generation !== cliSpawnGeneration
         || controller !== traexAutoModelController || cliRestartInProgress
@@ -6607,6 +6722,13 @@ function observeTraexAutoModelCapacity(screen: string): void {
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
       }
+      if (!snapshot) {
+        controller.catalogQueryFailed(action.turnId);
+        send({ type: 'user_notify', turnId: action.turnId,
+          message: t('worker.traex_auto_model.catalog_query_failed') });
+        return;
+      }
+      if (!await reconcileTraexModelCatalog(snapshot, controller, config, current, action.turnId)) return;
       rememberTraexModelLoadSnapshot(snapshot);
       const choice = controller.resolveModelLoads(action.turnId, snapshot?.loads ?? null);
       if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
@@ -6644,18 +6766,27 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
 }
 
-function currentTraexLoadSnapshot(timeoutMs: number): Promise<TraexModelLoadSnapshot | null> {
+function currentTraexLoadSnapshot(timeoutMs: number, cfg = lastInitConfig): Promise<TraexModelLoadSnapshot | null> {
   if (!cliAdapter || !lastInitConfig) return Promise.resolve(null);
-  const config = lastInitConfig;
-  return readTraexModelLoadSnapshot({
+  if (traexCatalogReadInFlight?.generation === cliSpawnGeneration) return traexCatalogReadInFlight.promise;
+  traexCatalogReadInFlight?.abort.abort();
+  const config = cfg!;
+  const abort = new AbortController();
+  const token = { generation: cliSpawnGeneration, abort, promise: readTraexModelLoadSnapshot({
     cliBin: cliAdapter.resolvedBin,
     cwd: config.workingDir,
     timeoutMs,
+    signal: abort.signal,
     env: {
       ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
       ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
     },
-  });
+  }) };
+  traexCatalogReadInFlight = token;
+  void token.promise.finally(() => {
+    if (traexCatalogReadInFlight === token) traexCatalogReadInFlight = undefined;
+  }).catch(() => {});
+  return token.promise;
 }
 
 function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
@@ -6669,18 +6800,32 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
       log(`TraeX preflight load query failed before idle turn: ${String(error)}`);
       return null;
     })
-    .then(snapshot => {
+    .then(async snapshot => {
       if (traexAutoModelPreflightPending !== token) return;
-      traexAutoModelPreflightPending = undefined;
       if (controller !== traexAutoModelController
         || token.generation !== cliSpawnGeneration
         || pendingMessages[0] !== head
         || !isPromptReady
         || cliRestartInProgress
         || activeTurnAuthority.snapshot()?.started) {
+        traexAutoModelPreflightPending = undefined;
         void flushPending();
         return;
       }
+      const current = () => traexAutoModelPreflightPending === token
+        && controller === traexAutoModelController && token.generation === cliSpawnGeneration
+        && pendingMessages[0] === head && isPromptReady && !cliRestartInProgress
+        && !activeTurnAuthority.snapshot()?.started;
+      if (!await reconcileTraexModelCatalog(snapshot, controller, lastInitConfig!, current, head.turnId)) {
+        if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
+        return;
+      }
+      if (!current()) {
+        if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
+        void flushPending();
+        return;
+      }
+      traexAutoModelPreflightPending = undefined;
       rememberTraexModelLoadSnapshot(snapshot);
       const decision = controller.preflightDecision(head.turnId!, snapshot?.loads ?? null, {
         preferFirstModel: controller.config.reselectPerTurn === true,
@@ -6699,6 +6844,9 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
       // A switch decision reaching here was refused; the model did not change.
       if (decision.kind !== 'switch') notifyTraexPreflightDecision(decision, head.turnId, head.dispatchAttempt);
       void flushPending();
+    }).catch(error => {
+      if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
+      log(`TraeX idle catalog reconciliation failed: ${String(error)}`);
     });
   return true;
 }
@@ -6708,6 +6856,12 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
 function resetTraexAutoModelBeforePendingTurn(): boolean {
   const controller = traexAutoModelController;
   const head = pendingMessages[0];
+  if (head && lastInitConfig?.traexAutoModel?.catalogUnavailable) {
+    if (!head.traexAutoModelPreflightDone) send({ type: 'user_notify', turnId: head.turnId,
+      message: t('worker.traex_auto_model.catalog_empty') });
+    head.traexAutoModelPreflightDone = true;
+    return true;
+  }
   if (!controller || !traexAutoModelRuntimeEligible() || !head?.turnId
     || head.traexAutoModelRecovery || head.noReplay === true
     || controller.currentTurnId() === head.turnId) return false;
@@ -35675,6 +35829,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'traex_model_pool_prune_result': {
+      const pending = pendingTraexModelPoolPrunes.get(msg.requestId);
+      if (!pending) break;
+      pendingTraexModelPoolPrunes.delete(msg.requestId);
+      clearTimeout(pending.timeout);
+      pending.resolve(msg.result);
+      break;
+    }
     case 'protected_mcp_secret_channel_result': {
       const pending = pendingProtectedSecretChannels.get(msg.requestId);
       if (!pending) {

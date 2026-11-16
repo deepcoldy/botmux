@@ -229,6 +229,7 @@ import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-confi
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
 import { buildReplyConsoleUrl } from './dashboard-url.js';
+import { pruneSavedTraexModelPool, traexCatalogConfigKey } from '../services/traex-model-pool-prune.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
@@ -19214,6 +19215,7 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  const traexCatalogContextKey = traexCatalogConfigKey(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   ensureReadonlyTaskContinuationAttached(ds, botCfg);
   resumeTurnNotices(ds);
@@ -19835,6 +19837,42 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'traex_model_pool_prune': {
+        const current = () => ownsWorkerSession()
+          && ds.workerGeneration === workerGeneration && effectiveCliId === 'traex'
+          && !ds.initConfig?.adoptMode && !ds.initConfig?.wrapperCli
+          && !ds.initConfig?.existingAppServerEndpoint && !isRemoteBackendSession(ds)
+          && (!msg.turnId || ds.currentTurnId === undefined || ds.currentTurnId === msg.turnId)
+          && (!msg.turnId || !sessionController
+            || !sessionController.store.executions(sessionController.ref, msg.turnId).some(execution =>
+              ['succeeded', 'failed', 'cancelled'].includes(execution.phase)));
+        let result: import('../services/traex-model-pool-prune.js').TraexModelPoolPruneResult;
+        try {
+          result = await pruneSavedTraexModelPool({
+            larkAppId: ds.larkAppId, expectedPolicyKey: msg.expectedPolicyKey,
+            expectedContextKey: traexCatalogContextKey,
+            availableModels: msg.availableModels, isCurrent: current,
+            notify: async models => {
+              await scopedReply(tr('worker.traex_auto_model.catalog_prune', {
+                models: models.join(', '),
+              }, loc), 'text', msg.turnId, { beforeWrite: () => {
+                if (!current()) throw new Error('TraeX model cleanup was superseded');
+              } });
+            },
+          });
+          if (result.config && result.status === 'applied' && current()) {
+            getBot(ds.larkAppId).config.traexAutoModel = result.config;
+            if (ds.initConfig) ds.initConfig.traexAutoModel = result.config;
+          }
+        } catch (error) {
+          logger.warn(`[${t}] TraeX model-pool cleanup failed: ${String(error)}`);
+          result = { status: 'failed', removedModels: [] };
+        }
+        if (current() && worker.connected) worker.send({
+          type: 'traex_model_pool_prune_result', requestId: msg.requestId, result,
+        } satisfies DaemonToWorker);
+        break;
+      }
       case 'link_ref_register': {
         const runtime = getLinkRefRuntime();
         const result = runtime
@@ -24340,6 +24378,10 @@ function setupWorkerHandlers(
   };
   const handleWorkerMessage = async (msg: WorkerToDaemon): Promise<void> => {
     if (!sessionController || !contractWorker || msg.type === 'worker_ipc_ready') return handleLegacyWorkerMessage(msg);
+    // Catalog maintenance precedes native spawn, so it cannot require an
+    // executor binding. The private child channel, current worker generation,
+    // account/config fingerprint and locked policy CAS authorize it instead.
+    if (msg.type === 'traex_model_pool_prune') return handleLegacyWorkerMessage(msg);
     // V1 recovery authenticates its frozen offer/token in the existing host
     // store. It cannot acquire executor control from a new worker envelope.
     if (msg.type === 'final_output_offer') return handleLegacyWorkerMessage(msg);

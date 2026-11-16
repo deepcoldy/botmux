@@ -653,7 +653,7 @@ describe('Auto live follow-up input policy', () => {
       expect(h.scope.pendingMessages).toEqual([h.item]);
       process.env.PATH = originalPath;
       repaint('◆ Working… (3s • esc to interrupt)');
-      expect(await h.admit()).toBe(true);
+      await vi.waitFor(async () => expect(await h.admit()).toBe(true));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
@@ -1085,7 +1085,7 @@ describe('Worker read-only capacity query', () => {
     expect(options.env).not.toHaveProperty('HTTP_PROXY');
     expect(options.env).not.toHaveProperty('API_TOKEN');
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(expect.objectContaining({ toModel: 'backup' }), { resumeCurrentTurn: true });
   });
   it.each([
@@ -1094,7 +1094,7 @@ describe('Worker read-only capacity query', () => {
   ])('ignores a completed query after the input boundary changed (%j)', async changed => {
     const h = query(); Object.assign(h.scope, changed);
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
   });
   it.each([
@@ -1105,7 +1105,7 @@ describe('Worker read-only capacity query', () => {
     const previous = Object.fromEntries(Object.keys(changed).map(key => [key, h.scope[key]]));
     Object.assign(h.scope, changed);
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     Object.assign(h.scope, previous);
     vi.useFakeTimers();
@@ -1126,7 +1126,7 @@ describe('Worker read-only capacity query', () => {
     h.observe('working');
     h.scope.isFlushing = true;
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     h.scope.isFlushing = false;
     vi.useFakeTimers();
@@ -1135,7 +1135,7 @@ describe('Worker read-only capacity query', () => {
       expect(h.read).toHaveBeenCalledOnce();
       vi.setSystemTime(15_000); h.observe('queue');
       expect(h.read).toHaveBeenCalledTimes(2);
-      await Promise.resolve(); await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
       expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
         expect.objectContaining({ turnId: 'turn', toModel: 'backup' }),
         { resumeCurrentTurn: true },

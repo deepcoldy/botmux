@@ -26,6 +26,8 @@ import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
 import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
 import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
+import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
@@ -93,6 +95,16 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
     if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
+    if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;
+    if (key === 'traexAutoModelPolicyKey') return traexAutoModelPolicyKey;
+    if (key === 'reconcileTraexModelCatalog') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
+    if (key === 'currentTraexLoadSnapshot') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (typeof key === 'string' && ['readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
