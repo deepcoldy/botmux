@@ -213,6 +213,8 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /** A launch argument contains private input; suppress argv in diagnostics. */
+  redactArgs?: boolean;
   /**
    * Inherited variables the session env overlay removes (core/session-env.ts).
    * The worker already deleted them from `env`; the shell-wrapped backends

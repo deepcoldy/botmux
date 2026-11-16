@@ -1171,6 +1171,7 @@ describe('Auto input and shared-setting continuity', () => {
     const h = harness({ isPromptReady: false });
     Object.assign(h.scope, {
       backend: {}, commandLineWritesPending: 0, pendingRawInputs: [],
+      traexStartupInputHeld: loadWorkerFunction('traexStartupInputHeld', h.scope),
       sendRawCommandLineWithRecoveryFence: vi.fn(async (_target, _content, beforeWrite) => beforeWrite()),
       applyMojoLivePatch: vi.fn(), renderer: { markNewTurn: vi.fn() },
       usageLimitTracker: { beginTurn: vi.fn() }, currentUsageLimitSnapshot: () => ({}), tmuxScrolledHalfPages: 0,

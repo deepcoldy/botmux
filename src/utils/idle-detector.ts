@@ -607,6 +607,15 @@ export class IdleDetector {
     return this.programStatusErrorMsg;
   }
 
+  /** An exact submission receipt from this live CLI proves initialization,
+   * without publishing an idle edge or erasing a busy/blocked program state. */
+  confirmStartupFromSubmission(): void {
+    // Native argv delivery skips the ordinary write-cycle reset. Adopt the
+    // latest busy/blocked report before queued type-ahead can be considered.
+    if (!this.inputCycleStarted) this.reset({ inputCycle: true });
+    this.markStartupComplete();
+  }
+
   /** External idle source — lets transcript-driven detectors (Claude jsonl
    *  Stop, Codex rollout assistant_final, CoCo events.jsonl finish_reason
    *  stop) push idle without waiting for screen-pattern + quiescence to

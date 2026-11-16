@@ -32,7 +32,7 @@ export class PtyBackend implements SessionBackend {
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     logger.debug(
-      `[pty] spawn bin=${bin} args=${JSON.stringify(args)} ` +
+      `[pty] spawn bin=${bin} args=${opts.redactArgs ? '[redacted]' : JSON.stringify(args)} ` +
       `cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
     );
     this.process = pty.spawn(bin, args, {

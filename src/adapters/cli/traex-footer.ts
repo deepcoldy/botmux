@@ -104,7 +104,7 @@ const EMPTY_COMPOSER_HINTS = new Set([
  */
 export function traexRestoredComposerReady(
   screen: string,
-  opts: { resumedSession?: boolean } = {},
+  opts: { resumedSession?: boolean; requireModelFooter?: boolean } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -115,6 +115,15 @@ export function traexRestoredComposerReady(
   // then the access/shortcut row. Extra rows can be a draft, picker or dialog.
   if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
   if (footer.length < 1 || footer.length > 2) return false;
+  // Older releases use a resolved model/directory banner and a context-only
+  // footer. Require both cells in the live screen; the short shortcut footer
+  // below must never inherit readiness from a stale banner.
+  if (opts.requireModelFooter && footer.length === 1
+    && /^[ \t]*Context \d+% left[ \t]*$/.test(footer[0]!)) {
+    return /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/.test(rows.slice(0, composer).join('\n'))
+      && !rows.some(row => /^(?:Sign in\b|Press (?:enter|return) to open|(?:waiting for|awaiting) authori[sz]ation\b)/i.test(row))
+      && !/esc to interr?upt|Queued for (?:capacity|next turn)/i.test(rows.slice(Math.max(0, composer - 3), composer).join('\n'));
+  }
   // Recorded 0.212.1 cold start: marketplace Git access failure replaces
   // BOTH native footer rows with a nonblocking notification for ~30s. The
   // initialized startup banner and an empty composer still prove readiness.
@@ -159,6 +168,11 @@ export function traexRestoredComposerReady(
   // so this arm deliberately trusts the footer-region geometry; revisit it if
   // a future build moves notification content below the composer.
   const truncatedStatusRow = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
+  // The short footer proves editability only: 0.214.1/0.215.0 discard Enter
+  // while initialization is pending. Mutation admission must not inherit this
+  // display compatibility fallback (nor a notification/truncated model cell).
+  if (opts.requireModelFooter && (repositoryNotice || shortcutOnlyFooter
+    || truncatedStatusRow.test(footer[0]!))) return false;
   if (!repositoryNotice && !shortcutOnlyFooter
     && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
     && !truncatedStatusRow.test(footer[0]!)) return false;

@@ -25,6 +25,7 @@ import { discoverRolloutSessions } from '../../services/resumable-session-discov
 import { delay } from '../../utils/timing.js';
 import { traexModelPickerPage, traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
 import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION, TRAEX_PROGRAM_STATUS_MIN_VERSION } from './traex-version.js';
+import { TRAEX_INITIAL_ARG_MAX_BYTES } from '../../services/traex-initial-delivery.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -408,7 +409,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
     launchNotice: () => launchNotice,
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+    passesInitialPromptViaArgs: true,
+    initialPromptArgsIgnoredOnResume: true,
+    maxInitialPromptArgBytes: TRAEX_INITIAL_ARG_MAX_BYTES,
+
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, initialPrompt, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
       launchNotice = undefined;
       // TraeX shares Codex's low-quota picker and notice setting. Disable it
       // per process so a message-submit Enter cannot confirm a model switch.
@@ -471,7 +476,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         baseArgs.push('-c', traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand));
       }
       if (workingDir) baseArgs.push('-C', workingDir);
-      if (!resume) return baseArgs;
+      // Worker admits native first delivery once. `--` preserves leading
+      // dashes, quotes and multiline input as one positional argument.
+      if (!resume) return initialPrompt && !forkSession ? [...baseArgs, '--', initialPrompt] : baseArgs;
 
       const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;

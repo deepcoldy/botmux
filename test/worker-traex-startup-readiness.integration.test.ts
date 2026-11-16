@@ -33,7 +33,7 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
   for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
-      `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
+      `TraeX ${backendType} ${mode}: waits for initialized input and submits once`,
       () => runScenario(backendType, mode),
       mode === 'session-lock' ? 120_000 : 65_000,
     );
@@ -281,6 +281,16 @@ await import(${JSON.stringify(resolve('src/worker.ts'))});
       paint(['TraeCode CLI (v0.213.1)', '', ...COMPOSER]);
     }
     if (heldIdle) await waitFor(() => existsSync(idleHeld), 'first idle edge held');
+    if (mode === 'shortcut-only-footer' || mode === 'truncated-cwd-footer'
+      || mode === 'repository-notice' || mode.startsWith('resumed-repository-notice')) {
+      // A visible composer can still discard Enter before initialization.
+      // These compatibility shapes are display evidence only; no input may
+      // leave the worker until a resolved model/context footer arrives.
+      await new Promise(resolveWait => setTimeout(resolveWait, 6_200));
+      expect(existsSync(inputFile), logs.join('')).toBe(false);
+      expect(messages.some(message => message.type === 'turn_input_committed')).toBe(false);
+      paint(COMPOSER);
+    }
     if (nativeViewport) {
       const pane = execFileSync('tmux', [...tmuxSocketArgs(preferredManagedTmuxSocket(env)),
         'capture-pane', '-p', '-t', `bmx-${sessionId.substring(0, 8)}`], { env, encoding: 'utf8' });
