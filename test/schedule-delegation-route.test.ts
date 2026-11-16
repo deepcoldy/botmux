@@ -393,7 +393,7 @@ describe('scheduled turn one-shot child creation', () => {
     return { ...h, parent };
   }
 
-  it('commits one anonymous, controller-bound child in the current topic', async () => {
+  it('commits one ownerless child with a controller-bound tool identity in the current topic', async () => {
     const h = childHarness();
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true, replay: false } });
     expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
@@ -403,6 +403,7 @@ describe('scheduled turn one-shot child creation', () => {
       targetTurnId: turnId,
       targetGeneration: 7,
       maxTasksPerTurn: 1,
+      controllerBoundToolIdentity: true,
       control: {
         openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_target',
         runScopes: [], selfManage: false,
@@ -452,7 +453,7 @@ describe('scheduled turn one-shot child creation', () => {
     });
   });
 
-  it('requires identity isolation before committing the anonymous child', async () => {
+  it('requires identity isolation before committing the controller-bound child', async () => {
     const h = childHarness();
     h.scope.getBot = () => ({ config: {} });
     expect(await h.run()).toMatchObject({
@@ -566,6 +567,51 @@ describe('scheduled turn one-shot child creation', () => {
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
+  it('rejects malformed controller-bound tool identity before authority commit', () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-child-binding-')), 'data');
+    config.session.dataDir = dataDir;
+    scheduleStore.setScheduleScope('cli_target');
+    const store = ScheduleAuthorityStore.open(dataDir);
+    try {
+      store.initializeApp('cli_target', []);
+      realScheduler.setScheduleAuthorityStore(store);
+      const base = {
+        params: {
+          id: 'c0000001', name: 'child', schedule: 'every 30m', prompt: 'check',
+          workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root',
+          executionPosition: 'topic' as const, larkAppId: 'cli_target',
+        },
+        grantId: 'schedule-child:cli_target:parent01:schedule:parent01:run-1',
+        requestHash: 'hash-child',
+        control: {
+          openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_target',
+          runScopes: [] as const, selfManage: false,
+        },
+        sourceMessageId: 'om_source', sourceSessionId: 'source-session',
+        targetTurnId: 'schedule:parent01:12345678-1234-1234-1234-123456789abc',
+        targetGeneration: 1, maxTasksPerTurn: 1, controllerBoundToolIdentity: true,
+      };
+      const invalid = [
+        { controllerBoundToolIdentity: false },
+        { grantId: 'dispatch:delivery-1:cli_target' },
+        { control: { ...base.control, openId: '' } },
+        { control: { ...base.control, credentialOpenId: 'ou_other' } },
+        { control: { ...base.control, runScopes: ['bytedcli'] as const } },
+        { control: { ...base.control, selfManage: true } },
+      ];
+      for (const patch of invalid) {
+        expect(() => realScheduler.commitDelegatedTask({ ...base, ...patch }))
+          .toThrow('delegated_schedule_controller_binding_invalid');
+      }
+    } finally {
+      realScheduler.setScheduleAuthorityStore(null);
+      store.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(join(dataDir, '..'), { recursive: true, force: true });
+    }
+  });
+
   it('keys the child quota to the exact scheduled turn in the real authority store', async () => {
     const previousDataDir = config.session.dataDir;
     const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-child-')), 'data');
@@ -596,10 +642,13 @@ describe('scheduled turn one-shot child creation', () => {
       const first = await h.run();
       expect(first).toMatchObject({ status: 201, value: { ok: true, replay: false } });
       const childId = (first.value as { task: { id: string } }).task.id;
-      expect(store.getRecord('cli_target', childId)).toMatchObject({
+      const childRecord = store.getRecord('cli_target', childId)!;
+      expect(childRecord).toMatchObject({
         kind: 'delegated', state: 'active', controlOpenId: 'ou_user_target', controlUnionId: 'on_user',
         runScopes: [], selfManage: false,
       });
+      expect(childRecord.task).not.toHaveProperty('ownerOpenId');
+      expect(childRecord.task).not.toHaveProperty('ownerUnionId');
       // A retry carries a fresh client id; the committed request is the same.
       request('a0000002', 'recheck');
       expect(await h.run()).toMatchObject({ status: 200, value: { replay: true, task: { id: childId } } });
@@ -622,7 +671,7 @@ describe('scheduled turn one-shot child creation', () => {
       const nextChildId = (next.value as { task: { id: string } }).task.id;
       expect(nextChildId).not.toBe(childId);
 
-      // The child's own anonymous fire cannot schedule a grandchild.
+      // The child's controller-bound tool identity still cannot schedule a grandchild.
       atTurn(`schedule:${nextChildId}:32345678-1234-1234-1234-123456789abc`, false);
       request('a0000006', 'grandchild');
       expect(await h.run()).toMatchObject({

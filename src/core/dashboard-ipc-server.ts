@@ -4385,15 +4385,34 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     });
   }
   const executionInput = (ds && peer?.ok)
-    ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId } : undefined;
+    ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
+      // This route is the narrow consumer of an ownerless schedule child's
+      // exact-turn tool actor. Workflow/current-execution callers do not set
+      // this option and therefore remain callerless.
+      allowScheduledToolActor: true } : undefined;
   const execution = executionInput ? attestCurrentExecutionLoopbackPeer(executionInput) : undefined;
   const liveOrigin = (ds && (process.platform !== 'linux' || execution)) ? ds.managedTurnOrigin : undefined;
   const detachedForUser = !liveOrigin?.turnId ? detachedScheduled : null;
   if (detachedForUser?.runIdentity.ok) {
     noteSenderUnionId(detachedForUser.larkAppId, detachedForUser.runIdentity.openId, detachedForUser.runIdentity.unionId);
   }
+  const scheduledToolActor = liveOrigin?.turnId
+    ? ds?.scheduledToolActors?.get(liveOrigin.turnId)
+    : undefined;
+  // turnCaller is the human turn principal used by BOTMUX_AS; baseSender also
+  // covers an ownerless scheduled child's bound tool actor (#3487).
   const turnCaller = liveOrigin?.callerOpenId
     ?? (detachedForUser?.runIdentity.ok ? detachedForUser.runIdentity.openId : undefined);
+  const baseSender = liveOrigin?.callerOpenId
+    ?? execution?.callerOpenId
+    ?? scheduledToolActor?.openId
+    ?? (detachedForUser?.runIdentity.ok ? detachedForUser.runIdentity.openId : undefined);
+  // Non-Linux bound-tool sessions have no kernel peer attestation. Their
+  // session access key already gates this route, so freeze the daemon-owned
+  // exact-turn map entry and compare it again after every await.
+  const usesBoundScheduledToolActor = !liveOrigin?.callerOpenId
+    && !execution?.callerOpenId
+    && scheduledToolActor !== undefined;
   const turnId = liveOrigin?.turnId ?? detachedForUser?.scheduledTurnId;
   if (!turnId) {
     return jsonRes(res, 403, {
@@ -4426,7 +4445,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       ? 'BOTMUX_AS names nobody who spoke in this turn; run the command without it to act as the person who started the turn'
       : 'This bot does not allow running a command for another speaker; run the command without BOTMUX_AS to act as the person who started the turn' });
   }
-  const originSender = choice.speaker?.openId ?? turnCaller;
+  const originSender = choice.speaker?.openId ?? baseSender;
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
@@ -4449,7 +4468,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const stableAfterAwait = liveOrigin?.turnId
     ? (!!ds && findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
       && (!execution || currentTurnPeerAttestationStable(execution, executionInput!))
-      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.callerOpenId === turnCaller
+      && ds.managedTurnOrigin?.turnId === turnId
+      && (usesBoundScheduledToolActor
+        ? ds.scheduledToolActors?.get(turnId)?.openId === scheduledToolActor.openId
+          && ds.scheduledToolActors?.get(turnId)?.unionId === scheduledToolActor.unionId
+        // A human turn (including a BOTMUX_AS switch, which only rewrites originSender)
+        // stays anchored to its original principal turnCaller; an execution-only bound
+        // call keeps the master originSender comparison.
+        : (ds.managedTurnOrigin?.callerOpenId ?? execution?.callerOpenId)
+          === (liveOrigin?.callerOpenId ? turnCaller : originSender))
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
   if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)

@@ -1825,6 +1825,7 @@ function retainedIdentityTurns(ds: DaemonSession): Set<string> | 'all' {
   add(ds.session.queuedActivationTurnId);
   add(ds.pendingRawTurnId);
   for (const turnId of ds.scheduledTurnCallers?.keys() ?? []) add(turnId);
+  for (const turnId of ds.scheduledToolActors?.keys() ?? []) add(turnId);
   for (const turnId of ds.silentScheduledTurns?.keys() ?? []) add(turnId);
   add(ds.session.deferredScheduleRun?.turnId);
   add(ds.session.ordinaryTurnRecovery?.currentTurnId);
@@ -15684,9 +15685,11 @@ function rememberScheduledTurnCaller(
 }
 
 function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || !ds.scheduledTurnCallers) return;
-  ds.scheduledTurnCallers.delete(turnId);
-  if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
+  if (!turnId) return;
+  ds.scheduledTurnCallers?.delete(turnId);
+  if (ds.scheduledTurnCallers?.size === 0) ds.scheduledTurnCallers = undefined;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
@@ -24642,6 +24645,7 @@ function setupWorkerHandlers(
       ds.workerCardViewToken = null;
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
+      ds.scheduledToolActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {

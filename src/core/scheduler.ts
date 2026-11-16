@@ -1461,6 +1461,9 @@ export function commitDelegatedTask(input: {
   targetTurnId: string;
   targetGeneration: number;
   maxTasksPerTurn: number;
+  /** Narrow same-topic child exception: admit the already verified controller
+   * as an exact-turn tool actor while keeping the task itself ownerless. */
+  controllerBoundToolIdentity?: boolean;
 }): CommitDelegatedScheduleResult {
   assertScheduleAuthorityAvailable();
   if (!authorityStore?.isInitialized(input.params.larkAppId)) {
@@ -1477,6 +1480,15 @@ export function commitDelegatedTask(input: {
   if (position !== 'top-level' && position !== 'topic') throw new Error('delegated_schedule_position_denied');
   if (position === 'topic' && !params.rootMessageId?.trim()) throw new Error('topic_root_required');
   if (params.followActive || params.deliver === 'new-topic') throw new Error('delegated_schedule_position_denied');
+  const controllerBoundToolIdentity = input.controllerBoundToolIdentity === true;
+  const scheduleChildGrant = input.grantId.startsWith('schedule-child:');
+  if (controllerBoundToolIdentity !== scheduleChildGrant
+    || (controllerBoundToolIdentity && (
+    !input.control.openId || !input.control.unionId
+    || input.control.credentialOpenId !== input.control.openId
+    || (input.control.runScopes ?? []).length !== 0
+    || input.control.selfManage !== false
+  ))) throw new Error('delegated_schedule_controller_binding_invalid');
   const createdAt = new Date().toISOString();
   const task: ScheduledTask = {
     id: params.id,
@@ -1499,10 +1511,9 @@ export function commitDelegatedTask(input: {
     creatorChatId: params.creatorChatId,
     creatorRootMessageId: params.creatorRootMessageId,
     creatorLarkAppId: params.creatorLarkAppId,
-    // The control principal lives only in the host authority store. Empty
-    // runScopes means the scheduled model turn is intentionally anonymous; it
-    // must not become a generic human TrustedCaller merely because a human
-    // authorized creation.
+    // Every delegated task stays ownerless. A bounded same-topic child may use
+    // its controller only as an exact-turn tool actor after a live host check;
+    // persisting it here would also grant workflow/schedule mutation authority.
     ownerOpenId: undefined,
     ownerUnionId: undefined,
     enabled: true,

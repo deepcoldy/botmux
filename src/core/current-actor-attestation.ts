@@ -363,6 +363,9 @@ export interface CurrentTurnPeerAttestationInput {
   expectedScheduledTurnId?: string;
   /** Receives the check that refused the proof; for operator logs only. */
   onRefusal?: (reason: string) => void;
+  /** Current-actor only: let the daemon's live ownerless-child tool actor
+   * satisfy the human caller requirement without promoting workflow authority. */
+  allowScheduledToolActor?: boolean;
 }
 
 /**
@@ -393,6 +396,15 @@ export function attestCurrentExecutionLoopbackPeer(
   const scheduledCaller = input.expectedScheduledTurnId
     ? ds?.scheduledTurnCallers?.get(input.expectedScheduledTurnId)
     : undefined;
+  const scheduledToolActor = input.allowScheduledToolActor && turnId
+    ? ds?.scheduledToolActors?.get(turnId)
+    : undefined;
+  const expectedScheduledToolActor = input.allowScheduledToolActor && input.expectedScheduledTurnId
+    ? ds?.scheduledToolActors?.get(input.expectedScheduledTurnId)
+    : undefined;
+  const attestedCallerOpenId = callerOpenId ?? scheduledToolActor?.openId;
+  const expectedScheduledCallerOpenId = scheduledCaller?.requestUserOpenId
+    ?? expectedScheduledToolActor?.openId;
   const refuse = (reason: string): null => { input.onRefusal?.(reason); return null; };
   if (!ds) return refuse('no session');
   if (ds.session.status !== 'active') return refuse('session not active');
@@ -421,8 +433,8 @@ export function attestCurrentExecutionLoopbackPeer(
   if (input.expectedScheduledTurnId
     && (!parseScheduledTurnId(input.expectedScheduledTurnId)
       || turnId !== input.expectedScheduledTurnId
-      || !scheduledCaller
-      || scheduledCaller.requestUserOpenId !== callerOpenId)) {
+      || !expectedScheduledCallerOpenId
+      || expectedScheduledCallerOpenId !== attestedCallerOpenId)) {
     return refuse('scheduled caller mismatch');
   }
   const preexistingProcessIdentities = new Set(processIdentities);
@@ -448,7 +460,7 @@ export function attestCurrentExecutionLoopbackPeer(
     return refuse(`peer pid ${input.peer.pid} start mismatch; ${roots}`);
   }
   return {
-    ds, turnId, generation, callerOpenId, capability,
+    ds, turnId, generation, callerOpenId: attestedCallerOpenId, capability,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     workerPid, workerProcStart, cliPid, cliProcStart, enginePid, engineProcStart,
     ...(input.expectedScheduledTurnId
@@ -458,8 +470,10 @@ export function attestCurrentExecutionLoopbackPeer(
   };
 }
 
-/** Human identity remains a separate requirement for actor callers.
- * Machine-triggered executions can prove their lineage without it. */
+/** Human identity remains a separate requirement for actor callers. An
+ * ownerless schedule child may satisfy it only through its exact-turn,
+ * daemon-owned tool-actor entry; that entry is not workflow authority.
+ * Machine-triggered executions can otherwise prove lineage without a human. */
 export function attestCurrentTurnLoopbackPeer(
   input: CurrentTurnPeerAttestationInput,
 ): CurrentTurnPeerAttestation | null {
@@ -502,6 +516,7 @@ export async function resolveDaemonCurrentActor(input: {
   const attestInput = {
     sessionId: input.sessionId, peer: input.peer,
     findSession: input.findSession, procRoot,
+    allowScheduledToolActor: true,
     ...(input.expectedScheduledTurnId
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),

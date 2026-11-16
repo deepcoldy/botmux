@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  attestCurrentExecutionLoopbackPeer,
   attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
@@ -157,8 +158,87 @@ describe('daemon current actor attestation', () => {
         openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
       }),
       procRoot,
-      expectedScheduledTurnId: SCHEDULED_TURN_ID,
     })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('proves an ownerless schedule child tool actor without creating a workflow caller', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    delete ds.managedTurnOrigin.callerOpenId;
+    ds.scheduledTurnCallers = undefined;
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    const request = () => resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    });
+
+    await expect(request()).resolves.toMatchObject({ ok: true });
+    expect(ds.managedTurnOrigin.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+
+    ds.scheduledToolActors = undefined;
+    await expect(request()).resolves.toEqual({
+      ok: false, error: 'current_actor_unverified',
+    });
+
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => {
+        ds.scheduledToolActors = undefined;
+        return { openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com' };
+      },
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+  });
+
+  it('hides the scheduled tool actor from attestation callers that do not opt in', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    delete ds.managedTurnOrigin.callerOpenId;
+    ds.scheduledTurnCallers = undefined;
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    const base = {
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      procRoot,
+    };
+
+    // Workflow / current-execution / session-auth callers never set the
+    // opt-in: the execution proof stays callerless rather than promoting the
+    // exact-turn tool actor into a human caller, and the turn proof (which
+    // requires an ou_ caller) is refused outright.
+    const silentProof = attestCurrentExecutionLoopbackPeer(base);
+    expect(silentProof?.callerOpenId).toBeUndefined();
+    expect(attestCurrentTurnLoopbackPeer(base)).toBeNull();
+    expect(attestCurrentExecutionLoopbackPeer({
+      ...base, expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    })).toBeNull();
+
+    // Only the two narrow identity routes opt in explicitly.
+    expect(attestCurrentExecutionLoopbackPeer({ ...base, allowScheduledToolActor: true }))
+      .toMatchObject({ callerOpenId: 'ou_scheduler' });
+    expect(attestCurrentTurnLoopbackPeer({ ...base, allowScheduledToolActor: true }))
+      .toMatchObject({ callerOpenId: 'ou_scheduler' });
   });
 
   it('rejects a missing, different, or cleaned-up scheduled turn', async () => {
