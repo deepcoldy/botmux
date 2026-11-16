@@ -8,6 +8,22 @@ describe('opt-in integrated plugin management', () => {
       .toEqual({ Component });
   });
 
+  it('accepts the generic dialog-body layout independently of prerequisites', () => {
+    const Component = () => null, LayoutComponent = () => null;
+    const managementLayout = { version: 1, placement: 'dialog-body', Component: LayoutComponent };
+    expect(integratedManagementExport({ managementLayout })).toEqual({ LayoutComponent });
+    expect(integratedManagementExport({ management: { version: 1, placement: 'before-scope-controls', Component }, managementLayout }))
+      .toEqual({ Component, LayoutComponent });
+  });
+
+  it.each([
+    { version: 2, placement: 'dialog-body', Component: () => null },
+    { version: 1, placement: 'before-scope-controls', Component: () => null },
+    { version: 1, placement: 'dialog-body', Component: 'not a component' },
+  ])('rejects an invalid layout opt-in without changing default presentation (%j)', managementLayout => {
+    expect(integratedManagementExport({ managementLayout })).toBeNull();
+  });
+
   it.each([
     null, {}, { default: () => null },
     { management: { version: 2, placement: 'before-scope-controls', Component: () => null } },

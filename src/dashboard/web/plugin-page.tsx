@@ -128,14 +128,31 @@ type PluginServiceAction = 'start' | 'stop' | 'restart';
 type PendingToggles = ReadonlyMap<string, boolean>;
 type PluginDashboardApi = ReturnType<typeof pluginDashboardApi>;
 type PluginDashboardComponent = ComponentType<{ pluginId: string; api: PluginDashboardApi }>;
+interface PluginManagementContext {
+  presentation: { displayName: string; audience?: string; description?: string; version: string };
+  scope: {
+    globalEnabled: boolean;
+    globalPending: boolean;
+    busy: boolean;
+    bots: Array<{ id: string; name: string; enabled: boolean }>;
+    onToggle(scope: string, enabled: boolean): void;
+  };
+}
 interface IntegratedManagement {
-  Component: ComponentType<{ pluginId: string; api: PluginDashboardApi; onReadinessChange(ready: boolean): void }>;
+  Component?: ComponentType<{ pluginId: string; api: PluginDashboardApi; onReadinessChange(ready: boolean): void }>;
+  LayoutComponent?: ComponentType<{ pluginId: string; api: PluginDashboardApi; management: PluginManagementContext; onReadinessChange(ready: boolean): void }>;
 }
 
 export function integratedManagementExport(mod: unknown): IntegratedManagement | null {
   const value = (mod as { management?: { version?: unknown; placement?: unknown; Component?: unknown } })?.management;
-  return value?.version === 1 && value.placement === 'before-scope-controls' && typeof value.Component === 'function'
-    ? { Component: value.Component as IntegratedManagement['Component'] } : null;
+  const layout = (mod as { managementLayout?: { version?: unknown; placement?: unknown; Component?: unknown } })?.managementLayout;
+  const Component = value?.version === 1 && value.placement === 'before-scope-controls' && typeof value.Component === 'function'
+    ? value.Component as IntegratedManagement['Component'] : undefined;
+  const LayoutComponent = layout?.version === 1 && layout.placement === 'dialog-body' && typeof layout.Component === 'function'
+    ? layout.Component as IntegratedManagement['LayoutComponent'] : undefined;
+  return Component || LayoutComponent ? {
+    ...(Component ? { Component } : {}), ...(LayoutComponent ? { LayoutComponent } : {}),
+  } : null;
 }
 
 /**
@@ -151,7 +168,8 @@ export function frontendManagesPrerequisiteGate(requiresPreparation: boolean, en
 
 function PluginManagementSurface(props: {
   plugin: ManagedPlugin;
-  children(canEnable: boolean): ReactNode;
+  management: PluginManagementContext;
+  children(canEnable: boolean, layout: ReactNode): ReactNode;
 }): React.JSX.Element {
   const [loaded, setLoaded] = useState(false);
   const [surface, setSurface] = useState<IntegratedManagement | null>(null);
@@ -166,7 +184,7 @@ function PluginManagementSurface(props: {
     setSurface(null);
     setError('');
     setReady(false);
-    if (!managed) { setLoaded(true); return; }
+    if (!entry?.url) { setLoaded(true); return; }
     const url = new URL(entry!.url, location.href);
     if (url.origin !== location.origin) { setLoaded(true); setError('插件管理入口必须来自当前宿主'); return; }
     url.searchParams.set('managementVersion', props.plugin.version);
@@ -176,16 +194,19 @@ function PluginManagementSurface(props: {
       if (!cancelled) { setError('插件管理面板加载失败，请刷新重试'); setLoaded(true); }
     });
     return () => { cancelled = true; };
-  }, [entry?.url, props.plugin.version, managed]);
+  }, [entry?.url, props.plugin.version]);
   const api = useMemo(() => pluginDashboardApi(props.plugin.id), [props.plugin.id]);
   const Component = surface?.Component;
+  const LayoutComponent = surface?.LayoutComponent;
   return <>
-    {managed ? <div data-plugin-prerequisites={props.plugin.id}>
+    {managed && !LayoutComponent ? <div data-plugin-prerequisites={props.plugin.id}>
       {!loaded ? <div role="status" className="plugin-muted">正在检查安装和登录状态…</div>
         : Component ? <Component pluginId={props.plugin.id} api={api} onReadinessChange={setReady} />
           : <div className="plugin-warning" role="alert">{error || '前置状态暂不可用，请刷新重试'}</div>}
     </div> : null}
-    {props.children(!managed || ready)}
+    {props.children(!managed || ready, LayoutComponent
+      ? <LayoutComponent pluginId={props.plugin.id} api={api} management={props.management} onReadinessChange={setReady} />
+      : null)}
   </>;
 }
 
@@ -757,12 +778,19 @@ function PluginCard(props: {
           <div><h2>{title}</h2></div>
           <button type="button" className="btn-link plugin-store-close" aria-label="关闭" title="关闭" onClick={() => setExpanded(false)}>×</button>
         </header>
-        <div className="plugin-store-introduction">
-          {plugin.audience ? <div className="plugin-store-audience"><span>{plugin.audience}</span></div> : null}
-          {description ? <p>{description}</p> : null}
-        </div>
         <div className="plugin-card-expanded" id={detailsId}>
-          {expanded ? <PluginManagementSurface plugin={plugin}>{canEnable => <>
+          {expanded ? <PluginManagementSurface plugin={plugin} management={{
+            presentation: { displayName: title, audience: plugin.audience, description, version: plugin.version },
+            scope: {
+              globalEnabled: enabledGlobal, globalPending: globalTogglePending, busy: props.busy,
+              bots: props.bots.map(bot => ({ id: bot.id, name: bot.name, enabled: pluginEnabledInScope(plugin, bot.id, props.pendingToggles) })),
+              onToggle: props.onToggle,
+            },
+          }}>{(canEnable, layout) => layout || <>
+          <div className="plugin-store-introduction">
+            {plugin.audience ? <div className="plugin-store-audience"><span>{plugin.audience}</span></div> : null}
+            {description ? <p>{description}</p> : null}
+          </div>
           <PluginBotSettings
             plugin={plugin}
             bots={props.bots}
@@ -774,7 +802,6 @@ function PluginCard(props: {
             onToggle={props.onToggle}
           />
           <DashboardActions plugin={plugin} />
-          </>}</PluginManagementSurface> : null}
           <details className="plugin-advanced" key={expanded ? 'open' : 'closed'}>
             <summary>高级设置</summary>
             <div className="plugin-card-body">
@@ -807,6 +834,7 @@ function PluginCard(props: {
           <PluginActionArea plugin={plugin} busy={props.busy} onServiceAction={props.onServiceAction} />
           <div className="plugin-card-body"><PluginTabs plugin={plugin} /></div>
           </details>
+          </>}</PluginManagementSurface> : null}
           <footer className="plugin-store-dialog-foot">
             {props.marketEntry?.package === plugin.packageName ? <button type="button" className="btn-link" disabled={props.busy} onClick={() => { setExpanded(false); props.onPrepare(); }}>检查更新</button> : null}
             <button type="button" className="btn-link plugin-store-danger" disabled={props.busy} onClick={() => { setExpanded(false); props.onUninstall(); }}>卸载插件</button>
@@ -1099,6 +1127,7 @@ function pluginDashboardApi(pluginId: string) {
   }
   return {
     react: React,
+    managementFeatures: { dialogBody: true },
     getSettings: () => settings('GET'),
     saveSettings: (value: unknown) => settings('PUT', value),
     async listBots() { return (await fetchPluginManagement()).bots; },
