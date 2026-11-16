@@ -883,7 +883,7 @@ import { botProviderRecoveryPolicy, providerRecoveryPacing } from './provider-re
 import { PROVIDER_RETRY_HINT_MAX_AHEAD_MS } from '../services/provider-retry-hint.js';
 import { publishAttentionPatch, publishClosedSessionPatch, raiseDaemonAttention } from './session-activity.js';
 import { isOrdinaryImTurnId } from './ordinary-im-turn.js';
-import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
+import { shouldQueueAfterActiveTurn, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
@@ -15846,6 +15846,7 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
+          ...(normalized.traexNativeContext ? { traexNativeContext: normalized.traexNativeContext } : {}),
           ...(normalized.linkRefs ? { linkRefs: normalized.linkRefs } : {}),
           // R4-B1: freeze the admission-time steer authorization into the queued
           // tail's frozen payload so promote/repark/restore COPY it verbatim
@@ -15940,6 +15941,7 @@ export function sendWorkerInput(
     ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
+    ...(normalized.traexNativeContext ? { traexNativeContext: normalized.traexNativeContext } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
@@ -15953,9 +15955,12 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
-      && (opts.trustedCaller?.source === 'schedule_creator'
-        || isSerialGroupInput(ds, opts.trustedCaller)))
+    ...(opts.queueAfterActiveTurn
+      || (opts.dispatchAttempt === undefined && opts.trustedCaller?.source === 'schedule_creator')
+      || shouldQueueAfterActiveTurn(ds, {
+        turnId: effectiveTurnId, dispatchAttempt: opts.dispatchAttempt,
+        codexAppSteerable: opts.codexAppSteerable, caller: opts.trustedCaller,
+      })
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -17527,6 +17532,7 @@ function forkWorkerPrepared(
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
+          ...(promptPayload.traexNativeContext ? { traexNativeContext: promptPayload.traexNativeContext } : {}),
           ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
@@ -18473,6 +18479,8 @@ function forkWorkerPrepared(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(promptPayload.traexNativeContext ? { traexNativeContext: promptPayload.traexNativeContext } : {}),
+    ...(ds.session.traexNativeContextReceipt ? { traexNativeContextReceipt: ds.session.traexNativeContextReceipt } : {}),
     ...(admittedOpeningLinkRefs.mode === 'disabled'
       ? {}
       : { linkRefMode: admittedOpeningLinkRefs.mode }),
@@ -20138,6 +20146,24 @@ function setupWorkerHandlers(
         if (starts.size > 512) starts.delete(starts.keys().next().value!);
         publishExecutionActivityPatch(ds);
         if (ds.session.workflowNode) cb.onWorkflowNodeTurnStarted?.(ds, { turnId: msg.turnId, startedAt: msg.startedAtMs });
+        break;
+      }
+      case 'traex_native_context_receipt': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration) break;
+        const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId
+          ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        // A fresh cold start learns cliSessionId only after the first turn is
+        // persisted, which happens after this ACK. Accept that first receipt so
+        // a worker replacement cannot re-inject role/compact catalog and so an
+        // ambiguous first delivery stays blocked; once the id is known it must
+        // match exactly.
+        if (effectiveCliId !== 'traex'
+          || !msg.receipt.nativeThreadId
+          || (ds.session.cliSessionId
+            && ds.session.cliSessionId !== msg.receipt.nativeThreadId)) break;
+        ds.session.traexNativeContextReceipt = structuredClone(msg.receipt);
+        sessionStore.updateSession(ds.session);
         break;
       }
       case 'turn_input_committed': {

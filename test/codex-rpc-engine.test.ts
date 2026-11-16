@@ -556,6 +556,14 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
 });
 
 describe('CodexRpcEngine — failure/recovery paths', () => {
+  it('classifies a call before thread start as definitely not sent', async () => {
+    const engine = makeEngine();
+    await expect(engine.sendTurn('never dispatched', owner('om_no_thread', 1))).rejects.toMatchObject({
+      name: 'CodexRpcDeliveryError', code: 'rpc_turn_start_not_sent', deliveryDisposition: 'not_sent',
+    });
+    engine.stop();
+  });
+
   it('P1-5: a wedged turn/start times out → onDead fires (fatal recovery, not a silent hang)', async () => {
     let deadCount = 0;
     const engine = makeEngine({
