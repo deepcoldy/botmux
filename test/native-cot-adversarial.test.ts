@@ -164,10 +164,15 @@ describe('independent native CoT adversarial lifecycle', () => {
       card: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"answer"}]}}' }, answer);
     const releaseCreate = await create.promise;
     await flush();
+    // Bun schedules the answer-card continuation one setImmediate hop later
+    // than the fake-timer drain; drain it too or the negative assertion below
+    // passes while a premature answer is already queued.
+    await nextImmediate();
     expect(answer).not.toHaveBeenCalled();
     releaseCreate();
     const releasePrologue = await prologue.promise;
     await flush();
+    await nextImmediate();
     expect(answer).not.toHaveBeenCalled();
     releasePrologue(); await start;
     expect(answer).toHaveBeenCalledTimes(1); expect(seq).toBe(1);
