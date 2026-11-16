@@ -21,6 +21,11 @@ function sessionIdFromEnv(env: Record<string, string | undefined>): string | und
  *  skill CLI path does not pull in the TUI adapter module. */
 const DOUBAO_CONVERSATION_ID_RE = /^\d{10,24}$/;
 
+/** Reverse lookup handed to resolveSessionId. Kept narrower than the real
+ *  store function (no dataDir) so the gating logic can be tested with a plain
+ *  recording fake instead of a SQLite fixture. */
+export type CliSessionIdLookup = (opts: { cliId: string; cliSessionId: string }) => string | undefined;
+
 /**
  * Resolve the owning botmux session for a skill invocation.
  *
@@ -32,13 +37,16 @@ const DOUBAO_CONVERSATION_ID_RE = /^\d{10,24}$/;
  * Unknown / ambiguous / malformed ids stay undefined so the caller fails
  * closed; any other CLI keeps the env-only path untouched.
  */
-function resolveSessionId(env: Record<string, string | undefined>): string | undefined {
+export function resolveSessionId(
+  env: Record<string, string | undefined>,
+  lookup: CliSessionIdLookup = findActiveSessionIdByCliSessionId,
+): string | undefined {
   const explicit = env.BOTMUX_SESSION_ID?.trim();
   if (explicit) return explicit;
   const nativeId = env.MCP_VM_CONVERSATION_ID?.trim();
   if (!nativeId || !DOUBAO_CONVERSATION_ID_RE.test(nativeId)) return undefined;
   try {
-    return findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: nativeId });
+    return lookup({ cliId: 'doubao', cliSessionId: nativeId });
   } catch {
     // An unreadable session store must not guess a session: fail closed.
     return undefined;
