@@ -1058,7 +1058,8 @@ import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionN
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
-import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup, closeSessionsInRecalledTopic, sweepRecalledTopicSessions } from './core/dismiss-command.js';
+import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup } from './core/dismiss-command.js';
+import { suspendRecalledTopicWorkers } from './core/topic-worker-suspend.js';
 import { ListenerCircuitBreaker } from './services/listener-circuit-breaker.js';
 import { pruneBotAttachments } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, resolveVerifiedUserIdentity, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -35221,8 +35222,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       handleChatGone: (chatId, appId, reason) =>
         closeSessionsInGoneChat({ larkAppId: appId, chatId, reason, activeSessions }),
       handleMessageRecalled: (chatId, messageId, appId) =>
-        closeSessionsInRecalledTopic({ larkAppId: appId, chatId, messageId, activeSessions,
-          enabled: () => getBot(appId).config.topicAutoClose === true }),
+        suspendRecalledTopicWorkers({ larkAppId: appId, chatId, messageId, activeSessions }),
       handleDocComment: (ctx) => handleDocComment(ctx),
       handleVcMeetingPush: (ctx) => withBotTurnAdmission(
         ctx.larkAppId,
@@ -36675,25 +36675,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     } catch { /* best-effort */ }
   };
   writeBusyHeartbeat();
-  const topicAutoCloseAbort = new AbortController();
-  let topicAutoCloseSweepInFlight = false;
-  const runTopicAutoCloseSweep = (): void => {
-    if (cfg.apiOnly || topicAutoCloseSweepInFlight || topicAutoCloseAbort.signal.aborted) return;
-    topicAutoCloseSweepInFlight = true;
-    void sweepRecalledTopicSessions({
-      larkAppId: cfg.larkAppId,
-      activeSessions,
-      enabled: () => !topicAutoCloseAbort.signal.aborted && getBot(cfg.larkAppId).config.topicAutoClose === true,
-      lookup: (appId, root) => getTopicMessageDetail(appId, root, {
-        userCardContent: false, timeoutMs: 10_000, signal: topicAutoCloseAbort.signal,
-      }),
-    }).catch(error => logger.warn(`[topic-gone] sweep failed; retained: ${error}`))
-      .finally(() => { topicAutoCloseSweepInFlight = false; });
-  };
-  const topicAutoCloseTimer = setInterval(runTopicAutoCloseSweep, 60_000);
-  topicAutoCloseTimer.unref?.();
-  runTopicAutoCloseSweep();
-
   const maintenanceHeartbeat = setInterval(writeBusyHeartbeat, 15_000);
   maintenanceHeartbeat.unref?.();
 
@@ -37048,8 +37029,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     vcMeetingClosingConsumerSessions.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
-    topicAutoCloseAbort.abort();
-    clearInterval(topicAutoCloseTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(orphanSessionSweepTimer);
     clearTimeout(orphanSessionSweepKickoff);
@@ -37322,8 +37301,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setSupervisorShutdownHandler(null);
     setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
-    topicAutoCloseAbort.abort();
-    clearInterval(topicAutoCloseTimer);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(orphanSessionSweepTimer);
     clearTimeout(orphanSessionSweepKickoff);

@@ -246,7 +246,7 @@ describe('suspendWorker', () => {
     expect(gone.mock.calls.map(call => call[1])).toEqual([undefined, 'botmux']);
   });
 
-  it('suspends a persistent worker without closing the active session', () => {
+  it.each(['idle', 'working', 'analyzing'])('suspends a %s persistent worker without closing the active session', status => {
     const worker = fakeWorker();
     const order: string[] = [];
     __testOnly_setSuspendBackingVerifier(() => { order.push('backing-verified'); return true; });
@@ -258,7 +258,7 @@ describe('suspendWorker', () => {
       workerPort: 3456,
       workerToken: 'token',
       managedTurnOrigin: { capability: 'cap-live', turnId: 'om-live' },
-      lastScreenStatus: 'idle',
+      lastScreenStatus: status,
       exitEventEmitted: false,
     };
 
@@ -278,12 +278,13 @@ describe('suspendWorker', () => {
     // --resume) and persist the suspend intent (→ restore won't zombie-close it).
     expect(ds.hasHistory).toBe(true);
     expect(ds.session.suspendedColdResume).toBe(true);
+    expect(ds.session.suspendReason).toBe('idle_budget');
     expect(hasFeedbackMaintenanceSessionWork(ds)).toBe(false);
     expect(dashboardEventBus.publish).toHaveBeenCalledWith({
       type: 'session.update',
       body: {
         sessionId: 'sid-1',
-        patch: { status: 'dormant', webPort: null, workerPid: null },
+        patch: { status: 'dormant', suspendReason: 'idle_budget', webPort: null, workerPid: null },
       },
     });
   });

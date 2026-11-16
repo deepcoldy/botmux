@@ -75,6 +75,7 @@ export interface SessionRow extends SessionMessagePreview {
   runtimeId?: string;
   runtimeDisplayName?: string;
   status: StreamStatus | 'closed' | 'dormant';
+  suspendReason?: string;
   adopt: boolean;
   spawnedAt: number;
   lastMessageAt: number;
@@ -421,6 +422,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     scope: ds.session.scope,
     whiteboardId: ds.session.whiteboardId,
     headless: ds.session.headless,
+    suspendReason: ds.session.suspendedColdResume ? ds.session.suspendReason : undefined,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
     titleSource: ds.session.titleSource,
@@ -504,6 +506,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     scope: s.scope,
     whiteboardId: s.whiteboardId,
     headless: s.headless,
+    suspendReason: s.suspendedColdResume ? s.suspendReason : undefined,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
     titleSource: s.titleSource,
@@ -566,6 +569,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     scope: s.scope,
     whiteboardId: s.whiteboardId,
     headless: s.headless,
+    suspendReason: s.suspendedColdResume ? s.suspendReason : undefined,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
     titleSource: s.titleSource,

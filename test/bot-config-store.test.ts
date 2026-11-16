@@ -677,20 +677,6 @@ describe('bot-config store', () => {
     expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
   });
 
-  it('round-trips topic resource cleanup through botconfig without a restart', async () => {
-    const { registry, store } = await loaded({ cliId: 'codex' });
-    const spec = store.findConfigField('topicAutoClose')!;
-    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
-    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
-    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
-    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
-    expect(registry.getBot('app_default').config.topicAutoClose).toBe(true);
-    expect(registry.loadBotConfigs()[0].topicAutoClose).toBe(true);
-    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
-    expect(registry.getBot('app_default').config.topicAutoClose).not.toBe(true);
-    expect(registry.loadBotConfigs()[0].topicAutoClose).toBe(false);
-  });
-
   it('hot-updates sender email hiding through botconfig and reloads it', async () => {
     const { registry, store } = await loaded({ cliId: 'codex' });
     const spec = store.findConfigField('senderTagHideEmail')!;

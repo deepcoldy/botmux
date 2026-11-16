@@ -587,7 +587,6 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
 | `promptInjection` | `"default"`（默认）或 `"none"`。`none` 是零注入模式：botmux 不加任何系统提示和提醒，只传任务原文和附件，并自动回传最终答复。见下方说明 |
 | `envelopeInjection` | 仅 Claude Code：`auto` 时把每轮的提醒内容改由 hook 注入，终端输入框里只剩消息本身；默认 `off` 保持原样 |
-| `topicAutoClose` | 默认关闭；开启后在根消息撤回或确认删除时释放 worker，启动时及每分钟巡检。见[话题资源自动回收](/topic-auto-close) |
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
 | `turnResults` | 提供每一轮的结构化结果，供外部系统读取。见[单轮结果](/turn-results) |
 

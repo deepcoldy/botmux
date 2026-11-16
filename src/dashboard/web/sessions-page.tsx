@@ -200,7 +200,9 @@ function windowStorage(): Storage | undefined {
 
 function StatusBadge(props: { row: any }): React.JSX.Element {
   const tone = taskTone(deriveSessionTaskStatus(props.row));
-  return <span className={`status status-task-${tone}`}>{sessionTaskStatusText(props.row)}</span>;
+  const label = props.row.status === 'dormant' && props.row.suspendReason === 'topic_recalled'
+    ? t('sessions.suspendReason.topicRecalled') : sessionTaskStatusText(props.row);
+  return <span className={`status status-task-${tone}`}>{label}</span>;
 }
 
 /** 任务态徽标：机器可能空闲，但 transcript 里还有未完成的 TODO。挂在卡片上让人

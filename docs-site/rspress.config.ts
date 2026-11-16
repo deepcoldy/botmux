@@ -34,7 +34,7 @@ const zhSidebar = [
     collapsed: false,
     items: [
       { text: '实时流式卡片', link: '/cards' },
-      { text: '话题资源自动回收', link: '/topic-auto-close' },
+      { text: '话题结束时自动挂起', link: '/topic-auto-close' },
       { text: '原话题不可用策略', link: '/topic-unavailable-policy' },
       { text: 'Web 终端', link: '/web-terminal' },
       { text: '多机器人协作', link: '/multi-bot' },
@@ -132,7 +132,7 @@ const enSidebar = [
     collapsed: false,
     items: [
       { text: 'Streaming Cards', link: '/en/cards' },
-      { text: 'Automatic Topic Cleanup', link: '/en/topic-auto-close' },
+      { text: 'Suspend on Topic End', link: '/en/topic-auto-close' },
       { text: 'Unavailable Topic Policy', link: '/en/topic-unavailable-policy' },
       { text: 'Web Terminal', link: '/en/web-terminal' },
       { text: 'Multi-Bot Collaboration', link: '/en/multi-bot' },

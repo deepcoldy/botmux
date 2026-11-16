@@ -10418,7 +10418,6 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
-    topicAutoClose: getBot(cachedLarkAppId).config.topicAutoClose === true,
     replyDelivery,
     replyDeliveryDefault,
     replyDeliverySupported,
@@ -11884,12 +11883,6 @@ botConfigPutRoute<{ p2pMode?: unknown }>('/api/bot-p2p-mode', 'p2pMode', {
 botConfigPutRoute<{ envelopeInjection?: unknown }>('/api/bot-envelope-injection', 'envelopeInjection', {
   normalize: body => fieldOk(body.envelopeInjection === 'auto' ? 'auto' : null),
   respond: value => ({ ok: true, envelopeInjection: value ?? 'off' }),
-});
-
-botConfigPutRoute<{ topicAutoClose?: unknown }>('/api/bot-topic-auto-close', 'topicAutoClose', {
-  normalize: body => typeof body?.topicAutoClose === 'boolean'
-    ? fieldOk(body.topicAutoClose) : fieldInvalid('invalid_topic_auto_close'),
-  respond: () => ({ ok: true, topicAutoClose: getBot(cachedLarkAppId).config.topicAutoClose === true }),
 });
 
 botConfigPutRoute('/api/bot-topic-unavailable-policy', 'topicUnavailablePolicy', {

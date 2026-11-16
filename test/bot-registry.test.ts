@@ -2939,14 +2939,6 @@ describe('parseBotConfigsFromText — askOptionLayout 冷读', () => {
 
 
 describe('topic write policy configuration', () => {
-  it('enables automatic topic cleanup only for an explicit boolean true', async () => {
-    const mod = await freshImport();
-    const inputs = [true, false, undefined, 'true', 1, null];
-    const parsed = mod.parseBotConfigsFromText(JSON.stringify(inputs.map((value, i) =>
-      makeCfg({ larkAppId: `app_auto_close_${i}`, topicAutoClose: value }))));
-    expect(parsed.map(config => config.topicAutoClose)).toEqual([true, false, false, false, false, false]);
-  });
-
   it('enables source checks only for an explicit stop policy', async () => {
     const mod = await freshImport();
     const inputs = ['stop', 'legacy', undefined, 'STOP', true, null];
