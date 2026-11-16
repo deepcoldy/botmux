@@ -3771,7 +3771,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
 });
 
 describe('Codex App native stop', () => {
-  it.each(['operator-interrupt', 'operator-interrupt-reject'])('handles %s without closing the thread', async behavior => {
+  it.each(['operator-interrupt', 'operator-interrupt-reject', 'operator-interrupt-timeout'])('handles %s without closing the thread', async behavior => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-interrupt-'));
     const fakeCodex = join(dir, 'fake-codex');
     const logPath = join(dir, 'requests.jsonl');
@@ -3790,6 +3790,13 @@ describe('Codex App native stop', () => {
       await waitFor(harness, () => !!target('om_first'));
       const first = target('om_first')!.turnEpoch;
       start('om_queued');
+      const timedOut = behavior.endsWith('-timeout');
+      if (timedOut) {
+        control.interrupt('stop-timeout', first);
+        await waitFor(harness, () => !!receipt('stop-timeout'));
+        expect(receipt('stop-timeout')?.status).toBe('delivery_failed');
+        expect(control.finals).toEqual([]);
+      }
       control.interrupt('stop-first', first);
       await waitFor(harness, () => !!receipt('stop-first'));
       const rejected = behavior.endsWith('-reject');
@@ -3810,6 +3817,7 @@ describe('Codex App native stop', () => {
       expect(requests.filter(r => r.method === 'thread/start')).toHaveLength(1);
       expect(requests.filter(r => r.method === 'turn/start')).toHaveLength(rejected ? 1 : 2);
       expect(requests.filter(r => r.method === 'turn/interrupt').map(r => r.params)).toEqual([
+        ...(timedOut ? [{ threadId: 'thread-fake', turnId: 'turn-fake-1' }] : []),
         { threadId: 'thread-fake', turnId: 'turn-fake-1' },
         ...(!rejected ? [{ threadId: 'thread-fake', turnId: 'turn-fake-2' }] : []),
       ]);

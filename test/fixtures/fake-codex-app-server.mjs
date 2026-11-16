@@ -77,6 +77,7 @@ let reconciledTurn = null;
 let activeTurn;
 let pendingUserInput;
 let steerCount = 0;
+let ignoredOperatorInterrupt = false;
 /** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
  *  fixture can emit a full-items terminal turn that OMITS one — exercising the
  *  runner's B5 group-aware identity defense (must fail closed). */
@@ -618,6 +619,10 @@ function handle(request) {
   if (request.method === 'turn/interrupt' && behavior.startsWith('operator-interrupt')) {
     if (!activeTurn || request.params.threadId !== activeTurn.threadId || request.params.turnId !== activeTurn.turnId) {
       reject(request.id, -32600, 'turn no longer active');
+      return;
+    }
+    if (behavior === 'operator-interrupt-timeout' && !ignoredOperatorInterrupt) {
+      ignoredOperatorInterrupt = true;
       return;
     }
     if (behavior === 'operator-interrupt-reject') {

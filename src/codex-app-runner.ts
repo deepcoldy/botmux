@@ -122,7 +122,11 @@ interface ActiveTurn {
   /** Proven canonical native turn id (distinct from the transient nativeTurnId
    * hint until an exact `turn/started` or start-response binds it). */
   canonicalNativeTurnId?: string;
-  interrupt?: Promise<boolean>;
+  /** A request was accepted or may have reached the server. Hold steering
+   * until the native turn settles, including while a timed-out stop is retried. */
+  interruptRequested?: boolean;
+  /** Coalesce a pending request and reuse a confirmed success. */
+  interruptRequest?: Promise<boolean>;
   /** A start-response is outstanding. SEPARATE from steerInFlight: per codex, a
    * start-response may overlap with a steer once an exact `turn/started` proved
    * the canonical id. */
@@ -850,21 +854,22 @@ async function interruptTurn(requestId: string, turnEpoch: number): Promise<void
   }
   // Freeze native coordinates before the RPC. Any queued input stays queued,
   // and the normal turn/completed path owns the final and next-turn admission.
-  if (!turn.interrupt) {
-    const request = client.request('turn/interrupt', { threadId: tid, turnId: nativeId }, { timeoutMs: 8_000 })
+  if (!turn.interruptRequest) {
+    const priorInterruptRequested = turn.interruptRequested;
+    turn.interruptRequested = true;
+    turn.interruptRequest = client.request('turn/interrupt', { threadId: tid, turnId: nativeId }, { timeoutMs: 8_000 })
       .then(() => true, error => {
         writeLine(`[codex-app] turn interrupt failed: ${asError(error).message}`);
-        // A timeout or lost transport can still be followed by an interrupted
-        // terminal. Keep the stop intent and block steering into that turn.
-        if (error instanceof AppServerRpcError && turn.interrupt === request) {
-          turn.interrupt = undefined;
-          if (activeTurn === turn) void tryAdmitSteer();
+        turn.interruptRequest = undefined;
+        // A retry's rejection cannot disprove a prior ambiguous request.
+        if (error instanceof AppServerRpcError) {
+          turn.interruptRequested = priorInterruptRequested;
+          if (activeTurn === turn && !turn.interruptRequested) void tryAdmitSteer();
         }
         return false;
       });
-    turn.interrupt = request;
   }
-  const delivered = await turn.interrupt;
+  const delivered = await turn.interruptRequest;
   emitMarker('interrupt_result', { requestId, status: delivered ? 'delivered' : 'delivery_failed' });
 }
 
@@ -1176,7 +1181,7 @@ function rebuildReconciledFinal(turn: JsonObject, userItemIndex: number): string
 
 function completeActiveTurnFromNative(turn: ActiveTurn, nativeTurn: JsonObject, exactIndex?: number): void {
   if (activeTurn !== turn || turn.completed || !isTerminalNativeTurn(nativeTurn)) return;
-  turn.failureCode = turn.interrupt && nativeTurn.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(nativeTurn);
+  turn.failureCode = turn.interruptRequested && nativeTurn.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(nativeTurn);
   if (exactIndex !== undefined) {
     turn.finalText = rebuildReconciledFinal(nativeTurn, exactIndex);
     turn.allAgentText = '';
@@ -1908,7 +1913,7 @@ function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
     && turn.phase !== 'fenced'
     && turn.phase !== 'closing'
     && !turn.steeringClosed
-    && !turn.interrupt
+    && !turn.interruptRequested
     && !turn.steerInFlight
     && !steerAdmitting
     && turn.canonicalNativeTurnId !== undefined
@@ -1982,7 +1987,7 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
     turn.knownAgentItemIds.clear();
   }
   turn.terminalCompletion = nativeTurn;
-  turn.failureCode = turn.interrupt && nativeTurn.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(nativeTurn);
+  turn.failureCode = turn.interruptRequested && nativeTurn.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(nativeTurn);
   if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
     nativeActiveTurnId = undefined;
   }
@@ -2046,7 +2051,7 @@ async function reconcileSteeredGroupFromHistory(
       turn.itemText.clear();
       turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
-      turn.failureCode = turn.interrupt && matched.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(matched);
+      turn.failureCode = turn.interruptRequested && matched.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(matched);
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
       // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
