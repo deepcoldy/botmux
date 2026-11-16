@@ -138,6 +138,17 @@ export function integratedManagementExport(mod: unknown): IntegratedManagement |
     ? { Component: value.Component as IntegratedManagement['Component'] } : null;
 }
 
+/**
+ * The dialog can only mirror prerequisite readiness when a single same-origin
+ * management entry exists to mount. A prerequisites plugin without one has no
+ * surface to report state, so the frontend must not gate the toggles: the
+ * server-side assertPluginPrerequisitesReady stays the authoritative fail-closed
+ * check on every enable write.
+ */
+export function frontendManagesPrerequisiteGate(requiresPreparation: boolean, entryUrl: string | undefined): boolean {
+  return requiresPreparation && !!entryUrl;
+}
+
 function PluginManagementSurface(props: {
   plugin: ManagedPlugin;
   children(canEnable: boolean): ReactNode;
@@ -148,14 +159,15 @@ function PluginManagementSurface(props: {
   const [ready, setReady] = useState(false);
   const requiresPreparation = !!props.plugin.contributions?.prerequisites;
   const entry = props.plugin.dashboard?.length === 1 ? props.plugin.dashboard[0] : undefined;
+  const managed = frontendManagesPrerequisiteGate(requiresPreparation, entry?.url);
   useEffect(() => {
     let cancelled = false;
     setLoaded(false);
     setSurface(null);
     setError('');
     setReady(false);
-    if (!requiresPreparation || !entry?.url) { setLoaded(true); return; }
-    const url = new URL(entry.url, location.href);
+    if (!managed) { setLoaded(true); return; }
+    const url = new URL(entry!.url, location.href);
     if (url.origin !== location.origin) { setLoaded(true); setError('插件管理入口必须来自当前宿主'); return; }
     url.searchParams.set('managementVersion', props.plugin.version);
     void import(/* @vite-ignore */ url.href).then(mod => {
@@ -164,16 +176,16 @@ function PluginManagementSurface(props: {
       if (!cancelled) { setError('插件管理面板加载失败，请刷新重试'); setLoaded(true); }
     });
     return () => { cancelled = true; };
-  }, [entry?.url, props.plugin.version, requiresPreparation]);
+  }, [entry?.url, props.plugin.version, managed]);
   const api = useMemo(() => pluginDashboardApi(props.plugin.id), [props.plugin.id]);
   const Component = surface?.Component;
   return <>
-    {requiresPreparation ? <div data-plugin-prerequisites={props.plugin.id}>
+    {managed ? <div data-plugin-prerequisites={props.plugin.id}>
       {!loaded ? <div role="status" className="plugin-muted">正在检查安装和登录状态…</div>
         : Component ? <Component pluginId={props.plugin.id} api={api} onReadinessChange={setReady} />
           : <div className="plugin-warning" role="alert">{error || '前置状态暂不可用，请刷新重试'}</div>}
     </div> : null}
-    {props.children(!requiresPreparation || ready)}
+    {props.children(!managed || ready)}
   </>;
 }
 
