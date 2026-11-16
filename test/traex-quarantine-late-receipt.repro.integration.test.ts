@@ -205,7 +205,6 @@ setInterval(() => {
       'initial prompt readiness',
       30_000,
     );
-    const initialReadyCount = messages.filter(message => message.type === 'prompt_ready').length;
 
     child.send({
       type: 'message',

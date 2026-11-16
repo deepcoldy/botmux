@@ -133,6 +133,37 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
     expect(h.scope.cliAdapter.writeInput.mock.calls[1][1]).toBe('next input');
   });
 
+  it('with no known native session id, an owned receipt without a session id cannot release', async () => {
+    const h = harness();
+    h.scope.lastInitConfig = { cliId: 'traex' };
+    await warnAndDrop(h);
+    const original = h.scope.inputDeliveryQuarantine;
+    h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true });
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.scope.inputDeliveryQuarantine).toBe(original);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+  });
+
+  it('binds to a native session id learned while quarantined', async () => {
+    const h = harness();
+    h.scope.lastInitConfig = { cliId: 'traex' };
+    await warnAndDrop(h);
+    const original = h.scope.inputDeliveryQuarantine;
+    // The binding can be learned after arm (e.g. rollout attach); from then on
+    // a receipt owned by a different native session must not release the queue.
+    h.scope.lastInitConfig.cliSessionId = 'learned-session';
+    h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true, cliSessionId: 'other-owned-session' });
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.scope.inputDeliveryQuarantine).toBe(original);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true, cliSessionId: 'learned-session' });
+    h.scope.cliAdapter.writeInput.mockResolvedValue({ submitted: true });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+    expect(h.scope.cliAdapter.writeInput.mock.calls[1][1]).toBe('next input');
+  });
+
   it.each(['backend', 'generation', 'restart', 'replacement', 'native-session'] as const)(
     'rejects an otherwise-valid owned receipt after %s change', async change => {
       const h = harness(); await warnAndDrop(h);
