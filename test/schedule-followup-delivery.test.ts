@@ -55,7 +55,8 @@ function addFollowup(overrides: Partial<Parameters<typeof scheduler.addTask>[0]>
     id: 'f0110a01', name: 'follow the original question', prompt: 'check rule 123',
     schedule: 'every 1m', workingDir: directory, chatId: 'oc_question',
     rootMessageId: placement.position === 'topic' ? 'om_question' : undefined,
-    executionPosition: placement.position, larkAppId: APP, untilDone: {}, ...overrides,
+    executionPosition: placement.position, larkAppId: APP, untilDone: {},
+    owner: { kind: 'ownerless' }, ...overrides,
   });
 }
 

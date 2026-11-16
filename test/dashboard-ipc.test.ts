@@ -7103,7 +7103,7 @@ describe('GET /api/schedules', () => {
       chatType: 'topic_group',
       untilDone: { retryMinutes: 5, deadline },
       notify: ['failing', 'expired'],
-      ownerOpenId: 'ou_schedule_owner',
+      owner: { kind: 'human' as const, openId: 'ou_schedule_owner' },
     });
     scheduleStore.updateTask(add.id, {
       runStats: { dispatched: 3, skipped: 0, failed: 2, missed: 0, consecutiveFailures: 2 },
