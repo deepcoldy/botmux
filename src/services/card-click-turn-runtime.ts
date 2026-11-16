@@ -13,6 +13,8 @@ import {
 
 export interface CardClickBoundSession {
   sessionId: string;
+  /** Where replies about this session go (its thread root, or the chat). */
+  anchorId?: string;
   chatId: string;
   chatType: 'group' | 'p2p';
   workingDir?: string;
@@ -87,7 +89,7 @@ export async function acceptCardClickTurn(
     sig?: string;
   },
   deps: CardClickTurnRuntimeDeps,
-): Promise<{ ok: true; chatId: string; run: () => Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> }
+): Promise<{ ok: true; chatId: string; anchorId?: string; prompt: string; run: () => Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> }
   | { ok: false; reason: CardClickTurnFailure }> {
   const now = deps.now();
   let secret: string;
@@ -165,6 +167,8 @@ export async function acceptCardClickTurn(
   return {
     ok: true,
     chatId,
+    ...(bound.anchorId ? { anchorId: bound.anchorId } : {}),
+    prompt,
     run: async () => {
       if (assignDir) {
         deps.setWorkingDir(bound, assignDir);
@@ -175,7 +179,10 @@ export async function acceptCardClickTurn(
         ...(unionId ? { memberUnionId: unionId } : {}),
         prompt,
       });
-      if (!started.ok && started.reason !== 'delivery_failed') {
+      if (!started.ok) {
+        // startTurn reports failure only after rolling back: nothing reached
+        // the session, so the same button may be clicked again.
+        try { deps.nonces.release?.(claims.nonce); } catch { /* the button stays used */ }
         return { ok: false, reason: 'delivery_failed' };
       }
       return started;

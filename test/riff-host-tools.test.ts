@@ -14,7 +14,8 @@ import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE, executeRiffHostTool, parseRiffHos
   RIFF_HOST_MAX_ATTACHMENT_BYTES, RIFF_HOST_MAX_BYTES,
   type RiffHostContext, type RiffHostBinding } from '../src/services/riff-host-tools.js';
 import { quotedAttachments, QuotedAttachmentLimitError } from '../src/services/remote-runner-session-tool.js';
-import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments } from '../src/cli/riff-host-tools.js';
+import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments,
+  type RiffHostHttpResponse } from '../src/cli/riff-host-tools.js';
 import { assertCardPatchChat } from '../src/cli/card-dispatch.js';
 
 const roots: string[] = [], servers: Server[] = [];
@@ -604,14 +605,43 @@ describe('Riff host client failure reporting', () => {
   });
 
   it('names the transport error code without the private address when the endpoint never answers', async () => {
-    const closed = createServer();
-    await new Promise<void>(resolve => closed.listen(0, '127.0.0.1', resolve));
-    const port = (closed.address() as { port: number }).port;
-    await new Promise<void>(resolve => closed.close(() => resolve()));
-    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}/api/riff-host-tools`), request()));
+    // The transport is injected instead of probing a closed ephemeral port: a
+    // port that was just released can be re-bound by a concurrent process before
+    // the client connects, which turned this case into a 404 from a stranger
+    // server instead of ECONNREFUSED (flaky on busy CI shards). The error shape
+    // mirrors what node:http hands the client for a refused loopback connect.
+    const port = 61234;
+    const refused = async (): Promise<RiffHostHttpResponse> => {
+      throw Object.assign(new Error(`connect ECONNREFUSED 127.0.0.1:${port}`), { code: 'ECONNREFUSED' });
+    };
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}/api/riff-host-tools`), request(), refused));
     expect(message).toMatch(/^riff_host_transport_unknown \(ECONNREFUSED\); do not repeat automatically — /);
     expect(message).toContain('riff.hostToolsUrl');
     expect(message).not.toContain(String(port));
+  });
+
+  it('keeps the code of a real transport failure and hides the address', async () => {
+    // The injected case above pins the classification; this one runs the real
+    // client, so the code must survive its own error path. The listener stays
+    // bound for the whole case (no released port another process could take)
+    // and drops each connection after reading the request.
+    const dropped: string[] = [];
+    const s = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.headers['x-riff-host-token'] === token) dropped.push(req.method!);
+        res.socket?.destroy();
+      });
+    });
+    servers.push(s);
+    await new Promise<void>(resolve => s.listen(0, '127.0.0.1', resolve));
+    const port = (s.address() as { port: number }).port;
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}${RIFF_HOST_TOOLS_ROUTE}`), request()));
+    expect(message).toMatch(/^riff_host_transport_unknown \(ECONNRESET\); do not repeat automatically — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain(String(port));
+    // The command went out once; the retries only asked for its outcome.
+    expect(dropped).toEqual(['POST', 'GET', 'GET']);
   });
 
   it('still completes a normal running → completed exchange through the direct client', async () => {

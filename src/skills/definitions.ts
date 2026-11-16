@@ -23,7 +23,7 @@ export interface SkillDef {
 
 const SCHEDULE_SKILL = `---
 name: botmux-schedule
-description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 按任务的执行位置续跑；群内默认发到群顶层，要继续当前话题必须显式传 --topic。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
+description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 按任务的执行位置续跑；常规报告默认群顶层；当前话题创建的 --until-done 跟进默认保留原话题，显式位置优先。其他当前话题提醒请传 --topic。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
 ---
 
 # botmux-schedule — 定时任务
@@ -33,7 +33,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ## 核心原则
 
 1. **创建前必须跟用户确认** schedule 和 prompt 的具体内容，避免误加
-2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
+2. **跟进沿用原话题** —— 当前群话题创建的 --until-done 默认沿用原话题；常规报告默认群顶层，其他当前话题提醒显式传 --topic。显式位置始终优先；在当前话题可省略 --chat-id / --root-msg-id，由 botmux 推断锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
 
@@ -58,7 +58,7 @@ botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --top
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 非静默 \`--new-topic\` / \`task\` 的 \`--topic-title\` 支持触发时模板：\`{{date}}\` 是定时任务时区的自然日，\`{{date:-1d}}\` / \`{{date:+2d}}\` 按自然日偏移，\`{{owner}}\` 是任务创建人的真实飞书 mention。模板仅在每次触发时渲染，保存的任务配置保持不变；silent 延迟建根仅支持静态标题，动态模板会在创建或更新时被拒绝。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
-执行位置是任务级可选项：**群内默认在群顶层执行，即使从话题内创建也不继承原话题**；要按用户要求在当前话题跟进、轮询或提醒，必须显式传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+执行位置是任务级可选项：**常规报告默认群顶层；同群真实话题创建的 --until-done 默认原话题，跨群不会继承**；显式执行位置优先。其他当前话题跟进、轮询或提醒请传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
 
 ### 查看
@@ -95,6 +95,8 @@ botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触�
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
 
 ### 跟进任务：等某件事发生后再做（--until-done）
+
+创建后核对执行位置、检查频率、通知对象和停止条件。详情卡和 Dashboard 同时显示上次结果、连续失败与到期原因；派发成功不代表业务完成，完成以 done 状态为准。
 
 用户要你「等 X 之后再做 Y」「每天看一下，好了就处理」「某天之后去清理」时，建一个 \`--until-done\` 任务，不要在 prompt 里自己设计循环和停止条件：
 
@@ -311,6 +313,8 @@ description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted 
 \`\`\`
 
 看到这种提示，先判断引用内容是否对当前任务必要：必要就调用 \`botmux quoted om_xxx\` 拉取，不必要就忽略（不要无脑调用、污染上下文）。
+
+**正文与关联附件**：读取由 botmux 新版本发送的主消息时，输出可包含 \`delivery\` 交付记录，列出文件/视频的显示名、status 与实际 messageId。只对所需 sent 项的 messageId 再运行 \`botmux quoted <附件消息ID>\` 下载。pending 表示中断后结果未确认，failed 表示该项发送失败，不自动重发；记录缺失时不要猜测附件关联。
 
 **不限于引用场景**：\`message_id\` 可以是任意你可见的消息 id——典型用法是从 \`botmux history\` 的输出里拿到某张卡片/图片消息的 \`messageId\`，再用本命令拉全文 + 把附件下载到本地（history 本身不下载附件）。
 
@@ -835,6 +839,8 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 ## 输出
 
 成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"...","quotedMessageId":"om_yyy 或 null","mentioned":[{"open_id":"ou_x","name":"Codex"}]}\`
+正文与文件/视频附件会关联为交付记录，成功输出的 \`replyDeliveryId\` 标识这次附件交付；后续 quoted 主消息可找到各附件的真实 messageId。返回 \`failedAttachments\` / \`failedVideoAttachments\` 时，应向用户说明具体失败项；\`attachmentTrackingErrors\` 表示关联记录未完整保存，已成功发送的正文和附件仍然有效，请勿因此重发。
+
 其中 \`quotedMessageId\` 是实际引用的消息（纯发为 null），\`mentioned\` 是实际 @ 的对象。stderr 另给一行人类可读摘要。
 失败 exit 1；**未做 @ 决策 exit 2**（按提示补 \`--mention\`/\`--mention-back\`/\`--no-mention\`）。
 `;

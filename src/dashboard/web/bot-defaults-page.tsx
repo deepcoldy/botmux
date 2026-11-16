@@ -14,7 +14,9 @@ import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { BlockedUsersEditor } from './blocked-users-editor.js';
 import { QuietPresetSection } from './quiet-preset-section.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
-import type { PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { resolvePromptCachePolicy, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
+import type { ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import {
   BOT_DEFAULTS_TABS,
   BOT_DEFAULTS_TAB_LABEL_KEYS,
@@ -28,6 +30,7 @@ import {
   fetchCliOptions,
   fetchCardBrandLabelEnabled,
   fetchGlobalPromptCache,
+  fetchGlobalProviderRecovery,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -658,6 +661,9 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     goalStatusCard: body.goalStatusCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
+    replyCardNextStep: body.replyCardNextStep,
+    replyCardRecap: body.replyCardRecap,
+    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -1175,6 +1181,10 @@ function BotDefaultsCard(props: {
             {/* 提示缓存 TTL / 保活只对 Claude Code 生效（--settings promptCacheTtl + 注入保活轮）。 */}
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('prompt-cache')}><PromptCacheSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {/* 暂态故障自动续跑只接 Claude Code 的普通轮次（Codex 容量续跑另有开关）。 */}
+            {bot.cliId === 'claude-code' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('provider-recovery')}><ProviderRecoverySection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -6012,6 +6022,9 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
+  const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
+  const [recap, setRecap] = useState(bot.replyCardRecap === true);
+  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6029,10 +6042,13 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setGoalStatusCard(bot.goalStatusCard === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
+    setNextStep(bot.replyCardNextStep === true);
+    setRecap(bot.replyCardRecap === true);
+    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6310,6 +6326,45 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = replyActions;
                 setReplyActions(checked);
                 void savePatch({ replyCardActions: checked }, 'reply-actions', () => setReplyActions(previous));
+              }}
+            />
+            <ToggleRow
+              checked={nextStep}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-next-step"
+              title={tr('botDefaults.replyCardNextStep')}
+              description={tr('botDefaults.replyCardNextStepDescription')}
+              help={tr('botDefaults.replyCardNextStepHelp')}
+              onChange={checked => {
+                const previous = nextStep;
+                setNextStep(checked);
+                void savePatch({ replyCardNextStep: checked }, 'reply-next-step', () => setNextStep(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recap}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-recap"
+              title={tr('botDefaults.replyCardRecap')}
+              description={tr('botDefaults.replyCardRecapDescription')}
+              help={tr('botDefaults.replyCardRecapHelp')}
+              onChange={checked => {
+                const previous = recap;
+                setRecap(checked);
+                void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recapModel}
+              disabled={busy !== null || !recap}
+              dataAction="toggle-reply-card-recap-model"
+              title={tr('botDefaults.replyCardRecapModel')}
+              description={tr('botDefaults.replyCardRecapModelDescription')}
+              help={tr('botDefaults.replyCardRecapModelHelp')}
+              onChange={checked => {
+                const previous = recapModel;
+                setRecapModel(checked);
+                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>
@@ -9088,6 +9143,50 @@ function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
         onSave={save}
       />
       <StatusSpan status={status} attr={{ 'data-prompt-cache-status': '' }} />
+    </section>
+  );
+}
+
+function ProviderRecoverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [globals, setGlobals] = useState<{ providerRecovery: ProviderRecoveryConfig | null; promptCache: PromptCacheConfig | null }>(
+    { providerRecovery: null, promptCache: null });
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchGlobalProviderRecovery().then(value => { if (alive) setGlobals(value); });
+    return () => { alive = false; };
+  }, []);
+
+  async function save(value: ProviderRecoveryConfig | null): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/provider-recovery`, { providerRecovery: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = body.providerRecovery && typeof body.providerRecovery === 'object'
+          ? body.providerRecovery as ProviderRecoveryConfig : null;
+        props.patchBot(props.bot.larkAppId, { providerRecovery: next });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionProviderRecovery')}</h3>
+      <small className="bd-section-note">{tr('botDefaults.providerRecoveryNote')}</small>
+      <ProviderRecoveryEditor
+        scope="bot"
+        value={props.bot.providerRecovery ?? null}
+        globalValue={globals.providerRecovery}
+        promptCacheTtl={resolvePromptCachePolicy(globals.promptCache ?? undefined, props.bot.promptCache ?? undefined).ttl}
+        disabled={busy}
+        onSave={save}
+      />
+      <StatusSpan status={status} attr={{ 'data-provider-recovery-status': '' }} />
     </section>
   );
 }

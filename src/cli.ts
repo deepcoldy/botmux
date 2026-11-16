@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { sendCompletionHintKey } from './services/send-completion-hint.js';
 import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
@@ -9202,18 +9203,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
-    // Default to group top-level: a schedule created inside a topic session
-    // (including an adopted one) must not pin its results to that topic.
-    // --topic opts in explicitly; p2p sessions keep the legacy inference.
-    const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
-      ? 'new-topic'
-      : wantsTopLevel
-        ? 'top-level'
-        : wantsTopic || wantsFollowActive
-          ? 'topic'
-          : cur?.chatType === 'p2p'
-            ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
-            : 'top-level';
+    const placement = scheduleCreatePlacement({
+      newTopic: wantsNewTopic, topLevel: wantsTopLevel, topic: wantsTopic,
+      followActive: wantsFollowActive, untilDone: rest.includes('--until-done'),
+      chatId, currentChatId: cur?.chatId, currentChatType: cur?.chatType, currentScope: cur?.scope, rootMessageId,
+    });
+    const executionPosition = placement.position;
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
       console.error(wantsFollowActive
@@ -9379,6 +9374,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
+    if (placement.inferredFollowup) console.log('   跟进落点: 当前问题的原话题（显式 --top-level / --new-topic 可覆盖）');
+    for (const line of scheduleSupportLines(task, 'zh').slice(1)) console.log(`   ${line}`);
     if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     if (task.untilDone) {
@@ -14971,16 +14968,36 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
+    const attachmentTrackingErrors: string[] = [];
+    let replyDeliveryId: string | undefined;
     if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
-      ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
-      ));
+      const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+      const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
+      if (files.length || videoAttachments.length) {
+        try {
+          replyDeliveryId = deliveryStore.begin(appId, messageId, targetChatId, [
+            ...files.map(path => ({ path, type: 'file' as const })),
+            ...videoAttachments.map(video => ({ path: video.videoPath, type: 'media' as const })),
+          ]);
+        } catch (error) { attachmentTrackingErrors.push(error instanceof Error ? error.message : String(error)); }
+      }
+      const onResult = replyDeliveryId ? (index: number, outcome: { messageId: string } | { failed: true }) =>
+        deliveryStore.record(appId, messageId, targetChatId, replyDeliveryId!, index, outcome) : undefined;
+      const fileResult = await sendFileAttachments(
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect, onResult }, appId, files,
+      );
+      attachmentMessageIds = fileResult.sent;
+      failedAttachments = fileResult.failed;
+      attachmentTrackingErrors.push(...(fileResult.trackingErrors ?? []).map(item => item.error));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect,
+          onResult: onResult ? (index, outcome) => onResult(files.length + index, outcome) : undefined }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+      attachmentTrackingErrors.push(...(videoResult.trackingErrors ?? []).map(item => item.error));
     }
+    for (const error of attachmentTrackingErrors) console.error(`⚠️ 正文/附件关联记录未完整保存（已发送的消息请勿重发）: ${error}`);
     // Attachments are independent Lark messages posted after the main reply
     // card. Record the actual bottom-most carrier so terminal auto mode never
     // PATCHes an earlier card and leaves a file/voice/custom carrier below it
@@ -15117,6 +15134,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         : {}),
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
+      ...(replyDeliveryId ? { replyDeliveryId } : {}),
+      ...(attachmentTrackingErrors.length ? { attachmentTrackingErrors } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),

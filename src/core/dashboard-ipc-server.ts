@@ -7756,6 +7756,16 @@ export interface ScheduleRow {
   lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
+  /** until-done state, run ledger and owner notification settings. They feed
+   *  the shared schedule support summary (schedule-followup) on the Dashboard
+   *  and Lark cards; without them the wire row renders the wrong stop
+   *  condition ("stops after one run") and never shows failure counts. The
+   *  anonymous public board still strips `ownerOpenId` via
+   *  redactSchedulesForPublic. */
+  untilDone?: ScheduledTask['untilDone'];
+  runStats?: ScheduledTask['runStats'];
+  notify?: ScheduledTask['notify'];
+  ownerOpenId?: ScheduledTask['ownerOpenId'];
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
@@ -7953,6 +7963,10 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     lastStatus: t.lastStatus,
     lastError: t.lastError,
     repeat: t.repeat,
+    untilDone: t.untilDone,
+    runStats: t.runStats,
+    notify: t.notify,
+    ownerOpenId: t.ownerOpenId,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
     followActive: t.followActive === true ? true : undefined,
@@ -10591,6 +10605,9 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     goalStatusCard: cardPrefs.goalStatusCard,
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
+    replyCardNextStep: cardPrefs.replyCardNextStep,
+    replyCardRecap: cardPrefs.replyCardRecap,
+    replyCardRecapModel: cardPrefs.replyCardRecapModel,
     cotEnabled: cardPrefs.cotEnabled,
     replyCardShowTools: cardPrefs.replyCardShowTools,
     replyCardNativeCot: cardPrefs.replyCardNativeCot,
@@ -10624,6 +10641,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
+    providerRecovery: (() => { try { return getBot(cachedLarkAppId).config.providerRecovery ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -10753,7 +10771,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; replyCardRecapModel?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -10775,7 +10793,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; replyCardRecapModel?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -10843,6 +10861,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.goalStatusCard === 'boolean') patch.goalStatusCard = body.goalStatusCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
+  if (typeof body.replyCardNextStep === 'boolean') patch.replyCardNextStep = body.replyCardNextStep;
+  if (typeof body.replyCardRecap === 'boolean') patch.replyCardRecap = body.replyCardRecap;
+  if (typeof body.replyCardRecapModel === 'boolean') patch.replyCardRecapModel = body.replyCardRecapModel;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
@@ -12305,6 +12326,21 @@ botConfigPutRoute<{ promptCache?: unknown }>('/api/bot-prompt-cache', 'promptCac
     return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
   },
   respond: value => ({ ok: true, promptCache: value ?? null }),
+});
+
+// Per-bot automatic continuation after transient provider failures. Body
+// `{ providerRecovery?: { enabled?, maxWaitMinutes? } | null }`: null/缺省 → 删除本 bot
+// 覆盖，回落全局 config.json `providerRecovery`（都没配 = 关闭）。daemon 实时读取：
+// 新轮次立即按新值，关闭时正在等待的续跑收尾并发通知。
+botConfigPutRoute<{ providerRecovery?: unknown }>('/api/bot-provider-recovery', 'providerRecovery', {
+  notBound: NOT_BOUND_BODY.okFalse,
+  normalize: (body, spec) => {
+    if (body.providerRecovery === null || body.providerRecovery === undefined) return fieldOk(null);
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.providerRecovery));
+    if (!parsed.ok && parsed.reason === 'empty') return fieldOk(null);
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, providerRecovery: value ?? null }),
 });
 
 botConfigPutRoute<{ feedback?: unknown }>('/api/bot-feedback', 'feedback', {

@@ -114,6 +114,7 @@
 | `cliConfigDir` | 仅 Claude Code：用 `CLAUDE_CONFIG_DIR=<目录>` 启动，设置、登录态和会话记录都来自这个目录。只影响新会话 |
 | `disableCliBypass` | 设为 `true` 时不自动追加 `--yolo`、`--dangerously-*` 这类免审批参数 |
 | `promptCache` | 仅 Claude Code：提示缓存的有效期和空闲保活，例如 `{"ttl":"1h","keepalive":{"enabled":true}}`。没写的字段沿用全局设置，默认关闭 |
+| `providerRecovery` | 仅 Claude Code：模型服务暂时出错时自动续跑，例如 `{"enabled":true,"maxWaitMinutes":30}`。没写的字段沿用全局设置，默认关闭。说明见[全局设置：暂态故障自动续跑](/global-settings#provider-recovery) |
 | `skillInjection` | botmux 自带 skill 怎么交给 CLI：`prompt`（按会话注入）、`global`（装进 CLI 全局 skill 目录）、`off`。不填时跟随全局设置，全局默认是 `prompt`。见 [Skill](/skill-cli) |
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |

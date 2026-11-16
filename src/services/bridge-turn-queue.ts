@@ -97,6 +97,13 @@ export interface BridgePendingTurn {
   /** Text of the API-error record that set a non-completed terminalOutcome
    *  (unmasked; the worker masks and clips it before it leaves). */
   terminalErrorDetail?: string;
+  /** Transcript time of the last real model reply this queue read before the
+   *  record that set a non-completed terminalOutcome — the last request the
+   *  provider answered, i.e. when its prompt cache was last refreshed. It may
+   *  belong to an earlier turn (a turn whose first request failed). Absent
+   *  when no reply was read since this queue started (e.g. right after a
+   *  worker restart, whose baseline skips history). */
+  terminalProviderLastSuccessAtMs?: number;
   /** Structured 429 observed for this turn. It remains owned by the existing
    * limited/reset path and must not be converted into ordinary ambiguity when
    * the following turn_duration closes the transcript boundary. */
@@ -412,6 +419,16 @@ export class BridgeTurnQueue {
    *  each waiting out the bound. A marker read afterwards outranks this.
    *  Survives clearPending for the same reason as durationMarkerSeen. */
   private durationMarkerWaitExpired = false;
+  /** Transcript time of the newest real model reply read (any main-thread
+   *  assistant record that is not an API error or a no-model placeholder,
+   *  tool_use blocks included). Survives clearPending like the markers above:
+   *  it describes the provider session, not one generation's turns. */
+  private lastProviderReplyAtMs: number | undefined;
+
+  private stampProviderLastSuccess(turn: BridgePendingTurn): void {
+    if (this.lastProviderReplyAtMs !== undefined) turn.terminalProviderLastSuccessAtMs = this.lastProviderReplyAtMs;
+    else delete turn.terminalProviderLastSuccessAtMs;
+  }
 
   /** Record that this transcript writes `system/turn_duration` markers. */
   noteDurationMarkerObserved(): void {
@@ -798,6 +815,7 @@ export class BridgeTurnQueue {
               const detail = apiErrorMessageText(ev).trim();
               if (detail) this.collecting.terminalErrorDetail = detail;
               else delete this.collecting.terminalErrorDetail;
+              this.stampProviderLastSuccess(this.collecting);
             } else {
               // The `<synthetic>` placeholder is the WEAKEST terminal signal
               // there is - no model call happened at all (no requestId, usage
@@ -809,11 +827,18 @@ export class BridgeTurnQueue {
               if (this.collecting.terminalOutcome === undefined) {
                 this.collecting.terminalOutcome = terminalOutcome;
                 this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
+                this.stampProviderLastSuccess(this.collecting);
               }
             }
             this.collecting.terminalObserved = true;
           }
           continue;
+        }
+        // A real model reply: the provider answered this request.
+        const replyAtMs = eventTimeMs(ev);
+        if (replyAtMs !== undefined
+          && (this.lastProviderReplyAtMs === undefined || replyAtMs > this.lastProviderReplyAtMs)) {
+          this.lastProviderReplyAtMs = replyAtMs;
         }
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
@@ -1380,6 +1405,9 @@ export class BridgeTurnQueue {
         if (head.terminalOutcome && absorbed.terminalOutcome === undefined) {
           absorbed.terminalOutcome = head.terminalOutcome;
           if (head.terminalErrorDetail) absorbed.terminalErrorDetail = head.terminalErrorDetail;
+          if (head.terminalProviderLastSuccessAtMs !== undefined) {
+            absorbed.terminalProviderLastSuccessAtMs = head.terminalProviderLastSuccessAtMs;
+          }
         }
         if (head.rateLimited) absorbed.rateLimited = true;
         out.push(absorbed);

@@ -3,6 +3,7 @@ import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
   CliTurnPayload,
+  AcceptedCommandInput,
   ChatContext,
   CotEntry,
   Session,
@@ -341,6 +342,7 @@ export interface DaemonSession {
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
   pendingCodexAppText?: string;
+  pendingAcceptedInput?: AcceptedCommandInput;
   /** Trusted, Botmux-authored instructions held out of the visible Codex App
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
@@ -500,6 +502,8 @@ export interface DaemonSession {
     completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
+    /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
+    lastDashboardPublishedAtMs?: number;
   }>;
   /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
    * Values are receipt epoch milliseconds, also fencing older legacy starts

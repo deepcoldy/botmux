@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildRecoveryFailedCard, type RecoveryFailedCardOpts } from '../src/im/lark/card-builder.js';
 import { t } from '../src/i18n/index.js';
+import { formatClockTime } from '../src/utils/clock-time.js';
 import { CODEX_CAPACITY_ERROR_CODE } from '../src/services/codex-transcript.js';
 import {
   buildRecoveryRetryContent,
@@ -90,6 +91,44 @@ describe('recovery failure card', () => {
       const { buttons, markdown } = render({ retry: { kind: 'none', reason } });
       expect(buttons.some(b => b.value?.action === 'retry_recovery_turn')).toBe(false);
       expect(markdown.join('\n')).toContain(t(`card.recovery_failed.no_retry_${reason}`, undefined, 'zh'));
+    }
+  });
+});
+
+describe('a recovery that stopped on its window', () => {
+  const endsAt = new Date('2026-11-13T12:02:58.000Z');
+  const providerRetryAt = new Date('2026-11-13T13:00:00.000Z');
+
+  it('says until when it kept continuing and why it stopped there', () => {
+    const outcomeKey = recoveryOutcomeI18nKey({ recoveryStatus: 'exhausted', continuations: 14, stopReason: 'window_closed' });
+    const { markdown } = render({ outcomeKey, continuations: 14, recoveryWindow: { endsAt, minutes: 55 } });
+    const text = markdown.join('\n');
+    expect(text).toContain(t(outcomeKey, { count: '14', windowEnd: formatClockTime(endsAt.getTime(), 'zh') }, 'zh'));
+    expect(text).toContain(formatClockTime(endsAt.getTime(), 'zh'));
+    expect(markdown).toContain(t('card.recovery_failed.window_hint', { minutes: '55' }, 'zh'));
+  });
+
+  it('names the provider\'s own time when that is what lay beyond the window', () => {
+    const outcomeKey = recoveryOutcomeI18nKey({ recoveryStatus: 'exhausted', continuations: 0, stopReason: 'provider_eta_beyond_window' });
+    const { markdown } = render({ outcomeKey, continuations: 0, recoveryWindow: { endsAt, minutes: 55, providerRetryAt } });
+    expect(markdown.join('\n')).toContain(formatClockTime(providerRetryAt.getTime(), 'zh'));
+  });
+
+  it('keeps the plain exhausted wording, without a window note, for a fixed-ladder recovery', () => {
+    const outcomeKey = recoveryOutcomeI18nKey({ recoveryStatus: 'exhausted', continuations: 2 });
+    expect(outcomeKey).toBe('card.recovery_failed.outcome.exhausted');
+    const { markdown } = render({ outcomeKey, continuations: 2 });
+    expect(markdown).not.toContain(t('card.recovery_failed.window_hint', { minutes: '55' }, 'zh'));
+  });
+
+  it('resolves every stop reason in both locales', () => {
+    for (const stopReason of ['window_closed', 'provider_eta_beyond_window', 'max_continuations'] as const) {
+      const key = recoveryOutcomeI18nKey({ recoveryStatus: 'exhausted', continuations: 3, stopReason });
+      for (const locale of ['zh', 'en'] as const) {
+        expect(t(key, { count: '3', windowEnd: '12:00', eta: '13:00' }, locale)).not.toBe(key);
+        expect(t(`worker.ordinary_recovery_${stopReason}`, { cliName: 'Claude', count: '3', minutes: '55', windowEnd: '12:00', eta: '13:00' }, locale))
+          .not.toBe(`worker.ordinary_recovery_${stopReason}`);
+      }
     }
   });
 });

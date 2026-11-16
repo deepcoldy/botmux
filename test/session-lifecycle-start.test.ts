@@ -283,7 +283,11 @@ import {
   __testOnly_resetTurnTerminalReportingClis,
   manualSuspendWaits,
   queueManualSuspend,
+  streamCardLabel,
 } from '../src/core/worker-pool.js';
+import { formatClockTime } from '../src/utils/clock-time.js';
+import { buildRecoveryFailedCard, buildTurnFailedCard } from '../src/im/lark/card-builder.js';
+import { disposeOrdinaryTurnRecovery } from '../src/services/ordinary-turn-recovery.js';
 import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
   awaitReadonlyTaskContinuationUser,
@@ -4883,9 +4887,188 @@ describe('TraeX task continuation', () => {
 });
 
 describe('ordinary Claude semantic recovery', () => {
-  it('continues twice without another user message, then warns exactly once', async () => {
+  it('replays the 11-13 gateway 503: waits for the provider\'s time, says so in the chat and on the card, then continues', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.setSystemTime(Date.parse('2026-11-13T11:08:19.343Z'));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'claude-code', providerRecovery: { enabled: true },
+      // A 1-hour prompt cache: the wait follows it (55 minutes).
+      promptCache: { ttl: '1h' },
+    }));
+    const sessionReply = vi.fn(async () => 'om_notice');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'review PR', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+    const recoveries = () => vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId?.startsWith('bmx-recovery-'));
+    const providerAvailableAt = Date.parse('2026-11-13T11:10:16Z');
+    const lastAnsweredAt = Date.parse('2026-11-13T11:07:58Z');
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+      providerRetryAtMs: providerAvailableAt,
+      providerLastSuccessAtMs: lastAnsweredAt,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const state = ds.session.ordinaryTurnRecovery!;
+    expect(state).toEqual(expect.objectContaining({
+      status: 'backoff',
+      providerRetryAt: providerAvailableAt,
+      windowEndsAt: lastAnsweredAt + 55 * 60_000,
+      windowMinutes: 55,
+      windowFollowsCache: true,
+    }));
+    expect(state.nextAttemptAt!).toBeGreaterThan(providerAvailableAt);
+
+    // One plain notice in the topic: what is wrong and when it continues.
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const [, notice, msgType, , replyTurnId] = sessionReply.mock.calls[0] as unknown as unknown[];
+    expect(msgType).toBe('text');
+    expect(replyTurnId).toBe('om_original');
+    expect(notice).toContain(formatClockTime(providerAvailableAt, 'zh'));
+    expect(notice).toContain(formatClockTime(state.nextAttemptAt!, 'zh'));
+    expect(notice).toContain(formatClockTime(state.windowEndsAt!, 'zh'));
+    // The live card reads 「预计 HH:MM 自动续跑」 while the CLI sits at its prompt.
+    ds.lastScreenStatus = 'idle';
+    expect(streamCardLabel(ds)).toEqual({ recoveryAt: state.nextAttemptAt });
+
+    // Where the fixed 2s/8s ladder continued — and gave up — nothing happens.
+    await vi.advanceTimersByTimeAsync(providerAvailableAt - Date.now());
+    expect(recoveries()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(state.nextAttemptAt! - Date.now());
+    expect(recoveries()).toHaveLength(1);
+    const continuation = recoveries()[0];
+    worker.emit('message', { type: 'turn_input_received', turnId: continuation.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: continuation.turnId });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: continuation.turnId, status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+    expect(sessionReply.mock.calls.filter(call => (call as unknown[])[2] === 'interactive')).toHaveLength(0);
+    expect(streamCardLabel(ds)).not.toEqual(expect.objectContaining({ recoveryAt: expect.any(Number) }));
+  });
+
+  it('a turn someone completes in the web terminal during the wait cancels it, like a new message', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'review PR', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true, providerRetryAtMs: Date.now() + 120_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    // A turn typed in the pane: the worker forwards no reply for it (local-typed),
+    // only its terminal under the bridge's `local-<uuid>` id.
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-u-typed-1', status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'cancelled', cancelledByTurnId: 'local-u-typed-1',
+    }));
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+  });
+
+  it('a web-terminal turn after the recovery already stopped leaves that failure and its attention alone', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'review PR', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+    // The provider expects to be back in three hours: beyond the window, so
+    // the recovery stops at once and says so.
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true, providerRetryAtMs: Date.now() + 3 * 60 * 60_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'exhausted', stopReason: 'provider_eta_beyond_window',
+    }));
+    const attention = ds.agentAttention;
+    expect(attention).toEqual(expect.objectContaining({ kind: 'blocked' }));
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-u-typed-2', status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('exhausted');
+    expect(ds.agentAttention).toBe(attention);
+  });
+
+  it('a background wake answering during the wait does not cancel it', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'review PR', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true, providerRetryAtMs: Date.now() + 120_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', {
+      type: 'final_output', content: 'background task finished', lastUuid: 'a-wake', turnId: 'local-headless-1',
+      kind: 'local-turn-headless',
+    });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-headless-1', status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    await vi.advanceTimersByTimeAsync(ds.session.ordinaryTurnRecovery!.nextAttemptAt! - Date.now());
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(1);
+  });
+
+  it('keeps continuing on the backoff ladder until the recovery window closes, then warns exactly once', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
@@ -4898,63 +5081,70 @@ describe('ordinary Claude semantic recovery', () => {
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
-
-    worker.emit('message', {
-      type: 'turn_terminal',
-      sessionId: ds.session.sessionId,
-      turnId: 'om_original',
-      status: 'failed',
-      errorCode: 'provider_unexpected_eof',
-      retryable: true,
-    });
-    await vi.advanceTimersByTimeAsync(2_000);
-    const firstRecovery = vi.mocked(worker.send).mock.calls
-      .map(call => call[0])
-      .find(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-recovery-'));
-    expect(firstRecovery).toEqual(expect.objectContaining({
-      content: expect.stringContaining('[BOTMUX_RECOVERY]'),
-    }));
-    expect(firstRecovery.content).not.toContain('original task');
-    worker.emit('message', { type: 'turn_input_received', turnId: firstRecovery.turnId });
-    worker.emit('message', { type: 'turn_input_committed', turnId: firstRecovery.turnId });
-    worker.emit('message', {
-      type: 'turn_terminal',
-      sessionId: ds.session.sessionId,
-      turnId: firstRecovery.turnId,
-      status: 'failed',
-      errorCode: 'provider_unexpected_eof',
-      retryable: true,
-    });
-
-    await vi.advanceTimersByTimeAsync(8_000);
-    const recoveries = vi.mocked(worker.send).mock.calls
+    const recoveries = () => vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
         && message?.turnId?.startsWith('bmx-recovery-'));
-    expect(recoveries).toHaveLength(2);
-    expect(recoveries[1].turnId).not.toBe(recoveries[0].turnId);
-    worker.emit('message', { type: 'turn_input_received', turnId: recoveries[1].turnId });
-    worker.emit('message', { type: 'turn_input_committed', turnId: recoveries[1].turnId });
-    worker.emit('message', {
+    const fail = (turnId: string) => worker.emit('message', {
       type: 'turn_terminal',
       sessionId: ds.session.sessionId,
-      turnId: recoveries[1].turnId,
+      turnId,
       status: 'failed',
       errorCode: 'provider_unexpected_eof',
       retryable: true,
     });
-    await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    // The recovery notice is now an interactive failure card rather than plain
-    // text. This fixture never recorded a lastFailedTurn (no onTurnTerminal
-    // callback is wired here), so the card correctly offers NO retry button —
-    // there is no input to re-send. The raw error code must still be visible:
-    // it is the only thing distinguishing a real provider fault from the
-    // unconditional "cannot retry safely" fallback wording.
-    // Delivered through the recovery-notice outbox: a stable Feishu uuid rides
-    // along so a retried send after an unconfirmed one is de-duplicated.
+    const firstFailureAt = Date.now();
+    fail('om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    // No provider hint and no reported last success: the window runs from the
+    // first failure; without a 1-hour prompt cache it is the 15-minute default.
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'backoff',
+      nextAttemptAt: firstFailureAt + 2_000,
+      windowEndsAt: firstFailureAt + 15 * 60_000,
+      windowMinutes: 15,
+    }));
+    expect(ds.session.ordinaryTurnRecovery?.windowFollowsCache).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(recoveries()).toHaveLength(1);
+    expect(recoveries()[0]).toEqual(expect.objectContaining({
+      content: expect.stringContaining('[BOTMUX_RECOVERY]'),
+    }));
+    expect(recoveries()[0].content).not.toContain('original task');
+
+    const delays: number[] = [];
+    while (ds.session.ordinaryTurnRecovery?.status !== 'exhausted') {
+      const recovery = recoveries().at(-1);
+      worker.emit('message', { type: 'turn_input_received', turnId: recovery.turnId });
+      worker.emit('message', { type: 'turn_input_committed', turnId: recovery.turnId });
+      fail(recovery.turnId);
+      await vi.advanceTimersByTimeAsync(0);
+      const state = ds.session.ordinaryTurnRecovery!;
+      if (state.status === 'exhausted') break;
+      expect(state.status).toBe('backoff');
+      // Never scheduled past the window.
+      expect(state.nextAttemptAt!).toBeLessThanOrEqual(state.windowEndsAt!);
+      delays.push(state.nextAttemptAt! - Date.now());
+      const before = recoveries().length;
+      await vi.advanceTimersByTimeAsync(state.nextAttemptAt! - Date.now());
+      expect(recoveries()).toHaveLength(before + 1);
+      expect(recoveries().length).toBeLessThan(40);
+    }
+    // The ladder lengthens to minutes instead of giving up after ~10 seconds.
+    expect(delays[0]).toBe(8_000);
+    expect(delays[1]).toBeGreaterThanOrEqual(30_000);
+    expect(Math.max(...delays)).toBeGreaterThanOrEqual(300_000);
+    expect(Date.now()).toBeGreaterThanOrEqual(firstFailureAt + 15 * 60_000);
+    const ids = recoveries().map(message => message.turnId);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    await Promise.resolve();
+    const cards = sessionReply.mock.calls.filter(call => (call as unknown[])[2] === 'interactive');
+    expect(cards).toHaveLength(1);
+    // This fixture never recorded a lastFailedTurn, so the card offers no
+    // retry button; the raw error code stays visible. Delivered through the
+    // recovery-notice outbox with a stable Feishu uuid.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('provider_unexpected_eof'),
@@ -4963,30 +5153,26 @@ describe('ordinary Claude semantic recovery', () => {
       'om_original',
       expect.objectContaining({ uuid: expect.any(String) }),
     );
-    expect(vi.mocked(sessionReply).mock.calls[0][1]).not.toContain('retry_turn');    expect(ds.agentAttention).toEqual(expect.objectContaining({
+    expect(cards[0][1]).not.toContain('retry_turn');
+    // One plain "waiting for the provider" notice once the waits reached a minute.
+    const waiting = sessionReply.mock.calls.filter(call => (call as unknown[])[2] === 'text');
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0][1]).toContain('自动续跑');
+    expect(ds.agentAttention).toEqual(expect.objectContaining({
       kind: 'blocked',
-      reason: expect.stringContaining('自动续跑 2 次'),
+      reason: expect.stringContaining(`自动续跑 ${ids.length} 次`),
     }));
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
       status: 'exhausted',
-      continuationsStarted: 2,
+      stopReason: 'window_closed',
+      continuationsStarted: ids.length,
       alertSentAt: expect.any(Number),
     }));
 
-    worker.emit('message', {
-      type: 'turn_terminal',
-      sessionId: ds.session.sessionId,
-      turnId: recoveries[1].turnId,
-      status: 'failed',
-      errorCode: 'provider_unexpected_eof',
-      retryable: true,
-    });
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(worker.send).mock.calls
-      .map(call => call[0])
-      .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(2);
+    fail(ids.at(-1)!);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(sessionReply.mock.calls.filter(call => (call as unknown[])[2] === 'interactive')).toHaveLength(1);
+    expect(recoveries()).toHaveLength(ids.length);
   });
 
   it.each([
@@ -4998,7 +5184,7 @@ describe('ordinary Claude semantic recovery', () => {
     ['claude-code', { chatId: 'http_async_test' }],
   ])('does not attach semantic recovery outside eligible ordinary Lark sessions (%s)', async (cliId, shape) => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, providerRecovery: { enabled: true } }));
     const { session: sessionShape, ...daemonShape } = shape as any;
     const ds = makeDs(daemonShape);
     if (sessionShape) Object.assign(ds.session, sessionShape);
@@ -5020,7 +5206,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('warns an adopt user when a suppressed provider failure has no recovery consumer', async () => {
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
@@ -5159,7 +5345,7 @@ describe('ordinary Claude semantic recovery', () => {
 
   it('keeps turn N as recovery owner when type-ahead N+1 is admitted', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
@@ -5198,7 +5384,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('does not cancel the running terminal owner when N+1 is staged behind activation', () => {
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'turn N', 'om_turn_n');
     ds.session.queuedActivationPending = true;
@@ -5214,7 +5400,7 @@ describe('ordinary Claude semantic recovery', () => {
 
   it('cancels a pending backoff when a fresh user message is admitted', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -5246,7 +5432,7 @@ describe('ordinary Claude semantic recovery', () => {
 
   it('starts recovery tracking when an admitted queued user turn is promoted to the worker', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'opening turn');
     ds.session.queuedActivationPending = true;
@@ -5267,7 +5453,7 @@ describe('ordinary Claude semantic recovery', () => {
 
   it('keeps a pending backoff armed when queued user input admission fails', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -5314,7 +5500,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('does not report an admitted user turn as failed when recovery bookkeeping persistence fails', () => {
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -5343,7 +5529,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('does not clear exhausted recovery attention when cancellation persistence fails', () => {
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     ds.session.ordinaryTurnRecovery = {
@@ -5370,7 +5556,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('clears exhausted recovery attention when a fresh user message is admitted', () => {
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     ds.session.ordinaryTurnRecovery = {
@@ -5400,7 +5586,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('preserves unrelated attention when a fresh user message is admitted', () => {
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     const unrelatedAttention = {
@@ -5424,7 +5610,7 @@ describe('ordinary Claude semantic recovery', () => {
 
   it('cold-resumes through forkWorker when the recovery timer finds no live worker', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     const firstWorker = forkMock.mock.results.at(-1)!.value;
@@ -5459,7 +5645,7 @@ describe('ordinary Claude semantic recovery', () => {
 
   it('raises one recovery warning when the synthetic turn never reaches the worker', async () => {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
@@ -9765,7 +9951,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
 
   async function bootClaudeSession() {
     vi.useFakeTimers();
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', providerRecovery: { enabled: true } }));
     const sessionReply = vi.fn(async () => 'om_card');
     initWorkerPool({
       sessionReply,
@@ -9846,6 +10032,69 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     });
   });
 
+  it('a scheduled fire that takes over a continuation wait gives the waiting turn its failure card; the fire keeps its own recovery', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'review it', 'om_task')).toBe(true);
+    ackInput(worker, 'om_task');
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_task', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true, providerRetryAtMs: Date.now() + 120_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    const recoveryCards = () => sessionReply.mock.calls
+      .filter(call => (call as unknown[])[2] === 'interactive')
+      .map(call => JSON.parse((call as unknown[])[1] as string))
+      .filter(card => card.type === 'recovery-failed');
+    expect(recoveryCards()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: SCHEDULED_TURN, status: 'running' }));
+    expect(recoveryCards()).toEqual([expect.objectContaining({ logicalTurnId: 'om_task' })]);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({
+      outcomeKey: 'card.recovery_failed.outcome.superseded_by_schedule',
+      task: 'review it',
+    }));
+
+    // The fire, failing too while the provider is down, is continued as itself.
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN, status: 'failed',
+      errorCode: 'provider_server_error', retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: SCHEDULED_TURN, status: 'backoff' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sentMessages(worker).filter((message: any) => message.turnId?.startsWith('schedule:abcdef12:')
+      && message.turnId !== SCHEDULED_TURN)).toHaveLength(1);
+    expect(recoveryCards()).toHaveLength(1);
+  });
+
+  it('a scheduled fire taking over a Codex capacity backoff stays as quiet as before', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, providerRecovery: { enabled: true } }));
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn(), loadScheduledTaskForIdentity });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_capacity');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    ackInput(worker, 'om_capacity');
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => { callback?.(null); return true; });
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    sessionReply.mockClear();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe(SCHEDULED_TURN);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     armSilentScheduledTurn(ds, SCHEDULED_TURN);
@@ -9905,43 +10154,76 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('bounds a scheduled turn to two continuations and then raises exactly one card', async () => {
+  it('with auto-continue off, a silent scheduled fire still keeps its silence on record and its failure gets one card', async () => {
+    const { ds, worker, sessionReply } = await bootClaudeSession();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    armSilentScheduledTurn(ds, SCHEDULED_TURN);
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    // Persisted at admission, so a daemon restart keeps the fire silent.
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: SCHEDULED_TURN, silentLogicalTurnIds: [SCHEDULED_TURN],
+    }));
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'attention_required', lastErrorCode: 'recovery_off', silentLogicalTurnIds: [SCHEDULED_TURN],
+    }));
+    expect(sessionReply.mock.calls.filter(call => (call as unknown[])[2] === 'interactive')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN)).toHaveLength(0);
+  });
+
+  it('bounds a scheduled turn by the recovery window and then raises exactly one card', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
     ackInput(worker, SCHEDULED_TURN);
 
-    const fail = async (turnId: string, advanceMs: number) => {
-      worker.emit('message', {
-        type: 'turn_terminal',
-        sessionId: ds.session.sessionId,
-        turnId,
-        status: 'failed',
-        errorCode: 'provider_server_error',
-        retryable: true,
-      });
-      await vi.advanceTimersByTimeAsync(advanceMs);
-    };
+    // The last answered request was 50 minutes before the failure: the window
+    // ends at the ten-minute floor after the first failure instead.
+    const lastAnsweredAt = Date.now() - 50 * 60_000;
+    const fail = (turnId: string) => worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+      providerLastSuccessAtMs: lastAnsweredAt,
+    });
     const continuations = () => sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN);
 
-    await fail(SCHEDULED_TURN, 2_000);
-    expect(continuations()).toHaveLength(1);
-    ackInput(worker, continuations()[0].turnId);
-    await fail(continuations()[0].turnId, 8_000);
-    expect(continuations()).toHaveLength(2);
-    expect(continuations()[1].turnId).not.toBe(continuations()[0].turnId);
+    const firstFailureAt = Date.now();
+    fail(SCHEDULED_TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.windowEndsAt).toBe(firstFailureAt + 10 * 60_000);
+    for (let guard = 0; ds.session.ordinaryTurnRecovery?.status === 'backoff' && guard < 30; guard += 1) {
+      const before = continuations().length;
+      await vi.advanceTimersByTimeAsync(ds.session.ordinaryTurnRecovery.nextAttemptAt! - Date.now());
+      expect(continuations()).toHaveLength(before + 1);
+      const latest = continuations().at(-1);
+      ackInput(worker, latest.turnId);
+      fail(latest.turnId);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(continuations().length).toBeGreaterThan(2);
+    expect(new Set(continuations().map(message => message.turnId)).size).toBe(continuations().length);
     for (const message of continuations()) {
       expect(message.turnId).toMatch(/^schedule:abcdef12:[0-9a-f-]{36}$/);
       expect(message.trustedCaller).toEqual(CREATOR_IDENTITY);
     }
-    expect(sessionReply).not.toHaveBeenCalled();
+    expect(Date.now()).toBeLessThanOrEqual(firstFailureAt + 10 * 60_000);
 
-    ackInput(worker, continuations()[1].turnId);
-    await fail(continuations()[1].turnId, 60_000);
-    expect(continuations()).toHaveLength(2);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const count = continuations().length;
+    expect(sessionReply.mock.calls.filter(call => (call as unknown[])[2] === 'interactive')).toHaveLength(1);
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
       status: 'exhausted',
-      continuationsStarted: 2,
+      stopReason: 'window_closed',
+      continuationsStarted: count,
     }));
   });
 
@@ -10170,6 +10452,278 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
   });
 });
 
+describe('providerRecovery switch (Claude auto-continue)', () => {
+  const RETRY_AT_OFFSET = 117_000;
+
+  async function boot(botConfig: Record<string, unknown>, prepare?: (ds: any) => void) {
+    vi.useFakeTimers();
+    const bot = defaultBot({ cliId: 'claude-code', ...botConfig });
+    vi.mocked(getBot).mockImplementation(() => bot as any);
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    prepare?.(ds);
+    forkWorker(ds, 'warm up', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    return { bot, ds, worker, sessionReply };
+  }
+  const fail = (ds: any, worker: any, turnId: string, retryAtMs?: number) => worker.emit('message', {
+    type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'failed',
+    errorCode: 'provider_server_error', retryable: true,
+    ...(retryAtMs !== undefined ? { providerRetryAtMs: retryAtMs } : {}),
+  });
+  const complete = (ds: any, worker: any, turnId: string) => worker.emit('message', {
+    type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed',
+  });
+  const admit = (ds: any, worker: any, turnId: string) => {
+    expect(sendWorkerInput(ds, `message ${turnId}`, turnId)).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId });
+  };
+  const continuations = (worker: any) => vi.mocked(worker.send).mock.calls.map(call => call[0])
+    .filter(message => message?.type === 'message' && message?.turnId?.startsWith('bmx-recovery-'));
+  const cardsOf = (sessionReply: any, type: string) => sessionReply.mock.calls
+    .filter((call: unknown[]) => call[2] === 'interactive' && JSON.parse(call[1] as string).type === type);
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    invalidateGlobalConfigCache();
+    disposeOrdinaryTurnRecovery({ sessionId: 'sid-start-test' });
+  });
+
+  it('is off by default: the failure settles at once with one card naming the provider\'s time, and nothing is continued', async () => {
+    const { ds, worker, sessionReply } = await boot({});
+    const retryAt = Date.now() + RETRY_AT_OFFSET;
+    fail(ds, worker, 'om_original', retryAt);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original', status: 'attention_required', lastErrorCode: 'recovery_off',
+      causeErrorCode: 'provider_server_error', providerRetryAt: retryAt,
+    }));
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+    expect(cardsOf(sessionReply, 'turn-failed')).toHaveLength(0);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({
+      continuationOff: { providerRetryAt: new Date(retryAt) },
+      outcomeKey: 'card.recovery_failed.outcome.off',
+    }));
+    expect(ds.agentAttention).toEqual(expect.objectContaining({ kind: 'blocked' }));
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+  });
+
+  it('leaves the provider time off the card when it has already passed', async () => {
+    const { ds, worker } = await boot({});
+    fail(ds, worker, 'om_original', Date.now() - 1_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({ continuationOff: {} }));
+  });
+
+  it('the waiting notice re-checks at send time that the wait is still on', async () => {
+    const { ds, worker, sessionReply } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    const notice = sessionReply.mock.calls.find((call: unknown[]) => call[2] === 'text') as unknown[] | undefined;
+    const beforeWrite = (notice?.[5] as { beforeWrite?: () => void } | undefined)?.beforeWrite;
+    expect(beforeWrite).toBeTypeOf('function');
+    expect(() => beforeWrite!()).not.toThrow();
+    admit(ds, worker, 'om_next');
+    expect(() => beforeWrite!()).toThrow();
+  });
+
+  it.each([
+    ['working', 0], ['analyzing', 0], ['stalled', 0],
+    // A usage limit is not someone driving the CLI: the continuation goes and
+    // meets the rate-limit handling.
+    ['limited', 1],
+  ] as const)('a continuation that comes due while the CLI is %s: %i sent', async (status, sent) => {
+    const { ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    ds.lastScreenStatus = status;
+    await vi.advanceTimersByTimeAsync(ds.session.ordinaryTurnRecovery!.nextAttemptAt! - Date.now());
+    expect(continuations(worker)).toHaveLength(sent);
+  });
+
+  it('a 1-hour cache window that closes is explained by the cache on the card', async () => {
+    const { ds, worker } = await boot({ providerRecovery: { enabled: true }, promptCache: { ttl: '1h' } });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true,
+      providerRetryAtMs: Date.now() + 3 * 60 * 60_000, providerLastSuccessAtMs: Date.now() - 60_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({
+      recoveryWindow: expect.objectContaining({ minutes: 55, followsCache: true }),
+    }));
+  });
+
+  it('with it off, the next admitted message clears that failure\'s attention, as before', async () => {
+    const { ds, worker } = await boot({});
+    fail(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.agentAttention).toEqual(expect.objectContaining({ kind: 'blocked' }));
+    admit(ds, worker, 'om_next');
+    expect(ds.agentAttention).toBeUndefined();
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: 'om_next', status: 'running' }));
+  });
+
+  it.each([
+    ['the machine-wide switch', {}, true],
+    ['a bot override that switches it off under the global "on"', { providerRecovery: { enabled: false } }, false],
+  ])('follows %s', async (_label, botConfig, expectRecovery) => {
+    const configPath = join(mkdtempSync(join(tmpdir(), 'botmux-provider-recovery-')), 'config.json');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configPath);
+    writeFileSync(configPath, JSON.stringify({ providerRecovery: { enabled: true, maxWaitMinutes: 20 } }));
+    invalidateGlobalConfigCache();
+    const { ds, worker, sessionReply } = await boot(botConfig);
+    fail(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    if (expectRecovery) {
+      expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ status: 'backoff', windowMinutes: 20 }));
+      expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(continuations(worker)).toHaveLength(1);
+    } else {
+      expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ lastErrorCode: 'recovery_off' }));
+      expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(continuations(worker)).toHaveLength(0);
+    }
+  });
+
+  it('switching it off during a wait: the card stops promising a time at once, and it settles with one notice when due', async () => {
+    const { bot, ds, worker, sessionReply } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    const waiting = ds.session.ordinaryTurnRecovery!;
+    expect(waiting.status).toBe('backoff');
+    ds.lastScreenStatus = 'idle';
+    expect(streamCardLabel(ds)).toEqual({ recoveryAt: waiting.nextAttemptAt });
+    (bot.config as any).providerRecovery = { enabled: false };
+    expect(streamCardLabel(ds)).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(waiting.nextAttemptAt! - Date.now());
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'attention_required', lastErrorCode: 'recovery_disabled', warningDispatched: true,
+    }));
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+    expect(ds.agentAttention?.reason).toMatch(/自动续跑已关闭|Automatic continuation/);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('a wait settled by switching it off ends like any failure left to a person: the card keeps the message, the next one clears the attention', async () => {
+    const { bot, ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    admit(ds, worker, 'om_wait');
+    fail(ds, worker, 'om_wait', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    (bot.config as any).providerRecovery = { enabled: false };
+    await vi.advanceTimersByTimeAsync(ds.session.ordinaryTurnRecovery!.nextAttemptAt! - Date.now());
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenLastCalledWith(expect.objectContaining({ task: 'message om_wait' }));
+    expect(ds.agentAttention).toEqual(expect.objectContaining({ kind: 'blocked' }));
+    admit(ds, worker, 'om_next');
+    complete(ds, worker, 'om_next');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.agentAttention).toBeUndefined();
+  });
+
+  it('switching it off during a wait and then sending a message replaces the wait quietly, as a new message always did', async () => {
+    const { bot, ds, worker, sessionReply } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original', Date.now() + RETRY_AT_OFFSET);
+    await vi.advanceTimersByTimeAsync(0);
+    (bot.config as any).providerRecovery = { enabled: false };
+    await vi.advanceTimersByTimeAsync(30_000);
+    admit(ds, worker, 'om_next');
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: 'om_next', status: 'running' }));
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(0);
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('switching it off while a continuation runs keeps its lost-terminal check', async () => {
+    const { bot, ds, worker, sessionReply } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(continuations(worker)).toHaveLength(1);
+    const continuation = continuations(worker)[0];
+    worker.emit('message', { type: 'turn_input_received', turnId: continuation.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: continuation.turnId });
+    (bot.config as any).providerRecovery = { enabled: false };
+    // The CLI goes idle but the continuation's own terminal never arrives.
+    worker.emit('message', { type: 'prompt_ready' });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'attention_required', lastErrorCode: 'recovery_outcome_unverified',
+    }));
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+  });
+
+  it('a restart with a hand-off interrupted mid-way settles it even though the switch is off', async () => {
+    const { ds, sessionReply } = await boot({}, ds => {
+      ds.session.ordinaryTurnRecovery = {
+        logicalTurnId: 'om_before', currentTurnId: 'bmx-recovery-before', continuationsStarted: 1,
+        status: 'dispatching', causeErrorCode: 'provider_server_error',
+      };
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    // Settled (and announced) on attach; the fork's own turn then takes the slot.
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+    expect(vi.mocked(buildRecoveryFailedCard)).toHaveBeenCalledWith(expect.objectContaining({
+      logicalTurnId: 'om_before', outcomeKey: 'card.recovery_failed.outcome.interrupted',
+    }));
+    expect(ds.session.ordinaryTurnRecovery?.status).not.toBe('dispatching');
+  });
+
+  it('follows the prompt cache this session\'s CLI was started with, not a later change of the bot', async () => {
+    const { bot, ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    (bot.config as any).promptCache = { ttl: '1h' };
+    fail(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ status: 'backoff', windowMinutes: 15 }));
+    expect(ds.session.ordinaryTurnRecovery?.windowFollowsCache).toBeUndefined();
+  });
+
+  it('switching it off: the next failure is not continued', async () => {
+    const { bot, ds, worker, sessionReply } = await boot({ providerRecovery: { enabled: true } });
+    complete(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    (bot.config as any).providerRecovery = { enabled: false };
+    admit(ds, worker, 'om_next');
+    fail(ds, worker, 'om_next');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({ logicalTurnId: 'om_next', lastErrorCode: 'recovery_off' }));
+    expect(cardsOf(sessionReply, 'recovery-failed')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('switching it on applies to the next failure without restarting the session', async () => {
+    const { bot, ds, worker } = await boot({});
+    complete(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    (bot.config as any).providerRecovery = { enabled: true };
+    admit(ds, worker, 'om_next');
+    fail(ds, worker, 'om_next');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(continuations(worker)).toHaveLength(1);
+  });
+});
+
 describe('Codex capacity recovery', () => {
   async function boot(botOverrides: Record<string, unknown> = {}) {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, ...botOverrides }));
@@ -10238,7 +10792,6 @@ describe('Codex capacity recovery', () => {
     worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'disabled-diagnostic', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
     await vi.advanceTimersByTimeAsync(0);
     expect(sessionReply).toHaveBeenCalledOnce();
-    const { disposeOrdinaryTurnRecovery } = await import('../src/services/ordinary-turn-recovery.js');
     disposeOrdinaryTurnRecovery(ds.session);
     // Fresh process with only the durable row, and the feature enabled again.
     const restored = makeDs({ session: { ...structuredClone(ds.session), ordinaryTurnRecovery: structuredClone(durable) } });
@@ -10248,6 +10801,63 @@ describe('Codex capacity recovery', () => {
     expect(restored.session.ordinaryTurnRecovery?.status).toBe('cancelled');
     expect(sessionReply).toHaveBeenCalledOnce();
     expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it.each([[60_000, true], [-60_000, false]] as const)(
+    'a failure card outside any recovery names an upcoming provider time only (offset %i)', async (offset, shown) => {
+      const { ds, worker } = await boot({ codexCapacityRecovery: undefined });
+      // A terminal no recovery owns gets the generic failure card.
+      worker.emit('message', {
+        type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'ambiguous',
+        errorCode: 'cli_exit', providerRetryAtMs: Date.now() + offset,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const opts = vi.mocked(buildTurnFailedCard).mock.calls.at(-1)?.[0] as { providerRetryAt?: Date } | undefined;
+      expect(opts).toBeDefined();
+      expect(opts!.providerRetryAt !== undefined).toBe(shown);
+    });
+
+  it('a restart with the opt-in off still delivers a failure card it owed but never recorded', async () => {
+    const { ds, sessionReply } = await boot({ codexCapacityRecovery: undefined });
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_capacity', currentTurnId: 'om_capacity', status: 'exhausted', continuationsStarted: 2,
+      lastErrorCode: 'codex_capacity_exceeded', alertSentAt: Date.now(), warningDispatched: true, failureNoticeOwed: true,
+    };
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('a restart with the opt-in off still re-arms the silent mark of a scheduled turn it tracked', async () => {
+    const { ds } = await boot({ codexCapacityRecovery: undefined });
+    const fire = 'schedule:task-1:00000000-0000-4000-8000-000000000001';
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: fire, currentTurnId: fire, status: 'completed', continuationsStarted: 0, silentLogicalTurnIds: [fire],
+    };
+    expect(isSilentScheduledTurn(ds, fire)).toBe(false);
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    expect(isSilentScheduledTurn(ds, fire)).toBe(true);
+  });
+
+  it('its backoff keeps the card as before even where the Claude auto-continue switch is on', async () => {
+    const { ds, worker } = await boot({ providerRecovery: { enabled: true } });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    ds.lastScreenStatus = 'idle';
+    expect(streamCardLabel(ds)).not.toEqual(expect.objectContaining({ recoveryAt: expect.any(Number) }));
+  });
+
+  it('a turn typed in the terminal during the capacity backoff leaves it running as before', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'local-u-typed', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(continuations(worker)).toHaveLength(1);
   });
 
   it('opt-off followed by a diagnostic before the timer settles once without a second card', async () => {

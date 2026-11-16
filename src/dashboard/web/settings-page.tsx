@@ -21,7 +21,9 @@ import { ScheduleBotGrantsEditor, type ScheduleBotGrantBotOption } from './sched
 import type { ScheduleBotGrant } from '../../global-config.js';
 import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
-import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { readPromptCacheConfig, resolvePromptCachePolicy, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
+import { readProviderRecoveryConfig, type ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -119,6 +121,7 @@ interface DashboardSettings {
   workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
+  providerRecovery: ProviderRecoveryConfig | null;
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
@@ -310,6 +313,7 @@ function parseSettings(s: any): DashboardSettings {
         : 60,
     },
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
+    providerRecovery: readProviderRecoveryConfig(s?.providerRecovery) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
@@ -1298,6 +1302,16 @@ export function SettingsBody(props: {
             value={settings.promptCache}
             disabled={dis || savingKey === 'promptCache'}
             onSave={next => props.onSave('promptCache', { promptCache: next }, s => ({ ...s, promptCache: next }))}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-provider-recovery" title={tr('settings.sectionProviderRecovery')}>
+          <p className="settings-help">{tr('settings.providerRecoveryNote')}</p>
+          <ProviderRecoveryEditor
+            scope="global"
+            value={settings.providerRecovery}
+            promptCacheTtl={resolvePromptCachePolicy(settings.promptCache ?? undefined, undefined).ttl}
+            disabled={dis || savingKey === 'providerRecovery'}
+            onSave={next => props.onSave('providerRecovery', { providerRecovery: next }, s => ({ ...s, providerRecovery: next }))}
           />
         </SettingsBlock>
       </SettingsGroup>

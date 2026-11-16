@@ -50,6 +50,7 @@ import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as sandboxStore from '../src/services/sandbox-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
+import { scheduleSupportLines } from '../src/core/schedule-followup.js';
 import * as botRegistry from '../src/bot-registry.js';
 import { sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
 import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
@@ -7079,6 +7080,58 @@ describe('GET /api/schedules', () => {
       schedule: '10 0,12 * * *',
       parsed: { display: '10 0,12 * * *' },
     });
+  });
+
+  it('projects until-done state, run ledger, notify settings and owner onto the wire row', async () => {
+    setLarkAppId('cli_ipc_test_bot002');
+    const previousScope = scheduleStore.getScheduleScope();
+    scheduleStore.setScheduleScope('cli_ipc_test_bot002');
+    try {
+    // Deadline stays relative to the wall clock: `addTask` validates it against
+    // Date.now() (`until_done_deadline_past`), so an absolute literal would make
+    // this case start failing the moment real time passes it.
+    const deadline = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
+    const add = scheduler.addTask({
+      name: '等待上游实例完成',
+      schedule: '1m',
+      prompt: '检查上游实例状态',
+      workingDir: '/tmp',
+      chatId: 'oc_schedule_followup',
+      larkAppId: 'cli_ipc_test_bot002',
+      executionPosition: 'topic',
+      rootMessageId: 'om_schedule_followup_root',
+      chatType: 'topic_group',
+      untilDone: { retryMinutes: 5, deadline },
+      notify: ['failing', 'expired'],
+      ownerOpenId: 'ou_schedule_owner',
+    });
+    scheduleStore.updateTask(add.id, {
+      runStats: { dispatched: 3, skipped: 0, failed: 2, missed: 0, consecutiveFailures: 2 },
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`);
+    expect(res.status).toBe(200);
+    const row = (await res.json()).schedules.find((s: any) => s.id === add.id);
+    expect(row).toMatchObject({
+      untilDone: { status: 'open', attempts: 0, retryMinutes: 5, deadline },
+      runStats: { consecutiveFailures: 2 },
+      notify: ['failing', 'expired'],
+      ownerOpenId: 'ou_schedule_owner',
+    });
+
+    // The Dashboard and Lark cards render support lines straight from this
+    // wire row: the until-done stop condition, retry cadence, failure count
+    // and notification owner must all survive the daemon projection.
+    const lines = scheduleSupportLines(row, 'zh').join('\n');
+    expect(lines).toContain('确认完成或达到截止时间');
+    expect(lines).toContain('之后每 5 分钟检查');
+    expect(lines).toContain('连续失败: 2');
+    expect(lines).toContain('ou_schedule_owner');
+    expect(lines).not.toContain('一次执行后停止');
+    } finally {
+      if (previousScope) scheduleStore.setScheduleScope(previousScope);
+    }
   });
 
   it('fails closed without revealing source material when the protected sidecar is damaged', async () => {

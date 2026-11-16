@@ -1,4 +1,5 @@
 import type { TrustedCaller } from '../types.js';
+import { PROVIDER_RETRY_HINT_MAX_AHEAD_MS } from './provider-retry-hint.js';
 
 export const ORDINARY_TURN_RECOVERY_PROMPT = [
   '[BOTMUX_RECOVERY]',
@@ -31,6 +32,148 @@ const MAX_QUEUED_RETRY_INPUTS = 8;
  *  recovery was in flight: the single recovery slot could not continue it, so
  *  it gets a failure notice instead of being forgotten. */
 export const RECOVERY_QUEUED_UNRECOVERED = 'recovery_queued_unrecovered';
+
+/** Error code of a failed turn whose continuation wait was taken over by a
+ *  scheduled fire (one slot per session): it is not continued, and gets its
+ *  failure card. A human message taking over stays silent, as before. */
+export const RECOVERY_SUPERSEDED_BY_SCHEDULE = 'recovery_superseded_by_schedule';
+
+/** Error code of a retryable failure that was not continued because automatic
+ *  continuation is switched off (`continuationsEnabled`): it settles at once
+ *  and raises the failure notice. */
+export const RECOVERY_OFF = 'recovery_off';
+
+/** Why a window-paced recovery stopped continuing (status `exhausted`). */
+export type OrdinaryTurnRecoveryStopReason =
+  /** Retried until the window closed; the provider never came back. */
+  | 'window_closed'
+  /** The provider's own "available at" lies beyond the window: waiting for it
+   *  would continue on an expired prompt cache, so no continuation is made. */
+  | 'provider_eta_beyond_window'
+  /** Runaway guard: this many continuations without finishing the turn. */
+  | 'max_continuations';
+
+/**
+ * Pacing of a window-paced recovery (2026-11-13: a gateway answered 503 "the
+ * earliest account is expected to be available at 11:10:16Z"; the fixed 2s/8s
+ * ladder spent both continuations before that time and gave up at 11:09).
+ *
+ * - A continuation is scheduled at the provider's own retry time when its
+ *   error names one (plus a little jitter so a fleet does not stampede it),
+ *   otherwise on the backoff ladder.
+ * - Continuations stop once the window closes. It is measured from the last
+ *   request the provider answered — while its (1 h) prompt cache is still warm
+ *   a continuation picks up cheaply; later it rewrites the whole context.
+ */
+export interface OrdinaryTurnRecoveryPacing {
+  /** Delays without a provider hint; the last entry repeats. Restarts after a
+   *  continuation that made progress (got a reply before failing again). */
+  backoffMs: readonly number[];
+  /** Window length from the last answered request. */
+  windowMs: number;
+  /** Floor from the first failure, for a turn whose last answered request is
+   *  already older than the window (cache gone anyway): still retry a while. */
+  minWindowMs: number;
+  /** Runaway guard over all continuations of one logical turn. */
+  maxContinuations: number;
+  /** A continuation scheduled at least this far out gets one "waiting for the
+   *  provider" notice per logical turn, so nobody mistakes it for a hang. */
+  waitNoticeMinDelayMs: number;
+  /** The window length is the prompt cache's (a 1-hour cache): user-facing
+   *  text may then explain the bound by the cache. */
+  followsPromptCache?: boolean;
+}
+
+export const DEFAULT_ORDINARY_TURN_RECOVERY_PACING: OrdinaryTurnRecoveryPacing = {
+  backoffMs: [2_000, 8_000, 30_000, 60_000, 120_000, 300_000],
+  windowMs: 55 * 60_000,
+  minWindowMs: 10 * 60_000,
+  maxContinuations: 20,
+  waitNoticeMinDelayMs: 60_000,
+};
+
+/** A provider hint this close to now (or past) is stale: use the ladder. */
+const PROVIDER_HINT_FRESH_MS = 1_000;
+/** Margin after the provider's time, for clock skew between it and us. */
+const PROVIDER_HINT_GRACE_MS = 1_000;
+const PROVIDER_HINT_JITTER_MIN_MS = 2_000;
+const PROVIDER_HINT_JITTER_MAX_MS = 15_000;
+/** Ladder steps this long and longer get jitter; the short ones are already
+ *  spread by when each session's own failure landed. */
+const BACKOFF_JITTER_MIN_STEP_MS = 30_000;
+const BACKOFF_JITTER_MAX_MS = 15_000;
+/** While the CLI is busy (a human typing in the web terminal, a background
+ *  wake) a due continuation waits and looks again this often. Once it has
+ *  seen the CLI busy, it also waits one more look after it went quiet, so the
+ *  result of that work (a human's terminal turn cancels the wait) lands first. */
+export const ORDINARY_RECOVERY_BUSY_RECHECK_MS = 15_000;
+/** A window-paced continuation whose timer fires later than this past the
+ *  window's end (the daemon was down, a closed session woke up) is not sent:
+ *  the recovery settles as `window_closed` instead. Covers timer lag only. */
+export const ORDINARY_RECOVERY_EXPIRED_GRACE_MS = 60_000;
+
+export type OrdinaryTurnRecoveryPlan =
+  | {
+    kind: 'retry';
+    nextAttemptAt: number;
+    windowEndsAt: number;
+    /** Set when the attempt follows the provider's own retry time. */
+    providerRetryAt?: number;
+  }
+  | {
+    kind: 'stop';
+    stopReason: OrdinaryTurnRecoveryStopReason;
+    windowEndsAt: number;
+    providerRetryAt?: number;
+  };
+
+/** Pure scheduling decision for the next continuation of a window-paced
+ *  recovery; see {@link OrdinaryTurnRecoveryPacing}. */
+export function planOrdinaryTurnRecoveryContinuation(input: {
+  now: number;
+  pacing: OrdinaryTurnRecoveryPacing;
+  random: () => number;
+  /** Continuations already dispatched for this logical turn. */
+  continuationsStarted: number;
+  /** Ladder restart point (continuationsStarted at the last progress). */
+  ladderBase: number;
+  firstFailureAt: number;
+  providerLastSuccessAt?: number;
+  providerRetryAt?: number;
+}): OrdinaryTurnRecoveryPlan {
+  const { now, pacing } = input;
+  const unit = (): number => {
+    const r = input.random();
+    return Number.isFinite(r) ? Math.min(Math.max(r, 0), 1) : 0;
+  };
+  const windowEndsAt = Math.max(
+    (input.providerLastSuccessAt ?? input.firstFailureAt) + pacing.windowMs,
+    input.firstFailureAt + pacing.minWindowMs,
+  );
+  if (input.continuationsStarted >= pacing.maxContinuations) {
+    return { kind: 'stop', stopReason: 'max_continuations', windowEndsAt };
+  }
+  const hint = input.providerRetryAt !== undefined && input.providerRetryAt > now + PROVIDER_HINT_FRESH_MS
+    ? input.providerRetryAt : undefined;
+  if (hint !== undefined) {
+    if (hint + PROVIDER_HINT_GRACE_MS > windowEndsAt) {
+      return { kind: 'stop', stopReason: 'provider_eta_beyond_window', windowEndsAt, providerRetryAt: hint };
+    }
+    const span = Math.min(PROVIDER_HINT_JITTER_MAX_MS, Math.max(PROVIDER_HINT_JITTER_MIN_MS, (hint - now) * 0.1));
+    const at = hint + PROVIDER_HINT_GRACE_MS + Math.floor(unit() * span);
+    return { kind: 'retry', nextAttemptAt: Math.min(at, windowEndsAt), windowEndsAt, providerRetryAt: hint };
+  }
+  const ladder = pacing.backoffMs;
+  const index = Math.min(Math.max(0, input.continuationsStarted - input.ladderBase), Math.max(0, ladder.length - 1));
+  const step = Math.max(0, ladder[index] ?? 0);
+  const jitter = step >= BACKOFF_JITTER_MIN_STEP_MS
+    ? Math.floor(unit() * Math.min(BACKOFF_JITTER_MAX_MS, step * 0.1)) : 0;
+  const at = now + step + jitter;
+  if (at <= windowEndsAt) return { kind: 'retry', nextAttemptAt: at, windowEndsAt };
+  // One last attempt right at the window's end, while the cache may be warm.
+  if (windowEndsAt > now) return { kind: 'retry', nextAttemptAt: windowEndsAt, windowEndsAt };
+  return { kind: 'stop', stopReason: 'window_closed', windowEndsAt };
+}
 
 export type OrdinaryTurnRecoveryStatus =
   | 'running'
@@ -89,6 +232,29 @@ export interface OrdinaryTurnRecoveryState {
    *  the process dies between the state write and the notice write. Absent on
    *  pre-upgrade states, whose notice the old code already sent. */
   failureNoticeOwed?: true;
+  /** Window-paced recovery only (see {@link OrdinaryTurnRecoveryPacing}).
+   *  Epoch ms of the first failure of this logical turn's recovery. */
+  firstFailureAt?: number;
+  /** Window-paced: the last request the provider answered (newest seen on
+   *  any of this turn's failures) — the window's anchor. */
+  providerLastSuccessAt?: number;
+  /** Window-paced: no continuation is scheduled after this instant. */
+  windowEndsAt?: number;
+  /** Window-paced: the provider's own retry time behind the pending attempt,
+   *  or the one beyond the window that stopped the recovery. */
+  providerRetryAt?: number;
+  /** Window-paced: continuationsStarted at the last continuation that made
+   *  progress; the backoff ladder restarts from there. */
+  ladderBase?: number;
+  /** Window-paced: why the recovery stopped (status `exhausted`). */
+  stopReason?: OrdinaryTurnRecoveryStopReason;
+  /** Window-paced: when the one "waiting for the provider" notice of this
+   *  logical turn was raised. */
+  waitNoticeSentAt?: number;
+  /** Window-paced: the window length in effect when last scheduled, and
+   *  whether it was the prompt cache's — for the user-facing explanation. */
+  windowMinutes?: number;
+  windowFollowsCache?: true;
 }
 
 /** A continuation has been delivered and is still awaiting its own terminal. */
@@ -122,6 +288,11 @@ export interface OrdinaryTurnRecoveryTerminal {
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
   errorCode?: string;
   retryable?: boolean;
+  /** Worker-reported provider retry time (turn_terminal field of the same
+   *  name); re-validated before use. */
+  providerRetryAtMs?: number;
+  /** Worker-reported last answered request (turn_terminal field). */
+  providerLastSuccessAtMs?: number;
 }
 
 export interface OrdinaryTurnRecoveryDispatch {
@@ -230,7 +401,25 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   mintContinuationTurnId?: (logicalTurnId: string, continuation: number) => string | undefined;
   now?: () => number;
   randomId?: () => string;
+  /** Uniform [0, 1) source for scheduling jitter (window-paced only). */
+  random?: () => number;
+  /** Fixed ladder: one continuation per entry, then `exhausted`. Ignored when
+   *  `pacing` is set. */
   backoffMs?: readonly number[];
+  /** Window-paced recovery (see {@link OrdinaryTurnRecoveryPacing}). A
+   *  function is read at every scheduling decision, so a configuration change
+   *  applies to the next failure without re-attaching. */
+  pacing?: OrdinaryTurnRecoveryPacing | (() => OrdinaryTurnRecoveryPacing);
+  /** Whether a failure may be continued at all, read at every decision. False:
+   *  a retryable failure settles at once as {@link RECOVERY_OFF} with the
+   *  failure notice, and a pending wait is dropped when it comes due (settled
+   *  `recovery_disabled`, also with the notice). Turn bookkeeping is unaffected.
+   *  Absent = always enabled. */
+  continuationsEnabled?: () => boolean;
+  /** Window-paced: called once per logical turn, after the state is saved,
+   *  when a continuation is scheduled at least `waitNoticeMinDelayMs` out.
+   *  Never for a silent scheduled turn. Must not throw into the caller. */
+  notifyWaiting?: (state: OrdinaryTurnRecoveryState) => void;
   /** A narrow CLI may continue only these explicit failure codes. Other
    * terminals settle bookkeeping silently and keep their normal UI path. */
   recoverableErrorCodes?: readonly string[];
@@ -248,6 +437,11 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
    *  to work (e.g. it picked up the queued continuation) is left alone, and
    *  its next idle edge re-arms the check. */
   isCliBusy?: () => boolean;
+  /** Window-paced: the CLI is running something right now (a human typing in
+   *  the web terminal, a background wake). A due continuation waits for it
+   *  instead of queueing behind it. A usage limit is not "running": the
+   *  continuation goes ahead and meets the existing rate-limit handling. */
+  isCliOccupied?: () => boolean;
   /** Whether a type-ahead successor's non-completed terminal, arriving while
    *  the owner's recovery is in flight, deserves a failure notice (the daemon's
    *  shouldNotifyTurnFailure). When true, the coordinator claims that terminal
@@ -279,18 +473,26 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   private timer: TTimer | undefined;
   private idleTimer: TTimer | undefined;
   private restoredRunningWithoutRecoveryAuthority = false;
+  /** Window-paced: the due continuation saw the CLI busy and owes one more
+   *  look once it is quiet (process-local; a restart starts afresh). */
+  private settleAfterBusy = false;
   private readonly now: () => number;
   private readonly randomId: () => string;
+  private readonly random: () => number;
   private readonly backoffMs: readonly number[];
+  private readonly pacing: OrdinaryTurnRecoveryPacing | (() => OrdinaryTurnRecoveryPacing) | undefined;
 
   constructor(private readonly deps: OrdinaryTurnRecoveryDeps<TTimer>) {
     this.now = deps.now ?? Date.now;
     this.randomId = deps.randomId ?? (() => Math.random().toString(36).slice(2));
+    this.random = deps.random ?? Math.random;
     this.backoffMs = deps.backoffMs ?? [2_000, 8_000];
+    this.pacing = deps.pacing;
   }
 
   restore(state: OrdinaryTurnRecoveryState): void {
     this.cancelTimer();
+    this.settleAfterBusy = false;
     this.state = { ...state };
     // Observe an already admitted execution, including its successful result,
     // but the old durable row cannot authorise another continuation after
@@ -442,6 +644,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       return next;
     }
     const causeErrorCode = terminal.errorCode ?? current.causeErrorCode;
+    if (this.deps.continuationsEnabled?.() === false) return this.settleNotContinued(current, terminal, causeErrorCode);
+    if (this.pacing) {
+      const pacing = typeof this.pacing === 'function' ? this.pacing() : this.pacing;
+      return this.scheduleWindowedContinuation(current, terminal, causeErrorCode, pacing);
+    }
     if (current.continuationsStarted >= this.backoffMs.length) {
       const exhausted = {
         ...current,
@@ -461,6 +668,97 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       ...(causeErrorCode ? { causeErrorCode } : {}),
     });
     this.armBackoff();
+    return next;
+  }
+
+  /** Automatic continuation is off: the failure settles now and its notice
+   *  names the provider's own recovery time when it gave one. */
+  private settleNotContinued(
+    current: OrdinaryTurnRecoveryState,
+    terminal: OrdinaryTurnRecoveryTerminal,
+    causeErrorCode: string | undefined,
+  ): OrdinaryTurnRecoveryState {
+    const now = this.now();
+    const retryAt = Number.isFinite(terminal.providerRetryAtMs) && terminal.providerRetryAtMs! > now
+      && terminal.providerRetryAtMs! <= now + PROVIDER_RETRY_HINT_MAX_AHEAD_MS ? terminal.providerRetryAtMs : undefined;
+    const { providerRetryAt: _staleRetryAt, stopReason: _staleStop, ...rest } = current;
+    const settled: OrdinaryTurnRecoveryState = {
+      ...rest,
+      status: 'attention_required',
+      nextAttemptAt: undefined,
+      lastErrorCode: RECOVERY_OFF,
+      ...(causeErrorCode ? { causeErrorCode } : {}),
+      ...(retryAt !== undefined ? { providerRetryAt: retryAt } : {}),
+    };
+    this.warnOnce(settled);
+    return this.state ?? settled;
+  }
+
+  private scheduleWindowedContinuation(
+    current: OrdinaryTurnRecoveryState,
+    terminal: OrdinaryTurnRecoveryTerminal,
+    causeErrorCode: string | undefined,
+    pacing: OrdinaryTurnRecoveryPacing,
+  ): OrdinaryTurnRecoveryState {
+    const now = this.now();
+    // Worker-reported instants are hints: a future "last success" is clamped
+    // to now, a retry time beyond the hint horizon is dropped.
+    const reportedSuccess = Number.isFinite(terminal.providerLastSuccessAtMs)
+      ? Math.min(terminal.providerLastSuccessAtMs!, now) : undefined;
+    const reportedRetryAt = Number.isFinite(terminal.providerRetryAtMs)
+      && terminal.providerRetryAtMs! <= now + PROVIDER_RETRY_HINT_MAX_AHEAD_MS
+      ? terminal.providerRetryAtMs : undefined;
+    const providerLastSuccessAt = reportedSuccess === undefined ? current.providerLastSuccessAt
+      : Math.max(reportedSuccess, current.providerLastSuccessAt ?? reportedSuccess);
+    // A continuation that got a reply before failing again moved the task on:
+    // the ladder starts over instead of waiting at its longest step.
+    const progressed = current.continuationsStarted > 0 && reportedSuccess !== undefined
+      && current.dispatchedAt !== undefined && reportedSuccess > current.dispatchedAt;
+    const ladderBase = progressed ? current.continuationsStarted : (current.ladderBase ?? 0);
+    const firstFailureAt = current.firstFailureAt ?? now;
+    const plan = planOrdinaryTurnRecoveryContinuation({
+      now, pacing, random: this.random,
+      continuationsStarted: current.continuationsStarted,
+      ladderBase,
+      firstFailureAt,
+      ...(providerLastSuccessAt !== undefined ? { providerLastSuccessAt } : {}),
+      ...(reportedRetryAt !== undefined ? { providerRetryAt: reportedRetryAt } : {}),
+    });
+    const { providerRetryAt: _staleRetryAt, stopReason: _staleStop, windowFollowsCache: _staleFollows, ...rest } = current;
+    const base: OrdinaryTurnRecoveryState = {
+      ...rest,
+      windowMinutes: Math.round(pacing.windowMs / 60_000),
+      ...(pacing.followsPromptCache ? { windowFollowsCache: true as const } : {}),
+      lastErrorCode: terminal.errorCode,
+      ...(causeErrorCode ? { causeErrorCode } : {}),
+      firstFailureAt,
+      ...(providerLastSuccessAt !== undefined ? { providerLastSuccessAt } : {}),
+      windowEndsAt: plan.windowEndsAt,
+      ladderBase,
+      ...(plan.providerRetryAt !== undefined ? { providerRetryAt: plan.providerRetryAt } : {}),
+    };
+    if (plan.kind === 'stop') {
+      const exhausted: OrdinaryTurnRecoveryState = {
+        ...base, status: 'exhausted', nextAttemptAt: undefined, stopReason: plan.stopReason,
+      };
+      this.warnOnce(exhausted);
+      return this.state ?? exhausted;
+    }
+    const noticeDue = !!this.deps.notifyWaiting
+      && current.waitNoticeSentAt === undefined
+      && !isSilentLogicalTurn(current, current.logicalTurnId)
+      && plan.nextAttemptAt - now >= pacing.waitNoticeMinDelayMs;
+    const next = this.commit({
+      ...base,
+      status: 'backoff',
+      nextAttemptAt: plan.nextAttemptAt,
+      ...(noticeDue ? { waitNoticeSentAt: now } : {}),
+    });
+    this.settleAfterBusy = false;
+    this.armBackoff();
+    if (noticeDue) {
+      try { this.deps.notifyWaiting!(next); } catch { /* informational; the status card still shows it */ }
+    }
     return next;
   }
 
@@ -580,6 +878,18 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       this.timer = undefined;
       const live = this.state;
       if (!live || live.status !== 'backoff') return;
+      if (this.deps.continuationsEnabled?.() === false) {
+        // Switched off during the wait: nothing is continued; say so. It ends
+        // like any failure left to a person — not `cancelled`, which would drop
+        // the frozen input the card's retry needs and keep the next message
+        // from clearing the attention this notice raises.
+        this.warnOnce({
+          ...live, status: 'attention_required', nextAttemptAt: undefined,
+          lastErrorCode: 'recovery_disabled',
+        });
+        return;
+      }
+      if (this.holdWindowedContinuation(live)) return;
       const continuation = live.continuationsStarted + 1;
       const turnId = this.deps.mintContinuationTurnId?.(live.logicalTurnId, continuation)
         ?? `bmx-recovery-${this.randomId()}`;
@@ -646,6 +956,35 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         failPreparation();
       }
     });
+  }
+
+  /** Window-paced only, when a due continuation fires. It is not sent:
+   *  - past its window (the daemon was down, a closed session woke up later):
+   *    the recovery settles as `window_closed`, with the usual notice;
+   *  - into a CLI someone is driving (web terminal, background wake): it looks
+   *    again shortly, and once more after the CLI went quiet; if the window
+   *    ends while the CLI is still busy it settles as `window_closed` rather
+   *    than typing into a CLI in use.
+   *  Returns true when the continuation was held back or settled. */
+  private holdWindowedContinuation(live: OrdinaryTurnRecoveryState): boolean {
+    if (!this.pacing || live.windowEndsAt === undefined) return false;
+    const now = this.now();
+    const occupied = this.deps.isCliOccupied?.() === true;
+    if (now > live.windowEndsAt + ORDINARY_RECOVERY_EXPIRED_GRACE_MS || (occupied && now >= live.windowEndsAt)) {
+      this.settleAfterBusy = false;
+      this.warnOnce({ ...live, status: 'exhausted', nextAttemptAt: undefined, stopReason: 'window_closed' });
+      return true;
+    }
+    if (!occupied && !this.settleAfterBusy) return false;
+    this.settleAfterBusy = occupied;
+    this.timer = this.deps.schedule(
+      Math.min(ORDINARY_RECOVERY_BUSY_RECHECK_MS, Math.max(0, live.windowEndsAt - now)),
+      () => {
+        this.timer = undefined;
+        this.armBackoff();
+      },
+    );
+    return true;
   }
 
   private warnOnce(state: OrdinaryTurnRecoveryState): void {
@@ -924,6 +1263,12 @@ export function cancelOrdinaryTurnRecoveryForStop(
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached || attached.session !== session) return session.ordinaryTurnRecovery;
   return attached.coordinator.cancelForStop();
+}
+
+/** A recovery coordinator currently owns this exact session object (its
+ *  timers are live). A persisted `backoff` without one is not going to run. */
+export function ordinaryTurnRecoveryArmed(session: OrdinaryTurnRecoverySession): boolean {
+  return attachedRecoveries.get(session.sessionId)?.session === session;
 }
 
 /** The CLI of this session reached an idle prompt (worker `prompt_ready`).
