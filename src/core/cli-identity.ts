@@ -1486,6 +1486,13 @@ const BYTEDCLI_AUTH_REQUEST_FN: readonly string[] = [
   '  command -v botmux >/dev/null 2>&1 || return 1',
   '  __botmux_ar_out=$(botmux auth request "$@" 2>/dev/null)',
   '}',
+  // botmux's answer to an authorization request, tagged so a caller can tell
+  // "the entry went to the person" (3) and "the provider is down" (4) from the
+  // refusals that are not about authorization at all. $1 = its exit status.
+  '__botmux_print_auth_answer() {',
+  `  printf '%s\\n' "$__botmux_ar_out" >&2`,
+  `  case "$1" in 3) printf '%s\\n' '${reasonTag('authorization_requested')}' >&2 ;; 4) printf '%s\\n' '${reasonTag('authorization_unavailable')}' >&2 ;; esac`,
+  '}',
   // The one refusal of a governed command in a run nobody attends: botmux is
   // asked to send the one private notice (its answer never reaches the agent),
   // then the command does not run. $1 = provider, $2 = message, $3 = Meego
@@ -1544,9 +1551,10 @@ function bytedcliMeegoBlock(realBinaryPath: string): string[] {
     `          HOME="$__botmux_home" ${shellSingleQuote(realBinaryPath)} meego config --tenant "$__botmux_mg_tenant" >/dev/null 2>&1 || true`,
     '        fi',
     '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
-    '        case $? in',
+    '        __botmux_rc=$?',
+    '        case $__botmux_rc in',
     `          0) printf '%s\\n' "$__botmux_ar_out" >&2; exit 0 ;;`,
-    `          3|4) printf '%s\\n' "$__botmux_ar_out" >&2 ;;`,
+    '          3|4) __botmux_print_auth_answer $__botmux_rc ;;',
     `          *) printf '%s\\n' ${shellSingleQuote(MEEGO_LOGIN_UNREACHABLE_MSG)} >&2 ;;`,
     '        esac',
     `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
@@ -1562,7 +1570,7 @@ function bytedcliMeegoBlock(realBinaryPath: string): string[] {
     '      if [ -n "$__botmux_mg_sub" ] && [ -n "$__botmux_mg_tok" ] && [ -z "$__botmux_mg_has" ]; then',
     `        if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse meego ${shellSingleQuote(UNATTENDED_MEEGO_MSG)} "$__botmux_mg_tenant"; fi`,
     '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
-    `        if [ $? -eq 3 ]; then printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
+    `        if [ $? -eq 3 ]; then __botmux_print_auth_answer 3; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
     '      fi',
     // Store not visible here (sandbox). In the person's own DM the session-
     // local login prints its link where only they can see it, as before.
@@ -1740,9 +1748,10 @@ export function renderIdentityWrapper(
         '  __botmux_resolve || :',
         `  if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse bytedcli ${shellSingleQuote(UNATTENDED_LOGIN_MSG)} "" ${shellSingleQuote(UNATTENDED_LOGIN_READY_MSG)}; fi`,
         '  __botmux_auth_request --provider bytedcli',
-        '  case $? in',
+        '  __botmux_rc=$?',
+        '  case $__botmux_rc in',
         `    0) printf '%s\\n' "$__botmux_ar_out" >&2; exit 0 ;;`,
-        `    3|4) printf '%s\\n' "$__botmux_ar_out" >&2 ;;`,
+        '    3|4) __botmux_print_auth_answer $__botmux_rc ;;',
         `    *) printf '%s\\n' ${shellSingleQuote(BYTECLOUD_LOGIN_UNREACHABLE_MSG)} >&2 ;;`,
         '  esac',
         `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
@@ -1774,7 +1783,7 @@ export function renderIdentityWrapper(
     `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '      fi',
     '    elif { [ "$__botmux_rc" -eq 3 ] || [ "$__botmux_rc" -eq 4 ]; } && [ -n "$__botmux_ar_out" ]; then',
-    `      printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    `      __botmux_print_auth_answer "$__botmux_rc"; exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    fi',
     '    ;;',
     '  esac',

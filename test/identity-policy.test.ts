@@ -276,6 +276,7 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
       expect(r.out).toBe('');
       expect(r.status).toBe(77);
       expect(r.err).toContain('BOTMUX-SAYS');
+      expect(r.err).toContain('[reason=authorization_requested]');
     });
 
     it.each(['bytedcli', 'codebase', 'bitscli'] as const)('%s: refused for want of authorization, then authorized: the same call goes on', name => {
@@ -308,8 +309,18 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
         expect(r.out).toBe('');
         expect(r.err).toContain('BOTMUX-SAYS');
         expect(r.err).not.toContain('平台没有签发');
+        expect(r.err).toContain('[reason=authorization_requested]');
         expect(botmuxCalls()).toBe('auth request --provider bytedcli\n');
       });
+
+    it('a refusal answered "provider unavailable" (4) is tagged apart from a delivered entry', () => {
+      denied();
+      const r = run(installFor('bytedcli'), ['codebase', 'mr', 'list'], { PATH: `${fakeBotmux(4)}:/usr/bin:/bin` });
+      expect(r.status).toBe(77);
+      expect(r.err).toContain('BOTMUX-SAYS');
+      expect(r.err).toContain('[reason=authorization_unavailable]');
+      expect(r.err).not.toContain('[reason=authorization_requested]');
+    });
 
     it.each(['platform_not_teammate', 'platform_forbidden'])(
       'a [reason=%s] refusal is final: botmux is not asked and the published text is shown', reason => {
