@@ -1,3 +1,4 @@
+import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
 import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
@@ -554,6 +555,7 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
+import { noteReplyCardTurnStarted } from './core/reply-card-turn-start.js';
 import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
@@ -4814,26 +4816,57 @@ async function prepareDelegatedScheduledTurnIdentity(
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
   if (authority.kind !== 'delegated') return false;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  // Same rule as the owner path: a one-shot is completed as soon as its turn
+  // is dispatched, so a replay or recovery of that admitted turn must still
+  // resolve (the scheduler admission refuses any new run of a completed task).
   const assertCurrent = () => assertScheduledAuthorityCurrent(authority,
-    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId });
+    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId, allowCompleted: true });
   const authorized = await authorizeDelegatedScheduleRun(
     authority.task,
     authority,
     { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
-      assertAuthorityCurrent: assertCurrent },
+      allowCompletedOnce: true, assertAuthorityCurrent: assertCurrent },
   );
-  await publishTurnCliIdentity({
-    botConfig: getBot(ds.larkAppId).config,
-    sessionDataDir: config.session.dataDir,
-    sessionId: ds.session.sessionId,
-    senderOpenId: undefined,
-    delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
-    locale: localeForBot(ds.larkAppId),
-    turnId,
-    storageModel: identityModelForPublication(ds),
-    privateChat: ds.chatType === 'p2p',
-  });
-  assertCurrent();
+  if (authorized.usesControllerToolActor) {
+    const identity: Extract<ScheduledRunIdentity, { ok: true }> = {
+      ok: true,
+      openId: authorized.targetOpenId,
+      unionId: authority.controlUnionId!,
+      source: 'creator',
+    };
+    noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+    noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: identity.openId,
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertCurrent();
+    (ds.scheduledToolActors ??= new Map()).set(turnId, {
+      openId: identity.openId,
+      unionId: identity.unionId,
+    });
+  } else {
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: undefined,
+      delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertCurrent();
+  }
   return true;
 }
 
@@ -6712,6 +6745,8 @@ function runIdleAutoCompact(): void {
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   noteTurnStarted(ds, turnId);
+  // The previous turn's「下一步」row stops being the last card's.
+  noteReplyCardTurnStarted(ds, turnId);
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
@@ -7773,6 +7808,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnId = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingAcceptedInput = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingChatContext = undefined;
@@ -10022,6 +10058,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       maxTasksPerTurn: scheduledChildMaxTasksPerTurn
         ?? readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
         ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+      controllerBoundToolIdentity: scheduledChildParent !== undefined,
     });
     if (!result.ok) {
       const error = scheduledChildParent && result.error === 'grant_task_limit'
@@ -22393,6 +22430,7 @@ function buildReservedInitialInput(
       whiteboardId: ds.session.whiteboardId,
       substituteTrigger: ds.pendingSubstituteTrigger,
       codexAppText: ds.pendingCodexAppText,
+      acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -22429,6 +22467,7 @@ function buildReservedInitialInput(
 function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingPrompt = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingAcceptedInput = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingAttachments = undefined;
@@ -27143,7 +27182,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (await executeNewTopicSlash({
     ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
     senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
-    forceTopic, forceTopicMode, botCfg,
+    forceTopic, forceTopicMode, botCfg, trustedCaller,
   })) return;
 
   // A setup-only `/t` must still pass the same talk-permission recheck as any
@@ -27454,6 +27493,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingTurnId: replyAnchorId,
     pendingTrustedCaller: trustedCaller,
     pendingCodexAppText: codexAppVisibleText,
+    pendingAcceptedInput: ctx.acceptedInput,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -27744,10 +27784,12 @@ interface NewTopicSlashContext {
   forceTopic: Extract<ReturnType<typeof parseTopicHeader>, { ok: true }> | null;
   forceTopicMode: 'default' | 'here' | 'worktree';
   botCfg: ReturnType<typeof getBot>['config'];
+  trustedCaller?: TrustedCaller;
 }
 
 async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
+  ctx.acceptedInput = undefined;
   // Intercept daemon commands in new topics (no session needed for some commands)
   // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
   // command when this bot opts in (default on). When off, fall through to
@@ -27766,6 +27808,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    delegatedCommands: sessionDelegatedSlashCommands(botCfg, undefined, config.daemon.backendType),
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
   });
   if (slashDecision.kind === 'plugin') {
@@ -27810,6 +27853,16 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
+        authorized: canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType),
+        primary: coordinationModeIsPrimary(),
+        caller: slash.trustedCaller,
+        larkAppId,
+        reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+      });
+      return !ctx.acceptedInput;
     }
     // Unlike daemon-management commands, `/sessions` is a read-only view of
     // metadata already visible in this group. Authorize it at canTalk level so
@@ -28472,6 +28525,10 @@ async function handleBotAdded(
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    // An ordinary join opens with the bootstrap, not a user question. Persist the
+    // awaiting-content marker at birth so naming starts from the first accepted
+    // content even if a later title write fails (forced openings carry a real task).
+    if (!forced) session.nativeSessionTitleAwaitingContent = true;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -29674,7 +29731,7 @@ async function handleThreadReplyAdmitted(
     ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent,
     routingChatId: ctxChatId, chatType: ctxChatType, chatId: threadChatId,
     senderOpenId: threadSenderOpenId, senderUnionId: threadSenderUnionId, teamTrustUnionId: threadTeamTrustUnionId,
-    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender,
+    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender, trustedCaller: threadTrustedCaller,
   })) return;
 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
@@ -30195,6 +30252,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
@@ -30305,6 +30363,7 @@ async function handleThreadReplyAdmitted(
         ds.pendingTurnId = parsed.messageId;
         ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
+        ds.pendingAcceptedInput = ctx.acceptedInput;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
@@ -30342,6 +30401,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
@@ -30555,6 +30615,10 @@ async function handleThreadReplyAdmitted(
     // pendingSender for the deferred spawn.
     const autoCreateSender = await getThreadSender();
     setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
+    // Hoisted for the same reason as promptContent/parsed below: the isolated
+    // newDs-literal eval in test/new-topic-lark-caller.test.ts only binds
+    // locals, never the RoutingContext, so it cannot see a bare `ctx` reference.
+    const autoCreateAcceptedInput = ctx.acceptedInput;
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -30573,6 +30637,7 @@ async function handleThreadReplyAdmitted(
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
+      pendingAcceptedInput: autoCreateAcceptedInput,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -30871,6 +30936,7 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            acceptedInput: ctx.acceptedInput,
             codexAppApplicationContext,
             codexAppMessageContext,
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
@@ -30901,6 +30967,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           codexAppMessageContext,
           solo: ds.soloSession,
@@ -31100,6 +31167,11 @@ async function handleThreadReplyAdmitted(
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
+    // A suspended/exited worker is the usual way back to a session, so this
+    // turn must also take the「下一步」row off the previous turn's card;
+    // otherwise that row stays clickable and this turn's own row is refused
+    // as belonging to an older turn.
+    noteReplyCardTurnStarted(ds, parsed.messageId);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -31143,6 +31215,7 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            acceptedInput: ctx.acceptedInput,
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,
@@ -31254,8 +31327,7 @@ async function handleThreadReplyAdmitted(
     // behind its unopened N. Appending this inbound to N would overtake those
     // persisted entries. Keep N exact and append the current turn after the
     // existing tail before starting the activation journal.
-    const queuedHasDurableTail = queuedDashboardTurn
-      && (ds.session.queuedActivationTail?.length ?? 0) > 0;
+    const queuedHasDurableTail = queuedOpeningHasTail(ds.session, ctx.acceptedInput);
     if (queuedHasDurableTail) await stageCurrentBehindQueuedActivation();
     const reforkContent = queuedDashboardTurn && !queuedHasDurableTail
       ? `${ds.session.queuedPrompt}\n\n${promptContent}`
@@ -31315,6 +31387,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: reforkCodexApp.text,
+          acceptedInput: queuedHasDurableTail ? ds.pendingAcceptedInput : ctx.acceptedInput,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -31339,6 +31412,7 @@ async function handleThreadReplyAdmitted(
         sender: queuedHasDurableTail ? undefined : reforkSender,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
         codexAppText: reforkCodexApp.text,
+        acceptedInput: queuedHasDurableTail ? ds.pendingAcceptedInput : ctx.acceptedInput,
         codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
         codexAppMessageContext: reforkCodexApp.messageContext,
         turnId: parsed.messageId,
@@ -31597,6 +31671,7 @@ async function handleThreadReplyAdmitted(
  * 推迟、透传送进已有会话。返回 true 表示已处理，入口应直接 return。
  */
 interface ThreadSlashContext {
+  trustedCaller?: TrustedCaller;
   ctx: RoutingContext;
   data: any;
   larkAppId: string;
@@ -31622,6 +31697,7 @@ interface ThreadSlashContext {
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  ctx.acceptedInput = undefined;
   if (ctx.effortTaskReentry) return false;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
@@ -31648,6 +31724,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       context: 'thread',
       phase: deriveSessionPhase(existingDs),
       sessionIsCommandScratch: !!existingDs && isResumeRecoveryPlaceholder(existingDs),
+      sessionHasBackendState: existingDs?.session.remoteBackendState !== undefined,
       passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
       coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
       senderIsBot: isBotSenderType || isForeignBotSender,
@@ -31657,6 +31734,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
         && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
       hasAttachments: resources.length > 0,
+      delegatedCommands: sessionDelegatedSlashCommands(getBot(larkAppId).config, existingDs, config.daemon.backendType),
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
@@ -31826,6 +31904,16 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
+        authorized: canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType),
+        primary: coordinationModeIsPrimary(),
+        caller: slash.trustedCaller,
+        larkAppId,
+        reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+      });
+      return !ctx.acceptedInput;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       const botSender = isBotSenderType || isForeignBotSender;
@@ -32571,6 +32659,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
+      noteReplyCardTurnStarted(ds, turnId);
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors

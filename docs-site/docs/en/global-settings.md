@@ -24,6 +24,7 @@ You can also edit `~/.botmux/config.json` directly. Every item below lists its J
 | Prefix group names created by `/g` | General → Group Creation | `groupNamePrefix` | None |
 | Hide worktrees in the repo picker | General → Repo Picker | `repoPickerMode` | Repos + worktrees |
 | Put new worktrees on a larger disk | General → Worktrees | `worktreeRoot` | Next to the main repo |
+| Let Claude carry on by itself after a transient model-service failure | General → Auto-continue after provider failures | `providerRecovery` | Off |
 | Download new versions through a proxy | System & Maintenance → Auto Maintenance → GitHub download proxy | `httpProxy` | Not set |
 | Skip pasting the callback URL after `/login` | General → Access → OAuth callback base URL | `oauthRedirectBase` | Not set |
 
@@ -140,6 +141,26 @@ An invalid timezone name is skipped and the next level is used. The auto-update 
 - **`/g` group name prefix** (General → Group Creation, `groupNamePrefix`): groups created with `/group` or `/g` get this text in front of their name, e.g. `AI-chat·`. Other ways of creating groups don't. Clear it and save to turn it off; takes effect within about 2 seconds. See [Create a session group](/en/group).
 - **Repo picker card mode** (General → Repo Picker, `repoPickerMode`): `all` (default, repos plus their worktrees) or `repos` (main repos only). With `repos`, `/repo <worktree path>` still takes you into a worktree.
 - **Worktree directory** (General → Worktrees, `worktreeRoot`): botmux creates new worktrees under this directory, e.g. `/data00/worktrees`. Useful when the system disk is small and a larger data disk is mounted. Worktrees are laid out under it by the main repo's own path: a worktree of `/root/iserver/botmux` becomes `/data00/worktrees/root/iserver/botmux-wt-…`, so repos with the same name in different places don't collide. Use an absolute path (may start with `~/`) to an existing, writable directory. Only affects worktrees created from then on; existing ones stay where they are and keep working, also if you change the directory again later. If the directory later goes missing or stops being writable (e.g. the data disk isn't mounted, or was remounted read-only), new worktrees are created next to the main repo instead and a warning is logged. Clear it and save to go back to creating them next to the main repo; takes effect within about 2 seconds.
+
+## Auto-continue after provider failures {#provider-recovery}
+
+Whether Botmux has a Claude Code turn resume from where it stopped after a transient model-service failure (5xx, a connection dropped mid-response, no upstream account available on the gateway…). The `config.json` field is `providerRecovery`; a bot's own setting under Bot settings → Sessions → Auto-continue after provider failures (`providerRecovery` in bots.json) takes precedence field by field. Claude Code only; Codex capacity recovery uses `codexCapacityRecovery`.
+
+**Off by default.** Then nothing is continued automatically: the failure card appears in the original topic (marked "not continued", with a Retry button), and when the provider's error named a recovery time the card shows "Provider expects recovery at HH:MM".
+
+| Option | Meaning | Default |
+|---|---|---|
+| Auto-continue (`enabled`) | Master switch | Off |
+| Keep trying for (`maxWaitMinutes`) | Counted from the last successful request; past it, automatic continuation stops and the failure card explains why. 1–240 minutes | Follows the prompt cache: 55 with a 1-hour cache, otherwise 15 |
+
+When on:
+
+- If the provider's error names its earliest availability (e.g. "available at 2026-11-13T11:10:16Z") or a `Retry-After`, the turn continues then, plus a few seconds of jitter; otherwise after 2 s, 8 s, 30 s, 1 min, 2 min, 5 min, then every 5 minutes. A continuation that makes progress and fails again restarts the short intervals.
+- If the provider's time lies beyond the limit, it stops right away and the failure card names that time.
+- A wait longer than a minute is announced once in the topic ("upstream unavailable, auto-continuing at HH:MM") and shown on the status card; a new message, or a turn completed in the Web Terminal, cancels it.
+- It never types into a CLI someone is using; it waits until the CLI is free, and if it is still in use at the limit it stops with the failure card.
+- Why the default follows the prompt cache: with a 1-hour cache ("Claude prompt cache" set to 1 hour, and the gateway really serving 1-hour caching), resuming within 55 minutes reads the cache and is cheapest; a 5-minute cache expires within minutes, so the limit only decides when to hand back to a human, and the default is shorter.
+- Switching it off drops a pending continuation: the expected time disappears from the status card right away, and at the scheduled time it settles with an "auto-continue is off" card.
 
 ## Network and access
 

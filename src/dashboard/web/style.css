@@ -35899,3 +35899,6 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-command-tags input:focus { border: 0; box-shadow: none; }
 .bd-command-tags.is-disabled { opacity: .65; }
 .bd-command-error { color: var(--danger); }
+
+#sessions-table .session-support-reason { font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#sessions-table .sessions-table-text-cell small { display: block; opacity: .75; }

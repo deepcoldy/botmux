@@ -114,6 +114,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `cliConfigDir` | Claude Code only: launch with `CLAUDE_CONFIG_DIR=<dir>`, so settings, login and transcripts all come from that directory. New sessions only |
 | `disableCliBypass` | `true` stops botmux from adding approval-bypass flags such as `--yolo` and `--dangerously-*` |
 | `promptCache` | Claude Code only: prompt-cache lifetime and idle keep-alive, e.g. `{"ttl":"1h","keepalive":{"enabled":true}}`. Fields you leave out follow the global setting; off by default |
+| `providerRecovery` | Claude Code only: continue automatically after a transient model-service failure, e.g. `{"enabled":true,"maxWaitMinutes":30}`. Fields you leave out follow the global setting; off by default. See [Global settings: auto-continue after provider failures](/global-settings#provider-recovery) |
 | `skillInjection` | How botmux's built-in skills reach the CLI: `prompt` (per session), `global` (installed into the CLI's global skills dir), or `off`. If unset, it follows the global setting, which defaults to `prompt`. See [Skills](/en/skill-cli) |
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |

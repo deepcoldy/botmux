@@ -162,13 +162,14 @@ describe('program-status relay launch plan', () => {
     expect(existsSync(dirname(launch.args.at(-1)!))).toBe(false);
   });
 
-  it('adds a constant-size argv regardless of the wrapped command (tmux caps new-session at ~16 KB)', () => {
+  it('adds a constant-size argv with bounded fixed overhead regardless of the wrapped command', () => {
     const small = compiledLaunch('/usr/bin/claude', ['hi']);
     const large = compiledLaunch('/usr/bin/claude', ['x'.repeat(12_000)]);
     const len = (a: string[]) => a.join(' ').length;
     expect(len(large.args)).toBe(len(small.args));
     // The absolute plan path follows TMPDIR, so exclude that environment-sized
-    // segment while keeping the relay's fixed overhead far below tmux's limit.
+    // segment while retaining a coarse guard against bloating the fixed relay
+    // argv overhead.
     expect(len(large.args) - large.args.at(-1)!.length).toBeLessThan(1_024);
   });
 

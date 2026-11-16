@@ -83,6 +83,30 @@ describe('POST /api/current-actor', () => {
     });
   });
 
+  it.skipIf(process.platform !== 'linux')('resolves an ownerless child tool actor from the normal CLI request shape', async () => {
+    const ds = activeSession();
+    ds.managedTurnOrigin.turnId = SCHEDULED_TURN_ID;
+    delete ds.managedTurnOrigin.callerOpenId;
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_current', unionId: 'on_current',
+    }]]);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+
+    const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      // This is the exact production `botmux actor current --json` body: no
+      // caller or scheduled-turn hint comes from the CLI.
+      body: JSON.stringify({ sessionId: 's-actor' }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      actor: { email: 'current.user@example.com' },
+      turnId: SCHEDULED_TURN_ID,
+    });
+  });
+
   it.skipIf(process.platform !== 'linux')('binds an expected scheduled turn to daemon liveness', async () => {
     const ds = activeSession();
     ds.managedTurnOrigin.turnId = SCHEDULED_TURN_ID;

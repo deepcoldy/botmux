@@ -166,9 +166,30 @@ vi.mock('../src/core/ordinary-recovery-retry.js', () => ({
   handleOrdinaryRecoveryRetryClick: (...a: any[]) => recoveryRetryClickMock(...a),
 }));
 
+// The「下一步」row's card writes, recorded instead of sent.
+const nextStepWrites: string[] = [];
+vi.mock('../src/core/next-step-io.js', () => ({ nextStepIo: {
+  enabled: () => true,
+  locale: () => 'zh',
+  issue: (_ds: unknown, prompt: string) => ({ payload: prompt, sig: 'sig' }),
+  readCard: async () => JSON.stringify({ schema: '2.0', body: { elements: [
+    { tag: 'markdown', content: 'answer' },
+    { tag: 'markdown', element_id: 'botmux_reply_footer', content: 'signature' },
+  ] } }),
+  cardId: async (_ds: unknown, messageId: string) => `card_${messageId}`,
+  insert: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`insert ${messageId}`); },
+  replace: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`replace ${messageId}`); },
+  remove: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`remove ${messageId}`); },
+  now: () => Date.now(),
+  warn: () => {},
+} }));
+
 // ─── Imports (after mocks) ────────────────────────────────────────────────
 
 import { handleCardAction } from '../src/im/lark/card-handler.js';
+import { nextStepIdle, noteNextStepCard, noteNextStepSuggestion, noteNextStepTurnStarted } from '../src/core/next-step-suggestion.js';
+import { nextStepIo } from '../src/core/next-step-io.js';
+import { noteCliRecap, noteRecapCard, noteRecapTurnStarted, recapIdle, type RecapIo } from '../src/core/turn-recap-state.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
@@ -603,6 +624,50 @@ describe('retry_recovery_turn — routing', () => {
 });
 
 
+describe('a retry takes over the last reply card', () => {
+  /** A finished turn whose card has a「本轮回顾」panel and a pending model wait. */
+  function recapIoFor(cancelled: string[], published: string[]) {
+    const io: RecapIo = {
+      enabled: () => true, modelEnabled: () => true, showFacts: () => true, locale: () => 'zh',
+      readCard: async () => undefined, cardId: async () => 'card', insert: async () => {}, replace: async () => {},
+      modelRecap: async () => undefined,
+      setTimer: () => () => { cancelled.push('model wait'); },
+      now: () => Date.now(), warn: () => {},
+    };
+    return { io, unified: { kind: 'unified' as const, publish: async (markdown: string) => { published.push(markdown); } } };
+  }
+  const input = { facts: { files: ['src/a.ts'], commands: 0 }, modelPrompt: 'PROMPT' };
+
+  it.each([
+    ['retry_turn', 'resend'],
+    ['purge_images_continue', null],
+    ['retry_last_task', null],
+  ] as const)('%s ends the previous turn\'s「本轮回顾」wait and gets its own panel', async (action, mode) => {
+    const ds = makeDs({
+      streamCardId: undefined,
+      lastCliInput: 'wrapped: do the thing', lastUserPrompt: 'do the thing', lastCliInputTurnId: TURN,
+      usageLimit: { limited: true, kind: 'usage', retryAtMs: 0, retryReady: true, retryLabel: '' } as any,
+    });
+    const cancelled: string[] = [];
+    const published: string[] = [];
+    const { io, unified } = recapIoFor(cancelled, published);
+    noteRecapTurnStarted(ds, 'om_turn_done');
+    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, input, io);
+    await recapIdle(ds);
+    await handleCardAction(actionData(TURN, mode, action), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const retryTurnId = sendWorkerInputMock.mock.calls[0][2] as string;
+    expect(retryTurnId).toMatch(/^retry-/);
+    expect(cancelled).toEqual(['model wait']);
+    noteRecapCard(ds, retryTurnId, unified, input, io);
+    noteCliRecap(ds, 'om_turn_done', '上一轮的回顾', io);
+    noteCliRecap(ds, retryTurnId, '重试这一轮的回顾', io);
+    await recapIdle(ds);
+    expect(published.at(-1)).toContain('重试这一轮的回顾');
+    expect(published.join('\n')).not.toContain('上一轮的回顾');
+  });
+});
+
 describe('manual card retries rejected admission routing transaction', () => {
   it.each(['retry_turn', 'retry_last_task', 'purge_images_continue'] as const)('%s preserves full routing and retry eligibility', async action => {
     const { fillRetryRouting, routingSnapshot } = await import('./helpers/retry-routing.js');
@@ -661,5 +726,52 @@ describe('/quote cold admission', () => {
     expect(rememberLastCliInputMock).not.toHaveBeenCalled();
     expect(ds.currentTurnId).toBeUndefined();
     expect(ds.streamCardPending).not.toBe(true);
+  });
+  it.each([['live', { killed: false }], ['cold', null]] as const)(
+    'moves the「下一步」row from the previous turn\'s card to the quote turn (%s worker)', async (_kind, worker) => {
+      const ds = makeDs({ worker: worker as any });
+      ds.lastScreenStatus = 'idle';
+      nextStepWrites.length = 0;
+      noteNextStepTurnStarted(ds, 'om_turn_before', nextStepIo);
+      noteNextStepCard(ds, 'om_turn_before', { kind: 'legacy', messageId: 'om_card_before' }, nextStepIo);
+      noteNextStepSuggestion(ds, 'om_turn_before', '继续', nextStepIo);
+      await nextStepIdle(ds);
+      expect(nextStepWrites).toEqual(['insert om_card_before']);
+      await handleCardAction(event(), depsWith(ds), LARK_APP_ID);
+      expect(ds.currentTurnId).toBe('om_quote_click');
+      await nextStepIdle(ds);
+      expect(nextStepWrites).toEqual(['insert om_card_before', 'remove om_card_before']);
+      // The quote turn is the latest one: its own card gets its row.
+      noteNextStepCard(ds, 'om_quote_click', { kind: 'legacy', messageId: 'om_card_quote' }, nextStepIo);
+      noteNextStepSuggestion(ds, 'om_quote_click', '合码', nextStepIo);
+      await nextStepIdle(ds);
+      expect(nextStepWrites).toEqual(['insert om_card_before', 'remove om_card_before', 'insert om_card_quote']);
+    });
+  it('hands the「本轮回顾」over from the previous turn to the quote turn', async () => {
+    const ds = makeDs({ worker: { killed: false } as any });
+    ds.lastScreenStatus = 'idle';
+    const cancelled: string[] = [];
+    const published: string[] = [];
+    const io: RecapIo = {
+      enabled: () => true, modelEnabled: () => true, showFacts: () => true, locale: () => 'zh',
+      readCard: async () => undefined, cardId: async () => 'card', insert: async () => {}, replace: async () => {},
+      modelRecap: async () => undefined,
+      setTimer: () => () => { cancelled.push('model wait'); },
+      now: () => Date.now(), warn: () => {},
+    };
+    const input = { facts: { files: ['src/a.ts'], commands: 0 }, modelPrompt: 'PROMPT' };
+    noteRecapTurnStarted(ds, 'om_turn_before');
+    noteRecapCard(ds, 'om_turn_before', { kind: 'legacy', messageId: 'om_card_before' }, input, io);
+    await recapIdle(ds);
+    await handleCardAction(event(), depsWith(ds), LARK_APP_ID);
+    expect(ds.currentTurnId).toBe('om_quote_click');
+    // The previous turn's model wait ends with it.
+    expect(cancelled).toEqual(['model wait']);
+    noteRecapCard(ds, 'om_quote_click', { kind: 'unified', publish: async markdown => { published.push(markdown); } }, input, io);
+    noteCliRecap(ds, 'om_turn_before', '上一轮的回顾', io);
+    noteCliRecap(ds, 'om_quote_click', '引用这一轮的回顾', io);
+    await recapIdle(ds);
+    expect(published.at(-1)).toContain('引用这一轮的回顾');
+    expect(published.join('\n')).not.toContain('上一轮的回顾');
   });
 });
