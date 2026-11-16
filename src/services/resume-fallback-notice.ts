@@ -90,7 +90,8 @@ export interface ResumeFallbackDecisionInput extends ResumeFallbackReport {
   /** The owning turn is auxiliary-UI suppressed (a silent scheduled run, a
    *  meeting-driven turn, a message-listener session, a no-transport bot). The
    *  notice then stays in the log and the per-session latch is NOT spent, so a
-   *  later human-visible turn on the same session still gets its one warning. */
+   *  later human-visible turn on the same session still gets its one warning.
+   *  Transport only: it never turns a noise report into an attention signal. */
   auxUiSuppressed?: boolean;
 }
 
@@ -105,6 +106,12 @@ export interface ResumeFallbackOutcome {
   };
   /** Notice text to post, or undefined when the report must stay in the log. */
   notice?: string;
+  /** The report cleared the CONTENT gates (something was lost and this
+   *  session has not been told yet), whether or not the transport lets the
+   *  notice out. Drives `session.requires_attention`, exactly as the transport
+   *  gate never silences that hook for other user_notify kinds. A noise report
+   *  (nothing lost / no history / already told) is not an attention event. */
+  attention: boolean;
 }
 
 export function decideResumeFallbackReport(input: ResumeFallbackDecisionInput): ResumeFallbackOutcome {
@@ -113,21 +120,27 @@ export function decideResumeFallbackReport(input: ResumeFallbackDecisionInput): 
     ...(input.reason ? { reason: input.reason } : {}),
     ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
   };
-  // Transport policy first: a turn whose auxiliary UI is suppressed must never
-  // surface a Lark message, and must not spend the latch a visible turn owns.
-  if (input.auxUiSuppressed) {
-    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'aux-ui-suppressed' } };
-  }
+  // Content gates first: they decide whether there is anything to tell a human
+  // at all (and so whether this is an attention event).
   if (input.lost === false) {
-    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'nothing-lost' } };
+    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'nothing-lost' }, attention: false };
   }
   if (!input.hasSessionHistory) {
-    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'no-history' } };
+    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'no-history' }, attention: false };
   }
   if (input.alreadyNotified) {
-    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'already-notified' } };
+    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'already-notified' }, attention: false };
   }
-  return { structured: { kind: 'resume_fallback', ...base }, notice: resumeFallbackNotice(input.tier) };
+  // Then transport: a turn whose auxiliary UI is suppressed must never surface
+  // a Lark message, and must not spend the latch a visible turn owns.
+  if (input.auxUiSuppressed) {
+    return { structured: { kind: 'resume_fallback', ...base, suppressed: 'aux-ui-suppressed' }, attention: true };
+  }
+  return {
+    structured: { kind: 'resume_fallback', ...base },
+    notice: resumeFallbackNotice(input.tier),
+    attention: true,
+  };
 }
 
 export interface ResumeFallbackHandlerInput {
@@ -136,6 +149,9 @@ export interface ResumeFallbackHandlerInput {
   /** See {@link ResumeFallbackDecisionInput.auxUiSuppressed}. When true the
    *  report is logged only, sends nothing, and does not spend the latch. */
   auxUiSuppressed?: boolean;
+  /** Raise the lifecycle attention signal; called once, before any send, iff
+   *  {@link ResumeFallbackOutcome.attention}. */
+  onAttention?: () => void;
   /** Deliver the one notice. A rejection releases the latch (retryable). */
   send: (notice: string) => Promise<void>;
   /** Structured record for every report, delivered or suppressed. */
@@ -157,7 +173,7 @@ export interface ResumeFallbackHandlerResult {
 export async function handleResumeFallbackReport(
   input: ResumeFallbackHandlerInput,
 ): Promise<ResumeFallbackHandlerResult> {
-  const { ds, report, send, log, auxUiSuppressed } = input;
+  const { ds, report, send, log, auxUiSuppressed, onAttention } = input;
   const outcome = decideResumeFallbackReport({
     ...report,
     hasSessionHistory: sessionHasResumeHistory(ds),
@@ -166,6 +182,7 @@ export async function handleResumeFallbackReport(
   });
   const fact = `resume fallback → fresh (tier=${outcome.structured.tier}`
     + (outcome.structured.reason ? `, reason: ${outcome.structured.reason}` : '') + ')';
+  if (outcome.attention) onAttention?.();
   if (!outcome.notice) {
     // Suppressed reports are recorded immediately: nothing is pending.
     log(`${fact}: notice suppressed (${outcome.structured.suppressed})`);
@@ -181,7 +198,7 @@ export async function handleResumeFallbackReport(
     ds.resumeFreshFallbackNotified = false;
     log(`${fact}: notice delivery failed (${(err as Error).message}); latch released for retry`);
     return {
-      outcome: { structured: { ...outcome.structured, deliveryFailed: true } },
+      outcome: { structured: { ...outcome.structured, deliveryFailed: true }, attention: outcome.attention },
       delivered: false,
     };
   }

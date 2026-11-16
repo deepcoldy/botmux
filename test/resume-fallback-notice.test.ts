@@ -141,18 +141,31 @@ describe('resume fallback delivery policy', () => {
     });
     expect(outcome.notice).toBeUndefined();
     expect(outcome.structured.suppressed).toBe('aux-ui-suppressed');
+    // Transport suppression is not content suppression: a human would have
+    // been told, so the lifecycle attention signal still fires.
+    expect(outcome.attention).toBe(true);
   });
 
-  it('aux-ui suppression wins over every other gate and stays silent', () => {
-    const outcome = decideResumeFallbackReport({
-      tier: 'probe-missing',
-      hasSessionHistory: true,
-      alreadyNotified: false,
-      lost: false,
-      auxUiSuppressed: true,
-    });
-    expect(outcome.notice).toBeUndefined();
-    expect(outcome.structured.suppressed).toBe('aux-ui-suppressed');
+  // The worker reports EVERY demotion (master's worker filtered nothing-lost and
+  // repeats before sending), so attention must follow the content gate: noise
+  // reports raise nothing whether or not the turn is also transport-suppressed.
+  it.each([
+    ['nothing-lost', { hasSessionHistory: true, alreadyNotified: false, lost: false }],
+    ['no-history', { hasSessionHistory: false, alreadyNotified: false }],
+    ['already-notified', { hasSessionHistory: true, alreadyNotified: true }],
+  ] as const)('a %s report is never an attention event, transport-suppressed or not', (suppressed, gates) => {
+    for (const auxUiSuppressed of [false, true]) {
+      const outcome = decideResumeFallbackReport({ tier: 'probe-missing', ...gates, auxUiSuppressed });
+      expect(outcome.notice).toBeUndefined();
+      expect(outcome.structured.suppressed).toBe(suppressed);
+      expect(outcome.attention).toBe(false);
+    }
+  });
+
+  it('a notice-worthy report is an attention event', () => {
+    const outcome = decideResumeFallbackReport({ tier: 'no-exact-id', hasSessionHistory: true, alreadyNotified: false });
+    expect(outcome.notice).toBe(resumeFallbackNotice('no-exact-id'));
+    expect(outcome.attention).toBe(true);
   });
 });
 
@@ -274,5 +287,23 @@ describe('handleResumeFallbackReport (daemon handler seam)', () => {
     expect(visible.delivered).toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(ds.resumeFreshFallbackNotified).toBe(true);
+  });
+
+  it('raises attention for a delivered or transport-suppressed notice, never for noise', async () => {
+    const run = async (ds: Parameters<typeof handleResumeFallbackReport>[0]['ds'], extra: { lost?: boolean; auxUiSuppressed?: boolean } = {}) => {
+      const onAttention = vi.fn();
+      const send = vi.fn(async () => {});
+      await handleResumeFallbackReport({
+        ds, report: { tier: 'probe-missing', lost: extra.lost }, auxUiSuppressed: extra.auxUiSuppressed,
+        onAttention, send, log: vi.fn(),
+      });
+      return { attention: onAttention.mock.calls.length, sent: send.mock.calls.length };
+    };
+    const told = { session: { lastCliInput: 'go' }, resumeFreshFallbackNotified: undefined as boolean | undefined };
+    expect(await run(told, { auxUiSuppressed: true })).toEqual({ attention: 1, sent: 0 });
+    expect(await run(told)).toEqual({ attention: 1, sent: 1 });
+    expect(await run(told)).toEqual({ attention: 0, sent: 0 }); // already told
+    expect(await run({ session: {} })).toEqual({ attention: 0, sent: 0 }); // no history
+    expect(await run({ session: { lastCliInput: 'go' } }, { lost: false })).toEqual({ attention: 0, sent: 0 });
   });
 });

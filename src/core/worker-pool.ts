@@ -22830,14 +22830,14 @@ function setupWorkerHandlers(
           // latch would re-post on every restart, and only the daemon can see
           // the persisted history evidence.
           // Keep the same auxiliary-UI contract as every other user_notify:
-          // the lifecycle hook fires regardless, but a silent scheduled /
-          // meeting-driven / no-transport turn must never get a Lark message
-          // (and must not spend the one-notice latch a visible turn owns).
+          // the transport gate never silences the lifecycle hook, but a silent
+          // scheduled / meeting-driven / no-transport turn must never get a
+          // Lark message (and must not spend the one-notice latch a visible
+          // turn owns). Unlike other kinds the worker reports EVERY demotion,
+          // so the hook follows the content gate (nothing lost / no history /
+          // already told are noise, not attention events) — the same reports
+          // master's worker never sent at all.
           logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
-          emitSessionLifecycleHook(ds, 'session.requires_attention', {
-            reason: 'user_notify',
-            message: msg.message,
-          });
           const auxUiSuppressed = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
           await handleResumeFallbackReport({
             ds,
@@ -22848,6 +22848,10 @@ function setupWorkerHandlers(
               lost: msg.resumeLost,
             },
             auxUiSuppressed,
+            onAttention: () => emitSessionLifecycleHook(ds, 'session.requires_attention', {
+              reason: 'user_notify',
+              message: msg.message,
+            }),
             send: notice => sendTurnNotice(ds, {
               kind: 'user_notify',
               turnId: fallbackTurnId(ds, msg.turnId),
