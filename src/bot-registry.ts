@@ -1710,6 +1710,8 @@ export interface BotConfig {
   promptInjection?: 'default' | 'none';
   /** Absent preserves existing routing; stop opts into source-topic checks. */
   topicUnavailablePolicy?: 'legacy' | 'stop';
+  /** Opt-in: reclaim workers when their topic root is recalled or confirmed deleted. */
+  topicAutoClose?: boolean;
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -4428,6 +4430,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
+      topicAutoClose: entry.topicAutoClose === true,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid

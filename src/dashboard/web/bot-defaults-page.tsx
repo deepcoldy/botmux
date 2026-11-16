@@ -6604,6 +6604,37 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
   );
 }
 
+function TopicAutoCloseSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  async function save(value: boolean) {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/topic-auto-close`, { topicAutoClose: value });
+      if (!res.ok || !res.body.ok) throw new Error(responseErrorText(res));
+      props.patchBot(props.bot.larkAppId, { topicAutoClose: res.body.topicAutoClose === true });
+      setStatus({ text: tr('botDefaults.cardPrefSaved'), ok: true });
+    } catch (error) {
+      setStatus({ text: caughtErrorText(error) });
+    } finally { setBusy(false); }
+  }
+  return (
+    <div className="bd-subsection" data-topic-auto-close>
+      <ToggleRow
+        checked={props.bot.topicAutoClose === true}
+        disabled={busy}
+        dataAction="toggle-topic-auto-close"
+        title={tr('botDefaults.topicAutoClose')}
+        help={tr('botDefaults.topicAutoCloseHelp')}
+        onChange={value => void save(value)}
+      />
+      <StatusSpan status={status} />
+    </div>
+  );
+}
+
 function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [busy, setBusy] = useState(false);
@@ -6767,6 +6798,7 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   return (
     <section className="bd-section" data-reply-delivery>
       <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
+      <TopicAutoCloseSection {...props} />
       <TopicUnavailablePolicySection {...props} />
       <ToggleRow
         checked={transcript}

@@ -21,6 +21,7 @@ const OK_FALSE = { ok: false, error: 'larkAppId_not_set' };
 const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-p2p-mode', LEGACY],
   ['/api/bot-envelope-injection', LEGACY],
+  ['/api/bot-topic-auto-close', LEGACY],
   ['/api/bot-topic-unavailable-policy', LEGACY],
   ['/api/bot-prompt-injection', LEGACY],
   ['/api/bot-reply-delivery', LEGACY],
@@ -51,6 +52,9 @@ const CASES: readonly Case[] = [
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"off"}', 200, { ok: true, envelopeInjection: 'off' }, { envelopeInjection: undefined }],
+  ['/api/bot-topic-auto-close', '{"topicAutoClose":true}', 200, { ok: true, topicAutoClose: true }, { topicAutoClose: true }],
+  ['/api/bot-topic-auto-close', '{"topicAutoClose":false}', 200, { ok: true, topicAutoClose: false }, { topicAutoClose: undefined }],
+  ['/api/bot-topic-auto-close', '{"topicAutoClose":"true"}', 400, { ok: false, error: 'invalid_topic_auto_close' }],
   ['/api/bot-topic-unavailable-policy', '{"topicUnavailablePolicy":"stop"}', 200, { ok: true, topicUnavailablePolicy: 'stop' }, { topicUnavailablePolicy: 'stop' }],
   ['/api/bot-topic-unavailable-policy', '{"topicUnavailablePolicy":"x"}', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
   ['/api/bot-topic-unavailable-policy', '[]', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],

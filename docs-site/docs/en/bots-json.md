@@ -576,6 +576,7 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 | `hideLocalAddresses` | Off by default: model replies reach Feishu as written. When on, host paths and local service addresses are kept out of replies. See [Hide development host addresses](#hide-local-addresses) below |
 | `promptInjection` | `"default"` (default) or `"none"`. `none` is zero-injection mode: botmux adds no system prompt or reminders, passes only the task and attachments, and forwards the final answer automatically. See below |
 | `envelopeInjection` | Claude Code only: `auto` moves the per-turn reminder into a hook, so the terminal input box shows only the message itself. Default `off` keeps it as is |
+| `topicAutoClose` | Off by default; reclaim workers after root recall or confirmed deletion, with startup and minute checks. See [Automatic topic cleanup](/en/topic-auto-close) |
 | `topicUnavailablePolicy` | What to do when the original topic is deleted or unavailable. See [Topic unavailable policy](/en/topic-unavailable-policy) |
 | `turnResults` | Structured per-turn results for external systems to read. See [Turn results](/en/turn-results) |
 

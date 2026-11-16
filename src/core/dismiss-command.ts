@@ -17,6 +17,7 @@ import { listSessionsStrict, findActiveSessionsByChatStrict } from '../services/
 import { botProvablyOwnsChat, disbandChat, probeChatGone } from '../services/groups-store.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { logger } from '../utils/logger.js';
+import { structuredLarkCode } from '../im/lark/lark-errors.js';
 
 /** A peer daemon that has not answered by then is treated as an unverified close. */
 const PEER_CLOSE_TIMEOUT_MS = 60_000;
@@ -289,14 +290,17 @@ export async function closeSessionsInRecalledTopic(args: {
   chatId: string;
   messageId: string;
   activeSessions: ReadonlyMap<string, DaemonSession>;
+  enabled?: () => boolean;
 }): Promise<void> {
   const tag = `[topic-gone] root=${args.messageId.slice(0, 12)}`;
+  if (args.enabled?.() === false) return;
   if (coordinationModeIsPrimary()) {
     logger.warn(`${tag}: durable primary requires the primary control path`);
     return;
   }
   try {
     await withBotTurnMutation(args.larkAppId, async () => {
+      if (args.enabled?.() === false) return;
       const own = new Set<string>();
       for (const s of listSessionsStrict()) {
         if (s.status === 'active' && s.scope === 'thread' && s.chatId === args.chatId
@@ -305,10 +309,13 @@ export async function closeSessionsInRecalledTopic(args: {
         }
       }
       for (const ds of args.activeSessions.values()) {
+        // A live binding supersedes a stale persisted projection after migration.
+        own.delete(ds.session.sessionId);
         if (ds.larkAppId === args.larkAppId && ds.scope === 'thread' && ds.chatId === args.chatId
-            && ds.session.rootMessageId === args.messageId) own.add(ds.session.sessionId);
+            && ds.session.status === 'active' && ds.session.rootMessageId === args.messageId) own.add(ds.session.sessionId);
       }
       for (const id of own) {
+        if (args.enabled?.() === false) return;
         try {
           const closed = await closeSession(id, { cardVisibility: 'private', awaitWorkerExit: false });
           if (!closed.ok) logger.warn(`${tag}: session ${id.slice(0, 8)} close refused: ${closed.error}`);
@@ -321,6 +328,47 @@ export async function closeSessionsInRecalledTopic(args: {
     });
   } catch (err) {
     logger.warn(`${tag}: sessions not closed: ${err}`);
+  }
+}
+
+/** Reconcile deleted roots after missed events or daemon downtime. */
+export async function sweepRecalledTopicSessions(args: {
+  larkAppId: string;
+  activeSessions: ReadonlyMap<string, DaemonSession>;
+  enabled: () => boolean;
+  lookup: (appId: string, messageId: string) => Promise<{
+    items?: { message_id?: string; chat_id?: string; deleted?: boolean }[];
+  }>;
+}): Promise<void> {
+  if (!args.enabled() || coordinationModeIsPrimary()) return;
+  const roots = new Map<string, { chatId: string; messageId: string }>();
+  const add = (s: Session, appId: string, scope = s.scope) => {
+    if (appId !== args.larkAppId || s.status !== 'active' || scope !== 'thread'
+        || !s.rootMessageId?.startsWith('om_') || !s.chatId?.startsWith('oc_')) return;
+    roots.set(JSON.stringify([s.chatId, s.rootMessageId]), { chatId: s.chatId, messageId: s.rootMessageId });
+  };
+  const liveIds = new Set([...args.activeSessions.values()].map(ds => ds.session.sessionId));
+  for (const s of listSessionsStrict()) {
+    if (!liveIds.has(s.sessionId)) add(s, s.larkAppId ?? args.larkAppId);
+  }
+  for (const ds of args.activeSessions.values()) add({ ...ds.session, chatId: ds.chatId }, ds.larkAppId, ds.scope);
+  for (const root of roots.values()) {
+    if (!args.enabled()) return;
+    let deleted = false;
+    try {
+      const detail = await args.lookup(args.larkAppId, root.messageId);
+      const matches = detail?.items?.filter(item => item.message_id === root.messageId) ?? [];
+      deleted = matches.length === 1 && matches[0].deleted === true
+        && (!matches[0].chat_id || matches[0].chat_id === root.chatId);
+    } catch (error) {
+      // Only the provider's explicit withdrawal code proves deletion. Missing
+      // permissions, timeouts and malformed responses must never retire workers.
+      deleted = structuredLarkCode(error) === 230011;
+      if (!deleted) logger.debug(`[topic-gone] root=${root.messageId.slice(0, 12)}: lookup unconfirmed; retained`);
+    }
+    if (deleted && args.enabled()) {
+      await closeSessionsInRecalledTopic({ ...root, ...args });
+    }
   }
 }
 

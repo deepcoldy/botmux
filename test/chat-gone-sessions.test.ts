@@ -23,10 +23,10 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 vi.mock('../src/core/worker-pool.js', () => ({ closeSession: h.close }));
 vi.mock('../src/services/groups-store.js', () => ({ disbandChat: vi.fn(), probeChatGone: h.probe }));
-vi.mock('../src/utils/logger.js', () => ({ logger: { warn: vi.fn(), info: vi.fn() } }));
+vi.mock('../src/utils/logger.js', () => ({ logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn() } }));
 vi.mock('../src/utils/daemon-discovery.js', () => ({ findOnlineDaemon: () => ({ ipcPort: 4100 }) }));
 vi.mock('../src/core/daemon-ipc-auth.js', () => ({ fetchDaemonIpc: h.ipc }));
-import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup, closeSessionsInRecalledTopic } from '../src/core/dismiss-command.js';
+import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup, closeSessionsInRecalledTopic, sweepRecalledTopicSessions } from '../src/core/dismiss-command.js';
 import { withBotTurnAdmission, __testOnly_resetBotTurnMutationGates } from '../src/core/bot-turn-mutation-gate.js';
 
 const APP = 'cli_self';
@@ -82,6 +82,14 @@ describe('closeSessionsInRecalledTopic', () => {
     expect(h.close).not.toHaveBeenCalled();
   });
 
+  it('prefers a migrated live binding over a stale persisted row', async () => {
+    h.rows = [topic('s1'), topic('s2')];
+    active.set('s1', live(topic('s1', { rootMessageId: 'om_new_root' })));
+    active.set('s2', live(topic('s2', { scope: 'chat' })));
+    await recall();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
   it('waits for admitted session creation, and duplicate recall does not close a persisted session twice', async () => {
     let admit!: () => void;
     const admission = withBotTurnAdmission(APP, () => new Promise<void>(resolve => { admit = () => {
@@ -111,6 +119,106 @@ describe('closeSessionsInRecalledTopic', () => {
     h.rows = [topic('s1')];
     await recall();
     expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the switch after waiting for an in-flight admission', async () => {
+    let enabled = true;
+    let admit!: () => void;
+    const admission = withBotTurnAdmission(APP, () => new Promise<void>(resolve => { admit = resolve; }));
+    h.rows = [topic('s1')];
+    const closing = closeSessionsInRecalledTopic({ larkAppId: APP, chatId: GONE, messageId: ROOT, activeSessions: active, enabled: () => enabled });
+    enabled = false;
+    admit();
+    await admission; await closing;
+    expect(h.close).not.toHaveBeenCalled();
+  });
+});
+
+describe('sweepRecalledTopicSessions', () => {
+  const ROOT = 'om_root';
+  const topic = (id: string, over: Partial<Session> = {}) => row(id, { scope: 'thread', rootMessageId: ROOT, ...over });
+  const lookup = vi.fn();
+  let enabled = true;
+  const sweep = () => sweepRecalledTopicSessions({ larkAppId: APP, activeSessions: active, enabled: () => enabled, lookup });
+  beforeEach(() => {
+    enabled = true;
+    lookup.mockReset().mockResolvedValue({ items: [{ message_id: ROOT, chat_id: GONE, deleted: true }] });
+  });
+
+  it('recovers persisted roots after missed events, deduplicates live roots and excludes synthetic/chat/peer sessions', async () => {
+    h.rows = [topic('s1'), topic('s2'), topic('peer', { larkAppId: PEER }), row('chat'),
+      topic('synthetic', { rootMessageId: 'headless:1' }), topic('closed', { status: 'closed' })];
+    active.set('s1', live(h.rows[0]));
+    await sweep();
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(APP, ROOT);
+    expect(closedIds()).toEqual(['s1', 's2']);
+  });
+
+  it.each([
+    { items: [{ message_id: ROOT, deleted: false }] },
+    { items: [{ message_id: ROOT }] },
+    { items: [{ message_id: 'om_wrong', deleted: true }] },
+    { items: [{ message_id: ROOT, chat_id: OTHER, deleted: true }] },
+    { items: [{ message_id: ROOT, deleted: true }, { message_id: ROOT, deleted: true }] },
+    { items: [] },
+  ])('retains workers for available, incomplete or mismatched readback: %j', async detail => {
+    h.rows = [topic('s1')];
+    lookup.mockResolvedValue(detail);
+    await sweep();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it.each([new Error('timeout'), { code: 99991672 }, { code: '230011' }, new Error('code: 230011')])('retains workers when the provider does not prove deletion: %j', async error => {
+    h.rows = [topic('s1')];
+    lookup.mockRejectedValue(error);
+    await sweep();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it.each([{ code: 230011 }, { response: { data: { code: 230011 } } }])('accepts a structured withdrawal code: %j', async error => {
+    h.rows = [topic('s1')];
+    lookup.mockRejectedValue(error);
+    await sweep();
+    expect(closedIds()).toEqual(['s1']);
+  });
+
+  it('rechecks the binding after a root lookup races a session migration', async () => {
+    h.rows = [topic('s1')];
+    lookup.mockImplementation(async () => {
+      h.rows[0].rootMessageId = 'om_new';
+      return { items: [{ message_id: ROOT, deleted: true }] };
+    });
+    await sweep();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it('looks up only the current live root when the stored projection is stale', async () => {
+    h.rows = [topic('s1')];
+    active.set('s1', live(topic('s1', { rootMessageId: 'om_new_root' })));
+    lookup.mockResolvedValue({ items: [{ message_id: 'om_new_root', deleted: false }] });
+    await sweep();
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(APP, 'om_new_root');
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it('does not close after a switch-off or shutdown while lookup is running', async () => {
+    h.rows = [topic('s1')];
+    lookup.mockImplementation(async () => {
+      enabled = false;
+      return { items: [{ message_id: ROOT, deleted: true }] };
+    });
+    await sweep();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it('does not query when disabled or in durable primary mode', async () => {
+    h.rows = [topic('s1')];
+    enabled = false;
+    await sweep();
+    enabled = true;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    await sweep();
+    expect(lookup).not.toHaveBeenCalled();
   });
 });
 
