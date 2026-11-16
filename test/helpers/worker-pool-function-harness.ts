@@ -4,7 +4,26 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
-import { executionObserverSupported } from '../../src/services/session-contract.js';
+import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
+
+/** Untracked handler fixtures still have the daemon's empty delivery registry.
+ * Resolve settlement through production functions so fixtures exercise its
+ * identity checks rather than substituting a no-op completion callback. */
+function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
+  if (key in scope) return scope[key as string];
+  if (key === 'controllerForSession') return controllerForSession;
+  if (key === 'isCodexAppCliId') return isCodexAppCliId;
+  if (key === 'executionObserverSupported') return executionObserverSupported;
+  if (key === 'contractTerminalStatus') return contractTerminalStatus;
+  if (key === 'sameExecution') return sameExecution;
+  if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
+  if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
+  if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
+    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn'].includes(key)) {
+    return scope[key] ??= loadWorkerPoolFunction(key, scope);
+  }
+  return (globalThis as any)[key];
+}
 
 export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
   name: string, scope: Record<string, any>,
@@ -18,7 +37,7 @@ export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
   }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : key === 'controllerForSession' ? controllerForSession : key === 'isCodexAppCliId' ? isCodexAppCliId : key === 'executionObserverSupported' ? executionObserverSupported : key === 'ownsCodexAppFinalDelivery' ? loadWorkerPoolFunction('ownsCodexAppFinalDelivery', scope) : (globalThis as any)[key],
+    get: (target, key) => resolvePoolDependency(target, key),
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;
@@ -38,7 +57,7 @@ export function loadWorkerPoolClosure<T extends (...args: any[]) => any>(name: s
   const compiled = ts.transpileModule(`const ${declaration.getText(source)};`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : key === 'controllerForSession' ? controllerForSession : key === 'isCodexAppCliId' ? isCodexAppCliId : key === 'executionObserverSupported' ? executionObserverSupported : key === 'ownsCodexAppFinalDelivery' ? loadWorkerPoolFunction('ownsCodexAppFinalDelivery', scope) : (globalThis as any)[key],
+    get: (target, key) => resolvePoolDependency(target, key),
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;

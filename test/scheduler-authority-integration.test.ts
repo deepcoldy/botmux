@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
+import { logger } from '../src/utils/logger.js';
 import type { ScheduledTask } from '../src/types.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
@@ -57,10 +58,37 @@ function commit(id = 'a1b2c3d4') {
   });
 }
 
+describe('creation observer', () => {
+  afterEach(() => scheduler.setScheduleCreatedObserver(undefined));
+
+  it('hears addTask with the creating turn when the route holds it; delegated commits (another app\'s credential key) are not announced', () => {
+    const seen: Array<[string, string | undefined, string | undefined]> = [];
+    scheduler.setScheduleCreatedObserver((task, turn) => { seen.push([task.id, task.ownerOpenId, turn?.turnId]); });
+    scheduler.addTask({ id: 'direct01', name: 'a', schedule: 'every 30m', prompt: 'p', workingDir: '/repo', chatId: 'oc_chat',
+      larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } }, { creatingTurn: { sessionId: 's1', turnId: 'om_t1' } });
+    scheduler.addTask({ id: 'direct02', name: 'b', schedule: 'every 30m', prompt: 'p', workingDir: '/repo', chatId: 'oc_chat',
+      larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } });
+    commit('a1b2c3d4');
+    expect(seen).toEqual([['direct01', 'ou_owner', 'om_t1'], ['direct02', 'ou_owner', undefined]]);
+  });
+
+  it('returns the stored task and logs when the observer throws', () => {
+    const warn = vi.spyOn(logger, 'warn');
+    scheduler.setScheduleCreatedObserver(() => { throw new Error('Bot not registered: cli_unknown'); });
+    const task = scheduler.addTask({ id: 'direct03', name: 'c', schedule: 'every 30m', prompt: 'p', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } });
+    expect(task.id).toBe('direct03');
+    expect(scheduleStore.getTask('direct03', APP)).toBeDefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Bot not registered: cli_unknown'));
+    warn.mockRestore();
+  });
+});
+
 describe('scheduler host authority integration', () => {
   const params = {
     id: 'direct01', name: 'poll', schedule: 'every 30m', prompt: 'check',
     workingDir: '/repo', chatId: 'oc_chat', larkAppId: APP,
+    owner: { kind: 'ownerless' as const },
   };
 
   it('runs a paused task once, preserves pause, and revokes the exact permit on another pause', async () => {
@@ -452,7 +480,7 @@ describe('scheduler host authority integration', () => {
       .toThrow('schedule_authority_store_unavailable');
     expect(() => scheduler.addTask({
       name: 'new', schedule: 'every 30m', prompt: 'new', workingDir: '/repo',
-      chatId: 'oc_chat', larkAppId: APP,
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'ownerless' },
     })).toThrow('schedule_authority_store_unavailable');
   });
 });
