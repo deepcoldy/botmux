@@ -26,7 +26,7 @@ vi.mock('../src/services/groups-store.js', () => ({ disbandChat: vi.fn(), probeC
 vi.mock('../src/utils/logger.js', () => ({ logger: { warn: vi.fn(), info: vi.fn() } }));
 vi.mock('../src/utils/daemon-discovery.js', () => ({ findOnlineDaemon: () => ({ ipcPort: 4100 }) }));
 vi.mock('../src/core/daemon-ipc-auth.js', () => ({ fetchDaemonIpc: h.ipc }));
-import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup } from '../src/core/dismiss-command.js';
+import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup, closeSessionsInRecalledTopic } from '../src/core/dismiss-command.js';
 import { withBotTurnAdmission, __testOnly_resetBotTurnMutationGates } from '../src/core/bot-turn-mutation-gate.js';
 
 const APP = 'cli_self';
@@ -55,6 +55,64 @@ beforeEach(() => {
   h.probe.mockResolvedValue(undefined);
 });
 afterEach(() => { delete process.env.BOTMUX_COORDINATION_MODE; });
+
+describe('closeSessionsInRecalledTopic', () => {
+  const ROOT = 'om_root';
+  const recall = () => closeSessionsInRecalledTopic({ larkAppId: APP, chatId: GONE, messageId: ROOT, activeSessions: active });
+  const topic = (id: string, over: Partial<Session> = {}) => row(id, { scope: 'thread', rootMessageId: ROOT, ...over });
+
+  it('closes exact live and persisted thread bindings once, preserving peers, chat scope and other roots', async () => {
+    h.rows = [topic('s1'), topic('s-store'), topic('s-legacy', { larkAppId: undefined }),
+      topic('s-peer', { larkAppId: PEER }), topic('s-other-chat', { chatId: OTHER }),
+      topic('s-other-root', { rootMessageId: 'om_other' }), topic('s-closed', { status: 'closed' }),
+      row('s-chat', { rootMessageId: ROOT })];
+    active.set('s1', live(h.rows[0]));
+    active.set('live-only', live(topic('s-live-only')));
+    active.set('peer', live(topic('s-peer-live'), PEER));
+    await recall();
+    expect(closedIds()).toEqual(['s-legacy', 's-live-only', 's-store', 's1']);
+    expect(h.close).toHaveBeenCalledWith('s1', { cardVisibility: 'private', awaitWorkerExit: false });
+    expect(h.remove).not.toHaveBeenCalled();
+    expect(h.ipc).not.toHaveBeenCalled();
+  });
+
+  it('does not close a topic when an ordinary reply is recalled', async () => {
+    h.rows = [topic('s1', { rootMessageId: 'om_actual_root' })];
+    await recall();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it('waits for admitted session creation, and duplicate recall does not close a persisted session twice', async () => {
+    let admit!: () => void;
+    const admission = withBotTurnAdmission(APP, () => new Promise<void>(resolve => { admit = () => {
+      h.rows.push(topic('s-new'));
+      resolve();
+    }; }));
+    const closing = recall();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(h.close).not.toHaveBeenCalled();
+    admit();
+    await admission; await closing; await recall();
+    expect(closedIds()).toEqual(['s-new']);
+  });
+
+  it('continues after a failed close and leaves the refused session retryable', async () => {
+    h.rows = [topic('s1'), topic('s2')];
+    h.close.mockRejectedValueOnce(new Error('close failed'));
+    await recall();
+    expect(closedIds()).toEqual(['s1', 's2']);
+    expect(h.rows[0].status).toBe('active');
+    await recall();
+    expect(closedIds()).toEqual(['s1', 's1', 's2']);
+  });
+
+  it('preserves primary ownership fencing', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    h.rows = [topic('s1')];
+    await recall();
+    expect(h.close).not.toHaveBeenCalled();
+  });
+});
 
 describe('closeSessionsInGoneChat', () => {
   it('closes every session this bot holds in the chat, and nothing of other bots or other chats', async () => {

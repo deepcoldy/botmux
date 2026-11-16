@@ -4032,6 +4032,9 @@ export interface EventHandlers {
    *  from it (`im.chat.member.bot.deleted_v1`). Runs after the event ACK, once
    *  per event id. Each bot's daemon receives its own copy. */
   handleChatGone?: (chatId: string, larkAppId: string, reason: 'disbanded' | 'bot_removed') => Promise<void>;
+  /** A recalled message may be a topic root. The daemon closes only sessions
+   * whose thread binding exactly matches it, never sessions for ordinary replies. */
+  handleMessageRecalled?: (chatId: string, messageId: string, larkAppId: string) => Promise<void>;
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
@@ -7517,8 +7520,7 @@ export function createLarkEventDispatcherRuntime(
     // 消息编辑（修改已发送消息）。只在编辑后补 @ 了本 bot 且该消息从未触发过任务时
     // 当作延迟首次 @ 处理，见 processMessageUpdatedEvent。投递层用 event_id 去重，
     // 刻意不走 message_id claim（原消息已 claim 过同 id）。
-    // 消息撤回：只给群聊上下文共享记录写 tombstone（group-context-ingest 自带开关与
-    // 错误隔离），不影响任何会话 / 任务状态。recall 幂等，无需 message_id claim。
+    // 撤回记录同步不依赖会话回收；话题根的回收在 ACK 后走独立事件去重。
     'im.message.recalled_v1': async (data: any) => {
       const ev = data?.event ?? data;
       const chatId = ev?.chat_id ?? ev?.message?.chat_id;
@@ -7536,6 +7538,16 @@ export function createLarkEventDispatcherRuntime(
         return;
       }
       ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime });
+      if (typeof chatId !== 'string' || !chatId || typeof messageId !== 'string' || !messageId
+          || !handlers.handleMessageRecalled) return;
+      scheduleAckSafeEvent(
+        `im.message.recalled_v1:${larkAppId}:${eventIdForKey(data) ?? messageId}`,
+        () => serializeByAnchor(
+          rawMessageIngressAnchor(larkAppId, { chat_id: chatId }),
+          () => handlers.handleMessageRecalled!(chatId, messageId, larkAppId),
+        ),
+        'message recalled lifecycle event',
+      );
     },
     'im.message.updated_v1': async (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;

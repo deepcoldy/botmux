@@ -283,6 +283,47 @@ export async function closeSessionsInGoneChat(args: {
   }
 }
 
+/** A root recall ends this bot's bound threads without posting to the deleted topic. */
+export async function closeSessionsInRecalledTopic(args: {
+  larkAppId: string;
+  chatId: string;
+  messageId: string;
+  activeSessions: ReadonlyMap<string, DaemonSession>;
+}): Promise<void> {
+  const tag = `[topic-gone] root=${args.messageId.slice(0, 12)}`;
+  if (coordinationModeIsPrimary()) {
+    logger.warn(`${tag}: durable primary requires the primary control path`);
+    return;
+  }
+  try {
+    await withBotTurnMutation(args.larkAppId, async () => {
+      const own = new Set<string>();
+      for (const s of listSessionsStrict()) {
+        if (s.status === 'active' && s.scope === 'thread' && s.chatId === args.chatId
+            && s.rootMessageId === args.messageId && (s.larkAppId ?? args.larkAppId) === args.larkAppId) {
+          own.add(s.sessionId);
+        }
+      }
+      for (const ds of args.activeSessions.values()) {
+        if (ds.larkAppId === args.larkAppId && ds.scope === 'thread' && ds.chatId === args.chatId
+            && ds.session.rootMessageId === args.messageId) own.add(ds.session.sessionId);
+      }
+      for (const id of own) {
+        try {
+          const closed = await closeSession(id, { cardVisibility: 'private', awaitWorkerExit: false });
+          if (!closed.ok) logger.warn(`${tag}: session ${id.slice(0, 8)} close refused: ${closed.error}`);
+          else if (closed.outcome !== 'closed') logger.warn(`${tag}: session ${id.slice(0, 8)} closed with residual: ${describeCloseResidual(closed.residual)}`);
+          else logger.info(`${tag}: closed session ${id.slice(0, 8)}`);
+        } catch (err) {
+          logger.warn(`${tag}: session ${id.slice(0, 8)} close failed: ${err}`);
+        }
+      }
+    });
+  } catch (err) {
+    logger.warn(`${tag}: sessions not closed: ${err}`);
+  }
+}
+
 /** Events missed while this daemon was offline: close sessions in chats that are gone. */
 export async function closeSessionsInGoneChatsOnStartup(args: {
   larkAppId: string;
