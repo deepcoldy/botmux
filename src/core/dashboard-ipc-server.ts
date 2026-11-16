@@ -4,8 +4,6 @@ import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
 import { readOncallBusinessName, readOncallChoices } from '../services/oncall-platform.js';
 import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
-import { isSessionEffortChangeInFlight } from './worker-pool.js';
-import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
@@ -48,7 +46,6 @@ import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflo
 import type { DraftClarifier, WorkflowDraftProjects } from '../workflows/v3/draft-service.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
-import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
@@ -271,7 +268,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -382,7 +379,6 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -7390,7 +7386,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // Mirror the card-button / /resume receipt wording: when the adapter can only
   // resume a precise cliSessionId and none was persisted, the next spawn is a
   // fresh CLI, so say so instead of claiming the old history is back.
-  const notice = resumeSuccessMessage(result, cliName, loc);
+  const notice = resumeSuccessMessage(result, cliName, loc, dshRuntimeForSession(ds));
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {

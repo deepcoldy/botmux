@@ -2,6 +2,7 @@ import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
+import { handleResumeFallbackReport } from '../services/resume-fallback-notice.js';
 import {
   compareLaunchedInstall,
   readRunningExeIdentity,
@@ -23094,6 +23095,46 @@ function setupWorkerHandlers(
       }
 
       case 'user_notify': {
+        if (msg.kind === 'resume_fallback') {
+          // The worker reports the demotion FACT on every occurrence; the
+          // delivery policy (persisted-evidence gate, per-session latch, copy)
+          // lives in services/resume-fallback-notice.ts so it is testable
+          // without booting a daemon. `/restart` refork means a worker-level
+          // latch would re-post on every restart, and only the daemon can see
+          // the persisted history evidence.
+          // Keep the same auxiliary-UI contract as every other user_notify:
+          // the transport gate never silences the lifecycle hook, but a silent
+          // scheduled / meeting-driven / no-transport turn must never get a
+          // Lark message (and must not spend the one-notice latch a visible
+          // turn owns). Unlike other kinds the worker reports EVERY demotion,
+          // so the hook follows the content gate (nothing lost / no history /
+          // already told are noise, not attention events) — the same reports
+          // master's worker never sent at all.
+          logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+          const auxUiSuppressed = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
+          await handleResumeFallbackReport({
+            ds,
+            report: {
+              tier: msg.resumeTier ?? 'probe-missing',
+              reason: msg.resumeReason,
+              turnId: msg.turnId,
+              lost: msg.resumeLost,
+            },
+            auxUiSuppressed,
+            onAttention: () => emitSessionLifecycleHook(ds, 'session.requires_attention', {
+              reason: 'user_notify',
+              message: msg.message,
+            }),
+            send: notice => sendTurnNotice(ds, {
+              kind: 'user_notify',
+              turnId: fallbackTurnId(ds, msg.turnId),
+              msgType: 'text',
+              content: notice,
+            }),
+            log: line => logger.warn(`[${t}] ${line}`),
+          });
+          break;
+        }
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'user_notify',

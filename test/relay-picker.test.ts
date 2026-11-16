@@ -21,6 +21,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   // Treat every fixture as a real session unless it explicitly omits BOTH a
   // worker and persisted CLI markers (matches the production predicate).
   isRelayableRealSession: (ds: any) =>
