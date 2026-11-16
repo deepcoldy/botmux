@@ -127,6 +127,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // ...and no startup dialog can be up (covered by
     // worker-claude-startup-dialog.integration.test.ts).
     probeStartupBlocker: () => null,
+    // These cases run after the first prompt was admitted; the TraeX-only
+    // native startup fence (covered by traex-startup-input) is inert here.
+    traexNativeStartupInputIsPending: () => false,
   };
   const run = new Function('scope', `with (scope) { ${readyCode}; return markPromptReady; }`)(scope);
   try { run(); } catch (err) { if (err !== released) throw err; }
