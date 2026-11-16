@@ -22,6 +22,7 @@ import {
   type ExecutableIdentity,
 } from '../src/services/cli-install-identity.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { standaloneSleep } from './helpers/standalone-sleep.js';
 
 const children: ChildProcess[] = [];
 const dirs: string[] = [];
@@ -34,6 +35,12 @@ function tempDir(): string {
 
 const EXEC_SETTLE_MS = 2_000;
 
+// The live-process cases need a sleep that still runs once renamed to `traex`
+// (not the case for uutils' multicall /bin/sleep, e.g. Ubuntu 26.04).
+const sleepBin = standaloneSleep();
+if (!sleepBin.path) console.warn(`[cli-install-identity] live-process cases will SKIP: ${sleepBin.reason}`);
+const itLive = it.skipIf(!sleepBin.path);
+
 /**
  * Bun spawns through vfork, so its `spawn` event can arrive while the child is
  * still inside execve and `/proc/<pid>/exe` still names the Bun runtime. Wait,
@@ -41,7 +48,7 @@ const EXEC_SETTLE_MS = 2_000;
  */
 async function spawnCopiedCli(dir: string): Promise<{ cli: string; child: ChildProcess }> {
   const cli = join(dir, 'traex');
-  copyFileSync('/bin/sleep', cli);
+  copyFileSync(sleepBin.path!, cli);
   const child = spawn(cli, ['30'], { stdio: 'ignore' });
   children.push(child);
   await new Promise<void>((resolve, reject) => {
@@ -132,7 +139,7 @@ describe('resolveInstallIdentity', () => {
 });
 
 describe('readRunningExeIdentity', () => {
-  it('reads the image the process actually runs, not the current path', async () => {
+  itLive('reads the image the process actually runs, not the current path', async () => {
     const dir = tempDir();
     const { cli, child } = await spawnCopiedCli(dir);
 
@@ -144,7 +151,7 @@ describe('readRunningExeIdentity', () => {
     // Upgrade in place: a new file is renamed over the entry while the old
     // process keeps running the unlinked inode.
     const next = join(dir, 'traex.next');
-    copyFileSync('/bin/sleep', next);
+    copyFileSync(sleepBin.path!, next);
     renameSync(next, cli);
 
     const after = readRunningExeIdentity(child.pid!);
@@ -156,7 +163,7 @@ describe('readRunningExeIdentity', () => {
     expect(compareRunningToInstall(after, resolveInstallIdentity(cli))).toBe('stale');
   });
 
-  it('keeps reporting the old identity after the running file is unlinked', async () => {
+  itLive('keeps reporting the old identity after the running file is unlinked', async () => {
     const { cli, child } = await spawnCopiedCli(tempDir());
 
     const before = readRunningExeIdentity(child.pid!);
@@ -178,7 +185,7 @@ describe('readRunningExeIdentity', () => {
     expect(readRunningExeIdentity(Number.NaN)).toBeUndefined();
   });
 
-  it('refuses to pair the exe with a different process birth', async () => {
+  itLive('refuses to pair the exe with a different process birth', async () => {
     const { child } = await spawnCopiedCli(tempDir());
 
     // The pid is alive, but the caller's attested birth token names some other

@@ -24,6 +24,28 @@ const repoRoot = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const bwrapArgs = ['--ro-bind', '/', '/', '--unshare-user', '--unshare-pid',
   '--unshare-net', '--proc', '/proc', '--dev', '/dev', '--'];
 
+// The nested cases start a second bwrap INSIDE the first, which needs more than
+// `canRunBwrap` proves. Ubuntu 26.04 (GitHub's `ubuntu-latest` since 2026-11)
+// loads AppArmor's bwrap-userns-restrict profile: /usr/bin/bwrap itself may
+// create namespaces, but everything it runs is confined as
+// `bwrap//&unpriv_bwrap`, which denies all capabilities. The inner bwrap is
+// then refused CAP_SYS_ADMIN for its new namespaces (kernel audit:
+// apparmor="DENIED" operation="capable" profile="unpriv_bwrap"
+// capname="sys_admin") and exits 1 with "No permissions to create a new
+// namespace", while one level still works. Probe that exact shape with plain
+// bwrap: no product code is involved, so a regression in linuxIsolationLaunch
+// fails the cases instead of skipping them. ci.yml unloads the profile so the
+// cases still run for real on CI.
+const nestedBwrap = canRunBwrap && supported
+  ? spawnSync('bwrap', [...bwrapArgs, 'bwrap', ...bwrapArgs, '/bin/true'], { encoding: 'utf8', timeout: 5_000 })
+  : undefined;
+const canNestBwrap = nestedBwrap?.status === 0;
+if (nestedBwrap && !canNestBwrap) {
+  const why = nestedBwrap.error?.message ?? (nestedBwrap.stderr.trim() || `exit ${nestedBwrap.status ?? nestedBwrap.signal}`);
+  console.warn(`[linux-isolation] nested-namespace cases will SKIP — this host cannot run bwrap inside bwrap: ${why}`);
+}
+const itNested = it.skipIf(!canNestBwrap);
+
 type Launch = ReturnType<typeof linuxIsolationLaunch>;
 
 // Inspect the exact bytes supplied to bwrap, not a second filter generator.
@@ -213,13 +235,13 @@ describe.skipIf(!canRunBwrap || !supported)('Linux isolation kernel probe', () =
     });
   }, 20_000);
 
-  it('survives another user/PID/mount namespace with no environment markers', () => {
+  itNested('survives another user/PID/mount namespace with no environment markers', () => {
     expect(run(linuxIsolationLaunch('bwrap', [
       ...bwrapArgs, 'bwrap', ...bwrapArgs, ...cleanCli,
     ]))).toMatchObject({ isolated: true, offline: true });
   });
 
-  it.each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
+  itNested.each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
     const inner = linuxIsolationLaunch('bwrap', [...bwrapArgs, ...cleanCli]);
     const bytes = filterBytes(inner);
     let replaced = 0;

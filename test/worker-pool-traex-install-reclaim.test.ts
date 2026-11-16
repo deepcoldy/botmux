@@ -113,6 +113,7 @@ import { readRunningExeIdentity, resolveInstallIdentity } from '../src/services/
 import { observeTraexInstall, __testOnly_resetTraexInstallWatch } from '../src/services/traex-install-watch.js';
 import { isTraexProcess } from '../src/core/traex-leaf-pid.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { standaloneSleep } from './helpers/standalone-sleep.js';
 
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -735,7 +736,14 @@ describe('launch provenance', () => {
   });
 });
 
-describe.skipIf(process.platform !== 'linux')('launch provenance with real processes', () => {
+// Fake releases are a sleep renamed to `traex`; uutils' multicall /bin/sleep
+// (e.g. Ubuntu 26.04) refuses to run under that name.
+const sleepBin = standaloneSleep();
+if (process.platform === 'linux' && !sleepBin.path) {
+  console.warn(`[traex-install-reclaim] real-process cases will SKIP: ${sleepBin.reason}`);
+}
+
+describe.skipIf(process.platform !== 'linux' || !sleepBin.path)('launch provenance with real processes', () => {
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
   function comm(pid: number): string | undefined {
@@ -749,7 +757,7 @@ describe.skipIf(process.platform !== 'linux')('launch provenance with real proce
   }
 
   /** A fake TRAE release: a copy of `bin` named `traex`, so comm and exe look real. */
-  function release(root: string, name: string, bin = '/bin/sleep'): string {
+  function release(root: string, name: string, bin = sleepBin.path!): string {
     const dir = join(root, 'releases', name);
     mkdirSync(dir, { recursive: true });
     const file = join(dir, 'traex');
