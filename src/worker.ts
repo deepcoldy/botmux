@@ -3256,6 +3256,11 @@ let traexFirstInputAdmissionPending = false;
 let traexStartupRendererWebInputGeneration = -1;
 let traexStartupRendererScreenRevision = -1;
 let traexStartupRendererDrain: object | undefined;
+/** Some write of this generation was positively submitted (sync or deferred
+ * recheck): thread initialization is proven, so the first-write lease ends at
+ * its next passing admission instead of outliving the first input. */
+let traexFirstSubmitConfirmed = false;
+let traexStartupWebRecheck: ReturnType<typeof setTimeout> | undefined;
 
 function shouldEnableProgramStatus(
   cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
@@ -15798,8 +15803,29 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     // An old empty footer is not proof about the composer after human input.
     // OSC-only reports do not advance this screen revision. Wait for actual
     // screen data and settle its renderer behind the current Web epoch.
-    if (backendScreenRevision === webTerminalInputBackendScreenRevision
-      || Date.now() - lastWebTerminalInputAtMs < READY_FLUSH_SETTLE_MS) return true;
+    const sinceInputMs = Date.now() - lastWebTerminalInputAtMs;
+    // Input that draws nothing (a focus-out report, a no-op key) never
+    // advances the revision; after a quiet window the pre-input frame IS the
+    // current frame. Either way, a hold must re-drive itself: under OSC
+    // authority later screen bytes do not re-run idle.
+    if (sinceInputMs < READY_FLUSH_SETTLE_MS
+      || (backendScreenRevision === webTerminalInputBackendScreenRevision
+        && sinceInputMs < READY_FLUSH_SETTLE_MS * 3)) {
+      if (!traexStartupWebRecheck && backend) {
+        const target = backend;
+        const generation = cliSpawnGeneration;
+        const waitMs = (sinceInputMs < READY_FLUSH_SETTLE_MS ? READY_FLUSH_SETTLE_MS : READY_FLUSH_SETTLE_MS * 3) - sinceInputMs;
+        traexStartupWebRecheck = setTimeout(() => {
+          traexStartupWebRecheck = undefined;
+          if (backend !== target || cliSpawnGeneration !== generation
+            || (cliRestartInProgress && !replacementSpawnInProgress)) return;
+          markPromptReady();
+          void flushPending();
+        }, Math.max(0, waitMs) + 1);
+        traexStartupWebRecheck.unref?.();
+      }
+      return true;
+    }
     if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
       || traexStartupRendererScreenRevision !== backendScreenRevision) {
       if (!traexStartupRendererDrain && renderer) {
@@ -15843,6 +15869,7 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     traexNativeStartupInputPending = false;
     log('TraeX native startup input readiness verified');
   }
+  if (traexFirstSubmitConfirmed) traexFirstInputAdmissionPending = false;
   return false;
 }
 
@@ -21710,6 +21737,7 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        traexFirstSubmitConfirmed = true;
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
           acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
         }
@@ -23416,8 +23444,10 @@ async function flushPending(): Promise<void> {
       } finally {
         settleSubmission(item, result?.submitted === true);
       }
-      if (guardTraexFirstAdmission && result?.submitted === true
-        && webTerminalInputGeneration === firstAdmissionWebInputGeneration) traexFirstInputAdmissionPending = false;
+      if (guardTraexFirstAdmission && result?.submitted === true) {
+        traexFirstSubmitConfirmed = true;
+        if (webTerminalInputGeneration === firstAdmissionWebInputGeneration) traexFirstInputAdmissionPending = false;
+      }
       if (isCodexAppCliId(lastInitConfig?.cliId)
         && item.turnId
         && result?.submitted !== false) {
@@ -24946,6 +24976,8 @@ async function spawnCliBody(
   traexStartupRendererWebInputGeneration = -1;
   traexStartupRendererScreenRevision = -1;
   traexStartupRendererDrain = undefined;
+  traexFirstSubmitConfirmed = false;
+  if (traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
@@ -31548,6 +31580,8 @@ function killCli(opts: {
   traexStartupRendererWebInputGeneration = -1;
   traexStartupRendererScreenRevision = -1;
   traexStartupRendererDrain = undefined;
+  traexFirstSubmitConfirmed = false;
+  if (traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   stopStructuredStartGraceRecheck();

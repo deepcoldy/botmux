@@ -109,7 +109,7 @@ function workerFence() {
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     screen: SHORTCUT,
     nativeState: undefined,
-    renderer: { rawSnapshot: () => h.scope.screen, markNewTurn: vi.fn() },
+    renderer: { rawSnapshot: () => h.scope.screen, markNewTurn: vi.fn(), writeAndFlush: vi.fn(async () => {}) },
     cliAdapter: { ...h.scope.cliAdapter, readyPattern },
     idleDetector: {
       isStartupPending: () => false,
@@ -157,6 +157,12 @@ describe('the actual pending-input writer honors native startup evidence', () =>
     h.scope.nativeState = 'idle';
     h.scope.webTerminalInputGeneration = 1;
     h.scope.screen = RESOLVED.replace('Ask TRAE CLI to do anything', 'a human draft');
+    // Long after that input, the fence drains the renderer and judges the
+    // current frame. The drained frame still shows the human draft.
+    h.scope.markPromptReady = vi.fn();
+    h.scope.flushPending = vi.fn(() => h.flush());
+    await h.flush();
+    await new Promise(resolve => setTimeout(resolve, 0));
     await h.flush();
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
     expect(h.scope.traexNativeStartupInputPending).toBe(true);
