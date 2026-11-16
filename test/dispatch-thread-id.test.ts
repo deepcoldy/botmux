@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
+import { readMessageWithinContext } from '../src/im/lark/message-read-context.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget } from '../src/core/dispatch.js';
 
@@ -57,6 +58,7 @@ function harness(mode: Mode, options: {
       thread_id: Object.hasOwn(options, 'threadId') ? options.threadId : currentThreadId }] } };
   });
   const lookupScope = {
+    readMessageWithinContext,
     getBotClient: () => ({ request }),
     logger: { debug: vi.fn() },
   };

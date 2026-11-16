@@ -42,6 +42,7 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: (...args: any[]) => mockUpdateSession(...args),
 }));
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   getActiveSessionsRegistry: () => activeSessions,
 }));
 

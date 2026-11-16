@@ -30,6 +30,7 @@ const wp = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: wp.forkWorker,
   sendWorkerInput: wp.sendWorkerInput,
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),

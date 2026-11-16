@@ -336,3 +336,15 @@ A session runs only on the replica that owns it, while Lark callbacks and browse
   - Cookies, Authorization, and other login credentials are never forwarded.
 - **What works across replicas**: only terminal links in Lark cards, which carry their own credential. The terminal embedded in the Dashboard, the touch-screen dynamic link, and takeover with write access must reach the owning replica directly (e.g. session-sticky load balancing); otherwise they return 403.
 - Deployments without primary mode are unaffected.
+
+## Evidence retrieval: index first, then selected details
+
+```bash
+botmux history --scope chat --view index --limit 50
+botmux history --view index --query "queue" --type text,interactive --since "2026-11-14T00:00:00+08:00"
+botmux quoted om_example_one om_example_two --no-download
+```
+
+The default full history and single-message quoted JSON remain compatible. Index mode avoids card/forward expansion and returns previews of up to 240 characters plus resource counts. `--no-download` preserves resource metadata without downloading attachment bytes. Batch quoted accepts up to 20 IDs, deduplicates them, preserves successful input order, and returns `messages`/`errors`; partial failure exits with code 1 while retaining successful results.
+
+Filters apply only within the fetched `--limit` window. `--since` is inclusive and `--until` exclusive; use ISO timestamps with a timezone. The `retrieval` block reports counts, filters, deferred details and detail failures. An index candidate marked `queryMatch=deferred` requires a detail read to verify the keyword. Index mode cannot be combined with `--with-card-json`. Message requests are coalesced only within one invocation, separately by app and representation; the next invocation reads afresh. Both commands support `--help`.

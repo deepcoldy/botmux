@@ -579,7 +579,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const [ready] = queue.drainEmittable();
       expect(ready?.finalText).toBe(body);
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_gallery');
-      sessionReply.mockRejectedValueOnce(new Error('temporary send failure'));
+      let rejectFirst!: (reason: Error) => void;
+      const firstReply = new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
+      sessionReply.mockImplementationOnce(() => firstReply);
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
       ds.adoptedFrom = undefined;
@@ -593,7 +595,14 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(uploadImageMock).toHaveBeenCalledTimes(12);
       paths.forEach(path => rmSync(path));
       await vi.advanceTimersByTimeAsync(30_000);
-      await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_gallery'));
+      // A send rejection can finish its async bookkeeping after the clock
+      // advance. Exercise that ordering explicitly and keep driving retries
+      // while waiting for completion, rather than assuming the timer exists.
+      setTimeout(() => rejectFirst(new Error('temporary send failure')), 400);
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_gallery');
+      }, { timeout: 5_000 });
       expect(sessionReply).toHaveBeenCalledTimes(2);
       expect(uploadImageMock).toHaveBeenCalledTimes(12);
       const card = sessionReply.mock.calls[1][1];
