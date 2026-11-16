@@ -35105,6 +35105,8 @@ function emitTurnTerminal(
   // same-principal steer must not clear the newer turn's authority.
   if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
     releaseTerminatedActiveTurnAuthority();
+  } else {
+    scheduleConsumedQueuedTurnAdvance();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt);
   if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
@@ -35301,6 +35303,22 @@ function markReplyInputConsumed(turnId: string | undefined): void {
   if (!queued || queued.inputConsumed) return;
   queued.inputConsumed = true;
   writeCliPidMarker();
+  scheduleConsumedQueuedTurnAdvance();
+}
+
+/** Claude starts a type-ahead input on its own once the running turn stops,
+ *  without a prompt-ready edge in between. Once the running turn's authority
+ *  is released and the CLI has natively consumed the next queued input, that
+ *  input owns the CLI, so it takes the turn authority. Deferred so terminals of
+ *  inputs folded into the finished turn, emitted in the same drain, retire
+ *  their records first. */
+function scheduleConsumedQueuedTurnAdvance(): void {
+  queueMicrotask(() => {
+    if (activeTurnAuthority.snapshot()) return;
+    if (currentBotmuxTurnId && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)) return;
+    const next = queuedTypeAheadTurns.find(queued => !turnTerminalEmitted(queued.turnId, queued.dispatchAttempt));
+    if (next?.inputConsumed) advanceQueuedTypeAheadTurn('queued_input_consumed');
+  });
 }
 
 /** Establish the boot identity synchronously, before the first input receipt.

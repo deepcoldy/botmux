@@ -71,7 +71,7 @@ function harness(reattached: boolean | 'native-recovery' = false, ordinary = fal
     currentBotmuxTurnId: 'turn-next', currentBotmuxDispatchAttempt: 99,
     inputDeliveryEvidence: { start: vi.fn() }, cliSpawnGeneration: 1,
     emittedTurnTerminals: new TurnTerminalDeduper(), cancelSubmitFailureChainForTerminal: vi.fn(),
-    submitFailureChains: new Map(), releaseActiveTurnAuthority: () => true, retireTerminatedQueuedTurn: vi.fn(),
+    submitFailureChains: new Map(), releaseActiveTurnAuthority: () => true, scheduleConsumedQueuedTurnAdvance: vi.fn(), retireTerminatedQueuedTurn: vi.fn(),
     terminalReleasesDurableTurn: () => false,
     parseCodexAppControlWireRecord, verifyCodexAppSignedControlMarker, encodeCodexAppControlAck, committedCodexAppSequence,
     codexAppControlChannelId: 1, codexAppControlEndpointEpoch: 'epoch', codexAppControlActiveSocket: socket,
