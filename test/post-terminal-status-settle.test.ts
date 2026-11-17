@@ -278,22 +278,26 @@ describe('turn_terminal status settle (daemon turn_terminal handler)', () => {
     expect(warnings[0]).toContain(TURN.substring(0, 8));
   });
 
-  it('stays out of the way when a real screen_update arrives inside the window', async () => {
+  it('treats a busy frame inside the settle window as stale and still corrects the card', async () => {
     const ds = makeDs();
     activate(ds);
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', terminalMsg(TURN));
+    // A busy frame from the just-completed turn (no newer turn admitted) is
+    // stale viewport evidence: it must not cancel the post-terminal correction.
     (ds.worker as any).emit('message', {
       type: 'screen_update', content: 'still drawing', status: 'working',
     });
 
     await vi.advanceTimersByTimeAsync(2_000);
 
-    expect(idlePatchCount()).toBe(0);
-    // The screen frame is authoritative; the fallback neither patches nor logs.
+    // turn_terminal is the card-display authority: the fallback still fires
+    // exactly once despite the stale busy frame.
+    expect(idlePatchCount()).toBe(1);
+    // The in-memory execution status is untouched (real idle edge still owns
+    // usage settlement); only the card was corrected.
     expect(ds.lastScreenStatus).toBe('working');
-    expect(settleWarnings()).toHaveLength(0);
   });
 
   it('does not settle a turn that is not the session current turn any more', async () => {
@@ -380,15 +384,18 @@ describe('turn_terminal status settle (daemon turn_terminal handler)', () => {
     expect(recordUsageMock).not.toHaveBeenCalled();
   });
 
-  it('repairs a late busy frame but does not keep PATCHing an acknowledged stable render', async () => {
+  it('needs no repeat sweep patch: a stale busy frame cannot invalidate the delivered correction', async () => {
     const ds = makeDs(); activate(ds); __testOnly_setupWorkerHandlers(ds, ds.worker as any);
     (ds.worker as any).emit('message', terminalMsg(TURN));
     await vi.advanceTimersByTimeAsync(2_000);
+    expect(idlePatchCount()).toBe(1); // first correction delivered
+    // The post-terminal busy frame no longer bumps the revision, so the
+    // delivered receipt keeps matching and the self-heal sweep never repaints.
     (ds.worker as any).emit('message', { type: 'screen_update', content: 'stale busy footer', status: 'working' });
     await vi.advanceTimersByTimeAsync(180_000);
-    expect(idlePatchCount()).toBe(2);
+    expect(idlePatchCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(180_000);
-    expect(idlePatchCount()).toBe(2);
+    expect(idlePatchCount()).toBe(1);
   });
 
   it('keeps the real delayed idle edge responsible for usage settlement', async () => {
@@ -552,5 +559,96 @@ describe('sweepStaleLiveCardStatuses (runtime self-heal)', () => {
 
     expect(sweepStaleLiveCardStatuses(APP)).toBe(0);
     expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('stale post-terminal busy frame gate (screen_update)', () => {
+  function setupTerminalDs() {
+    const ds = makeDs();
+    activate(ds);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    return ds;
+  }
+  function busyFrame(ds: DaemonSession, content = 'stale busy') {
+    return (ds.worker as any).emit('message', { type: 'screen_update', content, status: 'working' });
+  }
+
+  it('does not bump revision or patch the card for a stale busy frame, but keeps non-card state', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000); // settle idle PATCH queued
+    const revAfterSettle = ds.streamCardStatusRevision ?? 0;
+    const callsAfterSettle = updateMessageMock.mock.calls.length;
+
+    busyFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(revAfterSettle);
+    expect(updateMessageMock.mock.calls.length).toBe(callsAfterSettle);
+    // Non-card execution state is still refreshed.
+    expect(ds.lastScreenContent).toBe('stale busy');
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('still bumps revision on a real idle frame after the terminal', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'composer', status: 'idle' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.lastScreenStatus).toBe('idle');
+  });
+
+  it('resumes card driving (revision bump) once a new turn starts', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    ds.currentTurnId = 'turn-live-0002'; // beginNewTurn: newer turn admitted
+    busyFrame(ds, 'new turn work');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+  });
+
+  it('does not gate busy frames after a failed terminal', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN, 'failed'));
+    await vi.advanceTimersByTimeAsync(0);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    busyFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+  });
+
+  it('keeps the idle correction deliverable when stale busy frames race an in-flight PATCH (real beforeWrite fence)', async () => {
+    let releaseFirst!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const opts = args[3];
+      const run = async () => { if (opts && typeof opts.beforeWrite === 'function') await opts.beforeWrite(); };
+      if (!releaseFirst) return new Promise<void>(resolve => { releaseFirst = resolve; }).then(run);
+      return run();
+    });
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000); // settle idle PATCH held in flight
+
+    for (let i = 0; i < 3; i++) {
+      busyFrame(ds, `busy ${i}`);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(ds.streamCardStatusRevision ?? 0).toBe(0); // stale frames never bumped it
+
+    releaseFirst();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(lastPatchedStatus()).toBe('idle'); // fence passed, correction delivered
   });
 });

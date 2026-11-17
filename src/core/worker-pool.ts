@@ -6531,6 +6531,29 @@ function sessionHasLiveTurn(ds: DaemonSession): boolean {
   return !!ds.currentTurnId && ds.currentTurnId !== ds.lastTurnTerminalTurnId;
 }
 
+/**
+ * Whether a screen_update frame is STALE busy evidence from a turn that already
+ * reported a completed terminal. After `turn_terminal(completed)` the CLI's
+ * viewport can keep painting a busy marker for a while — the worker keeps
+ * emitting working frames until its own idle detection catches up. With no
+ * newer turn admitted, those frames must not drive the streaming card: they
+ * would repaint it back to a busy state AND bump `streamCardStatusRevision`,
+ * which invalidates the post-terminal idle correction's write fence and leaves
+ * the card stuck on "working" forever (the 60s self-heal then retries forever).
+ *
+ * The caller still updates non-card state (screen content, usage limit,
+ * background-task count, the in-memory execution status read by usage
+ * settlement); only card-facing writes and the revision bump are suppressed.
+ * A real idle/limited frame is never stale (those edges own usage settlement)
+ * and a new turn immediately re-enables live card driving via
+ * sessionHasLiveTurn(). A failed/cancelled terminal does not engage this gate.
+ */
+function isStalePostTerminalBusyFrame(ds: DaemonSession, projectedStatus: StreamStatus): boolean {
+  return ds.lastTurnTerminalStatus === 'completed'
+    && !sessionHasLiveTurn(ds)
+    && POST_TERMINAL_BUSY_STATUSES.has(projectedStatus);
+}
+
 function ownsSettleTarget(
   ds: DaemonSession,
   requireLiveWorker: boolean,
@@ -22226,7 +22249,17 @@ function setupWorkerHandlers(
         // Any real screen frame supersedes the post-terminal fallback: the card
         // is once again driven by live worker evidence.
         if (!ownsLifecycleMutation()) break;
-        cancelPostTerminalStatusSettle(ds);
+        // Project the frame's effective status once: reused for the in-memory
+        // status assignment below and the stale-post-terminal gate.
+        const projectedScreenStatus = resolveUsageAwareScreenStatus(
+          ds, msg.status, msg.usageLimit, msg.content,
+        );
+        // A busy frame from a turn that already reported a completed terminal
+        // (with no newer turn admitted) is stale viewport evidence. It must not
+        // cancel the post-terminal correction or drive the card/revision; the
+        // caller still refreshes non-card state further down.
+        const stalePostTerminalBusy = isStalePostTerminalBusyFrame(ds, projectedScreenStatus);
+        if (!stalePostTerminalBusy) cancelPostTerminalStatusSettle(ds);
         // Wait for worker init, independently of Web Terminal availability.
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
@@ -22251,25 +22284,35 @@ function setupWorkerHandlers(
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit, msg.content);
+        ds.lastScreenStatus = projectedScreenStatus;
         workersWithScreenStatus.add(worker);
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
         stampIdleSinceAt(ds, prevStatus);
-        bumpStreamCardStatusRevision(ds);
-        try {
-          const published = cb.onScreenStatus?.(ds, {
-            prevStatus,
-            status: ds.lastScreenStatus as ScreenStatus,
-            turnId: screenTurnId,
-          });
-          void Promise.resolve(published).catch((err: any) => {
-            logger.debug(`[${t}] runtime status card bridge failed: ${err?.message ?? err}`);
-          });
-        } catch (err: any) {
-          logger.debug(`[${t}] runtime status card bridge threw: ${err?.message ?? err}`);
+        // Stale post-terminal busy frames must not move the card revision: a
+        // bump here would invalidate the in-flight post-terminal idle
+        // correction's write fence (its receipt pins this revision). The card
+        // write segment below is skipped for the same reason.
+        if (!stalePostTerminalBusy) bumpStreamCardStatusRevision(ds);
+        // The onScreenStatus bridge repaints card elements and notifies
+        // workflow wake state. A stale busy frame has nothing new to publish —
+        // the turn already settled and a real idle frame (not gated) owns the
+        // workflow/usage transitions — so skip it entirely here.
+        if (!stalePostTerminalBusy) {
+          try {
+            const published = cb.onScreenStatus?.(ds, {
+              prevStatus,
+              status: ds.lastScreenStatus as ScreenStatus,
+              turnId: screenTurnId,
+            });
+            void Promise.resolve(published).catch((err: any) => {
+              logger.debug(`[${t}] runtime status card bridge failed: ${err?.message ?? err}`);
+            });
+          } catch (err: any) {
+            logger.debug(`[${t}] runtime status card bridge threw: ${err?.message ?? err}`);
+          }
         }
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
@@ -22385,6 +22428,13 @@ function setupWorkerHandlers(
           deferredScheduleIdleTurnIds.add(deferredTurnId);
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
+
+        // Stale post-terminal busy frames have refreshed all non-card state
+        // above. Skip the whole card segment (reply cards, rate-limit notices,
+        // streaming-card POST/PATCH): the post-terminal idle correction owns
+        // the visible card now, and repainting busy would fight it. A new turn
+        // (sessionHasLiveTurn) or a real idle/limited frame clears this gate.
+        if (stalePostTerminalBusy) break;
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
 
