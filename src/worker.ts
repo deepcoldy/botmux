@@ -31162,7 +31162,9 @@ async function spawnCliBody(
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
-      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
+      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
+        ...(lastInitConfig?.cliId === 'traex' ? { traexStartupFailure: freshCliNeverReady() } : {}),
+        ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }
   }));
 
