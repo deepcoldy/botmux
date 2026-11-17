@@ -1746,6 +1746,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           cliGeneration: engineCliGeneration,
         });
       },
+      onContextCompacted: (compactedThreadId) => invalidateTraexNativeContextReceipt(compactedThreadId),
       onDead: () => {
         // Death can race after the final awaited response but before the engine
         // is published below. Record it against this exact engagement even when
@@ -23126,10 +23127,13 @@ async function flushPending(): Promise<void> {
                 'not_sent',
               );
             }
-            prepareNormalWrite();
+            // Commit attribution/durable ownership only once the frame is on
+            // the socket: a not_sent rejection (dead socket, concurrent start)
+            // then leaves nothing to undo and the retained head retries cleanly.
             rpcNativeTurnId = (await writeRpcEngine.sendTurn(
               rpcContext?.content ?? msg,
               rpcTurnIdentity!,
+              { onDispatch: prepareNormalWrite },
             )).nativeTurnId;
           });
           // The await may overlap an engine/pane replacement. Fence the captured
@@ -23290,7 +23294,7 @@ async function flushPending(): Promise<void> {
           );
           send({
             type: 'user_notify',
-            message: 'TraeX RPC 消息尚未发送，已保留在队列中；当前轮结束后将按原顺序继续，不会并发启动新一轮。',
+            message: `${cliName()} RPC 消息尚未发送，已保留在队列中；将按原顺序继续，不会并发启动新一轮。`,
             turnId: rpcTurnIdentity.turnId,
             ...(rpcTurnIdentity.dispatchAttempt !== undefined
               ? { dispatchAttempt: rpcTurnIdentity.dispatchAttempt }
@@ -35483,6 +35487,19 @@ function acknowledgeNativeInputConsumed(
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
+}
+
+/** Compaction may have dropped the turn that carried the fixed context. The
+ * receipt no longer proves the thread holds it, so the next RPC write sends it
+ * again (an `unknown` receipt never omits anything). */
+function invalidateTraexNativeContextReceipt(threadId: string | undefined): void {
+  const receipt = lastInitConfig?.traexNativeContextReceipt;
+  if (lastInitConfig?.cliId !== 'traex' || receipt?.status !== 'accepted') return;
+  if (threadId && receipt.nativeThreadId !== threadId) return;
+  const invalidated = { ...receipt, status: 'unknown' as const };
+  lastInitConfig.traexNativeContextReceipt = invalidated;
+  log(`TraeX native thread ${receipt.nativeThreadId} compacted; fixed context will be resent`);
+  send({ type: 'traex_native_context_receipt', receipt: invalidated });
 }
 
 function publishTraexNativeContextReceipt(
