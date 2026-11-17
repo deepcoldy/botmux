@@ -452,10 +452,6 @@ describe('Codex App clean prompt sidecar', () => {
     });
 
     expect(built.content).toContain('legacy user text </user_message> stays intact');
-    expect(built.traexNativeContext).toMatchObject({
-      nativeThreadId: 'native-traex-refork',
-      budgetBytes: 24 * 1024,
-    });
   });
 
   it('does not add native context wrapping when a TraeX refork has no native thread', () => {
@@ -472,7 +468,6 @@ describe('Codex App clean prompt sidecar', () => {
     });
 
     expect(built.content).toContain('non-RPC user text');
-    expect(built.traexNativeContext).toBeUndefined();
   });
 
   it('keeps modern queued and ordinary non-queued reforks structured', () => {

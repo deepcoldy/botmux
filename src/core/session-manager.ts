@@ -41,7 +41,6 @@ import {
   type BuiltinSkillEntry,
 } from '../skills/injection-mode.js';
 import { compactSkillTriggerSummary } from './skills/prompt.js';
-import { prepareTraexNativeContext } from './traex-native-context.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
@@ -1998,10 +1997,11 @@ type FollowUpOpts = {
   /** 不注入 <botmux_reminder>（「至少回应一次」）：群秘书这类默认静默的回合用，
    *  否则提醒与「无事不发」直接矛盾。 */
   omitReminder?: boolean;
-  traexRpcContext?: {
-    nativeThreadId: string;
-    receipt?: Session['traexNativeContextReceipt'];
-  };
+  /** The session's frozen launch config writes through TraeX RPC: render the
+   *  self-contained compact envelope (role on every turn). Omitting blocks the
+   *  native thread already accepted happens only at the worker's RPC write
+   *  edge, never in a payload that is queued, persisted or re-forked. */
+  traexRpcContext?: true;
 };
 
 function buildFollowUpBlocks(
@@ -2390,17 +2390,6 @@ export function buildFollowUpCliInput(
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
-  if (opts?.cliId === 'traex' && !opts.isAdoptMode && opts.traexRpcContext) {
-    const prepared = prepareTraexNativeContext(
-      legacyContent, opts.traexRpcContext.nativeThreadId, opts.traexRpcContext.receipt,
-    );
-    const { content: preparedContent, contextVersion: _contextVersion, ...traexNativeContext } = prepared;
-    return finalizeCliTurnInput({
-      content: preparedContent,
-      ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
-      traexNativeContext,
-    }, content, opts);
-  }
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
     return finalizeCliTurnInput(
       { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
@@ -2547,20 +2536,16 @@ const STREAM_CARD_SENTINEL = '__posting__';
 
 /** Structured refork variant. Adopted external CLIs intentionally remain on
  * their existing raw bridge path and never receive a Codex App sidecar.
- *  The context sidecar only rides a session whose frozen launch config actually
- *  engages RPC: paste/sandbox/isolation/wrapper/startup-command sessions have no
- *  turn/start transport, so budgeting their fixed context would reject the input
- *  with no fallback. */
+ *  The compact RPC envelope only applies to a session whose frozen launch config
+ *  actually engages RPC: paste/sandbox/isolation/wrapper/startup-command sessions
+ *  have no turn/start transport and keep the legacy envelope. */
 export function traexRpcContextForSession(
   ds: DaemonSession,
   cliId: string | undefined,
 ): FollowUpOpts['traexRpcContext'] {
   if (cliId !== 'traex' || ds.adoptedFrom || !ds.initConfig || !ds.session.cliSessionId) return undefined;
   if (!codexRpcEligible(ds.initConfig, { sandboxForced: sandboxEnabled() })) return undefined;
-  return {
-    nativeThreadId: ds.session.cliSessionId,
-    ...(ds.session.traexNativeContextReceipt ? { receipt: ds.session.traexNativeContextReceipt } : {}),
-  };
+  return true;
 }
 
 export function buildReforkCliInput(

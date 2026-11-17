@@ -10,7 +10,8 @@ import type { LinkRefMode } from '../services/link-ref-types.js';
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
   content: string;
-  traexNativeContext?: import('../types.js').CliTurnPayload['traexNativeContext'];
+  /** Refreshed catalog parked for the TraeX RPC write edge; folded into
+   *  `content` if the item is written through a plain-text transport instead. */
   traexSkillCatalog?: string;
   traexSkillCatalogDigest?: string;
   /** The real user turn represented by `content` when delivery uses a short

@@ -2078,7 +2078,6 @@ export interface CodexAppGenerationCommit {
 
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
-  traexNativeContext?: import('./core/traex-native-context.js').TraexNativeContextMetadata;
   content: string;
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
@@ -2307,7 +2306,6 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerTransport & {
   sessionCommand?: import('./services/session-contract.js').SessionCommandContext;
-  traexNativeContext?: CliTurnPayload['traexNativeContext'];
   traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
 };
 

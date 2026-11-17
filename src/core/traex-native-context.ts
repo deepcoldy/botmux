@@ -11,10 +11,13 @@ export interface TraexNativeContextReceipt {
   status: 'accepted' | 'unknown';
 }
 
+/** The write-edge form of one TraeX RPC turn. `content` may omit fixed blocks
+ * the native thread already accepted, so it is only valid for the single
+ * `turn/start` it was prepared for: never persist, queue or forward it. Every
+ * queued/persisted payload stays self-contained, and the RPC write edge
+ * prepares it again against the receipt that is current at that moment. */
 export interface PreparedTraexNativeContext {
   content: string;
-  /** Preserve the exact fixed source across FIFO receipt changes, not just its digest. */
-  originalFixedPrefix?: string;
   nativeThreadId: string;
   roleDigest: string;
   skillCatalogDigest: string;
@@ -22,15 +25,12 @@ export interface PreparedTraexNativeContext {
   budgetBytes: number;
   includedRole: boolean;
   includedSkillCatalog: boolean;
-  blockedReason?: 'context_receipt_unknown';
   contextVersion?: {
     nativeThreadId: string;
     roleDigest: string;
     skillCatalogDigest: string;
   };
 }
-
-export type TraexNativeContextMetadata = Omit<PreparedTraexNativeContext, 'content' | 'contextVersion'>;
 
 export class TraexContextBudgetError extends Error {
   readonly code = 'traex_fixed_context_budget_exceeded';
@@ -41,24 +41,6 @@ export class TraexContextBudgetError extends Error {
   ) {
     super(`TraeX fixed context is ${fixedContextBytes} bytes; budget is ${budgetBytes} bytes`);
     this.name = 'TraexContextBudgetError';
-  }
-}
-
-export class TraexContextReceiptUnknownError extends Error {
-  readonly code = 'traex_context_receipt_unknown';
-
-  constructor(readonly nativeThreadId: string) {
-    super(`TraeX context receipt is unknown for native thread ${nativeThreadId}`);
-    this.name = 'TraexContextReceiptUnknownError';
-  }
-}
-
-export class TraexContextThreadMismatchError extends Error {
-  readonly code = 'traex_context_thread_mismatch';
-
-  constructor(readonly expectedThreadId: string, readonly actualThreadId: string) {
-    super(`TraeX native context thread mismatch: expected ${expectedThreadId}, got ${actualThreadId}`);
-    this.name = 'TraexContextThreadMismatchError';
   }
 }
 
@@ -132,36 +114,23 @@ export function prepareTraexNativeContext(
   const roleBlock = findFixedContextBlock(content, ROLE_BLOCK);
   const projectGroupBlock = findFixedContextBlock(content, PROJECT_GROUP_BLOCK);
   const roleContext = [roleBlock, projectGroupBlock].filter(Boolean).join('\n\n');
-  const variableStart = content.match(VARIABLE_BLOCK_START)?.index;
-  const originalFixedPrefix = variableStart === undefined ? undefined : content.slice(0, variableStart);
   const skillCatalogBlock = findFixedContextBlock(content, SKILL_REFRESH_BLOCK)
     ?? findFixedContextBlock(content, SKILL_BLOCK);
   const roleDigest = digest(roleContext);
   const skillCatalogDigest = digest(skillCatalogBlock);
-  const sameThreadReceipt = receipt?.nativeThreadId === nativeThreadId ? receipt : undefined;
-
-  if (sameThreadReceipt?.status === 'unknown') {
-    return {
-      content,
-      originalFixedPrefix,
-      nativeThreadId,
-      roleDigest,
-      skillCatalogDigest,
-      fixedContextBytes: fixedContextBytes(content),
-      budgetBytes: TRAEX_INITIAL_FIXED_CONTEXT_BUDGET_BYTES,
-      includedRole: !!roleContext,
-      includedSkillCatalog: !!skillCatalogBlock,
-      blockedReason: 'context_receipt_unknown',
-    };
-  }
+  // Only an accepted receipt proves the thread holds this context. An
+  // `unknown` one (turn/start dispatched, outcome unconfirmed) is treated as
+  // absent: resending identical fixed blocks is idempotent, while omitting a
+  // role/authorization boundary the thread never received is not, and a
+  // blocking `unknown` has no event that could ever clear it.
+  const sameThreadReceipt = receipt?.nativeThreadId === nativeThreadId && receipt.status === 'accepted'
+    ? receipt
+    : undefined;
 
   let preparedContent = content;
-  const omitRole = !!roleContext
-    && sameThreadReceipt?.status === 'accepted'
-    && sameThreadReceipt.roleDigest === roleDigest;
+  const omitRole = !!roleContext && sameThreadReceipt?.roleDigest === roleDigest;
   const omitSkillCatalog = !!skillCatalogBlock
-    && sameThreadReceipt?.status === 'accepted'
-    && sameThreadReceipt.skillCatalogDigest === skillCatalogDigest;
+    && sameThreadReceipt?.skillCatalogDigest === skillCatalogDigest;
   if (omitRole) {
     preparedContent = withoutExactBlock(preparedContent, roleBlock);
     preparedContent = withoutExactBlock(preparedContent, projectGroupBlock);
@@ -177,14 +146,13 @@ export function prepareTraexNativeContext(
   const effectiveSkillCatalogDigest = skillCatalogBlock
     ? skillCatalogDigest
     : sameThreadReceipt?.skillCatalogDigest ?? skillCatalogDigest;
-  const budgetBytes = sameThreadReceipt?.status === 'accepted' && !contextChanged
+  const budgetBytes = sameThreadReceipt && !contextChanged
     ? TRAEX_STEADY_FIXED_CONTEXT_BUDGET_BYTES
     : TRAEX_INITIAL_FIXED_CONTEXT_BUDGET_BYTES;
   const measuredFixedContextBytes = enforceBudget(preparedContent, budgetBytes);
 
   return {
     content: preparedContent,
-    originalFixedPrefix,
     nativeThreadId,
     roleDigest: effectiveRoleDigest,
     skillCatalogDigest: effectiveSkillCatalogDigest,
@@ -198,41 +166,6 @@ export function prepareTraexNativeContext(
             nativeThreadId,
             roleDigest: effectiveRoleDigest,
             skillCatalogDigest: effectiveSkillCatalogDigest,
-          },
-        }
-      : {}),
-  };
-}
-
-export function restorePreparedTraexNativeContext(
-  content: string,
-  metadata: TraexNativeContextMetadata,
-  nativeThreadId: string,
-  receipt?: TraexNativeContextReceipt,
-): PreparedTraexNativeContext {
-  if (metadata.nativeThreadId !== nativeThreadId) {
-    throw new TraexContextThreadMismatchError(nativeThreadId, metadata.nativeThreadId);
-  }
-  const variableStart = content.match(VARIABLE_BLOCK_START)?.index;
-  if (metadata.originalFixedPrefix !== undefined && variableStart !== undefined) {
-    const restored = metadata.originalFixedPrefix + content.slice(variableStart);
-    const prepared = prepareTraexNativeContext(restored, nativeThreadId, receipt);
-    if (!receipt && metadata.blockedReason) prepared.blockedReason = metadata.blockedReason;
-    return prepared;
-  }
-  if (receipt) return prepareTraexNativeContext(content, nativeThreadId, receipt);
-  const contextChanged = metadata.includedRole || metadata.includedSkillCatalog;
-  const measuredFixedContextBytes = enforceBudget(content, metadata.budgetBytes);
-  return {
-    content,
-    ...metadata,
-    fixedContextBytes: measuredFixedContextBytes,
-    ...(contextChanged
-      ? {
-          contextVersion: {
-            nativeThreadId,
-            roleDigest: metadata.roleDigest,
-            skillCatalogDigest: metadata.skillCatalogDigest,
           },
         }
       : {}),
@@ -269,7 +202,6 @@ export function appendTraexSkillCatalog(
   );
   return {
     content,
-    originalFixedPrefix: prepared.originalFixedPrefix,
     nativeThreadId: prepared.nativeThreadId,
     roleDigest: prepared.roleDigest,
     skillCatalogDigest,
@@ -277,7 +209,6 @@ export function appendTraexSkillCatalog(
     budgetBytes,
     includedRole,
     includedSkillCatalog,
-    ...(prepared.blockedReason ? { blockedReason: prepared.blockedReason } : {}),
     ...(contextChanged
       ? {
           contextVersion: {

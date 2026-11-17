@@ -4,7 +4,6 @@ import {
   TRAEX_STEADY_FIXED_CONTEXT_BUDGET_BYTES,
   appendTraexSkillCatalog,
   prepareTraexNativeContext,
-  restorePreparedTraexNativeContext,
   settleTraexNativeContextReceipt,
 } from '../src/core/traex-native-context.js';
 
@@ -14,25 +13,23 @@ const user = '<user_message>' + '用户正文'.repeat(3_000) + '</user_message>'
 const identity = '<sender type="user" open_id="ou_user" />';
 
 describe('TraeX native-thread context receipt', () => {
-  it('restores queued A after accepted A -> queued B -> queued A -> accepted B', () => {
+  it('sends queued A in full after accepted A -> queued B -> queued A -> accepted B', () => {
+    // The queue holds self-contained payloads; omission is decided only when
+    // each one is written, against the receipt current at that moment.
     const original = [role, skills, user, identity].join('\n\n');
     const first = prepareTraexNativeContext(original, 'native-thread-1');
     const acceptedA = settleTraexNativeContextReceipt(first, 'om_a', 'accepted')!;
-    const queuedA = prepareTraexNativeContext(original, 'native-thread-1', acceptedA);
     const changed = prepareTraexNativeContext(
       original.replace(role, '<role context="group">ROLE_B</role>')
         .replace(skills, '<botmux_skills><skill name="B" /></botmux_skills>'),
       'native-thread-1', acceptedA,
     );
     const acceptedB = settleTraexNativeContextReceipt(changed, 'om_b', 'accepted')!;
-    const { content, contextVersion: _version, ...metadata } = queuedA;
-    const restored = restorePreparedTraexNativeContext(
-      content, JSON.parse(JSON.stringify(metadata)), 'native-thread-1', acceptedB,
-    );
-    expect(restored.content).toBe(original);
-    expect(restored.roleDigest).toBe(acceptedA.roleDigest);
-    expect(restored.skillCatalogDigest).toBe(acceptedA.skillCatalogDigest);
-    expect(restored.content).not.toContain('ROLE_B');
+    const queuedAAtWrite = prepareTraexNativeContext(original, 'native-thread-1', acceptedB);
+    expect(queuedAAtWrite.content).toBe(original);
+    expect(queuedAAtWrite.roleDigest).toBe(acceptedA.roleDigest);
+    expect(queuedAAtWrite.skillCatalogDigest).toBe(acceptedA.skillCatalogDigest);
+    expect(queuedAAtWrite.content).not.toContain('ROLE_B');
   });
 
   it('tracks project-group context in the role version and omits it only after acceptance', () => {
@@ -215,45 +212,40 @@ describe('TraeX native-thread context receipt', () => {
     expect(steady.budgetBytes).toBe(TRAEX_STEADY_FIXED_CONTEXT_BUDGET_BYTES);
   });
 
-  it('revalidates prepared metadata against the latest same-thread receipt', () => {
+  it('deduplicates one queued payload against whichever receipt is current at write time', () => {
     const first = prepareTraexNativeContext([role, skills, user].join('\n\n'), 'native-thread-1');
     const firstReceipt = settleTraexNativeContextReceipt(first, 'om_first', 'accepted')!;
     const changedRole = '<role context="group">new authorization boundary</role>';
-    const queued = prepareTraexNativeContext(
-      [changedRole, skills, user].join('\n\n'),
-      'native-thread-1',
-      firstReceipt,
-    );
-    const { content, contextVersion: _contextVersion, ...metadata } = queued;
-    const changedReceipt = settleTraexNativeContextReceipt(queued, 'om_changed', 'accepted')!;
+    const queued = [changedRole, skills, user].join('\n\n');
 
-    const deduplicated = restorePreparedTraexNativeContext(
-      content,
-      metadata,
-      'native-thread-1',
-      changedReceipt,
-    );
+    const beforeChangeLands = prepareTraexNativeContext(queued, 'native-thread-1', firstReceipt);
+    expect(beforeChangeLands.content).toContain(changedRole);
+    const changedReceipt = settleTraexNativeContextReceipt(beforeChangeLands, 'om_changed', 'accepted')!;
+
+    const deduplicated = prepareTraexNativeContext(queued, 'native-thread-1', changedReceipt);
     expect(deduplicated.content).not.toContain(changedRole);
     expect(deduplicated.content).toContain(user);
     expect(deduplicated.contextVersion).toBeUndefined();
     expect(deduplicated.budgetBytes).toBe(TRAEX_STEADY_FIXED_CONTEXT_BUDGET_BYTES);
 
-    const blocked = restorePreparedTraexNativeContext(
-      content,
-      metadata,
-      'native-thread-1',
-      { ...changedReceipt, status: 'unknown' },
-    );
-    expect(blocked.blockedReason).toBe('context_receipt_unknown');
+    const otherThread = prepareTraexNativeContext(queued, 'native-thread-2', changedReceipt);
+    expect(otherThread.content).toBe(queued);
   });
 
-  it('fails closed when the same thread has an unknown context receipt', () => {
-    const first = prepareTraexNativeContext([role, skills, user].join('\n\n'), 'native-thread-1');
+  it('resends the full fixed context while the same-thread receipt is unknown, then settles', () => {
+    const original = [role, skills, user].join('\n\n');
+    const first = prepareTraexNativeContext(original, 'native-thread-1');
     const unknown = settleTraexNativeContextReceipt(first, 'om_first', 'unknown')!;
 
-    const next = prepareTraexNativeContext([role, skills, user].join('\n\n'), 'native-thread-1', unknown);
+    const next = prepareTraexNativeContext(original, 'native-thread-1', unknown);
 
-    expect(next.blockedReason).toBe('context_receipt_unknown');
+    expect(next.content).toBe(original);
+    expect(next.includedRole).toBe(true);
+    expect(next.includedSkillCatalog).toBe(true);
+    expect(next.budgetBytes).toBe(TRAEX_INITIAL_FIXED_CONTEXT_BUDGET_BYTES);
+    const accepted = settleTraexNativeContextReceipt(next, 'om_next', 'accepted');
+    expect(accepted).toMatchObject({ nativeThreadId: 'native-thread-1', turnId: 'om_next', status: 'accepted' });
+    expect(prepareTraexNativeContext(original, 'native-thread-1', accepted).content).not.toContain(role);
   });
 
   it('rejects oversized fixed context without truncating user or security content', () => {

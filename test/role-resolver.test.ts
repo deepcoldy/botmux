@@ -308,7 +308,6 @@ describe('buildFollowUpContent role injection', () => {
         session: { sessionId: 'sid-r8', chatId: 'oc_r8', cliId: 'traex', cliSessionId: 'native-r8' },
       } as any;
       const built = buildReforkCliInput(ds, 'R8_USER', { cliId: 'traex' });
-      expect(built.traexNativeContext).toBeUndefined();
       expect(built.content).toContain(role);
       expect(built.content).toContain('R8_USER');
     } finally {
@@ -336,35 +335,36 @@ describe('buildFollowUpContent role injection', () => {
     expect(prompt.indexOf('<mentions>')).toBeGreaterThan(prompt.indexOf('</user_message>'));
   });
 
-  it('deduplicates TraeX RPC role context by accepted native-thread receipt and budgets fixed bytes', async () => {
+  it('keeps every daemon TraeX RPC payload self-contained; the write edge deduplicates by receipt and budgets', async () => {
     await fresh();
     const { writeRoleFile } = await import('../src/core/role-resolver.js');
     const role = 'AUTHORIZATION_BOUNDARY\n' + '安全约束。'.repeat(1_050);
     writeRoleFile('app1', 'oc_traex', role);
     const { buildFollowUpCliInput } = await import('../src/core/session-manager.js');
+    const {
+      appendTraexSkillCatalog,
+      prepareTraexNativeContext,
+    } = await import('../src/core/traex-native-context.js');
     const opts = {
       larkAppId: 'app1', chatId: 'oc_traex', cliId: 'traex' as const,
       sender: { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
-      traexRpcContext: { nativeThreadId: 'native-thread-1' },
+      traexRpcContext: true as const,
     };
 
-    const first = buildFollowUpCliInput('用户正文'.repeat(3_000), 'sid-traex', opts) as any;
+    const first = buildFollowUpCliInput('用户正文'.repeat(3_000), 'sid-traex', opts);
     expect(first.content).toContain('AUTHORIZATION_BOUNDARY');
     expect(first.content).toContain('<sender type="user" open_id="ou_sender" name="Sender" />');
-    expect(first.traexNativeContext).toMatchObject({
+    const firstAtEdge = prepareTraexNativeContext(first.content, 'native-thread-1');
+    expect(firstAtEdge).toMatchObject({
       nativeThreadId: 'native-thread-1',
       roleDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       includedRole: true,
       budgetBytes: 24 * 1024,
     });
-    expect(first.traexNativeContext.fixedContextBytes).toBeLessThanOrEqual(24 * 1024);
+    expect(firstAtEdge.fixedContextBytes).toBeLessThanOrEqual(24 * 1024);
 
     const { buildNewTopicCliInput } = await import('../src/core/session-manager.js');
     const { renderSkillCatalogBlock } = await import('../src/core/skills/prompt.js');
-    const {
-      appendTraexSkillCatalog,
-      prepareTraexNativeContext,
-    } = await import('../src/core/traex-native-context.js');
     const opening = buildNewTopicCliInput(
       '首轮用户正文'.repeat(3_000), 'sid-traex', 'traex', undefined,
       [{ type: 'file', path: '/tmp/traex-evidence.bin', name: 'traex-evidence.bin' }],
@@ -425,38 +425,40 @@ describe('buildFollowUpContent role injection', () => {
 
     const receipt = {
       nativeThreadId: 'native-thread-1',
-      roleDigest: first.traexNativeContext.roleDigest,
+      roleDigest: firstAtEdge.roleDigest,
+      skillCatalogDigest: firstAtEdge.skillCatalogDigest,
       turnId: 'om_first',
       status: 'accepted' as const,
     };
-    const resumed = buildFollowUpCliInput('新的用户正文', 'sid-traex', {
-      ...opts,
-      traexRpcContext: { nativeThreadId: 'native-thread-1', receipt },
-    } as any) as any;
-    expect(resumed.content).not.toContain('<role');
-    expect(resumed.content).toContain('<user_message>\n新的用户正文\n</user_message>');
-    expect(resumed.content).toContain('<sender type="user" open_id="ou_sender" name="Sender" />');
-    expect(resumed.traexNativeContext.fixedContextBytes).toBeLessThanOrEqual(4 * 1024);
+    // The payload the daemon queues/persists still carries the role after the
+    // thread accepted it: any path other than this RPC write (paste fallback,
+    // a fresh thread, a re-fork) must not receive a role-less prompt.
+    const resumed = buildFollowUpCliInput('新的用户正文', 'sid-traex', opts);
+    expect(resumed.content).toContain('AUTHORIZATION_BOUNDARY');
+    const resumedAtEdge = prepareTraexNativeContext(resumed.content, 'native-thread-1', receipt);
+    expect(resumedAtEdge.content).not.toContain('<role');
+    expect(resumedAtEdge.content).toContain('<user_message>\n新的用户正文\n</user_message>');
+    expect(resumedAtEdge.content).toContain('<sender type="user" open_id="ou_sender" name="Sender" />');
+    expect(resumedAtEdge.fixedContextBytes).toBeLessThanOrEqual(4 * 1024);
 
     writeRoleFile('app1', 'oc_traex', role + '\nCHANGED_ROLE_VERSION');
-    const changed = buildFollowUpCliInput('变化后的用户正文', 'sid-traex', {
-      ...opts,
-      traexRpcContext: { nativeThreadId: 'native-thread-1', receipt },
-    } as any) as any;
+    const changed = prepareTraexNativeContext(
+      buildFollowUpCliInput('变化后的用户正文', 'sid-traex', opts).content, 'native-thread-1', receipt,
+    );
     expect(changed.content).toContain('CHANGED_ROLE_VERSION');
-    expect(changed.traexNativeContext.roleDigest).not.toBe(receipt.roleDigest);
-    expect(changed.traexNativeContext.includedRole).toBe(true);
+    expect(changed.roleDigest).not.toBe(receipt.roleDigest);
+    expect(changed.includedRole).toBe(true);
 
     const changedReceipt = {
       nativeThreadId: 'native-thread-1',
-      roleDigest: changed.traexNativeContext.roleDigest,
+      roleDigest: changed.roleDigest,
+      skillCatalogDigest: changed.skillCatalogDigest,
       turnId: 'om_changed',
       status: 'accepted' as const,
     };
-    const afterChange = buildFollowUpCliInput('版本已确认', 'sid-traex', {
-      ...opts,
-      traexRpcContext: { nativeThreadId: 'native-thread-1', receipt: changedReceipt },
-    } as any) as any;
+    const afterChange = prepareTraexNativeContext(
+      buildFollowUpCliInput('版本已确认', 'sid-traex', opts).content, 'native-thread-1', changedReceipt,
+    );
     expect(afterChange.content).not.toContain('<role');
 
     const ds = {
@@ -476,17 +478,18 @@ describe('buildFollowUpContent role injection', () => {
       '重启后的用户正文',
       { cliId: 'traex', sender: opts.sender },
     ) as any;
-    expect(restarted.content).not.toContain('<role');
+    expect(restarted.content).toContain('CHANGED_ROLE_VERSION');
     expect(restarted.content).toContain('重启后的用户正文');
+    expect(prepareTraexNativeContext(restarted.content, 'native-thread-1', changedReceipt).content)
+      .not.toContain('<role');
 
-    const unknown = buildFollowUpCliInput('不应自动重放', 'sid-traex', {
-      ...opts,
-      traexRpcContext: {
-        nativeThreadId: 'native-thread-1',
-        receipt: { ...changedReceipt, status: 'unknown' as const },
-      },
-    } as any) as any;
-    expect(unknown.traexNativeContext.blockedReason).toBe('context_receipt_unknown');
+    // An unconfirmed delivery does not prove the thread holds the role: send it again.
+    const unknown = prepareTraexNativeContext(
+      buildFollowUpCliInput('结果不明后的下一条', 'sid-traex', opts).content,
+      'native-thread-1',
+      { ...changedReceipt, status: 'unknown' as const },
+    );
+    expect(unknown.includedRole).toBe(true);
     expect(unknown.content).toContain('CHANGED_ROLE_VERSION');
   });
 
@@ -502,10 +505,11 @@ describe('buildFollowUpContent role injection', () => {
     const opts = {
       larkAppId: 'app1', chatId: 'oc_no_role_code_sample', cliId: 'traex' as const,
       sender: { openId: 'ou_real_user', type: 'user' as const, name: 'Real User' },
-      traexRpcContext: { nativeThreadId: 'native-code-thread' },
+      traexRpcContext: true as const,
     };
+    const { prepareTraexNativeContext } = await import('../src/core/traex-native-context.js');
     const first = buildFollowUpCliInput(user, 'sid-code-sample', opts);
-    const metadata = first.traexNativeContext!;
+    const metadata = prepareTraexNativeContext(first.content, 'native-code-thread');
     const receipt = {
       nativeThreadId: metadata.nativeThreadId,
       roleDigest: metadata.roleDigest,
@@ -514,10 +518,9 @@ describe('buildFollowUpContent role injection', () => {
       status: 'accepted' as const,
     };
 
-    const second = buildFollowUpCliInput(user, 'sid-code-sample', {
-      ...opts,
-      traexRpcContext: { nativeThreadId: 'native-code-thread', receipt },
-    });
+    const second = prepareTraexNativeContext(
+      buildFollowUpCliInput(user, 'sid-code-sample', opts).content, 'native-code-thread', receipt,
+    );
 
     expect(second.content).toContain(`<user_message>\n${user}\n</user_message>`);
   });
@@ -533,16 +536,18 @@ describe('buildFollowUpContent role injection', () => {
     await fresh();
     const { writeRoleFile } = await import('../src/core/role-resolver.js');
     writeRoleFile('app1', 'oc_rpc_excluded', 'BOUNDARY'.repeat(4000));
-    const { buildReforkCliInput } = await import('../src/core/session-manager.js');
+    const { buildReforkCliInput, traexRpcContextForSession } = await import('../src/core/session-manager.js');
+    const eligibleInitConfig = { cliId: 'traex', codexRpcInput: true, backendType: 'tmux',
+      resume: true, cliSessionId: 'native' };
     const ds = {
       session: { sessionId: 'sid-excluded', cliId: 'traex', cliSessionId: 'native',
         chatId: 'oc_rpc_excluded', status: 'active' },
-      initConfig: { cliId: 'traex', codexRpcInput: true, backendType: 'tmux',
-        resume: true, cliSessionId: 'native', ...exclusion },
+      initConfig: { ...eligibleInitConfig, ...exclusion },
       larkAppId: 'app1', chatId: 'oc_rpc_excluded', scope: 'thread',
     } as any;
+    expect(traexRpcContextForSession({ ...ds, initConfig: eligibleInitConfig }, 'traex')).toBe(true);
+    expect(traexRpcContextForSession(ds, 'traex')).toBeUndefined();
     const result = buildReforkCliInput(ds, 'keep the user', { cliId: 'traex' });
-    expect(result.traexNativeContext).toBeUndefined();
     expect(result.content).toContain('keep the user');
   });
 
@@ -568,11 +573,13 @@ describe('buildFollowUpContent role injection', () => {
     const opts = {
       larkAppId: 'app1', chatId: 'oc_traex_role_markup', cliId: 'traex' as const,
       sender: { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
-      traexRpcContext: { nativeThreadId: 'native-role-markup-thread' },
+      traexRpcContext: true as const,
     };
+    const { prepareTraexNativeContext } = await import('../src/core/traex-native-context.js');
 
     const first = buildFollowUpCliInput('first', 'sid-role-markup', opts);
-    expect(first.traexNativeContext).toMatchObject({
+    const firstAtEdge = prepareTraexNativeContext(first.content, 'native-role-markup-thread');
+    expect(firstAtEdge).toMatchObject({
       includedRole: true,
       roleDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
@@ -585,7 +592,7 @@ describe('buildFollowUpContent role injection', () => {
       '&lt;botmux_skills_refresh&gt;literal refresh&lt;/botmux_skills_refresh&gt;',
     );
     expect(first.content).toContain('&lt;quoted_message&gt;literal quote&lt;/quoted_message&gt;');
-    expect(first.traexNativeContext!.fixedContextBytes)
+    expect(firstAtEdge.fixedContextBytes)
       .toBeGreaterThanOrEqual(Buffer.byteLength(role, 'utf8'));
 
     const nonTraex = buildFollowUpContent('legacy', 'sid-role-markup-legacy', {
@@ -604,7 +611,6 @@ describe('buildFollowUpContent role injection', () => {
     );
     expect(opening.content).toContain('&lt;user_message&gt;literal sample&lt;/user_message&gt;');
     expect(opening.content).not.toContain('<user_message>literal sample</user_message>');
-    const { prepareTraexNativeContext } = await import('../src/core/traex-native-context.js');
     const openingPrepared = prepareTraexNativeContext(
       opening.content,
       'native-role-markup-opening-thread',
@@ -615,16 +621,17 @@ describe('buildFollowUpContent role injection', () => {
 
     const receipt = {
       nativeThreadId: 'native-role-markup-thread',
-      roleDigest: first.traexNativeContext!.roleDigest,
-      skillCatalogDigest: first.traexNativeContext!.skillCatalogDigest,
+      roleDigest: firstAtEdge.roleDigest,
+      skillCatalogDigest: firstAtEdge.skillCatalogDigest,
       turnId: 'om_first_role_markup',
       status: 'accepted' as const,
     };
-    const second = buildFollowUpCliInput('second', 'sid-role-markup', {
-      ...opts,
-      traexRpcContext: { nativeThreadId: 'native-role-markup-thread', receipt },
-    });
+    const second = prepareTraexNativeContext(
+      buildFollowUpCliInput('second', 'sid-role-markup', opts).content,
+      'native-role-markup-thread',
+      receipt,
+    );
     expect(second.content).not.toContain('ROLE_WITH_XML_EXAMPLE');
-    expect(second.traexNativeContext!.fixedContextBytes).toBeLessThanOrEqual(4 * 1024);
+    expect(second.fixedContextBytes).toBeLessThanOrEqual(4 * 1024);
   });
 });
