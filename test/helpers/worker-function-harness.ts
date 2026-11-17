@@ -26,6 +26,13 @@ import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
 import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
 import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
+
+/** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
+ *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
+ *  loaded as the real functions, so a fixture with no rewind in flight keeps
+ *  its old behaviour. */
+const FAILED_TURN_REWIND_FUNCTIONS = ['turnFailedWithoutOutput', 'failedTurnRewindWriteEdge', 'stopHeldFailedTurnRewind'];
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
@@ -93,9 +100,11 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
     if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
+    if (key === 'rewindableErrorCode') return rewindableErrorCode;
+    if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
-    if (typeof key === 'string' && ['readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }
