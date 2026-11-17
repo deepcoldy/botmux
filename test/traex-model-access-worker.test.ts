@@ -1,4 +1,5 @@
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { TraexAutoModelController, TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS, TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT } from '../src/services/traex-auto-model.js';
@@ -22,6 +23,7 @@ function fixture(extra: Record<string, unknown> = {}) {
   const catalog = new Promise<any>(done => { resolve = done; });
   const scope: Record<string, any> = {
     inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
+    codexBridgeQueue: new CodexBridgeQueue(),
     traexAutoModelRuntimeEligible: () => true, traexAutoModelController: controller,
     activeTurnAuthority: authority, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
     lastInitConfig: { cliSessionId: 'native', model: models[0] }, backend: {},
