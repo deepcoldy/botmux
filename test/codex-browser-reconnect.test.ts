@@ -74,6 +74,30 @@ describe.sequential('browser connection recovery', () => {
     expect(f.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
   });
 
+  it('tears down and rebuilds a dead Node runtime when discovery fails', async () => {
+    const close = vi.fn(async () => {});
+    const get = vi.fn(async () => {
+      throw new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
+    });
+    const setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
+    broker = new CodexBrowserBroker({
+      sessionId: 'dead-runtime-discovery',
+      family: 'chrome',
+      modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
+    });
+
+    const first = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+    expect(first.success).toBe(false);
+    expect((first.contentItems[0] as { text: string }).text).toContain('Browser connection changed');
+    expect(close).toHaveBeenCalledOnce();
+
+    const second = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+    expect(second.success).toBe(false);
+    // A fresh runtime must be built: the exited child cannot be reused.
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
   it.each(['Browser is not available: 1', 'native pipe closed before response', 'Debugger unattached'])(
     'rediscovers after a cached browser disconnects: %s', async message => {
       const previousRuntime = (globalThis as any).nodeRepl;

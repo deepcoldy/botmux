@@ -15,6 +15,9 @@ const MAX_LINE_BYTES = 32 * 1024 * 1024;
  * bounds a child that stays alive without answering.
  */
 export const DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS = 660_000;
+/** Covers process spawn, the worker's ready handshake and the plugin's own
+ *  dynamic import/initialization, all of which are one startup sequence. */
+export const DEFAULT_BROWSER_NODE_STARTUP_TIMEOUT_MS = 10_000;
 
 // Encode objects as entries, so page-controlled keys cannot impersonate a wire
 // tag. The browser service also returns byte arrays (for example screenshots).
@@ -57,6 +60,7 @@ export class CodexBrowserNodeService {
     private readonly runtime: () => Runtime,
     private readonly nodeCommand = 'node',
     private readonly requestTimeoutMs = DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS,
+    private readonly startupTimeoutMs = DEFAULT_BROWSER_NODE_STARTUP_TIMEOUT_MS,
   ) {}
 
   async handleRpc(request: { method: string; params?: unknown }): Promise<unknown> {
@@ -70,7 +74,11 @@ export class CodexBrowserNodeService {
 
   private start(): Promise<void> {
     if (this.closed) return Promise.reject(new Error('Browser Node runtime is closed'));
-    return this.starting ??= this.launch();
+    const launch = this.starting ??= this.launch();
+    // A failed launch must not be cached as the permanent state: allow the next
+    // call to spawn a fresh child instead of replaying the same rejection.
+    launch.catch(() => { if (this.starting === launch) this.starting = undefined; });
+    return launch;
   }
 
   private async launch(): Promise<void> {
@@ -81,12 +89,19 @@ export class CodexBrowserNodeService {
     this.child = child;
     child.stderr.on('data', () => {}); // Never forward credential-bearing SDK diagnostics.
     let ready!: () => void;
-    let failed!: (e: Error) => void;
-    const connected = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; });
-    const timer = setTimeout(() => failed(new Error('Browser Node runtime startup timed out')), 10_000);
+    let failStartup!: (e: Error) => void;
+    const connected = new Promise<void>(resolve => { ready = resolve; });
+    // Stays pending on success; the catch handler keeps a later exit-driven
+    // reject from surfacing as an unhandled rejection.
+    const startupFailure = new Promise<never>((_, reject) => { failStartup = reject; });
+    startupFailure.catch(() => {});
+    const watchdog = setTimeout(
+      () => failStartup(new Error(`Browser Node runtime is unavailable: startup timed out after ${this.startupTimeoutMs}ms`)),
+      this.startupTimeoutMs,
+    );
     const stop = () => {
       const error = new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
-      failed(error);
+      failStartup(error);
       for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
       this.pending.clear();
     };
@@ -111,10 +126,16 @@ export class CodexBrowserNodeService {
       }
     });
     try {
-      await connected;
-      await this.request('initialize', { modulePath: join(this.root, 'scripts/browser-service.mjs') });
+      // One watchdog bounds the whole startup sequence, including the plugin's
+      // dynamic import inside the initialize request; a hanging top-level await
+      // must not fall through to the much larger per-request budget.
+      await Promise.race([connected, startupFailure]);
+      await Promise.race([
+        this.request('initialize', { modulePath: join(this.root, 'scripts/browser-service.mjs') }),
+        startupFailure,
+      ]);
     } catch (error) { child.kill(); throw error; }
-    finally { clearTimeout(timer); }
+    finally { clearTimeout(watchdog); }
   }
 
   private send(message: unknown): void {
@@ -145,12 +166,14 @@ export class CodexBrowserNodeService {
       case 'config.writeToml': return r.config.writeToml(params.path, params.value);
       case 'createElicitation': return r.createElicitation(params);
       case 'fetch': {
+        // No parent-side AbortSignal: the owner fetch (CodexBrowserAuthenticatedFetch)
+        // starts its own per-call transport budget only after its serialized queue
+        // releases. An outer timeout created here would include that queue wait and
+        // abort calls the inner budget would still allow. The per-request watchdog
+        // still bounds a fetch that never settles at all.
         const response = await r.fetch(params.url, {
           method: params.method, headers: params.headers,
           ...(params.body ? { body: Buffer.from(params.body, 'base64') } : {}),
-          // Match the authenticated-fetch MCP transport's own 40s budget instead
-          // of aborting calls that transport would still allow.
-          signal: AbortSignal.timeout(40_000),
         });
         return { status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body: Buffer.from(await response.arrayBuffer()).toString('base64') };
       }

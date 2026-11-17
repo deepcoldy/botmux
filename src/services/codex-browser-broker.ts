@@ -288,7 +288,7 @@ export interface DynamicToolCallResponse {
   success: boolean;
 }
 
-const TOOL_TIMEOUT_MS = 660_000;
+export const TOOL_TIMEOUT_MS = 660_000;
 const MAX_TEXT_RESULT_BYTES = 512 * 1024;
 const MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024;
 const MAX_OPERATION_TIMEOUT_MS = 60_000;
@@ -696,7 +696,11 @@ export class CodexBrowserBroker {
       );
     }));
     if (this.pluginModules?.handleTurnEnded) {
-      results.push(...await Promise.allSettled([withTimeout(this.pluginModules.handleTurnEnded(event), 4_000)]));
+      // The Node worker enforces each plugin handler's own timeoutMs (4s
+      // default) on its side; the service's per-request watchdog still bounds
+      // the whole call. A fixed 4s wrapper here would discard a handler that
+      // legitimately configured a longer timeout.
+      results.push(...await Promise.allSettled([this.pluginModules.handleTurnEnded(event)]));
     }
     const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (failure) throw failure.reason;
@@ -723,21 +727,39 @@ export class CodexBrowserBroker {
         && /^(?:Browser is not available:|native pipe closed before response\b|Debugger unattached\b|Browser Node runtime (?:exited|is unavailable)\b)/i.test(message)) {
         // Rediscover on the next explicit call. Never replay an operation that
         // may have run, or discard a newer binding for an older call's error.
-        if (/^Browser Node runtime /i.test(message)) {
-          await this.pluginModules?.close?.();
-          this.pluginModules = undefined;
-          this.agent = undefined;
-          this.turnEndedHandlers.clear();
+        if (this.isDeadRuntimeError(message)) {
+          await this.invalidateDeadRuntime();
+        } else {
+          this.browserGeneration++;
+          this.browser = undefined;
+          this.init = undefined;
+          this.claimedTabs.clear();
+          this.requiresFreshTabClaim = true;
         }
-        this.browserGeneration++;
-        this.browser = undefined;
-        this.init = undefined;
-        this.claimedTabs.clear();
-        this.requiresFreshTabClaim = true;
         throw new Error(`${message}. Browser connection changed; call list_tabs and claim_tab again before using an existing tab. The failed operation was not replayed.`);
       }
       throw error;
     }
+  }
+
+  private isDeadRuntimeError(message: string): boolean {
+    return /^Browser Node runtime (?:exited|is unavailable)\b/i.test(message);
+  }
+
+  /** Full teardown for a dead owner-scoped Node runtime. The next operation
+   *  rebuilds runtime and binding through initialize(); the failed operation is
+   *  never replayed. Idempotent so discovery- and operation-path callers can
+   *  both trigger it. */
+  private async invalidateDeadRuntime(): Promise<void> {
+    await this.pluginModules?.close?.();
+    this.pluginModules = undefined;
+    this.agent = undefined;
+    this.turnEndedHandlers.clear();
+    this.browserGeneration++;
+    this.browser = undefined;
+    this.init = undefined;
+    this.claimedTabs.clear();
+    this.requiresFreshTabClaim = true;
   }
 
   private async executeWithBrowser(
@@ -1243,6 +1265,14 @@ export class CodexBrowserBroker {
       this.browser = await init;
       return this.browser;
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isDeadRuntimeError(message)) {
+        // agent.browsers.get() runs outside execute()'s operation guard, so a
+        // dead Node runtime must be torn down here as well; otherwise the stale
+        // agent and its exited child would be reused on every later operation.
+        await this.invalidateDeadRuntime();
+        throw new Error(`${message}. Browser connection changed; call list_tabs and claim_tab again before using an existing tab. The failed operation was not replayed.`);
+      }
       // Extension/native-host availability can change after the first tool
       // call (for example when the user enables or reconnects the extension).
       // Do not permanently cache that transient discovery failure: the next

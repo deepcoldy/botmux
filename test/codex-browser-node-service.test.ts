@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexBrowserNodeService, createBrowserWireCodec, DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS } from '../src/services/codex-browser-node-service.js';
+import { TOOL_TIMEOUT_MS } from '../src/services/codex-browser-broker.js';
 import { resolveNodeExecutable, spawnSyncBunTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const fixture = `
@@ -22,6 +23,7 @@ export async function handleRpc(request) {
   if(request.method==='approval')return r.createElicitation(request.params);
   if(request.method==='fetch') { const response=await r.fetch('https://identity.example.invalid/test',{method:'POST',body:'input'});return {status:response.status,body:await response.text()}; }
   if(request.method==='hook'){r.addTurnEndedHandler({run:e=>events.push(e)});return;}
+  if(request.method==='slow-hook'){r.addTurnEndedHandler({timeoutMs:150,run:()=>new Promise(()=>{})});return;}
   if(request.method==='events')return events;
   if(request.method==='exit')process.exit(7);
   if(request.method==='wait')return new Promise(()=>{});
@@ -31,12 +33,21 @@ export async function handleRpc(request) {
 describe('Node browser service boundary', () => {
   let service: CodexBrowserNodeService | undefined;
   const roots: string[] = [];
-  function setup(requestTimeoutMs?: number) {
+  function setup(requestTimeoutMs?: number, startupTimeoutMs?: number) {
     const root=mkdtempSync(join(tmpdir(),'botmux-node-browser-'));roots.push(root);
     mkdirSync(join(root,'scripts'));writeFileSync(join(root,'scripts/browser-service.mjs'),fixture);
     const runtime:any={requestMeta:{turn:'first'},config:{read:vi.fn(async p=>({p,ok:true}))},createElicitation:vi.fn(async()=>({action:'decline'})),fetch:vi.fn(async()=>new Response('output',{status:201}))};
-    service=new CodexBrowserNodeService(root,()=>runtime,resolveNodeExecutable()!,requestTimeoutMs);
+    service=new CodexBrowserNodeService(root,()=>runtime,resolveNodeExecutable()!,requestTimeoutMs,startupTimeoutMs);
     return {root,runtime};
+  }
+  function setupHangingPlugin(startupTimeoutMs: number) {
+    const root=mkdtempSync(join(tmpdir(),'botmux-node-browser-hang-'));roots.push(root);
+    mkdirSync(join(root,'scripts'));
+    writeFileSync(join(root,'scripts/browser-service.mjs'),`
+await new Promise(() => {});
+export async function handleRpc(){ return null; }`);
+    service=new CodexBrowserNodeService(root,()=>({requestMeta:{}}),resolveNodeExecutable()!,60_000,startupTimeoutMs);
+    return root;
   }
   afterEach(async()=>{await service?.close();service=undefined;roots.splice(0).forEach(p=>rmSync(p,{recursive:true,force:true}));});
 
@@ -99,8 +110,41 @@ describe('Node browser service boundary', () => {
     expect(runtime.createElicitation).toHaveBeenCalledOnce();
   });
   it('keeps the default request budget no shorter than the broker tool timeout',()=>{
-    // The broker allows 600s Lark approvals and 60s operations inside a 660s
-    // tool timeout; the child watchdog must not reject those calls first.
-    expect(DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(660_000);
+    // Both sides read their real exported symbols: mutating the broker budget
+    // past the Node default must make this relationship fail.
+    expect(DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(TOOL_TIMEOUT_MS);
   });
+  it('leaves the abort budget with the owner fetch instead of injecting a signal',async()=>{
+    const {runtime}=setup();
+    const initCapture:RequestInit[]=[];
+    runtime.fetch=vi.fn(async(_url:string,init:RequestInit)=>{
+      initCapture.push(init);
+      await new Promise(resolve=>setTimeout(resolve,100));
+      return new Response('slow-output',{status:200});
+    });
+    await expect(service!.handleRpc({method:'fetch'})).resolves.toMatchObject({status:200,body:'slow-output'});
+    expect(initCapture).toHaveLength(1);
+    expect(initCapture[0]!.signal).toBeUndefined();
+  });
+  it('bounds a hanging plugin initialize with the startup watchdog and relaunches on retry',async()=>{
+    setupHangingPlugin(300);
+    const first=Date.now();
+    await expect(service!.handleRpc({method:'probe'}))
+      .rejects.toThrow('Browser Node runtime is unavailable: startup timed out after 300ms');
+    expect(Date.now()-first).toBeGreaterThanOrEqual(250);
+    // The failed launch is not cached: a retry spawns a fresh child and hits the
+    // same watchdog instead of replaying the stored rejection immediately.
+    const second=Date.now();
+    await expect(service!.handleRpc({method:'probe'}))
+      .rejects.toThrow(/startup timed out/);
+    expect(Date.now()-second).toBeGreaterThanOrEqual(250);
+  },15_000);
+  it('enforces the plugin handler own timeoutMs inside the Node worker',async()=>{
+    setup();
+    await service!.handleRpc({method:'slow-hook'});
+    const started=Date.now();
+    await expect(service!.handleTurnEnded({turn_id:'slow'}))
+      .rejects.toThrow('turn-ended handler timed out after 150ms');
+    expect(Date.now()-started).toBeLessThan(1_000);
+  },10_000);
 });

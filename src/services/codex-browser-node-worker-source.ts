@@ -90,7 +90,17 @@ async function browserNodeServiceMain(wire) {
                 value = await service.handleRpc(message.params);
             }
             else if (message.method === 'turnEnded') {
-                await Promise.all([...hooks].map(h => h.run(message.params)));
+                await Promise.all([...hooks].map(h => {
+                    const timeoutMs = typeof h.timeoutMs === 'number' && Number.isFinite(h.timeoutMs) && h.timeoutMs > 0
+                        ? h.timeoutMs : 4000;
+                    return Promise.race([
+                        Promise.resolve().then(() => h.run(message.params)),
+                        new Promise((_, reject) => setTimeout(
+                            () => reject(new Error('turn-ended handler timed out after ' + timeoutMs + 'ms')),
+                            timeoutMs,
+                        )),
+                    ]);
+                }));
             }
             else
                 throw new Error('Unsupported browser runtime request');
