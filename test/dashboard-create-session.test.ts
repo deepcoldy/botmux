@@ -77,6 +77,7 @@ const findQuarantinedRoutingConflictMock = vi.fn((_key: string, _appId: string):
 const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
   recordTurnExplicitMention: (...a: any[]) => recordTurnExplicitMentionMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),

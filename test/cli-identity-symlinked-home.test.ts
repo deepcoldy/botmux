@@ -36,7 +36,7 @@ import { ensureSessionTempDir } from '../src/core/session-temp.js';
 
 const SESSION = 'sess-symlink-home';
 const HOST = 'code.example.test';
-const POLICY = { enabled: true, tools: ['bytedcli' as const], fallback: 'none' as const, gitHost: HOST };
+const POLICY = { enabled: true, tools: ['bytedcli' as const], gitHost: HOST };
 
 const linux = process.platform === 'linux';
 const canRunBwrap = linux && spawnSync('bwrap', [

@@ -1,3 +1,4 @@
+import type { TurnSpeaker } from './core/turn-speakers.js';
 import type { BackendType, HerdrBackendConfig, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 // The IPC carries the USER-facing MojoConfig. EffectiveMojoConfig exists only
@@ -2160,6 +2161,7 @@ type DaemonToWorkerBase =
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
   | { type: 'codex_app_effort'; requestId: string; effort: string }
+  | { type: 'codex_app_interrupt'; requestId: string; generation: string; turnEpoch: number }
   | { type: 'worker_ipc_probe' }
   | { type: 'protected_mcp_secret_channel_result'; requestId: string; ok: boolean; error?: string }
   | { type: 'traex_model_pool_prune_result'; requestId: string; result: import('./services/traex-model-pool-prune.js').TraexModelPoolPruneResult }
@@ -2433,6 +2435,8 @@ export interface WorkerFinalOutput {
   /** Redacted terminal diagnostic only, without partial model text. May
    * surface as auxiliary failure UI when a loud trigger hides its answer. */
   turnFailureNotice?: string;
+  /** A signed Codex App final whose native terminal was interrupted. */
+  codexAppCancelled?: true;
   /** True when `content` is the worker's "completed but no final text matched"
    *  diagnostic, not a model answer: it must not count as the turn's delivered
    *  final reply. Presentation is unchanged. */
@@ -2486,6 +2490,8 @@ export type WorkerToDaemonBase =
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
+  | { type: 'codex_app_interrupt_target'; target?: { generation: string; turnEpoch: number; replyTurnId: string; dispatchAttempt?: number } }
+  | { type: 'codex_app_interrupt_result'; requestId: string; status: 'delivered' | 'stale_turn' | 'delivery_failed' }
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'runtime_binding_started'; bindingId: string; operationId?: string; continuation?: import('./services/session-contract.js').RuntimeExecutionContinuation }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
@@ -2653,6 +2659,8 @@ export type WorkerToDaemonBase =
     signal: string | null;
     logTail?: string;
     canParkDiagnostic?: boolean;
+    /** Presentation-only evidence that this TraeX generation never reached a prompt. */
+    traexStartupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
@@ -2787,11 +2795,23 @@ export type WorkerToDaemonBase =
         | 'structured_turn_not_collected'
         /** Claude's own permission dialog seen on screen (claudeActionPrompt). The
          *  daemon drops it while the PermissionRequest hook's card is pending. */
-        | 'claude_permission_prompt';
+        | 'claude_permission_prompt'
+        /** The CLI's resume was demoted to a fresh session. The worker reports
+         *  the FACT on every demotion; the daemon decides whether to speak
+         *  (per-session latch + history gate) and composes the copy. A worker
+         *  is reforked on every `/restart`, so it cannot own that latch. */
+        | 'resume_fallback';
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */
-      screenTail?: string }
+      screenTail?: string
+      /** `kind='resume_fallback'`: which tier demoted the launch. */
+      resumeTier?: import('./services/resume-fallback-notice.js').ResumeFallbackTier
+      /** `kind='resume_fallback'`: the worker's demotion reason (log only). */
+      resumeReason?: string
+      /** `kind='resume_fallback'`: false when nothing user-visible was lost
+       *  (claude-family first-turn launch recovery with no transcript ever). */
+      resumeLost?: boolean }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
@@ -2817,7 +2837,7 @@ export type WorkerToDaemonBase =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; linkRefMode?: 'observe' | 'enabled' }
   /** Worker→daemon single-source identity storage decision, sent right after
    *  the worker resolved the actual spawn (or RPC engine): the effective model
    *  plus the spawn facts it was derived from. The daemon publishes identity

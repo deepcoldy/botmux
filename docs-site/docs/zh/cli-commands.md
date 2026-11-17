@@ -336,3 +336,18 @@ botmux create-group --bot reviewer-a --bot reviewer-b --name "PR #123 评审" \
   - 转发时不会带上 Cookie、Authorization 等登录凭据。
 - **哪些能跨副本**：只有飞书卡片里自带凭据的终端链接能跨副本打开。Dashboard 里内嵌的终端、触屏动态链接、需要写权限的接管，都必须直接访问持有会话的副本（例如让负载均衡按会话粘滞），否则会返回 403。
 - 没开 primary 的部署不受以上影响。
+
+## 历史取证：先索引，再详情
+
+```bash
+botmux history --scope chat --view index --limit 50
+botmux history --view index --query "queue" --type text,interactive --since "2026-11-14T00:00:00+08:00"
+botmux quoted om_example_one om_example_two --no-download
+botmux quoted om_example_one --raw
+```
+
+默认 full 输出和单消息 quoted 的 JSON 形状保持兼容。index 不展开卡片/转发，返回最多 240 字符的预览和资源数量；指定消息详情仍保留全文和资源编号。`--no-download` 只跳过附件字节下载，默认 quoted 仍自动下载附件。
+
+筛选仅覆盖 `--limit` 读取的最近消息窗口，不能据此断言全群没有匹配。`--since` 包含边界，`--until` 不包含边界；时间推荐带时区。`retrieval` 报告读取窗口、筛选数量、详情失败和待展开 id。index 中 `queryMatch=deferred` 表示卡片/转发内容未核验，应按 id 读详情；index 与 `--with-card-json` 互斥。
+
+批量 quoted 返回 `messages` 和 `errors`；重复 id 去重，成功消息保持输入顺序，部分失败退出码 1 并保留已成功结果。请求缓存只在单次命令内生效，区分应用和卡片表示形式；下一次命令重新读取。两个命令均支持 `--help`。
