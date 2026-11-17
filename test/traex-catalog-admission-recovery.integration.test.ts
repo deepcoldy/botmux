@@ -133,6 +133,18 @@ describe('idle catalog reconciliation settles the queued input', () => {
     expect(p.scope.pendingMessages).toEqual([]);
   });
 
+  it('never adopts a superseded config that is not a strict directory-confirmed subset', async () => {
+    // A manual pool edit can carry a foreign model and the same length as the
+    // current pool. Only a strictly smaller, catalog-confirmed subset may be
+    // adopted; anything else must fall back with the original pool intact.
+    const p = idlePreflightProbe({ reply: 'sibling', siblingModels: ['core', 'manual-choice'], catalog: coreOnlyCatalog });
+    await p.flush();
+    await vi.waitFor(() => expect(p.scope.cliAdapter.writeInput).toHaveBeenCalledOnce());
+    expect(p.scope.lastInitConfig.traexAutoModel.models).toEqual(['core', 'backup']);
+    expect(p.controller.config.models).toEqual(['core', 'backup']);
+    expect(p.scope.pendingMessages).toEqual([]);
+  });
+
   it('executes catalog_unavailable before writing and forwards the queued attempt', async () => {
     const p = idlePreflightProbe({ reply: 'applied', dispatchAttempt: 2 });
     await p.flush();
