@@ -55,4 +55,16 @@ describe('rewrapSubmissionFailure — WAL transaction preserves the framed-runne
     // A transaction rejected before its write is never promoted to started.
     expect(rewrapSubmissionFailure(unknown, 'held', false).submissionStarted).toBe(false);
   });
+
+  it('preserves a proven TraeX catalog pre-write refusal across the WAL rewrap', () => {
+    const original = Object.assign(new Error('catalog changed before write'), {
+      submissionStarted: false, traexCatalogAdmissionRequired: true,
+    });
+    const rewrapped = rewrapSubmissionFailure(original, 'journal-cancelled', true);
+    expect(rewrapped).toMatchObject({
+      submissionStarted: false,
+      runnerGenerationUnsafe: false,
+      traexCatalogAdmissionRequired: true,
+    });
+  });
 });

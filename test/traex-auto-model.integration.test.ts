@@ -1,4 +1,4 @@
-import { writeFileSync, rmSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { DaemonToWorker } from '../src/types.js';
 import { t } from '../src/i18n/index.js';
@@ -160,7 +160,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     const f = await fixture(true, 'busy');
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 1, 'original submit');
-    rmSync(f.fake);
+    writeFileSync(f.removeCliAfterCatalog, '1');
     await f.wait(() => f.messages.some(message => message.type === 'error'), 'failed Auto launch error');
     expect(rows(f.launches)).toHaveLength(1);
     expect(rows(f.submissions)).toHaveLength(1);
@@ -290,7 +290,9 @@ describe('TraeX auto-model real Worker and PTY', () => {
   it('refuses environment argv before launching an out-of-pool model', async () => {
     const f = await fixture(true, false, false, undefined, false, '--model outside');
     expect(rows(f.launches)).toEqual([]);
-    expect(rows(f.rpcRequests)).toEqual([]);
+    // Catalog admission is read-only; invalid argv must still prevent the
+    // actual terminal launch and every thread/turn RPC.
+    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(['initialize', 'initialized', 'model/list']);
     expect(f.messages.some(message => message.type === 'prompt_ready')).toBe(false);
   });
 
@@ -320,7 +322,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
   it('automatically uses terminal input for legacy Auto even when the daemon sends inherited RPC', async () => {
     const f = await fixture(true, false, false, { global: true });
     expect(f.messages.some(message => message.type === 'user_notify' && message.message.includes('RPC'))).toBe(false);
-    expect(rows(f.rpcRequests)).toHaveLength(0);
+    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(['initialize', 'initialized', 'model/list']);
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_legacy' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 2, 'legacy Auto continuation');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
@@ -463,7 +465,10 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await new Promise(resolveWait => setTimeout(resolveWait, 8_000));
     expect(rows(f.launches)).toHaveLength(2);
     expect(rows(f.submissions).filter(row => row.text.startsWith('original ask'))).toHaveLength(1);
-    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(['initialize', 'initialized', 'model/list']);
+    // Initial catalog + capacity load + replacement catalog; no inference RPC.
+    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(
+      Array.from({ length: 3 }, () => ['initialize', 'initialized', 'model/list']).flat(),
+    );
     writeFileSync(f.release, 'go');
     f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).some(row => row.text === 'next ask'), 'sticky input without repeated skill catalog');
@@ -510,7 +515,8 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await new Promise(resolveWait => setTimeout(resolveWait, 6_000));
     expect(rows(f.launches)).toHaveLength(3);
     expect(new Set(rows(f.rpcRequests).map(row => row.method))).toEqual(new Set(['initialize', 'initialized', 'model/list']));
-    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(3);
+    // Three launch catalogs and one load check for each queued candidate.
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(6);
     writeFileSync(f.release, 'go');
     await f.wait(() => rows(f.submissions).some(row => row.text.startsWith('next ask')), 'next turn on retained model');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);

@@ -6,6 +6,7 @@ import { controllerForSession } from '../../src/core/session-controller.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
+import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
@@ -19,6 +20,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'sameExecution') return sameExecution;
   if (key === 'hasConfirmedNativeGrokEffort') return hasConfirmedNativeGrokEffort;
   if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
+  if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
   if (key === 'config') return { terminalEffortWriteback: false };
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
