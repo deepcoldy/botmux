@@ -71,7 +71,7 @@ import { join, basename, dirname, delimiter, relative, extname } from 'node:path
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
-import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { tokenStoreProtection, capabilityOn, larkUserNative } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -270,8 +270,11 @@ import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, sh
 import { RETIRED_RUNTIME_EXIT_GRACE_MS, WORKER_EXIT_RUNTIME_RETIRED } from './core/retired-runtime-exit.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
+import { planChildSpawnEnv } from './core/child-spawn-env.js';
+import { DSH_TUI_RESUME_ENV_KEYS, dshTuiResumeScope } from './core/dsh-tui-env.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { writeSessionEnvStamp } from './services/session-env-stamp.js';
+import { resumeFallbackNotice } from './services/resume-fallback-notice.js';
 import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
@@ -517,7 +520,7 @@ import {
   clamp,
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
-import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandReal } from './adapters/cli/registry.js';
+import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandReal, resolveEffectiveCliId } from './adapters/cli/registry.js';
 import { parsePiInstallUpdatedNotice, readPiInstallVersion } from './adapters/cli/pi.js';
 import { cursorStopLeftParkedFollowUp } from './adapters/cli/cursor.js';
 import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
@@ -903,6 +906,7 @@ import {
   encodeCodexAppControlAck,
   encodeCodexAppControlAccepted,
   encodeCodexAppControlChallenge,
+  encodeCodexAppControlInterrupt,
   ensureCodexAppControlDirectory,
   generateCodexAppControlEpoch,
   generateCodexAppControlChallenge,
@@ -1716,7 +1720,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
         : undefined);
     if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
-      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, userNative: larkUserNative(cfg.triggerUserAuth) });
     for (const key of protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy)) delete engineEnv[key];
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
@@ -2554,10 +2558,6 @@ let consecutiveInWorkerRestarts = 0;
 /** The last CLI exit was the tmux server being lost, not the CLI (see restart-fresh-budget.ts). */
 let lastCliExitServerReplaced = false;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
-/** Guard: user_notify for "resume → fresh fallback" is sent once per worker
- *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
- *  of the same warning. */
-let resumeFallbackNotified = false;
 /** Guard: the scratch "submounts over the overlay limit" notice is sent once
  *  per worker, not on every CLI respawn. */
 let scratchSubmountOverflowNotified = false;
@@ -7011,7 +7011,7 @@ function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const policyCapability = sandboxPolicyCapability ?? randomBytes(32).toString('hex');
-  const activeIdentity = activeTurnAuthority.identity();
+  const activeIdentity = { ...activeTurnAuthority.identity(), speakers: activeTurnAuthority.speakers() };
   const authorityTurnId = activeIdentity.turnId ?? currentBotmuxTurnId;
   const authorityDispatchAttempt = activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt;
   const authorityLinkRefMode = currentBotmuxLinkRefMode;
@@ -7102,7 +7102,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     const execution = capability.turnId
       ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
       : undefined;
-    publishedOriginContractScope = binding && execution
+    publishedOriginContractScope = binding?.runtime && execution
       ? { bindingId: binding.bindingId, executionId: execution.executionId }
       : undefined;
     const explicitOrigin = binding?.runtime
@@ -7118,6 +7118,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(activeIdentity.turnId ? {
         trustedCaller: activeIdentity.caller ?? null,
         identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
+        ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
       } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
@@ -7817,6 +7818,14 @@ let codexAppPosixOwnerLease: CodexAppPosixOwnerLease | undefined;
 let codexAppPosixOwnerLeaseSessionId: string | undefined;
 let codexAppPosixOwnerLeasePromise: Promise<void> | undefined;
 let codexAppControlActiveSocket: Socket | undefined;
+let codexAppInterruptTarget: Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }>['target'];
+const codexAppInterruptRequests = new Map<string, { socket: Socket; timer: NodeJS.Timeout }>();
+
+function clearCodexAppInterruptTarget(): void {
+  if (!codexAppInterruptTarget) return;
+  codexAppInterruptTarget = undefined;
+  send({ type: 'codex_app_interrupt_target' });
+}
 let codexAppFreshCandidateGeneration: string | undefined;
 let codexAppUnprovenPromptDeferred = false;
 let codexAppRejectedControlLogged = false;
@@ -7892,6 +7901,9 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  clearCodexAppInterruptTarget();
+  for (const request of codexAppInterruptRequests.values()) clearTimeout(request.timer);
+  codexAppInterruptRequests.clear();
   codexAppRunnerProcessIdentity = undefined;
   clearCodexAppEngineIdentity();
   // Attribution belongs to exactly one worker/control generation.  A fresh or
@@ -8079,6 +8091,7 @@ function activateCodexAppControlConnection(
   clearTimeout(connection.authTimer);
   const previous = codexAppControlActiveSocket;
   codexAppControlActiveSocket = connection.socket;
+  clearCodexAppInterruptTarget();
   if (previous && previous !== connection.socket) previous.destroy();
   if (proofKind === 'warm reattach') restoreCodexAppContractNativeSession();
   cleanupCodexAppControlBootstrap();
@@ -8087,6 +8100,7 @@ function activateCodexAppControlConnection(
     identity.generation,
     connection.challenge,
     connection.epoch,
+    true,
   )}\n`);
   log(`Authenticated Codex App ${proofKind} by Ed25519 challenge proof (generation=${identity.generation.slice(0, 8)})`);
   send({
@@ -8353,6 +8367,13 @@ function acceptCodexAppControlSocket(
     const wasActive = codexAppControlActiveSocket === socket;
     if (wasActive) {
       codexAppControlActiveSocket = undefined;
+      clearCodexAppInterruptTarget();
+      for (const [requestId, request] of codexAppInterruptRequests) {
+        if (request.socket !== socket) continue;
+        clearTimeout(request.timer);
+        codexAppInterruptRequests.delete(requestId);
+        send({ type: 'codex_app_interrupt_result', requestId, status: 'delivery_failed' });
+      }
       clearCodexAppEngineIdentity();
       codexAppControlProven = false;
       codexAppSignedStateObserved = false;
@@ -18909,6 +18930,44 @@ async function handleTrustedCodexAppMarker(
   payload: Record<string, unknown>,
   control?: { generation: string; seq: number; socket?: Socket; channelId?: number; epoch?: string },
 ): Promise<boolean> {
+  if (kind === 'interrupt_target' && control && isCodexAppCliId(lastInitConfig?.cliId)) {
+    const reservation = typeof payload.replyTurnId === 'string'
+      ? codexAppTurnDispatchQueue.findByTurnId(payload.replyTurnId) : undefined;
+    if (!reservation || typeof payload.turnEpoch !== 'number' || !Number.isSafeInteger(payload.turnEpoch) || payload.turnEpoch <= 0) {
+      clearCodexAppInterruptTarget();
+      return true;
+    }
+    codexAppInterruptTarget = {
+      generation: control.generation,
+      turnEpoch: payload.turnEpoch,
+      replyTurnId: reservation.turnId,
+      dispatchAttempt: reservation.dispatchAttempt,
+    };
+    send({ type: 'codex_app_interrupt_target', target: codexAppInterruptTarget });
+    return true;
+  }
+  if (kind === 'interrupt_result' && control?.socket && isCodexAppCliId(lastInitConfig?.cliId)) {
+    const { requestId, status } = payload;
+    if (typeof requestId !== 'string'
+        || (status !== 'delivered' && status !== 'stale_turn' && status !== 'delivery_failed')) return false;
+    const request = codexAppInterruptRequests.get(requestId);
+    if (request && request.socket === control.socket) {
+      clearTimeout(request.timer);
+      codexAppInterruptRequests.delete(requestId);
+      send({ type: 'codex_app_interrupt_result', requestId, status });
+    }
+    return true;
+  }
+  if (kind === 'runtime' && lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) {
+    if (typeof payload.threadId !== 'string' || payload.threadId !== lastInitConfig.cliSessionId
+      || (payload.model !== undefined && (typeof payload.model !== 'string' || payload.model.length > 256))
+      || (payload.reasoningEffort !== undefined && (typeof payload.reasoningEffort !== 'string' || payload.reasoningEffort.length > 32))) return false;
+    publishActiveRuntime({
+      ...(typeof payload.model === 'string' ? { model: payload.model } : {}),
+      ...(typeof payload.reasoningEffort === 'string' ? { reasoningEffort: payload.reasoningEffort } : {}),
+    });
+    return true;
+  }
   if (kind === 'effort_result' && isCodexAppCliId(lastInitConfig?.cliId)) {
     if (typeof payload.requestId !== 'string'
       || !['applied', 'future_only', 'invalid', 'unavailable', 'error'].includes(String(payload.status))
@@ -19437,7 +19496,8 @@ async function handleTrustedCodexAppMarker(
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(linkRefMode ? { linkRefMode } : {}),
-        ...((suppressDelivery || isSuperseded) ? { suppressDelivery: true } : {}),
+        ...((suppressDelivery || isSuperseded || outcome.status === 'cancelled') ? { suppressDelivery: true } : {}),
+        ...(outcome.status === 'cancelled' ? { codexAppCancelled: true as const } : {}),
         ...(isSuperseded ? { disposition: 'steer_superseded' as const } : {}),
         ...(outcome.status === 'failed' ? {
           turnFailed: true,
@@ -19508,6 +19568,7 @@ async function handleTrustedCodexAppMarker(
           ...(linkRefMode ? { linkRefMode } : {}),
           suppressDelivery: true,
           disposition: 'steer_superseded' as const,
+          ...(outcome.status === 'cancelled' ? { codexAppCancelled: true as const } : {}),
         });
       } else if (!finalContent) {
         log(`${cliName()} empty final settled for botmux turn ${turnId.substring(0, 12)}`);
@@ -25089,9 +25150,7 @@ async function spawnCliBody(
     readIsolation: cfg.readIsolation,
   }, "worker session " + cfg.sessionId);
 
-  const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
-    ? 'dsh-tui'
-    : cfg.cliId as CliId;
+  const effectiveCliId: CliId = resolveEffectiveCliId(cfg.cliId, cfg.dshRuntime);
   // A CLI reinstalling itself (Claude Code's auto-update) is absent for a
   // moment. Wait that out before anything resolves or caches its path —
   // resolvedBin, launcher args, the macOS policy digest — with the adapter
@@ -25595,7 +25654,7 @@ async function spawnCliBody(
         delete env.BOTMUX_LARK_TOOL_BINDING;
         if (cfg.larkToolBinding !== false) {
           prepareLarkToolEnv({ env, dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
-            sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+            sessionId, appId: cfg.larkAppId, brand: cfg.brand, userNative: larkUserNative(cfg.triggerUserAuth) });
         }
         const pinned = resolveChildBotsConfig(cfg.loadedBotsConfigPath, cfg.loadedBotsConfigProvenance);
         if (pinned) env.BOTS_CONFIG = pinned;
@@ -26933,28 +26992,39 @@ async function spawnCliBody(
       (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
         claudeJsonlPathForSession(effectiveAdapterSessionId, cfg.workingDir, claudeDataDir);
     }
-    // Single human-visible warning. Spam guard: at most once per worker
-    // lifecycle (a 4× crash loop otherwise duplicates the notice).
+    // Report the FACT of the demotion to the daemon; it owns delivery.
+    //   - `/restart` forks a new worker, so any worker-level "already
+    //     notified" latch would re-post the notice on every restart. The
+    //     daemon dedupes per session and only speaks when the session really
+    //     had history.
+    //   - Tier 0 (no native id) is not a launch failure: it gets neutral copy.
+    //     Tier 1/2 keep the "startup failed" wording.
     // claude-family only: when the transcript bridge never saw the session's
     // JSONL file, the "history" that would not carry over never existed — the
     // fallback is recovering a first-turn launch failure, and the pending
-    // first prompt is re-queued, not lost. Notifying the user about context
-    // they never had is a false alarm. Other CLIs (no JSONL bridge) keep the
-    // legacy always-notify behavior.
-    const suppressFallbackNotice =
-      (tier1ProbeFalse || tier2ForceFresh) && claudeDataDir !== undefined && !cliTranscriptEverExisted;
-    if (suppressFallbackNotice) {
-      log(`Resume fallback notice suppressed: no CLI transcript ever existed for this session (first-turn launch recovery); nothing user-visible was lost`);
-    } else if (!resumeFallbackNotified) {
-      resumeFallbackNotified = true;
-      send({
-        type: 'user_notify',
-        turnId: currentBotmuxTurnId,
-        message:
-          `⚠️ 会话启动失败，正在尝试以新会话重新启动。\n` +
-          `这次重试不会恢复历史上下文；如需继续之前的任务，请补充背景。`,
-      });
+    // first prompt is re-queued, not lost. That is reported as `lost: false`
+    // instead of being swallowed, so the fact stays auditable while the user
+    // is not told they lost context they never had. Other CLIs (no JSONL
+    // bridge) always report `lost: true`.
+    const resumeFallbackLost =
+      !((tier1ProbeFalse || tier2ForceFresh) && claudeDataDir !== undefined && !cliTranscriptEverExisted);
+    const resumeFallbackTier = tier2ForceFresh
+      ? 'restart-loop'
+      : missingExactResumeId
+        ? 'no-exact-id'
+        : 'probe-missing';
+    if (!resumeFallbackLost) {
+      log('Resume fallback reported with lost=false: no CLI transcript ever existed for this session (first-turn launch recovery)');
     }
+    send({
+      type: 'user_notify',
+      kind: 'resume_fallback',
+      turnId: currentBotmuxTurnId,
+      resumeTier: resumeFallbackTier,
+      resumeReason: reason,
+      resumeLost: resumeFallbackLost,
+      message: resumeFallbackNotice(resumeFallbackTier),
+    });
     // Reset the counter so the fresh spawn gets a clean 2-attempt budget in
     // case IT crashes later for an unrelated reason.
     consecutiveInWorkerRestarts = 0;
@@ -27261,7 +27331,7 @@ async function spawnCliBody(
     // governed — that is the exact condition under which installGitAskpass
     // writes the file, and pointing GIT_ASKPASS at a missing path would break
     // git prompts rather than fall back.
-    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('bytedcli')) {
+    if (capabilityOn(cfg.triggerUserAuth, 'bytecloud')) {
       identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
     }
   }
@@ -27534,7 +27604,7 @@ async function spawnCliBody(
       : undefined,
     { canonicalPaths: sandboxRequested });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
-    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested });
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested, userNative: larkUserNative(cfg.triggerUserAuth) });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the
     // allowlist sandbox the agent runs as the same OS user as botmux and can
@@ -29589,35 +29659,6 @@ async function spawnCliBody(
     return false;
   };
 
-  // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
-  // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。基础 CLI
-  // bin/args 取 sandbox 包装前的快照，最终形态（含/不含 wrapperCli）由
-  // selectReproduceLaunch 决策——绝不含 sandbox-exec/bwrap 外层。riff 返回 null。
-  try {
-    const reproduceLaunch = selectReproduceLaunch({
-      baseBin: reproduceBaseBin,
-      baseArgs: reproduceBaseArgs,
-      wrapperCli: cfg.wrapperCli,
-      cliLaunchMode: cfg.cliLaunchMode,
-      sandboxOn: sandboxRequested,
-      wrapperInsideSandbox: !!sandboxWrapperLaunch,
-      binResolver: (b) => locateOnPath(b) ?? b,
-      ttadkModel: cfg.model,
-    });
-    capturedSpawnCommand = cfg.envPolicy?.mode === 'strict' ? null : buildReproduceCommand({
-      backendType: effectiveBackendType,
-      bin: reproduceLaunch.bin,
-      args: reproduceLaunch.args,
-      cwd: spawnCwd,
-      env: childEnv,
-      injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
-      gitConfigPairs,
-    });
-  } catch (err: any) {
-    capturedSpawnCommand = null;
-    log(`Failed to capture reproduce command: ${err?.message ?? err}`);
-  }
-
   // Create the asymmetric candidate as late as possible. Persistent backends
   // receive it even on a predicted reattach: an actual reuse ignores the
   // launch env and proves the old key, while an actual fresh start consumes
@@ -29707,6 +29748,71 @@ async function spawnCliBody(
       delete childEnv[key];
       delete perBotInjectEnv[key];
     }
+    // The exact three values handed to backend.spawn(). A FRESH dsh-tui launch
+    // must not inherit the launcher's DSH_TUI_RESUME_* markers (daemon env, this
+    // bot's env, or a persistent backend's shared server env would silently
+    // resume another conversation), and the pane-side removals must reach the
+    // shell after its rcfile. `willReattachPersistent` is part of the scope
+    // because the backends may downgrade a predicted reattach to a REAL spawn
+    // after effectiveResume was already computed (zellij frozen reattach).
+    const spawnEnvPlan = planChildSpawnEnv({
+      baseEnv: childEnv,
+      botEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+      envUnset: cfg.envUnset,
+      scope: dshTuiResumeScope({
+        resume: effectiveResume,
+        cliId: cliAdapter.id,
+        willReattachPersistent,
+      }),
+    });
+    if (cliAdapter.id === 'dsh-tui') {
+      // Value-free audit line: the fresh demotion itself is silent (no CLI
+      // error to inspect), so the resolved intent plus exactly what this spawn
+      // did with the launcher markers must be greppable after the fact.
+      const present = (env: Record<string, string | undefined> | undefined) =>
+        DSH_TUI_RESUME_ENV_KEYS.filter(key => env?.[key] !== undefined).join(',') || '-';
+      const scrubbed = (spawnEnvPlan.unsetEnv ?? [])
+        .filter(key => (DSH_TUI_RESUME_ENV_KEYS as readonly string[]).includes(key));
+      log(
+        `dsh-tui spawn env: resume=${effectiveResume} fresh=${!effectiveResume} `
+        + `willReattachPersistent=${willReattachPersistent} `
+        + `markersInEnv=${present(spawnEnvPlan.childEnv)} `
+        + `markersInInject=${present(spawnEnvPlan.injectEnv)} `
+        + `unsetEnv=${scrubbed.join(',') || '-'}`,
+      );
+    }
+    // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
+    // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。基础 CLI
+    // bin/args 取 sandbox 包装前的快照，最终形态（含/不含 wrapperCli）由
+    // selectReproduceLaunch 决策——绝不含 sandbox-exec/bwrap 外层。riff 返回 null。
+    // 组装用 spawnEnvPlan 的产物（不是 planner 前的 childEnv/perBotInjectEnv），
+    // 并把 unsetEnv 表达成命令里的 `env -u KEY`：否则 demoted/fresh 会话复制出来的
+    // 命令会带上 stale resume marker，和真实子进程不一致。
+    try {
+      const reproduceLaunch = selectReproduceLaunch({
+        baseBin: reproduceBaseBin,
+        baseArgs: reproduceBaseArgs,
+        wrapperCli: cfg.wrapperCli,
+        cliLaunchMode: cfg.cliLaunchMode,
+        sandboxOn: sandboxRequested,
+        wrapperInsideSandbox: !!sandboxWrapperLaunch,
+        binResolver: (b) => locateOnPath(b) ?? b,
+        ttadkModel: cfg.model,
+      });
+      capturedSpawnCommand = cfg.envPolicy?.mode === 'strict' ? null : buildReproduceCommand({
+        backendType: effectiveBackendType,
+        bin: reproduceLaunch.bin,
+        args: reproduceLaunch.args,
+        cwd: spawnCwd,
+        env: spawnEnvPlan.childEnv,
+        injectEnv: spawnEnvPlan.injectEnv,
+        unsetEnv: spawnEnvPlan.unsetEnv,
+        gitConfigPairs,
+      });
+    } catch (err: any) {
+      capturedSpawnCommand = null;
+      log(`Failed to capture reproduce command: ${err?.message ?? err}`);
+    }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
     spawnWithCodexModelLaunch({
@@ -29722,14 +29828,15 @@ async function spawnCliBody(
           cwd: spawnCwd,
           cols: PTY_COLS,
           rows: PTY_ROWS,
-          env: childEnv as Record<string, string>,
-          injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+          env: spawnEnvPlan.childEnv as Record<string, string>,
+          injectEnv: spawnEnvPlan.injectEnv,
           gitConfigPairs,
           // Already removed from childEnv; shell-wrapped backends also `env -u`
           // them after the pane's rcfile / terminal-server env (session env
           // overlay). This includes both session-overlay removals and
-          // configured protected-MCP credential keys.
-          unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
+          // configured protected-MCP credential keys, plus the dsh-tui resume
+          // markers this spawn must not inherit (child-spawn-env.ts).
+          unsetEnv: spawnEnvPlan.unsetEnv,
           protectedUnsetEnv: protectedMcpEnvKeys,
           launchShell: lastInitConfig?.launchShell,
           // tmux reads the pane's launch argv from a private file here instead of
@@ -31059,7 +31166,9 @@ async function spawnCliBody(
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
-      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
+      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
+        ...(lastInitConfig?.cliId === 'traex' ? { traexStartupFailure: freshCliNeverReady() } : {}),
+        ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }
   }));
 
@@ -35306,6 +35415,15 @@ function markReplyInputConsumed(turnId: string | undefined): void {
   writeCliPidMarker();
 }
 
+/** Establish the boot identity synchronously, before the first input receipt.
+ * Backend startup may await later; a receipt only proves worker ownership. */
+function initializeWorkerSessionContract(msg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  sessionId = msg.sessionId;
+  workerSessionEventScope = msg.sessionContract ? new WorkerSessionEventScope(msg.sessionContract.session, msg.sessionContract.worker) : undefined;
+  for (const state of msg.sessionContract?.executions ?? []) workerSessionEventScope?.noteAdmission(state);
+  if (msg.sessionCommand?.execution) workerSessionEventScope?.rememberExecution(msg.sessionCommand.execution);
+}
+
 /** Native acceptance proof for shared group background coverage. Emitted only
  * from boundaries where the CLI itself evidenced this exact input: Codex's
  * exact owned history line, a Codex RPC turn/start acknowledgement, or a
@@ -35764,6 +35882,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (msg.workflowNodeSession === true) process.env[WORKFLOW_NODE_SESSION_ENV] = '1';
       else delete process.env[WORKFLOW_NODE_SESSION_ENV];
       captureTurnFailureDiagnostics = msg.captureTurnFailureDiagnostics === true;
+      initializeWorkerSessionContract(msg);
       if (ordinaryImTurnId) {
         const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
         // Receipt is the daemon ↔ worker transport boundary. Publish it before
@@ -35800,10 +35919,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
-      sessionId = msg.sessionId;
-      workerSessionEventScope = msg.sessionContract ? new WorkerSessionEventScope(msg.sessionContract.session, msg.sessionContract.worker) : undefined;
       seedInitTurnTerminals(msg);
-      if (msg.sessionCommand?.execution) workerSessionEventScope?.rememberExecution(msg.sessionCommand.execution);
       initializeFinalOutputHandoff(msg);
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
       // Dashboard grants stay per-boot, while the Lark-card capability is
@@ -36343,7 +36459,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           ? (msg.observedExecutions ?? []).find(entry =>
             entry.execution.turnId === currentBotmuxTurnId && entry.execution.dispatchAttempt === currentBotmuxDispatchAttempt)
           : undefined;
-        const resumedExecution = directExecution ?? observedEntry?.execution;
+        const unboundExecution = !directExecution && !observedEntry
+          ? scope.executionForTurn(currentBotmuxTurnId, currentBotmuxDispatchAttempt)
+          : undefined;
+        const unboundState = unboundExecution
+          ? (msg.admissionStates ?? []).find(state => state.ref.executionId === unboundExecution.executionId)
+          : undefined;
+        const resumedExecution = directExecution ?? observedEntry?.execution
+          ?? (unboundState && !unboundState.runtime ? unboundExecution : undefined);
         const resumedState = resumedExecution
           ? (msg.admissionStates ?? []).find(state => state.ref.executionId === resumedExecution.executionId)
           : undefined;
@@ -36729,6 +36852,36 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       } catch {
         send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'error' });
       }
+      break;
+    }
+
+    case 'codex_app_interrupt': {
+      const socket = codexAppControlActiveSocket;
+      const connection = socket && codexAppControlConnections.get(socket);
+      const target = codexAppInterruptTarget;
+      if (!socket || socket.destroyed || !connection?.authenticated || !codexAppControlProven
+          || codexAppControlFatal || codexAppControlStopping || cliRestartInProgress || closeRequested
+          || !lastInitConfig || !isCodexAppCliId(lastInitConfig.cliId) || lastInitConfig.adoptMode
+          || connection.identity?.generation !== msg.generation
+          || !target || target.generation !== msg.generation || target.turnEpoch !== msg.turnEpoch) {
+        send({ type: 'codex_app_interrupt_result', requestId: msg.requestId, status: 'stale_turn' });
+        break;
+      }
+      const fail = () => {
+        clearTimeout(timer);
+        if (codexAppInterruptRequests.delete(msg.requestId)) {
+          send({ type: 'codex_app_interrupt_result', requestId: msg.requestId, status: 'delivery_failed' });
+        }
+      };
+      const timer = setTimeout(fail, 9_000);
+      timer.unref();
+      codexAppInterruptRequests.set(msg.requestId, { socket, timer });
+      socket.write(`${encodeCodexAppControlInterrupt({
+        sessionId: lastInitConfig.sessionId, generation: msg.generation, challenge: connection.challenge,
+        requestId: msg.requestId, turnEpoch: msg.turnEpoch,
+      })}\n`, error => {
+        if (error) fail();
+      });
       break;
     }
 
@@ -37907,6 +38060,7 @@ process.on('message', (raw: unknown, handle: unknown) => {
       const target = msg.sessionCommand?.runtime ? workerSessionEventScope.bindingForRuntime(msg.sessionCommand.runtime) : binding;
       const reject = () => {
         if (msg.type === 'interrupt_turn') send({ type: 'turn_interrupt_result', requestId: msg.requestId, turnId: msg.turnId, delivered: false, reason: 'stale_turn' });
+        if (msg.type === 'codex_app_interrupt') send({ type: 'codex_app_interrupt_result', requestId: msg.requestId, status: 'stale_turn' });
         if (msg.type === 'restart' && msg.attemptId) send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed', untouched: true });
       };
       if (target) workerSessionEventScope.run(target, reject, msg.sessionCommand?.execution, msg.sessionCommand?.operationId);

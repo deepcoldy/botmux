@@ -412,6 +412,21 @@ export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: 
 
 export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter, createZcodeAdapter, createDoubaoAdapter };
 
+/** The CLI id a session actually runs with.
+ *
+ * A bot keeps `cliId='dsh'` and selects the PTY-driven TUI through its
+ * `dshRuntime` toggle, so the worker (and every display/copy surface that asks
+ * "will a resume restore history?") must map that pair to the `dsh-tui`
+ * adapter. Keeping the mapping here — rather than re-deriving it per caller —
+ * is what stops the worker from resuming through one adapter while the closed
+ * card / resume receipt describe another. */
+export function resolveEffectiveCliId(
+  cliId: string,
+  dshRuntime?: 'official' | 'tui',
+): CliId {
+  return (cliId === 'dsh' && dshRuntime === 'tui' ? 'dsh-tui' : cliId) as CliId;
+}
+
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): CliAdapter {
   switch (id.toLowerCase() as CliId) {

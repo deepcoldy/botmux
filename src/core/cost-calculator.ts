@@ -32,6 +32,7 @@ import { cursorConfigDirForBot } from '../services/cursor-paths.js';
 import { getBot } from '../bot-registry.js';
 import { botOneShotEnv } from './session-env-resolve.js';
 import { config } from '../config.js';
+import type { ModelTokenUsage } from '../services/model-token-usage.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,8 @@ export interface SessionCost {
 export interface SessionTokenUsage extends SessionCost, SessionTokenUsageSnapshot {
   in: number;
   out: number;
+  /** Cumulative native execution-model attribution (when the CLI exposes it). */
+  models?: ModelTokenUsage[];
 }
 
 /** Latest Context Usage reported by the Agent CLI. A missing window means the

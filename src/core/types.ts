@@ -1,3 +1,4 @@
+import type { TurnSpeaker } from './turn-speakers.js';
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
@@ -7,6 +8,7 @@ import type {
   CotEntry,
   Session,
   DaemonToWorker,
+  WorkerToDaemon,
   LarkAttachment,
   LarkMention,
   ModelFallbackState,
@@ -206,6 +208,17 @@ export interface DaemonSession {
   /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
   lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
+  /**
+   * This session already received its ONE "resume fell back to a fresh
+   * session" notice.
+   *
+   * Daemon-side on purpose: `/restart` forks a new worker, so a worker-level
+   * latch would re-post the notice on every restart. The worker reports the
+   * demotion fact each time (and the daemon logs every report); only the
+   * user-visible notice is spent once. In-memory only — a daemon restart is a
+   * new conversation surface as far as this once-per-session courtesy goes.
+   */
+  resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   /**
@@ -641,6 +654,7 @@ export interface DaemonSession {
   messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
+  codexAppInterruptTarget?: Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }>['target'];
   /**
    * Authenticated human principal that owns the currently executing interactive
    * turn. Set only after a worker accepts the turn and cleared by its exact
@@ -664,6 +678,11 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact-turn controller identity exposed only to tool credential publication
+   * and `botmux actor current` for a bounded schedule child. Unlike
+   * scheduledTurnCallers, this does not authorize workflow or schedule
+   * mutations and is never persisted. */
+  scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
@@ -945,6 +964,9 @@ export interface DaemonSession {
     identityTurnId?: string;
     dispatchAttempt?: number;
     trustedCaller?: TrustedCaller | null;
+    /** Humans whose messages are in the running turn, in order of their latest
+     * message (the last one spoke last). Worker-reported, never CLI-supplied. */
+    speakers?: TurnSpeaker[];
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
