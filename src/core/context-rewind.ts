@@ -12,7 +12,7 @@
  * （groupContextEpoch），换新 id 会让整段群历史——包括想丢掉的那条——重新注入。
  */
 
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import {
   extractTurnStartText,
   isMeaningfulQueuedCommand,
@@ -209,7 +209,18 @@ export interface LastTurnInspection {
   /** A user/assistant record precedes the turn, so the cut file still
    *  resumes (see {@link RewindCheckpoint.resumable}). */
   resumable?: boolean;
+  /** The file this was read from: a cut planned on it must land on it. */
+  file?: FileIdentity;
 }
+
+/** A file pinned by device and inode: a pathname under an agent-writable
+ *  directory can be swapped between two steps, an inode cannot. */
+export interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+const sameFile = (a: FileIdentity, b: FileIdentity): boolean => a.dev === b.dev && a.ino === b.ino;
 
 /** Upper bound on bytes read back from the end of the transcript. A failed
  *  turn is a few records; anything longer did work and is not a candidate. */
@@ -287,9 +298,13 @@ function isTopLevelConversationLine(line: Buffer): boolean {
  * bookkeeping makes the outcome `progress` or `other`, never `error_only`.
  */
 export function inspectLastClaudeTurn(path: string, limit = LAST_TURN_SCAN_LIMIT_BYTES): LastTurnInspection {
-  const fd = openSync(path, 'r');
+  // What is read here can reach the CLI (the cut turn's write-edge blocks):
+  // never through a link, and never block on a FIFO planted at the path.
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
   try {
-    const size = fstatSync(fd).size;
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`refusing to inspect non-regular file ${path}`);
+    const size = st.size;
     if (size === 0) return { outcome: 'no_turn' };
     const last = Buffer.alloc(1);
     readSync(fd, last, 0, 1, size - 1);
@@ -373,6 +388,7 @@ export function inspectLastClaudeTurn(path: string, limit = LAST_TURN_SCAN_LIMIT
       ...(typeof start.ev.uuid === 'string' ? { uuid: start.ev.uuid } : {}),
       text: extractTurnStartText(start.ev),
       resumable,
+      file: { dev: st.dev, ino: st.ino },
     };
   } finally {
     closeSync(fd);
@@ -382,6 +398,13 @@ export function inspectLastClaudeTurn(path: string, limit = LAST_TURN_SCAN_LIMIT
 export interface RewindResult {
   backupPath: string;
   removedBytes: number;
+  /** The transcript that was cut: the only file
+   *  {@link restoreRewoundTranscript} writes the bytes back to. */
+  transcript: FileIdentity;
+  /** `backup: 'removed'` only: the bytes cut, as read from the pinned
+   *  descriptor. A restore puts back these — never what is in the backup file
+   *  by then, which sits in a directory the sandboxed CLI can write. */
+  removed?: Buffer;
 }
 
 /**
@@ -424,6 +447,9 @@ export function rewindClaudeTranscript(
      *  transcript of hundreds of MB each time is not affordable, and the part
      *  that stays needs no backup. Default `full` (the /rewind command). */
     backup?: 'full' | 'removed';
+    /** The file the cut was planned on ({@link LastTurnInspection.file}): a
+     *  different inode at the path now is refused. */
+    expectFile?: FileIdentity;
   } = {},
 ): RewindResult {
   const pre = lstatSync(path);
@@ -433,6 +459,7 @@ export function rewindClaudeTranscript(
   try {
     // Pin the descriptor to the inode lstat inspected (regular-file swap TOCTOU).
     assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
+    if (opts.expectFile) assertSameInode(opts.expectFile, fstatSync(fd), path);
     return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
     closeSync(fd);
@@ -445,7 +472,7 @@ export function rewindClaudeTranscript(
  *  between validation and use, and a path-based copy would then read whatever
  *  the link points at (host data the daemon can read but the sandbox cannot)
  *  into the agent-readable backup. */
-function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number, from = 0): void {
+function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number, from = 0, keep = false): Buffer | undefined {
   const dstFd = openSync(
     backupPath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -457,6 +484,7 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
     }
     const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
     const total = size - from;
+    const kept: Buffer[] = [];
     let copied = 0;
     while (copied < total) {
       // Positional reads against the pinned descriptor — the pathname is
@@ -469,6 +497,7 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
         if (w <= 0) throw new Error('short write while creating rewind backup');
         written += w;
       }
+      if (keep) kept.push(Buffer.from(buf.subarray(0, n)));
       copied += n;
     }
     if (copied !== total) throw new Error(`rewind backup size mismatch (${copied}/${total} bytes)`);
@@ -480,6 +509,7 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
     if (fstatSync(dstFd).size !== total) {
       throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${total} bytes)`);
     }
+    return keep ? Buffer.concat(kept, total) : undefined;
   } catch (err) {
     try { unlinkSync(backupPath); } catch { /* may not have been created */ }
     throw err;
@@ -508,9 +538,14 @@ function rewindOpenTranscript(
   const removedOnly = opts.backup === 'removed';
   const backupPath = `${path}.rewind-${stamp}${removedOnly ? '.removed' : ''}.bak`;
   opts.beforeBackup?.();
-  copyBackupFromDescriptor(fd, backupPath, st.size, removedOnly ? offset : 0);
+  const removed = copyBackupFromDescriptor(fd, backupPath, st.size, removedOnly ? offset : 0, removedOnly);
   ftruncateSync(fd, offset);
-  return { backupPath, removedBytes: st.size - offset };
+  return {
+    backupPath,
+    removedBytes: st.size - offset,
+    transcript: { dev: st.dev, ino: st.ino },
+    ...(removed ? { removed } : {}),
+  };
 }
 
 /** Most bytes of records a CLI may append after a cut and still allow it to be
@@ -558,7 +593,8 @@ function mayFollowRestoredTurn(line: string): boolean {
 }
 
 /**
- * Undo a cut made with `backup: 'removed'`: put the removed bytes back. What
+ * Undo a cut made with `backup: 'removed'`: put the removed bytes back — the
+ * ones the cut read (`RewindResult.removed`), not the backup file's. What
  * the CLI appended since may only be metadata outside the conversation and
  * local slash commands (see {@link mayFollowRestoredTurn}). The removed bytes
  * are appended after them, never written back in place: the turn's first
@@ -572,27 +608,35 @@ function mayFollowRestoredTurn(line: string): boolean {
  * moved on and nothing is changed. Same descriptor discipline as the cut
  * itself. Returns whether the transcript holds the cut turn again.
  */
-export function restoreRewoundTranscript(path: string, offset: number, backupPath: string): boolean {
+export function restoreRewoundTranscript(
+  path: string,
+  cut: { offset: number; transcript: FileIdentity; removed: Buffer },
+): boolean {
+  // The transcript sits in a directory the sandboxed CLI can write: opened
+  // without following a link, it must be the very inode the cut cut — never
+  // a file planted at the path since. The bytes come from the cut itself; a
+  // cut always removes some (it starts at a turn).
+  if (cut.removed.length === 0) return false;
   const pre = lstatSync(path);
   if (!pre.isFile()) return false;
   const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
   try {
-    assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
-    const size = fstatSync(fd).size;
-    if (size < offset || size - offset > RESTORE_TAIL_LIMIT_BYTES) return false;
-    const tail = Buffer.alloc(size - offset);
-    if (tail.length > 0 && readSync(fd, tail, 0, tail.length, offset) !== tail.length) return false;
+    const st = fstatSync(fd);
+    if (!st.isFile() || !sameFile(pre, st) || !sameFile(cut.transcript, st)) return false;
+    const size = st.size;
+    if (size < cut.offset || size - cut.offset > RESTORE_TAIL_LIMIT_BYTES) return false;
+    const tail = Buffer.alloc(size - cut.offset);
+    if (tail.length > 0 && readSync(fd, tail, 0, tail.length, cut.offset) !== tail.length) return false;
     // Whole lines only: the text after the last newline must be empty.
     const lines = tail.toString('utf8').split('\n');
     if (lines.pop() !== '' || !lines.every(mayFollowRestoredTurn)) return false;
-    const removed = readFileSync(backupPath);
     let written = 0;
-    while (written < removed.length) {
-      const w = writeSync(fd, removed, written, removed.length - written, size + written);
+    while (written < cut.removed.length) {
+      const w = writeSync(fd, cut.removed, written, cut.removed.length - written, size + written);
       if (w <= 0) throw new Error('short write while restoring a rewound transcript');
       written += w;
     }
-    return fstatSync(fd).size === size + removed.length;
+    return fstatSync(fd).size === size + cut.removed.length;
   } finally {
     closeSync(fd);
   }

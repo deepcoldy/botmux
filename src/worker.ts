@@ -572,9 +572,10 @@ import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
-import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript } from './core/context-rewind.js';
+import { restoreRewoundTranscript, rewindClaudeTranscript, type RewindResult } from './core/context-rewind.js';
 import {
   planFailedTurnRewindRequest,
+  inspectLastTurnInProjectsRoot,
   rewindableErrorCode,
   rewoundContent,
   runFailedTurnRewindMaintenance,
@@ -35809,6 +35810,10 @@ interface FailedTurnCut {
   path: string;
   offset: number;
   backupPath: string;
+  /** The transcript that was cut, pinned by inode, and the bytes the cut
+   *  removed: putting them back writes only that file, from memory. */
+  transcript: RewindResult['transcript'];
+  removed: Buffer;
   sessionId: string;
   preserveScratchTree: boolean;
   plainContent: string;
@@ -35871,7 +35876,7 @@ function startFailedTurnRewind(
               : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
                 ? 'a turn is running' : undefined,
     directive,
-    inspect: inspectLastClaudeTurn,
+    inspect: inspectLastTurnInProjectsRoot,
   });
   if (plan.kind === 'decline') {
     report('declined', plan.reason);
@@ -35891,8 +35896,10 @@ function startFailedTurnRewind(
     beforeRespawn: async retiring => {
       const outcome = await runFailedTurnRewindMaintenance({
         waitForQuiescence: () => waitForRetiringCliQuiescence(retiring),
-        inspect: () => inspectLastClaudeTurn(plan.target.jsonlPath),
-        rewind: offset => rewindClaudeTranscript(plan.target.jsonlPath, offset, Date.now(), { backup: 'removed' }),
+        inspect: () => inspectLastTurnInProjectsRoot(plan.target.jsonlPath),
+        rewind: (offset, file) => rewindClaudeTranscript(plan.target.jsonlPath, offset, Date.now(), {
+          backup: 'removed', ...(file ? { expectFile: file } : {}),
+        }),
         planned: { offset: plan.offset, ...(plan.uuid ? { uuid: plan.uuid } : {}) },
         failedInput: directive.failedInput,
         // Held behind the restart fence, so nothing can have written it yet —
@@ -35909,6 +35916,8 @@ function startFailedTurnRewind(
         path: plan.target.jsonlPath,
         offset: plan.offset,
         backupPath: outcome.result.backupPath,
+        transcript: outcome.result.transcript,
+        removed: outcome.result.removed ?? Buffer.alloc(0),
         sessionId: plan.target.sessionId,
         preserveScratchTree: plan.preserveScratchTree,
         plainContent: queued.content,
@@ -35962,7 +35971,7 @@ function waitForRetiringCliQuiescence(retiring: { pid?: number; processScope: nu
 /** Put a failed-turn cut back while no CLI is running on the transcript. */
 function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
   try {
-    return restoreRewoundTranscript(cut.path, cut.offset, cut.backupPath);
+    return restoreRewoundTranscript(cut.path, cut);
   } catch (err) {
     log(`Restoring the cut failed turn failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;

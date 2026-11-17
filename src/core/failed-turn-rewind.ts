@@ -28,7 +28,9 @@ import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { normaliseForFingerprint } from '../services/claude-transcript.js';
 import type { PurgeResumeTarget } from '../services/transcript-image-purge.js';
-import { inspectLastClaudeTurn, type LastTurnInspection, type RewindResult } from './context-rewind.js';
+import { realpathSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { inspectLastClaudeTurn, type FileIdentity, type LastTurnInspection, type RewindResult } from './context-rewind.js';
 
 /** The failed input, then the newer one, as one turn. A newer input identical
  *  to how the failed input already ends (a connector re-sending its bare
@@ -159,6 +161,24 @@ export function transcriptTurnFailedWithoutOutput(jsonlPath: string, writtenInpu
   return lastTurnIsFailedInput(inspectLastClaudeTurn(jsonlPath), writtenInput);
 }
 
+/** The last turn of a transcript that sits inside its projects directory —
+ *  the check the image purge applies: a project directory swapped for a link
+ *  to somewhere else is refused (the file itself is never followed, see
+ *  {@link inspectLastClaudeTurn}). The root is taken from the path itself, so
+ *  a link at or above the projects directory moves it along; what keeps a cut
+ *  from landing outside is that it needs the session's exact failed turn in
+ *  the file it reads, and that a restore writes only the inode it cut. */
+export function inspectLastTurnInProjectsRoot(jsonlPath: string): LastTurnInspection {
+  const root = dirname(dirname(jsonlPath));
+  const lexical = relative(resolve(root), resolve(jsonlPath));
+  const realRoot = realpathSync(root);
+  const realFile = realpathSync(jsonlPath);
+  if (lexical.startsWith('..') || isAbsolute(lexical) || !realFile.startsWith(`${realRoot}${sep}`)) {
+    throw new Error('transcript outside its projects directory');
+  }
+  return inspectLastClaudeTurn(jsonlPath);
+}
+
 /** What the CLI gets once the turn is cut: the directive's content, then the
  *  write-edge blocks the cut turn carried (see {@link matchRecordedInput}). */
 export function rewoundContent(content: string, suffix: string): string {
@@ -235,7 +255,8 @@ export function planFailedTurnRewindRequest(input: {
 export async function runFailedTurnRewindMaintenance(deps: {
   waitForQuiescence: () => Promise<void>;
   inspect: () => LastTurnInspection;
-  rewind: (offset: number) => RewindResult;
+  /** Cuts the file `inspect` read (`file`), not whatever is at the path. */
+  rewind: (offset: number, file: FileIdentity | undefined) => RewindResult;
   planned: { offset: number; uuid?: string };
   failedInput: string;
   /** Checked right before the cut, with nothing awaited in between: the
@@ -262,7 +283,7 @@ export async function runFailedTurnRewindMaintenance(deps: {
   if (!deps.messageStillQueued()) return { kind: 'declined', reason: 'the message is no longer waiting for the CLI' };
   const suffix = matchRecordedInput(turn.text!, deps.failedInput)!.suffix;
   try {
-    return { kind: 'rewound', result: deps.rewind(turn.offset!), suffix };
+    return { kind: 'rewound', result: deps.rewind(turn.offset!, turn.file), suffix };
   } catch (err) {
     return { kind: 'declined', reason: `cut failed: ${text(err)}` };
   }

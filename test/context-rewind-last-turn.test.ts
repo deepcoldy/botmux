@@ -6,10 +6,14 @@
  * the API-error record and turn_duration.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints } from '../src/core/context-rewind.js';
+import { dirname, join } from 'node:path';
+import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, type RewindResult } from '../src/core/context-rewind.js';
+
+/** What a restore takes from a `removed` cut. */
+const pinned = (result: RewindResult, offset: number) => ({ ...result, offset, removed: result.removed! });
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -149,18 +153,18 @@ describe('restoreRewoundTranscript', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const before = readFileSync(path);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 22), { backup: 'removed' });
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 22), { backup: 'removed' }), offset!);
+    expect(restoreRewoundTranscript(path, cut)).toBe(true);
     expect(readFileSync(path).equals(before)).toBe(true);
   });
 
   it('refuses once the transcript moved on after the cut', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 23), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 23), { backup: 'removed' }), offset!);
     writeFileSync(path, `${readFileSync(path, 'utf8')}${JSON.stringify(prompt('新的一轮', 'u2'))}\n`);
     const grown = readFileSync(path);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(restoreRewoundTranscript(path, cut)).toBe(false);
     expect(readFileSync(path).equals(grown)).toBe(true);
   });
 
@@ -168,17 +172,17 @@ describe('restoreRewoundTranscript', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const before = readFileSync(path);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 24), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 24), { backup: 'removed' }), offset!);
     // What Claude Code 2.1.326 appends when a resumed CLI that got no input exits.
     const onExit = `${JSON.stringify({ type: 'cost-state', sessionId: 's', totalCostUsd: 0 })}\n${JSON.stringify({ type: 'mode', mode: 'normal' })}\n`;
     writeFileSync(path, readFileSync(path, 'utf8') + onExit);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    expect(restoreRewoundTranscript(path, cut)).toBe(true);
     // Appended, never rewritten in place: a write cut short cannot interleave.
     expect(readFileSync(path).equals(Buffer.concat([before.subarray(0, offset), Buffer.from(onExit), before.subarray(offset)]))).toBe(true);
     expect(inspectLastClaudeTurn(path)).toMatchObject({ outcome: 'error_only', uuid: 'u1' });
     // A second restore finds the turn already back and changes nothing.
     const restored = readFileSync(path);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(restoreRewoundTranscript(path, cut)).toBe(false);
     expect(readFileSync(path).equals(restored)).toBe(true);
   });
 
@@ -186,7 +190,7 @@ describe('restoreRewoundTranscript', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const before = readFileSync(path);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 27), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 27), { backup: 'removed' }), offset!);
     // What Claude Code 2.1.326 records for `/effort high`, then its exit.
     const ran = [
       { type: 'file-history-snapshot', messageId: 'm', snapshot: {} },
@@ -196,7 +200,7 @@ describe('restoreRewoundTranscript', () => {
       { type: 'cost-state', sessionId: 's', totalCostUsd: 0 },
     ].map(record => `${JSON.stringify(record)}\n`).join('');
     writeFileSync(path, readFileSync(path, 'utf8') + ran);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    expect(restoreRewoundTranscript(path, cut)).toBe(true);
     expect(readFileSync(path).equals(Buffer.concat([before.subarray(0, offset), Buffer.from(ran), before.subarray(offset)]))).toBe(true);
     expect(inspectLastClaudeTurn(path)).toMatchObject({ outcome: 'error_only', uuid: 'u1' });
   });
@@ -204,49 +208,127 @@ describe('restoreRewoundTranscript', () => {
   it('also takes a command output recorded as a local_command system record (earlier Claude Code builds)', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 29), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 29), { backup: 'removed' }), offset!);
     // The shape of test/fixtures/claude-background-tasks/after-clear.jsonl.
     const ran = [
       { parentUuid: 'p', type: 'user', uuid: 'c1', message: { role: 'user', content: '<command-name>/effort</command-name>' } },
       { parentUuid: 'c1', type: 'system', subtype: 'local_command', uuid: 'c2', isMeta: false, content: '<local-command-stdout></local-command-stdout>' },
     ].map(record => `${JSON.stringify(record)}\n`).join('');
     writeFileSync(path, readFileSync(path, 'utf8') + ran);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    expect(restoreRewoundTranscript(path, cut)).toBe(true);
     expect(inspectLastClaudeTurn(path)).toMatchObject({ outcome: 'error_only', uuid: 'u1' });
   });
 
   it('refuses once a slash command after the cut got a model turn', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 28), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 28), { backup: 'removed' }), offset!);
     const answered = [
       { parentUuid: 'p', type: 'user', uuid: 'c1', message: { role: 'user', content: '<command-name>/review</command-name>' } },
       reply('审查结果'),
     ].map(record => `${JSON.stringify(record)}\n`).join('');
     writeFileSync(path, readFileSync(path, 'utf8') + answered);
     const grown = readFileSync(path);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(restoreRewoundTranscript(path, cut)).toBe(false);
     expect(readFileSync(path).equals(grown)).toBe(true);
   });
 
   it('refuses a message written after the cut even when it has no uuid', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 26), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 26), { backup: 'removed' }), offset!);
     writeFileSync(path, `${readFileSync(path, 'utf8')}${JSON.stringify({ type: 'user', message: { role: 'user', content: '新的一轮' } })}\n`);
     const grown = readFileSync(path);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(restoreRewoundTranscript(path, cut)).toBe(false);
     expect(readFileSync(path).equals(grown)).toBe(true);
   });
 
   it('refuses when what follows the cut ends in a partial line', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
     const { offset } = inspectLastClaudeTurn(path);
-    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 25), { backup: 'removed' });
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 25), { backup: 'removed' }), offset!);
     writeFileSync(path, `${readFileSync(path, 'utf8')}{"type":"cost-state"`);
     const partial = readFileSync(path);
-    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(restoreRewoundTranscript(path, cut)).toBe(false);
     expect(readFileSync(path).equals(partial)).toBe(true);
+  });
+});
+
+describe('restoreRewoundTranscript reads and writes only the files the cut pinned', () => {
+  const cutFixture = (stamp: number) => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const before = readFileSync(path);
+    const { offset } = inspectLastClaudeTurn(path);
+    const cut = pinned(rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 15, stamp), { backup: 'removed' }), offset!);
+    return { path, before, cut, afterCut: readFileSync(path) };
+  };
+
+  it('puts back the bytes the cut removed, never the backup file: a link or other bytes there change nothing', () => {
+    const linked = cutFixture(1);
+    const outside = join(mkdtempSync(join(tmpdir(), 'botmux-outside-')), 'host-only.txt');
+    dirs.push(dirname(outside));
+    writeFileSync(outside, 'HOST-ONLY-CONTENT\n');
+    unlinkSync(linked.cut.backupPath);
+    symlinkSync(outside, linked.cut.backupPath);
+    expect(restoreRewoundTranscript(linked.path, linked.cut)).toBe(true);
+    expect(readFileSync(linked.path).equals(linked.before)).toBe(true);
+    expect(readFileSync(linked.path, 'utf8')).not.toContain('HOST-ONLY-CONTENT');
+
+    const rewritten = cutFixture(2);
+    writeFileSync(rewritten.cut.backupPath, `${JSON.stringify(prompt('别的内容', 'ux'))}\n`);
+    expect(restoreRewoundTranscript(rewritten.path, rewritten.cut)).toBe(true);
+    expect(readFileSync(rewritten.path).equals(rewritten.before)).toBe(true);
+  });
+
+  it('a transcript replaced by another file — a link or a regular file — is left alone', () => {
+    const linked = cutFixture(4);
+    const real = `${linked.path}.real`;
+    renameSync(linked.path, real);
+    symlinkSync(real, linked.path);
+    expect(restoreRewoundTranscript(linked.path, linked.cut)).toBe(false);
+    expect(readFileSync(real).equals(linked.afterCut)).toBe(true);
+
+    const swapped = cutFixture(5);
+    const copy = `${swapped.path}.copy`;
+    copyFileSync(swapped.path, copy);
+    renameSync(copy, swapped.path);
+    expect(restoreRewoundTranscript(swapped.path, swapped.cut)).toBe(false);
+    expect(readFileSync(swapped.path).equals(swapped.afterCut)).toBe(true);
+  });
+
+  it('without the cut bytes there is nothing to put back', () => {
+    const { path, cut, afterCut } = cutFixture(8);
+    expect(restoreRewoundTranscript(path, { ...cut, removed: Buffer.alloc(0) })).toBe(false);
+    expect(readFileSync(path).equals(afterCut)).toBe(true);
+  });
+
+  it('the unchanged files are put back together', () => {
+    const { path, before, cut } = cutFixture(6);
+    expect(restoreRewoundTranscript(path, cut)).toBe(true);
+    expect(readFileSync(path).equals(before)).toBe(true);
+  });
+});
+
+describe('the last-turn read and the cut stay on the file they planned on', () => {
+  it('the last-turn read does not follow a link, nor block on a FIFO', () => {
+    const real = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const link = `${real}.link`;
+    symlinkSync(real, link);
+    expect(() => inspectLastClaudeTurn(link)).toThrow();
+    const fifo = `${real}.fifo`;
+    execFileSync('mkfifo', [fifo]);
+    expect(() => inspectLastClaudeTurn(fifo)).toThrow(/non-regular/);
+  });
+
+  it('a cut planned on one file refuses another file at the path', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const { offset, file } = inspectLastClaudeTurn(path);
+    const copy = `${path}.copy`;
+    copyFileSync(path, copy);
+    renameSync(copy, path);
+    const swapped = readFileSync(path);
+    expect(() => rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 15, 7), { backup: 'removed', expectFile: file })).toThrow(/replaced/);
+    expect(readFileSync(path).equals(swapped)).toBe(true);
   });
 });
 

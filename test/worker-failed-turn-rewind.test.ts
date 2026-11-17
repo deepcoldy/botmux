@@ -4,7 +4,7 @@
  * inspection and rewind modules and a real transcript, with the worker's
  * restart machinery stubbed (same harness as the image purge).
  */
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,8 +13,9 @@ import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTa
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { resolvePurgeResumeTarget } from '../src/services/transcript-image-purge.js';
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
-import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript } from '../src/core/context-rewind.js';
+import { restoreRewoundTranscript, rewindClaudeTranscript } from '../src/core/context-rewind.js';
 import {
+  inspectLastTurnInProjectsRoot,
   planFailedTurnRewindRequest,
   rewindableErrorCode,
   rewoundContent,
@@ -96,7 +97,7 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     dirname,
     resolvePurgeResumeTarget,
     waitForProcessQuiescence,
-    inspectLastClaudeTurn,
+    inspectLastTurnInProjectsRoot,
     rewindClaudeTranscript,
     restoreRewoundTranscript,
     planFailedTurnRewindRequest,
@@ -483,6 +484,31 @@ describe('startFailedTurnRewind', () => {
     await cutAfterExit();
     expect(readFileSync(jsonl, 'utf8')).toBe(replaced);
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/changed/) })]);
+  });
+
+  it('does not cut a file other than the one the last-turn read pinned', async () => {
+    const original = failedTranscript();
+    const { jsonl, cutAfterExit, reports } = setup(original, {
+      // As if another file had been put at the path between the read and the cut.
+      inspectLastTurnInProjectsRoot: (path: string) => ({ ...inspectLastTurnInProjectsRoot(path), file: { dev: -1, ino: -1 } }),
+    });
+    await cutAfterExit();
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut failed/) })]);
+  });
+
+  it('does not cut a transcript whose project directory became a link to somewhere else', async () => {
+    const original = failedTranscript();
+    const { jsonl, cutAfterExit, reports } = setup(original);
+    // Planned on the real directory; by the cut it points elsewhere.
+    const projectDir = dirname(jsonl);
+    const elsewhere = join(dirname(dirname(dirname(projectDir))), 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    renameSync(projectDir, join(elsewhere, 'cwd-key'));
+    symlinkSync(join(elsewhere, 'cwd-key'), projectDir);
+    await cutAfterExit();
+    expect(readFileSync(join(elsewhere, 'cwd-key', `${SID}.jsonl`), 'utf8')).toBe(original);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/outside its projects directory/) })]);
   });
 
   it('does not cut once the message is no longer waiting: its input would be lost', async () => {
