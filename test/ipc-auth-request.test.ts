@@ -1,5 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
@@ -1096,6 +1099,35 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
     expect(start).toHaveBeenCalledWith('ou_sender');
     expect(body).toMatchObject({ ok: true, provider: 'bytedcli', status: 'ready' });
     expect(body.message).not.toContain('暂时无法发起');
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
+  // The same through the real provider module and a stand-in bytedcli. Status
+  // first says logged out; `--begin` then finishes bytedcli's own pending
+  // challenge and answers with that login instead of a link, as 0.186+ does.
+  it('a stand-in bytedcli that finishes its pending login on --begin: ready, not "cannot start"', async () => {
+    const tools = mkdtempSync(join(tmpdir(), 'botmux-fake-bytedcli-'));
+    writeFileSync(join(tools, 'bytedcli'), `#!/bin/sh
+case "$2" in
+  login) : > "$HOME/completed"
+    printf '%s\\n' '{"status":"success","data":{"site":"cn","status":"ready","login_status":"success","already_completed":true},"error":null}' ;;
+  status) if [ -e "$HOME/completed" ]; then a=true; else a=false; fi
+    printf '%s\\n' '{"status":"success","data":{"authenticated":'"$a"',"auth_as":"user","bytecloud_auth":{"site":"cn","status":"ready"}},"error":null}' ;;
+esac
+`);
+    chmodSync(join(tools, 'bytedcli'), 0o755);
+    vi.stubEnv('PATH', [tools, '/usr/bin', '/bin'].join(delimiter));
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+      rmSync(tools, { recursive: true, force: true });
+      rmSync(bytedcliAuth.bytedcliHomeFor('ou_sender'), { recursive: true, force: true });
+    });
+    vi.spyOn(cliIdentity, 'recallProvenIdentityContent').mockReturnValue(undefined);
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const body = await (await ask({ provider: 'bytedcli' })).json() as { message: string };
+    expect(body).toMatchObject({ ok: true, provider: 'bytedcli', status: 'ready' });
+    expect(body.message).toBe(t('provider_auth.ready_bytedcli', undefined, 'zh'));
     expect(dm).not.toHaveBeenCalled();
     expect(replies).toEqual([]);
   });
