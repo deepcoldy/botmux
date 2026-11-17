@@ -681,10 +681,19 @@ async function runTurn(content: string): Promise<void> {
   });
 
   try {
-    const ack = await client.request<unknown>('session/prompt', {
-      sessionId: dshSessionId,
-      contentBlocks: [{ type: 'text', text: promptContent }],
-    }, PROMPT_ACK_TIMEOUT_MS);
+    // The watchdog may fire (or the runtime exit) before the prompt is ACKed,
+    // e.g. on a loaded host. Awaiting only the request would leave that
+    // rejection unhandled — the runner dies with exit 1 and no final reply —
+    // and would keep a timed-out turn waiting for an ACK that may never come.
+    // Racing the turn is safe: it cannot resolve before the ACK, because its
+    // notifications stay buffered until the ACK's messageId claims the receipt.
+    const ack = await Promise.race([
+      client.request<unknown>('session/prompt', {
+        sessionId: dshSessionId,
+        contentBlocks: [{ type: 'text', text: promptContent }],
+      }, PROMPT_ACK_TIMEOUT_MS),
+      turnPromise,
+    ]);
     const messageId = parsePromptMessageId(ack);
     // The ACK's messageId correlates this turn's events: notifications may
     // already be buffered (they can precede the response), and a late idle
