@@ -264,10 +264,21 @@ export async function pollDoubaoSessionForSubmit(
 }
 
 /** True when the session directory exists locally; undefined when no session
- *  root is readable (cannot tell — let the worker's secondary guard decide). */
+ *  root is readable (cannot tell — let the worker's secondary guard decide).
+ *  A definite ENOENT/ENOTDIR on every root means "absent" (false); any other
+ *  stat failure (EACCES/EIO) means "unknown" (undefined), so a temporarily
+ *  unreadable account store cannot demote a valid `--resume` to a fresh spawn. */
 export function doubaoSessionExists(sessionId: string, roots: readonly string[] = doubaoSessionRoots()): boolean | undefined {
   if (roots.length === 0) return undefined;
-  return roots.some(root => { try { return statSync(join(root, sessionId)).isDirectory(); } catch { return false; } });
+  let indeterminate = false;
+  for (const root of roots) {
+    try {
+      if (statSync(join(root, sessionId)).isDirectory()) return true;
+    } catch (error) {
+      if (!isAbsentPathError(error)) indeterminate = true;
+    }
+  }
+  return indeterminate ? undefined : false;
 }
 
 /** Parse the model list doubao prints for an unsupported `--model` value:

@@ -370,6 +370,44 @@ describe('doubao session capture', () => {
     expect(doubaoSessionExists(SID, [])).toBeUndefined();
     expect(createDoubaoAdapter('/bin/doubao').checkResumeTargetExists?.({ sessionId: 's', cliSessionId: 'bad id' })).toBe(false);
   });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'keeps an unreadable session root indeterminate so a valid resume is not demoted',
+    () => {
+      const root = makeSessionsRoot();
+      writeAssignment(root, SID, 'x');
+      // Direct three-state contract: EACCES on the root means "cannot tell".
+      chmodSync(root, 0);
+      try {
+        expect(doubaoSessionExists(SID, [root])).toBeUndefined();
+      } finally {
+        chmodSync(root, 0o700);
+      }
+      // A confirmed directory on any readable root still wins outright.
+      const peer = makeSessionsRoot();
+      writeAssignment(peer, SID, 'x');
+      chmodSync(root, 0);
+      try {
+        expect(doubaoSessionExists(SID, [root, peer])).toBe(true);
+        // Indeterminate must beat a definite miss on another root.
+        expect(doubaoSessionExists(OTHER_SID, [root, peer])).toBeUndefined();
+      } finally {
+        chmodSync(root, 0o700);
+      }
+      // End-to-end through doubaoSessionRoots: an unreadable workspace keeps
+      // the candidate root, and the resume probe stays indeterminate.
+      const dataRoot = join(root, '..', '..', '..', '..');
+      const workspace = join(dataRoot, 'agent_mode', '100', 'workspace');
+      chmodSync(workspace, 0);
+      try {
+        const roots = doubaoSessionRoots(dataRoot);
+        expect(roots).toHaveLength(1);
+        expect(doubaoSessionExists(SID, roots)).toBeUndefined();
+      } finally {
+        chmodSync(workspace, 0o700);
+      }
+    },
+  );
 });
 
 describe('doubao submit capture polling', () => {
