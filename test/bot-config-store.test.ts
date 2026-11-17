@@ -860,7 +860,12 @@ describe('bot-config store', () => {
     expect(readConfig().groupCreation).toEqual(groupCreation);
   });
 
-  it.each([null, [], 'bad', { agents: 'Review' }, { agents: [''] }, { agents: ['  '] }, { agents: [1] }, { agents: [null] }, { avatar: 'name' }, { typo: [] }])('rejects malformed inviteConfig on edits and cold loads: %j', async value => {
+  it.each([
+    { value: null }, { value: [] }, { value: 'bad' },
+    { value: { agents: 'Review' } }, { value: { agents: [''] } }, { value: { agents: ['  '] } },
+    { value: { agents: [1] } }, { value: { agents: [null] } },
+    { value: { avatar: 'name' } }, { value: { typo: [] } },
+  ])('rejects malformed inviteConfig on edits and cold loads: %j', async ({ value }) => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('inviteConfig');
     expect(spec).toBeDefined();
