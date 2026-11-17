@@ -147,7 +147,9 @@ if (argv[0] === '--version') {
   process.stdout.write('fake cli 1.0.0\\n');
   process.exit(0);
 }
-if (argv[0] === 'app-server') {
+// The engine legitimately prepends a global --dangerously-bypass-hook-trust
+// before the app-server subcommand, so dispatch on presence, not argv[0].
+if (argv.includes('app-server')) {
   await import(pathToFileURL(process.env.RPC_FIXTURE_PATH).href);
 } else {
   process.stdout.write('\\n› \\n');
@@ -357,22 +359,25 @@ describe('TRAE native subagent hook worker launches', () => {
       harness,
       () => {
         const launches = readLaunches(harness.capturePath);
-        return launches.some(record => record.argv[0] === 'app-server')
-          && launches.some(record => record.argv[0] === '--remote')
+        return launches.some(record => record.argv.includes('app-server'))
+          && launches.some(record => record.argv.includes('--remote'))
           && harness.messages.some(message => message.type === 'ready');
       },
       'Trae app-server and remote viewer launches',
       20_000,
     );
     const launches = readLaunches(harness.capturePath);
-    const appServer = launches.find(record => record.argv[0] === 'app-server');
-    const viewer = launches.find(record => record.argv[0] === '--remote');
+    const appServer = launches.find(record => record.argv.includes('app-server'));
+    const viewer = launches.find(record => record.argv.includes('--remote'));
     expect(appServer).toBeDefined();
     expect(viewer).toBeDefined();
     expectSingleNativeHook(appServer!);
     expect(appServer!.argv).toContain('default_mode_request_user_input');
     expect(hookOverrides(viewer!.argv)).toEqual([]);
+    // The RPC viewer shares the app-server's hook-trust version gate: the flag
+    // leads before the --remote subcommand, while no native subagent hook rides.
     expect(viewer!.argv).toEqual([
+      '--dangerously-bypass-hook-trust',
       '--remote', expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
       '-c', 'notice.hide_rate_limit_model_nudge=true', 'thread-fake-1',

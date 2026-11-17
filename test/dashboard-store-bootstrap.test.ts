@@ -96,6 +96,28 @@ afterEach(() => {
 });
 
 describe('dashboard store bootstrap', () => {
+  it('shows and updates sessions while optional schedules hang, then replays schedule races over their snapshot', async () => {
+    const schedules = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn((path: string) => path === '/api/sessions?view=board'
+      ? Promise.resolve(jsonResponse({ sessions: [{ sessionId: 'ready', status: 'working' }] }))
+      : schedules.promise));
+    const { bootstrap, store } = await import('../src/dashboard/web/store.js');
+    const boot = bootstrap();
+    const events = FakeEventSource.instance!;
+    events.emit('schedule.updated', { id: 'job', patch: { name: 'newer' } });
+    await vi.waitFor(() => expect(store.getSnapshot().bootstrapped).toBe(true));
+    expect(store.getSnapshot().schedulesReady).toBe(false);
+    expect(store.sessions.get('ready')?.status).toBe('working');
+    events.emit('session.update', { sessionId: 'ready', patch: { status: 'idle' } });
+    expect(store.sessions.get('ready')?.status).toBe('idle');
+    events.emit('schedule.deleted', { id: 'deleted' });
+    schedules.resolve(jsonResponse({ schedules: [{ id: 'job', name: 'old' }, { id: 'deleted' }] }));
+    await boot;
+    expect(store.getSnapshot().schedulesReady).toBe(true);
+    expect(store.schedules.get('job')?.name).toBe('newer');
+    expect(store.schedules.has('deleted')).toBe(false);
+  });
+
   it('fetches the snapshot without waiting for SSE open, then buffers races and reconciles on open', async () => {
     const initialSessions = deferred<Response>();
     const initialSchedules = deferred<Response>();
@@ -266,6 +288,7 @@ describe('dashboard store bootstrap · optional resources cannot sink the sessio
     expect(fetchMock).toHaveBeenCalledWith('/api/sessions?view=board');
     expect(store.sessions.has('h5-session')).toBe(true);
     expect(store.getSnapshot().schedulesAvailable).toBe(false);
+    expect(store.getSnapshot().schedulesReady).toBe(true);
   });
 
   it('still loads schedules and the effective timezone for an identity that has the capability', async () => {
