@@ -769,6 +769,11 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       triggerUserAuth: { enabled: true, tools: ['bytedcli'] },
     } } as any);
     vi.spyOn(meegoAuth, 'requestMeegoLogin').mockResolvedValue({ state: 'link', authUrl: MEEGO_URL });
+    // Nothing here may reach a real bytedcli: a Meego request also lists a
+    // missing ByteCloud login, and listing it starts one. As on CI (no
+    // bytedcli installed), there is no ByteCloud link unless a test gives one.
+    vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue(null);
+    vi.spyOn(bytedcliAuth, 'startBytedcliLogin').mockResolvedValue({ state: 'failed', detail: 'no bytedcli in tests' });
     replies = [];
     vi.spyOn(larkClient, 'replyMessage').mockImplementation(async (_app, _root, text) => { replies.push(String(text)); return 'om_reply'; });
   });
@@ -1117,6 +1122,7 @@ case "$2" in
 esac
 `);
     chmodSync(join(tools, 'bytedcli'), 0o755);
+    vi.mocked(bytedcliAuth.startBytedcliLogin).mockRestore();
     vi.stubEnv('PATH', [tools, '/usr/bin', '/bin'].join(delimiter));
     onTestFinished(() => {
       vi.unstubAllEnvs();
