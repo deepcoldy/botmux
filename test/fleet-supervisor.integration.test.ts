@@ -170,7 +170,7 @@ console.log('daemon pid=' + process.pid);
     }
   });
 
-  it('resumes a persisted daemon retirement after its config was removed during downtime', async () => {
+  it.each(['online', 'launching'] as const)('retires a persisted %s daemon after its config was removed during downtime', async status => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const distDir = fakeDist(root, `
 process.on('SIGTERM', () => {});
@@ -181,33 +181,37 @@ console.log('daemon pid=' + process.pid);
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'prior',
       procs: [{ name: 'botmux-removed', appId: 'cli_a', pid: orphan.pid!, generation: 1,
-        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+        status, restarts: 0, lastExitCode: null, startedAt: 'T',
         processStart: readDurableProcessIdentity(orphan.pid!) }],
     }));
     const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
     try {
       sup.start([]);
+      expect(readFleetState(statePath)!.procs).toMatchObject([{ pid: orphan.pid, status: 'launching' }]);
       expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
       expect(await waitFor(() => (readFleetState(statePath)?.procs.length ?? 0) === 0)).toBe(true);
     } finally { await sup.stopAll(); }
   });
 
-  it('does not signal a removed non-daemon member while resuming persisted retirement', async () => {
+  it.each(['online', 'launching'] as const)('does not signal a removed %s non-daemon member while resuming persisted retirement', async status => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const orphan = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'prior',
       procs: [{ name: 'botmux-plugin-removed', appId: '', pid: orphan.pid!, generation: 1,
-        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+        status, restarts: 0, lastExitCode: null, startedAt: 'T',
         processStart: readDurableProcessIdentity(orphan.pid!) }],
     }));
     const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
+    const signals = vi.spyOn(process, 'kill');
+    vi.useFakeTimers();
     try {
       sup.start([]);
-      await delay(150);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === orphan.pid && signal !== 0)).toEqual([]);
       expect(pidAlive(orphan.pid!)).toBe(true);
       expect(readFleetState(statePath)!.procs).toMatchObject([{ name: 'botmux-plugin-removed', status: 'launching', pid: orphan.pid }]);
-    } finally { await sup.stopAll(); }
+    } finally { vi.useRealTimers(); signals.mockRestore(); await sup.stopAll(); }
   });
 
   it('reclaims every live alias after a hard supervisor death and rename', async () => {

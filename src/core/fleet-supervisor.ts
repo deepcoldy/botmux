@@ -225,10 +225,10 @@ export class FleetSupervisor {
     // where the OS recycles the dead supervisor's pid onto the new one.)
     for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
       const configured = this.specForProc(p);
-      // A bot removed while its supervisor was down still needs its persisted
-      // retirement finished. With no configured member, allow only a fresh
+      // A bot removed while its supervisor was down may still be online or
+      // partway through retirement. With no configured member, allow only a fresh
       // built-in daemon command match; never infer plugin/dashboard ownership.
-      const retireOnly = !configured && p.status === 'launching' && p.pid > 1;
+      const retireOnly = !configured && (p.status === 'online' || p.status === 'launching') && p.pid > 1;
       const spec = configured ?? (retireOnly ? { name: p.name, appId: p.appId, botIndex: -1 } : undefined);
       if (spec && (p.status === 'online' || (p.status === 'launching' && p.pid > 1)) && !this.children.has(p.name)) {
         // Include every alias of a configured App ID, not only its chosen name.
@@ -241,12 +241,12 @@ export class FleetSupervisor {
       // Sending SIGTERM alone does not prove that a daemon has stopped.
       cur.procs = cur.procs.filter(p => specByName.has(p.name)
         || (p.pid > 1 && identityRuntime.pidExists(p.pid)
-          && (this.specForProc(p) || p.status === 'launching' || this.children.has(p.name))));
+          && (this.specForProc(p) || p.status === 'launching' || this.children.has(p.name) || this.orphanStops.has(p.name))));
       for (const p of cur.procs) {
         if (p.status === 'online' && !identityRuntime.pidExists(p.pid)) {
           p.pid = 0;
           p.status = 'stopped';
-        } else if (p.pid > 1 && !this.children.has(p.name) && this.specForProc(p)) {
+        } else if (p.pid > 1 && !this.children.has(p.name) && (this.specForProc(p) || this.orphanStops.has(p.name))) {
           // Retirement admission may have failed its first write. A successful
           // reconcile still cannot publish an unowned PID as healthy.
           p.status = 'launching';

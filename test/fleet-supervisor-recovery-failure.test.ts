@@ -32,6 +32,46 @@ vi.mock('../src/utils/atomic-write.js', async importOriginal => {
 });
 
 describe('fleet orphan retirement with a failed durable write', () => {
+  it('retains a removed online daemon when the first retirement write fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-removed-write-failure-'));
+    const statePath = join(root, 'fleet.json');
+    const distDir = join(root, 'dist'); mkdirSync(distDir);
+    const script = join(distDir, 'index-daemon.js');
+    writeFileSync(script, "process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000); console.log('ready');");
+    const orphan = spawnTsScript(script, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const sup = new FleetSupervisor({ statePath, distDir, cwd: root, daemonEnv: {}, log: () => {} });
+    try {
+      let output = '';
+      for await (const data of orphan.stdout!) {
+        output += data.toString();
+        if (output.includes('ready')) break;
+      }
+      expect(output).toContain('ready');
+      writeFleetState(statePath, { supervisorPid: 999_999, supervisorStartedAt: 'prior',
+        procs: [freshProc('botmux-removed', 'cli_a', orphan.pid!, 'T')] });
+      Object.assign(fault, { path: statePath, pid: orphan.pid!, transition: 'admission', failed: false });
+      vi.useFakeTimers();
+      sup.start([]);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(fault.failed).toBe(true);
+      expect(readFleetState(statePath)!.procs).toMatchObject([{ pid: orphan.pid, status: 'launching' }]);
+      expect(pidAlive(orphan.pid!)).toBe(true);
+      sup.start([]);
+      if (orphan.exitCode === null && orphan.signalCode === null) await once(orphan, 'exit');
+      await vi.advanceTimersByTimeAsync(500);
+      expect(readFleetState(statePath)!.procs).toEqual([]);
+    } finally {
+      fault.path = '';
+      if (orphan.exitCode === null && orphan.signalCode === null) {
+        const exited = once(orphan, 'exit'); orphan.kill('SIGKILL'); await exited;
+      }
+      if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(2000);
+      vi.useRealTimers();
+      await sup.stopAll();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['admission', 'completion'])('recovers after one %s write fails without reporting an orphan healthy', async transition => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-write-failure-'));
     const statePath = join(root, 'fleet.json');
