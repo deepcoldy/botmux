@@ -505,7 +505,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await primaryEffectsBarrier();
     expect(ds.streamCardId).toBe('om_new_card');
     expect(pinMessageMock).toHaveBeenCalledWith('app_test', 'om_new_card');
-    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_frozen_predecessor');
+    expect(deleteMessageMock.mock.calls.map(call => call.slice(0, 2))).toContainEqual(['app_test', 'om_frozen_predecessor']);
 
     // A successor wins while the older Pin is still in flight. Primary recall
     // already happened; the old continuation may only compensate its own Pin.
@@ -542,7 +542,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await primaryEffectsBarrier();
     expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String), { beforeWrite: expect.any(Function) });
     expect(pinMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card');
-    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_frozen_predecessor');
+    expect(deleteMessageMock.mock.calls.map(call => call.slice(0, 2))).toContainEqual(['app_test', 'om_frozen_predecessor']);
 
     ds.streamCardId = 'om_successor';
     resolvePin(sameAppPin('om_restored_card'));
@@ -601,6 +601,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalled());
     resolvePin(sameAppPin('om_new_card'));
     await __testOnly_waitForPinStreamingCardIdle();
   });
@@ -629,6 +630,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalled());
     resolvePin(sameAppPin('om_new_card'));
     await __testOnly_waitForPinStreamingCardIdle();
   });
@@ -986,6 +988,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalled());
     resolvePin(sameAppPin('om_new_card'));
     await __testOnly_waitForPinStreamingCardIdle();
   });
@@ -2189,7 +2192,7 @@ describe('worker-authoritative handoff live card', () => {
     await flush(); await flush();
     expect(onStart).toHaveBeenCalledExactlyOnceWith(ds, '审查上传取消修复', 'trg_review');
     expect(reply).toHaveBeenCalledTimes(1); expect(ds.streamCardId).toBe('om_handoff_card');
-    if (previous) expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_previous');
+    if (previous) expect(deleteMessageMock.mock.calls.map(call => call.slice(0, 2))).toContainEqual(['app_test', 'om_previous']);
     else expect(deleteMessageMock).not.toHaveBeenCalled();
     worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_unrelated_user' });
