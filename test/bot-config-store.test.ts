@@ -838,6 +838,65 @@ describe('bot-config store', () => {
     expect(readConfig().groupCreation).toBeUndefined();
   });
 
+  it('persists, hot-applies, cold-loads and clears per-bot inviteConfig independently of /g defaults', async () => {
+    const groupCreation = { agents: ['cli_group'], tag: 'Work', avatar: 'name' };
+    const { registry, store } = await loaded({ groupCreation });
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    const value = { agents: ['Review', 'cli_build'] };
+    const parsed = store.coerceConfigValue(spec!, JSON.stringify({ agents: [' Review ', 'cli_build', 'Review'] }));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec!, parsed.value)).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ groupCreation, inviteConfig: value });
+    expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach(c => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config).toMatchObject({ groupCreation, inviteConfig: value });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('inviteConfig')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().inviteConfig).toBeUndefined();
+    expect(cold.registry.getBot('app_default').config.inviteConfig).toBeUndefined();
+    expect(cold.registry.loadBotConfigs()[0].inviteConfig).toBeUndefined();
+    expect(readConfig().groupCreation).toEqual(groupCreation);
+  });
+
+  it.each([
+    { value: null }, { value: [] }, { value: 'bad' },
+    { value: { agents: 'Review' } }, { value: { agents: [''] } }, { value: { agents: ['  '] } },
+    { value: { agents: [1] } }, { value: { agents: [null] } },
+    { value: { avatar: 'name' } }, { value: { typo: [] } },
+  ])('rejects malformed inviteConfig on edits and cold loads: %j', async ({ value }) => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    expect(store.coerceConfigValue(spec!, JSON.stringify(value)).ok).toBe(false);
+    writeConfig({ inviteConfig: value });
+    expect(() => registry.loadBotConfigs()).toThrow();
+  });
+
+  it('updates only the selected bot\'s invitation defaults', async () => {
+    const { registry, store } = await loaded();
+    const other = {
+      larkAppId: 'app_other', larkAppSecret: 'secret', cliId: 'codex',
+      inviteConfig: { agents: ['cli_other'] },
+    };
+    writeFileSync(configPath, JSON.stringify([readConfig(), other]));
+    const value = { agents: ['cli_review'] };
+    expect(await store.applyConfigField('app_default', store.findConfigField('inviteConfig')!, value)).toMatchObject({ ok: true });
+    const configs = registry.loadBotConfigs();
+    expect(configs.find(c => c.larkAppId === 'app_default')?.inviteConfig).toEqual(value);
+    expect(configs.find(c => c.larkAppId === 'app_other')?.inviteConfig).toEqual(other.inviteConfig);
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[1]).toEqual(other);
+  });
+
+  it.each([{}, { agents: [] }])('accepts an empty inviteConfig without adding defaults: %j', async value => {
+    const { registry, store } = await loaded({ inviteConfig: value });
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    expect(store.coerceConfigValue(spec!, JSON.stringify(value))).toEqual({ ok: true, value });
+    expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
+  });
+
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {
     const original = { feedback: { enabled: true, allowReselect: true }, chatFeedbackPolicies: { oc_a: { enabled: false } } };
     const { registry, store } = await loaded(original);
