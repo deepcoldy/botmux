@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -208,8 +208,9 @@ describe('detectModels（live 探测，fail-soft）', () => {
 
     const p1 = catalog.detectModels('codex', { adapterFactory: factory });
     const p2 = catalog.detectModels('codex', { adapterFactory: factory });
-    // 两个调用都已进入：factory 只被同步调起一次（in-flight 复用）
-    expect(calls).toBe(1);
+    // Executable discovery may now yield; overlapping requests still share
+    // the catalog probe once both asynchronous lookups reach the cache.
+    await vi.waitFor(() => expect(calls).toBe(1));
 
     release(['live-only']);
     const [r1, r2] = await Promise.all([p1, p2]);
@@ -220,6 +221,67 @@ describe('detectModels（live 探测，fail-soft）', () => {
     // 完成后 in-flight 已清理：再来一次（TTL 内）走缓存而非 in-flight
     expect(await catalog.detectModels('codex', { adapterFactory: factory })).toEqual(['live-only']);
     expect(calls).toBe(1);
+  });
+
+  it('慢速 identity 解析不会绕过失败探测的 in-flight 去重', async () => {
+    const catalog = createModelCatalog();
+    let calls = 0;
+    let secondResolves = 0;
+    let releaseProbe!: (value: null) => void;
+    let releaseSecondIdentity!: (value: string) => void;
+    const blocked = new Promise<null>(resolve => { releaseProbe = resolve; });
+    const secondIdentity = new Promise<string>(resolve => { releaseSecondIdentity = resolve; });
+    const factory = () => fakeAdapter(() => {
+      calls++;
+      return calls === 1 ? blocked : Promise.resolve(null);
+    });
+    const first = catalog.detectModels('codex', {
+      runtimeExecutable: '/missing-codex',
+      adapterFactory: factory,
+      resolveExecutable: async () => '/missing-codex',
+    });
+    await vi.waitFor(() => expect(calls).toBe(1));
+    const second = catalog.detectModels('codex', {
+      runtimeExecutable: '/missing-codex',
+      adapterFactory: factory,
+      resolveExecutable: () => { secondResolves++; return secondIdentity; },
+    });
+
+    releaseProbe(null);
+    await expect(first).resolves.toBeNull();
+    releaseSecondIdentity('/missing-codex');
+    await expect(second).resolves.toBeNull();
+    expect(calls).toBe(1);
+    expect(secondResolves).toBe(0);
+  });
+
+  it('不同路径别名解析到同一 executable 时仍共享 identity 探测', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-identity-'));
+    try {
+      const target = join(dir, 'codex');
+      const alias = join(dir, 'codex-alias');
+      writeFileSync(target, 'fixture');
+      symlinkSync(target, alias);
+      const catalog = createModelCatalog();
+      let calls = 0;
+      let release!: (value: readonly string[]) => void;
+      const blocked = new Promise<readonly string[]>(resolve => { release = resolve; });
+      const factory = () => fakeAdapter(() => { calls++; return blocked; });
+      const options = (runtimeExecutable: string) => ({
+        runtimeExecutable,
+        adapterFactory: factory,
+        resolveExecutable: async (command: string) => command,
+      });
+      const first = catalog.detectModels('codex', options(target));
+      const second = catalog.detectModels('codex', options(alias));
+      await vi.waitFor(() => expect(calls).toBe(1));
+      release(['shared-model']);
+      await expect(first).resolves.toEqual(['shared-model']);
+      await expect(second).resolves.toEqual(['shared-model']);
+      expect(calls).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('失败不缓存：抛异常 / null / 空数组 下次都会重试', async () => {
@@ -268,6 +330,19 @@ describe('detectModels（live 探测，fail-soft）', () => {
       resolveExecutable: () => { resolves++; throw new Error('must not resolve'); },
     })).resolves.toBeNull();
     expect(resolves).toBe(0);
+  });
+
+  it('静态能力预检不通过时不构造适配器或解析 executable', async () => {
+    const catalog = createModelCatalog();
+    const adapterFactory = vi.fn(() => fakeAdapter(async () => ['must-not-probe']));
+    const resolveExecutable = vi.fn(() => '/must-not-resolve');
+    await expect(catalog.detectModels('claude-code', {
+      supportsModelDiscovery: () => false,
+      adapterFactory,
+      resolveExecutable,
+    })).resolves.toBeNull();
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(resolveExecutable).not.toHaveBeenCalled();
   });
 
   it('Bot runtime 只对三元组精确匹配的 native 选择生效', () => {

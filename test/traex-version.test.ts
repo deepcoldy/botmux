@@ -53,6 +53,22 @@ describe('traecli version parsing', () => {
 });
 
 describe('hook-trust flag version gate', () => {
+  it.each([
+    ['0.200.7', false],
+    ['0.200.16', true],
+    ['0.212.1', true],
+  ])('uses the same version gate for the RPC viewer on %s', (version, supported) => {
+    const fake = fakeTraecli(`rpc-${version}`, `traecli ${version}`);
+    const adapter = createTraexAdapter(fake.bin);
+    const args = adapter.buildArgs({
+      sessionId: 's', resume: true, bypassHookTrust: true,
+      remoteWsUrl: 'ws://127.0.0.1:9999', remoteThreadId: 'native',
+    });
+    expect(args.includes(HOOK_TRUST)).toBe(supported);
+    if (supported) expect(args.indexOf(HOOK_TRUST)).toBeLessThan(args.indexOf('--remote'));
+    expect(fake.calls()).toBe(1);
+  });
+
   it('leaves the flag out for a release older than 0.200.16 and reports why', () => {
     const { bin } = fakeTraecli('old', 'traecli 0.200.7');
     const { args, notice } = launch(bin);

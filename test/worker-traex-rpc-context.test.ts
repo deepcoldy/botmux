@@ -289,6 +289,11 @@ function engageHarness(opts: {
     rpcEngagementFence: { begin: () => 1, isCurrent: () => true, isLive: () => true, markDead: noop },
     cliSpawnGeneration: 1,
     createCliAdapterSync: () => ({ resolvedBin: '/bin/traex' }),
+    // RPC hook-trust gating (PR #3515): the engine reads the global toggle and
+    // probes the CLI version during engageCodexRpc. Stub both so the harness does
+    // not exec the fake resolvedBin and keeps a deterministic supported verdict.
+    config: { bypassCodexHookTrust: true },
+    probeTraexHookTrustSupport: () => ({ status: 'supported' as const }),
     buildSessionChildEnv: () => ({}),
     prependBotmuxBin: (_dir: string, path: string | undefined) => path,
     resolveBotmuxWrapperBinDir: () => '/bin',
