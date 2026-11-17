@@ -431,7 +431,7 @@ import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './serv
 import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { traexRejectedArgument } from './adapters/cli/traex-version.js';
+import { probeTraexHookTrustSupport, traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import {
   readRunningExeIdentity,
@@ -696,6 +696,12 @@ import { programStatusBlockHoldsTypeAhead, programStatusEnabledForLaunch, startu
 import { shouldFenceTraexStartupInput, traexStartupInputReady } from './core/traex-startup-input.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
+import {
+  BusyReadyDeferralTracker,
+  BusyReadyLogThrottle,
+  shouldRearmBusyProbeAfterSettleAbort,
+  type PromptReadySkipReason,
+} from './utils/busy-ready-deferral.js';
 import {
   ClaudeTranscriptTurnEnd,
   claudeTranscriptLatestTurnState,
@@ -1739,6 +1745,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
+      bypassHookTrust: cfg.cliId === 'traex'
+        && cfg.disableCliBypass !== true
+        && config.bypassCodexHookTrust
+        && probeTraexHookTrustSupport(cliBin).status !== 'unsupported',
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
@@ -3114,6 +3124,22 @@ const busyReadyFallbackGate = new BusyReadyFallbackGate(() => ({
   stableScreenMs: BUSY_STABLE_SCREEN_MS,
 }));
 let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * True while this worker is withholding a prompt-ready because a busy signal
+ * (db session state or the authoritative viewport) still says the CLI is
+ * working. Drives the settle-abort re-arm and the `turn_terminal` release.
+ */
+const busyReadyDeferral = new BusyReadyDeferralTracker();
+/** One WARN per skip reason+turn; distinct reasons are spaced 30s apart. */
+const busyReadyLogThrottle = new BusyReadyLogThrottle();
+/**
+ * Narrow bypass used only by the `turn_terminal` recovery: the terminal has
+ * already proven the exact attempt is over, so only the argv-turn-start
+ * gate may be overridden for exactly one markPromptReady()
+ * call. Every input-safety gate (composer write in flight, input quarantine,
+ * ready gate, startup hold, …) still applies.
+ */
+let forceReadyAfterTurnTerminal = false;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 /** This worker re-attached a CLI that survived the previous worker, and that
  *  CLI has not reached a prompt under this worker yet. While set, an absent
@@ -21323,10 +21349,16 @@ function holdForNativeSessionFork(): boolean {
 }
 
 function markPromptReady(): void {
-  if (workerSessionEventScope && !hasCurrentSessionRuntime()) return;
+  if (workerSessionEventScope && !hasCurrentSessionRuntime()) {
+    warnPromptReadySkipped('turn-authority-missing');
+    return;
+  }
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
-  if (idleDetector?.isStartupPending()) return;
+  if (idleDetector?.isStartupPending()) {
+    warnPromptReadySkipped('startup-pending');
+    return;
+  }
   if (traexNativeStartupInputIsPending()) {
     if (!traexNativeStartupHoldLogged) {
       traexNativeStartupHoldLogged = true;
@@ -21416,7 +21448,10 @@ function markPromptReady(): void {
     idleDetector?.reset();
     return;
   }
-  if (holdForNativeSessionFork()) return;
+  if (holdForNativeSessionFork()) {
+    warnPromptReadySkipped('native-session-fork-hold');
+    return;
+  }
   stopBusyPatternIdleProbe();
   // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
   // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
@@ -21487,7 +21522,7 @@ function markPromptReady(): void {
   // delivered the moment evidence appears (the transcript latch re-kicks, a
   // busy-marker latch implies a later quiescence edge) or by the 90s
   // fail-open.
-  if (spawnArgvTurnStartGateHolds()) {
+  if (spawnArgvTurnStartGateHolds() && !forceReadyAfterTurnTerminal) {
     log('Argv-baked first prompt has not visibly started (no busy marker or transcript user event since spawn) — re-arming idle detector');
     idleDetector?.reset();
     scheduleSpawnArgvTurnStartFailOpen();
@@ -21511,7 +21546,12 @@ function markPromptReady(): void {
     // blocked until turn_completed so they cannot publish idle mid-turn.
     const remainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
-    log('Ignoring prompt-ready heuristic while a structured turn is unfinished or submit verification/start is pending');
+    // Keep the historical phrase (integration fixtures match it) and append
+    // the machine-readable reason the skip happened.
+    const skipReason = remainingMs !== undefined ? 'submit-verification-pending' : 'structured-turn-unfinished';
+    if (busyReadyLogThrottle.shouldLog(skipReason, currentBotmuxTurnId)) {
+      log(`WARN Ignoring prompt-ready heuristic while a structured turn is unfinished or submit verification/start is pending (reason=${skipReason})`);
+    }
     idleDetector?.reset();
     if (remainingMs !== undefined) scheduleStructuredStartGraceRecheck(remainingMs);
     flushQueuedInputAfterTurnStartEvidence();
@@ -21562,6 +21602,9 @@ function markPromptReady(): void {
   // idle throughout. Before any flush below: a submit's reset() disarms it.
   idleDetector?.adoptPromptReady();
   isPromptReady = true;
+  // A published ready edge ends any busy-marker deferral episode it outlived.
+  busyReadyDeferral.clear('prompt-ready');
+  cancelTurnTerminalReadyRecovery();
   reattachOpenTurnGate = false;
   promptReadyEdges++;
   judgeClaudeBridgeTurn();
@@ -25122,6 +25165,23 @@ function viewportShowsIdlePrompt(be: SessionBackend): boolean {
 function cliProcessAliveProbe(be: SessionBackend): () => boolean | undefined {
   return () => cliProcessAliveFromBackend(be);
 }
+/** Record that prompt-ready is being withheld by a busy signal. */
+function deferBusyReady(reason: 'busy-marker' | 'db-busy', source: string): void {
+  busyReadyDeferral.defer({
+    reason,
+    source,
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+  });
+}
+
+/** Throttled WARN for a prompt-ready publication that was skipped. The detail
+ *  is a caller label only — never prompt text, tokens or filesystem paths. */
+function warnPromptReadySkipped(reason: PromptReadySkipReason, detail?: string): void {
+  if (!busyReadyLogThrottle.shouldLog(reason, currentBotmuxTurnId)) return;
+  log(`WARN prompt-ready suppressed (reason=${reason}${detail ? `; ${detail}` : ''})`);
+}
+
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   if (traexQuestionHoldsIdle(source, be)) {
     scheduleBusyPatternIdleProbe(source);
@@ -25135,7 +25195,8 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
     getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
       ? () => captureBackendScreen(be) : undefined,
   })) {
-    log(`${source}: session state indicates active work (db busy); deferring prompt ready`);
+    deferBusyReady('db-busy', source);
+    log(`${source}: session state indicates active work (db busy); deferring prompt ready (reason=deferred-session-busy)`);
     idleDetector?.reset();
     scheduleBusyPatternIdleProbe(source);
     return true;
@@ -25144,7 +25205,8 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
   try {
     const content = captureBackendScreen(be);
     if (!content || !cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
-    log(`${source}: authoritative viewport still shows busy marker; deferring prompt ready`);
+    deferBusyReady('busy-marker', source);
+    log(`${source}: authoritative viewport still shows busy marker; deferring prompt ready (reason=deferred-busy-marker)`);
     idleDetector?.reset();
     scheduleBusyPatternIdleProbe(source);
     return true;
@@ -25175,12 +25237,36 @@ function reattachedTurnStillOpen(source: string): boolean {
   return true;
 }
 
+/** Re-arm the busy probe when an async settle aborted *and* a real deferral is
+ *  active. Adopt-idle / screen-idle probe callers never defer, so they gain no
+ *  polling loop here. */
+function handleBusyProbeSettleAbort(
+  source: string,
+  be: SessionBackend,
+  outcome: { settleProceeded: boolean; revisionChanged: boolean },
+): void {
+  if (backend !== be) return;
+  if (!shouldRearmBusyProbeAfterSettleAbort({
+    deferralActive: busyReadyDeferral.active,
+    promptReady: isPromptReady,
+    settleProceeded: outcome.settleProceeded,
+    revisionChanged: outcome.revisionChanged,
+  })) return;
+  warnPromptReadySkipped('settle-aborted', `${source}: busy probe settle aborted; re-arming`);
+  scheduleBusyPatternIdleProbe(source);
+}
+
 function probeBusyPatternIdle(
   source: string,
   be: SessionBackend,
   opts: { requireReadyPattern?: boolean } = {},
 ): boolean {
   if (traexQuestionHoldsIdle(source, be)) return false;
+  const probeGeneration = cliSpawnGeneration;
+  const probeTurnId = currentBotmuxTurnId;
+  const probeAttempt = currentBotmuxDispatchAttempt;
+  const ownsProbe = () => backend === be && cliSpawnGeneration === probeGeneration
+    && currentBotmuxTurnId === probeTurnId && currentBotmuxDispatchAttempt === probeAttempt;
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
@@ -25211,7 +25297,13 @@ function probeBusyPatternIdle(
       if (reattachedTurnStillOpen(source)) return false;
       if (!be.settleCurrentScreen) {
         log(`${source} idle probe: busy marker absent, marking prompt ready`);
-        markPromptReady();
+        markPromptReadyFromBusyProbe(be);
+        // Publication can still be refused by an input-safety gate (the argv
+        // first-turn-start gate, a quarantine, …). Re-arm the probe explicitly
+        // in that case and keep reporting "taken over": the first-prompt
+        // timeout must not fall through to flushPending() and write queued
+        // input into a CLI whose own gate just withheld readiness.
+        if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
         return true;
       }
 
@@ -25223,15 +25315,26 @@ function probeBusyPatternIdle(
       const revisionBeforeSettle = backendScreenRevision;
       log(`${source} idle probe: busy marker absent, settling authoritative screen before prompt ready`);
       void settleBackendScreenBeforeIdle(be, revisionBeforeSettle).then((settle) => {
-        if (!settle.proceed || backend !== be || isPromptReady) return;
+        if (!ownsProbe()) return;
+        if (!settle.proceed || isPromptReady) {
+          // An aborted settle used to end the only retry chain. Re-arm while a
+          // real busy-marker deferral still owns readiness.
+          handleBusyProbeSettleAbort(source, be, {
+            settleProceeded: settle.proceed,
+            revisionChanged: backendScreenRevision !== revisionBeforeSettle,
+          });
+          return;
+        }
         if (backendScreenRevision !== revisionBeforeSettle) {
           log(`${source} idle probe: authoritative screen changed during settle; deferring completion`);
+          handleBusyProbeSettleAbort(source, be, { settleProceeded: true, revisionChanged: true });
           return;
         }
         if (settle.degraded) {
           log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
         }
-        markPromptReady();
+        markPromptReadyFromBusyProbe(be);
+        if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
       });
       return true;
     } catch (err: any) {
@@ -25240,21 +25343,33 @@ function probeBusyPatternIdle(
   } else if (cliAdapter?.isSessionBusy) {
     if (!be.settleCurrentScreen) {
       log(`${source} idle probe: session state store no longer busy, marking prompt ready`);
-      markPromptReady();
+      markPromptReadyFromBusyProbe(be);
+      // Same takeover contract as the busy-marker branch above: a refused
+      // publication re-arms the probe but never lets callers flush through.
+      if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
       return true;
     }
     const revisionBeforeSettle = backendScreenRevision;
     log(`${source} idle probe: session state store no longer busy, settling authoritative screen before prompt ready`);
     void settleBackendScreenBeforeIdle(be, revisionBeforeSettle).then((settle) => {
-      if (!settle.proceed || backend !== be || isPromptReady) return;
+      if (!ownsProbe()) return;
+      if (!settle.proceed || isPromptReady) {
+        handleBusyProbeSettleAbort(source, be, {
+          settleProceeded: settle.proceed,
+          revisionChanged: backendScreenRevision !== revisionBeforeSettle,
+        });
+        return;
+      }
       if (backendScreenRevision !== revisionBeforeSettle) {
         log(`${source} idle probe: authoritative screen changed during settle; deferring completion`);
+        handleBusyProbeSettleAbort(source, be, { settleProceeded: true, revisionChanged: true });
         return;
       }
       if (settle.degraded) {
         log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
       }
-      markPromptReady();
+      markPromptReadyFromBusyProbe(be);
+      if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
     });
     return true;
   }
@@ -25299,10 +25414,15 @@ function scheduleBusyPatternIdleProbe(source: string): void {
     if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
   }
 
+  const probeBackend = backend;
+  const probeGeneration = cliSpawnGeneration;
+  const probeTurnId = currentBotmuxTurnId;
+  const probeAttempt = currentBotmuxDispatchAttempt;
   const tick = () => {
     busyPatternIdleProbeTimer = null;
-    if (!backend || isPromptReady) return;
-    if (probeBusyPatternIdle(source, backend)) return;
+    if (backend !== probeBackend || cliSpawnGeneration !== probeGeneration || isPromptReady
+      || currentBotmuxTurnId !== probeTurnId || currentBotmuxDispatchAttempt !== probeAttempt) return;
+    if (probeBusyPatternIdle(source, backend, { requireReadyPattern: awaitingFirstPrompt })) return;
     if (!isPromptReady) {
       if (maybeForceReadyOnStaleBusyMarker(source, backend)) return;
       busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);
@@ -25355,7 +25475,11 @@ function maybeForceReadyOnStaleBusyMarker(source: string, be: SessionBackend): b
   log(`${source}: busy marker lingered past the bounded fallback window with the composer visible `
     + 'and the screen frozen; releasing prompt ready');
   busyReadyFallbackGate.reset();
-  markPromptReady();
+  markPromptReadyFromBusyProbe(be);
+  // The bounded fallback only fires on positive composer evidence; if an
+  // input-safety gate still refuses, keep the probe chain alive and preserve
+  // the "taken over" return contract for the tick / timeout callers.
+  if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
   return true;
 }
 
@@ -32233,6 +32357,8 @@ function killCli(opts: {
   if (traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
+  cancelTurnTerminalReadyRecovery();
+  busyReadyDeferral.reset();
   stopStructuredStartGraceRecheck();
   stopSpawnArgvTurnStartFailOpen();
   spawnArgvTurnStartBusyScanTail = '';
@@ -35886,6 +36012,52 @@ function turnFailureScreen(): string | undefined {
   try { return captureBackendScreen(backend); } catch { return undefined; }
 }
 
+// An exact terminal may release only the argv-start heuristic, never a live
+// structured turn, DB busy, composer safety or the frozen-screen bound.
+let turnTerminalReadyRecovery: {
+  turnId: string;
+  dispatchAttempt?: number;
+  backend: SessionBackend;
+  generation: number;
+} | null = null;
+
+function cancelTurnTerminalReadyRecovery(): void {
+  turnTerminalReadyRecovery = null;
+}
+
+function markPromptReadyFromBusyProbe(be: SessionBackend): void {
+  const recovery = turnTerminalReadyRecovery;
+  forceReadyAfterTurnTerminal = !!recovery && recovery.backend === be
+    && backend === be && recovery.generation === cliSpawnGeneration
+    && recovery.turnId === currentBotmuxTurnId
+    && recovery.dispatchAttempt === currentBotmuxDispatchAttempt;
+  try { markPromptReady(); } finally { forceReadyAfterTurnTerminal = false; }
+}
+
+/** Re-drive the existing fenced probe chain. Keep the deferral alive until
+ * readiness is actually published: an async settle being started is NOT a
+ * ready edge, and a declined settle must still have an owner that retries it. */
+function recoverDeferredPromptReadyAtTurnTerminal(input: {
+  turnId: string;
+  dispatchAttempt?: number;
+}): void {
+  try {
+    if (!backend || isPromptReady) return;
+    if (input.turnId !== currentBotmuxTurnId
+      || input.dispatchAttempt !== currentBotmuxDispatchAttempt) return;
+    if (!busyReadyDeferral.active && !awaitingFirstPrompt) return;
+    turnTerminalReadyRecovery = { ...input, backend, generation: cliSpawnGeneration };
+    if (!busyReadyDeferral.active) {
+      busyReadyDeferral.defer({ ...input, reason: 'settle-aborted', source: 'turn-terminal' });
+    }
+    const source = `${cliName()} turn-terminal`;
+    scheduleBusyPatternIdleProbe(source);
+    probeBusyPatternIdle(source, backend, { requireReadyPattern: awaitingFirstPrompt });
+  } catch (err: any) {
+    log(`turn-terminal deferred prompt-ready recovery failed: ${err.message}`);
+  }
+}
+
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
  *  runners may surface the same final boundary more than once. */
@@ -35979,6 +36151,9 @@ function emitTurnTerminal(
       return true;
     });
   } else send(terminal);
+  // After the terminal is on the wire, re-drive the exact attempt's busy
+  // deferral through the fenced readiness probe. Never force a live composer.
+  recoverDeferredPromptReadyAtTurnTerminal({ turnId, dispatchAttempt });
   let wakePending = false;
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -38501,6 +38676,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
+      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -38513,6 +38689,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
+      }
+      try {
+        await closeRpcEngine?.stopAndWait();
+      } catch (error) {
+        log(`Local close RPC teardown failed: ${String(error)}`);
+        process.exit(1);
+        return;
       }
       stopOwnedSessionScope('close');
       killCli();
@@ -38891,7 +39074,17 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
+let parentExitShutdown: Promise<void> | undefined;
+
 function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
+  parentExitShutdown ??= shutdownWorkerForParentExitImpl(reason, exitCode).catch(error => {
+    log(`Parent-exit RPC teardown failed: ${String(error)}`);
+    cleanup();
+    process.exit(1);
+  });
+}
+
+async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Promise<void> {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -38908,6 +39101,7 @@ function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
     process.exit(exitCode);
     return;
   }
+  await codexRpcEngine?.stopAndWait();
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
   // this exit (backend.kill() only detaches) and still runs against its
   // per-session tree: the relay outbox is bound into it by inode, and a scratch

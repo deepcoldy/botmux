@@ -29,6 +29,7 @@ import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallb
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
+import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
@@ -112,6 +113,8 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
     if (key === 'traexCatalogEmptyNoticeTurns') return scope.traexCatalogEmptyNoticeTurns ??= new WeakMap();
     if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
+    if (key === 'busyReadyDeferral') return scope.busyReadyDeferral ??= new BusyReadyDeferralTracker();
+    if (key === 'busyReadyLogThrottle') return scope.busyReadyLogThrottle ??= new BusyReadyLogThrottle();
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
     if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;
     if (key === 'traexAutoModelPolicyKey') return traexAutoModelPolicyKey;
@@ -126,7 +129,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
-    if (typeof key === 'string' && ['traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

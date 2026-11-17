@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { CodexProfileCatalog } from '../../services/codex-profiles.js';
 import { DropdownField } from './field-controls.js';
 import { useT } from './react-hooks.js';
+import { afterNextPaint } from './deferred-task.js';
 
 export function CodexProfilePicker(props: {
   appId: string; contextKey: unknown; value: string; disabled?: boolean; launchChanged?: boolean;
@@ -15,7 +16,8 @@ export function CodexProfilePicker(props: {
   useEffect(() => {
     let stale = false;
     const abort = new AbortController();
-    fetch(`/api/bots/${encodeURIComponent(props.appId)}/codex-profiles`, { signal: abort.signal })
+    const cancel = afterNextPaint(() => {
+      void fetch(`/api/bots/${encodeURIComponent(props.appId)}/codex-profiles`, { signal: abort.signal })
       .then(async response => {
         if (!response.ok) throw new Error('scan_failed');
         const body = await response.json();
@@ -24,7 +26,8 @@ export function CodexProfilePicker(props: {
       }).catch(() => {
         if (!stale) setLoaded({ key, catalog: { status: 'scan_failed', candidates: [], error: 'scan_failed' } });
       });
-    return () => { stale = true; abort.abort(); };
+    });
+    return () => { stale = true; cancel(); abort.abort(); };
   }, [key]);
   const missing = !!props.value && !!catalog && !catalog.candidates.some(p => p.name === props.value && p.available);
   // Catalog-level failures carry a machine code; show a localized reason while
