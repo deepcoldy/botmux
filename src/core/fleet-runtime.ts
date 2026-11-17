@@ -558,9 +558,9 @@ export function startBotViaSupervisor(
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start', name: spec.name };
   }
   // Already online+alive? No-op.
-  const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
+  const existing = readFleetStatus().rows.find((r) => r.appId === spec.appId && r.status === 'online' && r.alive);
   if (existing && existing.status === 'online' && existing.alive) {
-    return { ok: true, state: 'already-online', name: spec.name };
+    return { ok: true, state: 'already-online', name: existing.name };
   }
   enqueueFleetCommand(fleetCommandPath(), {
     id: idFactory(), op: 'start-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
@@ -568,9 +568,16 @@ export function startBotViaSupervisor(
   if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP')) {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
-  const health = waitFleetOnline([spec.name], timeoutMs);
-  if (health.healthy) return { ok: true, state: 'started', name: spec.name };
-  return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内上线`, name: spec.name };
+  // The supervisor may retain a pre-rename handle. Wait for the stable app
+  // identity instead of timing out after a successful, deduplicated start.
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    const status = readFleetStatus();
+    const online = status.supervisorAlive && status.rows.find(r => r.appId === spec.appId && r.status === 'online' && r.alive);
+    if (online) return { ok: true, state: 'started', name: online.name };
+    if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内上线`, name: spec.name };
+    sleepSyncMs(250);
+  }
 }
 
 /**
@@ -591,7 +598,7 @@ export function stopBotViaSupervisor(
   if (!supervisorTarget) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
   }
-  const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
+  const existing = readFleetStatus().rows.filter((r) => r.appId === spec.appId);
   // Short-circuit as already-stopped ONLY when the bot is genuinely at rest with
   // no supervisor-side work pending: absent, 'stopped' (pid 0), or 'errored'
   // (parked, no restart timer). A 'launching' bot is mid-crash-backoff — the
@@ -600,7 +607,7 @@ export function stopBotViaSupervisor(
   // reappears ~200ms later. 'online' (with or without a live pid) likewise needs
   // the supervisor to act. In all those cases we must enqueue + SIGHUP so the
   // supervisor's stopOneBot cancels the timer and marks it stopped authoritatively.
-  const atRest = !existing || existing.status === 'stopped' || existing.status === 'errored';
+  const atRest = existing.every(r => r.status === 'stopped' || r.status === 'errored');
   if (atRest) {
     return { ok: true, state: 'already-stopped', name: spec.name };
   }
@@ -615,8 +622,8 @@ export function stopBotViaSupervisor(
   // (or the restart timer hasn't been cancelled yet), so keep waiting.
   const deadline = Date.now() + Math.max(0, timeoutMs);
   for (;;) {
-    const row = readFleetStatus().rows.find((r) => r.name === spec.name);
-    if (!row || row.status === 'stopped' || row.status === 'errored') return { ok: true, state: 'stopped', name: spec.name };
+    const rows = readFleetStatus().rows.filter((r) => r.appId === spec.appId);
+    if (rows.every(r => r.status === 'stopped' || r.status === 'errored')) return { ok: true, state: 'stopped', name: spec.name };
     if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内停止`, name: spec.name };
     sleepSyncMs(150);
   }

@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync } from 'node:fs';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { spawn, ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -96,6 +96,97 @@ async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 }
 
 describe('FleetSupervisor (live, integration)', () => {
+  it('addresses a renamed bot by App ID even when its requested name belongs to a peer', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      sup.start(bots);
+      const peerPid = readFleetState(statePath)!.procs.find(p => p.appId === bots[1].appId)!.pid;
+      await sup.drainCommands([{ id: 'stop', op: 'stop-bot', name: bots[1].name, appId: bots[0].appId, botIndex: 0, at: 'T' }]);
+      expect(readFleetState(statePath)!.procs.find(p => p.appId === bots[0].appId)!.status).toBe('stopped');
+      expect(pidAlive(peerPid)).toBe(true);
+      sup.startOneBot({ name: bots[1].name, appId: 'cli_copy', botIndex: 2 });
+      expect(readFleetState(statePath)!.procs.filter(p => p.status === 'online')).toHaveLength(1);
+      expect(pidAlive(peerPid)).toBe(true);
+    } finally { await sup.stopAll(); }
+  });
+
+  it.each([false, true])('deduplicates maintenance-deferred aliases and honors stop=%s before admission', async (stop) => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const data = join(root, 'data'); mkdirSync(data);
+    const marker = join(data, 'feedback-maintenance.json');
+    writeFileSync(marker, JSON.stringify({ migrationId: 'test', state: 'frozen', generation: 1, participants: [], blockers: [] }));
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: { SESSION_DATA_DIR: data }, cwd: root, log: () => {} });
+    sup.start([]);
+    vi.useFakeTimers();
+    try {
+      sup.startOneBot(bots[0]);
+      sup.startOneBot({ ...bots[0], name: 'botmux-renamed' });
+      sup.start([{ ...bots[0], name: 'botmux-reconciled' }]);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(readFleetState(statePath)!.procs).toMatchObject([{ appId: bots[0].appId, status: 'launching', pid: 0 }]);
+      if (stop) await sup.drainCommands([{ id: 'stop', op: 'stop-bot', name: 'botmux-renamed', appId: bots[0].appId, botIndex: 0, at: 'T' }]);
+      unlinkSync(marker);
+      vi.advanceTimersByTime(1000);
+      expect(readFleetState(statePath)!.procs.filter(p => p.status === 'online')).toHaveLength(stop ? 0 : 1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); await sup.stopAll(); }
+  });
+
+  it('keeps one daemon across a rename, while a copy with a new App ID starts independently', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      sup.start([bots[0]]);
+      const pid = readFleetState(statePath)!.procs[0].pid;
+      await sup.drainCommands([{ id: 'rename', op: 'start-bot', name: 'botmux-renamed', appId: bots[0].appId, botIndex: 0, at: 'T' }]);
+      const rows = readFleetState(statePath)!.procs.filter(p => p.status === 'online');
+      expect(rows).toHaveLength(1);
+      expect(rows[0].pid).toBe(pid);
+      sup.startOneBot({ name: 'botmux-copy', appId: 'cli_copy', botIndex: 2 });
+      expect(readFleetState(statePath)!.procs.filter(p => p.status === 'online')).toHaveLength(2);
+      await sup.drainCommands([{ id: 'stop-renamed', op: 'stop-bot', name: 'botmux-renamed', appId: bots[0].appId, botIndex: 0, at: 'T' }]);
+      expect(pidAlive(pid)).toBe(false);
+      expect(readFleetState(statePath)!.procs.filter(p => p.status === 'online').map(p => p.appId)).toEqual(['cli_copy']);
+    } finally { await sup.stopAll(); }
+  });
+
+  it('reconciles changed names and duplicate App IDs without losing the original child', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      sup.start([bots[0]]);
+      const pid = readFleetState(statePath)!.procs[0].pid;
+      sup.start([{ ...bots[0], name: 'botmux-renamed' }, { ...bots[0], name: 'botmux-alias' }]);
+      expect(readFleetState(statePath)!.procs.filter(p => p.status === 'online')).toMatchObject([{ pid, appId: bots[0].appId }]);
+      expect(readFleetState(statePath)!.procs).toHaveLength(1);
+    } finally { await sup.stopAll(); }
+  });
+
+  it('renamed start during crash backoff cancels the previous restart timer', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 60_000 }, log: () => {} });
+    try {
+      sup.start([bots[0]]);
+      const oldPid = readFleetState(statePath)!.procs[0].pid;
+      process.kill(oldPid, 'SIGKILL');
+      expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'launching')).toBe(true);
+      sup.startOneBot({ ...bots[0], name: 'botmux-renamed' });
+      const rows = readFleetState(statePath)!.procs;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ appId: bots[0].appId, status: 'online' });
+      expect(rows[0].pid).not.toBe(oldPid);
+      await sup.drainCommands([{ id: 'stop', op: 'stop-bot', name: 'botmux-renamed', appId: bots[0].appId, botIndex: 0, at: 'T' }]);
+      expect(readFleetState(statePath)!.procs.every(p => p.status === 'stopped')).toBe(true);
+    } finally { await sup.stopAll(); }
+  });
+
   it('does not forget a live external member when signalling fails', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');

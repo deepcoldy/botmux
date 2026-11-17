@@ -154,6 +154,22 @@ export class FleetSupervisor {
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
   }
 
+  /** Process names can change after setup/clone. Keep an active daemon's name
+   * as its handle until it stops; App ID owns identity, including crash backoff.
+   * Dashboard/plugin members have separate identities and must not coalesce. */
+  private resolveDaemonSpec(spec: FleetBotSpec): FleetBotSpec {
+    if (spec.external || (spec.entry ?? 'daemon') !== 'daemon' || !spec.appId) return spec;
+    // Maintenance admission can defer the very first spawn before any state
+    // row exists. Its in-memory timer still owns this App ID.
+    const pending = [...this.knownSpecs.values()].find(p => p.appId === spec.appId
+      && !p.external && (p.entry ?? 'daemon') === 'daemon'
+      && (this.children.has(p.name) || this.restartTimers.has(p.name)));
+    if (pending) return { ...spec, name: pending.name };
+    const active = (readFleetState(this.opts.statePath)?.procs ?? []).find(p =>
+      p.appId === spec.appId && (p.status === 'online' || p.status === 'launching'));
+    return active ? { ...spec, name: active.name } : spec;
+  }
+
   /** Start (or reconcile) the fleet: spawn every configured bot not already
    *  alive. Idempotent — an already-live child (per state + kill -0) is left be.
    *  This is both the initial start and the resurrect path.
@@ -167,10 +183,19 @@ export class FleetSupervisor {
       this.log(`fleet is owned by live supervisor pid ${owner}; not starting a second one`);
       return false;
     }
-    const specByName = new Map(bots.map((b) => [b.name, b]));
+    const specByName = new Map<string, FleetBotSpec>();
+    const daemonApps = new Set<string>();
+    for (const input of bots) {
+      const spec = this.resolveDaemonSpec(input);
+      if (!spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId) {
+        if (daemonApps.has(spec.appId)) continue;
+        daemonApps.add(spec.appId);
+      }
+      specByName.set(spec.name, spec);
+    }
     // Remember the spec set so queued start-bot/stop-bot can resolve name→spec.
     this.knownSpecs.clear();
-    for (const b of bots) this.knownSpecs.set(b.name, b);
+    for (const b of specByName.values()) this.knownSpecs.set(b.name, b);
     // A full fleet start clears any explicit-stop marks — `botmux start` means
     // "bring everything up", overriding a prior single-bot stop.
     this.explicitStop.clear();
@@ -268,7 +293,7 @@ export class FleetSupervisor {
     const toStart = planStart([...specByName.keys()], current, (p) => p.status === 'online' && pidAlive(p.pid));
     for (const name of toStart) {
       const spec = specByName.get(name);
-      if (spec) this.spawnBot(spec, /* isRestart */ false);
+      if (spec) this.startOneBot(spec);
     }
     return true;
   }
@@ -334,6 +359,13 @@ export class FleetSupervisor {
    *  clears any explicit-stop mark (an explicit start overrides a prior stop). */
   startOneBot(spec: FleetBotSpec): void {
     if (this.stopping) return;
+    spec = this.resolveDaemonSpec(spec);
+    const occupant = this.knownSpecs.get(spec.name);
+    if (occupant && occupant.appId !== spec.appId
+      && (this.children.has(spec.name) || this.restartTimers.has(spec.name))) {
+      this.log(`start-bot ${spec.name}: name belongs to another active App ID`);
+      return;
+    }
     this.knownSpecs.set(spec.name, spec);
     this.explicitStop.delete(spec.name);
     // Cancel any pending crash-restart timer FIRST (mirrors stopOneBot). A bot
@@ -420,11 +452,17 @@ export class FleetSupervisor {
       // member in knownSpecs, so use that and fall back to the payload only for
       // a name we have never seen.
       const known = this.knownSpecs.get(cmd.name);
-      const spec: FleetBotSpec = known ?? { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
+      const spec: FleetBotSpec = known?.appId === cmd.appId ? known : { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
       if (cmd.op === 'start-bot') {
         this.startOneBot(spec);
       } else {
-        await this.stopOneBot(cmd.name);
+        // A renamed bot may still run under its previous handle. Include all
+        // aliases so an operator can also retire duplicates from older builds.
+        const aliases = !spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId
+          ? [...(readFleetState(this.opts.statePath)?.procs ?? []), ...this.knownSpecs.values()]
+            .filter(p => p.appId === spec.appId).map(p => p.name)
+          : [cmd.name];
+        for (const name of new Set(aliases)) await this.stopOneBot(name);
       }
     }
   }
@@ -434,6 +472,19 @@ export class FleetSupervisor {
     const entry = spec.entry ?? 'daemon';
     if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
       this.log(`feedback maintenance: deferred ${spec.name}`);
+      // Publish admission before scheduling: stop-bot must see pending work
+      // even when this daemon has never spawned. Preserve crash/generation
+      // history when maintenance overlaps an existing restart.
+      mutateFleetState(this.opts.statePath, cur => {
+        let pending = cur.procs.find(p => p.name === spec.name);
+        if (!pending) {
+          pending = freshProc(spec.name, spec.appId, 0, new Date().toISOString());
+          cur.procs.push(pending);
+        }
+        pending.status = 'launching';
+        pending.pid = 0;
+        return cur;
+      });
       const timer = setTimeout(() => {
         this.restartTimers.delete(spec.name);
         this.spawnBot(spec, isRestart);
