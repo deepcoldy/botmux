@@ -688,10 +688,10 @@ async function applyConfigFieldInternal(
     if (spec.configKey === 'cliId' && !isCodexServiceTierCliId(nextCliId)) {
       delete entry.serviceTier;
     }
-    // The pane-argv budget applies to the legacy /botconfig env / envUnset
-    // writes too — an oversized layer makes every new tmux session of this bot
-    // fail deterministically ("command too long"). Shrinking (including clear)
-    // stays allowed so an already-oversized layer can always be cleaned up.
+    // Legacy /botconfig env / envUnset writes share the retained layer budget.
+    // Private pane-launch files removed the old deterministic tmux failure, but
+    // keep shrinking (including clear) allowed so an already-oversized legacy
+    // layer can always be cleaned up.
     if (prevEnvLayer && !envLayerWithinBudget(prevEnvLayer, botEnvLayer(entry))) {
       return { write: false, result: 'layer_too_large' };
     }

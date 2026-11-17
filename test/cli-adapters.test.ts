@@ -2237,11 +2237,10 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // OpenCode bakes the full first-round prompt into `--prompt <content>`.
-    // tmux new-session rejects long command strings well below OS ARG_MAX,
-    // so the adapter must declare a byte budget: short prompts keep --prompt,
-    // over-limit prompts defer to the post-start input queue.
+    // Keep the historical byte budget so short prompts retain --prompt while
+    // over-budget prompts retain the post-start input queue.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
@@ -3055,7 +3054,7 @@ describe('mtr buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
