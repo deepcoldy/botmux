@@ -584,7 +584,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const [ready] = queue.drainEmittable();
       expect(ready?.finalText).toBe(body);
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_gallery');
-      sessionReply.mockRejectedValueOnce(new Error('temporary send failure'));
+      let rejectFirst!: (reason: Error) => void;
+      const firstReply = new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
+      sessionReply.mockImplementationOnce(() => firstReply);
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
       ds.adoptedFrom = undefined;
@@ -598,7 +600,14 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(uploadImageMock).toHaveBeenCalledTimes(12);
       paths.forEach(path => rmSync(path));
       await vi.advanceTimersByTimeAsync(30_000);
-      await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_gallery'));
+      // A send rejection can finish its async bookkeeping after the clock
+      // advance. Exercise that ordering explicitly and keep driving retries
+      // while waiting for completion, rather than assuming the timer exists.
+      setTimeout(() => rejectFirst(new Error('temporary send failure')), 400);
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_gallery');
+      }, { timeout: 5_000 });
       expect(sessionReply).toHaveBeenCalledTimes(2);
       expect(uploadImageMock).toHaveBeenCalledTimes(12);
       const card = sessionReply.mock.calls[1][1];
@@ -2571,6 +2580,39 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-grp-2', ok: true })));
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+  });
+
+  it('persists an interrupted Codex App trigger before acknowledging the signed final', async () => {
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({ sessionReply, onTurnTerminal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-codex-app-cancelled';
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.asyncTriggerResults = new Map([['first', { status: 'pending', createdAt: 1 }]]);
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'first', turnId: 'first', dispatchAttempt: 1, state: 'prepared', content: 'first', deliverySink: 'http_async' },
+      { dispatchId: 'next', turnId: 'next', dispatchAttempt: 1, state: 'accepted', content: 'next', deliverySink: 'lark' },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const final = {
+      type: 'final_output', sessionId: ds.session.sessionId, content: '', lastUuid: 'first', turnId: 'first', dispatchAttempt: 1,
+      suppressDelivery: true, codexAppCancelled: true,
+      codexAppSettlement: { requestId: 'stop-first', generation: 'gen-stop', seq: 1, dispatchId: 'first' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>;
+    ds.worker!.emit('message', final);
+    await vi.waitFor(() => expect(ds.worker!.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'stop-first', ok: true })));
+    const { lookup } = await import('../src/services/async-trigger-store.js');
+    expect(lookup(ds.session.sessionId, 'first')?.result.status).toBe('interrupted');
+    expect(onTurnTerminal).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: 'first', status: 'cancelled' }), expect.anything());
+    expect(ds.session.codexAppDispatchLedger).toMatchObject([{ turnId: 'next', state: 'accepted' }]);
+    ds.worker!.emit('message', { ...final, codexAppSettlement: { ...final.codexAppSettlement, requestId: 'replay' } });
+    await vi.waitFor(() => expect(ds.worker!.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'replay', ok: true })));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('HTTP steer: an http_async steer group fans the REAL final out to the superseded member (in-memory + durable, no Lark)', async () => {

@@ -25,6 +25,7 @@ import { logger } from '../utils/logger.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from '../core/cost-calculator.js';
 import { estimateCostCny, type ResolvedModelPricing } from './model-pricing.js';
 import type { DaemonSession } from '../core/types.js';
+import { modelTokenDeltas, normalizeModelTokenUsage, type ModelTokenUsage } from './model-token-usage.js';
 
 export type InputTokenSemantics = 'includes_cache' | 'uncached';
 
@@ -52,6 +53,11 @@ export interface UsageLedgerRecord {
    *  metadata only; usage is billed to the machine owner. */
   callerOpenId?: string;
   model: string;
+  /** Attribution of this delta; a mixed delta has model="". */
+  models?: Array<ModelTokenUsage & { costCny?: number }>;
+  /** Cumulative attribution, committed with the same append as the delta so
+   * restart recovery does not depend on a later state-file write. */
+  modelTotals?: ModelTokenUsage[];
   /** Positive deltas since the previous record of this session. */
   inputTokens: number;
   outputTokens: number;
@@ -97,6 +103,7 @@ interface SessionBaseline {
   /** Bumped on every baseline reset (shrink, explicit anchor) so identical
    *  totals transitions in different epochs get distinct recordIds. */
   epoch?: number;
+  models?: ModelTokenUsage[];
 }
 
 interface LedgerState {
@@ -225,6 +232,10 @@ function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | n
         ...(semanticsPresent ? { inputTokenSemantics: latest.inputTokenSemantics } : {}),
         recordedAt: typeof latest.ts === 'string' ? latest.ts : new Date(0).toISOString(),
         epoch: finiteNum(latest.epoch),
+        models: normalizeModelTokenUsage(latest.modelTotals, {
+          inputTokens: finiteNum(latest.totalInputTokens), outputTokens: finiteNum(latest.totalOutputTokens),
+          cacheReadTokens: finiteNum(latest.totalCacheReadTokens), cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
+        }),
       };
     }
   }
@@ -240,6 +251,7 @@ function newerBaseline(a: SessionBaseline | undefined | null, b: SessionBaseline
   const eb = b.epoch ?? 0;
   if (ea !== eb) return ea > eb ? a : b;
   const sum = (x: SessionBaseline) => x.inputTokens + x.outputTokens + x.cacheReadTokens + x.cacheCreateTokens;
+  if (sum(a) === sum(b) && !a.models && b.models) return b;
   return sum(a) >= sum(b) ? a : b;
 }
 
@@ -345,6 +357,11 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     const state = loadState(dir, args.larkAppId);
     const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId]);
     const cur = args.usage;
+    const models = normalizeModelTokenUsage(cur.models, cur);
+    const previousModels = prev ? normalizeModelTokenUsage(prev.models, prev) : [];
+    // Old aggregate-only baselines cannot identify which model generated the
+    // next delta. Preserve that interval as unknown, then seed exact totals.
+    const deltas = models && previousModels ? modelTokenDeltas(models, previousModels) : undefined;
     const prevEpoch = prev?.epoch ?? 0;
 
     const deltaInput = cur.inputTokens - (prev?.inputTokens ?? 0);
@@ -360,6 +377,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       inputTokenSemantics: 'uncached',
       recordedAt: now.toISOString(),
       epoch: prevEpoch,
+      ...(models ? { models } : {}),
     };
 
     if (deltaInput < 0 || deltaOutput < 0 || deltaCacheRead < 0 || deltaCacheCreate < 0) {
@@ -373,6 +391,11 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       return null;
     }
     if (deltaInput === 0 && deltaOutput === 0 && deltaCacheRead === 0 && deltaCacheCreate === 0) {
+      if (models && !previousModels) {
+        sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
+        state.sessions[args.sessionId] = baseline;
+        saveState(dir, args.larkAppId, state, now);
+      }
       return null;
     }
 
@@ -388,7 +411,8 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
             outputTokens: deltaOutput,
             cacheReadTokens: deltaCacheRead,
             cacheCreateTokens: deltaCacheCreate,
-            model: cur.model,
+            model: models ? (deltas?.length === 1 ? deltas[0].model : '') : cur.model,
+            ...(deltas ? { models: deltas } : {}),
           },
           pricing,
         )
@@ -408,7 +432,12 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       ...(args.title ? { title: args.title } : {}),
       ...(args.workingDir ? { workingDir: args.workingDir } : {}),
       ...(args.callerOpenId ? { callerOpenId: args.callerOpenId } : {}),
-      model: cur.model,
+      model: models ? (deltas?.length === 1 ? deltas[0].model : '') : cur.model,
+      ...(deltas ? { models: deltas.map(delta => {
+        const cost = estimateCostCny(delta, pricing);
+        return { ...delta, ...(cost !== null && Number.isFinite(cost) ? { costCny: cost } : {}) };
+      }) } : {}),
+      ...(models ? { modelTotals: models } : {}),
       inputTokens: deltaInput,
       outputTokens: deltaOutput,
       cacheReadTokens: deltaCacheRead,
@@ -470,6 +499,7 @@ export function anchorSessionUsage(args: RecordSessionUsageArgs): void {
       // Anchors start a new epoch: transitions after a re-anchor must never
       // collide with recordIds from before it.
       epoch: (prev?.epoch ?? 0) + 1,
+      models: normalizeModelTokenUsage(args.usage.models, args.usage),
     };
     sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
     state.sessions[args.sessionId] = baseline;

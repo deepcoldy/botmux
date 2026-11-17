@@ -4,8 +4,6 @@ import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
 import { readOncallBusinessName, readOncallChoices } from '../services/oncall-platform.js';
 import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
-import { isSessionEffortChangeInFlight } from './worker-pool.js';
-import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
@@ -48,7 +46,6 @@ import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflo
 import type { DraftClarifier, WorkflowDraftProjects } from '../workflows/v3/draft-service.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
-import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
@@ -271,7 +268,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -382,7 +379,6 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -7390,7 +7386,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // Mirror the card-button / /resume receipt wording: when the adapter can only
   // resume a precise cliSessionId and none was persisted, the next spawn is a
   // fresh CLI, so say so instead of claiming the old history is back.
-  const notice = resumeSuccessMessage(result, cliName, loc);
+  const notice = resumeSuccessMessage(result, cliName, loc, dshRuntimeForSession(ds));
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
@@ -9068,7 +9064,7 @@ ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, re
   } finally { res.off('close', onClose); }
 }, NOT_BOUND_BODY.okFalse));
 
-/** Generic plugin operation: an explicit scope prevents unrelated personal-group removal. */
+/** Generic plugin operation: managedLabels must be explicit — an array limits removal, null clears all normal groups; omitted is rejected. */
 ipcRoute('PUT', '/api/groups/:chatId/feed-groups', requireBoundBot(async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -13637,7 +13633,24 @@ export function startIpcServer(opts: {
     });
     return {
     port,
-    close: () => new Promise<void>(r => server.close(() => r())),
+    // server.close() only stops accepting: its callback waits for every already
+    // accepted socket to finish. A request whose body we abandoned (the 413
+    // early return resumes the request and answers without reading the rest)
+    // can leave such a socket behind: on Bun 1.4.4, when the client is Bun's
+    // global fetch on a keep-alive connection, it stays open until the runtime
+    // reclaims it about 6 s later, and close() waits all that time (node:http
+    // clients, which every production loopback caller uses, do not leave it).
+    // Tests awaiting close() paid for that; the daemon's teardown does not await
+    // close() and exits explicitly, so shutdown itself was never held up.
+    // Closing every connection before the listener makes close() resolve at
+    // once. It also resets requests still in flight at that moment while their
+    // handlers run on — teardown callers already have to cope with that, since
+    // the daemon can exit mid-request. listen-with-probe's release path tears
+    // sockets down for the same reason.
+    close: () => new Promise<void>(r => {
+      server.closeAllConnections?.();
+      server.close(() => r());
+    }),
   };
   });
 }

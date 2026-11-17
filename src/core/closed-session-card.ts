@@ -110,8 +110,16 @@ export function buildClosedSessionCard(
     runtimeDisplayName,
     // No precise resume command AND the adapter can only resume a precise id:
     // resuming reactivates the route but starts a FRESH session — the card
-    // must not imply history is restored.
-    !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId, sessionId: session.sessionId, workingDir: session.workingDir }),
+    // must not imply history is restored. The runtime toggle is the LIVE bot
+    // value: a `dsh` session runs the dsh-tui adapter when the bot has
+    // dshRuntime='tui', exactly like `dshRuntimeForSession` for the worker.
+    !cliResumeCommand && resumeStartsFresh({
+      cliId: closedCliId,
+      cliSessionId: session.cliSessionId,
+      sessionId: session.sessionId,
+      workingDir: session.workingDir,
+      dshRuntime: botCfg.dshRuntime,
+    }),
     closedCardWorktreeSection(
       worktreeCleanupState,
       !worktreeCleanupState && sessionWorktreeOffer(session) !== undefined,
