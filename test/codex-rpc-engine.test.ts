@@ -246,6 +246,81 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     }
   }, 15_000);
 
+  it.skipIf(process.platform !== 'linux')('refreshes group identity on the FIRST turn ack before any turn/completed event', async () => {
+    const childFile = join(tmpdir(), `rpc-first-turn-${process.pid}-${Date.now()}`);
+    const sid = `first-turn-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    // The tool child appears only after the start()-time identity snapshot, and
+    // the leader is killed before any turn/completed event can fire: the
+    // sendFirstTurn ack path is the last chance to record it.
+    const engine = makeEngine({
+      sessionId: sid,
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '300' },
+    });
+    let leader: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        const tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      const tool = Number(readFileSync(childFile, 'utf8').trim());
+      const recordedPids = () => JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]).members
+        .map((member: { pid: number }) => member.pid);
+      expect(recordedPids()).not.toContain(tool);
+      await engine.startThread();
+      const outcome = await engine.sendFirstTurn('first turn', owner('first-turn-1', 1), async () => false);
+      expect(outcome.outcome).toBe('accepted');
+      expect(recordedPids()).toContain(tool);
+      await engine.stopAndWait();
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 20_000);
+
+  it.skipIf(process.platform !== 'linux')('fails start and keeps the marker when signalling a verified stale group throws', async () => {
+    const childFile = join(tmpdir(), `rpc-eperm-${process.pid}-${Date.now()}`);
+    const sid = `eperm-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    const engine = makeEngine({ sessionId: sid, env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile } });
+    let leader: number | undefined;
+    let tool: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      process.kill(leader, 'SIGKILL');
+      await vi.waitFor(() => expect(isAlive(leader!)).toBe(false));
+      expect(existsSync(marker)).toBe(true);
+      const successor = makeEngine({ sessionId: sid }, {
+        spawnProcess: (command, args, options) => spawn(command, args, options),
+        // Identity is verified first; the subsequent group signal then fails the
+        // way an EPERM would against a peer-owned group. The reaper must fail
+        // closed rather than swallow the error and overwrite the live marker.
+        killProcessGroup: () => {
+          const error = new Error('kill Eperm') as Error & { code?: string };
+          error.code = 'EPERM';
+          throw error;
+        },
+      });
+      await expect(successor.start()).rejects.toThrow(/EPERM|Eperm/);
+      // No second app-server was spawned and the orphan's marker is retained.
+      expect(successor.appServerPid).toBeUndefined();
+      expect(Number(readFileSync(marker, 'utf8').split('\n')[0])).toBe(leader);
+      expect(isAlive(tool!) && !isLinuxZombie(tool!)).toBe(true);
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 15_000);
+
   it('passes the permitted hook-trust flag before the app-server subcommand', async () => {
     const launches: string[][] = [];
     const engine = makeEngine({ bypassHookTrust: true }, {

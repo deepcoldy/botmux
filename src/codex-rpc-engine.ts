@@ -630,6 +630,11 @@ export class CodexRpcEngine {
         () => { dispatched = true; },
         identity,
       );
+      // Mirror sendTurn(): a tool child spawned before this ack is only provable
+      // as this group's while the leader is alive. Snapshot now so a leader crash
+      // before the turn/completed event still leaves the successor a verified
+      // member — the completion callback never fires after a crash.
+      this.captureGroupIdentity();
       return { outcome: 'accepted', nativeTurnId: this.takeNativeTurnId(identity) };
     } catch (err) {
       if (!dispatched) {
@@ -649,9 +654,13 @@ export class CodexRpcEngine {
         // fallback: doing so could execute an already-landed first turn twice.
         this.log(`[codex-rpc] first-turn rollout probe failed (${(probeErr as Error).message}); keeping delivery ambiguous`);
       }
-      return landed
-        ? { outcome: 'accepted', nativeTurnId: undefined }
-        : { outcome: 'ambiguous' };
+      if (landed) {
+        // The frame was dispatched and persisted despite the lost ack; its tool
+        // children are still this leader's, so refresh membership on acceptance.
+        this.captureGroupIdentity();
+        return { outcome: 'accepted', nativeTurnId: undefined };
+      }
+      return { outcome: 'ambiguous' };
     }
   }
 
@@ -788,6 +797,12 @@ export class CodexRpcEngine {
   private async reapStaleAppServer(): Promise<void> {
     const mp = this.markerPath();
     if (!mp || !existsSync(mp)) return;
+    // Flips true only AFTER the group's identity is proven. Every error past that
+    // point (a signal that fails with EPERM/…, a reap check that throws, or a
+    // group that survives its bounded cleanup) must fail closed: keep the marker
+    // and reject start(), rather than silently spawning a second app-server on top
+    // of an orphan that may still be operating the workspace.
+    let verified = false;
     try {
       const [pidStr, markedUrl, rawIdentity] = readFileSync(mp, 'utf8').trim().split('\n');
       const pid = /^\d+$/.test(pidStr) ? Number(pidStr) : NaN;
@@ -806,15 +821,18 @@ export class CodexRpcEngine {
         rmSync(mp, { force: true });
         return;
       }
+      verified = true;
       this.signalProcessGroup(pid, 'SIGKILL', markedUrl, identity);
       if (!await this.waitForGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
         throw new Error(`stale codex app-server process group ${pid} still alive after bounded cleanup`);
       }
       rmSync(mp, { force: true });
     } catch (error) {
-      // Only a verified group that survived its own bounded cleanup is fatal.
-      if (error instanceof Error && /still alive after bounded cleanup/.test(error.message)) throw error;
-      // An unreadable marker is not evidence authorizing a signal.
+      // A verified group's signal/reap failure is fatal: the marker is retained so
+      // a later incarnation can retry, and start() rejects instead of overwriting
+      // the only record of a live orphan. Only unverified/marker-read failures are
+      // swallowed (they are not evidence authorizing a signal).
+      if (verified) throw error;
     }
   }
 
