@@ -3,6 +3,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { defaultLedgerDir } from './usage-ledger.js';
+import { normalizeModelTokenUsage, type ModelTokenUsage } from './model-token-usage.js';
 import { emptyUsageMetrics, usageBreakdown, UsageMetricsAccumulator } from './usage-metrics.js';
 import type { UsageGroup, UsageQuery, UsageReport, UsageSession, UsageTotals } from '../dashboard/usage-types.js';
 
@@ -54,6 +55,7 @@ type RecordDelta = Omit<UsageTotals, 'totalTokens' | 'records' | 'pricedRecords'
   model: string;
   sessionId: string;
   title: string;
+  models?: Array<ModelTokenUsage & { costCny: number | null }>;
 };
 
 /** Four mutually exclusive buckets. v1 Codex/TraeX/Aiden input included caches. */
@@ -84,7 +86,15 @@ function normalizeRecord(raw: unknown): RecordDelta | 'ownership' | null {
   }
   if (!Number.isSafeInteger(inputTokens + outputTokens + cacheReadTokens + cacheCreateTokens)) return null;
   const costCny = typeof r.costCny === 'number' && Number.isFinite(r.costCny) && r.costCny >= 0 ? r.costCny : null;
+  const models = r.models === undefined ? undefined : normalizeModelTokenUsage(r.models, {
+    inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens,
+  });
+  if (r.models !== undefined && !models) return null;
   return { recordId: r.recordId, ts, inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, costCny,
+    ...(models ? { models: models.map(model => {
+      const raw = (r.models as Array<Record<string, unknown>>).find(row => row.model === model.model)!;
+      return { ...model, costCny: typeof raw.costCny === 'number' && Number.isFinite(raw.costCny) && raw.costCny >= 0 ? raw.costCny : null };
+    }) } : {}),
     bot: typeof r.larkAppId === 'string' ? r.larkAppId : '',
     model: typeof r.model === 'string' ? r.model : '', sessionId: r.sessionId,
     title: typeof r.title === 'string' ? r.title.slice(0, 500) : '' };
@@ -172,18 +182,23 @@ export async function queryUsageLedger(queryInput: UsageQuery, options: { ledger
         if (seen.has(key)) { report.coverage.duplicateRecords++; continue; }
         seen.add(key);
         if (delta.bot) botOptions.add(delta.bot);
-        if (delta.model) modelOptions.add(delta.model);
-        if ((query.bot && delta.bot !== query.bot) || (query.model && delta.model !== query.model)) continue;
-        add(report.summary, delta);
-        metrics.add(delta);
-        add(group(trend, dateBucket(formatter, delta.ts)), delta);
-        add(group(bots, delta.bot), delta);
-        add(group(models, delta.model), delta);
+        const attributed = delta.models?.map(model => ({ ...delta, ...model, models: undefined })) ?? [delta];
+        for (const part of attributed) if (part.model) modelOptions.add(part.model);
+        if (query.bot && delta.bot !== query.bot) continue;
+        const selected = query.model ? attributed.find(part => part.model === query.model) : delta;
+        if (!selected) continue;
+        add(report.summary, selected);
+        metrics.add(selected);
+        add(group(trend, dateBucket(formatter, delta.ts)), selected);
+        add(group(bots, delta.bot), selected);
+        for (const part of attributed) {
+          if (!query.model || part.model === query.model) add(group(models, part.model), part);
+        }
         const sessionKey = `${delta.bot}\0${delta.sessionId}`;
         let session = sessions.get(sessionKey);
         if (!session) { session = { id: delta.sessionId, bot: delta.bot, title: delta.title, ...emptyUsageTotals() }; sessions.set(sessionKey, session); }
         if (delta.title) session.title = delta.title;
-        add(session, delta);
+        add(session, selected);
         first = first === null ? delta.ts : Math.min(first, delta.ts);
         last = last === null ? delta.ts : Math.max(last, delta.ts);
       }
