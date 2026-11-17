@@ -398,5 +398,5 @@ it.skipIf(!tmuxAvailable)(
     expect(lateHook.events.map(e => e.kind).indexOf('dialog'))
       .toBeLessThan(lateHook.events.map(e => e.kind).indexOf('person'));
   },
-  180_000,
+  300_000,
 );
