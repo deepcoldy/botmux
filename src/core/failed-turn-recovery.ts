@@ -99,7 +99,7 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string },
+  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {

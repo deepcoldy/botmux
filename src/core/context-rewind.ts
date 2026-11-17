@@ -18,6 +18,8 @@ import {
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
+  isSyntheticNoModelReplyEvent,
+  isTranscriptRateLimitEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
 import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
@@ -70,7 +72,11 @@ export function summarizeUserText(text: string): string {
  *  内置定时任务触发。tool_result、isMeta、compact 摘要、sidechain、轮中吸收的排队
  *  消息都不是起点——它们随所在轮一起被删。 */
 function isTurnStart(ev: TranscriptEvent): boolean {
-  return isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev) || isScheduledTurnStartEvent(ev);
+  // Top-level user records only: Claude Code ≥ 2.1.31x also writes
+  // `api-request-blob` records whose `message.role` is "user" (a copy of the
+  // request body); the role-based predicates alone would take one for a turn.
+  return (ev.type === 'user' && (isMeaningfulUserEvent(ev) || isScheduledTurnStartEvent(ev)))
+    || isMeaningfulQueuedCommand(ev);
 }
 
 function isCompactBoundary(ev: TranscriptEvent): boolean {
@@ -179,6 +185,200 @@ export function findCheckpoint(
     : cp.offset === target.offset && cp.preview === target.preview));
 }
 
+/** What the transcript's last turn amounts to, read from its end. */
+export type LastTurnOutcome =
+  /** Only API-error records (or the no-model-reply placeholder) answered it:
+   *  no tool call, no text — a turn that failed without doing anything. */
+  | 'error_only'
+  /** It called a tool or answered with text. */
+  | 'progress'
+  /** Anything this module must not cut around: an interrupt, a slash command,
+   *  a queued input folded into the turn, a compaction, a rate limit, a write
+   *  still in progress, an unreadable line, or a turn too long to read back. */
+  | 'other'
+  /** No turn start at all. */
+  | 'no_turn';
+
+export interface LastTurnInspection {
+  outcome: LastTurnOutcome;
+  /** Byte offset of the last turn's start record: where a cut would land. */
+  offset?: number;
+  uuid?: string;
+  /** The turn's input as Claude recorded it. */
+  text?: string;
+  /** A user/assistant record precedes the turn, so the cut file still
+   *  resumes (see {@link RewindCheckpoint.resumable}). */
+  resumable?: boolean;
+}
+
+/** Upper bound on bytes read back from the end of the transcript. A failed
+ *  turn is a few records; anything longer did work and is not a candidate. */
+const LAST_TURN_SCAN_LIMIT_BYTES = 8 << 20;
+
+/** Meta user record Claude Code writes before resuming a turn cut mid-flight. */
+const RESUME_NUDGE = 'Continue from where you left off.';
+
+/** Attachments that carry input of their own (a queued prompt, a file the
+ *  user edited), as opposed to per-turn context. */
+const CONTENT_ATTACHMENT_RE = /queued_command|edited_/;
+
+/** Complete lines of `fd`, last first, with their byte offsets. Stops once
+ *  `limit` bytes were read (the caller then sees the generator end early and
+ *  treats the region as unread). */
+function* linesFromEnd(fd: number, size: number, limit: number): Generator<{ line: Buffer; offset: number }, boolean> {
+  let pos = size;
+  let pending: Buffer = Buffer.alloc(0);
+  let read = 0;
+  while (pos > 0) {
+    if (read >= limit) return false;
+    const n = Math.min(CHUNK_BYTES, pos);
+    pos -= n;
+    const chunk = Buffer.allocUnsafe(n);
+    let got = 0;
+    while (got < n) {
+      const r = readSync(fd, chunk, got, n - got, pos + got);
+      if (r <= 0) throw new Error(`unexpected EOF reading ${n} bytes at ${pos}`);
+      got += r;
+    }
+    read += n;
+    const data = pending.length > 0 ? Buffer.concat([chunk, pending]) : chunk;
+    let end = data.length;
+    for (let nl = data.lastIndexOf(10, end - 1); nl >= 0; nl = end > 0 ? data.lastIndexOf(10, end - 1) : -1) {
+      if (nl + 1 < end) yield { line: data.subarray(nl + 1, end), offset: pos + nl + 1 };
+      end = nl;
+    }
+    pending = Buffer.from(data.subarray(0, end));
+  }
+  if (pending.length > 0) yield { line: pending, offset: 0 };
+  return true;
+}
+
+/** An assistant record that did something: called a tool or wrote text.
+ *  Thinking alone is not progress. Unknown block types count as progress, so
+ *  a shape this module does not know never makes a turn look empty. */
+function assistantMadeProgress(content: unknown): boolean {
+  if (typeof content === 'string') return content.trim().length > 0;
+  if (!Array.isArray(content)) return false;
+  return content.some((block: any) => {
+    if (!block || typeof block !== 'object') return false;
+    if (block.type === 'thinking' || block.type === 'redacted_thinking') return false;
+    if (block.type === 'text') return typeof block.text === 'string' && block.text.trim().length > 0;
+    return true;
+  });
+}
+
+function isTopLevelConversationLine(line: Buffer): boolean {
+  if (!line.includes('"type":"user"') && !line.includes('"type":"assistant"')) return false;
+  try {
+    const ev: unknown = JSON.parse(line.toString('utf8'));
+    const type = ev && typeof ev === 'object' ? (ev as TranscriptEvent).type : undefined;
+    return type === 'user' || type === 'assistant';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read the transcript's LAST turn back from the end of the file: where it
+ * starts, what its input was, and whether anything but API errors answered it.
+ * Only the tail is read, so it stays cheap on a transcript of hundreds of MB.
+ *
+ * Fail-closed: every record this does not positively recognise as error-only
+ * bookkeeping makes the outcome `progress` or `other`, never `error_only`.
+ */
+export function inspectLastClaudeTurn(path: string, limit = LAST_TURN_SCAN_LIMIT_BYTES): LastTurnInspection {
+  const fd = openSync(path, 'r');
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return { outcome: 'no_turn' };
+    const last = Buffer.alloc(1);
+    readSync(fd, last, 0, 1, size - 1);
+    // A trailing line without '\n' is a write in progress.
+    if (last[0] !== 10) return { outcome: 'other' };
+    let errors = 0;
+    let start: { ev: TranscriptEvent; offset: number } | undefined;
+    let readToFileStart = false;
+    const lines = linesFromEnd(fd, size, limit);
+    for (let next = lines.next(); ; next = lines.next()) {
+      if (next.done) {
+        readToFileStart = next.value;
+        break;
+      }
+      const { line, offset } = next.value;
+      let ev: TranscriptEvent;
+      try {
+        const parsed: unknown = JSON.parse(line.toString('utf8'));
+        if (!parsed || typeof parsed !== 'object') return { outcome: 'other' };
+        ev = parsed as TranscriptEvent;
+      } catch {
+        return { outcome: 'other' };
+      }
+      if (isCompactBoundary(ev)) return { outcome: 'other' };
+      if (isTurnStart(ev)) {
+        start = { ev, offset };
+        break;
+      }
+      // A subagent's record belongs to a Task tool call of this turn.
+      if ((ev as any).isSidechain === true) return { outcome: 'progress' };
+      if (ev.type === 'assistant') {
+        if (ev.isApiErrorMessage === true) {
+          // Rate limits have their own handling; a cancelled request is a stop.
+          if (isTranscriptRateLimitEvent(ev) || String(ev.error ?? '').toLowerCase().includes('cancel')) {
+            return { outcome: 'other' };
+          }
+          errors += 1;
+          continue;
+        }
+        if (isSyntheticNoModelReplyEvent(ev)) {
+          errors += 1;
+          continue;
+        }
+        if (assistantMadeProgress(ev.message?.content)) return { outcome: 'progress' };
+        continue;
+      }
+      if (ev.type === 'user') {
+        // The nudge Claude Code writes when it resumes a turn cut mid-flight
+        // (before its no-model-reply placeholder) belongs to the turn. Any
+        // other meta record carries something of its own — a peer session's
+        // message, a subagent's hand-back — that a cut would lose.
+        if ((ev as any).isMeta === true && extractTurnStartText(ev).trim() === RESUME_NUDGE) continue;
+        const content = ev.message?.content;
+        if (Array.isArray(content) && content.some((block: any) => block?.type === 'tool_result')) {
+          return { outcome: 'progress' };
+        }
+        // An interrupt, a slash command's records, a compaction summary.
+        return { outcome: 'other' };
+      }
+      // An input folded into this turn has no record of its own, and a note
+      // that the user edited a file is not written again: cutting the turn
+      // would lose them. The other attachments are context Claude Code
+      // derives afresh for the next turn (hook context, date, skill listing…).
+      if (ev.type === 'attachment' && CONTENT_ATTACHMENT_RE.test(String((ev as any).attachment?.type ?? ''))) {
+        return { outcome: 'other' };
+      }
+      // system (turn_duration, retry notices), attachments, snapshots, request
+      // metadata: bookkeeping, not output.
+    }
+    if (!start) return { outcome: readToFileStart && errors === 0 ? 'no_turn' : 'other' };
+    let resumable = false;
+    for (let next = lines.next(); !next.done; next = lines.next()) {
+      if (isTopLevelConversationLine(next.value.line)) {
+        resumable = true;
+        break;
+      }
+    }
+    return {
+      outcome: errors > 0 ? 'error_only' : 'other',
+      offset: start.offset,
+      ...(typeof start.ev.uuid === 'string' ? { uuid: start.ev.uuid } : {}),
+      text: extractTurnStartText(start.ev),
+      resumable,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export interface RewindResult {
   backupPath: string;
   removedBytes: number;
@@ -219,6 +419,11 @@ export function rewindClaudeTranscript(
      *  but before the backup is read from it. Lets the symlink-swap regression
      *  replace the pathname deterministically mid-operation. */
     beforeBackup?: () => void;
+    /** `removed` keeps only the bytes being cut (`<path>.rewind-<stamp>.removed.bak`).
+     *  An automatic rewind of one failed turn runs on every failure: copying a
+     *  transcript of hundreds of MB each time is not affordable, and the part
+     *  that stays needs no backup. Default `full` (the /rewind command). */
+    backup?: 'full' | 'removed';
   } = {},
 ): RewindResult {
   const pre = lstatSync(path);
@@ -240,7 +445,7 @@ export function rewindClaudeTranscript(
  *  between validation and use, and a path-based copy would then read whatever
  *  the link points at (host data the daemon can read but the sandbox cannot)
  *  into the agent-readable backup. */
-function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number): void {
+function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number, from = 0): void {
   const dstFd = openSync(
     backupPath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -251,12 +456,13 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
       throw new Error(`refusing to write rewind backup to non-regular file ${backupPath}`);
     }
     const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
+    const total = size - from;
     let copied = 0;
-    while (copied < size) {
+    while (copied < total) {
       // Positional reads against the pinned descriptor — the pathname is
       // irrelevant from here on.
-      const n = readSync(srcFd, buf, 0, Math.min(buf.length, size - copied), copied);
-      if (n <= 0) throw new Error(`unexpected EOF while backing up transcript (${copied}/${size} bytes)`);
+      const n = readSync(srcFd, buf, 0, Math.min(buf.length, total - copied), from + copied);
+      if (n <= 0) throw new Error(`unexpected EOF while backing up transcript (${copied}/${total} bytes)`);
       let written = 0;
       while (written < n) {
         const w = writeSync(dstFd, buf, written, n - written);
@@ -265,14 +471,14 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
       }
       copied += n;
     }
-    if (copied !== size) throw new Error(`rewind backup size mismatch (${copied}/${size} bytes)`);
+    if (copied !== total) throw new Error(`rewind backup size mismatch (${copied}/${total} bytes)`);
     // The CLI is supposed to be dead; a growing source here means it is not.
     // Refuse rather than back up or cut a moving file.
     if (fstatSync(srcFd).size !== size) {
       throw new Error(`transcript changed size while creating backup ${backupPath}`);
     }
-    if (fstatSync(dstFd).size !== size) {
-      throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${size} bytes)`);
+    if (fstatSync(dstFd).size !== total) {
+      throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${total} bytes)`);
     }
   } catch (err) {
     try { unlinkSync(backupPath); } catch { /* may not have been created */ }
@@ -287,7 +493,7 @@ function rewindOpenTranscript(
   path: string,
   offset: number,
   now: number,
-  opts: { beforeBackup?: () => void } = {},
+  opts: { beforeBackup?: () => void; backup?: 'full' | 'removed' } = {},
 ): RewindResult {
   const st = fstatSync(fd);
   if (!Number.isInteger(offset) || offset <= 0 || offset > st.size) {
@@ -299,11 +505,50 @@ function rewindOpenTranscript(
     if (byte[0] !== 10) throw new Error(`rewind offset ${offset} is not at a line boundary`);
   }
   const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
-  const backupPath = `${path}.rewind-${stamp}.bak`;
+  const removedOnly = opts.backup === 'removed';
+  const backupPath = `${path}.rewind-${stamp}${removedOnly ? '.removed' : ''}.bak`;
   opts.beforeBackup?.();
-  copyBackupFromDescriptor(fd, backupPath, st.size);
+  copyBackupFromDescriptor(fd, backupPath, st.size, removedOnly ? offset : 0);
   ftruncateSync(fd, offset);
   return { backupPath, removedBytes: st.size - offset };
+}
+
+/**
+ * Undo a cut made with `backup: 'removed'`: append the removed bytes back,
+ * provided nothing was written after the cut (the file still ends at
+ * `offset`). Same descriptor discipline as the cut itself. Returns whether the
+ * transcript is whole again.
+ */
+export function restoreRewoundTranscript(path: string, offset: number, backupPath: string): boolean {
+  const pre = lstatSync(path);
+  if (!pre.isFile()) return false;
+  const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+  try {
+    assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
+    if (fstatSync(fd).size !== offset) return false;
+    const backupFd = openSync(backupPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const size = fstatSync(backupFd).size;
+      const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
+      let copied = 0;
+      while (copied < size) {
+        const n = readSync(backupFd, buf, 0, Math.min(buf.length, size - copied), copied);
+        if (n <= 0) throw new Error(`unexpected EOF while restoring ${backupPath}`);
+        let written = 0;
+        while (written < n) {
+          const w = writeSync(fd, buf, written, n - written, offset + copied + written);
+          if (w <= 0) throw new Error('short write while restoring a rewound transcript');
+          written += w;
+        }
+        copied += n;
+      }
+      return fstatSync(fd).size === offset + size;
+    } finally {
+      closeSync(backupFd);
+    }
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

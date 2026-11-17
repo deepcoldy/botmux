@@ -150,6 +150,7 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
@@ -3886,6 +3887,11 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.retry.cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, loc));
           break;
         }
+        // Already being re-sent by an input whose CLI restart is still running.
+        if (failedTurnRewindInFlight(ds, failedTurn.turnId)) {
+          await sessionReply(rootId, t('card.action.retry_turn_in_flight', undefined, loc));
+          break;
+        }
         // Strip clientUserMessageId to avoid dedup conflicts (same as retry_last_task)
         const retryCodexAppInput = failedTurn.codexAppInput
           ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
@@ -3899,7 +3905,9 @@ export async function handleCommand(
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+            // A turn that failed without any output is cut first, so the
+            // retry replaces it instead of stacking on top.
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurn: 'resend' });
           } else {
             accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }

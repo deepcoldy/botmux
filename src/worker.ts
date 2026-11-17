@@ -500,6 +500,7 @@ import type {
   DaemonToWorker,
   WorkerToDaemon,
   DisplayMode,
+  FailedTurnRewindDirective,
   TermActionKey,
   ScreenStatus,
   TrustedCaller,
@@ -571,6 +572,15 @@ import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
+import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript } from './core/context-rewind.js';
+import {
+  lastTurnIsFailedInput,
+  planFailedTurnRewindRequest,
+  rewindableErrorCode,
+  rewoundContent,
+  runFailedTurnRewindMaintenance,
+  transcriptTurnFailedWithoutOutput,
+} from './core/failed-turn-rewind.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
@@ -2111,7 +2121,10 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // event. A backlog is reported only when it changes, so the daemon would keep
   // the previous report — "the CLI has not taken its input" — for good. The
   // producer is still this worker; the gateway admits it as a worker event.
-  if (msg.type === 'cli_input_backlog') {
+  // A failed-turn rewind is reported from inside a CLI restart: the runtime
+  // it began under is being retired and the message's turn has not run yet.
+  // It is this worker's account of its own input queue, like the backlog.
+  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind') {
     delete context.scope.execution;
     delete context.scope.runtime;
     delete context.scope.operationId;
@@ -17183,6 +17196,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
+  if ((key === 'ctrlc' || key === 'esc') && stopHeldFailedTurnRewind()) return;
   if (!backend) return;
   const criticalInterrupt = isCriticalInterruptKey(key);
   if (criticalInterrupt && (traexQuotaPending?.failedTurn
@@ -22745,6 +22759,11 @@ async function flushPending(): Promise<void> {
       }
       if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
       else workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
+      if (failedTurnRewindWriteEdge(item) === 'stopped') {
+        // Stopped while the failed-turn rewind held it: it never ran.
+        if (item.turnId) emitTurnTerminal(item.turnId, 'cancelled', FAILED_TURN_REWIND_STOPPED, item.dispatchAttempt);
+        continue;
+      }
       cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -26950,9 +26969,14 @@ async function spawnCliBody(
   }
   const fallBackToFresh =
     effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
-  if (opts.exactResumeSessionId && (cfg.cliId !== 'traex' || fallBackToFresh
+  // An exact resume is asked for when the conversation itself is the point of
+  // the restart: TraeX's capacity switch, and Claude Code transcript repairs
+  // (the image purge, cutting a turn that failed without output) that rewrote
+  // this very transcript. Falling back to a fresh start would silently drop
+  // the context they exist to keep, so it fails instead.
+  if (opts.exactResumeSessionId && ((cfg.cliId !== 'traex' && cfg.cliId !== 'claude-code') || fallBackToFresh
     || !effectiveResume || effectiveCliSessionId !== opts.exactResumeSessionId)) {
-    throw new Error('TraeX auto-model requires the exact native resume target; refusing fresh fallback');
+    throw new Error(`${cfg.cliId} requires the exact native resume target; refusing fresh fallback`);
   }
   if (codexAutoUpgrade?.stage === 'restoring'
       && (fallBackToFresh || !effectiveResume || effectiveCliSessionId !== codexAutoUpgrade.threadId)) {
@@ -35161,6 +35185,22 @@ function turnFailureScreen(): string | undefined {
   try { return captureBackendScreen(backend); } catch { return undefined; }
 }
 
+/** A Claude Code provider failure whose turn is the transcript's last turn,
+ *  holding the input this worker wrote for it and nothing but API errors
+ *  after it (core/failed-turn-rewind.ts). Best effort: any doubt is false. */
+function turnFailedWithoutOutput(turnId: string, errorCode: string | undefined): boolean {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode
+    || isRemoteBackendType(effectiveBackendType)) return false;
+  if (!rewindableErrorCode(errorCode) || !bridgeJsonlPath) return false;
+  const written = lastWrittenCliInput?.turnId === turnId ? lastWrittenCliInput.content : undefined;
+  if (!written) return false;
+  try {
+    return transcriptTurnFailedWithoutOutput(bridgeJsonlPath, written);
+  } catch {
+    return false;
+  }
+}
+
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
  *  runners may surface the same final boundary more than once. */
@@ -35222,6 +35262,7 @@ function emitTurnTerminal(
   const diagnostics = captureTurnFailureDiagnostics && (status === 'failed' || status === 'ambiguous')
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
     : {};
+  const directFailure = status === 'failed' && turnFailedWithoutOutput(turnId, errorCode);
   const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
     type: 'turn_terminal',
     sessionId,
@@ -35239,6 +35280,7 @@ function emitTurnTerminal(
       ? { providerRetryAtMs: providerTiming!.retryAtMs } : {}),
     ...(status !== 'completed' && Number.isFinite(providerTiming?.lastSuccessAtMs)
       ? { providerLastSuccessAtMs: providerTiming!.lastSuccessAtMs } : {}),
+    ...(directFailure ? { directFailure: true as const } : {}),
   };
   // The「本轮回顾」material first: the daemon reads it when the terminal lands.
   const recapInput = status === 'completed'
@@ -35554,6 +35596,202 @@ function startTranscriptImagePurge(
       else rejectContinuation(notice.rejectReason);
     },
   });
+}
+
+/** The message a failed-turn rewind holds behind its CLI restart, until that
+ *  message reaches the CLI's write edge (see startFailedTurnRewind). */
+interface FailedTurnRewindInFlight {
+  queued: PendingCliInput | undefined;
+  /** The cut, once it landed: what to undo if the restart then fails. */
+  cut?: { path: string; offset: number; backupPath: string; plainContent: string; reason: string };
+  /** The user pressed stop while the message was still held. */
+  stopped: boolean;
+  report: (outcome: 'rewound' | 'declined', reason: string, opts?: { cut?: true }) => void;
+}
+let failedTurnRewindInFlight: FailedTurnRewindInFlight | null = null;
+
+/** Turn code of a message the user stopped while a failed-turn rewind still
+ *  held it behind the CLI restart: it never reached the CLI. */
+const FAILED_TURN_REWIND_STOPPED = 'stopped_before_start';
+
+/** A message whose directive says the transcript's last turn failed without
+ *  any output (core/failed-turn-rewind.ts): cut that turn out — the way
+ *  /rewind does — and write the directive's content instead of the message's.
+ *
+ *  Everything is checked while the CLI still runs; any reason not to proceed
+ *  leaves the CLI alone and the message goes in unchanged (`declined`). To
+ *  proceed, the CLI is stopped, its exit proven, the turn re-read and cut, and
+ *  the CLI resumed (`--resume`, same session id) — as the image purge does.
+ *  The message is queued right after the restart fences input, so anything
+ *  arriving meanwhile stays behind it; its content is swapped once the cut has
+ *  landed. The daemon hears `rewound` only when the message reaches the CLI's
+ *  write edge (failedTurnRewindWriteEdge): until then its record of the failed
+ *  turn stays the one to retry. A restart that fails after the cut puts the
+ *  cut bytes back; a stop pressed while the message is held keeps it from the
+ *  CLI, as a stop would have ended the turn it starts. */
+function startFailedTurnRewind(
+  turnId: string | undefined,
+  directive: FailedTurnRewindDirective,
+  enqueueMessage: () => void,
+  setContent: (content: string) => void,
+): void {
+  let reported = false;
+  const report = (outcome: 'rewound' | 'declined', reason: string, opts: { cut?: true } = {}): void => {
+    if (reported) return;
+    reported = true;
+    log(`Failed-turn rewind ${outcome} for ${directive.failedTurnId.slice(0, 16)} → ${(turnId ?? '-').slice(0, 16)} (${directive.mode}): ${reason}`);
+    send({ type: 'failed_turn_rewind', turnId: turnId ?? '', failedTurnId: directive.failedTurnId, outcome, reason, ...(opts.cut ? { cut: true as const } : {}) });
+  };
+  // The failed turn was cut by an earlier message the user then stopped: it
+  // is no longer in the conversation, so this message brings it back as it
+  // is — unless the transcript says otherwise (then the ordinary cut below).
+  if (directive.detached && bridgeJsonlPath) {
+    let stillThere = true;
+    try {
+      stillThere = lastTurnIsFailedInput(inspectLastClaudeTurn(bridgeJsonlPath), directive.failedInput);
+    } catch { /* unreadable: treat as still there, the plan below decides */ }
+    if (!stillThere) {
+      setContent(directive.content);
+      report('rewound', 'the failed turn was already cut; its input goes in with this one');
+      enqueueMessage();
+      return;
+    }
+  }
+  const target = resolvePurgeResumeTarget(
+    bridgeJsonlPath,
+    backend
+      ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend).claudeJsonlPath
+      : undefined,
+  );
+  const plan = planFailedTurnRewindRequest({
+    cliId: lastInitConfig?.cliId,
+    localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
+      && !isRemoteBackendType(effectiveBackendType),
+    target,
+    restartInProgress: cliRestartInProgress,
+    childPid: backend?.getChildPid?.(),
+    sandboxMode: lastResolvedSandboxMode,
+    platform: process.platform,
+    cliBusy: !isPromptReady ? 'not at its prompt'
+      : isFlushing || injectionFlushing || commandLineWritesPending > 0 ? 'writing input'
+        : pendingMessages.length > 0 || pendingRawInputs.length > 0 ? 'input queued'
+          : tuiPromptBlocking ? 'a TUI prompt is open'
+            : sessionRenameInFlight() ? 'renaming the session'
+              : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
+                ? 'a turn is running' : undefined,
+    directive,
+    inspect: inspectLastClaudeTurn,
+  });
+  if (plan.kind === 'decline') {
+    report('declined', plan.reason);
+    enqueueMessage();
+    return;
+  }
+  const state: FailedTurnRewindInFlight = { queued: undefined, stopped: false, report };
+  failedTurnRewindInFlight = state;
+  void restartCliProcess('cut a turn that failed without output', {
+    immediate: true,
+    preservePending: true,
+    // Rescuing the context, not recovering from a crash: spending the budget
+    // could force a FRESH start and drop exactly what this keeps.
+    skipRestartBudget: true,
+    exactResumeSessionId: plan.target.sessionId,
+    preserveScratchTreeForRespawn: plan.preserveScratchTree,
+    beforeRespawn: async retiring => {
+      const outcome = await runFailedTurnRewindMaintenance({
+        waitForQuiescence: () => waitForProcessQuiescence(retiring.pid, {
+          now: () => Date.now(),
+          wait: ms => delay(ms),
+          provablyGone: pid => !pidNotProvablyGone(pid),
+        }, { ownedPids: retiring.processScope }),
+        inspect: () => inspectLastClaudeTurn(plan.target.jsonlPath),
+        rewind: offset => rewindClaudeTranscript(plan.target.jsonlPath, offset, Date.now(), { backup: 'removed' }),
+        planned: { offset: plan.offset, ...(plan.uuid ? { uuid: plan.uuid } : {}) },
+        failedInput: directive.failedInput,
+        // Held behind the restart fence, so nothing can have written it yet.
+        messageStillQueued: () => !state.stopped && !!state.queued && pendingMessages.includes(state.queued),
+      });
+      if (outcome.kind === 'declined') {
+        report('declined', state.stopped ? 'stopped before the cut' : outcome.reason);
+        return;
+      }
+      const queued = state.queued!;
+      state.cut = {
+        path: plan.target.jsonlPath,
+        offset: plan.offset,
+        backupPath: outcome.result.backupPath,
+        plainContent: queued.content,
+        reason: `cut ${outcome.result.removedBytes} bytes, backup ${outcome.result.backupPath}`,
+      };
+      queued.content = rewoundContent(directive.content, outcome.suffix);
+    },
+    onRespawnSettled: result => {
+      if (result !== 'failed') {
+        // Nothing was cut (declined above, or the restart ended before the
+        // cut): the message goes in unchanged.
+        if (!state.cut) report('declined', `restart ${result} before the cut`);
+        return;
+      }
+      // The worker exits right after a failed spawn. Leave the conversation
+      // as it was: the failed turn back in the transcript, the daemon's record
+      // of it still the one to retry.
+      if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
+      const cut = state.cut;
+      let restored = !cut;
+      if (cut) {
+        try {
+          restored = restoreRewoundTranscript(cut.path, cut.offset, cut.backupPath);
+        } catch (err) {
+          log(`Restoring the cut failed turn failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (restored && state.queued) state.queued.content = cut.plainContent;
+      }
+      // Without this the held message dies with the worker; the next worker
+      // writes what it finds here (the old flow never restarted, so it was
+      // always delivered).
+      saveUnsentInputsForSuccessor('failed-turn rewind restart failed');
+      // A cut that could not be put back is NOT reported as cut: the saved
+      // message still carries the failed input (merged), and the next worker
+      // delivers it. Flagging it would make the input after that bring the
+      // failed input back a second time.
+      if (!cut) report('declined', 'restart failed before the cut');
+      else if (restored) report('declined', 'restart failed after the cut; cut restored');
+      else report('declined', `restart failed after the cut; cut NOT restored, the saved message carries it (backup ${cut.backupPath})`);
+    },
+  });
+  const before = pendingMessages.length;
+  enqueueMessage();
+  const last = pendingMessages[pendingMessages.length - 1];
+  state.queued = pendingMessages.length > before && last?.turnId === turnId ? last : undefined;
+}
+
+/** At the CLI write edge of a message a failed-turn rewind held: report what
+ *  the CLI is about to get, or — when the user stopped it while it was held —
+ *  keep it from the CLI (the caller ends its turn as cancelled). */
+function failedTurnRewindWriteEdge(item: PendingCliInput): 'write' | 'stopped' {
+  const held = failedTurnRewindInFlight;
+  if (!held || held.queued !== item) return 'write';
+  failedTurnRewindInFlight = null;
+  if (held.stopped) {
+    // Cut already: the failed turn is out of the transcript while this
+    // message, which carried it, never ran. The daemon keeps its record and
+    // brings it back with the next input (FailedTurnRewindDirective.detached).
+    held.report('declined', 'stopped before it reached the CLI', held.cut ? { cut: true } : {});
+    return 'stopped';
+  }
+  if (held.cut) held.report('rewound', held.cut.reason);
+  return 'write';
+}
+
+/** A stop (Ctrl-C / Esc) while a failed-turn rewind holds its message behind
+ *  the CLI restart: nothing is running for it to interrupt yet, and without
+ *  this the message would start right after. Returns whether it was taken. */
+function stopHeldFailedTurnRewind(): boolean {
+  const held = failedTurnRewindInFlight;
+  if (!held?.queued || !pendingMessages.includes(held.queued) || held.stopped) return false;
+  held.stopped = true;
+  log(`Stop while a failed-turn rewind holds ${(held.queued.turnId ?? '-').slice(0, 16)}: it will not be written`);
+  return true;
 }
 
 function publishLocalProcessAttestation(
@@ -36717,6 +36955,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         };
         if (msg.purgeUndersizedImages) {
           startTranscriptImagePurge(msg.turnId, ordinaryImTurnId, enqueueMessage);
+          break;
+        }
+        if (msg.failedTurnRewind) {
+          startFailedTurnRewind(msg.turnId, msg.failedTurnRewind, enqueueMessage, next => { content = next; });
           break;
         }
         enqueueMessage();

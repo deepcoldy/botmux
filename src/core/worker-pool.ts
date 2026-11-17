@@ -952,6 +952,8 @@ import {
 } from '../services/quota-fallback.js';
 import type {
   CliTurnPayload,
+  FailedTurnRecord,
+  FailedTurnRewindDirective,
   CodexAppDeliverySink,
   CodexAppDispatchLedgerEntry,
   CodexAppTurnInput,
@@ -991,6 +993,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
@@ -2744,16 +2747,22 @@ function buildSessionTurnFailedCard(
     continuations?: number;
     retryable?: boolean;
     providerRetryAt?: Date;
+    repeatedFailures?: number;
   },
 ): string {
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const failedTurn = ds.session.lastFailedTurn;
-  const offer = turnRetryOffer({
+  const policyOffer = turnRetryOffer({
     status: opts.status,
     ...(opts.errorCode !== undefined ? { errorCode: opts.errorCode } : {}),
     ...(opts.retryable !== undefined ? { retryable: opts.retryable } : {}),
   });
+  // The worker read this turn back from the transcript: nothing but the error
+  // answered it, so nothing ran — re-sending it as it was is safe, and the
+  // retry cuts the failure out first (core/failed-turn-rewind.ts).
+  const directFailure = policyOffer !== 'none' && failedTurn?.status === 'failed' && failedTurn.directFailure === true;
+  const offer = directFailure ? 'safe' : policyOffer;
   // 没有真人 footer 收件人时才回退 @ bot 管理员（与失败兜底通知同口径，且
   // 绝不 @ bot——那会触发对方新一轮）。
   const mentionOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId)
@@ -2769,8 +2778,10 @@ function buildSessionTurnFailedCard(
     failedAt: new Date(),
     ...(failedTurn?.userPrompt !== undefined ? { task: failedTurn.userPrompt } : {}),
     ...(opts.continuations !== undefined ? { continuations: opts.continuations } : {}),
+    ...(opts.repeatedFailures !== undefined ? { repeatedFailures: opts.repeatedFailures } : {}),
     ...(opts.providerRetryAt ? { providerRetryAt: opts.providerRetryAt } : {}),
     retryOffer: offer,
+    ...(directFailure ? { directFailure: true } : {}),
     ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
     ...(mentionOpenId ? { mentionOpenId } : {}),
     terminalUrl: readableTerminalUrlFor(ds),
@@ -3005,18 +3016,20 @@ function enqueueContinuationFailureNotice(
 /** Send a failure card / worker notice. When the send fails transiently (see
  *  turnNoticeSendRetryable) the notice is kept on the session and retried with
  *  the same uuid; any other failure is thrown as before. */
+/** Resolves with the posted message's id; undefined when the post did not
+ *  land now (the notice then waits in the session's retry outbox). */
 async function sendTurnNotice(
   ds: DaemonSession,
   notice: Pick<TurnNoticeRecord, 'kind' | 'turnId' | 'msgType' | 'content'>,
   owns?: () => boolean,
-): Promise<void> {
-  if (owns?.() === false) return;
+): Promise<string | undefined> {
+  if (owns?.() === false) return undefined;
   const beforeWrite = owns ? () => {
     if (!owns()) throw new Error('Turn notice no longer owns delivery');
   } : undefined;
   const uuid = randomUUID();
   try {
-    await requireCallbacks().sessionReply(
+    return await requireCallbacks().sessionReply(
       sessionAnchorId(ds),
       notice.content,
       notice.msgType,
@@ -3025,7 +3038,7 @@ async function sendTurnNotice(
       { uuid, sourceSessionId: ds.session.sessionId, ...(beforeWrite ? { beforeWrite } : {}) },
     );
   } catch (err) {
-    if (owns?.() === false) return;
+    if (owns?.() === false) return undefined;
     if (!turnNoticeSendRetryable(err)) throw err;
     const now = Date.now();
     const delayMs = recoveryNoticeRetryDelayMs(1);
@@ -3055,7 +3068,58 @@ async function sendTurnNotice(
     logger.warn(`[${tag(ds)}] Failed to deliver ${notice.kind} notice (${lastError}); `
       + `retrying in ${Math.round(delayMs / 1000)}s`);
     resumeTurnNotices(ds);
+    return undefined;
   }
+}
+
+/**
+ * Post the failure card for `turnId` — or, when that turn carried an input that
+ * had already failed without any output (its failed turn was cut and the input
+ * re-sent, see core/failed-turn-rewind.ts) and it failed the same way again,
+ * update that input's one card in place with the count and the latest error
+ * instead of posting another. A card that can no longer be updated (withdrawn,
+ * too old) is replaced by a new one, which the chain then keeps.
+ *
+ * Remembers the card as the session's latest, so the next cut of this turn
+ * continues the chain on it. Rejects when posting fails (callers own retries).
+ */
+async function deliverTurnFailureCard(
+  ds: DaemonSession,
+  turnId: string,
+  build: (repeatedFailures: number | undefined) => string,
+  post: (content: string) => Promise<string | undefined>,
+): Promise<string | undefined> {
+  const chain = ds.session.failedTurnRewindChain;
+  const failed = ds.session.lastFailedTurn;
+  const chained = chain?.turnId === turnId;
+  const repeated = chained && failed?.turnId === turnId && failed.directFailure === true
+    ? chain!.failures + 1 : undefined;
+  let messageId: string | undefined;
+  if (repeated !== undefined && chain?.cardMessageId) {
+    try {
+      await updateMessage(ds.larkAppId, chain.cardMessageId, build(repeated));
+      messageId = chain.cardMessageId;
+      logger.info(`[${tag(ds)}] Failure card ${chain.cardMessageId} updated in place: input failed ${repeated} times without output`);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Could not update failure card ${chain.cardMessageId} in place, posting a new one: `
+        + `${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (!messageId) messageId = await post(build(repeated));
+  const current = ds.session.failedTurnRewindChain;
+  if (current?.turnId === turnId) {
+    // A turn that made progress before failing ends the chain: its next cut
+    // (if any) starts a new count on a new card.
+    if (repeated === undefined) delete ds.session.failedTurnRewindChain;
+    else if (messageId) ds.session.failedTurnRewindChain = { ...current, cardMessageId: messageId };
+  }
+  if (messageId) ds.session.lastFailureCard = { turnId, messageId };
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] Could not persist failure card ${messageId ?? '-'}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return messageId;
 }
 
 function enqueueOrdinaryRecoveryNotice(
@@ -3110,13 +3174,18 @@ function ordinaryRecoveryNoticeHost(ds: DaemonSession): RecoveryNoticeHost {
       sessionStore.updateSession(ds.session);
       return find(logicalTurnId);
     },
-    send: record => requireCallbacks().sessionReply(
-      sessionAnchorId(ds),
-      buildOrdinaryRecoveryNoticeCard(ds, record),
-      'interactive',
-      ds.larkAppId,
+    send: record => deliverTurnFailureCard(
+      ds,
       record.logicalTurnId,
-      { uuid: record.delivery.uuid },
+      repeatedFailures => buildOrdinaryRecoveryNoticeCard(ds, record, repeatedFailures),
+      content => requireCallbacks().sessionReply(
+        sessionAnchorId(ds),
+        content,
+        'interactive',
+        ds.larkAppId,
+        record.logicalTurnId,
+        { uuid: record.delivery.uuid },
+      ),
     ),
     canDeliver: () => ds.session.status === 'active' && ordinaryTurnRecoveryStillOwnsSession(ds),
   };
@@ -3127,6 +3196,7 @@ function ordinaryRecoveryNoticeHost(ds: DaemonSession): RecoveryNoticeHost {
 export function buildOrdinaryRecoveryNoticeCard(
   ds: DaemonSession,
   record: OrdinaryRecoveryNoticeRecord,
+  repeatedFailures?: number,
 ): string {
   const botCfg = getBot(ds.larkAppId).config;
   const cliId = sessionCliId(ds, botCfg);
@@ -3158,6 +3228,7 @@ export function buildOrdinaryRecoveryNoticeCard(
     errorCodes: [record.causeErrorCode, record.errorCode].filter((code): code is string => !!code),
     ...(record.task ? { task: record.task } : {}),
     failedAt: new Date(record.createdAt),
+    ...(repeatedFailures !== undefined ? { repeatedFailures } : {}),
     retry: retried
       ? { kind: 'retried', byOpenId: retried.byOpenId, at: new Date(retried.at) }
       : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
@@ -3377,11 +3448,14 @@ export function ensureOrdinaryTurnRecoveryAttached(
             { resume: true, turnId: dispatch.turnId },
           );
         } else {
+          // A turn that failed without any output is cut first and its input
+          // re-sent instead of the recovery prompt: nothing ran, so there is
+          // no checkpoint to continue from (core/failed-turn-rewind.ts).
           enqueued = sendWorkerInput(
             ds,
             dispatch.prompt,
             dispatch.turnId,
-            trustedCaller ? { trustedCaller } : {},
+            { ...(trustedCaller ? { trustedCaller } : {}), failedTurn: 'resend' },
           );
         }
       } catch (err) {
@@ -15841,6 +15915,144 @@ function commitAcceptedInputTitle(ds: DaemonSession, plan: AutomaticSessionTitle
   return true;
 }
 
+/** The failed-turn rewind directive (core/failed-turn-rewind.ts) an input to
+ *  a live Claude Code worker carries, if any. Inputs that must reach the CLI
+ *  byte for byte — durable/attempted deliveries, the image purge, structured
+ *  App input — and sessions whose transcript botmux does not own go as they
+ *  are. */
+function failedTurnRewindForInput(
+  ds: DaemonSession,
+  payload: CliTurnPayload,
+  turnId: string | undefined,
+  cliId: string | undefined,
+  opts: {
+    failedTurn?: 'resend';
+    purgeUndersizedImages?: true;
+    dispatchAttempt?: number;
+    durablePrimaryInbox?: true;
+    trustedCaller?: TrustedCaller;
+    viaTransferGate: boolean;
+  },
+): FailedTurnRewindDirective | undefined {
+  if (cliId !== 'claude-code' || !turnId || opts.viaTransferGate || !ds.worker || ds.worker.killed) return undefined;
+  if (opts.purgeUndersizedImages || opts.dispatchAttempt !== undefined || opts.durablePrimaryInbox
+    || payload.codexAppInput) return undefined;
+  if (isRemoteBackendSession(ds) || isSharedAdoptSession(ds) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+    return undefined;
+  }
+  const mode = opts.failedTurn ?? 'merge';
+  // An input already on its way to carry this failed turn on (its CLI restart
+  // is running): another one would run the failed input twice.
+  const record = ds.session.lastFailedTurn;
+  if (record && failedTurnRewindInFlight(ds, record.turnId)) return undefined;
+  if (mode === 'merge' && !mergeKeepsFailedInputDelivered(ds, record, turnId, opts.trustedCaller)) {
+    return undefined;
+  }
+  return planFailedTurnRewind({
+    record: ds.session.lastFailedTurn,
+    turnId,
+    content: payload.content,
+    mode,
+  });
+}
+
+/** Folding a failed input into another turn hands it that turn's identity and
+ *  delivery. Only where both stay what the failed input had:
+ *  - the new turn's answer reaches the chat like the failed one's would have
+ *    (not a silent scheduled fire, a trigger with its final output
+ *    suppressed, an HTTP wait/async result, a headless session), and the
+ *    failed input was not a silent fire itself;
+ *  - the new turn runs as nobody stronger: a human sender must be the one
+ *    who sent the failed input. An unidentified input (a webhook's "继续")
+ *    runs the failed input with less authority than it had, never more.
+ *  Anything else goes in as it is, stacked on the failure, as before. */
+function mergeKeepsFailedInputDelivered(
+  ds: DaemonSession,
+  record: FailedTurnRecord | undefined,
+  turnId: string,
+  caller: TrustedCaller | undefined,
+): boolean {
+  if (!record || record.silent) return false;
+  // The same exits codexAppDeliverySinkForTurn tells apart: only a turn whose
+  // answer goes to the chat, on either side, may take the other's input.
+  const docComment = (id: string) => !!ds.session.docCommentTargets?.[id] || !!ds.docCommentTurns?.has(id);
+  if (isSilentScheduledTurn(ds, turnId) || isTriggerFinalSuppressed(ds, turnId)
+    || ds.suppressedFinalOutputTurns?.has(turnId)
+    || ds.pendingWaitPromises?.has(turnId) || ds.asyncTriggerResults?.has(turnId)
+    || docComment(turnId) || docComment(record.turnId)
+    || ds.session.headless) return false;
+  if (!caller) return true;
+  const failedBy = record.trustedCaller;
+  return !!failedBy
+    && failedBy.requestLarkAppId === caller.requestLarkAppId
+    && !!caller.requestUserOpenId
+    && failedBy.requestUserOpenId === caller.requestUserOpenId;
+}
+
+/** The worker's answer to an input's failed-turn rewind directive. Once the
+ *  failed turn is cut, the input's turn carries the failed input on: it is
+ *  the session's latest input (what the next failure records, and retries),
+ *  the failed turn's record is spent, and a further failure of the same input
+ *  joins the chain whose card is updated in place. */
+export function applyFailedTurnRewindResult(
+  ds: DaemonSession,
+  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; reason: string; cut?: true },
+): void {
+  const pending = ds.pendingFailedTurnRewinds?.get(result.turnId);
+  ds.pendingFailedTurnRewinds?.delete(result.turnId);
+  if (result.outcome !== 'rewound') {
+    logger.info(`[${tag(ds)}] Failed turn ${result.failedTurnId.slice(0, 16)} not carried on by ${result.turnId.slice(0, 16)}`
+      + `${result.cut ? ' (cut from the transcript all the same)' : ''}: ${result.reason}`);
+    // Its input lives on only in the record now: the next input brings it
+    // back without a cut, and the failure card's retry still re-sends it.
+    const record = ds.session.lastFailedTurn;
+    if (result.cut && pending?.failedTurnId === result.failedTurnId && record?.turnId === result.failedTurnId) {
+      record.cutFromTranscript = true;
+      try { sessionStore.updateSession(ds.session); }
+      catch (err) { logger.warn(`[${tag(ds)}] Could not persist that failed turn ${record.turnId.slice(0, 16)} was cut: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+    return;
+  }
+  if (!pending || pending.failedTurnId !== result.failedTurnId) {
+    logger.warn(`[${tag(ds)}] Failed turn ${result.failedTurnId.slice(0, 16)} cut for an input this daemon did not track (${result.turnId.slice(0, 16)})`);
+    return;
+  }
+  logger.info(`[${tag(ds)}] Failed turn ${result.failedTurnId.slice(0, 16)} cut; ${result.turnId.slice(0, 16)} carries its input (${pending.mode}): ${result.reason}`);
+  // The input becomes the session's latest unless a newer one was dispatched
+  // meanwhile (it queued behind this one's restart): that one keeps it.
+  // Inputs never remembered as latest (an automatic continuation) leave the
+  // failed turn as the latest, which they now replace.
+  if (ds.lastCliInputTurnId === result.turnId || ds.lastCliInputTurnId === result.failedTurnId) {
+    const userPrompt = pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
+      ? mergeFailedTurnInput(pending.failedUserPrompt, ds.lastUserPrompt)
+      : pending.failedUserPrompt;
+    ds.lastUserPrompt = userPrompt;
+    ds.lastCliInput = pending.content;
+    ds.lastCliInputTurnId = result.turnId;
+    ds.session.lastUserPrompt = userPrompt;
+    ds.session.lastCliInput = pending.content;
+    ds.session.lastCliInputTurnId = result.turnId;
+  }
+  const retryInput = ds.session.ordinaryTurnRecovery?.retryInputs?.[result.turnId];
+  if (retryInput) retryInput.cliInput = pending.content;
+  if (ds.session.lastFailedTurn?.turnId === result.failedTurnId) delete ds.session.lastFailedTurn;
+  const previous = ds.session.failedTurnRewindChain;
+  const continues = previous?.turnId === result.failedTurnId;
+  const card = continues
+    ? previous!.cardMessageId
+    : ds.session.lastFailureCard?.turnId === result.failedTurnId ? ds.session.lastFailureCard.messageId : undefined;
+  ds.session.failedTurnRewindChain = {
+    turnId: result.turnId,
+    failures: continues ? previous!.failures + 1 : 1,
+    ...(card ? { cardMessageId: card } : {}),
+  };
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    logger.error(`[${tag(ds)}] Could not persist the cut of failed turn ${result.failedTurnId.slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export function sendWorkerInput(
   ds: DaemonSession,
   payload: string | CliTurnPayload,
@@ -15867,6 +16079,12 @@ export function sendWorkerInput(
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
     queueAfterActiveTurn?: true;
+    /** This input retries the session's failed turn (failure card button,
+     *  /retry, automatic continuation): when that turn failed without any
+     *  output, the worker cuts it and re-sends its input instead of this
+     *  content. Any other input is sent together with such a failed input
+     *  (core/failed-turn-rewind.ts). */
+    failedTurn?: 'resend';
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
@@ -16008,12 +16226,17 @@ export function sendWorkerInput(
     opts.dispatchAttempt,
     vcMeetingImTurnOrigin,
   );
+  const failedTurnRewind = failedTurnRewindForInput(ds, normalized, effectiveTurnId, effectiveCliId, {
+    ...opts,
+    viaTransferGate: !!transferGate,
+  });
   // Route through sendWorkerSessionInput so an in-flight routing transfer
   // buffers this turn instead of dropping it (master's transfer input gate),
   // while preserving PR #597's accepted-dispatch ledger + reply-context wiring.
   const message: Extract<DaemonToWorker, { type: 'message' }> = {
     type: 'message',
     content: normalized.content,
+    ...(failedTurnRewind ? { failedTurnRewind } : {}),
     // A parked (crash-loop stopped) worker respawns the CLI from INSIDE the
     // worker when this message arrives, and that path has no restart IPC to
     // refresh its launch snapshot — so carry the current model on the message
@@ -16079,6 +16302,17 @@ export function sendWorkerInput(
     return false;
   }
   commitAcceptedInputTitle(ds, automaticTitlePlan);
+  if (failedTurnRewind && effectiveTurnId) {
+    const pending = ds.pendingFailedTurnRewinds ??= new Map();
+    pending.set(effectiveTurnId, {
+      failedTurnId: failedTurnRewind.failedTurnId,
+      mode: failedTurnRewind.mode,
+      content: failedTurnRewind.content,
+      failedUserPrompt: ds.session.lastFailedTurn?.userPrompt ?? failedTurnRewind.failedInput,
+      worker: ds.worker,
+    });
+    while (pending.size > 16) pending.delete(pending.keys().next().value!);
+  }
   rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, opts.trustedCaller);
   {
     const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
@@ -20103,6 +20337,15 @@ function setupWorkerHandlers(
         acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
         break;
       }
+      case 'failed_turn_rewind': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored failed_turn_rewind from stale worker generation`);
+          break;
+        }
+        applyFailedTurnRewindResult(ds, msg);
+        break;
+      }
+
       case 'turn_input_rejected': {
         if (
           ds.worker !== worker
@@ -23239,12 +23482,14 @@ function setupWorkerHandlers(
               reason: 'user_notify',
               message: msg.message,
             }),
-            send: notice => sendTurnNotice(ds, {
-              kind: 'user_notify',
-              turnId: fallbackTurnId(ds, msg.turnId),
-              msgType: 'text',
-              content: notice,
-            }),
+            send: async notice => {
+              await sendTurnNotice(ds, {
+                kind: 'user_notify',
+                turnId: fallbackTurnId(ds, msg.turnId),
+                msgType: 'text',
+                content: notice,
+              });
+            },
             log: line => logger.warn(`[${t}] ${line}`),
           });
           break;
@@ -23528,6 +23773,14 @@ function setupWorkerHandlers(
           if (msg.continuationFailure) throw err;
         }
         if (terminalPersisted) publishTurnFinished(ds, msg);
+        // The turn is over: whatever its rewind directive did is settled.
+        ds.pendingFailedTurnRewinds?.delete(msg.turnId);
+        // The re-sent failed input got through (or was stopped / cut short):
+        // a later failure is a new story with a card of its own.
+        if (msg.status !== 'failed' && ds.session.failedTurnRewindChain?.turnId === msg.turnId) {
+          delete ds.session.failedTurnRewindChain;
+          try { sessionStore.updateSession(ds.session); } catch { /* the next session write carries it */ }
+        }
         if (terminalPersisted && msg.turnId.startsWith('mlrp_turn_')
           && msg.status === 'completed' && isSilentMessageListenerSession(ds.session)) {
           markMessageListenerRunPreviewCompleted(msg.turnId);
@@ -23689,17 +23942,23 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await sendTurnNotice(ds, {
-              kind: 'turn_failure',
-              turnId: fallbackTurnId(ds, msg.turnId),
-              msgType: 'interactive',
-              content: buildSessionTurnFailedCard(ds, {
+            await deliverTurnFailureCard(
+              ds,
+              msg.turnId,
+              repeatedFailures => buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
                 ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
                 ...(upcomingProviderRetryAt(msg.providerRetryAtMs) ? { providerRetryAt: upcomingProviderRetryAt(msg.providerRetryAtMs) } : {}),
+                ...(repeatedFailures !== undefined ? { repeatedFailures } : {}),
               }),
-            });
+              content => sendTurnNotice(ds, {
+                kind: 'turn_failure',
+                turnId: fallbackTurnId(ds, msg.turnId),
+                msgType: 'interactive',
+                content,
+              }),
+            );
           } catch (err) {
             logger.error(
               `[${t}] Failed to deliver turn failure card: `

@@ -196,6 +196,20 @@ export function trustedPayloadSessionInScope(requestChatId: string | undefined, 
   return sessionChatId.startsWith('http_async_') || sessionChatId.startsWith('http_wait_');
 }
 
+/** Zero-injection prompt of an external trigger: the caller's instruction,
+ *  then the event data as-is. An event without data (no rawText, payload
+ *  absent or `{}`) sends the instruction alone — rendering the missing payload
+ *  as `{}` put a stray "{}" line under every bare "继续" a connector sent. A
+ *  request with neither still renders its (empty) payload, as before: an empty
+ *  input is not a turn the CLI would start. */
+export function buildZeroInjectionTriggerPrompt(req: Pick<TriggerRequest, 'instruction' | 'envelope'>): string {
+  const { rawText, payload } = req.envelope;
+  const emptyPayload = payload === undefined || payload === null
+    || (typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0);
+  const data = rawText ?? (emptyPayload ? undefined : JSON.stringify(payload));
+  return [req.instruction, data].filter(Boolean).join('\n\n') || JSON.stringify(payload ?? {});
+}
+
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
   const applicationContext = buildExternalEventApplicationContext(req);
   const eventData = buildExternalEventDataContext(req, triggerId);
@@ -1009,7 +1023,7 @@ async function triggerSessionTurnAdmitted(
   const dryRun = !!req.options?.dryRun;
   const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
-    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);

@@ -2239,6 +2239,13 @@ export interface TurnFailedCardOpts {
   task?: string;
   /** Auto-continuation count, when a recovery ladder ran and gave up. */
   continuations?: number;
+  /** How many times in a row this input has now failed without any output
+   *  (≥ 2): the card is the one updated in place for each of them. */
+  repeatedFailures?: number;
+  /** The transcript shows nothing but the error for this turn (no tool call,
+   *  no text): the advice says so, and that retrying cuts the failure out and
+   *  re-sends the input (core/failed-turn-rewind.ts). Pair with `safe`. */
+  directFailure?: boolean;
   /** The provider's own recovery time, when its error named one: the card
    *  says when continuing makes sense. */
   providerRetryAt?: Date;
@@ -2281,6 +2288,9 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
   const lines: string[] = [];
   // 先 @ 人再讲事：飞书的通知摘要只取前一段，@ 放最后会被截掉。
   if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  if (o.repeatedFailures !== undefined && o.repeatedFailures > 1) {
+    lines.push(t('card.turn_failed.field_repeat', { count: String(o.repeatedFailures) }, locale));
+  }
   // errorCode 是闭集常量（`cli_exit` / `provider_*` / `codexTaskFailureCode` 的
   // 固定返回值），从不携带 provider 原文，所以用反引号包成行内代码而不是
   // escapeMd —— 后者会把 `a_b_c` 里的下划线转义成可见的反斜杠，正是这类码最常
@@ -2324,9 +2334,11 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
       ? 'card.turn_failed.no_retry'
       : !o.retryTurnId
         ? 'card.turn_failed.no_input'
-        : o.retryOffer === 'safe'
-          ? 'card.turn_failed.retry_safe'
-          : 'card.turn_failed.retry_caveated';
+        : o.directFailure
+          ? 'card.turn_failed.retry_direct'
+          : o.retryOffer === 'safe'
+            ? 'card.turn_failed.retry_safe'
+            : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -2407,6 +2419,8 @@ export interface RecoveryFailedCardOpts {
   errorCodes: string[];
   task?: string;
   failedAt?: Date;
+  /** See {@link TurnFailedCardOpts.repeatedFailures}. */
+  repeatedFailures?: number;
   /** `available` renders the retry button; `retried` replaces it with who
    *  retried and when; `none` explains why there is nothing to re-deliver. */
   retry:
@@ -2437,6 +2451,9 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
   const { locale } = o;
   const lines: string[] = [];
   if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  if (o.repeatedFailures !== undefined && o.repeatedFailures > 1) {
+    lines.push(t('card.turn_failed.field_repeat', { count: String(o.repeatedFailures) }, locale));
+  }
   lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
   if (o.continuationOff?.providerRetryAt) {
     lines.push(t('card.recovery_failed.field_provider_eta', {

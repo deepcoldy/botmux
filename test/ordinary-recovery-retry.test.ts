@@ -171,6 +171,24 @@ describe('at most once', () => {
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
   });
 
+  // Another input is re-sending this very message right now (its failed turn
+  // is being cut out first, the CLI restarting): a retry would run it twice.
+  it('refuses while another input is already re-sending this message, and the button stays usable', async () => {
+    const ds = session();
+    // What is being re-sent can be a continuation of this message that failed
+    // in turn (its own turn id): any re-send in flight refuses the click.
+    ds.pendingFailedTurnRewinds = new Map([['trg_carrier', {
+      failedTurnId: 'bmx-recovery-cont-1', mode: 'merge', content: 'x', failedUserPrompt: 'x', worker: ds.worker,
+    }]]);
+    const res = await click(ds, 'ou_asker');
+    expect(res.toast).toEqual({ type: 'warning', content: t('card.action.retry_turn_in_flight') });
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(ds.session.ordinaryRecoveryNotices[0].retried).toBeUndefined();
+    ds.pendingFailedTurnRewinds.clear();
+    await click(ds, 'ou_asker');
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+  });
+
   it('two concurrent presses submit once', async () => {
     const ds = session();
     let release!: () => void;
