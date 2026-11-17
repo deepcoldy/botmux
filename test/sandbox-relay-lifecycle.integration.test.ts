@@ -76,6 +76,8 @@ function runtimeAvailable(flavour: SandboxFlavour): boolean {
 }
 
 interface RelayResponse { code?: number; stdout?: string; stderr?: string }
+/** Present in the fake CLI's own directory: it fails at startup (see createLab). */
+const DIE_ON_START_BASENAME = 'die-on-start';
 interface Report { event: string; relay?: string | null; id?: string; error?: string }
 
 /** One hermetic session on a private tmux server, driven by real workers. */
@@ -127,6 +129,10 @@ function createLab(opts: { flavour: SandboxFlavour; backend: Backend }) {
 const fs = require('node:fs');
 const path = require('node:path');
 if (process.argv.includes('--version')) { console.log('2.1.0 (Claude Code)'); process.exit(0); }
+if (fs.existsSync(path.join(__dirname, ${JSON.stringify(DIE_ON_START_BASENAME)}))) {
+  console.error('fake-cli: injected startup failure');
+  process.exit(3);
+}
 const relay = process.env.BOTMUX_SEND_RELAY || null;
 const reportFile = path.join(relay || __dirname, 'fake-cli-report.jsonl');
 const report = (entry) => { try { fs.appendFileSync(reportFile, JSON.stringify(entry) + '\\n'); } catch {} };
@@ -178,6 +184,12 @@ setInterval(() => {}, 1 << 30);
   // exited unexpectedly`. Scoped to the pane so unrelated kills/probes
   // (diagnostic sessions, backend selection) neither arm nor count.
   const exitingServerFlag = join(dir, 'exiting-server-on-post-kill-probe');
+  // `cliDiesBeforePipePane` makes the fake CLI print one line and exit 3 the
+  // moment it starts, and holds the worker's pipe-pane of THIS pane until tmux
+  // reports the pane dead: the fresh launch then meets a pane whose CLI is
+  // already gone when pipe-pane attaches (`target pane has exited`) — the
+  // shape CI hit in #3470, made deterministic instead of a startup race.
+  const holdPipePaneFlag = join(dir, 'hold-pipe-pane-until-dead');
   const paneMarker = isolationPaneMarkerPath(dataDir, sessionId);
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
 if [ -e '${failNewSessionFlag}' ]; then
@@ -215,6 +227,20 @@ if [ -e '${exitingServerFlag}' ]; then
         echo fired >> '${exitingServerFlag}.fired'
         echo 'server exited unexpectedly' >&2; exit 1
       fi
+    done
+  fi
+fi
+if [ -e '${holdPipePaneFlag}' ]; then
+  piping=0; ours=0
+  for arg in "$@"; do
+    case "$arg" in *pipe-pane*) piping=1 ;; esac
+    case "$arg" in *'${paneTarget}'*) ours=1 ;; esac
+  done
+  if [ $piping = 1 ] && [ $ours = 1 ]; then
+    i=0
+    while [ $i -lt 400 ]; do
+      [ "$('${realTmux}' -S '${socket}' display-message -p -t '${paneTarget}' '#{pane_dead}' 2>/dev/null)" = 1 ] && break
+      sleep 0.05; i=$((i + 1))
     done
   fi
 fi
@@ -273,6 +299,10 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     failNewSession: (): void => writeFileSync(failNewSessionFlag, ''),
     corruptProofOnPipePane: (): void => writeFileSync(corruptProofFlag, ''),
+    cliDiesBeforePipePane: (): void => {
+      writeFileSync(join(workDir, DIE_ON_START_BASENAME), '');
+      writeFileSync(holdPipePaneFlag, '');
+    },
     exitingServerOnPostKillProbes: (ordinals: number[]): void => {
       if (ordinals.length) writeFileSync(exitingServerFlag, ordinals.join(' '));
     },
@@ -519,6 +549,33 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
       expect(first.errors().join('\n'), first.logs()).toContain('EMFILE: injected by test');
       expect(first.logs()).toContain('retired the tmux session it had created');
       expect(lab.paneAlive()).toBe(false);
+      expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
+      if (flavour === 'scratch') {
+        expect(isMountpoint(join(lab.sessionRoot, 'root'))).toBe(false);
+        expect(existsSync(join('/var/tmp/botmux-scratch', lab.sessionId))).toBe(false);
+      }
+    } finally {
+      await lab.dispose();
+    }
+  }, 120_000);
+
+  // #3470: the CLI chain in the fresh pane exits before pipe-pane attaches, so
+  // tmux answers `target pane has exited`. The dead pane is retired and the
+  // tree rolled back as for any post-pane failure — and the worker's own log
+  // must say WHY (exit status, last screen). That reason used to travel only
+  // in the IPC error, so a CI flake of this shape showed nothing but
+  // "retired the tmux session it had created".
+  it.skipIf(!realTmux || !runtime)('tmux × fresh launch whose CLI exits before pipe-pane attaches: retires the dead pane, rolls the tree back, logs the pane\'s exit reason', async () => {
+    const lab = createLab({ flavour, backend: 'tmux' });
+    try {
+      lab.cliDiesBeforePipePane();
+      const first = lab.start('boot-1');
+      await workerExit(first);
+      expect(first.errors().join('\n'), first.logs()).toContain('fake-cli: injected startup failure');
+      expect(first.logs()).toContain('retired the tmux session it had created');
+      expect(first.logs(), first.errors().join('\n')).toContain('fake-cli: injected startup failure');
+      expect(lab.paneAlive()).toBe(false);
+      expect(lab.starts()).toEqual([]);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
       if (flavour === 'scratch') {
         expect(isMountpoint(join(lab.sessionRoot, 'root'))).toBe(false);

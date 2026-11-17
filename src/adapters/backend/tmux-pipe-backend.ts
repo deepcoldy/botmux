@@ -152,6 +152,14 @@ export interface PipePaneDeathEvidence {
 
 const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
 const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+/** History lines read above the visible screen for the post-mortem. When the
+ *  pane dies, tmux writes its remain-on-exit banner ("Pane is dead (status N,
+ *  …)") on the bottom row with a linefeed, scrolling the whole screen up one
+ *  line. A CLI that died at startup usually printed a single line at the top —
+ *  exactly the line that scrolls into history — so a visible-only capture
+ *  kept tmux's banner and lost the reason (#3470). The tail cap still bounds
+ *  what is reported. */
+const PANE_DEATH_SCREEN_HISTORY_LINES = 50;
 
 /** After #{pane_dead} flips, #{pane_dead_status} is populated a beat later
  *  (`1:` → `1:77` observed on tmux 3.3a; the gap widens under a loaded server).
@@ -343,7 +351,7 @@ function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly s
     const out = String(
       execFileSync(
         'tmux',
-        [...socketArgs, 'capture-pane', '-p', '-t', paneTarget],
+        [...socketArgs, 'capture-pane', '-p', '-S', `-${PANE_DEATH_SCREEN_HISTORY_LINES}`, '-t', paneTarget],
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
       ) ?? '',
     );
