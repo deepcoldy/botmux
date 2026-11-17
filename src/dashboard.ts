@@ -6298,6 +6298,13 @@ const server = createServer(async (req, res) => {
         probeEnv: probeContext.probeEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
         resolveExecutable,
+        supportsModelDiscovery: requestedCliId => {
+          // Capability fields are static for a CLI. An absolute placeholder
+          // keeps even eager constructors (for example pi) from resolving the
+          // real command before this preflight has proved discovery is needed.
+          const adapter = createCliAdapterSync(requestedCliId, '/__botmux_model_capability_probe__');
+          return Boolean(adapter.detectModelCapabilities || adapter.detectModels);
+        },
         adapterFactory: async (requestedCliId, pathOverride) => {
           const command = pathOverride ?? rawCliExecutable(requestedCliId);
           return createCliAdapterSync(requestedCliId, command ? await resolveExecutable(command) : undefined);

@@ -16,6 +16,10 @@ export interface StoreSnapshot {
    *  而不是画一个永远为空的面板。false 同时覆盖「没有能力所以没请求」和「请求
    *  失败」两种情况。 */
   schedulesAvailable: boolean;
+  /** True once the first schedules snapshot attempt has committed, including an
+   * unavailable (`schedulesAvailable === false`) result. Stays true on later
+   * reconciles so an established page does not return to a loading state. */
+  schedulesReady: boolean;
   /** True once the first authoritative `/api/sessions` snapshot has been
    *  installed. UI uses it to hold a skeleton instead of flashing an empty
    *  list before the bootstrap fetch lands. Stays true forever after. */
@@ -42,6 +46,7 @@ class Store {
   online = true;
   scheduleTimeZone = '';
   schedulesAvailable = true;
+  private schedulesReady = false;
   private bootstrapped = false;
   private closedCursor: string | null = null;
   private closedTotal = 0;
@@ -57,6 +62,7 @@ class Store {
     version: this.version,
     scheduleTimeZone: this.scheduleTimeZone,
     schedulesAvailable: this.schedulesAvailable,
+    schedulesReady: this.schedulesReady,
     bootstrapped: false,
     closedCursor: null,
     closedTotal: 0,
@@ -89,6 +95,7 @@ class Store {
     this.schedules.clear();
     for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
     this.schedulesAvailable = schedules !== null;
+    this.schedulesReady = true;
     if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
     this.bootstrapped = true;
     this.emit();
@@ -107,6 +114,7 @@ class Store {
     this.schedules.clear();
     for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
     this.schedulesAvailable = schedules !== null;
+    this.schedulesReady = true;
     if (timezone) this.scheduleTimeZone = timezone;
     this.emit();
     if (schedules !== null) for (const fn of this.scheduleRunLogListeners) fn();
@@ -310,6 +318,7 @@ class Store {
       version: this.version,
       scheduleTimeZone: this.scheduleTimeZone,
       schedulesAvailable: this.schedulesAvailable,
+      schedulesReady: this.schedulesReady,
       bootstrapped: this.bootstrapped,
       closedCursor: this.closedCursor,
       closedTotal: this.closedTotal,

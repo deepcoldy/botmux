@@ -17,6 +17,15 @@ describe('Dashboard asynchronous executable discovery', () => {
     expect(await first).toBe('/test/bin/codex');
   });
 
+  it('preserves trimmed absolute and relative executable paths without a shell probe', async () => {
+    const probe = vi.fn();
+    const resolve = createDashboardExecutableResolver({}, probe);
+    await expect(resolve('  /custom/codex  ')).resolves.toBe('/custom/codex');
+    await expect(resolve('  ./vendorCodex  ')).resolves.toBe('./vendorCodex');
+    await expect(resolve('../tools/vendorCodex')).resolves.toBe('../tools/vendorCodex');
+    expect(probe).not.toHaveBeenCalled();
+  });
+
   it('rejects unresolved bare names instead of falling back to a synchronous adapter lookup', async () => {
     const resolve = createDashboardExecutableResolver({}, async command => ({ resolved: command, inconclusive: true }));
     await expect(resolve('missing-cli')).rejects.toThrow('cli_executable_unresolved');
@@ -35,5 +44,21 @@ describe('Dashboard asynchronous executable discovery', () => {
     expect(resolve.mock.calls.map(([command]) => command).sort()).toEqual(['broken', 'codex']);
     expect(targets).toHaveLength(1);
     expect(targets[0]).toMatchObject({ runtimeId: 'codex', binPath: '/test/bin/codex' });
+  });
+
+  it('keeps relative update targets and normalizes a blank legacy override to the default', async () => {
+    const relativeResolve = vi.fn(async (command: string) => command);
+    const relative = await resolveDashboardRuntimeUpdateTargets([
+      { cliId: 'codex', cliPathOverride: '  ./vendorCodex  ' },
+    ], relativeResolve);
+    expect(relativeResolve).toHaveBeenCalledWith('./vendorCodex');
+    expect(relative[0]).toMatchObject({ binPath: './vendorCodex', runtimeId: 'vendorCodex' });
+
+    const defaultResolve = vi.fn(async () => '/test/bin/codex');
+    const official = await resolveDashboardRuntimeUpdateTargets([
+      { cliId: 'codex', cliPathOverride: '   ' },
+    ], defaultResolve);
+    expect(defaultResolve).toHaveBeenCalledWith('codex');
+    expect(official[0]).toMatchObject({ binPath: '/test/bin/codex', runtimeId: 'codex' });
   });
 });

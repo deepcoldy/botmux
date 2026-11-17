@@ -40,6 +40,9 @@ export interface DetectModelsOptions {
   readonly now?: () => number;
   /** 适配器工厂注入，默认 createCliAdapterSync。 */
   readonly adapterFactory?: (cliId: CliId, pathOverride?: string) => CliAdapter | Promise<CliAdapter>;
+  /** Optional shell-free capability preflight. Returning false must prevent both
+   * adapter construction and executable resolution (Dashboard HTTP probes). */
+  readonly supportsModelDiscovery?: (cliId: CliId) => boolean;
   /** Aiden AIPROXY 探测器注入，默认调用 `aiden x models --codex --json`。 */
   readonly aidenCodexDetector?: () => Promise<readonly string[] | null>;
   /** Bot-specific runtime identity; never returned to clients. */
@@ -148,16 +151,6 @@ async function detectModelCatalogWith(
     // is handled by its dedicated detector below.
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
 
-    const adapter = opt.key === 'aiden-x-codex'
-      ? undefined
-      : await factory(opt.cliId, opts?.runtimeExecutable);
-    // Confirm discovery capability before resolving/fingerprinting a command.
-    // This keeps non-discoverable CLIs (for example claude-code) shell-free.
-    if (opt.key !== 'aiden-x-codex'
-      && !adapter?.detectModelCapabilities
-      && !adapter?.detectModels) return null;
-
-    // TTL 内的成功缓存直接复用。
     // Pi reads local configuration in the effective environment, including
     // ambient HOME/agent-dir when no Bot-specific probe env was supplied.
     const probeEnv = opts?.probeEnv ?? (opt.cliId === 'pi' ? process.env : undefined);
@@ -166,54 +159,82 @@ async function detectModelCatalogWith(
         Object.keys(probeEnv).sort().map(key => [key, probeEnv[key]]),
       )).digest('hex')
       : '';
-    const runtimeIdentity = opt.key === 'aiden-x-codex'
-      ? 'aiden'
-      : await runtimeCacheIdentity(
-          opts?.runtimeExecutable ?? rawCliExecutable(opt.cliId),
-          opts?.resolveExecutable ?? resolveCommand,
-        );
-    const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}`;
-    const cached = cache.get(cacheKey);
-    if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
-      return { models: cached.models, ...(cached.modelCapabilities ? { modelCapabilities: cached.modelCapabilities } : {}) };
-    }
+    const executable = opts?.runtimeExecutable ?? rawCliExecutable(opt.cliId);
+    const operationKey = `operation:${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${opt.key === 'aiden-x-codex' ? 'aiden' : executable ?? ''}`;
+    const pendingOperation = inFlight.get(operationKey);
+    if (pendingOperation) return pendingOperation;
 
-    // 同一 key 并发调用复用 in-flight Promise（去重）。
-    const pending = inFlight.get(cacheKey);
-    if (pending) return pending;
-
-    const promise = (async (): Promise<DetectedModelCatalog | null> => {
+    // Register the raw operation before the first await. A second request must
+    // share a failed probe even when its own executable lookup is slower.
+    const operation = Promise.resolve().then(async (): Promise<DetectedModelCatalog | null> => {
       try {
-        const capabilities = adapter?.detectModelCapabilities
-          ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
-          : undefined;
-        const models = opt.key === 'aiden-x-codex'
-          ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
-          : adapter?.detectModelCapabilities
-            ? capabilities?.map(model => model.slug) ?? null
-            : await adapter?.detectModels?.({ env: probeEnv }) ?? null;
-        // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
-        if (models === null) return null;
-        if (models.length === 0) return { models: [] };
-        const detected = {
-          models: [...models],
-          // A wrapper can remap models or credentials. Until its probe runs
-          // through the real launcher, expose only the legacy slug list.
-          ...(!opt.wrapperCli && capabilities && capabilities.length > 0
-            ? { modelCapabilities: capabilities }
-            : {}),
-        };
-        cache.set(cacheKey, { at: now(), ...detected });
-        return detected;
+        if (opt.key !== 'aiden-x-codex' && opts?.supportsModelDiscovery?.(opt.cliId) === false) return null;
+        const adapter = opt.key === 'aiden-x-codex'
+          ? undefined
+          : await factory(opt.cliId, opts?.runtimeExecutable);
+        // Keep the adapter-level check for callers without a static preflight.
+        if (opt.key !== 'aiden-x-codex'
+          && !adapter?.detectModelCapabilities
+          && !adapter?.detectModels) return null;
+
+        const runtimeIdentity = opt.key === 'aiden-x-codex'
+          ? 'aiden'
+          : await runtimeCacheIdentity(
+              executable,
+              opts?.resolveExecutable ?? resolveCommand,
+            );
+        const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}`;
+        const cached = cache.get(cacheKey);
+        if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
+          return { models: cached.models, ...(cached.modelCapabilities ? { modelCapabilities: cached.modelCapabilities } : {}) };
+        }
+
+        // Aliases that resolve to the same executable still share the final
+        // identity-keyed probe, while the operation key closes the setup race.
+        const identityKey = `identity:${cacheKey}`;
+        const pendingIdentity = inFlight.get(identityKey);
+        if (pendingIdentity) return await pendingIdentity;
+
+        const promise = (async (): Promise<DetectedModelCatalog | null> => {
+          try {
+            const capabilities = adapter?.detectModelCapabilities
+              ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
+              : undefined;
+            const models = opt.key === 'aiden-x-codex'
+              ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
+              : adapter?.detectModelCapabilities
+                ? capabilities?.map(model => model.slug) ?? null
+                : await adapter?.detectModels?.({ env: probeEnv }) ?? null;
+            // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
+            if (models === null) return null;
+            if (models.length === 0) return { models: [] };
+            const detected = {
+              models: [...models],
+              // A wrapper can remap models or credentials. Until its probe runs
+              // through the real launcher, expose only the legacy slug list.
+              ...(!opt.wrapperCli && capabilities && capabilities.length > 0
+                ? { modelCapabilities: capabilities }
+                : {}),
+            };
+            cache.set(cacheKey, { at: now(), ...detected });
+            return detected;
+          } catch {
+            return null;
+          } finally {
+            inFlight.delete(identityKey);
+          }
+        })();
+
+        inFlight.set(identityKey, promise);
+        return await promise;
       } catch {
         return null;
       } finally {
-        inFlight.delete(cacheKey);
+        inFlight.delete(operationKey);
       }
-    })();
-
-    inFlight.set(cacheKey, promise);
-    return promise;
+    });
+    inFlight.set(operationKey, operation);
+    return operation;
   } catch {
     return null;
   }

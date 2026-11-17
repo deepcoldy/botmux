@@ -54,7 +54,7 @@ describe('optional dashboard reads', () => {
     act(() => renderer.unmount());
   });
 
-  it('reads remote descriptions only when editing and keeps save disabled until the snapshot arrives', async () => {
+  it('loads on edit, allows closing during the read, then reopens the fetched snapshot', async () => {
     vi.stubGlobal('document', { body: {} });
     let resolve!: (response: Response) => void;
     const fetcher = vi.fn(() => new Promise<Response>(done => { resolve = done; }));
@@ -66,7 +66,15 @@ describe('optional dashboard reads', () => {
     expect(fetcher).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls[0]?.[0]).toBe('/api/bots/app_lazy_description/description');
     expect(renderer.root.findByProps({ className: 'primary' }).props.disabled).toBe(true);
+    expect(renderer.root.findByProps({ 'data-action': 'close-bot-description' }).props.disabled).toBe(false);
+    expect(renderer.root.findByProps({ 'data-action': 'cancel-bot-description' }).props.disabled).toBe(false);
+
+    act(() => { renderer.root.findByProps({ 'data-action': 'cancel-bot-description' }).props.onClick(); });
+    expect(renderer.root.findAllByProps({ 'data-action': 'cancel-bot-description' })).toHaveLength(0);
     await act(async () => { resolve(new Response(JSON.stringify({ ok: true, primaryLang: 'en_us', languages: [{ lang: 'en_us', description: 'Existing remote description' }] }))); });
+
+    await act(async () => { renderer.root.findByProps({ 'data-action': 'edit-bot-description' }).props.onClick(); });
+    expect(fetcher).toHaveBeenCalledOnce();
     expect(renderer.root.findByType('textarea').props.value).toBe('Existing remote description');
     expect(renderer.root.findByProps({ className: 'primary' }).props.disabled).toBe(false);
     act(() => renderer.unmount());

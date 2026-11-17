@@ -20,13 +20,16 @@ describe('Dashboard HTTP probe isolation', () => {
         import { loadOrCreatePersistedToken } from './src/dashboard/auth.js';
         const registry = { ...await import('./src/adapters/cli/registry.js') };
         let begin;
+        let lookups = 0;
         const started = new Promise(resolve => { begin = resolve; });
         let release;
         const lookup = new Promise(resolve => { release = resolve; });
         mock.module('./src/adapters/cli/registry.js', () => ({
           ...registry,
-          resolveCommandAsync: async () => { begin(); return lookup; },
-          createCliAdapterSync: () => ({ detectModels: async () => ['fixture-live-model'] }),
+          resolveCommandAsync: async () => { lookups++; begin(); return lookup; },
+          createCliAdapterSync: id => id === 'codex'
+            ? { detectModels: async () => ['fixture-live-model'] }
+            : {},
         }));
         const dir = join(homedir(), '.botmux');
         const token = loadOrCreatePersistedToken(join(dir, '.dashboard-token'));
@@ -50,6 +53,10 @@ describe('Dashboard HTTP probe isolation', () => {
         const models = await slow;
         const result = await models.json();
         if (models.status !== 200 || result.models?.[0] !== 'fixture-live-model') throw new Error('probe_failed');
+        const staticOnly = await request('/api/cli-options/models?key=claude-code');
+        const staticResult = await staticOnly.json();
+        if (staticOnly.status !== 200 || !staticResult.models?.includes('sonnet')) throw new Error('static_catalog_failed');
+        if (lookups !== 1) throw new Error('static_only_cli_started_executable_discovery');
         console.log('HTTP_PROBE_NONBLOCKING_OK');
         process.exit(0);
       `, { env: { ...process.env, HOME: home, SESSION_DATA_DIR: join(dir, 'data'), BOTMUX_BOTS_CONFIG: join(dir, 'bots.json'), BOTMUX_DASHBOARD_PORT: '0' }, timeout: 30000 });

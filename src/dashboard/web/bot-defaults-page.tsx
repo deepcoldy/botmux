@@ -2434,13 +2434,15 @@ export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
   const [snapshot, setSnapshot] = useState<BotDescriptionSnapshot | null>(null);
   const [drafts, setDrafts] = useState<BotDescriptionDrafts>({});
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const busy = loading || saving;
   const [status, setStatus] = useState<StatusMessage>(null);
   const [loginVisible, setLoginVisible] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
 
   const loadDescriptions = useCallback(async (previousDrafts?: BotDescriptionDrafts) => {
-    setBusy(true);
+    setLoading(true);
     setStatus({ text: `⏳ ${tr('botDefaults.descriptionLoading')}`, ok: true });
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`);
@@ -2470,7 +2472,7 @@ export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     } catch (e: any) {
       setStatus({ text: `✗ ${tr('botDefaults.descriptionLoadFailed', { error: caughtErrorText(e) })}` });
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
     return null;
   }, [bot.larkAppId, tr]);
@@ -2493,7 +2495,7 @@ export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
       setStatus({ text: `✗ ${tr(key, { lang: normalized.lang ?? '' })}` });
       return;
     }
-    setBusy(true);
+    setSaving(true);
     setStatus({ text: `⏳ ${tr('botDefaults.descriptionPublishing')}`, ok: true });
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`, {
@@ -2526,7 +2528,7 @@ export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     } catch (e: any) {
       setStatus({ text: `✗ ${tr('botDefaults.descriptionFailed', { error: caughtErrorText(e) })}` });
     } finally {
-      setBusy(false);
+      setSaving(false);
     }
   }, [bot.larkAppId, drafts, loadDescriptions, snapshot?.primaryLang, tr]);
 
@@ -2565,13 +2567,13 @@ export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
         <div
           className="bot-defaults-page bd-description-overlay"
           onClick={event => {
-            if (event.currentTarget === event.target && !busy) setOpen(false);
+            if (event.currentTarget === event.target && !saving) setOpen(false);
           }}
         >
           <div className="bd-description-modal" role="dialog" aria-modal="true" aria-labelledby="bd-description-title">
             <div className="bd-description-modal-head">
               <h3 id="bd-description-title">{tr('botDefaults.descriptionTitle')}</h3>
-              <button type="button" className="feishu-login-close" aria-label={tr('feishuLogin.close')} disabled={busy} onClick={() => setOpen(false)}>x</button>
+              <button type="button" className="feishu-login-close" data-action="close-bot-description" aria-label={tr('feishuLogin.close')} disabled={saving} onClick={() => setOpen(false)}>x</button>
             </div>
             {status ? (
               <small className={statusClass(status, 'bd-description-modal-status')} data-description-modal-status>
@@ -2616,7 +2618,7 @@ export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
               })}
             </div>
             <div className="bd-description-actions">
-              <button type="button" disabled={busy} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
+              <button type="button" data-action="cancel-bot-description" disabled={saving} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
               <button type="button" className="primary" disabled={busy || rows.length === 0} onClick={() => void save()}>{tr('botDefaults.descriptionSave')}</button>
             </div>
           </div>
