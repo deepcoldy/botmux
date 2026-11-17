@@ -20031,13 +20031,15 @@ function setupWorkerHandlers(
                 if (!current()) throw new Error('TraeX model cleanup was superseded');
               } });
             },
+            onCommitted: config => {
+              // Published under the same config lock as the durable write. A
+              // later manual generation can win; this stale handler cannot
+              // overwrite it after returning from the transaction.
+              getBot(ds.larkAppId).config.traexAutoModel = config;
+            },
           });
-          // `applied` proves the durable CAS committed. Always refresh the
-          // registry, even if this execution/generation became stale before the
-          // ACK; only the session-local snapshot remains generation-fenced.
-          if (result.config && result.status === 'applied') {
-            getBot(ds.larkAppId).config.traexAutoModel = result.config;
-            if (current() && ds.initConfig) ds.initConfig.traexAutoModel = result.config;
+          if (result.config && result.status === 'applied' && current() && ds.initConfig) {
+            ds.initConfig.traexAutoModel = result.config;
           }
         } catch (error) {
           logger.warn(`[${t}] TraeX model-pool cleanup failed: ${String(error)}`);

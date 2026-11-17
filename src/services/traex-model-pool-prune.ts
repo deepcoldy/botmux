@@ -53,6 +53,8 @@ export async function pruneSavedTraexModelPool(input: {
   availableModels: readonly string[];
   isCurrent: () => boolean;
   notify: (removedModels: string[]) => Promise<void>;
+  /** Runs after the durable write while the same file lock is still held. */
+  onCommitted?: (config: TraexAutoModelConfig) => void | Promise<void>;
   path?: string;
 }): Promise<TraexModelPoolPruneResult> {
   const available = new Set(input.availableModels.map(model => model.trim().toLowerCase()));
@@ -83,10 +85,19 @@ export async function pruneSavedTraexModelPool(input: {
   if (!preview.ok) return { status: 'failed', removedModels: [] };
   if (preview.result.status !== 'applied') return preview.result;
   await input.notify(preview.result.removedModels);
+  let committedConfig: TraexAutoModelConfig | undefined;
   const committed = await rmwBotEntry<TraexModelPoolPruneResult>(input.larkAppId, entry => {
     const next = plan(entry);
-    if (next.status === 'applied') entry.traexAutoModel = next.config;
+    if (next.status === 'applied') {
+      entry.traexAutoModel = next.config;
+      committedConfig = next.config;
+    }
     return { write: next.status === 'applied', result: next };
-  }, options);
+  }, {
+    ...options,
+    onCommitted: async () => {
+      if (committedConfig) await input.onCommitted?.(committedConfig);
+    },
+  });
   return committed.ok ? committed.result : { status: 'failed', removedModels: [] };
 }

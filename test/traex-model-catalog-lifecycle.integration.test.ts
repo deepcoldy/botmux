@@ -224,6 +224,28 @@ describe('catalog host lifecycle and durable configuration', () => {
     expect(h.worker.send).not.toHaveBeenCalled();
   });
 
+  it('does not let a stale committed result overwrite a later manual pool generation', async () => {
+    const h = hostFixture();
+    const prune = h.scope.pruneSavedTraexModelPool;
+    h.scope.pruneSavedTraexModelPool = async (args: any) => {
+      const result = await prune(args);
+      await rmwBotEntry('cli_catalog_lifecycle', entry => {
+        entry.traexAutoModel.models = ['manual'];
+        entry.traexAutoModel.modelSettings = {};
+        return { write: true, result: null };
+      }, { path: h.path });
+      h.botCfg.traexAutoModel = { ...pool, models: ['manual'], modelSettings: {} };
+      h.ds.workerGeneration++;
+      h.ds.session.workerGeneration++;
+      return result;
+    };
+    await h.handle(h.request());
+    expect(h.read()[0].traexAutoModel.models).toEqual(['manual']);
+    expect(h.botCfg.traexAutoModel.models).toEqual(['manual']);
+    expect(h.ds.initConfig.traexAutoModel.models).toEqual(pool.models);
+    expect(h.worker.send).not.toHaveBeenCalled();
+  });
+
   it('survives notification then rename failure; the next independent request can persist without touching another bot', async () => {
     const h = hostFixture(); const before = readFileSync(h.path, 'utf8'); const original = fsp.rename.bind(fsp);
     let fail = true;

@@ -19,12 +19,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function idlePreflightProbe(options: { reply?: ReplyKind; catalog?: typeof backupCatalog; preflight?: boolean; dispatchAttempt?: number; siblingModels?: string[] } = {}) {
+function idlePreflightProbe(options: { reply?: ReplyKind; catalog?: typeof backupCatalog; preflight?: boolean; dispatchAttempt?: number; siblingModels?: string[]; sameTurn?: boolean } = {}) {
   const h = workerSubmitHarness();
   const { scope } = h;
   const pool = { ...basePool, preflightLoadCheck: options.preflight ?? true };
   const controller = new TraexAutoModelController(pool);
-  controller.beginTurn('previous');
+  const owningTurn = options.sameTurn ? 'next' : 'previous';
+  controller.beginTurn(owningTurn);
   const head: Record<string, any> = { content: 'follow-up', turnId: 'next' };
   if (options.dispatchAttempt !== undefined) head.dispatchAttempt = options.dispatchAttempt;
   scope.pendingMessages.splice(0, scope.pendingMessages.length, head);
@@ -39,7 +40,7 @@ function idlePreflightProbe(options: { reply?: ReplyKind; catalog?: typeof backu
     traexAutoModelController: controller, traexAutoModelSwitching: false,
     traexAutoModelTurnReplayForbidden: false, traexAutoModelPreflightPending: undefined,
     traexAutoModelPreflightEnabled, activeTurnAuthority: new ActiveTurnAuthority(),
-    currentBotmuxTurnId: 'previous', backendScreenRevision: 0, observedPaneGridRevision: 0,
+    currentBotmuxTurnId: owningTurn, backendScreenRevision: 0, observedPaneGridRevision: 0,
     renderer: null, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     commandLineWritesPending: 0, injectionFlushing: false,
     currentPostTerminalInputFence: () => null, retryTraexAutoModelAdmission: vi.fn(),
@@ -250,6 +251,27 @@ describe('catalog proof arriving at the final write edge', () => {
     expect(p.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'switch', reason: 'catalog_unavailable', fromModel: 'core', toModel: 'backup' }),
       { resumeCurrentTurn: false },
+    );
+  });
+
+  it.each([
+    { name: 'same-turn ordinary retry', dispatchAttempt: undefined },
+    { name: 'same-turn durable attempt', dispatchAttempt: 2 },
+  ])('fences a $name when catalog proof arrives after the pre-dequeue gate', async ({ dispatchAttempt }) => {
+    const p = idlePreflightProbe({ reply: 'none', preflight: false, sameTurn: true, dispatchAttempt });
+    p.scope.runAmbiguousSubmissionTransaction = async (_backend: unknown, write: () => Promise<any>, _accepted: unknown, prepare: () => void) => {
+      p.controller.observeModelCatalog(new Set(['backup']));
+      p.controller.markCatalogPruned(['core'], { ...p.pool, models: ['backup'] });
+      prepare();
+      return { result: await write() };
+    };
+    await p.flush();
+    await vi.waitFor(() => expect(p.scope.executeTraexAutoModelSwitch).toHaveBeenCalledOnce());
+    expect(p.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(p.scope.pendingMessages).toEqual([p.head]);
+    expect(p.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'switch', reason: 'catalog_unavailable', fromModel: 'core', toModel: 'backup', turnId: 'next' }),
+      { resumeCurrentTurn: false, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}) },
     );
   });
 });

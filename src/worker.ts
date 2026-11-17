@@ -6792,8 +6792,8 @@ function executeTraexAutoModelSwitch(
 function admitTraexCatalogModelBeforeInput(turnId: string, dispatchAttempt?: number): boolean {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()) return false;
-  const action = controller.catalogAdmissionDecision(turnId);
-  if (action.kind === 'none') return false;
+  const action = controller.catalogAdmissionDecision?.(turnId);
+  if (!action || action.kind === 'none') return false;
   if (action.kind === 'exhausted') {
     controller.requestRecoveryStop(turnId);
     controller.catalogQueryFailed(turnId);
@@ -23359,6 +23359,18 @@ async function flushPending(): Promise<void> {
             && itemsWrittenInThisFlush === 0 && !isTypeAhead;
         }
 
+        if (item.turnId && traexAutoModelRuntimeEligible()) {
+          // Independent of beginTurn: same-turn retries return none there, and
+          // durable attempts bypass that block entirely. Directory proof must
+          // still fence every attempt at the final pre-write boundary.
+          const catalogAction = traexAutoModelController?.catalogAdmissionDecision?.(item.turnId);
+          if (catalogAction?.kind === 'switch' || catalogAction?.kind === 'exhausted') {
+            throw new SubmissionWriteError(
+              `TraeX catalog admission ${catalogAction.kind} before the native write`,
+              undefined, false, false, true,
+            );
+          }
+        }
         if (item.turnId && item.dispatchAttempt === undefined) {
           // A live correction belongs to the running model, even when idle
           // turns opt into reselection. Once multiple native inputs coexist,
@@ -23378,7 +23390,7 @@ async function flushPending(): Promise<void> {
               );
             }
             if (action?.kind === 'exhausted'
-              && traexAutoModelController?.catalogAdmissionDecision(item.turnId).kind === 'exhausted') {
+              && traexAutoModelController?.catalogAdmissionDecision?.(item.turnId)?.kind === 'exhausted') {
               throw new SubmissionWriteError(
                 'TraeX catalog is empty before the native write',
                 undefined, false, false, true,
