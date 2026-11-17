@@ -29,6 +29,21 @@ describe('session Oncall request ownership', () => {
     expect(store.claim({ ...source, sessionId: 'other' })).toBe(true);
     expect(store.claim({ ...source, appId: 'other' })).toBe(true);
   });
+  it('requires the persisted attemptId for every finish on a non-session creation claim', () => {
+    const store = new OncallGroupStore(temp());
+    const groupSource: OncallGroupSource = { ...source, sessionId: undefined };
+    const creation = { target, username: 'test.user', region: target.region, typeId: target.typeId };
+    expect(store.claim(groupSource, 'ou_owner', undefined, creation)).toBe(true);
+    const claim = store.getRequest(groupSource)!;
+    expect(claim.attemptId).toEqual(expect.any(String));
+    // The persisted creation marker makes even non-session requests attempt-scoped:
+    // a missing or stale attempt must never overwrite the durable claim.
+    expect(() => store.finish(groupSource, { status: 'unknown' })).toThrow();
+    expect(() => store.finish(groupSource, { status: 'succeeded', openChatId: 'oc_created' }, 'stale-attempt')).toThrow();
+    expect(store.getRequest(groupSource)?.status).toBe('pending');
+    store.finish(groupSource, { status: 'succeeded', openChatId: 'oc_created' }, claim.attemptId);
+    expect(store.getRequest(groupSource)).toMatchObject({ status: 'succeeded', openChatId: 'oc_created' });
+  });
   it('freezes the exact known messages at submission and rejects a second group binding', () => {
     const store = new OncallGroupStore(temp());
     store.registerTurn('app', 'session', 'om_q1'); store.recordSource({ ...source, turnNumber: 1 });
