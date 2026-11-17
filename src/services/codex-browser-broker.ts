@@ -663,6 +663,9 @@ export class CodexBrowserBroker {
   private runtimeShim?: Json;
   private authenticatedFetch?: CodexBrowserAuthenticatedFetch;
   private pluginModules?: BrowserPluginModules;
+  /** The init promise whose dead-runtime teardown has already run, so concurrent
+   *  callers rejecting the same shared init perform the cleanup exactly once. */
+  private invalidatedInit?: Promise<unknown>;
 
   constructor(private readonly opts: CodexBrowserBrokerOptions) {}
 
@@ -748,10 +751,23 @@ export class CodexBrowserBroker {
 
   /** Full teardown for a dead owner-scoped Node runtime. The next operation
    *  rebuilds runtime and binding through initialize(); the failed operation is
-   *  never replayed. Idempotent so discovery- and operation-path callers can
-   *  both trigger it. */
-  private async invalidateDeadRuntime(): Promise<void> {
-    await this.pluginModules?.close?.();
+   *  never replayed.
+   *
+   *  Discovery failures pass the shared `init` promise: concurrent callers that
+   *  rejected the same init then run this teardown exactly once, and a runtime
+   *  rebuilt while the close() was in flight is never erased by the stale
+   *  generation's continuation. The operation path passes no init and keeps the
+   *  original single-caller semantics. */
+  private async invalidateDeadRuntime(init?: Promise<unknown>): Promise<void> {
+    if (init !== undefined) {
+      if (this.invalidatedInit === init) return;
+      this.invalidatedInit = init;
+    }
+    const modules = this.pluginModules;
+    await modules?.close?.();
+    // While close() was pending, another path may already have rebuilt a newer
+    // runtime; leave that generation completely untouched.
+    if (modules !== undefined && this.pluginModules !== modules) return;
     this.pluginModules = undefined;
     this.agent = undefined;
     this.turnEndedHandlers.clear();
@@ -1270,7 +1286,9 @@ export class CodexBrowserBroker {
         // agent.browsers.get() runs outside execute()'s operation guard, so a
         // dead Node runtime must be torn down here as well; otherwise the stale
         // agent and its exited child would be reused on every later operation.
-        await this.invalidateDeadRuntime();
+        // Passing init makes concurrent failures of the same discovery share
+        // one teardown instead of each erasing a later rebuild.
+        await this.invalidateDeadRuntime(init);
         throw new Error(`${message}. Browser connection changed; call list_tabs and claim_tab again before using an existing tab. The failed operation was not replayed.`);
       }
       // Extension/native-host availability can change after the first tool

@@ -18,6 +18,24 @@ export const DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS = 660_000;
 /** Covers process spawn, the worker's ready handshake and the plugin's own
  *  dynamic import/initialization, all of which are one startup sequence. */
 export const DEFAULT_BROWSER_NODE_STARTUP_TIMEOUT_MS = 10_000;
+/** Grace period between SIGTERM and the forced SIGKILL when tearing a child down. */
+export const DEFAULT_BROWSER_NODE_TERMINATE_GRACE_MS = 2_000;
+
+interface PendingEntry {
+  resolve: (v: any) => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** One spawned child plus the state that belongs to it alone. A new launch
+ *  gets a new context, so a late exit/error from a previous generation can
+ *  never touch the next child's pending requests. */
+interface LaunchContext {
+  child: ChildProcessWithoutNullStreams;
+  pending: Map<number, PendingEntry>;
+  exited: Promise<void>;
+  markExited: () => void;
+}
 
 // Encode objects as entries, so page-controlled keys cannot impersonate a wire
 // tag. The browser service also returns byte arrays (for example screenshots).
@@ -49,18 +67,18 @@ export function createBrowserWireCodec() {
  * The typed Botmux tool, caller identity, approvals and authenticated fetch stay
  * with the owning broker. No new browser control endpoint is exposed. */
 export class CodexBrowserNodeService {
-  private child?: ChildProcessWithoutNullStreams;
+  private current?: LaunchContext;
   private starting?: Promise<void>;
   private serial = 0;
   private closed = false;
   private readonly wire = createBrowserWireCodec();
-  private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   constructor(
     private readonly root: string,
     private readonly runtime: () => Runtime,
     private readonly nodeCommand = 'node',
     private readonly requestTimeoutMs = DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS,
     private readonly startupTimeoutMs = DEFAULT_BROWSER_NODE_STARTUP_TIMEOUT_MS,
+    private readonly terminateGraceMs = DEFAULT_BROWSER_NODE_TERMINATE_GRACE_MS,
   ) {}
 
   async handleRpc(request: { method: string; params?: unknown }): Promise<unknown> {
@@ -69,7 +87,7 @@ export class CodexBrowserNodeService {
   }
 
   async handleTurnEnded(event: unknown): Promise<void> {
-    if (this.child) await this.request('turnEnded', event);
+    if (this.current) await this.request('turnEnded', event);
   }
 
   private start(): Promise<void> {
@@ -86,7 +104,15 @@ export class CodexBrowserNodeService {
     delete env.BUN_BE_BUN;
     const source = BROWSER_NODE_WORKER_SOURCE.replace('__BOTMUX_BROWSER_CODEC__', createBrowserWireCodec.toString());
     const child = spawn(this.nodeCommand, ['--input-type=module', '--eval', source], { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-    this.child = child;
+    let markExited!: () => void;
+    const exited = new Promise<void>(resolve => { markExited = resolve; });
+    const ctx: LaunchContext = {
+      child,
+      pending: new Map<number, PendingEntry>(),
+      exited,
+      markExited,
+    };
+    this.current = ctx;
     child.stderr.on('data', () => {}); // Never forward credential-bearing SDK diagnostics.
     let ready!: () => void;
     let failStartup!: (e: Error) => void;
@@ -99,14 +125,17 @@ export class CodexBrowserNodeService {
       () => failStartup(new Error(`Browser Node runtime is unavailable: startup timed out after ${this.startupTimeoutMs}ms`)),
       this.startupTimeoutMs,
     );
-    const stop = () => {
-      const error = new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
+    const failContext = (error: Error): void => {
+      // A previous generation's late exit/error must never reject the next
+      // child's requests or overwrite its startup state.
+      if (this.current !== ctx) return;
       failStartup(error);
-      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
-      this.pending.clear();
+      for (const p of ctx.pending.values()) { clearTimeout(p.timer); p.reject(error); }
+      ctx.pending.clear();
     };
-    child.once('error', stop);
-    child.once('exit', stop);
+    const exitError = new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
+    child.once('exit', () => { ctx.markExited(); failContext(exitError); });
+    child.once('error', error => { ctx.markExited(); failContext(error instanceof Error ? error : new Error(String(error))); });
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     lines.on('line', line => {
       if (Buffer.byteLength(line) > MAX_LINE_BYTES) { child.kill(); return; }
@@ -114,14 +143,14 @@ export class CodexBrowserNodeService {
       try { message = this.wire.decode(JSON.parse(line)); } catch { child.kill(); return; }
       if (message.type === 'ready') ready();
       else if (message.type === 'result') {
-        const p = this.pending.get(message.id);
+        const p = ctx.pending.get(message.id);
         if (!p) return;
-        this.pending.delete(message.id); clearTimeout(p.timer);
+        ctx.pending.delete(message.id); clearTimeout(p.timer);
         typeof message.error === 'string' ? p.reject(new Error(message.error)) : p.resolve(message.value);
       } else if (message.type === 'callback') {
         void this.callback(message.method, message.params).then(
-          value => this.send({ type: 'callback-result', id: message.id, value }),
-          () => this.send({ type: 'callback-result', id: message.id, error: 'Browser runtime callback failed' }),
+          value => this.send(ctx, { type: 'callback-result', id: message.id, value }),
+          () => this.send(ctx, { type: 'callback-result', id: message.id, error: 'Browser runtime callback failed' }),
         ).catch(() => child.kill());
       }
     });
@@ -134,26 +163,51 @@ export class CodexBrowserNodeService {
         this.request('initialize', { modulePath: join(this.root, 'scripts/browser-service.mjs') }),
         startupFailure,
       ]);
-    } catch (error) { child.kill(); throw error; }
-    finally { clearTimeout(watchdog); }
+    } catch (error) {
+      // Reap the failed generation fully (SIGTERM -> bounded grace -> SIGKILL)
+      // before allowing a retry: the old child's exit is therefore already
+      // consumed and cannot interfere with the next generation.
+      await this.terminateContext(ctx);
+      if (this.current === ctx) this.current = undefined;
+      throw error;
+    } finally { clearTimeout(watchdog); }
   }
 
-  private send(message: unknown): void {
+  /** SIGTERM, wait for the actual exit, then SIGKILL after a bounded grace.
+   *  The hard cap only covers an unreapable process (e.g. zombie); callers
+   *  never wait indefinitely. */
+  private async terminateContext(ctx: LaunchContext): Promise<void> {
+    const { child } = ctx;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGTERM');
+    const grace = new Promise<void>(resolve => setTimeout(resolve, this.terminateGraceMs));
+    await Promise.race([ctx.exited, grace]);
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      const hardCap = new Promise<void>(resolve => setTimeout(resolve, 5_000));
+      await Promise.race([ctx.exited, hardCap]);
+    }
+  }
+
+  private send(ctx: LaunchContext, message: unknown): void {
     const line = JSON.stringify(this.wire.encode(message));
     if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new Error('Browser runtime message is too large');
-    if (!this.child || this.child.killed || !this.child.stdin.writable) throw new Error('Browser Node runtime is unavailable');
-    this.child.stdin.write(line + '\n');
+    const { child } = ctx;
+    if (child.killed || !child.stdin.writable) throw new Error('Browser Node runtime is unavailable');
+    child.stdin.write(line + '\n');
   }
 
   private request(method: string, params: unknown): Promise<any> {
     if (this.closed) return Promise.reject(new Error('Browser Node runtime is closed'));
-    if (this.pending.size >= MAX_PENDING) return Promise.reject(new Error('Browser runtime request capacity exceeded'));
+    const ctx = this.current;
+    if (!ctx) return Promise.reject(new Error('Browser Node runtime is unavailable'));
+    if (ctx.pending.size >= MAX_PENDING) return Promise.reject(new Error('Browser runtime request capacity exceeded'));
     const id = ++this.serial;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('Browser Node runtime request timed out')); }, this.requestTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      try { this.send({ type: 'request', id, method, params, meta: this.runtime().requestMeta }); }
-      catch (error) { this.pending.delete(id); clearTimeout(timer); reject(error as Error); }
+      const timer = setTimeout(() => { ctx.pending.delete(id); reject(new Error('Browser Node runtime request timed out')); }, this.requestTimeoutMs);
+      ctx.pending.set(id, { resolve, reject, timer });
+      try { this.send(ctx, { type: 'request', id, method, params, meta: this.runtime().requestMeta }); }
+      catch (error) { ctx.pending.delete(id); clearTimeout(timer); reject(error as Error); }
     });
   }
 
@@ -183,8 +237,12 @@ export class CodexBrowserNodeService {
 
   async close(): Promise<void> {
     this.closed = true;
-    this.child?.kill();
-    for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Browser Node runtime is closed')); }
-    this.pending.clear();
+    const ctx = this.current;
+    this.current = undefined;
+    this.starting = undefined;
+    if (!ctx) return;
+    for (const p of ctx.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Browser Node runtime is closed')); }
+    ctx.pending.clear();
+    await this.terminateContext(ctx);
   }
 }

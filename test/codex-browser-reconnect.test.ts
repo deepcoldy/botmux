@@ -98,6 +98,56 @@ describe.sequential('browser connection recovery', () => {
     expect(close).toHaveBeenCalledTimes(2);
   });
 
+  it('shares one invalidation across concurrent discovery failures and keeps the rebuilt browser', async () => {
+    const closeDefers: Array<{ resolve: () => void }> = [];
+    const close = vi.fn(async () => new Promise<void>(resolve => {
+      closeDefers.push({ resolve });
+    }));
+    let getCalls = 0;
+    const setupBrowserRuntime = vi.fn(async () => ({
+      browsers: {
+        get: vi.fn(async () => {
+          getCalls += 1;
+          if (getCalls === 1) {
+            throw new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
+          }
+          return {
+            browserId: `browser-${getCalls}`,
+            nameSession: vi.fn(async () => {}),
+            tabs: { get: vi.fn(), list: vi.fn(async () => []), new: vi.fn(), selected: vi.fn() },
+            user: { claimTab: vi.fn(), openTabs: vi.fn(async () => [{ id: 't1' }]) },
+          };
+        }),
+      },
+    }));
+    broker = new CodexBrowserBroker({
+      sessionId: 'stale-invalidation',
+      family: 'chrome',
+      modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
+    });
+
+    // Both calls share the same rejected init. The shared-init dedup means the
+    // teardown (and its close()) runs exactly once; the second caller no-ops.
+    const first = broker.handleToolCall(call({ operation: 'list_tabs' }));
+    const second = broker.handleToolCall(call({ operation: 'list_tabs' }));
+    await vi.waitFor(() => expect(closeDefers.length).toBe(1));
+    expect((await second).success).toBe(false);
+
+    // Releasing the single close lets the one shared invalidation finish.
+    closeDefers[0]!.resolve();
+    expect((await first).success).toBe(false);
+    expect(close).toHaveBeenCalledOnce();
+    // Teardown and any later close must not park on the test-controlled defer.
+    close.mockImplementation(async () => {});
+
+    // A retry rebuilds the runtime; later calls reuse that browser instead of
+    // triggering a third setup (the stale caller's cleanup never erased it).
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+  });
+
   it.each(['Browser is not available: 1', 'native pipe closed before response', 'Debugger unattached'])(
     'rediscovers after a cached browser disconnects: %s', async message => {
       const previousRuntime = (globalThis as any).nodeRepl;

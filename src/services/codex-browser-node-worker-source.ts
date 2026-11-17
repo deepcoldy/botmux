@@ -37,6 +37,21 @@ async function browserNodeServiceMain(wire) {
             }
         });
     }
+    // Each hook gets its own bounded timeout, and the timer is cleared as soon
+    // as the hook settles, so a fast hook never leaves a pending Timeout handle.
+    function runTurnEndedHook(h, event) {
+        const timeoutMs = typeof h.timeoutMs === 'number' && Number.isFinite(h.timeoutMs) && h.timeoutMs > 0
+            ? h.timeoutMs : 4000;
+        let timer;
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(
+                () => reject(new Error('turn-ended handler timed out after ' + timeoutMs + 'ms')),
+                timeoutMs,
+            );
+        });
+        return Promise.race([Promise.resolve().then(() => h.run(event)), timeout])
+            .finally(() => clearTimeout(timer));
+    }
     async function handle(message) {
         if (message.type === 'callback-result') {
             const p = pending.get(message.id);
@@ -90,17 +105,13 @@ async function browserNodeServiceMain(wire) {
                 value = await service.handleRpc(message.params);
             }
             else if (message.method === 'turnEnded') {
-                await Promise.all([...hooks].map(h => {
-                    const timeoutMs = typeof h.timeoutMs === 'number' && Number.isFinite(h.timeoutMs) && h.timeoutMs > 0
-                        ? h.timeoutMs : 4000;
-                    return Promise.race([
-                        Promise.resolve().then(() => h.run(message.params)),
-                        new Promise((_, reject) => setTimeout(
-                            () => reject(new Error('turn-ended handler timed out after ' + timeoutMs + 'ms')),
-                            timeoutMs,
-                        )),
-                    ]);
-                }));
+                // Settle the whole batch (each hook bounded by its own timeout)
+                // before answering: a fail-fast race would let the next turn
+                // start while hooks from this batch are still running.
+                const outcomes = await Promise.allSettled([...hooks].map(h => runTurnEndedHook(h, message.params)));
+                const rejected = outcomes.find(outcome => outcome.status === 'rejected');
+                if (rejected)
+                    throw rejected.reason;
             }
             else
                 throw new Error('Unsupported browser runtime request');

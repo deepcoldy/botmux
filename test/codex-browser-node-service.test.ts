@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -147,4 +147,145 @@ export async function handleRpc(){ return null; }`);
       .rejects.toThrow('turn-ended handler timed out after 150ms');
     expect(Date.now()-started).toBeLessThan(1_000);
   },10_000);
+});
+
+describe('Node browser service child generation and reaping', () => {
+  let dir = '';
+  let service: CodexBrowserNodeService | undefined;
+  let pidFile = '';
+  const spawnedPids: number[] = [];
+
+  function writeLauncher(): string {
+    const launcher = join(dir, 'node-launcher.sh');
+    pidFile = join(dir, 'pids.log');
+    // exec keeps the shell PID, so the recorded PID is the Node process itself.
+    writeFileSync(launcher, `#!/bin/sh\necho $$ >> "${pidFile}"\nexec "${resolveNodeExecutable()}" "$@"\n`);
+    chmodSync(launcher, 0o755);
+    return launcher;
+  }
+  function readPids(): number[] {
+    try { return readFileSync(pidFile, 'utf8').trim().split('\n').filter(Boolean).map(Number); }
+    catch { return []; }
+  }
+  function makeRoot(fixtureSource: string): string {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-node-browser-gen-'));
+    mkdirSync(join(dir, 'scripts'));
+    writeFileSync(join(dir, 'scripts/browser-service.mjs'), fixtureSource);
+    return dir;
+  }
+  afterEach(async () => {
+    await service?.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    // Defensive cleanup of exactly the PIDs this test spawned.
+    for (const pid of spawnedPids) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    spawnedPids.length = 0;
+  });
+
+  it('a late exit from the previous child cannot reject the next generation startup', async () => {
+    const delayedExit = `
+process.on('SIGTERM', () => setTimeout(() => process.exit(0), 80));
+await new Promise(() => {});
+export async function handleRpc(){ return null; }`;
+    const root = makeRoot(delayedExit);
+    service = new CodexBrowserNodeService(root, () => ({ requestMeta: {} }), writeLauncher(), 60_000, 250);
+
+    const first = await service.handleRpc({ method: 'echo' })
+      .then(() => 'resolved', (error: Error) => `rejected: ${error.message}`);
+    expect(first).toMatch(/startup timed out/);
+
+    const started = Date.now();
+    const second = await service.handleRpc({ method: 'echo' })
+      .then(() => 'resolved', (error: Error) => `rejected: ${error.message}`);
+    const elapsed = Date.now() - started;
+    spawnedPids.push(...readPids());
+    // The new child is governed by its own 250ms watchdog, not the old child's
+    // ~80ms delayed exit; two distinct PIDs prove the generations were separate.
+    expect(new Set(readPids()).size).toBeGreaterThanOrEqual(2);
+    expect(second).toMatch(/startup timed out/);
+    expect(second).not.toMatch(/exited/);
+    expect(elapsed).toBeGreaterThanOrEqual(200);
+  }, 20_000);
+
+  it('SIGKILLs a child that ignores SIGTERM so failed startups never leak processes', async () => {
+    const ignoreSigterm = `
+process.on('SIGTERM', () => {});
+await new Promise(() => {});
+export async function handleRpc(){ return null; }`;
+    const root = makeRoot(ignoreSigterm);
+    service = new CodexBrowserNodeService(root, () => ({ requestMeta: {} }), writeLauncher(), 60_000, 60, 100);
+
+    for (let i = 0; i < 2; i++) {
+      await expect(service.handleRpc({ method: 'echo' })).rejects.toThrow(/startup timed out/);
+    }
+    await service.close();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const pids = readPids();
+    spawnedPids.push(...pids);
+    expect(pids.length).toBeGreaterThanOrEqual(2);
+    const alive = pids.map(pid => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    });
+    expect(alive).not.toContain(true);
+  }, 20_000);
+});
+
+describe('Node browser service turn-ended batch semantics', () => {
+  let root = '';
+  let service: CodexBrowserNodeService | undefined;
+  afterEach(async () => { await service?.close(); if (root) rmSync(root, { recursive: true, force: true }); });
+
+  function makeService(fixtureSource: string): void {
+    root = mkdtempSync(join(tmpdir(), 'botmux-node-browser-turn-'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'scripts/browser-service.mjs'), fixtureSource);
+    service = new CodexBrowserNodeService(root, () => ({ requestMeta: {} }), resolveNodeExecutable()!, 60_000, 4_000);
+  }
+
+  it('waits for the whole hook batch before accepting the next turn', async () => {
+    makeService(`
+let bRunning = false;
+const events = [];
+export async function handleRpc(request){
+  const r = globalThis.nodeRepl;
+  if(request.method==='register'){
+    r.addTurnEndedHandler({ timeoutMs: 40, run: async () => { await new Promise(()=>{}); } });
+    r.addTurnEndedHandler({ run: async (e) => {
+      events.push('B-start:'+e.turn_id+':overlap='+bRunning);
+      bRunning = true;
+      await new Promise(resolve => setTimeout(resolve, 180));
+      bRunning = false;
+      events.push('B-end:'+e.turn_id);
+    }});
+    return { registered: true };
+  }
+  if(request.method==='snapshot') return { events };
+  throw new Error('unsupported');
+}`);
+    await service.handleRpc({ method: 'register' });
+    await service.handleTurnEnded({ turn_id: 'one' }).catch(() => {});
+    await service.handleTurnEnded({ turn_id: 'two' }).catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const snapshot = await service.handleRpc({ method: 'snapshot' }) as { events: string[] };
+    const secondBatch = snapshot.events.find(line => line.startsWith('B-start:two'))!;
+    expect(secondBatch).toContain('overlap=false');
+  }, 15_000);
+
+  it('clears the hook timeout timer once a fast hook settles', async () => {
+    makeService(`
+export async function handleRpc(request){
+  const r = globalThis.nodeRepl;
+  if(request.method==='register'){
+    r.addTurnEndedHandler({ timeoutMs: 1000, run: async () => {} });
+    return { registered: true };
+  }
+  if(request.method==='timers')
+    return { timeouts: process.getActiveResourcesInfo().filter(x => x === 'Timeout').length };
+  throw new Error('unsupported');
+}`);
+    await service.handleRpc({ method: 'register' });
+    await service.handleTurnEnded({ turn_id: 'one' });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const timers = await service.handleRpc({ method: 'timers' }) as { timeouts: number };
+    expect(timers.timeouts).toBe(0);
+  }, 15_000);
 });
