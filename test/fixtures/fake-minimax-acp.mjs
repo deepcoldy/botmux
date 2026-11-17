@@ -1,5 +1,6 @@
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { once } from 'node:events';
 const log = value => process.env.MCODE_TEST_LOG && appendFileSync(process.env.MCODE_TEST_LOG, JSON.stringify(value) + '\n');
 log({ pid: process.pid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, legacyOwner: process.env.__OWNER_OPEN_ID });
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
@@ -69,7 +70,27 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (prompt === 'crash') { process.exit(4); }
     if (prompt === 'invalid-json') { process.stdout.write('invalid json\n'); continue; }
     if (prompt === 'oversize') { process.stdout.write('x'.repeat(8_000_001)); continue; }
-    if (prompt === 'oversize-stderr') { process.stderr.write('x'.repeat(8_000_001)); continue; }
+    if (prompt === 'oversize-stderr') {
+      if (!process.stderr.write('x'.repeat(8_000_001))) await once(process.stderr, 'drain');
+      complete('stderr drained'); continue;
+    }
+    if (['long-stream', 'oversize-content'].includes(prompt)) {
+      // Respect transport backpressure: exercise cumulative traffic without
+      // making the fixture itself retain an unbounded queue.
+      for (let i = 0; i < 100; i++) {
+        const frame = JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId,
+          update: { sessionUpdate: prompt === 'long-stream' ? 'agent_thought_chunk' : 'agent_message_chunk',
+            messageId: 'final', content: { type: 'text', text: '中'.repeat(30_000) } } } }) + '\n';
+        if (!process.stdout.write(frame)) await once(process.stdout, 'drain');
+      }
+      complete('long stream complete'); continue;
+    }
+    if (prompt === 'split-utf8') {
+      const frame = Buffer.from(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '你好🌍' } } } }) + '\n');
+      for (const byte of frame) if (!process.stdout.write(Buffer.from([byte]))) await once(process.stdout, 'drain');
+      send({ id: promptId, result: { stopReason: 'end_turn' } }); continue;
+    }
     if (prompt === 'unknown-response') { send({ id: 999, result: {} }); continue; }
     if (prompt === 'foreign-update') {
       send({ method: 'session/update', params: { sessionId: 'foreign', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'foreign' } } } }); continue;

@@ -344,11 +344,17 @@ describe('mcode ACP wire client', () => {
     await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: async () => { throw new Error('ask timed out'); } }, bounded())).rejects.toThrow('ask timed out');
     expect(f.calls().some(c => c.message?.id === 'native-question' && !c.message.method)).toBe(false);
   });
-  it.each(['oversize', 'oversize-stderr'])('rejects %s specifically at the output byte limit', async content => {
+  it.each([['oversize', 'frame'], ['oversize-content', 'content']])('rejects %s at its retained-data limit', async (content, limit) => {
     const f = fixture();
-    await expect(runMinimaxAcp({ ...f.options, content }, bounded())).rejects.toThrow('mcode_acp_output_limit');
+    await expect(runMinimaxAcp({ ...f.options, content }, bounded())).rejects.toThrow(`mcode_acp_${limit}_limit`);
     await stopped(f.calls()[0].pid);
   });
+  it.each([['long-stream', 'long stream complete'], ['oversize-stderr', 'stderr drained'], ['split-utf8', '你好🌍']])(
+    'processes %s without counting drained traffic against the reply budget', async (content, expected) => {
+      const f = fixture();
+      expect((await runMinimaxAcp({ ...f.options, content }, bounded())).content).toBe(expected);
+      await stopped(f.calls()[0].pid);
+    });
   it.each(['foreign-ask', 'foreign-update', 'crash', 'invalid-json', 'unknown-response', 'cancelled', 'limit'])('rejects %s without a successful final', async content => {
     const f = fixture(); const input = vi.fn();
     await expect(runMinimaxAcp({ ...f.options, content, onUserInput: input }, bounded())).rejects.toThrow();
