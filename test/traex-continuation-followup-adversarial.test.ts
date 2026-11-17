@@ -90,6 +90,7 @@ function fixture(mode: 'planned' | 'approved' | 'unreserved' = 'approved', appId
     cancelSubmitFailureChainForTerminal: vi.fn(),
     turnExecutionClock: { settle: () => undefined, forget: vi.fn() },
     releaseActiveTurnAuthority: () => true,
+    scheduleConsumedQueuedTurnAdvance: vi.fn(),
     retireTerminatedQueuedTurn: vi.fn(), terminalReleasesDurableTurn: () => false,
     currentBotmuxTurnId: execution.turnId, currentBotmuxDispatchAttempt: undefined,
     runtimeIdentityForContract: (binding: any) => binding.identity,
