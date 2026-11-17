@@ -96,6 +96,19 @@ async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 }
 
 describe('FleetSupervisor (live, integration)', () => {
+  it('replaces the persisted App ID when a stopped process name is reused by a new bot', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      sup.start([bots[0]]);
+      await sup.stopOneBot(bots[0].name);
+      sup.startOneBot({ ...bots[0], appId: 'cli_replacement' });
+      expect(readFleetState(statePath)!.procs[0].appId).toBe('cli_replacement');
+      sup.startOneBot({ name: 'botmux-renamed', appId: 'cli_replacement', botIndex: 0 });
+      expect(readFleetState(statePath)!.procs.filter(p => p.status === 'online')).toHaveLength(1);
+    } finally { await sup.stopAll(); }
+  });
+
   it('addresses a renamed bot by App ID even when its requested name belongs to a peer', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');

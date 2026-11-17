@@ -481,6 +481,7 @@ export class FleetSupervisor {
           pending = freshProc(spec.name, spec.appId, 0, new Date().toISOString());
           cur.procs.push(pending);
         }
+        pending.appId = spec.appId;
         pending.status = 'launching';
         pending.pid = 0;
         return cur;
@@ -583,6 +584,9 @@ export class FleetSupervisor {
     const generation = mutateFleetState(this.opts.statePath, (cur) => {
       const existing = cur.procs.find((p) => p.name === spec.name);
       if (existing) {
+        // Reusing an index/name for a different application must not leave the
+        // previous identity attached to this newly spawned generation.
+        existing.appId = spec.appId;
         existing.pid = child.pid ?? 0;
         existing.generation += 1;
         existing.status = 'online';
