@@ -188,6 +188,42 @@ describe('catalog host lifecycle and durable configuration', () => {
     expect(h.worker.send).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: 'applied' }) }));
   });
 
+  it('admits a live follow-up execution while currentTurnId still names its predecessor', async () => {
+    const h = hostFixture();
+    h.sessionController.admitInput('om_followup');
+    expect(h.ds.currentTurnId).toBe('om_turn');
+    await h.handle({ ...h.request(), turnId: 'om_followup' });
+    expect(h.read()[0].traexAutoModel.models).toEqual(['core', 'backup']);
+    expect(h.worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: 'applied' }),
+    }));
+  });
+
+  it('keeps the legacy current-turn fence when no contract execution exists to prove admission', async () => {
+    const h = hostFixture();
+    h.scope.sessionController = undefined;
+    h.ds.currentTurnId = 'om_other';
+    await h.handle(h.request());
+    expect(h.read()[0].traexAutoModel.models).toEqual(pool.models);
+    expect(h.worker.send).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the registry after a durable commit even when a generation change suppresses the ACK', async () => {
+    const h = hostFixture();
+    const prune = h.scope.pruneSavedTraexModelPool;
+    h.scope.pruneSavedTraexModelPool = async (args: any) => {
+      const result = await prune(args);
+      h.ds.workerGeneration++;
+      h.ds.session.workerGeneration++;
+      return result;
+    };
+    await h.handle(h.request());
+    expect(h.read()[0].traexAutoModel.models).toEqual(['core', 'backup']);
+    expect(h.botCfg.traexAutoModel.models).toEqual(['core', 'backup']);
+    expect(h.ds.initConfig.traexAutoModel.models).toEqual(pool.models);
+    expect(h.worker.send).not.toHaveBeenCalled();
+  });
+
   it('survives notification then rename failure; the next independent request can persist without touching another bot', async () => {
     const h = hostFixture(); const before = readFileSync(h.path, 'utf8'); const original = fsp.rename.bind(fsp);
     let fail = true;
@@ -237,6 +273,7 @@ function connectWorker(h: ReturnType<typeof hostFixture>, dispatchAttempt?: numb
   const cfg: any = { traexAutoModel: structuredClone(pool), turnId: 'om_turn', dispatchAttempt };
   const jobs: Promise<void>[] = [];
   const scope: any = { lastInitConfig: cfg, pendingTraexModelPoolPrunes: new Map(), randomUUID,
+    traexAutoModelRuntimeEligible: () => true,
     traexAutoModelPolicyKey, send: vi.fn(), t: (key: string) => key,
     process: { send: vi.fn((msg: any) => { jobs.push(h.handle(msg)); }) } };
   h.worker.send.mockImplementation(loadWorkerMessageHandler('traex_model_pool_prune_result', scope));

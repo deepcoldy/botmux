@@ -18,7 +18,7 @@ export function traexCatalogConfigKey(entry: Record<string, any>): string {
 }
 
 export type TraexModelPoolPruneResult = {
-  status: 'applied' | 'unchanged' | 'superseded' | 'failed';
+  status: 'applied' | 'unchanged' | 'superseded' | 'failed' | 'timed_out';
   removedModels: string[];
   config?: TraexAutoModelConfig;
 };

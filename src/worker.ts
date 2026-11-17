@@ -5133,6 +5133,9 @@ class SubmissionWriteError extends Error {
      *  half-frame and be dropped while the backend still reports success.
      *  Callers must fence/exit the generation, never continue typing. */
     readonly runnerGenerationUnsafe = false,
+    /** The catalog changed before any byte was written; requeue and rotate
+     * instead of classifying this proven pre-write refusal as ambiguous. */
+    readonly traexCatalogAdmissionRequired = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
@@ -6262,6 +6265,22 @@ const pendingTraexModelPoolPrunes = new Map<string, {
 }>();
 let traexCatalogReadInFlight: { generation: number; abort: AbortController; promise: Promise<TraexModelLoadSnapshot | null> } | undefined;
 let traexCatalogRetryPending: { controller: TraexAutoModelController; generation: number; turnId?: string } | undefined;
+const traexCatalogEmptyNoticeTurns = new WeakMap<TraexAutoModelController, Set<string>>();
+
+function notifyTraexCatalogEmpty(
+  controller: TraexAutoModelController,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  const key = `${turnId ?? ''}:${dispatchAttempt ?? ''}`;
+  const seen = traexCatalogEmptyNoticeTurns.get(controller) ?? new Set<string>();
+  if (seen.has(key)) return;
+  seen.add(key);
+  traexCatalogEmptyNoticeTurns.set(controller, seen);
+  send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    message: t('worker.traex_auto_model.catalog_empty') });
+}
 
 async function reconcileTraexModelCatalog(
   snapshot: TraexModelLoadSnapshot | null,
@@ -6282,7 +6301,7 @@ async function reconcileTraexModelCatalog(
   const result = await new Promise<TraexModelPoolPruneResult>(resolve => {
     const timeout = setTimeout(() => {
       pendingTraexModelPoolPrunes.delete(requestId);
-      resolve({ status: 'failed', removedModels: [] });
+      resolve({ status: 'timed_out', removedModels: [] });
     }, 20_000);
     pendingTraexModelPoolPrunes.set(requestId, { resolve, timeout });
     process.send?.({
@@ -6293,11 +6312,16 @@ async function reconcileTraexModelCatalog(
     } satisfies WorkerToDaemon);
   });
   if (!isCurrent()) return false;
-  // CAS rejection means the account or user policy changed during the notice.
-  // Do not label an old controller with the new policy, or use the old catalog
-  // for another selection. The next initialized flow owns the manual change.
-  if (result.status === 'superseded') return false;
-  if (result.config && result.status !== 'failed') {
+  // A sibling may have committed the same directory cleanup first. Its returned
+  // current config is safe to adopt only as a strict, directory-confirmed subset
+  // of this controller's pool; arbitrary manual replacements stay superseded.
+  const siblingSubset = result.status === 'superseded' && result.config
+    && result.config.models.length < controller.config.models.length
+    && result.config.models.every(model =>
+      controller.config.models.some(current => current.toLowerCase() === model.toLowerCase())
+      && available.has(model.toLowerCase()));
+  if (result.status === 'superseded' && !siblingSubset) return false;
+  if (result.config && result.status !== 'failed' && result.status !== 'timed_out') {
     controller.observeModelCatalog(available);
     const removed = controller.config.models.filter(model =>
       !result.config!.models.some(next => next.toLowerCase() === model.toLowerCase()));
@@ -6309,15 +6333,18 @@ async function reconcileTraexModelCatalog(
         controller.requestRecoveryStop(turnId);
         controller.catalogQueryFailed(turnId);
       }
-      send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
-        message: t('worker.traex_auto_model.catalog_empty') });
+      notifyTraexCatalogEmpty(controller, turnId, dispatchAttempt);
       return false;
     }
   }
-  if (result.status === 'failed') {
-    if (turnId) controller.catalogQueryFailed(turnId);
+  if (result.status === 'failed' || result.status === 'timed_out') {
+    // The catalog READ succeeded; only persistence is failed/unconfirmed. Keep
+    // the pre-catalog ordered fallback live instead of latching catalogReadFailed.
     send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
-      message: t('worker.traex_auto_model.catalog_persist_failed') });
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      message: t(result.status === 'timed_out'
+        ? 'worker.traex_auto_model.catalog_persist_timeout'
+        : 'worker.traex_auto_model.catalog_persist_failed') });
     return false;
   }
   return true;
@@ -6757,6 +6784,39 @@ function executeTraexAutoModelSwitch(
   return true;
 }
 
+/** Directory admission is shared by preflight, the pre-dequeue gate and the
+ * final write-edge safety net. A catalog switch never replays the original
+ * task: the replacement resumes the exact native session with pending input
+ * preserved. If called inside flush, defer the physical restart until the
+ * flush mutex has been released; the input remains queued throughout. */
+function admitTraexCatalogModelBeforeInput(turnId: string, dispatchAttempt?: number): boolean {
+  const controller = traexAutoModelController;
+  if (!controller || !traexAutoModelRuntimeEligible()) return false;
+  const action = controller.catalogAdmissionDecision(turnId);
+  if (action.kind === 'none') return false;
+  if (action.kind === 'exhausted') {
+    controller.requestRecoveryStop(turnId);
+    controller.catalogQueryFailed(turnId);
+    notifyTraexCatalogEmpty(controller, turnId, dispatchAttempt);
+    return true;
+  }
+  if (action.kind !== 'switch') {
+    log(`TraeX catalog admission returned ${action.kind}; keeping input queued`);
+    return true;
+  }
+  const execute = (): void => {
+    if (controller !== traexAutoModelController) return;
+    const switched = executeTraexAutoModelSwitch(action, {
+      resumeCurrentTurn: false,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    });
+    if (!switched) log(`TraeX catalog admission switch refused; keeping input queued for ${turnId}`);
+  };
+  if (isFlushing) queueMicrotask(execute);
+  else execute();
+  return true;
+}
+
 function observeTraexAutoModelCapacity(screen: string): void {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()) return;
@@ -6820,7 +6880,10 @@ function observeTraexAutoModelCapacity(screen: string): void {
           message: t('worker.traex_auto_model.catalog_query_failed') });
         return;
       }
-      if (!await reconcileTraexModelCatalog(snapshot, controller, config, current, action.turnId)) return;
+      if (!await reconcileTraexModelCatalog(snapshot, controller, config, current, action.turnId)) {
+        controller.resolveModelLoads(action.turnId, null);
+        return;
+      }
       rememberTraexModelLoadSnapshot(snapshot);
       const choice = controller.resolveModelLoads(action.turnId, snapshot?.loads ?? null);
       if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
@@ -6909,7 +6972,11 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
         && pendingMessages[0] === head && isPromptReady && !cliRestartInProgress
         && !activeTurnAuthority.snapshot()?.started;
       if (!await reconcileTraexModelCatalog(snapshot, controller, lastInitConfig!, current, head.turnId, head.dispatchAttempt)) {
-        if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
+        if (traexAutoModelPreflightPending === token) {
+          traexAutoModelPreflightPending = undefined;
+          head.traexAutoModelPreflightDone = true;
+          void flushPending();
+        }
         return;
       }
       if (!current()) {
@@ -6931,6 +6998,7 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
           resumeCurrentTurn: false,
           ...(head.dispatchAttempt !== undefined ? { dispatchAttempt: head.dispatchAttempt } : {}),
         })) return;
+      if (admitTraexCatalogModelBeforeInput(head.turnId!, head.dispatchAttempt)) return;
       controller.beginTurn(head.turnId!, { retainCurrentModel: true });
       if (lastInitConfig) applyTraexAutoModelSettings(lastInitConfig, controller, controller.currentModel());
       // A switch decision reaching here was refused; the model did not change.
@@ -6949,7 +7017,8 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
   const controller = traexAutoModelController;
   const head = pendingMessages[0];
   if (head && lastInitConfig?.traexAutoModel?.catalogUnavailable) {
-    if (!head.traexAutoModelPreflightDone) send({ type: 'user_notify', turnId: head.turnId,
+    if (controller) notifyTraexCatalogEmpty(controller, head.turnId, head.dispatchAttempt);
+    else if (!head.traexAutoModelPreflightDone) send({ type: 'user_notify', turnId: head.turnId,
       message: t('worker.traex_auto_model.catalog_empty') });
     head.traexAutoModelPreflightDone = true;
     return true;
@@ -6971,6 +7040,7 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
     && !activeTurnAuthority.snapshot()
     && queuedTypeAheadTurns.length === 0) return true;
   if (!isPromptReady) return traexAutoModelInputHold();
+  if (admitTraexCatalogModelBeforeInput(head.turnId, head.dispatchAttempt)) return true;
   if (controller.config.trigger === 'quota') return selectTraexQuotaModelBeforeTurn(head);
   if (traexAutoModelPreflightEnabled(controller.config)) {
     if (!head.traexAutoModelPreflightDone) return selectTraexCapacityModelBeforeTurn(head);
@@ -20379,6 +20449,7 @@ async function runAmbiguousSubmissionTransaction<T>(
       rewrapped.recoveryFailureReason,
       rewrapped.submissionStarted,
       rewrapped.runnerGenerationUnsafe,
+      rewrapped.traexCatalogAdmissionRequired,
     );
   } finally {
     release();
@@ -23077,6 +23148,9 @@ async function flushPending(): Promise<void> {
         holdFirstAdmissionAfterWebInput();
         break;
       }
+      const catalogAdmissionHead = pendingMessages[0];
+      if (catalogAdmissionHead?.turnId
+        && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -23181,10 +23255,21 @@ async function flushPending(): Promise<void> {
               traexAutoModelTurnReplayForbidden = item.noReplay === true;
             }
             const action = traexAutoModelController?.beginTurn(item.turnId);
-            // A fallback-to-core transition must be handled before dequeueing.
-            // Reaching it here means a future input path bypassed the shared
-            // pre-flush gate. The input is already dequeued: keep this turn on
-            // the running pool model rather than throwing into a retry loop.
+            if (action?.kind === 'switch' && action.reason === 'catalog_unavailable') {
+              throw new SubmissionWriteError(
+                'TraeX catalog admission changed before the native write',
+                undefined, false, false, true,
+              );
+            }
+            if (action?.kind === 'exhausted'
+              && traexAutoModelController?.catalogAdmissionDecision(item.turnId).kind === 'exhausted') {
+              throw new SubmissionWriteError(
+                'TraeX catalog is empty before the native write',
+                undefined, false, false, true,
+              );
+            }
+            // A preferred-model reset is still safe to retain at this late edge.
+            // Catalog admission above is not: it must requeue and rotate instead.
             if (action?.kind === 'switch') {
               log(
                 `TraeX auto-model skipped preferred-model reset at the write edge `
@@ -23593,6 +23678,19 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {
+          // prepareNormalWrite threw before invoking the adapter. This is a
+          // proven pre-write refusal, never an ambiguous submission: restore
+          // the exact head and rotate after the flush mutex has been released.
+          pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          if (item.turnId) queueMicrotask(() => {
+            if (pendingMessages[0] !== item || !item.turnId) return;
+            if (!admitTraexCatalogModelBeforeInput(item.turnId, item.dispatchAttempt)) void flushPending();
+          });
+          break;
+        }
         recoveryFailureReason = err instanceof SubmissionWriteError
           ? err.recoveryFailureReason
           : recoveryFailureReason;

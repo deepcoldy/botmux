@@ -102,6 +102,8 @@ import {
   resolveSessionGroupSettings,
   resolveTopicReasoningEffort,
   resolveSessionLaunchEffort,
+  assertSessionLaunchModelChoiceAllowed,
+  isSessionLaunchModelBlockedError,
 } from './session-model.js';
 import {
   initialNativeRenameStartupCommand,
@@ -3931,7 +3933,15 @@ function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier |
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+  options: { allowTraexCatalogEmptyReattach?: boolean } = {},
 ): { codexProfile?: string; codexProfileHome?: string; cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
+  const launchModelChoice = () => {
+    const choice = resolveSessionLaunchModelChoice(ds, botCfg);
+    // A live persistent pane is only observed, never launched. Preserve the
+    // historical reattach shape while every real launch rejects the tombstone.
+    return choice.blocked && options.allowTraexCatalogEmptyReattach
+      ? {} : assertSessionLaunchModelChoiceAllowed(choice);
+  };
   const selected = ds.session.cliLaunchSnapshot;
   const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
@@ -3971,7 +3981,7 @@ function sessionAgentConfig(
     // and stays consistent with in-place restarts (latestModelForRespawn), which never
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
     refreshNativeCodexModel(ds, botCfg);
-    const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+    const modelChoice = launchModelChoice();
     const model = modelChoice.model;
     recordLaunchModel(ds, model);
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
@@ -4077,7 +4087,7 @@ function sessionAgentConfig(
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
   refreshNativeCodexModel(ds, botCfg);
-  const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+  const modelChoice = launchModelChoice();
   const model = modelChoice.model;
   recordLaunchModel(ds, model);
   // Effort is frozen per session, but whether it is *supported* depends on the
@@ -8070,7 +8080,9 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
     return undefined;
   }
   refreshNativeCodexModel(ds, botCfg);
-  const model = resolveSessionLaunchModel(ds, botCfg);
+  const model = assertSessionLaunchModelChoiceAllowed(
+    resolveSessionLaunchModelChoice(ds, botCfg),
+  ).model;
   // An in-worker respawn IS a launch, so the rule-3 record must converge here
   // too — otherwise `/restart` starts B while the record still says A, and a
   // later CLI hot-switch pulls A back out of the record.
@@ -8125,21 +8137,31 @@ export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefine
 
 function latestTraexAutoModelForRespawn(ds: DaemonSession): TraexAutoModelConfig | null | undefined {
   try {
-    const policy = resolveSessionLaunchModelChoice(ds, getBot(ds.larkAppId).config).traexAutoModel;
+    const policy = assertSessionLaunchModelChoiceAllowed(
+      resolveSessionLaunchModelChoice(ds, getBot(ds.larkAppId).config),
+    ).traexAutoModel;
     return policy ?? null;
-  } catch { return undefined; }
+  } catch (error) {
+    if (isSessionLaunchModelBlockedError(error)) throw error;
+    return undefined;
+  }
 }
 
 function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
   try {
     const botCfg = getBot(ds.larkAppId).config;
+    const traexAutoModel = !ds.session.adoptedFrom && !ds.session.wrapperCli && !ds.session.cliLaunchMode
+      ? assertSessionLaunchModelChoiceAllowed(resolveSessionLaunchModelChoice(ds, botCfg)).traexAutoModel
+      : undefined;
     return resolveCodexRpcInput(
       sessionCliId(ds, botCfg), botCfg.codexRpcInput, config.codexRpcInputDefault,
       ds.session.existingAppServerEndpoint,
-      !ds.session.adoptedFrom && !ds.session.wrapperCli && !ds.session.cliLaunchMode
-        ? resolveSessionLaunchModelChoice(ds, botCfg).traexAutoModel : undefined,
+      traexAutoModel,
     );
-  } catch { return undefined; }
+  } catch (error) {
+    if (isSessionLaunchModelBlockedError(error)) throw error;
+    return undefined;
+  }
 }
 
 /**
@@ -8311,6 +8333,15 @@ export function requestSessionRestart(
       });
     } catch (error) {
       start.failure = { error };
+      if (isSessionLaunchModelBlockedError(error) && callbacks && observer.source !== 'cli_crash') {
+        const content = tr('worker.traex_auto_model.catalog_empty', {}, botLocale(getBot(ds.larkAppId).config));
+        // The coordinator settles the restart observer as failed; this notice
+        // carries the machine-readable catalog_empty reason to the same turn.
+        void callbacks.sessionReply(sessionAnchorId(ds), content, 'text', ds.larkAppId,
+          ds.currentReplyTarget?.turnId, { sourceSessionId: ds.session.sessionId }).catch(replyError => {
+            logger.error(`[${tag(ds)}] Failed to report empty TraeX model pool: ${String(replyError)}`);
+          });
+      }
       const before = topicEffortRestartReadiness.get(ds.session.sessionId);
       if (opts.topicEffort && before?.attemptId === attemptId && before.worker === ds.worker
         && before.workerGeneration === ds.workerGeneration) {
@@ -17664,6 +17695,22 @@ function forkWorkerPrepared(
   const cb = requireCallbacks();
   const bot = preparedBot ?? getBot(ds.larkAppId);
   const botCfg = bot.config;
+  const launchChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+  if (launchChoice.blocked && !opts.reattachLiveBackend && !isSharedAdoptSession(ds)) {
+    const blockedTurnId = fallbackTurnId(ds, initTurnId);
+    const content = tr('worker.traex_auto_model.catalog_empty', {}, botLocale(botCfg));
+    logger.warn(`[${tag(ds)}] Refused TraeX launch with an empty model pool`);
+    if (opts.onAdmissionBlocked) {
+      opts.onAdmissionBlocked({ content, ...(blockedTurnId ? { turnId: blockedTurnId } : {}) });
+    } else if (prompt.length > 0 || initTurnId) {
+      void cb.sessionReply(sessionAnchorId(ds), content, 'text', ds.larkAppId, blockedTurnId,
+        { sourceSessionId: ds.session.sessionId }).catch(error => logger.error(
+          `[${tag(ds)}] Failed to report empty TraeX model pool: ${String(error)}`,
+        ));
+    }
+    reportAdmission('rejected');
+    return true;
+  }
   const admission = checkWorkerAdmission(readGlobalConfig().worker);
   for (const warning of admission.pressure.warnings) {
     if (hostPressureWarningsLogged.has(warning)) continue;
@@ -18016,7 +18063,9 @@ function forkWorkerPrepared(
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
   if (!isSharedAdoptSession(ds)) reclaimParkedCrashDiagnostic(ds);
 
-  agentCfg = sessionAgentConfig(ds, botCfg);
+  agentCfg = sessionAgentConfig(ds, botCfg, {
+    allowTraexCatalogEmptyReattach: opts.reattachLiveBackend === true || isSharedAdoptSession(ds),
+  });
   if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
@@ -19948,7 +19997,8 @@ function setupWorkerHandlers(
     switch (msg.type) {
       case 'traex_model_pool_prune': {
         const executionCurrent = () => {
-          if (!msg.turnId || !sessionController) return true;
+          if (!msg.turnId) return true;
+          if (!sessionController) return ds.currentTurnId === undefined || ds.currentTurnId === msg.turnId;
           // executions(ref, turnId) means the exact undefined attempt, not all
           // attempts. Keep pre-bootstrap maintenance possible, but never let a
           // missing/mismatched attempt borrow a different execution's authority.
@@ -19967,8 +20017,7 @@ function setupWorkerHandlers(
           && ds.workerGeneration === workerGeneration && effectiveCliId === 'traex'
           && !ds.initConfig?.adoptMode && !ds.initConfig?.wrapperCli
           && !ds.initConfig?.existingAppServerEndpoint && !isRemoteBackendSession(ds)
-          && (!msg.turnId || ds.currentTurnId === undefined || ds.currentTurnId === msg.turnId)
-          && executionCurrent();
+          && (!msg.turnId || executionCurrent());
         let result: import('../services/traex-model-pool-prune.js').TraexModelPoolPruneResult;
         try {
           result = await pruneSavedTraexModelPool({
@@ -19983,9 +20032,12 @@ function setupWorkerHandlers(
               } });
             },
           });
-          if (result.config && result.status === 'applied' && current()) {
+          // `applied` proves the durable CAS committed. Always refresh the
+          // registry, even if this execution/generation became stale before the
+          // ACK; only the session-local snapshot remains generation-fenced.
+          if (result.config && result.status === 'applied') {
             getBot(ds.larkAppId).config.traexAutoModel = result.config;
-            if (ds.initConfig) ds.initConfig.traexAutoModel = result.config;
+            if (current() && ds.initConfig) ds.initConfig.traexAutoModel = result.config;
           }
         } catch (error) {
           logger.warn(`[${t}] TraeX model-pool cleanup failed: ${String(error)}`);
@@ -26909,7 +26961,7 @@ export function forkAdoptWorker(
 
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
-  const agentCfg = sessionAgentConfig(ds, botCfg);
+  const agentCfg = sessionAgentConfig(ds, botCfg, { allowTraexCatalogEmptyReattach: true });
   const globalConfig = readGlobalConfig();
   const effectivePluginIds = resolveEffectivePluginIds(botCfg, globalConfig);
   const protectedHttpEgressPolicies = collectProtectedHttpEgressPolicies(effectivePluginIds);
