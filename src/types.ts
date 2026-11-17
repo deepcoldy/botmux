@@ -2166,6 +2166,7 @@ type DaemonToWorkerBase =
   | { type: 'codex_app_interrupt'; requestId: string; generation: string; turnEpoch: number }
   | { type: 'worker_ipc_probe' }
   | { type: 'protected_mcp_secret_channel_result'; requestId: string; ok: boolean; error?: string }
+  | { type: 'traex_model_pool_prune_result'; requestId: string; result: import('./services/traex-model-pool-prune.js').TraexModelPoolPruneResult }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
@@ -2489,6 +2490,7 @@ export interface WorkerFinalOutput {
 export type WorkerToDaemon = WorkerToDaemonBase & { sessionContract?: import('./services/session-contract.js').SessionEventContext };
 
 export type WorkerToDaemonBase =
+  | { type: 'traex_model_pool_prune'; requestId: string; expectedPolicyKey: string; availableModels: string[]; turnId?: string; dispatchAttempt?: number }
   | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
