@@ -160,7 +160,7 @@ describe('idle catalog reconciliation settles the queued input', () => {
   });
 });
 
-function queuedProbe(reply: 'superseded' | 'sibling') {
+function queuedProbe(reply: 'superseded' | 'sibling' | 'failed' | 'timeout') {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
   vi.setSystemTime(0);
   const controller = new TraexAutoModelController(basePool);
@@ -185,11 +185,14 @@ function queuedProbe(reply: 'superseded' | 'sibling') {
     TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS: 8_000,
     pendingTraexModelPoolPrunes: pendingPrunes, randomUUID: () => 'queued-prune', traexAutoModelPolicyKey,
     process: { send: vi.fn((msg: any) => {
+      if (reply === 'timeout') return;
       const entry = pendingPrunes.get(msg.requestId);
       clearTimeout(entry.timeout); pendingPrunes.delete(msg.requestId);
       entry.resolve(reply === 'sibling'
         ? { status: 'superseded', removedModels: [], config: { ...basePool, models: ['backup'] } }
-        : { status: 'superseded', removedModels: [] });
+        : reply === 'failed'
+          ? { status: 'failed', removedModels: [] }
+          : { status: 'superseded', removedModels: [] });
     }) },
     send: vi.fn(), t: (key: string) => key, log: vi.fn(),
     rememberTraexModelLoadSnapshot: vi.fn(), executeTraexAutoModelSwitch: vi.fn(() => true),
@@ -214,6 +217,29 @@ describe('queued catalog reconciliation releases or completes the pending load c
     expect(await p.settled).toBe(false);
     await vi.waitFor(() => expect(p.resolveLoads).toHaveBeenCalledWith('turn', null));
     vi.setSystemTime(10_000);
+    p.observe('Request queued, position: 3');
+    expect(p.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'switch', toModel: 'backup' }), { resumeCurrentTurn: true },
+    );
+  });
+
+  it.each([
+    { reply: 'failed' as const, nextTickMs: 10_000 },
+    { reply: 'timeout' as const, nextTickMs: 30_000 },
+  ])('settles $reply through resolveModelLoads(null) and keeps ordered fallback live', async ({ reply, nextTickMs }) => {
+    const p = queuedProbe(reply);
+    p.observe('Request queued, position: 3');
+    vi.setSystemTime(5_000);
+    p.observe('Request queued, position: 3');
+    if (reply === 'timeout') {
+      await vi.advanceTimersByTimeAsync(0);
+      await fsp.stat('package.json');
+      await vi.advanceTimersByTimeAsync(20_000);
+      await fsp.stat('package.json');
+    }
+    expect(await p.settled).toBe(false);
+    await vi.waitFor(() => expect(p.resolveLoads).toHaveBeenCalledWith('turn', null));
+    vi.setSystemTime(nextTickMs);
     p.observe('Request queued, position: 3');
     expect(p.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'switch', toModel: 'backup' }), { resumeCurrentTurn: true },
