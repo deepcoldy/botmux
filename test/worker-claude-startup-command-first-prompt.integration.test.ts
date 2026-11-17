@@ -288,6 +288,12 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
       return run;
     }
     if (scenario.swallowCommandEnter) {
+      // The acknowledgement wait starts only after Enter reaches the fake.
+      // Cold worker loading / CLI boot must not spend the notice's budget.
+      await waitFor(
+        () => readEvents(eventsFile).some(e => e.kind === 'swallowed'),
+        60_000 + scenario.bootMs, 'the startup command Enter to be swallowed',
+      );
       await waitFor(
         () => messages.some(m => m.type === 'user_notify' && m.message.includes('/effort xhigh')),
         60_000, 'the held-prompt notice',
@@ -346,7 +352,9 @@ it.skipIf(!tmuxAvailable)(
   async () => {
     const [cold, swallowed, passthrough, held, stuck] = await Promise.all([
       runScenario({ name: 'A cold start', bootMs: 20_000, swallowCommandEnter: false }),
-      runScenario({ name: 'B swallowed command Enter', bootMs: 0, swallowCommandEnter: true }),
+      // Cold boot + the command acknowledgement wait exceed the old 60s
+      // spawn-relative notice budget, even on an otherwise idle runner.
+      runScenario({ name: 'B swallowed command Enter', bootMs: 45_000, swallowCommandEnter: true }),
       runScenario({ name: 'C cold-start passthrough', bootMs: 20_000, swallowCommandEnter: false, rawInput: '/model opus' }),
       // Past the ~100s after which PTY activity no longer held the old warning back.
       runScenario({ name: 'D record held until late SessionStart', bootMs: 0, swallowCommandEnter: false, lateSessionStartMs: 125_000, holdPromptRecord: true }),
