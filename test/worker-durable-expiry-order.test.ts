@@ -24,6 +24,8 @@ type Restart = (reason: string, opts?: {
   immediate?: boolean;
   preservePending?: boolean;
   restartCause?: 'traex-auto-model';
+  beforeRespawn?: () => Promise<void>;
+  beforeRespawnMustSucceed?: boolean;
   onRespawnSettled?: (result: RespawnResult) => void;
 }) => Promise<void>;
 
@@ -97,6 +99,28 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
 }
 
 describe('worker restart input fence', () => {
+  it('explicit history replacement never schedules a new CLI after failed retirement/history verification', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    await h.restart('explicit native history replacement', {
+      preservePending: true, beforeRespawnMustSucceed: true,
+      beforeRespawn: async () => { throw new Error('changed native history'); },
+    });
+    expect(h.scope.sendFatalWorkerErrorAndExit).toHaveBeenCalledTimes(1);
+    expect(h.timers).toHaveLength(0);
+    expect(h.scope.spawnCli).not.toHaveBeenCalled();
+    expect(h.scope.rawInputRestartGate).toBe(true);
+  });
+
+  it('ordinary existing maintenance keeps its documented non-fatal failure behavior', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    await h.restart('ordinary maintenance', {
+      beforeRespawn: async () => { throw new Error('optional maintenance'); },
+    });
+    expect(h.scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
+    await h.runSpawnTimer();
+    expect(h.scope.spawnCli).toHaveBeenCalledTimes(1);
+  });
+
   it('forgets old input and terminal evidence before restarting the CLI', async () => {
     const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
     const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 1 };

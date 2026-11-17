@@ -1,3 +1,6 @@
+import { nativeResumeTargetReadback } from './worker-pool.js';
+import { parseNativeResumeTarget } from '../services/native-resume-target.js';
+import { sessionAcceptsDirectCommand } from './worker-pool.js';
 import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
@@ -3130,6 +3133,64 @@ ipcRoute('DELETE', '/api/sessions/:sessionId/model-pin', async (req, res, params
       return jsonRes(res, body.error === 'session_not_found' ? 404 : 409, body);
     }
   });
+});
+
+/** Explicit management-only replacement with an already prepared native history
+ * copy. Ordinary restart/resume semantics are unchanged. HTTP202 is admission,
+ * never proof of the new native identity; read the session after the correlated
+ * restart and require ready + the exact target ID. */
+ipcRoute('GET', '/api/sessions/:sessionId/resume-target', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  try {
+    const ds = findActiveBySessionId(params.sessionId);
+    if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    return jsonRes(res, 200, { ok: true, protocol: 1, supportedCli: 'traex',
+      transition: nativeResumeTargetReadback(ds) ?? null,
+      nativeSessionId: ds.session.cliSessionId ?? null,
+      workerGeneration: ds.workerGeneration ?? null,
+      workerReady: !!ds.worker && !ds.worker.killed && ds.workerReady === true,
+      cliReady: ds.cliReady === true,
+      busy: !sessionAcceptsDirectCommand(ds) || ds.lastScreenStatus !== 'idle' || isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)
+        || hasPendingOrdinaryImDelivery(ds) || (ds.backgroundTaskCount ?? 0) > 0 });
+  } catch {
+    return jsonRes(res, 500, { ok: false, error: 'native_resume_target_readback_failed' });
+  }
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/resume-target', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  let requested;
+  try { requested = parseNativeResumeTarget(await readJsonBody<unknown>(req, 4096)); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_native_resume_target' }); }
+  // A disconnected/timed-out proxy must not leave an invisible mutation queued
+  // behind another operator action. Bound acquisition below the proxy deadline,
+  // and recheck transport ownership immediately before starting any lifecycle.
+  let disconnected = req.aborted || res.destroyed;
+  const onClose = () => { disconnected = true; };
+  res.once('close', onClose);
+  try {
+    const initial = findActiveBySessionId(params.sessionId);
+    if (!initial || initial.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    const mutation = await tryWithBotTurnMutation(initial.larkAppId, 5_000, () => {
+      if (disconnected || req.aborted || res.destroyed) return;
+      const ds = findActiveBySessionId(params.sessionId);
+      if (!ds || ds !== initial) return jsonRes(res, 409, { ok: false, error: 'session_changed' });
+      if (rejectProtectedSessionMutation(res, [ds])) return;
+      if (isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)) return jsonRes(res, 409, { ok: false, error: 'worker_busy' });
+      const restart = requestSessionRestart(ds, dashboardRestartObserver(ds), { nativeResumeTarget: requested });
+      if (!restart) return jsonRes(res, 409, { ok: false, error: 'native_resume_target_unavailable' });
+      if (restart.startFailure) return jsonRes(res, 502, { ok: false, error: 'native_resume_target_start_failed' });
+      return jsonRes(res, 202, { ok: true, state: 'accepted', attemptId: restart.attemptId,
+        sourceId: requested.sourceId, targetId: requested.targetId });
+    });
+    if (!mutation.acquired && !disconnected && !res.destroyed) {
+      return jsonRes(res, 409, { ok: false, error: 'native_resume_target_gate_busy' });
+    }
+  } catch {
+    if (!res.destroyed && !res.writableEnded) return jsonRes(res, 502, { ok: false, error: 'native_resume_target_start_failed' });
+  } finally {
+    res.off('close', onClose);
+  }
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {

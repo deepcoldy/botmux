@@ -2221,7 +2221,7 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
+  | { type: 'restart'; nativeResumeTarget?: import('./services/native-resume-target.js').NativeResumeTarget; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
       traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig | null;
       /** Latest bot startupCommands / launchShell for the respawn (a frozen per-session
        *  `/cli` selection keeps its own). Same tri-state; see core/respawn-config-patch.ts. */
@@ -2706,6 +2706,7 @@ export type WorkerToDaemonBase =
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';
+      nativeResumeTarget?: { sourceId: string; targetId: string; errorCode?: string };
       untouched?: true;
       topicEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort; variant: 'standard' | 'max' };
       attemptId: string;

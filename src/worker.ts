@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { verifyNativeResumeTarget, nativeResumeTargetFailure, type NativeResumeTarget } from './services/native-resume-target.js';
+import { nativeResumeTargetAllowed } from './utils/native-resume-target-plan.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
@@ -438,7 +440,7 @@ import {
   resolveInstallIdentity,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
-import { pinWorkerTraeHome } from './services/traex-paths.js';
+import { pinWorkerTraeHome, traeSessionsRoot } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
@@ -3153,6 +3155,7 @@ let reattachOpenTurnGate = false;
 let reattachOpenTurnLogged = false;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
 let persistCodexRunnerBuildOnReady = false;
+let pendingNativeResumeTarget: { attemptId: string; requested: NativeResumeTarget; applied: boolean } | undefined;
 let pendingTopicEffortRestart: { attemptId: string; requested: TraexTopicEffortRestart; variant: 'standard' | 'max' } | undefined;
 let activeRestartAttemptId: string | undefined;
 /** Launch settings (cwd / env / model / larkToolBinding) the current restart
@@ -21455,6 +21458,17 @@ function settleRestartAttemptOnReady(
     upgradeInFlight: !!codexAutoUpgrade,
   });
   if (receipt === 'emit') {
+    let nativeResumeTarget: { sourceId: string; targetId: string } | undefined;
+    if (pendingNativeResumeTarget?.attemptId === activeRestartAttemptId) {
+      const pending = pendingNativeResumeTarget;
+      const pid = bridgeCliPid ?? backend?.getChildPid?.();
+      const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+      const observed = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+      if (!pending.applied || observed?.cliSessionId !== pending.requested.targetId) return;
+      nativeResumeTarget = { sourceId: pending.requested.sourceId, targetId: pending.requested.targetId };
+      persistCliSessionId(pending.requested.targetId);
+      pendingNativeResumeTarget = undefined;
+    }
     let topicEffort: Extract<WorkerToDaemon, { type: 'restart_result' }>['topicEffort'];
     if (pendingTopicEffortRestart?.attemptId === activeRestartAttemptId) {
       let current;
@@ -21477,6 +21491,7 @@ function settleRestartAttemptOnReady(
       status: 'succeeded',
       category: 'prompt_ready',
       ...(topicEffort ? { topicEffort } : {}),
+      ...(nativeResumeTarget ? { nativeResumeTarget } : {}),
     });
     activeRestartAttemptId = undefined;
     return;
@@ -32694,9 +32709,12 @@ async function restartCliProcess(
     skipRestartBudget?: boolean;
     exactResumeSessionId?: string;
     restartCause?: CliRestartCause;
-    /** Runs after the old CLI is killed and before the respawn. A rejection is
-     *  logged and the respawn still happens: the old CLI is already gone. */
+    /** Runs after the old CLI is killed and before the respawn. Normally a
+     * rejection is logged and the original history resumes. Explicit history
+     * replacement opts into the strict boundary below. */
     beforeRespawn?: (retiring: { pid?: number; processScope: number[] }) => Promise<void>;
+    /** Explicit native history replacement must not continue after an uncertain retirement or changed source. */
+    beforeRespawnMustSucceed?: boolean;
     /** Keep the Linux scratch view for the respawn (see killCli). */
     preserveScratchTreeForRespawn?: boolean;
     /** Called exactly once with how this restart ended, including when it never
@@ -32846,11 +32864,17 @@ async function restartCliProcess(
       });
       // Transcript maintenance runs only after destroy+kill (it proves the exit
       // itself: node-pty kill() returns before its child has necessarily stopped
-      // writing). It can never abort the restart.
+      // writing). Ordinary optional maintenance cannot abort the restart;
+      // explicit native replacement must fail closed.
       if (opts.beforeRespawn) {
         try {
           await opts.beforeRespawn({ pid: retiringCliPid ?? undefined, processScope: retiringProcessScope });
         } catch (err) {
+          if (opts.beforeRespawnMustSucceed) {
+            settleRespawn('failed');
+            await sendFatalWorkerErrorAndExit(err instanceof Error ? err : new Error(String(err)));
+            return;
+          }
           log(`beforeRespawn failed (${reason}), respawning anyway: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
@@ -38158,6 +38182,31 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'restart': {
+      if (msg.nativeResumeTarget) {
+        try {
+          if (!lastInitConfig || !backend || !msg.attemptId || msg.topicEffort) throw new Error('native_resume_target_unavailable');
+          const pid = bridgeCliPid ?? backend.getChildPid?.();
+          const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+          const observed = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+          if (!nativeResumeTargetAllowed(lastInitConfig, msg.nativeResumeTarget, {
+            ready: isPromptReady && traexRestoredComposerReady(captureBackendScreen(backend), { resumedSession: true }),
+            busy: !!cliRestartInProgress || !!tmuxRestartTimer || !!isFlushing || !!injectionFlushing
+              || !!commandLineWritesPending || !!pendingMessages.length || !!pendingRawInputs.length
+              || durableTurnInFlight || backgroundWaitTasks > 0,
+            isolated: sandboxEnabled(), nativeSessionId: observed?.cliSessionId,
+          })) throw new Error('native_resume_target_not_idle');
+          verifyNativeResumeTarget(msg.nativeResumeTarget, {
+            root: traeSessionsRoot(), source: findTraexRolloutBySessionId(msg.nativeResumeTarget.sourceId),
+            target: findTraexRolloutBySessionId(msg.nativeResumeTarget.targetId),
+          });
+          pendingNativeResumeTarget = { attemptId: msg.attemptId, requested: msg.nativeResumeTarget, applied: false };
+        } catch (error) {
+          if (msg.attemptId) send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed', untouched: true,
+            nativeResumeTarget: { sourceId: msg.nativeResumeTarget.sourceId, targetId: msg.nativeResumeTarget.targetId,
+              errorCode: nativeResumeTargetFailure(error) } });
+          break;
+        }
+      }
       if (msg.topicEffort) {
         let current;
         try {
@@ -38280,6 +38329,26 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         emitAmbiguous: () => emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous', undefined, currentBotmuxDispatchAttempt),
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
       });
+      if (msg.nativeResumeTarget) {
+        const requested = msg.nativeResumeTarget;
+        const restartOptions: NonNullable<Parameters<typeof restartCliProcess>[1]> = {
+          immediate: true, preservePending: true, skipRestartBudget: true,
+          exactResumeSessionId: requested.sourceId, beforeRespawnMustSucceed: true,
+          beforeRespawn: async retiring => {
+            await waitForProcessQuiescence(retiring.pid, {
+              now: () => Date.now(), wait: ms => delay(ms), provablyGone: pid => !pidNotProvablyGone(pid),
+            }, { ownedPids: retiring.processScope });
+            verifyNativeResumeTarget(requested, { root: traeSessionsRoot(),
+              source: findTraexRolloutBySessionId(requested.sourceId), target: findTraexRolloutBySessionId(requested.targetId) });
+            restartOptions.exactResumeSessionId = requested.targetId;
+            const pending = pendingNativeResumeTarget;
+            if (!pending || pending.attemptId !== msg.attemptId) throw new Error('native_resume_target_superseded');
+            pending.applied = true;
+          },
+        };
+        await restartCliProcess('explicit native history replacement', restartOptions);
+        break;
+      }
       await restartCliProcess(
         msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
         // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制

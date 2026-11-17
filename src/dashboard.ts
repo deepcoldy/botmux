@@ -6575,6 +6575,27 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(owner, url.pathname, { method: req.method, signal: AbortSignal.timeout(15_000) });
       res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
     }
+    if (['GET', 'POST'].includes(req.method ?? '') && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/resume-target$/))) {
+      if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+      if (req.method === 'POST' && !sessionWriteOriginAllowed(req, url.pathname)) return jsonRes(res, 403, { ok: false, error: 'invalid_origin' });
+      if (req.method === 'POST' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      let body: unknown;
+      try { if (req.method === 'POST') body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'invalid_native_resume_target' }); }
+      try {
+        const upstream = await proxyToDaemon(owner, `/api/sessions/${encodeURIComponent(sid)}/resume-target`, {
+          method: req.method, ...(req.method === 'POST'
+            ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+          signal: AbortSignal.timeout(15_000),
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+      } catch {
+        return jsonRes(res, 502, { ok: false, error: 'native_resume_target_proxy_failed' });
+      }
+    }
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
       // P1-11：locate 与接管/解锁同属工作台三项操作能力，同样是无 body POST。
