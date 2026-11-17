@@ -527,9 +527,21 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (pickerFailure) return { submitted: false, failureReason: pickerFailure };
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
+      // A boolean false from sendSpecialKeys (e.g. tmux send-keys timing out
+      // under load) is not proof the Enter was lost: the key may still have
+      // reached the pane, and writeInput's history polling plus its recheck
+      // closure own that uncertainty. Only a thrown transport error fails the
+      // write here; the strict boolean contract stays on pressComposerSubmit,
+      // whose one-shot rescue must not guess.
       const trySendEnter = (): boolean => {
         if (context?.submitGuard && !context.submitGuard.current()) return false;
-        return pressSubmit(pty);
+        try {
+          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+          else pty.write('\r');
+          return true;
+        } catch {
+          return false;
+        }
       };
 
       // Submit confirmation polls the global submit log history.jsonl, NOT the
