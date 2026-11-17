@@ -6,7 +6,7 @@ import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe, HerdrBackendConfig, HerdrBackendPlacement } from './types.js';
 import { logger } from '../../utils/logger.js';
-import { sessionChildEnvWithInject, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
+import { sessionChildEnvWithInject, sessionEnvUnsetFlags, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
 import { herdrExecutable } from '../../utils/herdr-executable.js';
 import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
 import { maskCredentialShapes } from '../../core/stuck-page-catalog.js';
@@ -274,6 +274,27 @@ function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+/** The command Herdr finally executes for the CLI.
+ *
+ * Herdr starts the CLI from an INTERACTIVE shell, so both kinds of removal must
+ * sit on the FINAL exec — after the pane's rcfile ran:
+ *   - ordinary `unsetEnv` (session env overlay removals, and a fresh dsh-tui
+ *     spawn's launcher resume markers which the rcfile could otherwise re-add),
+ *   - protected host-authorized removals (which may name reserved BOTMUX_*
+ *     keys), keeping their existing trusted-only validation.
+ */
+export function buildHerdrFinalCommand(
+  bin: string,
+  args: string[],
+  opts: { unsetEnv?: readonly string[]; protectedUnsetEnv?: readonly string[] },
+): string[] {
+  const unsetFlags = [
+    ...sessionEnvUnsetFlags(opts.unsetEnv),
+    ...trustedSessionEnvUnsetFlags(opts.protectedUnsetEnv),
+  ];
+  return unsetFlags.length > 0 ? ['/usr/bin/env', ...unsetFlags, bin, ...args] : [bin, ...args];
+}
+
 /** Build a short-lived canonical launcher for Herdr's managed-agent facade.
  *
  * Run this script by absolute path so interactive shell rc files cannot
@@ -283,21 +304,16 @@ function shellSingleQuote(value: string): string {
  * once when a launch step fails, and only as a delayed fallback after the
  * agent was detected (see startPaneAgent).
  */
-function createPaneAgentLauncher(
+export function createPaneAgentLauncher(
   canonicalExecutable: string,
   bin: string,
   args: string[],
   originalPath: string,
-  protectedUnsetEnv?: readonly string[],
+  opts: { unsetEnv?: readonly string[]; protectedUnsetEnv?: readonly string[] },
 ): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-herdr-launch-'));
   const path = join(dir, canonicalExecutable);
-  const protectedUnsetFlags = trustedSessionEnvUnsetFlags(protectedUnsetEnv);
-  const command = [
-    ...(protectedUnsetFlags.length > 0 ? ['/usr/bin/env', ...protectedUnsetFlags] : []),
-    bin,
-    ...args,
-  ].map(shellSingleQuote).join(' ');
+  const command = buildHerdrFinalCommand(bin, args, opts).map(shellSingleQuote).join(' ');
   writeFileSync(path, [
     '#!/bin/sh',
     // Minimise the lifetime of the mode-0700 file containing the exact argv.
@@ -754,16 +770,20 @@ export class HerdrBackend implements SessionBackend {
         const envArgs = this.opts.ownsSession === false
           ? envCommandArgs(this.childEnv ?? {})
           : [];
-        const protectedCommand = protectedUnsetFlags.length > 0
-          ? ['/usr/bin/env', ...protectedUnsetFlags, bin, ...args]
-          : [bin, ...args];
+        // Ordinary + protected removals both have to survive the pane's shell
+        // rcfile, so they belong on the FINAL command (see
+        // buildHerdrFinalCommand) — not merely on the env this call forwards.
+        const finalCommand = buildHerdrFinalCommand(bin, args, {
+          unsetEnv: opts.unsetEnv,
+          protectedUnsetEnv: opts.protectedUnsetEnv,
+        });
         const started = requiredJsonCommand(
           `herdr agent start ${this.agentName} in ${this.sessionName}`,
           herdrSessionArgs(this.sessionName, [
           'agent', 'start', this.agentName,
           '--cwd', opts.cwd,
           ...envArgs,
-          '--', ...protectedCommand,
+          '--', ...finalCommand,
           ]),
           { timeout: 10_000, env: this.childEnv },
         );
@@ -1281,7 +1301,10 @@ export class HerdrBackend implements SessionBackend {
       }
       this.paneId = paneId;
 
-      launcher = createPaneAgentLauncher(kind, bin, args, originalPath, opts.protectedUnsetEnv);
+      launcher = createPaneAgentLauncher(kind, bin, args, originalPath, {
+        unsetEnv: opts.unsetEnv,
+        protectedUnsetEnv: opts.protectedUnsetEnv,
+      });
       requiredJsonCommand(
         `herdr pane run ${paneId} in ${this.sessionName}`,
         // One quoted COMMAND argument reaches the shell verbatim, even while

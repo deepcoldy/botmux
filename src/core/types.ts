@@ -8,6 +8,7 @@ import type {
   CotEntry,
   Session,
   DaemonToWorker,
+  WorkerToDaemon,
   LarkAttachment,
   LarkMention,
   ModelFallbackState,
@@ -207,6 +208,17 @@ export interface DaemonSession {
   /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
   lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
+  /**
+   * This session already received its ONE "resume fell back to a fresh
+   * session" notice.
+   *
+   * Daemon-side on purpose: `/restart` forks a new worker, so a worker-level
+   * latch would re-post the notice on every restart. The worker reports the
+   * demotion fact each time (and the daemon logs every report); only the
+   * user-visible notice is spent once. In-memory only — a daemon restart is a
+   * new conversation surface as far as this once-per-session courtesy goes.
+   */
+  resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   /**
@@ -642,6 +654,7 @@ export interface DaemonSession {
   messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
+  codexAppInterruptTarget?: Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }>['target'];
   /**
    * Authenticated human principal that owns the currently executing interactive
    * turn. Set only after a worker accepts the turn and cleared by its exact

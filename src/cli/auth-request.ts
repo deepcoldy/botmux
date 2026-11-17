@@ -1,5 +1,6 @@
 import { AUTH_PROVIDERS, type AuthProvider } from '../core/provider-auth-request.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { reasonTag } from '../core/refusal-reasons.js';
 
 export const AUTH_REQUEST_USAGE = `用法: botmux auth request [--scope "<scope1 scope2,...>"] [--allow-unknown] [--json]
       botmux auth request --provider <meego|bytedcli|lark-cli> [--tenant dcar] [--json]
@@ -83,5 +84,19 @@ export function providerAuthExitCode(ok: boolean, status: unknown): number {
     case 'undelivered': case 'platform_undelivered': return 5;
     case 'unavailable': return 4;
     default: return 1;
+  }
+}
+
+/** The `[reason=…]` line printed after a provider answer, so a caller can tell
+ *  "an entry went to the person" and "the provider is down" from refusals that
+ *  are not about authorization. Decided from the status, not the exit code: a
+ *  request botmux refused to start (delegated turn, unbound host, …) also
+ *  exits 3, yet no entry went anywhere, so it carries no tag. */
+export function providerAuthAnswerTag(ok: boolean, status: unknown): string | undefined {
+  if (!ok) return undefined;
+  switch (status) {
+    case 'delivered': case 'pending': case 'undeliverable': return reasonTag('authorization_requested');
+    case 'unavailable': return reasonTag('authorization_unavailable');
+    default: return undefined;
   }
 }

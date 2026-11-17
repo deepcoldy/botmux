@@ -17,6 +17,7 @@ const canOperateMock = (_app: string, _chat: string | undefined, openId: string 
 const canTalkMock = (_app: string, _chat: string | undefined, openId: string | undefined) => openId !== 'ou_blocked';
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
   prepareFailedTurnRecoveryIdentity: (...a: any[]) => prepareMock(...a),
