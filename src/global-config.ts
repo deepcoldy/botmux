@@ -572,6 +572,8 @@ export interface DashboardGlobalConfig {
    *  显式 `false` 时只有 Bot 管理员（canOperate）能按卡片上的任何键。与默认值相同的 `true`
    *  不落盘（Dashboard 写入时删键）。点击时 live 读取（见 config.ts `stuckCardInitiatorKeys`）。 */
   stuckCardInitiatorKeys?: boolean;
+  /** Show explicit model-capacity queue status on live cards. Default OFF; read live. */
+  modelQueueNotify?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -739,6 +741,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   // Default ON: only an explicit stored false disables (config.ts getter).
   if (typeof d.stuckCardInitiatorKeys === 'boolean') out.stuckCardInitiatorKeys = d.stuckCardInitiatorKeys;
+  if (typeof d.modelQueueNotify === 'boolean') out.modelQueueNotify = d.modelQueueNotify;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

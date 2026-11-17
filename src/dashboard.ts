@@ -1271,6 +1271,7 @@ interface ResolvedDashboardSettings {
   cardBrandLabel: boolean;
   /** Turn initiator may press the safe keys on stuck cards. Default ON. */
   stuckCardInitiatorKeys: boolean;
+  modelQueueNotify: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1956,6 +1957,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     cardBrandLabel: dashboard.cardBrandLabel !== false,
     // default ON — only an explicit stored false disables (matches config.ts getter)
     stuckCardInitiatorKeys: dashboard.stuckCardInitiatorKeys !== false,
+    modelQueueNotify: dashboard.modelQueueNotify === true,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,

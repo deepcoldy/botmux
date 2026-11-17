@@ -11,10 +11,12 @@ import type { ExecutionActivity } from './execution-activity.js';
 export function streamCardExecutionLabel(
   cliId: string | undefined,
   observed: ExecutionActivity | undefined,
+  modelQueueNotify = false,
 ): ActivityCardLabel | undefined {
   if (cliId !== 'traex' || observed?.elapsedSeconds === undefined) return undefined;
   return {
-    activity: observed.phase === 'unknown' ? 'working' : observed.phase,
+    activity: observed.phase === 'unknown' || (observed.phase === 'model_queue' && !modelQueueNotify)
+      ? 'working' : observed.phase,
     elapsedSeconds: observed.elapsedSeconds,
     ...(observed.progressAgeSeconds !== undefined ? { progressAgeSeconds: observed.progressAgeSeconds } : {}),
   };

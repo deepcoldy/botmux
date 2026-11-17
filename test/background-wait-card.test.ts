@@ -27,6 +27,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { mergeDashboardConfig } from '../src/global-config.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import { __testOnly_activeSessions as activeSessions, __testOnly_sessionReply as sessionReply } from '../src/daemon.js';
@@ -52,6 +53,8 @@ beforeEach(() => {
   vi.stubEnv('BOTMUX_LARK_QPS', '100000');
   vi.stubEnv('BOTMUX_LARK_GATE_RETRY_BASE_MS', '1');
   home = mkdtempSync(join(tmpdir(), 'background-wait-card-'));
+  vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+  mergeDashboardConfig({ modelQueueNotify: true });
   const data = join(home, 'data'); mkdirSync(data, { mode: 0o700 });
   config.session.dataDir = data;
   activeSessions.clear(); setActiveSessionsRegistry(activeSessions);
@@ -124,6 +127,57 @@ async function beginActivity(cliId: 'traex' | 'codex', usageDisplay: 'streaming'
 }
 
 describe('activity-triggered refresh boundaries', () => {
+  it('reads queue notification live while keeping the shared queue observation', async () => {
+    await beginActivity('traex', 'streaming');
+    ds.lastScreenContent = '◆ Queued for capacity (3s • esc to interrupt)';
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+    mergeDashboardConfig({ modelQueueNotify: false });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    expect(composeRowFromActive(ds, { includeTokenUsage: false }).executionActivity).toMatchObject({ phase: 'model_queue' });
+    mergeDashboardConfig({ modelQueueNotify: true });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+  });
+
+  it('binds initial topic activity to the exact root before a follow-up assigns currentTurnId', async () => {
+    await beginActivity('traex', 'streaming');
+    ds.currentTurnId = undefined; ds.currentReplyTarget = undefined; ds.session.rootMessageId = 'om_turn';
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    ds.lastScreenContent = '◆ Queued for capacity (3s • esc to interrupt)';
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+    ds.currentTurnId = 'om_successor';
+    expect(streamCardLabel(ds)).toBeUndefined();
+  });
+
+  it('uses the exact initial reply turn and still requires execution evidence', async () => {
+    await beginActivity('traex', 'streaming'); ds.currentTurnId = undefined;
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    ds.currentReplyTarget = { turnId: 'om_successor', rootMessageId: 'om_root' };
+    expect(streamCardLabel(ds)).toBeUndefined();
+    ds.currentReplyTarget = { turnId: 'om_turn', rootMessageId: 'om_root' };
+    ds.replyExecutionStarts = undefined;
+    expect(streamCardLabel(ds)).toBeUndefined();
+  });
+
+  it.each(['streaming', 'footer', 'off'] as const)('PATCHes capacity entry and exit immediately with usage %s', async usageDisplay => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', usageDisplay);
+      const screen = async (content: string) => {
+        await worker.listeners('message')[0]({ type: 'screen_update', content, status: 'working', turnId: 'om_turn', dispatchAttempt: 1 });
+        await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      };
+      await screen('◆ Queued for capacity (3s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+      const queuedHeader = patchedHeaders()[0];
+      await screen('⠋ Queued for capacity (4s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      await screen('✧ Thinking… (5s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(2);
+      expect(patchedHeaders()[1]).not.toEqual(queuedHeader);
+      expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    });
+  });
+
   it.each([
     ['codex', 'streaming', 0], ['codex', 'footer', 0], ['codex', 'off', 0],
     ['traex', 'streaming', 1], ['traex', 'footer', 1], ['traex', 'off', 1],
