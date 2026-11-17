@@ -2,6 +2,8 @@
 import { StringDecoder } from 'node:string_decoder';
 import { spawnOwnedModelProcess } from './constrained-invocation/native-process.js';
 import { applySessionOwnerEnv } from '../utils/child-env.js';
+import { isNativeReasoningEffort } from './native-reasoning-observation.js';
+import type { CodexReasoningEffort } from './codex-reasoning-effort.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -19,6 +21,8 @@ export interface AntigravityAcpOptions {
   onRuntime?: (runtime: { model?: string; reasoningEffort?: string }) => void;
   onText?: (text: string) => void;
   onTool?: (title: string) => void;
+  /** Server-reported currentValue or a successful, validated settings ACK. */
+  onReasoningEffort?: (effort: CodexReasoningEffort | null) => void;
 }
 
 /** Accept only JSON objects at the protocol boundary. */
@@ -26,9 +30,19 @@ function object(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+export function antigravityAcpReasoningEffort(value: JsonObject): CodexReasoningEffort | null | undefined {
+  const options = Array.isArray(value.configOptions) ? value.configOptions.filter(object) : [];
+  const current = options.find(option => option.category === 'thought_level' || option.id === 'thought_level');
+  if (!current || !Object.hasOwn(current, 'currentValue')) return;
+  return isNativeReasoningEffort(current.currentValue) ? current.currentValue : null;
+}
+
 /** Send a complete prompt over NDJSON; stop and reap only this owned process on failure or cancellation. */
 export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: AbortSignal): Promise<string> {
   signal.throwIfAborted();
+  const reportReasoningEffort = (level: CodexReasoningEffort | null) => {
+    try { opts.onReasoningEffort?.(level); } catch { /* a display observer cannot stop the business turn */ }
+  };
   const env = { ...opts.env };
   applySessionOwnerEnv(env, opts.env.BOTMUX_OWNER_OPEN_ID);
   const child = spawnOwnedModelProcess(opts.executable, [
@@ -155,10 +169,12 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
       const update = params.update;
       if (update.sessionUpdate === 'config_option_update') {
         observeRuntime(update);
+        const effort = antigravityAcpReasoningEffort(update);
+        if (effort !== undefined) reportReasoningEffort(effort);
         return;
       }
       if (!prompting) return;
-      if (awaitingSelectionEcho) { awaitingSelectionEcho = false; announceRuntime(); }
+      if (awaitingSelectionEcho) { awaitingSelectionEcho = false; reportReasoningEffort(null); announceRuntime(); }
       if (update.sessionUpdate === 'agent_message_chunk') {
         if (!object(update.content) || update.content.type !== 'text' || typeof update.content.text !== 'string') {
           throw new Error('Antigravity ACP invalid message');
@@ -225,6 +241,8 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
     }
     opts.onSession(sessionId);
     observeRuntime(control);
+    const initialEffort = antigravityAcpReasoningEffort(control);
+    if (initialEffort !== undefined) reportReasoningEffort(initialEffort);
     for (const update of earlyUpdates.splice(0)) receive(update);
     // agy's CLI aliases include an effort suffix; ACP exposes those exact IDs
     // through models, while configOptions.model contains only base models.
@@ -233,7 +251,11 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
       && control.models.availableModels.some(model => object(model) && model.modelId === opts.model)) {
       // Armed before the request: the echo may share the acknowledgement's frame.
       awaitingSelectionEcho = true;
-      observeRuntime(await rpc('session/set_model', { sessionId, modelId: opts.model }));
+      const selected = await rpc('session/set_model', { sessionId, modelId: opts.model });
+      observeRuntime(selected);
+      const effort = antigravityAcpReasoningEffort(selected);
+      if (effort !== undefined) reportReasoningEffort(effort);
+      else if (!awaitingSelectionEcho) reportReasoningEffort(null);
       modelApplied = true;
     }
     for (const [category, selected] of [['model', opts.model], ['thought_level', opts.effort]] as const) {
@@ -244,13 +266,18 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
         || !config.options.some(option => object(option) && option.value === selected)) {
         throw new Error(`Antigravity ACP configuration unavailable: ${category}`);
       }
-      observeRuntime(await rpc('session/set_config_option', { sessionId, configId: config.id, value: selected }));
+      const applied = await rpc('session/set_config_option', { sessionId, configId: config.id, value: selected });
+      observeRuntime(applied);
+      const currentEffort = antigravityAcpReasoningEffort(applied);
+      if (currentEffort !== undefined) reportReasoningEffort(currentEffort);
+      else if (category === 'thought_level' && isNativeReasoningEffort(selected)) reportReasoningEffort(selected);
+      else if (category === 'model') reportReasoningEffort(null);
     }
     runtimeSettled = true;
     announceRuntime();
     prompting = true;
     const result = await rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text: opts.content }] }, false);
-    awaitingSelectionEcho = false;
+    if (awaitingSelectionEcho) { awaitingSelectionEcho = false; reportReasoningEffort(null); }
     announceRuntime();
     if (result.stopReason !== 'end_turn') throw new Error(`Antigravity ACP turn stopped: ${String(result.stopReason)}`);
     return content;

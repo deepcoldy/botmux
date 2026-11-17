@@ -57,9 +57,12 @@ function replacementReady(f: ReturnType<typeof fixture>) {
 }
 
 function capacityObserver(f: ReturnType<typeof fixture>, result: Promise<any>) {
+  const accessRead = f.scope.currentTraexLoadSnapshot;
   Object.assign(f.scope, { isPromptReady: false, commandLineWritesPending: 0,
     cliAdapter: { resolvedBin: 'unused-probe' }, buildSessionChildEnv: () => ({}), botInjectedEnv: () => ({}),
-    readTraexModelLoadSnapshot: vi.fn(() => result), traexCapacityQueueVisible, traexCapacityQueuePosition,
+    currentTraexLoadSnapshot: vi.fn().mockImplementationOnce(() => result)
+      .mockImplementation((...args: any[]) => accessRead(...args)),
+    traexCapacityQueueVisible, traexCapacityQueuePosition,
     traexModelProgressVisible, traexQueuedTypeAheadVisible, flushPending: vi.fn(),
   });
   f.scope.notifyTraexModelAccessSwitchActivity = f.notify;
@@ -82,7 +85,7 @@ describe('model access recovery Worker boundary', () => {
     const f = fixture(); const observe = capacityObserver(f, new Promise(() => {}));
     vi.useFakeTimers(); f.recover(f.turn);
     observe(queuedScreen); await vi.advanceTimersByTimeAsync(6000); observe(queuedScreen);
-    expect(f.scope.readTraexModelLoadSnapshot).not.toHaveBeenCalled();
+    expect(f.scope.currentTraexLoadSnapshot).toHaveBeenCalledOnce();
     expect(f.scope.restartCliProcess).not.toHaveBeenCalled();
   });
   it('rejects an older in-flight capacity result after admitting an access refusal', async () => {
@@ -90,14 +93,16 @@ describe('model access recovery Worker boundary', () => {
     const observe = capacityObserver(f, new Promise(resolve => { capacityResult = resolve; }));
     vi.useFakeTimers(); observe(queuedScreen);
     await vi.advanceTimersByTimeAsync(5001); observe(queuedScreen);
-    expect(f.scope.readTraexModelLoadSnapshot).toHaveBeenCalledOnce();
-    f.recover(f.turn); capacityResult(loads()); await drainPromises();
+    expect(f.scope.currentTraexLoadSnapshot).toHaveBeenCalledOnce();
+    f.recover(f.turn); capacityResult(loads()); await vi.advanceTimersByTimeAsync(0);
     expect(f.scope.restartCliProcess).not.toHaveBeenCalled();
     expect(f.scope.rememberTraexModelLoadSnapshot).not.toHaveBeenCalled();
     expect(f.controller.currentModel()).toBe(models[0]);
     expect(f.controller.runtimeState('native').modelAccessRecovery?.blockedModels).toEqual([models[0]]);
-    f.resolve(loads()); await drainPromises();
-    expect(f.scope.restartCliProcess).toHaveBeenCalledOnce();
+    const freshLoads = loads();
+    f.resolve(freshLoads);
+    await vi.waitFor(() => expect(f.scope.restartCliProcess).toHaveBeenCalledOnce());
+    expect(f.scope.rememberTraexModelLoadSnapshot).toHaveBeenCalledExactlyOnceWith(freshLoads);
     expect(f.controller.currentModel()).toBe(models[1]);
   });
   it('continues an active access search when the next model reports confirmed quota exhaustion', async () => {

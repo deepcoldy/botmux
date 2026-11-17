@@ -424,19 +424,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
         : [];
-      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
-      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
-      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
-      // shape, so this is identical to the codex adapter's branch.
-      if (remoteWsUrl && remoteThreadId) {
-        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
-        // so an interactive update dialog would freeze the resume. TraeX shares
-        // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
-      }
-      // Releases before the baseline reject the hook-trust flag at argv parsing
-      // and exit; leave it out for them (they have no hook-trust gate to pass
-      // either) and tell the user to upgrade. Unknown version → pass it as before.
       let hookTrustFlag = !disableCliBypass && !!bypassHookTrust;
       if (hookTrustFlag) {
         const support = probeTraexHookTrustSupport(resolvedBin());
@@ -450,6 +437,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           };
         }
       }
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return [
+          ...(hookTrustFlag ? [TRAEX_HOOK_TRUST_FLAG] : []),
+          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
+          ...modelNudgeArgs, remoteThreadId,
+        ];
+      }
+      // Releases before the baseline reject the hook-trust flag at argv parsing
+      // and exit; leave it out for them (they have no hook-trust gate to pass
+      // either) and tell the user to upgrade. Unknown version → pass it as before.
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',

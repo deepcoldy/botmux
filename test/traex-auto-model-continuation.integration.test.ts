@@ -297,7 +297,8 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(rows(f.launches).slice(1).every(row => row.args.includes(f.nativeId))).toBe(true);
     expect(rows(f.submissions).filter(row => row.text.startsWith('original restricted task'))).toHaveLength(1);
     expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access')).toHaveLength(1);
-    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(2);
+    // Initial/replacement catalogs (3) plus the two access-recovery reads.
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(5);
     expect(f.messages.filter(message => message.type === 'active_runtime' && message.traexAutoModelRuntime?.modelAccessRecovery?.blockedModels.length === 2).length).toBeGreaterThan(0);
   }, 45_000);
 
