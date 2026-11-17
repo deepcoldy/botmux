@@ -356,9 +356,10 @@ export async function applyPerBotEnvChange(
     const prevLayer = botEnvLayer(entry);
     const prev = sanitizePerBotEnv(entry.env);
     const next = nextPerBotEnv({ prev, ...change });
-    // Same pane-argv budget as the session-env editor: the whole bot layer
-    // (`env` set + `envUnset` removals) must fit a tmux pane start command.
-    // Shrinking stays allowed, so an already-oversized layer stays fixable.
+    // Same retained layer budget as the session-env editor; the legacy
+    // /botconfig path shares the same helper. Private pane-launch files removed
+    // the old deterministic tmux start-command failure, but shrinking stays
+    // allowed so an already-oversized layer stays fixable.
     if (!envLayerWithinBudget(prevLayer, botEnvLayer({ env: next ?? undefined, envUnset: entry.envUnset }))) {
       return { write: false, result: 'layer_too_large' };
     }
