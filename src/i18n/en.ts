@@ -329,7 +329,10 @@ export const messages: Record<string, string> = {
   // /invite (pull an out-of-chat bot into this chat, owner only)
   'cmd.invite.owner_only': '⚠️ Only a bot admin can use /invite.',
   'cmd.invite.p2p': '⚠️ Bots cannot be added in a DM — use /invite inside a group chat.',
-  'cmd.invite.usage': 'Usage: @me /invite @bot-to-add (multiple allowed), or @me /invite --app cli_xxx',
+  'cmd.invite.usage': 'Usage: @me /invite @target (multiple allowed), or @me /invite --app cli_xxx; use @me /invite all to add missing bots from inviteConfig.agents.',
+  'cmd.invite.no_defaults': 'No inviteConfig.agents configured. Set the list with /botconfig set inviteConfig {"agents":["bot name or app ID"]}.',
+  'cmd.invite.invalid_defaults': '⚠️ Invalid inviteConfig.agents; no bots were invited: {reason}',
+  'cmd.invite.roster_unavailable': '⚠️ Chat membership is temporarily unavailable. No default-list invitations were sent; please retry later.',
   'cmd.invite.header': '🤝 /invite results:',
   'cmd.invite.ok': '✅ Added to the chat: {names}',
   'cmd.invite.already': '⏭️ Already in the chat (skipped): {names}',
