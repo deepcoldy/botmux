@@ -105,6 +105,15 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
+    // markPromptReady's busy-deferral bookkeeping (worker.ts module-level
+    // symbols in the real process): this fixture asserts lifecycle/release
+    // boundaries, so the throttle stays quiet and the bookkeeping is stubbed.
+    busyReadyLogThrottle: { shouldLog: () => false },
+    warnPromptReadySkipped: vi.fn(),
+    busyReadyDeferral: { clear: vi.fn() },
+    cancelTurnTerminalReadyRecovery: vi.fn(),
+    forceReadyAfterTurnTerminal: false,
+    currentBotmuxTurnId: undefined,
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
