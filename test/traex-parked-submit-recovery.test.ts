@@ -103,6 +103,25 @@ describe('TRAE parked draft recovery', () => {
       expect(h.chain.size()).toBe(0);
     });
 
+  it('clears the queue retention flag when releasing so the head can prune again', async () => {
+    const h = fixture();
+    // Arming the quarantine must also pin the bridge-queue head against lease
+    // expiry pruning while the draft is parked.
+    expect(h.queue.peek()[0]?.inputDeliveryQuarantined).toBe(true);
+    expect(h.queue.pruneExpiredPreStartHeads(100_000)).toEqual([]);
+
+    h.scope.releaseInputDeliveryQuarantine(
+      h.scope.inputDeliveryQuarantine,
+      'receipt',
+      { redriveTerminal: false },
+    );
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.queue.peek()[0]?.inputDeliveryQuarantined).toBeUndefined();
+    // Without the flag clear, an unstarted head past every lease stays pinned
+    // forever and blocks attribution of every later fingerprint.
+    expect(h.queue.pruneExpiredPreStartHeads(100_000).map(turn => turn.turnId)).toEqual(['delivery']);
+  });
+
   it('keeps the exact mark after one warning and accepts a later manual submit', async () => {
     const h = fixture({ acceptsRescue: false });
     h.start();
