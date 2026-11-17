@@ -21630,6 +21630,18 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        // history.jsonl is shared by every TRAE pane under one TRAE_HOME, and
+        // the adapter's any-text fallback confirms on a same-text line from a
+        // SIBLING pane without an owned cliSessionId. Releasing the parked-draft
+        // quarantine on that evidence would redrive successors into the still
+        // parked composer as one merged message. Keep read-only polling until
+        // an owned receipt (cliSessionId) or a native structured terminal
+        // releases the quarantine via its exact-turn path.
+        if (retainTraexReceipt && !cliSessionId) {
+          log(`Deferred recheck saw an unattributed same-text receipt — keeping TRAE draft quarantine. preview="${preview}"`);
+          armDeferredRecheck();
+          return;
+        }
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
           acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
         }

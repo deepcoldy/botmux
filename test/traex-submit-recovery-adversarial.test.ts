@@ -41,7 +41,10 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
   evidence.start({ turnId: 'delivery', dispatchAttempt: options.dispatchAttempt, cliGeneration: 1 }, Date.now(), 1, 0);
   const chain = createSubmitFailureChainController();
   chains.add(chain);
-  const recheck = vi.fn(() => received);
+  // A successful receipt from this pane carries the owned rollout session id;
+  // an unattributed same-text line (sibling pane) is modeled separately and
+  // must not release the parked-draft quarantine.
+  const recheck = vi.fn(() => received ? { submitted: true as const, cliSessionId: 'owned-session' } : false);
   const scope: Record<string, any> = {
     backend, cliAdapter: createTraexAdapter(), cliSpawnGeneration: 1,
     cliRestartInProgress: false, lastInitConfig: { cliId: 'traex' },
@@ -160,7 +163,7 @@ describe('TRAE recovery adversarial interleavings', () => {
     h.start();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
-    h.recheck.mockResolvedValue(true);
+    h.recheck.mockResolvedValue({ submitted: true, cliSessionId: 'owned-session' });
     await vi.advanceTimersByTimeAsync(20_000);
     expect(h.scope.inputDeliveryQuarantine).toBeNull();
   });
@@ -189,5 +192,26 @@ describe('TRAE recovery adversarial interleavings', () => {
     await vi.advanceTimersByTimeAsync(80_000);
     expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
     expect(h.warnings()).toHaveLength(0);
+  });
+
+  it('keeps the quarantine on a sibling-pane same-text receipt without an owned session id', async () => {
+    const h = fixture({ acceptsRescue: false });
+    // history.jsonl is shared across TRAE panes: the any-text fallback can
+    // confirm on a SIBLING's same-text line, which carries no cliSessionId this
+    // pane owns. Such a receipt must not release the parked-draft quarantine.
+    h.recheck.mockResolvedValue({ submitted: true });
+    h.start();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.chain.size()).toBe(1);
+    expect(h.queue.hasPendingTurn('delivery')).toBe(true);
+
+    // An owned receipt (same pane manual submit with a proven rollout) still
+    // releases the quarantine exactly as before.
+    h.recheck.mockResolvedValue({ submitted: true, cliSessionId: 'owned-session' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
   });
 });

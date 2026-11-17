@@ -41,7 +41,10 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
   evidence.start({ turnId: 'delivery', dispatchAttempt: options.dispatchAttempt, cliGeneration: 1 }, Date.now(), 1, 0);
   const chain = createSubmitFailureChainController();
   chains.add(chain);
-  const recheck = vi.fn(() => received);
+  // A successful receipt from this pane carries the owned rollout session id;
+  // an unattributed same-text line (sibling pane) is modeled separately and
+  // must not release the parked-draft quarantine.
+  const recheck = vi.fn(() => received ? { submitted: true as const, cliSessionId: 'owned-session' } : false);
   const scope: Record<string, any> = {
     backend, cliAdapter: createTraexAdapter(), cliSpawnGeneration: 1,
     cliRestartInProgress: false, lastInitConfig: { cliId: 'traex' },
@@ -135,7 +138,7 @@ describe('TRAE parked draft recovery', () => {
       expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
       expect(h.warnings()).toHaveLength(1);
       h.accept();
-      h.recheck.mockReturnValue(true);
+      h.recheck.mockReturnValue({ submitted: true, cliSessionId: 'owned-session' });
       await vi.advanceTimersByTimeAsync(20_000);
       expect(h.scope.inputDeliveryQuarantine).toBeNull();
     });
