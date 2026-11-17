@@ -13,6 +13,7 @@ import {
   deriveKanbanColumn,
   effectiveKanbanPosition,
   isOffBoardDormant,
+  isOffBoardIdle,
 } from '../src/dashboard/web/kanban-model.js';
 import { deriveSessionBoardColumn } from '../src/dashboard/web/sessions.js';
 import { matchesStatusFilter, sessionTaskCardLine } from '../src/dashboard/web/session-task-view.js';
@@ -276,5 +277,25 @@ describe('table and card views share the derivation', () => {
     expect(working).toMatchObject({ tone: 'work' });
     expect(`${working!.label} ${working!.detail ?? ''}`).toMatch(/3/);
     expect(sessionTaskCardLine({ kind: 'idle' }, T0)).toBeNull();
+  });
+});
+
+
+describe('idle sessions do not imply pending work', () => {
+  it('hides idle and silent completed rounds without inventing completion', () => {
+    expect(isOffBoardIdle({ status: 'idle' })).toBe(true);
+    expect(isOffBoardIdle({ status: 'idle', lastTurn: { turnId: 'silent', outcome: 'no_output', at: T0 } })).toBe(true);
+    expect(deriveSessionTaskStatus({ status: 'idle' }).kind).toBe('idle');
+  });
+  it('keeps unfinished work, explicit placement, queued input, results and blockers', () => {
+    for (const facts of [
+      { openTodos: { remaining: 1 } }, { kanbanColumn: 'todo' }, { queued: true },
+      { lastTurn: delivered(T0) }, { pendingRepo: true }, { tuiPromptActive: true },
+      { lastTurn: { turnId: 'failed', outcome: 'interrupted', at: T0 } },
+      { agentAttention: { source: 'agent', reason: 'decision', at: T0 } },
+    ]) expect(isOffBoardIdle({ status: 'idle', ...facts })).toBe(false);
+    for (const status of ['working', 'starting', 'limited', 'stalled', 'closed', 'dormant']) {
+      expect(isOffBoardIdle({ status })).toBe(false);
+    }
   });
 });

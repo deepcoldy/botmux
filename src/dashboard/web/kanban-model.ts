@@ -86,6 +86,13 @@ export function isOffBoardDormant(s: KanbanRowLike, now: number = Date.now()): b
   return turnAt === undefined || now - turnAt >= RECENT_TURN_ON_BOARD_MS;
 }
 
+/** No work is implied by a resident CLI waiting at its prompt. Keep explicit
+ * placement and queued inputs; completed replies and blockers remain on-board. */
+export function isOffBoardIdle(s: KanbanRowLike): boolean {
+  return s.status === 'idle' && !s.queued && !activeManualColumn(s)
+    && deriveSessionTaskStatus(s).kind === 'idle';
+}
+
 /** 未手动排过序的卡片的排序键基底：量级远大于任何手动位置，保证手动卡片
  *  永远排在自动卡片前面；减 lastMessageAt 让自动区按最近活跃倒序。 */
 const UNPINNED_BASE = 1e15;

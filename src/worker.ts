@@ -2129,6 +2129,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     delete context.scope.execution;
     return { ...msg, sessionContract: context };
   }
+  // turnId on a screen is presentation context, not execution authority.
+  // The sampler can outlive both the turn and an in-process identity rebind.
+  if (msg.type === 'screen_update') {
+    const context = workerSessionEventScope.envelope(origin ?? workerSessionEventScope.screenObservationOrigin());
+    delete context.scope.execution;
+    return { ...msg, sessionContract: context };
+  }
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
@@ -2140,12 +2147,6 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
-    if (execution) context.scope.execution = execution;
-  }
-  if (msg.type === 'screen_update' && context.scope.execution
-    && (msg.turnId !== context.scope.execution.turnId || msg.dispatchAttempt !== context.scope.execution.dispatchAttempt)) {
-    delete context.scope.execution;
-    const execution = workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
     if (execution) context.scope.execution = execution;
   }
   // Physical process proof is available before an opening attempt is bound.

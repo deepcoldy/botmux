@@ -234,6 +234,19 @@ const lostTurnWarnings = (warn: ReturnType<typeof vi.spyOn>) => warn.mock.calls.
   .filter(line => /Dropped managed_turn_origin|not delivered|Worker user_notify/.test(line));
 
 describe('turns around a semantic runtime rebind', () => {
+  it('settles the live screen after a semantic rebind without moving the execution origin', async () => {
+    const s = await startWorker();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    const capability = await s.deliver(TURNS[1]);
+    await s.bridge({ type: 'screen_update', content: 'running', status: 'working', turnId: TURNS[1] });
+    expect(s.ds.lastScreenStatus).toBe('working');
+    await s.answer(TURNS[1], capability);
+    await s.bridge({ type: 'screen_update', content: 'prompt', status: 'idle', turnId: undefined });
+    expect(s.ds.lastScreenStatus).toBe('idle');
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[1])));
+  });
+
   it('delivers both turns of a cold resume whose relay resolves the real CLI mid-turn', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const s = await startWorker();
