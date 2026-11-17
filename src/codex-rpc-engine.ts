@@ -212,6 +212,10 @@ export interface CodexRpcEngineDependencies {
   /** Test seam: replace group signalling to simulate a verified group that
    *  survives its bounded SIGKILL cleanup (an ordinary process cannot). */
   killProcessGroup?(pid: number, signal: NodeJS.Signals): void;
+  /** Test seam: fault injected into the proc-table scan inside group-identity
+   *  capture, to prove a bookkeeping failure cannot change a determined turn
+   *  delivery result. */
+  groupIdentityScanError?: Error;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
@@ -633,7 +637,8 @@ export class CodexRpcEngine {
       // Mirror sendTurn(): a tool child spawned before this ack is only provable
       // as this group's while the leader is alive. Snapshot now so a leader crash
       // before the turn/completed event still leaves the successor a verified
-      // member — the completion callback never fires after a crash.
+      // member — the completion callback never fires after a crash. capture is
+      // best-effort, so a scan fault cannot downgrade this already-acked result.
       this.captureGroupIdentity();
       return { outcome: 'accepted', nativeTurnId: this.takeNativeTurnId(identity) };
     } catch (err) {
@@ -657,6 +662,8 @@ export class CodexRpcEngine {
       if (landed) {
         // The frame was dispatched and persisted despite the lost ack; its tool
         // children are still this leader's, so refresh membership on acceptance.
+        // capture is best-effort: rollout already proved the turn landed, so a
+        // scan fault cannot escape here into a duplicate paste fallback.
         this.captureGroupIdentity();
         return { outcome: 'accepted', nativeTurnId: undefined };
       }
@@ -736,12 +743,25 @@ export class CodexRpcEngine {
     });
   }
 
+  /** Capture the current process-group identity. Best-effort bookkeeping: the
+   *  proc-table scan and marker rewrite can fail, but such a fault must NEVER
+   *  break a live turn/startup/teardown flow — on failure we retain the prior
+   *  identity, and a later reap without fresh evidence simply fails closed. This
+   *  also protects the terminal-handler and sendTurn captures that fire on the
+   *  same clean-ack path as a first turn, not just the first-turn call sites. */
   private captureGroupIdentity(): void {
     const pid = this.child?.pid;
     if (!pid || !this.processIsOurAppServer(pid, this.wsUrl)) return;
     const currentBoot = bootId();
     if (!currentBoot) return;
-    this.groupIdentity = { bootId: currentBoot, members: groupMembers(pid) };
+    try {
+      // Test seam: raised where the real groupMembers() proc-table scan would.
+      if (this.dependencies.groupIdentityScanError) throw this.dependencies.groupIdentityScanError;
+      this.groupIdentity = { bootId: currentBoot, members: groupMembers(pid) };
+    } catch (error) {
+      this.log(`[codex-rpc] group identity scan failed; retaining prior identity: ${String(error)}`);
+      return;
+    }
     const mp = this.markerPath();
     if (!mp) return;
     try {

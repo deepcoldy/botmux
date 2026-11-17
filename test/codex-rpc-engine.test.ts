@@ -1017,6 +1017,83 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
   }, 20_000);
 
+  it('keeps an acked first turn accepted (and its nativeTurnId) when identity capture fails', async () => {
+    let probed = false;
+    const engine = makeEngine({ sessionId: 'first-ack-capture-fault' }, {
+      spawnProcess: (command, args, options) => spawn(command, args, options),
+      groupIdentityScanError: Object.assign(new Error('EACCES reading /proc'), { code: 'EACCES' }),
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => { probed = true; return false; });
+    // A clean ack is already accepted: a bookkeeping fault must not reroute it
+    // into the lost-ack branch (which would consult rollout and downgrade to
+    // ambiguous), nor drop the bound native turn id.
+    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: 'turn-fake-1' });
+    expect(probed).toBe(false);
+    engine.stop();
+  }, 20_000);
+
+  it('stays accepted without escaping to paste fallback when capture fails after a rollout hit', async () => {
+    let probed = false;
+    const engine = makeEngine(
+      {
+        sessionId: 'first-rollout-capture-fault',
+        env: { ...process.env, FAKE_HANG_TURN: '1' },
+        requestTimeoutMs: 400,
+      },
+      {
+        spawnProcess: (command, args, options) => spawn(command, args, options),
+        groupIdentityScanError: Object.assign(new Error('EACCES reading /proc'), { code: 'EACCES' }),
+      },
+    );
+    await engine.start();
+    await engine.startThread();
+    // The frame is dispatched, the ack is lost, and rollout positively proves it
+    // persisted. An escaping capture throw here previously made engageCodexRpc
+    // fall back to paste and re-submit the persisted prompt; sendFirstTurn must
+    // instead resolve accepted (the worker only pastes on not-engaged/ambiguous).
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => { probed = true; return true; });
+    expect(probed).toBe(true);
+    expect(outcome).toEqual({ outcome: 'accepted' });
+    engine.stop();
+  }, 20_000);
+
+  it.skipIf(process.platform !== 'linux')('records a late tool child on the rollout-hit accepted path before any ack', async () => {
+    const childFile = join(tmpdir(), `rpc-rollout-refresh-${process.pid}-${Date.now()}`);
+    const sid = `rollout-refresh-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    // Hanging turn/start means no turn/completed terminal fires, so the rollout
+    // branch's capture is the only remaining chance to record this tool child.
+    const engine = makeEngine({
+      sessionId: sid,
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '300', FAKE_HANG_TURN: '1' },
+      requestTimeoutMs: 400,
+    });
+    let leader: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        const tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      const tool = Number(readFileSync(childFile, 'utf8').trim());
+      const recordedPids = () => JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]).members
+        .map((member: { pid: number }) => member.pid);
+      expect(recordedPids()).not.toContain(tool); // start() snapshot predates the tool
+      await engine.startThread();
+      const outcome = await engine.sendFirstTurn('hello', owner('rollout-1', 1), async () => true);
+      expect(outcome).toEqual({ outcome: 'accepted' });
+      expect(recordedPids()).toContain(tool);
+      engine.stop();
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 20_000);
+
   it.each([
     ['aborted', 'aborted', undefined],
     ['failed', 'failed', 'fake_failed'],
