@@ -342,6 +342,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_resetOrdinaryImDeliveries();
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
+    // Cancel queued 1200 ms tool-card timers before the data dir is removed so
+    // a flush from a finished test can neither race the rmdir nor land in the
+    // next test's dir (same contract as unified-native-cot's teardown).
+    const { __testOnlyDrainTurnReplyTools } = await import('../src/core/turn-reply-card.js');
+    await __testOnlyDrainTurnReplyTools();
     setActiveSessionsRegistry(undefined);
     rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
@@ -629,7 +634,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
       entries: [{ kind: 'tool_call', id: 'read', name: 'Read', args: '{"file_path":"README.md"}', subject: 'README.md' }] });
     await vi.waitFor(() => expect(store.read(key)).toMatchObject({ mode: 'unified', phase: 'working', messageId: 'om_doubao_visible_card' }), { timeout: 4000 });
-    await vi.waitFor(() => expect(store.read(key)?.lastCard).toContain('README.md'), { timeout: 4000 });
+    // The tool card is published by the 1200 ms debounce in queueTurnReplyTools.
+    // Drive that flush through its test seam instead of racing the unref'd timer
+    // inside a wall-clock waitFor: a stalled hosted runner can push the timer
+    // past the 4 s budget even though the queued render itself is correct.
+    const { flushTurnReplyTools } = await import('../src/core/turn-reply-card.js');
+    await flushTurnReplyTools(ds, ds.currentTurnId);
+    expect(store.read(key)?.lastCard).toContain('README.md');
     expect(store.read(key)?.finalDelivered).not.toBe(true);
     expect(getBotClient).not.toHaveBeenCalled();
     ds.worker!.emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
