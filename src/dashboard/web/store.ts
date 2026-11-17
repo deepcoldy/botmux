@@ -16,6 +16,10 @@ export interface StoreSnapshot {
    *  而不是画一个永远为空的面板。false 同时覆盖「没有能力所以没请求」和「请求
    *  失败」两种情况。 */
   schedulesAvailable: boolean;
+  /** True once the first schedules snapshot attempt has committed, including an
+   * unavailable (`schedulesAvailable === false`) result. Stays true on later
+   * reconciles so an established page does not return to a loading state. */
+  schedulesReady: boolean;
   /** True once the first authoritative `/api/sessions` snapshot has been
    *  installed. UI uses it to hold a skeleton instead of flashing an empty
    *  list before the bootstrap fetch lands. Stays true forever after. */
@@ -42,6 +46,7 @@ class Store {
   online = true;
   scheduleTimeZone = '';
   schedulesAvailable = true;
+  private schedulesReady = false;
   private bootstrapped = false;
   private closedCursor: string | null = null;
   private closedTotal = 0;
@@ -57,6 +62,7 @@ class Store {
     version: this.version,
     scheduleTimeZone: this.scheduleTimeZone,
     schedulesAvailable: this.schedulesAvailable,
+    schedulesReady: this.schedulesReady,
     bootstrapped: false,
     closedCursor: null,
     closedTotal: 0,
@@ -85,6 +91,36 @@ class Store {
    */
   replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string,
     history?: { closedCursor?: string | null; closedTotal?: number }) {
+    this.replaceSessionRows(rows, history);
+    this.schedules.clear();
+    for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
+    this.schedulesAvailable = schedules !== null;
+    this.schedulesReady = true;
+    if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
+    this.bootstrapped = true;
+    this.emit();
+    if (schedules !== null) {
+      for (const fn of this.scheduleRunLogListeners) fn();
+    }
+  }
+  /** Commit the critical session list without waiting for optional schedules. */
+  replaceSessionsSnapshot(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number }) {
+    this.replaceSessionRows(rows, history);
+    this.bootstrapped = true;
+    this.emit();
+  }
+
+  replaceSchedulesSnapshot(schedules: Schedule[] | null, timezone?: string) {
+    this.schedules.clear();
+    for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
+    this.schedulesAvailable = schedules !== null;
+    this.schedulesReady = true;
+    if (timezone) this.scheduleTimeZone = timezone;
+    this.emit();
+    if (schedules !== null) for (const fn of this.scheduleRunLogListeners) fn();
+  }
+
+  private replaceSessionRows(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number }) {
     this.sessionGeneration += 1;
     this.closedCursor = history?.closedCursor ?? null;
     this.closedTotal = history?.closedTotal ?? 0;
@@ -100,15 +136,6 @@ class Store {
     for (const row of rows) this.sessions.set(row.sessionId, row);
     for (const row of keptClosed) {
       if (!this.sessions.has(row.sessionId)) this.sessions.set(row.sessionId, row);
-    }
-    this.schedules.clear();
-    for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
-    this.schedulesAvailable = schedules !== null;
-    if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
-    this.bootstrapped = true;
-    this.emit();
-    if (schedules !== null) {
-      for (const fn of this.scheduleRunLogListeners) fn();
     }
   }
   /**
@@ -291,6 +318,7 @@ class Store {
       version: this.version,
       scheduleTimeZone: this.scheduleTimeZone,
       schedulesAvailable: this.schedulesAvailable,
+      schedulesReady: this.schedulesReady,
       bootstrapped: this.bootstrapped,
       closedCursor: this.closedCursor,
       closedTotal: this.closedTotal,
@@ -374,6 +402,7 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
   // authoritative snapshot is installed.
   const buffered: Array<{ type: string; body: any }> = [];
   let snapshotReady = false;
+  let sessionsReady = false;
   const types = [
     'session.spawned', 'session.update', 'session.exited',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
@@ -390,26 +419,33 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
       while (completedReconcile < requestedReconcile) {
         const generation = requestedReconcile;
         snapshotReady = false;
+        sessionsReady = false;
         try {
           // 会话快照是**必需**资源：它失败仍然让 bootstrap reject，EventSource
           // 保持打开、下一次 open 重试（见文件末尾注释与对应测试）。排程是**可选**
           // 资源：拿不到只是这一块降级，绝不能反过来吃掉会话快照。
-          const [s, sch] = await Promise.all([
-            fetch('/api/sessions?view=board').then(r => {
-              if (!r.ok) throw new Error('session_snapshot_unavailable');
-              return r.json();
-            }),
-            canReadSchedules() ? fetchSchedulesSnapshot() : Promise.resolve(null),
-          ]);
-          store.replaceSnapshot(
-            s.sessions ?? [],
-            sch ? sch.schedules : null,
-            sch?.timezone,
-            s,
-          );
+          const sessions = fetch('/api/sessions?view=board');
+          const schedules = canReadSchedules() ? fetchSchedulesSnapshot() : Promise.resolve(null);
+          const response = await sessions;
+          if (!response.ok) throw new Error('session_snapshot_unavailable');
+          const s = await response.json();
+          store.replaceSessionsSnapshot(s.sessions ?? [], s);
+          sessionsReady = true;
+          // Session events must remain live even while an optional schedule
+          // response hangs. Keep schedule events buffered until its own snapshot
+          // lands, so a late snapshot cannot overwrite a newer SSE update.
+          const scheduleEvents = [];
+          for (const event of buffered.splice(0)) {
+            if (event.type.startsWith('schedule.')) scheduleEvents.push(event);
+            else store.applySse(event.type, event.body);
+          }
+          buffered.push(...scheduleEvents);
+          const sch = await schedules;
+          store.replaceSchedulesSnapshot(sch?.schedules ?? null, sch?.timezone);
           completedReconcile = generation;
         } finally {
           snapshotReady = true;
+          sessionsReady = true;
           for (const event of buffered.splice(0)) {
             store.applySse(event.type, event.body);
           }
@@ -444,7 +480,7 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
   let rosterDigest: string | null = null;
 
   const deliver = (type: string, body: any): void => {
-    if (snapshotReady) store.applySse(type, body);
+    if (snapshotReady || (sessionsReady && !type.startsWith('schedule.'))) store.applySse(type, body);
     else buffered.push({ type, body });
   };
 

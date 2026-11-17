@@ -18,9 +18,9 @@
 // function` crash in file Z. Per-process execution restores the isolation
 // boundary vitest gives for free.
 //
-// The cost is process startup per file (~21 min wall clock for this suite versus
-// a few minutes batched). That is the price of trustworthy results; a leg whose
-// failures are mostly artefacts is worse than no leg at all.
+// Startup per file is expensive. CI distributes the isolated processes across
+// four duration-balanced shards; --timings-output records their real wall times
+// for later calibration without changing their isolation boundary.
 //
 // A subset of files cannot run here yet: `vi.doMock` / `vi.doUnmock` /
 // `vi.resetModules`, the `importOriginal` / `importActual` mock-factory callbacks,
@@ -34,10 +34,37 @@
 // quietly start skipping files (or fail on files that have since been fixed).
 
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
 import { acquireTestSlot, resolveTestConcurrency } from './test-concurrency.mjs';
+import { bunSuiteHash, parseBunRunnerArgs, selectBunShard, writeBunTimingReport } from './bun-test-shards.mjs';
+
+let options;
+try {
+  options = parseBunRunnerArgs(process.argv.slice(2));
+} catch (error) {
+  console.error(error.message);
+  process.exit(2);
+}
+
+// Invalidate an old successful output BEFORE collection or selector startup.
+// A setup failure must never leave reusable green evidence from a previous run.
+const timingReport = {
+  schemaVersion: 1,
+  runtime: 'bun',
+  revision: process.env.GITHUB_SHA ?? null,
+  runId: process.env.GITHUB_RUN_ID ?? null,
+  shard: options.shard ?? { index: 1, count: 1 },
+  suite: null,
+  plannedCount: 0,
+  complete: false,
+  files: [],
+};
+function checkpointTimings() {
+  if (options.timingsOutput) writeBunTimingReport(options.timingsOutput, timingReport);
+}
+checkpointTimings();
 
 const TEST_DIR = 'test';
 
@@ -171,12 +198,12 @@ const FILE_WALL_MS = TEST_TIMEOUT_MS * 4;
 // cut short; it only fires when NOTHING has been printed for that long.
 const POST_RESULT_IDLE_MS = TEST_TIMEOUT_MS;
 
-const all = collectTestFiles(TEST_DIR).sort();
+const all = collectTestFiles(TEST_DIR).map(file => file.split(sep).join('/')).sort();
 
 // Parsed before anything spawns bun: the canary home below depends on it, and a `const`
 // read before its declaration is a TDZ ReferenceError — the same runtime-only failure
 // class that made an earlier commit run 0 of 994 files.
-const selfCheck = process.argv.includes('--self-check');
+const selfCheck = options.selfCheck;
 
 // In self-check mode, point the RUNNER's own home at a fresh empty directory before
 // anything spawns bun. Every `bun` this script starts is supposed to get its env from
@@ -228,7 +255,7 @@ if (allRunnable.length === 0) {
   exitCleanly(1);
 }
 
-const extraArgs = process.argv.slice(2).filter(a => a !== '--self-check');
+const extraArgs = options.extraArgs;
 // `--self-check` runs ONE trivially-passing file instead of the suite, so every code
 // path the real run needs — selector probe, fenced spawn env, per-file constants, the
 // close handler, the completeness accounting — actually EXECUTES in a few seconds.
@@ -251,7 +278,14 @@ if (selfCheck && !allRunnable.includes(SELF_CHECK_FILE)) {
   );
   exitCleanly(1);
 }
-const runnable = selfCheck ? [SELF_CHECK_FILE] : allRunnable;
+const runnable = selfCheck ? [SELF_CHECK_FILE] : selectBunShard(allRunnable, options.shard);
+if (runnable.length === 0) {
+  console.error('Refusing to report success: the selected Bun shard contains no runnable files');
+  exitCleanly(1);
+}
+timingReport.suite = { count: allRunnable.length, hash: bunSuiteHash(allRunnable) };
+timingReport.plannedCount = runnable.length;
+checkpointTimings();
 // Keep concurrency moderate: many of these files spawn real daemons, ptys and
 // bwrap sandboxes, and oversubscribing turns their internal timeouts into
 // spurious reds (measured on a busy host). But do not starve a small runner
@@ -274,7 +308,7 @@ console.log(
   selfCheck
     ? `bun test SELF-CHECK: 1 of ${allRunnable.length} runnable files (${SELF_CHECK_FILE}) — `
       + 'exercising the runner itself, NOT a suite result'
-    : `bun test: ${runnable.length} files, one process each, ${concurrency} at a time `
+    : `bun test: ${runnable.length} files${options.shard ? ` (shard ${options.shard.index}/${options.shard.count} of ${allRunnable.length})` : ''}, one process each, ${concurrency} at a time `
       + `(${skipped.length} deferred to vitest — module-registry APIs)`,
 );
 
@@ -484,7 +518,13 @@ async function worker() {
   for (;;) {
     const file = queue.shift();
     if (!file) return;
+    const started = performance.now();
     const res = await runOne(file);
+    timingReport.files.push({
+      file, seconds: Math.max(0.001, (performance.now() - started) / 1000), ok: res.ok,
+      ...(res.signal ? { signal: res.signal } : {}),
+    });
+    checkpointTimings();
     done += 1;
     if (!res.ok) {
       failures.push(res);
@@ -516,6 +556,8 @@ if (failures.length > 0) {
 // exit code was right but the headline contradicted it, and a human or a log
 // excerpt reads the headline.
 const incomplete = workerErrors.length > 0 || done !== runnable.length;
+timingReport.complete = !incomplete;
+checkpointTimings();
 if (incomplete) {
   console.error(
     `\nbun test: INCOMPLETE — ${done}/${runnable.length} files ran`

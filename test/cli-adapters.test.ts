@@ -952,14 +952,21 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
-  it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
+  it.each([
+    { toggle: true, restricted: false, flag: true },
+    { toggle: true, restricted: true, flag: false },
+    { toggle: false, restricted: false, flag: false },
+    { toggle: false, restricted: true, flag: false },
+  ])('traex RPC viewer: toggle=$toggle restricted=$restricted', ({ toggle, restricted, flag }) => {
     const traex = createTraexAdapter('/bin/traex');
     const args = traex.buildArgs({
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
-      bypassHookTrust: true,
+      bypassHookTrust: toggle,
+      disableCliBypass: restricted,
     });
     expect(args).toEqual([
+      ...(flag ? ['--dangerously-bypass-hook-trust'] : []),
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
       '-c', 'check_for_update_on_startup=false', 'thread-xyz',
     ]);
@@ -1628,6 +1635,29 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     // Headless dsh is a different adapter and keeps its own behaviour.
     expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).id).toBe('dsh');
     expect(createCliAdapterSync(resolveEffectiveCliId('dsh', undefined)).id).toBe('dsh');
+  });
+
+  // dsh-tui paints the alternate screen and owns its transcript redraw, so a
+  // read-only web terminal has no xterm/tmux scrollback to page. The only way
+  // to reach history is forwarding SGR wheel events back to the CLI — the
+  // narrow, rate-limited `type:'scroll'` path this flag opts into.
+  it('declares readOnlyRemoteScroll so read-only viewers can forward wheel scroll', () => {
+    expect(createDshTuiAdapter().readOnlyRemoteScroll).toBe(true);
+  });
+
+  it('the worker-resolved dsh-tui adapter also forwards wheel scroll', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.readOnlyRemoteScroll).toBe(true);
+  });
+
+  // The opt-in is dsh-tui-only: headless dsh speaks JSON-RPC over a plain log
+  // and never parses SGR wheel input, so forwarding a wheel there would be a
+  // no-op while wrongly suppressing the read-only page's own fallback path.
+  it('headless dsh never opts into remote scroll', () => {
+    expect(createDshAdapter('/opt/dsh/bin/dsh').readOnlyRemoteScroll).toBeUndefined();
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).readOnlyRemoteScroll)
+      .toBeUndefined();
   });
 
   it('omits --resume on fresh spawn when the question bridge is disabled', () => {

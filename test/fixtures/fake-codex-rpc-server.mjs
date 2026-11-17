@@ -17,6 +17,30 @@
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { appendFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+
+// An ordinary tool descendant has no app-server/listen identity in its argv.
+// FAKE_GROUP_CHILD_DELAY_MS simulates a tool spawned by a later turn, i.e. after
+// the engine captured the group identity at start().
+if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
+  const spawnTool = () => {
+    const tool = spawn(process.execPath, ['-e',
+      "process.on('SIGTERM', () => {}); process.on('message', () => process.send('ready')); setInterval(() => {}, 1000);",
+    ], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    tool.once('spawn', () => {
+      // Wait for the child's handler, rather than treating spawn as readiness.
+      tool.send('ready');
+    });
+    tool.on('message', () => {
+      writeFileSync(process.env.FAKE_GROUP_CHILD_PID_FILE, `${tool.pid}\n`);
+      tool.disconnect();
+      tool.unref();
+    });
+  };
+  const delay = Number(process.env.FAKE_GROUP_CHILD_DELAY_MS ?? '0');
+  if (delay > 0) setTimeout(spawnTool, delay).unref?.();
+  else spawnTool();
+}
 
 if (process.env.FAKE_ENV_PROBE_PATH) {
   const e = process.env;

@@ -326,7 +326,8 @@ describe('⌘K index coverage', () => {
   // 只能读文本反查；守的是「某个分类里新加了格子却没登记进 BOT_DEFAULTS_SECTIONS / 没挂深链落点 id」。
   it('every tile in the Bot config category panels carries a registered section id of that category', () => {
     const source = botDefaultsPageSource();
-    const starts = BOT_DEFAULTS_TABS.map(tab => ({ tab, at: source.indexOf(`id="bd-panel-${tab}"`) }));
+    // 面板已改为 LazyTabPanel 懒挂载（id 传给组件，运行时仍渲染为 bd-panel-<tab>），按组件开头定位。
+    const starts = BOT_DEFAULTS_TABS.map(tab => ({ tab, at: source.indexOf(`<LazyTabPanel id="${tab}"`) }));
     expect(starts.every(entry => entry.at > 0)).toBe(true);
     const tiles: string[] = [];
     starts.forEach(({ tab, at }, index) => {
