@@ -93,8 +93,9 @@ describe.skipIf(process.platform !== 'linux' || !hasTmux || !TMPDIR)('tmux anti-
     const settlement = waitForListenerSetToSettle(expected, {
       readPids: () => linuxListeningServerPids(socketPath),
     });
-    expect(settlement.settled).toBe(true);
-    expect(settlement.pids).toEqual(expected);
+    // One object assertion: on failure it prints BOTH settled:false and the
+    // actual pid array (including any extra listener), not just the boolean.
+    expect(settlement).toEqual({ settled: true, pids: expected });
   });
 
   it('the guard RECREATES the socket via SIGUSR1 instead of forking (one bmx listener, ENOENT)', () => {
