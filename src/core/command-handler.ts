@@ -20,7 +20,7 @@ import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies, credentialSourceOf, capabilityOn } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
-import { startBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { startBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
 import { meegoLoginCommand } from './provider-auth-request.js';
@@ -4862,9 +4862,16 @@ export async function handleCommand(
                   : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
             break;
           }
-          const started = await startBytedcliLogin(loginOpenId);
-          // Newer bytedcli answers `--begin` with the login it already holds
-          // instead of a link: that is success, not a failure to start.
+          // Someone already logged in is told so, whatever the CLI version.
+          // Same order as the wrapper's request: finish a link they already
+          // approved, then ask whether a login is in force, only then start.
+          const pendingChallenge = pendingBytedcliChallenge(loginOpenId);
+          const alreadyAuthorized = (pendingChallenge
+            && (await completeBytedcliLogin(loginOpenId, pendingChallenge)).state === 'authorized')
+            || (await describeBytedcliAuth(loginOpenId)).state === 'authorized';
+          // Newer bytedcli also answers `--begin` with the login it already
+          // holds instead of a link: that is success, not a failure to start.
+          const started = alreadyAuthorized ? { state: 'authorized' as const } : await startBytedcliLogin(loginOpenId);
           if (started.state === 'authorized') {
             await sessionReply(rootId, bytedcliLoginSuccessReply(botCfg2, loc, 'cmd.login.bytedcli_already'));
             break;

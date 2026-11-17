@@ -139,6 +139,7 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
     challenge: { authUrl: 'https://cloud.example.com/auth?state=x', completeToken: 'tok-1' },
   }) as import('../src/services/bytedcli-auth.js').BytedcliLoginStart),
   completeBytedcliLogin: vi.fn(async () => ({ state: 'authorized' as const })),
+  describeBytedcliAuth: vi.fn(async () => ({ state: 'needs-login' as const })),
   pendingBytedcliChallenge: vi.fn(() => null),
 }));
 
@@ -775,7 +776,7 @@ import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWor
 import { getChatReplyModeState, resolveRegularGroupMode } from '../src/services/chat-reply-mode-store.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
-import { hasBytedcliHome, startBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
+import { hasBytedcliHome, startBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
 import { hasLarkCliHome, beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge } from '../src/services/lark-cli-auth.js';
 import { platformCredentialsUrl } from '../src/platform/credential-grant-client.js';
 import { askPlatformToAuthorize } from '../src/core/platform-authorization-request.js';
@@ -2297,6 +2298,12 @@ describe('handleCommand', () => {
     // impls). Every mock that tests override must therefore be restored to
     // its default here, or the last override leaks into subsequent tests.
     vi.mocked(readGlobalConfig).mockReturnValue({});
+    vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+    vi.mocked(completeBytedcliLogin).mockReset().mockResolvedValue({ state: 'authorized' });
+    vi.mocked(describeBytedcliAuth).mockReset().mockResolvedValue({ state: 'needs-login' });
+    vi.mocked(startBytedcliLogin).mockReset().mockResolvedValue({
+      state: 'challenge', challenge: { authUrl: 'https://cloud.example.com/auth?state=x', completeToken: 'tok-1' },
+    });
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
     vi.mocked(findOncallChat).mockReturnValue(undefined);
     vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
@@ -8357,6 +8364,39 @@ describe('handleCommand', () => {
         expect(text).not.toContain('❌');
         expect(text).not.toContain('https://');
         expect(vi.mocked(sendUserMessage)).not.toHaveBeenCalled();
+      });
+
+      // Whatever the CLI version: an older bytedcli would hand out a fresh link
+      // to someone already logged in, and a link they already approved (but
+      // never sent `done` for) would otherwise be sent to them again.
+      it.each([
+        ['a login already in force', () => {
+          vi.mocked(describeBytedcliAuth).mockResolvedValueOnce({ state: 'authorized' });
+        }],
+        ['a link they approved without sending done', () => {
+          vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+          vi.mocked(completeBytedcliLogin).mockResolvedValueOnce({ state: 'authorized' });
+        }],
+      ])('reports %s as authorized without starting a login', async (_name, arrange) => {
+        governBot({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
+        arrange();
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        expect(startBytedcliLogin).not.toHaveBeenCalled();
+        const text = vi.mocked(deps.sessionReply).mock.calls.map(c => String(c[1])).join('\n');
+        expect(text).toContain(t('cmd.login.bytedcli_already', undefined, 'zh'));
+        expect(text).not.toContain('https://');
+      });
+
+      it('resends a link that is still waiting for approval', async () => {
+        governBot({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValueOnce({ state: 'pending' });
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+        expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+        expect(startBytedcliLogin).toHaveBeenCalledWith('ou_sender');
+        expect(vi.mocked(deps.sessionReply).mock.calls[0][1]).toContain('https://cloud.example.com/auth?state=x');
       });
 
       it('a login that cannot start shows bytedcli\'s own reason, not a fixed command name', async () => {
