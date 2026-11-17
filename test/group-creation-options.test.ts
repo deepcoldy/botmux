@@ -123,6 +123,18 @@ describe('/g task mode (default; --no-start / autoStart: false)', () => {
     expect(() => parseGroupCreationArgs('--no-start=yes 任务')).toThrow(/takes no value/);
     expect(() => parseGroupCreationArgs('--no-start --no-start 任务')).toThrow(/Duplicate option/);
   });
+  it('reads options from the first line only; later task lines stay verbatim', () => {
+    const task = '排查镜像构建失败\n复现：docker build --tag app:dev .\n还原：git checkout -- src/foo.ts\n对比 --tag 和 --tag=x、--avatar off、--agents a,b、--no-start';
+    const args = parseGroupCreationArgs(task);
+    expect(args).toMatchObject({ name: '排查镜像构建失败', body: task });
+    expect(args.tag).toBeUndefined();
+    expect(args.avatar).toBeUndefined();
+    expect(args.agents).toBeUndefined();
+    expect(args.autoStart).toBeUndefined();
+    expect(parseGroupCreationArgs(`--tag Work ${task}`)).toMatchObject({ tag: 'Work', body: task });
+    // Options-only first line: the name falls through to the task's first line.
+    expect(parseGroupCreationArgs('--no-start\n项目群\n--tag x')).toMatchObject({ autoStart: false, name: '项目群', body: '项目群\n--tag x' });
+  });
   it('--start is not an option', () => {
     expect(parseGroupCreationArgs('--start 任务').body).toBe('--start 任务');
   });

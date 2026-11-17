@@ -111,6 +111,8 @@ By default the text after `/g` is the **task** (multi-line is fine):
 
 You can also quote a message and send just `/g`; the quoted message is the task.
 
+Options (`--tag`, `--no-start`, …) are read from the first line only; later lines are kept verbatim as the task. If the first line of the task itself contains words like `--tag`, put `--` before the task, e.g. `/g -- npm publish --tag canary`.
+
 After the group is created:
 
 - The group is first named after the first 20 characters of the task, then renamed to a short title the bot's own CLI generates from the task (kept as is when the CLI has no one-shot mode or the bot is sandboxed);

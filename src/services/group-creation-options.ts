@@ -97,13 +97,21 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
  *  - No shell evaluation. Quotes are only syntax for option values; the group
  *    name retains its original punctuation and spacing on the first non-empty
  *    line, matching the historical behavior.
+ *  - Options are read from the first non-empty line only. Later lines are task
+ *    text and stay verbatim: a pasted `docker build --tag x` or
+ *    `git checkout -- file` must neither become an option nor lose its flags.
  */
-export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefaults): GroupCreationArgs {
+export function parseGroupCreationArgs(rawArgs: string, defaults?: GroupCreationDefaults): GroupCreationArgs {
   // `parseGroupCreationDefaults` already normalizes blank defaults to absent,
   // but we may have been handed a raw object from a legacy call site; mirror
   // that normalization locally so defaults can be mutated by opt-outs.
   const bag: Record<string, unknown> = { ...defaults };
   if (typeof bag.tag === 'string' && !bag.tag.trim()) delete bag.tag;
+
+  const firstContent = rawArgs.search(/\S/);
+  const optionsEnd = firstContent < 0 ? -1 : rawArgs.indexOf('\n', firstContent);
+  const raw = optionsEnd < 0 ? rawArgs : rawArgs.slice(0, optionsEnd);
+  const taskTail = optionsEnd < 0 ? '' : rawArgs.slice(optionsEnd);
 
   const seen = new Set<OutputKey>();
   const removals: Array<[number, number]> = [];
@@ -178,7 +186,7 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
     body += raw.slice(cursor, s);
     cursor = e;
   }
-  body += raw.slice(cursor);
+  body += raw.slice(cursor) + taskTail;
   const firstLine = body.split(/\r?\n/).map(x => x.trim()).find(Boolean) ?? '';
 
   const roleProfileId = typeof bag.roleProfileId === 'string' ? bag.roleProfileId : undefined;
