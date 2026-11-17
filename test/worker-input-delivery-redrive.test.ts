@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 function harness() {
   const backend = {};
@@ -10,6 +11,7 @@ function harness() {
     cliRestartInProgress: false,
     isPromptReady: true,
     inputDeliveryQuarantine: quarantine as typeof quarantine | null,
+    codexBridgeQueue: new CodexBridgeQueue(),
     flushPending: vi.fn(async () => {}),
     idleDetector: { fireIdle: vi.fn() },
     log: vi.fn(),
