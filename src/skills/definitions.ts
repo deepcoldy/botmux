@@ -854,6 +854,9 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
+| \`--into <om_xxx>\` | 指定回复进目标群的话题根消息（root_id）；跨群话题回复用 \`--chat-id <oc_xxx> --into <om_xxx>\` |
+| \`--follow-thread-at\` | 跨群发送时追踪该消息话题内的 @本bot 回复回源会话（默认开启） |
+| \`--no-follow-thread\` | 跨群发送时不追踪该消息话题内的回复回源会话 |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
 
 ## 输出

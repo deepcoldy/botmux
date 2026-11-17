@@ -281,6 +281,12 @@ export interface ReplyTargetEntry {
    *  `botmux send` treats an incomplete window as ambiguous → forces an explicit
    *  --mention decision rather than risk auto-@-ing the wrong single counterpart. */
   participantsIncomplete?: boolean;
+  /** When this turn arrived from a cross-chat followed thread in another group. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
 }
 
 /** Record of the most recent failed/interrupted turn, persisted so `/retry`
@@ -2065,6 +2071,12 @@ export interface FrozenSessionReplyContext {
    * reads as "unknown" and callers must fail toward the pre-existing behavior.
    */
   inThread?: boolean;
+  /** When this turn arrived from a cross-chat followed thread in another group. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
 }
 
 /** Host-side destination frozen when a Codex App turn crosses daemon

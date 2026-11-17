@@ -4467,7 +4467,7 @@ interface SessionData {
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[] }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[]; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
    *  `botmux send` 读取发送人类型，并用 `inThread` 判断 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
@@ -4477,6 +4477,7 @@ interface SessionData {
     inThread?: boolean;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
+    crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string };
   }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
@@ -8230,6 +8231,9 @@ const SEND_HELP_BODY = [
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
   '       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）',
+  '       --into <om_xxx>                 指定回复进目标群的话题根消息（root_id）',
+  '       --follow-thread-at              跨群发送时追踪该消息话题内的 @本bot 回复回源会话（默认开启）',
+  '       --no-follow-thread              跨群发送时不追踪该消息话题内的回复回源会话',
   '       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard',
   '                                       「需要你」列并通知你——撞到只有你能解的硬阻碍',
   '                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板',
@@ -10599,7 +10603,7 @@ async function relaySend(
   // identity and the routing wish (must match the watcher's allowlist); path
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level', '--follow-thread-at', '--no-follow-thread']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--reply-to', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -11963,6 +11967,12 @@ async function cmdSend(
   // another thread, etc.) instead of the session's own location. Wins over the
   // auto/scope default; `dispatch` opens topics, `send --into` posts into them.
   const sendInto = argValue(rest, '--into');
+  const followThreadAt = rest.includes('--follow-thread-at');
+  const noFollowThread = rest.includes('--no-follow-thread');
+  if (followThreadAt && noFollowThread) {
+    console.error('botmux send: --follow-thread-at 与 --no-follow-thread 不能同时使用');
+    process.exit(2);
+  }
   // --voice: synthesize the content into a Feishu voice bubble instead of a
   // text/card message. The content should be spoken-style prose (the 🔊 button
   // injects a condense-first instruction before the model calls this).
@@ -12283,10 +12293,14 @@ async function cmdSend(
     process.exit(2);
   }
   const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
-  const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
-    ?? s.turnReplyContexts?.[replyMessageId ?? '']?.quoteTargetId
-    ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-    ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined);
+  const replyContextForQuote = s.turnReplyContexts?.[replyMessageId ?? ''];
+  const isCrossChatOriginTurn = !!(replyContextForQuote?.crossChatOrigin ?? s.replyTargets?.[replyMessageId ?? '']?.crossChatOrigin);
+  const turnBoundQuoteTarget = isCrossChatOriginTurn
+    ? ((!overrideChatId || overrideChatId === s.chatId) ? s.quoteTargetId : undefined)
+    : (turnReplyTarget?.rootMessageId
+      ?? replyContextForQuote?.quoteTargetId
+      ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
+      ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined));
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12844,8 +12858,16 @@ async function cmdSend(
     console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
     process.exit(2);
   }
+  const currentTurnCrossChatOrigin = currentTurnId
+    ? (s.turnReplyContexts?.[currentTurnId]?.crossChatOrigin
+      ?? s.replyTargets?.[currentTurnId]?.crossChatOrigin)
+    : undefined;
+  const sendingToOriginSessionChat = (!overrideChatId || overrideChatId === s.chatId) && !sendInto;
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
+    ?? (currentTurnCrossChatOrigin && sendingToOriginSessionChat
+      ? (s.quoteTargetSenderOpenId ?? s.lastCallerOpenId ?? s.ownerOpenId ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId)
+      : undefined)
     ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
     ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
     // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
@@ -13082,11 +13104,7 @@ async function cmdSend(
       mentions: mentionArgs,
       mentionBack,
       noMention,
-      replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-        ?? frozenTurnDispatch?.replyTargetSenderOpenId
-        ?? turnReplyTarget?.senderOpenId
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-        ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
+      replyTargetSenderOpenId,
     },
     presentation: {
       voice: asVoice,
@@ -13378,9 +13396,13 @@ async function cmdSend(
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
+      const voiceCrossChatFollowThread = voicePrimaryOutputChatId !== (originSession ?? s).chatId
+        ? (noFollowThread ? 'off' as const : 'at' as const)
+        : undefined;
       if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput)) {
+        || !!deferredTopicRootMessageIdForOutput
+        || voiceCrossChatFollowThread !== undefined)) {
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
@@ -13400,6 +13422,7 @@ async function cmdSend(
             targetChatId: voicePrimaryOutputChatId,
             targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
             targetSessionId: sid,
+            crossChatFollowThread: voiceCrossChatFollowThread,
           });
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
@@ -13823,7 +13846,7 @@ async function cmdSend(
   // right one instead of guessing (or mis-@-ing the lone human). Reads the
   // persisted per-turn participant window — no group-stats round-trip. Explicit
   // VC turns carry their own single-target origin, so they skip this gate.
-  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel && !(currentTurnCrossChatOrigin && sendingToOriginSessionChat)) {
     const window = collectTurnWindowParticipants(s, currentTurnId);
     const selectedWindow = selectedReplyContext ? collectTurnWindowParticipants(s, replyMessageId) : window;
     window.participants = dedupeParticipants([...window.participants, ...selectedWindow.participants]);
@@ -14090,6 +14113,9 @@ async function cmdSend(
   // 此包装自出生即无调用方；但 test/cli-send-hook-context.test.ts 对其源码文本做了断言，
   // 删除需同步改测试。
   void dispatch;
+  const crossChatFollowThread = targetChatId !== (originSession ?? s).chatId
+    ? (noFollowThread ? 'off' as const : 'at' as const)
+    : undefined;
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
@@ -14120,6 +14146,7 @@ async function cmdSend(
         targetRootMessageId: deferredTopicRootMessageIdForOutput
           ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
         targetSessionId: sid,
+        crossChatFollowThread,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -14127,8 +14154,12 @@ async function cmdSend(
   // A detoured send is still positive user-visible output for its exact source
   // turn. Require an exact turn before recording a detour so a manually-run,
   // unattributed publish cannot suppress a real empty reply by timestamp alone.
+  // Cross-chat sends also record their messageId in turn-sends/<sessionId>.jsonl
+  // so replies in that cross-chat thread can route back to the origin session
+  // (detoured_send without turnId is ignored by evaluateBridgeFallbackGate).
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto
-    || !!(originTurnId ?? currentTurnId);
+    || !!(originTurnId ?? currentTurnId)
+    || crossChatFollowThread !== undefined;
   let unifiedReplyUsed = false;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
@@ -14849,6 +14880,9 @@ async function cmdSend(
       const replyStore = new TurnReplyCardStore(resolveDataDir());
       const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
       const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
+        ?? (currentTurnCrossChatOrigin && sendingToOriginSessionChat && replyTargetSenderOpenId && replyTargetSenderOpenId === (s.quoteTargetSenderOpenId ?? s.lastCallerOpenId ?? s.ownerOpenId)
+          ? (s.quoteTargetSenderIsBot ?? false)
+          : undefined)
         ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
         ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
         ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);

@@ -1,5 +1,11 @@
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
-import { renderInboundMessageLocation } from './core/reply-message.js';
+import { renderCrossChatReplyHint, renderInboundMessageLocation, type InboundMessageLocation } from './core/reply-message.js';
+import {
+  resolveCrossChatFollowedThread,
+  type CrossChatCandidateSession,
+  type CrossChatFollowedThreadMatch,
+  type CrossChatFollowedThreadOrigin,
+} from './services/cross-chat-thread-binding.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { registerSessionContractPrimary } from './core/session-contract-primary.js';
@@ -4343,6 +4349,36 @@ function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): 
     : null;
 }
 
+function findCrossChatFollowedThread(
+  candidateRootIds: readonly string[],
+  chatId: string,
+  larkAppId: string,
+): CrossChatFollowedThreadMatch | null {
+  const candidates: CrossChatCandidateSession[] = [];
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId) continue;
+    candidates.push({
+      sessionId: ds.session.sessionId,
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      scope: ds.scope,
+      rootMessageId: ds.session.rootMessageId,
+      runtimeRoutingAnchor: ds.runtimeRoutingAnchor,
+      status: ds.session.status,
+      queued: ds.session.queued,
+      messageListenerRun: ds.session.messageListenerRun,
+      deferredScheduleRun: ds.session.deferredScheduleRun,
+    });
+  }
+  return resolveCrossChatFollowedThread({
+    dataDir: config.session.dataDir,
+    larkAppId,
+    chatId,
+    candidateRootIds,
+    sessions: candidates,
+  });
+}
+
 function setDirectChatDisplayNameFromSender(
   session: Session,
   chatType: 'group' | 'p2p' | undefined,
@@ -5114,6 +5150,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     );
   }
   const turnSenderOpenId = delegationBlocked
+    || !registryTurnMayAuthenticateHuman(ds.session, turnId)
     || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
     || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
     ? undefined : reply?.senderOpenId;
@@ -5649,6 +5686,8 @@ export async function enforceMessageQuotaForCliInput(
     /** 与 bot-locked senderUnionId 同源的飞书 sender app_id；external roster 需要配对。 */
     senderAppId?: string;
     listenerAuthorized?: boolean;
+    crossChatFollowedThreadAuthorized?: boolean;
+    crossChatFollowedChatId?: string;
     skipCharge?: boolean;
     alreadyAuthorizedAndCharged?: boolean;
     /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
@@ -5668,6 +5707,38 @@ export async function enforceMessageQuotaForCliInput(
     }>;
   },
 ): Promise<boolean> {
+  if (opts?.crossChatFollowedThreadAuthorized) {
+    const checkChatId = opts.crossChatFollowedChatId ?? chatId;
+    const ev = botSender
+      ? evaluateBotTalk(larkAppId, checkChatId, senderOpenId, senderUnionId)
+      : evaluateTalk(larkAppId, checkChatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+    if (ev.reason === 'blocked') {
+      logger.info(`[quota:${larkAppId}] dropping cross-chat thread message ${messageId.substring(0, 12)} from blocked sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+      return false;
+    }
+    const crossChatGate = await evaluatePromptGate('prompt.submit', {
+      larkAppId,
+      chatId: checkChatId,
+      chatType,
+      anchor,
+      messageId,
+      senderOpenId,
+      senderUnionId,
+      memberUnionId,
+      botSender: !!botSender,
+      talkReason: 'crossChatFollowedThread',
+      content: opts.promptContent,
+      attachments: opts.promptAttachments,
+    });
+    if (!crossChatGate.allowed) {
+      logger.info(
+        `[hooks:${larkAppId}] prompt.submit gate denied cross-chat thread message ${messageId.substring(0, 12)}`
+        + `${crossChatGate.reason ? `: ${crossChatGate.reason}` : ''}`,
+      );
+      return false;
+    }
+    return true;
+  }
   if (opts?.listenerAuthorized) {
     // Listener matches skip the talk/quota model (a third-party alert bot is
     // not a "sender" with a grant), but they DO reach a CLI — and their content
@@ -29792,13 +29863,14 @@ async function handleThreadReplyAdmitted(
   // 同样跳过纯占位符种子（见出生侧注释）：自愈闸本就是为「停在占位名」兜底的，
   // 拿一张图片去改名只会把错名焊死，反而堵死后面真消息的自愈机会。
   // Completion Proposal 合成续跑不是真人新消息，同样不触发改名。
-  if (!ctx.completionProposalContinuation && ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+  if (!ctx.completionProposalContinuation && !ctx.crossChatThreadFollowUp && ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
     const sgEntry = getSessionGroup(ctxChatId);
     if (sgEntry && !sgEntry.titled && shouldSeedSessionGroupTitle(parsed.content)) {
       scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
     }
   }
   const groupAutoTitlePending = !ctx.completionProposalContinuation
+    && !ctx.crossChatThreadFollowUp
     && groupAutoTitleEligible(data, larkAppId, ctxChatId, ctxChatType);
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
@@ -29894,15 +29966,38 @@ async function handleThreadReplyAdmitted(
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
+  const crossChatOrigin: CrossChatFollowedThreadOrigin | undefined = ctx.crossChatThreadFollowUp
+    ? {
+        sourceChatId: ctx.crossChatThreadFollowUp.sourceChatId,
+        followedChatId: ctx.crossChatThreadFollowUp.followedChatId,
+        followedRootMessageId: ctx.crossChatThreadFollowUp.followedRootMessageId,
+      }
+    : undefined;
+  const buildTurnMessageLocation = (targetDs: DaemonSession): InboundMessageLocation => ({
+    messageId: parsed.messageId,
+    ...(crossChatOrigin
+      ? { rootMessageId: crossChatOrigin.followedRootMessageId, crossChatOrigin }
+      : (targetDs.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {})),
+  });
+
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
-  const initialCodexAppMessageContext = zeroInjection ? ''
-    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix
+  const baseQuoteAndBotContext = zeroInjection ? ''
+    : buildQuoteHint(
+        parsed,
+        crossChatOrigin ? 'thread' : scope,
+        crossChatOrigin?.followedRootMessageId ?? anchor,
+        localeForBot(larkAppId),
+      )
+      + botSenderPrefix
       + buildReportReplyContext(inputSession?.session.reportReplyReferences);
+  const initialCodexAppMessageContext = zeroInjection ? ''
+    : (crossChatOrigin ? `${renderCrossChatReplyHint(crossChatOrigin)}\n` : '')
+      + baseQuoteAndBotContext;
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
   const initialPromptContent = zeroInjection
     ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
-    : initialCodexAppMessageContext + initialCodexAppApplicationContext
+    : baseQuoteAndBotContext + initialCodexAppApplicationContext
       + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
@@ -29959,7 +30054,10 @@ async function handleThreadReplyAdmitted(
   let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
   // The administrative effort prefix was already consumed. Its attached task
   // remains literal model text while quota/resources/principal admission run.
-  if (ctx.effortTaskReentry) cmdContent = '';
+  // Cross-chat thread follow-up replies from another group are also literal
+  // conversational text — never daemon/slash commands or ask answers in the
+  // origin session.
+  if (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp) cmdContent = '';
   // Keep the three values consumed by the remainder of this function in lock
   // step. In particular, workflow/slash parsing reads cmdContent while worker
   // injection reads content/parsed.content; listener input is never trusted as
@@ -29982,14 +30080,18 @@ async function handleThreadReplyAdmitted(
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
   // external roster 还要求和 union 配对的飞书 app_id；cross-ref 认识的 peer 不补造该证据。
   const threadTeamTrustAppId: string | undefined = isBotSenderType ? data?.sender?.sender_id?.app_id : undefined;
-  const threadTrustedCaller = await trustedCallerForInboundTurn(
+  const rawThreadTrustedCaller = await trustedCallerForInboundTurn(
     larkAppId,
     threadSenderOpenId,
     threadSenderUnionId,
     senderIsBotTriState(parsed.senderType, isForeignBot),
     parsed.messageId,
   );
-  const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
+  // Cross-chat followed thread replies are admitted via talk-gate exemption on
+  // the bot's own cross-chat thread, so they never replace the origin session's
+  // execution principal (nor trigger XPI principal staging in the origin chat).
+  const threadTrustedCaller = ctx.crossChatThreadFollowUp ? undefined : rawThreadTrustedCaller;
+  const xpiControlNotice = rawThreadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
     : undefined;
   if (xpiControlNotice) {
@@ -30005,7 +30107,7 @@ async function handleThreadReplyAdmitted(
   }
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
-    if (isForeignBot || isBotSenderType) return;
+    if (isForeignBot || isBotSenderType || ctx.crossChatThreadFollowUp) return;
     const ds = activeSessions.get(runtimeSessionKey);
     if (ds) {
       if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
@@ -30025,8 +30127,8 @@ async function handleThreadReplyAdmitted(
   // ^https?://127.0.0.1, so the mention prefix breaks the match — fall back to
   // the mention-stripped cmdContent so pasting the callback back into the
   // topic still works.
-  const callbackText = !ctx.effortTaskReentry && isCallbackUrl(content) ? content
-    : !ctx.effortTaskReentry && isCallbackUrl(cmdContent) ? cmdContent : null;
+  const callbackText = !ctx.effortTaskReentry && !ctx.crossChatThreadFollowUp && isCallbackUrl(content) ? content
+    : !ctx.effortTaskReentry && !ctx.crossChatThreadFollowUp && isCallbackUrl(cmdContent) ? cmdContent : null;
   if (callbackText) {
     const result = await handleCallbackUrl(callbackText);
     if (result) {
@@ -30182,7 +30284,7 @@ async function handleThreadReplyAdmitted(
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
   // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
-  const askCandidate = ctx.effortTaskReentry ? null : askCustomReplyCandidate({
+  const askCandidate = (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp) ? null : askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -30319,12 +30421,14 @@ async function handleThreadReplyAdmitted(
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(dsPre, Date.now(), {
-        human: parsed.senderType === 'user' && !isForeignBot,
+        human: parsed.senderType === 'user' && !isForeignBot && !ctx.crossChatThreadFollowUp,
       });
-      const nativeTopicChanged = fillNativeTopicId(dsPre.session, scope, parsed.threadId);
-      if (!ctx.completionProposalContinuation) dsPre.session.quoteTargetId = parsed.messageId;
-      dsPre.session.quoteTargetSenderOpenId = callerOpenId;
-      dsPre.session.quoteTargetSenderIsBot = isForeignBot;
+      const nativeTopicChanged = !ctx.crossChatThreadFollowUp && fillNativeTopicId(dsPre.session, scope, parsed.threadId);
+      if (!ctx.completionProposalContinuation && !ctx.crossChatThreadFollowUp) {
+        dsPre.session.quoteTargetId = parsed.messageId;
+        dsPre.session.quoteTargetSenderOpenId = callerOpenId;
+        dsPre.session.quoteTargetSenderIsBot = isForeignBot;
+      }
       const substituteReplyMode = substituteTrigger
         ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
         : 'thread';
@@ -30347,8 +30451,9 @@ async function handleThreadReplyAdmitted(
         inThread: !!parsed.threadId,
         foldedRootId: ctx.foldedRootId,
         sourceMessageId: parsed.messageId,
+        ...(crossChatOrigin ? { crossChatOrigin } : {}),
       });
-      if (callerOpenId) dsPre.session.lastCallerOpenId = callerOpenId;
+      if (callerOpenId && !ctx.crossChatThreadFollowUp) dsPre.session.lastCallerOpenId = callerOpenId;
       publishLastInputFromBotPatch(dsPre);
       if (dsPre.session.vcMeetingReceiver) {
         dsPre.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
@@ -30374,7 +30479,7 @@ async function handleThreadReplyAdmitted(
       return;
     }
   }
-  if (dsPre && fillNativeTopicId(dsPre.session, scope, parsed.threadId)) {
+  if (dsPre && !ctx.crossChatThreadFollowUp && fillNativeTopicId(dsPre.session, scope, parsed.threadId)) {
     sessionStore.updateSession(dsPre.session);
     publishNativeTopicLinkPatch(dsPre);
   }
@@ -30409,7 +30514,17 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
-    { senderAppId: threadTeamTrustAppId, promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
+    {
+      senderAppId: threadTeamTrustAppId,
+      promptContent: parsed.content,
+      promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
+      ...(ctx.crossChatThreadFollowUp
+        ? {
+            crossChatFollowedThreadAuthorized: true,
+            crossChatFollowedChatId: ctx.crossChatThreadFollowUp.followedChatId,
+          }
+        : {}),
+    },
   )) {
     return;
   }
@@ -30572,13 +30687,15 @@ async function handleThreadReplyAdmitted(
   // where the caller is often not the session owner).
   const callerOpenId = inboundSenderOpenId;
   if (ds) {
-    markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
+    markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot && !ctx.crossChatThreadFollowUp });
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
-    if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
-    ds.session.quoteTargetSenderOpenId = callerOpenId;
-    ds.session.quoteTargetSenderIsBot = isForeignBot;
+    if (!ctx.completionProposalContinuation && !ctx.crossChatThreadFollowUp) {
+      ds.session.quoteTargetId = parsed.messageId;
+      ds.session.quoteTargetSenderOpenId = callerOpenId;
+      ds.session.quoteTargetSenderIsBot = isForeignBot;
+    }
     publishLastInputFromBotPatch(ds);
     if (ds.session.vcMeetingReceiver) {
       ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
@@ -30600,8 +30717,18 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
-    if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+      quoteOnly: substituteReplyMode === 'quote',
+      substitute: !!substituteTrigger,
+      senderOpenId: callerOpenId,
+      participants: existingWindow.participants,
+      participantsIncomplete: existingWindow.incomplete,
+      inThread: !!parsed.threadId,
+      foldedRootId: ctx.foldedRootId,
+      sourceMessageId: parsed.messageId,
+      ...(crossChatOrigin ? { crossChatOrigin } : {}),
+    });
+    if (callerOpenId && !ctx.crossChatThreadFollowUp && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
     sessionStore.updateSession(ds.session);
@@ -30679,7 +30806,7 @@ async function handleThreadReplyAdmitted(
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
         if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+          messageLocation: buildTurnMessageLocation(ds),
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30772,10 +30899,7 @@ async function handleThreadReplyAdmitted(
     const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
       ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
       : undefined;
-    if (!zeroInjection) enriched = `${renderInboundMessageLocation({
-      messageId: parsed.messageId,
-      ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}),
-    })}\n${enriched}`;
+    if (!zeroInjection) enriched = `${renderInboundMessageLocation(buildTurnMessageLocation(ds))}\n${enriched}`;
     const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
@@ -30833,7 +30957,7 @@ async function handleThreadReplyAdmitted(
         // 此分支是 pending 首个 worker 的同步屏障，不能 await 网络（见上方注释），
         // 所以不重算 solo，沿用会话注册时算好的 ds.soloSession。
         const exactFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+          messageLocation: buildTurnMessageLocation(ds),
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30949,6 +31073,10 @@ async function handleThreadReplyAdmitted(
   if (!ds) {
     if (ctx.completionProposalContinuation) {
       logger.warn('[completion-proposal] source session disappeared before continuation admission; refusing auto-create');
+      return;
+    }
+    if (ctx.crossChatThreadFollowUp) {
+      logger.warn('[cross-chat-thread] source session disappeared before follow-up admission; refusing auto-create');
       return;
     }
     // No active session at this anchor — auto-create. This branch is mostly a
@@ -31402,7 +31530,7 @@ async function handleThreadReplyAdmitted(
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+          messageLocation: buildTurnMessageLocation(ds),
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -31651,7 +31779,7 @@ async function handleThreadReplyAdmitted(
           const currentCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
           const traexRpcContext = traexRpcContextForSession(ds, currentCliId);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+            messageLocation: buildTurnMessageLocation(ds),
             attachments,
             mentions: parsed.mentions,
             isAdoptMode: false,
@@ -31868,6 +31996,7 @@ async function handleThreadReplyAdmitted(
         codexAppMessageContext: reforkCodexApp.messageContext,
         turnId: parsed.messageId,
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+        ...(!queuedHasDurableTail ? { messageLocation: buildTurnMessageLocation(ds) } : {}),
       });
       wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
         queued: queuedDashboardTurn,
@@ -35718,6 +35847,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ctx.larkAppId,
       ))?.session,
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      resolveCrossChatFollowedThread: (rootIds, chatId, appId) => findCrossChatFollowedThread(rootIds, chatId, appId),
       chatSessionAnsweredRootAtTopLevel: (rootId, chatId, appId) => {
         for (const ds of activeSessions.values()) {
           if (ds.larkAppId !== appId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
