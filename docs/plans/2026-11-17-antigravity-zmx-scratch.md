@@ -10,7 +10,7 @@ Antigravity 的 transcript 中无工具调用的 planner response 只是候选�
 
 ## scratch
 
-日志写入隔离视图，宿主侧读取必须定位同一个 session 的副本，而不是实际 HOME。除了 transcript，还需覆盖提交历史确认、`--log-file` 写入路径与读取路径、会话 ID 发现、CoT、usage、冷恢复和 reattach。Linux 容器内使用原生路径，宿主读取 merged 视图；macOS CLI 与宿主都需指向 clone。HOME 存在符号链接时，应先解析已存在的 HOME 再拼尚未创建的子路径，不能对不存在的完整路径仅做 lexical resolve。不得在隔离视图缺失时回退宿主历史。
+日志写入隔离视图，宿主侧读取必须定位同一个 session 的副本，而不是实际 HOME。除了 transcript，还需覆盖提交历史确认、`--log-file` 写入路径与读取路径、会话 ID 发现、CoT、usage、冷恢复和 reattach。Linux 容器内使用原生路径，宿主读取 merged 视图；macOS 的 `.gemini` 当前不是必需 clone，必须改为必需的 COW clone，失败时拒绝启动；CLI 与宿主均需指向该 clone。HOME 存在符号链接时，应先解析已存在的 HOME 再拼尚未创建的子路径，不能对不存在的完整路径仅做 lexical resolve。不得在隔离视图缺失时回退宿主历史。
 
 需要在 Linux overlay 和 macOS clone 分别测试新会话、延迟创建、原生 ID、连续轮次、重启与缺失视图；测试需证明宿主会话数据未被改写，且并发会话不会互相读取。保留对 `zmx + scratch` 的明确拒绝。
 
