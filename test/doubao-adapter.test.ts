@@ -251,6 +251,30 @@ describe('doubao session capture', () => {
     },
   );
 
+  it('treats plain files in the account and session trees as absent, not as an incomplete inventory', () => {
+    // Finder leaves `.DS_Store` in folders a user browses (docs point users at
+    // this tree). A file where a directory belongs holds no session; it must
+    // not make every future capture — in any session, however old — fail.
+    const root = makeSessionsRoot();
+    const dataRoot = join(root, '..', '..', '..', '..');
+    const since = Date.now() - 1000;
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
+    writeAssignment(root, OTHER_SID, 'old desktop task', since - 86_400_000);
+    writeAssignment(root, SID, envelope, since + 100);
+    writeFileSync(join(dataRoot, 'agent_mode', '.DS_Store'), 'x');
+    writeFileSync(join(root, OTHER_SID, 'agents', '.DS_Store'), 'x');
+    writeFileSync(join(root, '38450922917350001'), 'x');
+
+    const roots = doubaoSessionRoots(dataRoot);
+    expect(roots).toEqual([root]);
+    expect(findDoubaoSessionForSubmit(envelope, since, roots)).toBe(SID);
+    expect(findDoubaoSessionForSubmit('request', since, roots)).toBe(SID);
+    // Each site on its own: the account-level file reaches the scan only if
+    // the root filter keeps it.
+    expect(findDoubaoSessionForSubmit(envelope, since, [...roots, join(dataRoot, 'agent_mode', '.DS_Store', 'workspace', '.sessions')]))
+      .toBe(SID);
+  });
+
   it('splits concurrent cold starts by session marker even when fingerprints collide', () => {
     // Two botmux sessions submit in the same poll window. Their envelopes share
     // a fixed routing suffix, so the legacy last-line fingerprint is identical;

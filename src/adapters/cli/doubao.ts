@@ -51,6 +51,15 @@ export function doubaoDataRoot(env: NodeJS.ProcessEnv = process.env, platform = 
   return parent && isAbsolute(parent) ? join(parent, 'doubao_cli') : undefined;
 }
 
+/** A path that definitively holds no session: it does not exist, or one of its
+ *  components is a plain file where a directory belongs (e.g. Finder's
+ *  `.DS_Store` in `agent_mode/` or `agents/`). Unlike EACCES / EIO, neither can
+ *  hide a peer session, so neither makes the capture inventory incomplete. */
+function isAbsentPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 /** Every `.sessions` directory under the data root (one per logged-in account). */
 export function doubaoSessionRoots(dataRoot: string | undefined = doubaoDataRoot()): string[] {
   if (!dataRoot) return [];
@@ -64,7 +73,7 @@ export function doubaoSessionRoots(dataRoot: string | undefined = doubaoDataRoot
       catch (error) {
         // Retain unreadable candidates so the assignment scan can refuse an
         // incomplete inventory, while genuinely absent account stores stay out.
-        return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+        return !isAbsentPathError(error);
       }
     });
 }
@@ -130,7 +139,7 @@ function forEachDoubaoAssignment(
   for (const root of roots) {
     let sessions: string[];
     try { sessions = readdirSync(root); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+      if (!isAbsentPathError(error)) complete = false;
       continue;
     }
     for (const sid of sessions) {
@@ -140,7 +149,7 @@ function forEachDoubaoAssignment(
       try {
         agents = readdirSync(agentsDir);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+        if (!isAbsentPathError(error)) complete = false;
         continue;
       }
       for (const agent of agents) {
@@ -152,7 +161,7 @@ function forEachDoubaoAssignment(
         } catch (error) {
           // Missing / racing writers are retried by the poll; unreadable peers
           // prevent proving uniqueness and must not narrow the inventory.
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+          if (!isAbsentPathError(error)) complete = false;
         }
       }
     }
