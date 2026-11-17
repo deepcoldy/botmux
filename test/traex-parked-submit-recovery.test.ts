@@ -54,6 +54,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     usageLimitTracker: { currentTurn: () => 1, detectedThisTurn: () => false },
     submitActivityEvidenceSince: () => 'pty-output', readyGate: { isArmed: false },
     SUBMIT_DEFERRED_RECHECK_MS: 20_000, SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2,
+    FIRST_PROMPT_HARD_TIMEOUT_MS: 90_000,
     SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA: 12, SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA: 3,
     unscopedSubmitFailureChainSequence: 0, effectiveBackendType: 'tmux', lastPtyActivityAtMs: 0,
     captureBackendScreen: () => screen, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
@@ -183,6 +184,28 @@ describe('TRAE parked draft recovery', () => {
     await vi.advanceTimersByTimeAsync(40_000);
     expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
     expect(h.warnings()).toEqual([]);
+  });
+
+  it('waits for the provisional pre-thread composer before using the sole rescue', async () => {
+    const h = fixture({ screen: '─────────────────────────\n❯ [Pasted Content 6 chars]\n  ? for shortcuts' });
+    h.start();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.warnings()).toEqual([]);
+
+    h.setScreen(composer(`[Pasted Content ${Array.from(content).length} chars]`));
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.backend.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    expect(h.warnings()).toEqual([]);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+  });
+
+  it('warns without pressing when the provisional composer outlives the startup hard cap', async () => {
+    const h = fixture({ screen: '─────────────────────────\n❯ [Pasted Content 6 chars]\n  ? for shortcuts' });
+    h.start();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.warnings()).toHaveLength(1);
   });
 
   it.each(['pty', 'zmx', 'adopt'] as const)('does not guess a recovery for %s', async surface => {

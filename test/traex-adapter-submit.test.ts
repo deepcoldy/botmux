@@ -275,6 +275,13 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     expect(typeof (result as any).recheck).toBe('function');
   });
 
+  it('honors a rejected fallback write for one-shot composer rescue', () => {
+    const pty: PtyHandle & { write: ReturnType<typeof vi.fn> } = { write: vi.fn(() => false) };
+
+    expect(createTraexAdapter('/bin/traex').pressComposerSubmit?.(pty)).toBe(false);
+    expect(pty.write).toHaveBeenCalledExactlyOnceWith('\r');
+  });
+
   // ── Session-id ownership (only RETURN a pid-owned id) ──
 
   it('returns the session id when THIS pid provably owns the rollout', async () => {

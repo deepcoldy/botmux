@@ -376,8 +376,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const pressSubmit = (pty: PtyHandle): boolean => {
     try {
       if (pty.sendSpecialKeys) return pty.sendSpecialKeys('Enter') !== false;
-      pty.write('\r');
-      return true;
+      return pty.write('\r') !== false;
     } catch {
       return false;
     }

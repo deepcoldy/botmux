@@ -21924,14 +21924,27 @@ function scheduleSubmitFailureNotify(
     // Receipt checks are read-only. A parked TRAE draft gets at most one
     // additional submit, after a fresh authoritative composer and a second
     // receipt check; any manual input disables this automatic intervention.
-    if (retainTraexReceipt && !quarantineAtSchedule!.draftRescueAttempted && !quarantineAtSchedule!.submitWarningSent
+    const traexRescueEligible = retainTraexReceipt && !quarantineAtSchedule!.draftRescueAttempted && !quarantineAtSchedule!.submitWarningSent
       && !lastInitConfig?.adoptMode
       && externalInputGenerationAtWrite !== undefined
       && externalInputGenerationAtWrite === webTerminalInputGeneration
       && interruptGenerationAtWrite !== undefined
       && interruptGenerationAtWrite === cliInterruptGeneration
-      && backendScreenEvidenceIsAuthoritativeForMutation()
-      && traexComposerHoldsInput(submitDiagnosisScreen, draftContent)) {
+      && backendScreenEvidenceIsAuthoritativeForMutation();
+    const traexDraftVisible = traexRescueEligible
+      && traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
+    const traexDraftReady = traexDraftVisible
+      && traexComposerHoldsInput(submitDiagnosisScreen, draftContent);
+    if (traexDraftVisible && !traexDraftReady
+      && Date.now() - activityBaselineMs < FIRST_PROMPT_HARD_TIMEOUT_MS) {
+      // The provisional startup composer can display the pasted draft while its
+      // native thread is still unable to accept Enter. Wait for initialization
+      // instead of spending the sole rescue or warning while recovery is due.
+      log('Deferred recheck: TRAE draft is visible but the native thread is not ready — waiting before rescue');
+      armDeferredRecheck();
+      return;
+    }
+    if (traexDraftReady) {
       const freshScreen = await traexQuestionCapture();
       if (!chainIsCurrent() || !deferredAttemptIsCurrent()) return;
       if (externalInputGenerationAtWrite === webTerminalInputGeneration

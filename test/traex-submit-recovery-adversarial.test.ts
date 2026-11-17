@@ -54,6 +54,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     usageLimitTracker: { currentTurn: () => 1, detectedThisTurn: () => false },
     submitActivityEvidenceSince: () => 'pty-output', readyGate: { isArmed: false },
     SUBMIT_DEFERRED_RECHECK_MS: 20_000, SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2,
+    FIRST_PROMPT_HARD_TIMEOUT_MS: 90_000,
     SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA: 12, SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA: 3,
     unscopedSubmitFailureChainSequence: 0, effectiveBackendType: 'tmux', lastPtyActivityAtMs: 0,
     captureBackendScreen: () => screen, backendScreenEvidenceIsAuthoritativeForMutation: () => true,

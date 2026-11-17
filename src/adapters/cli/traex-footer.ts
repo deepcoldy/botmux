@@ -97,15 +97,21 @@ const EMPTY_COMPOSER_HINTS = new Set([
 
 /** Match only the live composer, never a pasted-content example in history.
  * A collapsed chip is usable only together with the worker's unchanged
- * external-input generation: its character count alone is not ownership. */
-export function traexComposerHoldsInput(screen: string, input: string): boolean {
+ * external-input generation: its character count alone is not ownership.
+ * The provisional shortcut-only startup composer can show a pasted draft while
+ * still dropping Enter, so it must not consume the worker's one-shot rescue. */
+export function traexComposerHoldsInput(
+  screen: string,
+  input: string,
+  opts: { requireThreadReady?: boolean } = {},
+): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
   if (composer < 0 || !input.trim()) return false;
   for (let end = composer + 1; end < rows.length; end++) {
     const empty = [...rows.slice(0, composer), '❯', ...rows.slice(end)].join('\n');
-    if (!traexRestoredComposerReady(empty)) continue;
+    if (!traexRestoredComposerReady(empty, { requireThreadReady: opts.requireThreadReady !== false })) continue;
     const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
       .join('\n').trim();
     const chip = /^\[Pasted Content (\d+) chars?\]$/i.exec(body);
