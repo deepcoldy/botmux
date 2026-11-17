@@ -23,7 +23,9 @@
  * worker and daemon state stay with their callers.
  */
 import type { FailedTurnRecord, FailedTurnRewindDirective } from '../types.js';
-import type { DaemonSession } from './types.js';
+import { isHttpVirtualSession, type DaemonSession } from './types.js';
+import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { normaliseForFingerprint } from '../services/claude-transcript.js';
 import type { PurgeResumeTarget } from '../services/transcript-image-purge.js';
 import { inspectLastClaudeTurn, type LastTurnInspection, type RewindResult } from './context-rewind.js';
@@ -81,7 +83,6 @@ export function planFailedTurnRewind(input: {
     failedInput: record.cliInput,
     mode: input.mode,
     content: input.mode === 'resend' ? record.cliInput : mergeFailedTurnInput(record.cliInput, input.content),
-    ...(record.cutFromTranscript ? { detached: true as const } : {}),
   };
 }
 
@@ -109,6 +110,23 @@ export function matchRecordedInput(recorded: string, input: string): { suffix: s
     if (normaliseForFingerprint(head) === want) return { suffix: last };
   }
   return undefined;
+}
+
+/** Daemon side: this turn's answer goes to the chat — the same exits
+ *  codexAppDeliverySinkForTurn tells apart, plus silent runs and HTTP-only
+ *  sessions. Read while the turn's routing state is still in place (at its
+ *  admission, or at its terminal before the HTTP settlement drops it). */
+export function turnAnswersInChat(ds: DaemonSession, turnId: string): boolean {
+  return !isSilentScheduledTurn(ds, turnId)
+    && !isTriggerFinalSuppressed(ds, turnId)
+    && !ds.suppressedFinalOutputTurns?.has(turnId)
+    && !ds.pendingWaitPromises?.has(turnId)
+    && !ds.asyncTriggerResults?.has(turnId)
+    && !ds.settledHttpTerminalTurns?.has(turnId)
+    && !ds.session.docCommentTargets?.[turnId]
+    && !ds.docCommentTurns?.has(turnId)
+    && !isHttpVirtualSession(ds.chatId)
+    && !ds.session.headless;
 }
 
 /** Daemon side: an input sent to the live worker to carry `failedTurnId` on

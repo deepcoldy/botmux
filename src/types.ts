@@ -310,10 +310,10 @@ export interface FailedTurnRecord {
   directFailure?: true;
   /** The terminal's `retryable`, kept for the rewind decision. */
   retryable?: boolean;
-  /** The failed turn was cut from the transcript but the input meant to carry
-   *  it on never reached the CLI (stopped while held): the next input brings
-   *  it back without another cut. */
-  cutFromTranscript?: true;
+  /** Frozen at the failure: this turn's answer was meant for the chat (not an
+   *  HTTP wait/async result, a suppressed or silent run, a document comment).
+   *  Only such a failed input may be folded into another chat turn. */
+  answersInChat?: true;
   recovery?: {
     requestId: string;
     mode: 'retry' | 'fresh';
@@ -338,9 +338,6 @@ export interface FailedTurnRewindDirective {
   mode: 'resend' | 'merge';
   /** What the CLI gets once the turn is cut. */
   content: string;
-  /** The failed turn is already out of the transcript (an earlier cut whose
-   *  message was stopped): write `content` without cutting anything. */
-  detached?: true;
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -2987,9 +2984,6 @@ export type WorkerToDaemonBase =
       failedTurnId: string;
       outcome: 'rewound' | 'declined';
       reason: string;
-      /** `declined` only: the failed turn was cut all the same (the message
-       *  was stopped after the cut), so it is no longer in the transcript. */
-      cut?: true;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

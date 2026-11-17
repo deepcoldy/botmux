@@ -13,7 +13,6 @@ import { resolvePurgeResumeTarget } from '../src/services/transcript-image-purge
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
 import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript } from '../src/core/context-rewind.js';
 import {
-  lastTurnIsFailedInput,
   planFailedTurnRewindRequest,
   rewindableErrorCode,
   rewoundContent,
@@ -100,33 +99,36 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     planFailedTurnRewindRequest,
     runFailedTurnRewindMaintenance,
     rewoundContent,
-    lastTurnIsFailedInput,
     saveUnsentInputsForSuccessor: vi.fn(),
+    interruptRewoundInputOnceRecorded: null,
+    handleTermAction: vi.fn(async () => {}),
+    turnTerminalEmitted: vi.fn(() => false),
     ...overrides,
   };
   // The real restart fences input synchronously: from here on a message waits
   // in the queue for the replacement CLI.
   const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => { scope.cliRestartInProgress = true; });
   scope.restartCliProcess ??= restartCliProcess;
-  const start = loadWorkerFunction<(turnId: string | undefined, d: FailedTurnRewindDirective, enqueue: () => void, setContent: (c: string) => void) => void>(
+  const start = loadWorkerFunction<(turnId: string | undefined, d: FailedTurnRewindDirective, enqueue: () => void) => void>(
     'startFailedTurnRewind', scope,
   );
   const writeEdge = loadWorkerFunction<(item: unknown) => 'write' | 'stopped'>('failedTurnRewindWriteEdge', scope);
-  const stop = loadWorkerFunction<() => boolean>('stopHeldFailedTurnRewind', scope);
+  const stopHeld = loadWorkerFunction<(key: string) => boolean>('stopHeldFailedTurnRewind', scope);
+  const stop = () => stopHeld('ctrlc');
+  const recorded = loadWorkerFunction<(turnId: string) => void>('interruptRewoundInputIfStopped', scope);
   // What the message case's enqueue does: queue behind a restart, write otherwise.
-  let content = '继续';
   const enqueue = vi.fn(() => {
-    if (scope.cliRestartInProgress) pendingMessages.push({ content, turnId: 'trg_new' });
-    else written.push(content);
+    if (scope.cliRestartInProgress) pendingMessages.push({ content: '继续', turnId: 'trg_new' });
+    else written.push('继续');
   });
-  start('trg_new', d, enqueue, next => { content = next; });
+  start('trg_new', d, enqueue);
   const reports = () => send.mock.calls.map(([m]) => m).filter(m => m.type === 'failed_turn_rewind');
   const restartOpts = () => restartCliProcess.mock.calls[0]![1];
   const cutAfterExit = () => restartOpts().beforeRespawn!({ pid: 4242, processScope: [4242] });
   const settle = (result: 'spawned' | 'failed' | 'superseded') => restartOpts().onRespawnSettled!(result);
   /** flushPending reaching the held message: what it writes, if anything. */
   const reachWriteEdge = () => writeEdge(pendingMessages[0]);
-  return { jsonl, scope, pendingMessages, written, enqueue, restartCliProcess, reports, restartOpts, cutAfterExit, settle, reachWriteEdge, stop };
+  return { jsonl, scope, pendingMessages, written, enqueue, restartCliProcess, reports, restartOpts, cutAfterExit, settle, reachWriteEdge, stop, recorded };
 }
 
 describe('startFailedTurnRewind', () => {
@@ -205,30 +207,35 @@ describe('startFailedTurnRewind', () => {
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
   });
 
-  it('a stop after the cut keeps the message from the CLI and never reports it as carrying the failed input', async () => {
-    const { cutAfterExit, settle, reachWriteEdge, stop, reports } = setup(failedTranscript());
+  it('a stop after the cut lets the message in and interrupts it once recorded: the failed input stays in the conversation', async () => {
+    const { scope, pendingMessages, cutAfterExit, settle, reachWriteEdge, stop, recorded, reports } = setup(failedTranscript());
     await cutAfterExit();
     settle('spawned');
     expect(stop()).toBe(true);
-    expect(reachWriteEdge()).toBe('stopped');
-    // The failed turn is out of the transcript now: the daemon is told, and
-    // brings the input back with the next message.
-    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/stopped/), cut: true })]);
-  });
-
-  it('a failed turn an earlier stopped message already cut: the input goes in with this one, no restart', () => {
-    const { jsonl, written, restartCliProcess, reports } = setup(HISTORY, {}, directive({ detached: true }));
-    expect(restartCliProcess).not.toHaveBeenCalled();
-    expect(written).toEqual([MERGED]);
-    expect(readFileSync(jsonl, 'utf8')).toBe(HISTORY);
+    // Not dropped: it carries the failed input, which is no longer in the transcript.
+    expect(pendingMessages).toEqual([{ content: MERGED, turnId: 'trg_new' }]);
+    expect(reachWriteEdge()).toBe('write');
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'rewound' })]);
+    expect(scope.handleTermAction).not.toHaveBeenCalled();
+    recorded('trg_other');
+    recorded('trg_new');
+    await Promise.resolve();
+    expect(scope.handleTermAction).toHaveBeenCalledWith('ctrlc');
+    recorded('trg_new');
+    await Promise.resolve();
+    expect(scope.handleTermAction).toHaveBeenCalledTimes(1);
   });
 
-  it('a detached directive whose failed turn is in fact still there takes the ordinary cut', async () => {
-    const { jsonl, restartCliProcess, cutAfterExit } = setup(failedTranscript(), {}, directive({ detached: true }));
-    expect(restartCliProcess).toHaveBeenCalledTimes(1);
+  it('a stopped message that ended as soon as it was recorded is not interrupted afterwards', async () => {
+    const { scope, cutAfterExit, settle, reachWriteEdge, stop, recorded } = setup(failedTranscript());
     await cutAfterExit();
-    expect(readFileSync(jsonl, 'utf8')).toBe(HISTORY);
+    settle('spawned');
+    stop();
+    reachWriteEdge();
+    (scope.turnTerminalEmitted as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    recorded('trg_new');
+    await Promise.resolve();
+    expect(scope.handleTermAction).not.toHaveBeenCalled();
   });
 
   it('a stop once the message was written is an ordinary stop', async () => {

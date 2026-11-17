@@ -62,6 +62,7 @@ import { recordFailedTurnTerminal } from '../src/core/failed-turn-recovery.js';
 import { failedTurnRewindInFlight } from '../src/core/failed-turn-rewind.js';
 import { rememberLastCliInput } from '../src/core/session-manager.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { armTriggerFinalSuppression } from '../src/core/trigger-final-suppression.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';
 import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -140,7 +141,7 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     const s = session();
     rememberLastCliInput(s.ds, HINT, HINT, 'trg_1');
     await s.failed('trg_1', { directFailure: true });
-    expect(s.ds.session.lastFailedTurn).toMatchObject({ turnId: 'trg_1', cliInput: HINT, directFailure: true, retryable: true });
+    expect(s.ds.session.lastFailedTurn).toMatchObject({ turnId: 'trg_1', cliInput: HINT, directFailure: true, retryable: true, answersInChat: true });
     expect(s.failureCards()).toHaveLength(1);
     expect(s.ds.session.lastFailureCard).toEqual({ turnId: 'trg_1', messageId: 'om_card_1' });
     // Nothing ran: the card says so, and its button re-sends the input as it was.
@@ -378,19 +379,31 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     expect(failedTurnRewindInFlight(s.ds, 'trg_1')).toBe(false);
   });
 
-  it('a cut whose input was stopped before reaching the CLI: the next input brings the failed input back without a cut', async () => {
+  // The failed turn's own exit is frozen when it fails: its HTTP / suppression
+  // state is gone by the time the next input arrives (wait settled, marker
+  // expired, daemon restarted), and folding it into a chat turn would post
+  // an answer that was never meant for the chat.
+  it.each([
+    ['an HTTP wait result', (ds: DaemonSession) => { ds.pendingWaitPromises = new Map([['trg_1', { resolve: () => {}, reject: () => {} } as any]]); }],
+    ['an async HTTP result', (ds: DaemonSession) => { ds.asyncTriggerResults = new Map([['trg_1', { status: 'pending', createdAt: Date.now() } as any]]); }],
+    ['a trigger with its final output suppressed', (ds: DaemonSession) => armTriggerFinalSuppression(ds, 'trg_1')],
+    ['a durable delivery with its final output suppressed', (ds: DaemonSession) => { ds.suppressedFinalOutputTurns = new Map([['trg_1', 1]]); }],
+    // A failed final output can settle the HTTP wait before the terminal arrives.
+    ['an HTTP result settled before its terminal', (ds: DaemonSession) => { ds.settledHttpTerminalTurns = new Set(['trg_1']); }],
+  ] as const)('does not fold a failed input whose answer was %s into a chat turn', async (_label, arm) => {
     const s = session();
     rememberLastCliInput(s.ds, HINT, HINT, 'trg_1');
+    arm(s.ds);
     await s.failed('trg_1', { directFailure: true });
-    s.input('trg_2', '继续');
-    await s.rewound('trg_2', 'trg_1', 'declined', true);
-    await s.fromWorker({ type: 'turn_terminal', sessionId: SID, turnId: 'trg_2', status: 'cancelled', errorCode: 'stopped_before_start' });
-    expect(s.ds.session.lastFailedTurn).toMatchObject({ turnId: 'trg_1', cutFromTranscript: true });
-    expect(s.input('trg_3', '再来').failedTurnRewind).toEqual({
-      failedTurnId: 'trg_1', failedInput: HINT, mode: 'merge', content: `${HINT}\n\n再来`, detached: true,
-    });
-    // The card's retry still re-sends it.
-    expect(failedTurnRewindInFlight(s.ds, 'trg_1')).toBe(true);
+    expect(s.ds.session.lastFailedTurn).toMatchObject({ turnId: 'trg_1', directFailure: true });
+    expect(s.ds.session.lastFailedTurn?.answersInChat).toBeUndefined();
+    // Whatever runtime state is left (or not, after a restart).
+    s.ds.pendingWaitPromises?.clear();
+    s.ds.asyncTriggerResults?.clear();
+    s.ds.suppressedFinalOutputTurns?.clear();
+    expect(s.input('trg_2', '继续').failedTurnRewind).toBeUndefined();
+    // Its own retry still re-sends it.
+    expect(s.input('retry-1', HINT, { failedTurn: 'resend' }).failedTurnRewind).toMatchObject({ mode: 'resend' });
   });
 
   it.each([
@@ -399,8 +412,9 @@ describe('a turn that failed without output, then more input (daemon side)', () 
   ] as const)('does not fold when %s: the answer would go elsewhere', async (_label, arm) => {
     const s = session();
     rememberLastCliInput(s.ds, HINT, HINT, 'trg_1');
-    await s.failed('trg_1', { directFailure: true });
+    // Routing is registered when a turn is admitted, before it can fail.
     arm(s.ds);
+    await s.failed('trg_1', { directFailure: true });
     expect(s.input('trg_2', '继续').failedTurnRewind).toBeUndefined();
   });
 

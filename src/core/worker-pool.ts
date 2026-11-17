@@ -993,7 +993,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind } from './failed-turn-rewind.js';
+import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
@@ -3083,7 +3083,7 @@ async function sendTurnNotice(
  * Remembers the card as the session's latest, so the next cut of this turn
  * continues the chain on it. Rejects when posting fails (callers own retries).
  */
-async function deliverTurnFailureCard(
+function deliverTurnFailureCard(
   ds: DaemonSession,
   turnId: string,
   build: (repeatedFailures: number | undefined) => string,
@@ -3091,35 +3091,46 @@ async function deliverTurnFailureCard(
 ): Promise<string | undefined> {
   const chain = ds.session.failedTurnRewindChain;
   const failed = ds.session.lastFailedTurn;
-  const chained = chain?.turnId === turnId;
-  const repeated = chained && failed?.turnId === turnId && failed.directFailure === true
-    ? chain!.failures + 1 : undefined;
-  let messageId: string | undefined;
-  if (repeated !== undefined && chain?.cardMessageId) {
+  const repeated = chain?.turnId === turnId && failed?.turnId === turnId && failed.directFailure === true
+    ? chain.failures + 1 : undefined;
+  const remember = (messageId: string | undefined): void => {
+    const current = ds.session.failedTurnRewindChain;
+    if (current?.turnId === turnId) {
+      // A turn that made progress before failing ends the chain: its next cut
+      // (if any) starts a new count on a new card.
+      if (repeated === undefined) delete ds.session.failedTurnRewindChain;
+      else if (messageId) ds.session.failedTurnRewindChain = { ...current, cardMessageId: messageId };
+    }
+    if (messageId) ds.session.lastFailureCard = { turnId, messageId };
     try {
-      await updateMessage(ds.larkAppId, chain.cardMessageId, build(repeated));
-      messageId = chain.cardMessageId;
-      logger.info(`[${tag(ds)}] Failure card ${chain.cardMessageId} updated in place: input failed ${repeated} times without output`);
+      sessionStore.updateSession(ds.session);
     } catch (err) {
-      logger.warn(`[${tag(ds)}] Could not update failure card ${chain.cardMessageId} in place, posting a new one: `
+      logger.warn(`[${tag(ds)}] Could not persist failure card ${messageId ?? '-'}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  const cardMessageId = repeated !== undefined ? chain?.cardMessageId : undefined;
+  if (!cardMessageId) {
+    // The ordinary post: hand back the poster's own promise (callers and the
+    // notice outbox see exactly the timing they saw before) and record the
+    // card alongside.
+    const sent = post(build(repeated));
+    sent.then(remember, () => { /* the caller owns the failure */ });
+    return sent;
+  }
+  return (async () => {
+    let messageId: string | undefined;
+    try {
+      await updateMessage(ds.larkAppId, cardMessageId, build(repeated));
+      messageId = cardMessageId;
+      logger.info(`[${tag(ds)}] Failure card ${cardMessageId} updated in place: input failed ${repeated} times without output`);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Could not update failure card ${cardMessageId} in place, posting a new one: `
         + `${err instanceof Error ? err.message : String(err)}`);
     }
-  }
-  if (!messageId) messageId = await post(build(repeated));
-  const current = ds.session.failedTurnRewindChain;
-  if (current?.turnId === turnId) {
-    // A turn that made progress before failing ends the chain: its next cut
-    // (if any) starts a new count on a new card.
-    if (repeated === undefined) delete ds.session.failedTurnRewindChain;
-    else if (messageId) ds.session.failedTurnRewindChain = { ...current, cardMessageId: messageId };
-  }
-  if (messageId) ds.session.lastFailureCard = { turnId, messageId };
-  try {
-    sessionStore.updateSession(ds.session);
-  } catch (err) {
-    logger.warn(`[${tag(ds)}] Could not persist failure card ${messageId ?? '-'}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return messageId;
+    if (!messageId) messageId = await post(build(repeated));
+    remember(messageId);
+    return messageId;
+  })();
 }
 
 function enqueueOrdinaryRecoveryNotice(
@@ -3455,7 +3466,12 @@ export function ensureOrdinaryTurnRecoveryAttached(
             ds,
             dispatch.prompt,
             dispatch.turnId,
-            { ...(trustedCaller ? { trustedCaller } : {}), failedTurn: 'resend' },
+            {
+              ...(trustedCaller ? { trustedCaller } : {}),
+              // Only Claude Code transcripts can be cut; other CLIs keep their
+              // continuation exactly as it was.
+              ...(sessionCliId(ds, botCfg) === 'claude-code' ? { failedTurn: 'resend' as const } : {}),
+            },
           );
         }
       } catch (err) {
@@ -15958,10 +15974,9 @@ function failedTurnRewindForInput(
 
 /** Folding a failed input into another turn hands it that turn's identity and
  *  delivery. Only where both stay what the failed input had:
- *  - the new turn's answer reaches the chat like the failed one's would have
- *    (not a silent scheduled fire, a trigger with its final output
- *    suppressed, an HTTP wait/async result, a headless session), and the
- *    failed input was not a silent fire itself;
+ *  - both turns answer in the chat (turnAnswersInChat): the failed one as
+ *    frozen at its failure, the new one now — not an HTTP wait/async result,
+ *    a silent or suppressed run, a document comment, a headless session;
  *  - the new turn runs as nobody stronger: a human sender must be the one
  *    who sent the failed input. An unidentified input (a webhook's "继续")
  *    runs the failed input with less authority than it had, never more.
@@ -15972,15 +15987,7 @@ function mergeKeepsFailedInputDelivered(
   turnId: string,
   caller: TrustedCaller | undefined,
 ): boolean {
-  if (!record || record.silent) return false;
-  // The same exits codexAppDeliverySinkForTurn tells apart: only a turn whose
-  // answer goes to the chat, on either side, may take the other's input.
-  const docComment = (id: string) => !!ds.session.docCommentTargets?.[id] || !!ds.docCommentTurns?.has(id);
-  if (isSilentScheduledTurn(ds, turnId) || isTriggerFinalSuppressed(ds, turnId)
-    || ds.suppressedFinalOutputTurns?.has(turnId)
-    || ds.pendingWaitPromises?.has(turnId) || ds.asyncTriggerResults?.has(turnId)
-    || docComment(turnId) || docComment(record.turnId)
-    || ds.session.headless) return false;
+  if (!record || record.silent || record.answersInChat !== true || !turnAnswersInChat(ds, turnId)) return false;
   if (!caller) return true;
   const failedBy = record.trustedCaller;
   return !!failedBy
@@ -15996,21 +16003,12 @@ function mergeKeepsFailedInputDelivered(
  *  joins the chain whose card is updated in place. */
 export function applyFailedTurnRewindResult(
   ds: DaemonSession,
-  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; reason: string; cut?: true },
+  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; reason: string },
 ): void {
   const pending = ds.pendingFailedTurnRewinds?.get(result.turnId);
   ds.pendingFailedTurnRewinds?.delete(result.turnId);
   if (result.outcome !== 'rewound') {
-    logger.info(`[${tag(ds)}] Failed turn ${result.failedTurnId.slice(0, 16)} not carried on by ${result.turnId.slice(0, 16)}`
-      + `${result.cut ? ' (cut from the transcript all the same)' : ''}: ${result.reason}`);
-    // Its input lives on only in the record now: the next input brings it
-    // back without a cut, and the failure card's retry still re-sends it.
-    const record = ds.session.lastFailedTurn;
-    if (result.cut && pending?.failedTurnId === result.failedTurnId && record?.turnId === result.failedTurnId) {
-      record.cutFromTranscript = true;
-      try { sessionStore.updateSession(ds.session); }
-      catch (err) { logger.warn(`[${tag(ds)}] Could not persist that failed turn ${record.turnId.slice(0, 16)} was cut: ${err instanceof Error ? err.message : String(err)}`); }
-    }
+    logger.info(`[${tag(ds)}] Failed turn ${result.failedTurnId.slice(0, 16)} not carried on by ${result.turnId.slice(0, 16)}: ${result.reason}`);
     return;
   }
   if (!pending || pending.failedTurnId !== result.failedTurnId) {

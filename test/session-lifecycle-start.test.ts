@@ -10116,6 +10116,32 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('continues a turn that failed without any output by re-sending its input after cutting it, not by asking to continue', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    // What the daemon recorded from the worker's directFailure terminal.
+    ds.session.lastFailedTurn = {
+      turnId: SCHEDULED_TURN, userPrompt: 'hourly task prompt', cliInput: 'hourly task prompt',
+      failedAt: new Date().toISOString(), errorCode: 'provider_server_error', status: 'failed',
+      retryable: true, directFailure: true, retryCount: 0,
+    };
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    // Nothing ran, so there is no checkpoint: the worker is told to cut the
+    // failed turn and re-send its input (the recovery prompt is the fallback).
+    expect(continuation.content).toContain('[BOTMUX_RECOVERY]');
+    expect(continuation.failedTurnRewind).toEqual({
+      failedTurnId: SCHEDULED_TURN, failedInput: 'hourly task prompt', mode: 'resend', content: 'hourly task prompt',
+    });
+  });
+
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     armSilentScheduledTurn(ds, SCHEDULED_TURN);

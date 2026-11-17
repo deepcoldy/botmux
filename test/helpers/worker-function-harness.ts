@@ -33,7 +33,7 @@ import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
  *  loaded as the real functions, so a fixture with no rewind in flight keeps
  *  its old behaviour. */
-const FAILED_TURN_REWIND_FUNCTIONS = ['turnFailedWithoutOutput', 'failedTurnRewindWriteEdge', 'stopHeldFailedTurnRewind'];
+const FAILED_TURN_REWIND_FUNCTIONS = ['turnFailedWithoutOutput', 'failedTurnRewindWriteEdge', 'stopHeldFailedTurnRewind', 'interruptRewoundInputIfStopped'];
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,

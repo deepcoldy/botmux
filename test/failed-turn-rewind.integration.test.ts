@@ -67,6 +67,7 @@ function startWorker() {
   const prompts = join(root, 'prompts.jsonl');
   const down = join(root, 'provider-down');
   const slowResume = join(root, 'slow-resume');
+  const slowTurn = join(root, 'slow-turn');
   writeFileSync(down, '');
   const fakeClaude = join(root, 'fake-claude');
   // Each launch (the first and every --resume) draws a prompt; each submitted
@@ -76,13 +77,29 @@ import('node:fs').then(fs => {
 const T = ${JSON.stringify(transcript)};
 const put = row => fs.appendFileSync(T, JSON.stringify({ timestamp: new Date().toISOString(), uuid: Math.random().toString(36).slice(2), ...row }) + '\\n');
 fs.appendFileSync(${JSON.stringify(prompts)}, JSON.stringify({ launch: process.argv.slice(2) }) + '\\n');
+let running;
 // A resumed launch can take a while to draw its prompt (a long transcript).
 const slow = process.argv.includes('--resume') && fs.existsSync(${JSON.stringify(slowResume)});
 setTimeout(() => process.stdout.write('❯ '), slow ? 4000 : 0);
-process.on('SIGINT', () => fs.appendFileSync(${JSON.stringify(prompts)}, JSON.stringify({ sigint: true }) + '\\n'));
+// Without raw mode the pty turns Ctrl-C into SIGINT (Claude reads it raw).
+process.on('SIGINT', () => {
+  fs.appendFileSync(${JSON.stringify(prompts)}, JSON.stringify({ sigint: true }) + '\\n');
+  interrupt();
+});
 let typed = '';
+// Ctrl-C / Esc while a turn runs: Claude cancels it and records the stop.
+function interrupt() {
+  if (!running) return;
+  clearTimeout(running);
+  running = undefined;
+  fs.appendFileSync(${JSON.stringify(prompts)}, JSON.stringify({ interrupt: true }) + '\\n');
+  put({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } });
+  process.stdout.write('\\r\\n❯ ');
+}
 process.stdin.on('data', chunk => {
-  typed += chunk.toString();
+  const raw = chunk.toString();
+  if ((raw === '\\x03' || raw === '\\x1b') && running) { interrupt(); return; }
+  typed += raw;
   if (!/[\\r\\n]$/.test(typed)) return;
   if (typed.includes('\\x1b[200~') && !typed.includes('\\x1b[201~')) return;
   const prompt = typed.replace(/\\x1b\\[20[01]~/g, '').trim();
@@ -94,7 +111,10 @@ process.stdin.on('data', chunk => {
   fs.appendFileSync(T, JSON.stringify({ type: 'api-request-blob', hash: 'h' + Date.now(),
     message: { role: 'user', content: [{ type: 'text', text: '<system-reminder>ctx</system-reminder>' }] } }) + '\\n');
   const failing = fs.existsSync(${JSON.stringify(down)});
-  setTimeout(() => {
+  // A slow turn leaves time to stop it.
+  const turnMs = fs.existsSync(${JSON.stringify(slowTurn)}) ? 8000 : 300;
+  running = setTimeout(() => {
+    running = undefined;
     if (failing) {
       put({ type: 'assistant', isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 503,
         message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence',
@@ -103,9 +123,9 @@ process.stdin.on('data', chunk => {
       put({ type: 'assistant', message: { id: 'm' + Date.now(), role: 'assistant', model: 'claude-test', stop_reason: 'end_turn',
         content: [{ type: 'text', text: 'done: ' + prompt.split('\\n')[0] }] } });
     }
-    put({ type: 'system', subtype: 'turn_duration', durationMs: 300 });
+    put({ type: 'system', subtype: 'turn_duration', durationMs: turnMs });
     process.stdout.write('\\r\\n❯ ');
-  }, 300);
+  }, turnMs);
 });
 });
 `);
@@ -140,9 +160,13 @@ process.stdin.on('data', chunk => {
     .filter(entry => 'prompt' in entry).map(entry => entry.prompt as string);
   const launches = () => readFileSync(prompts, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
     .filter(entry => 'launch' in entry).length;
-  const sigints = () => readFileSync(prompts, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
-    .filter(entry => 'sigint' in entry).length;
-  return { messages, logs, rows, received, launches, sigints, slowResume: () => writeFileSync(slowResume, ''),
+  const events = () => readFileSync(prompts, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const sigints = () => events().filter(entry => 'sigint' in entry).length;
+  /** What the fake CLI saw, in order: prompts and interrupts. */
+  const timeline = () => events().filter(entry => 'prompt' in entry || 'interrupt' in entry)
+    .map(entry => ('prompt' in entry ? flat(entry.prompt as string) : '<interrupt>'));
+  return { messages, logs, rows, received, launches, sigints, timeline,
+    slowResume: () => writeFileSync(slowResume, ''), slowTurns: () => writeFileSync(slowTurn, ''),
     providerUp: () => { if (existsSync(down)) unlinkSync(down); } };
 }
 
@@ -170,7 +194,10 @@ async function send(w: Worker, turnId: string, content: string, failed: FailedTu
   return { terminal, record, failedTurnRewind };
 }
 
-const userTurns = (w: Worker) => w.rows().filter(row => row.type === 'user').map(row => String(row.message.content));
+const userTurns = (w: Worker) => w.rows().filter(row => row.type === 'user').map(row => (
+  typeof row.message.content === 'string'
+    ? row.message.content
+    : (row.message.content as Array<{ text?: string }>).map(block => block.text ?? '').join('')));
 const apiErrors = (w: Worker) => w.rows().filter(row => row.isApiErrorMessage === true).length;
 const REFRESH = /<botmux_skills_refresh>[\s\S]*?<\/botmux_skills_refresh>/g;
 /** Whitespace-insensitive, without the skill catalog refresh the worker
@@ -239,33 +266,50 @@ describe('a turn that failed without output is cut before the next input (real w
     expect(w.launches()).toBe(1);
     expect(second.terminal.status).toBe('failed');
   }, 120_000);
-  it('a stop pressed while the CLI restarts for the cut keeps the message from running; the next input brings the failed one back', async () => {
+  it('a stop pressed while the CLI restarts for the cut: before the cut nothing runs; after it, the failed input still reaches the conversation', async () => {
+    // Before the cut: the message never runs and the failed turn stays.
+    {
+      const w = startWorker();
+      const first = await send(w, 'board:app:hint-1', HINT, undefined);
+      w.slowResume();
+      const failedTurnRewind = planFailedTurnRewind({ record: first.record, turnId: 'trg_1', content: '继续', mode: 'merge' });
+      // Stop right as the message arrives, before the old CLI's exit is proven.
+      child!.send({ type: 'message', content: '继续', turnId: 'trg_1', failedTurnRewind } satisfies DaemonToWorker);
+      child!.send({ type: 'term_action', key: 'ctrlc' } satisfies DaemonToWorker);
+      await waitUntil(() => !!terminalOf(w, 'trg_1'), w.logs, 60_000);
+      expect(terminalOf(w, 'trg_1')).toMatchObject({ status: 'cancelled', errorCode: 'stopped_before_start' });
+      expect(w.messages).toContainEqual(expect.objectContaining({ type: 'failed_turn_rewind', turnId: 'trg_1', outcome: 'declined' }));
+      expect(w.received().map(flat)).toEqual([flat(HINT)]);
+      expect(userTurns(w).map(flat)).toEqual(['hi', flat(HINT)]);
+      expect(w.sigints()).toBe(0);
+      if (child && child.exitCode === null) {
+        const stopped = new Promise<void>(done => child!.once('exit', () => done()));
+        child.kill('SIGKILL');
+        await stopped;
+      }
+      rmSync(root!, { recursive: true, force: true });
+    }
+
+    // After the cut, with the next input already queued behind it: the
+    // message goes in carrying the failed input and is interrupted once the
+    // CLI recorded it; the queued input runs after it. The failed input is
+    // never lost from the conversation.
     const w = startWorker();
     const first = await send(w, 'board:app:hint-1', HINT, undefined);
-    expect(first.terminal).toMatchObject({ status: 'failed', directFailure: true });
     w.slowResume();
     const failedTurnRewind = planFailedTurnRewind({ record: first.record, turnId: 'trg_1', content: '继续', mode: 'merge' });
     child!.send({ type: 'message', content: '继续', turnId: 'trg_1', failedTurnRewind } satisfies DaemonToWorker);
-    // Stop once the cut has landed, while the resumed CLI is still starting.
     await waitUntil(() => userTurns(w).length === 1, w.logs);
-    child!.send({ type: 'term_action', key: 'ctrlc' } satisfies DaemonToWorker);
-    await waitUntil(() => !!terminalOf(w, 'trg_1'), w.logs, 60_000);
-    expect(terminalOf(w, 'trg_1')).toMatchObject({ status: 'cancelled', errorCode: 'stopped_before_start' });
-    expect(w.messages).toContainEqual(expect.objectContaining({ type: 'failed_turn_rewind', turnId: 'trg_1', outcome: 'declined', cut: true }));
-    expect(w.messages.some(msg => msg.type === 'failed_turn_rewind' && msg.outcome === 'rewound')).toBe(false);
-    // The CLI never got that message, and the stop did not reach a running turn.
-    expect(w.received().map(flat)).toEqual([flat(HINT)]);
-    expect(w.sigints()).toBe(0);
-
-    // The daemon kept its record and marked it cut: the next input carries
-    // the failed input back without another cut.
+    // The daemon sends the next input plainly while the first is in flight.
+    child!.send({ type: 'message', content: '还在吗', turnId: 'trg_2' } satisfies DaemonToWorker);
+    w.slowTurns();
     w.providerUp();
-    const record = { ...first.record!, cutFromTranscript: true as const };
-    const next = await send(w, 'trg_2', '还在吗', record);
-    expect(next.failedTurnRewind).toMatchObject({ detached: true });
-    expect(next.terminal).toMatchObject({ status: 'completed' });
-    expect(w.received().map(flat)).toEqual([flat(HINT), flat(`${HINT}\n\n还在吗`)]);
-    expect(userTurns(w).map(flat)).toEqual(['hi', flat(`${HINT}\n\n还在吗`)]);
+    child!.send({ type: 'term_action', key: 'ctrlc' } satisfies DaemonToWorker);
+    await waitUntil(() => !!terminalOf(w, 'trg_2'), w.logs, 90_000);
+    expect(w.messages).toContainEqual(expect.objectContaining({ type: 'failed_turn_rewind', turnId: 'trg_1', outcome: 'rewound' }));
+    expect(w.timeline()).toEqual([flat(HINT), flat(`${HINT}\n\n继续`), '<interrupt>', '还在吗']);
+    expect(userTurns(w).map(flat)).toEqual(['hi', flat(`${HINT}\n\n继续`), '[Request interrupted by user]', '还在吗']);
+    expect(terminalOf(w, 'trg_2')).toMatchObject({ status: 'completed' });
     expect(apiErrors(w)).toBe(0);
-  }, 150_000);
+  }, 240_000);
 });
