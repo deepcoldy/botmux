@@ -170,6 +170,46 @@ console.log('daemon pid=' + process.pid);
     }
   });
 
+  it('resumes a persisted daemon retirement after its config was removed during downtime', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const distDir = fakeDist(root, `
+process.on('SIGTERM', () => {});
+setInterval(() => {}, 1000);
+console.log('daemon pid=' + process.pid);
+`);
+    const orphan = await spawnReadyOrphan([join(distDir, 'index-daemon.js')]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 999_999, supervisorStartedAt: 'prior',
+      procs: [{ name: 'botmux-removed', appId: 'cli_a', pid: orphan.pid!, generation: 1,
+        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: readDurableProcessIdentity(orphan.pid!) }],
+    }));
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
+    try {
+      sup.start([]);
+      expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
+      expect(await waitFor(() => (readFleetState(statePath)?.procs.length ?? 0) === 0)).toBe(true);
+    } finally { await sup.stopAll(); }
+  });
+
+  it('does not signal a removed non-daemon member while resuming persisted retirement', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const orphan = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 999_999, supervisorStartedAt: 'prior',
+      procs: [{ name: 'botmux-plugin-removed', appId: '', pid: orphan.pid!, generation: 1,
+        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: readDurableProcessIdentity(orphan.pid!) }],
+    }));
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
+    try {
+      sup.start([]);
+      await delay(150);
+      expect(pidAlive(orphan.pid!)).toBe(true);
+      expect(readFleetState(statePath)!.procs).toMatchObject([{ name: 'botmux-plugin-removed', status: 'launching', pid: orphan.pid }]);
+    } finally { await sup.stopAll(); }
+  });
+
   it('reclaims every live alias after a hard supervisor death and rename', async () => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const distDir = fakeDist(root, STAY);
@@ -222,9 +262,12 @@ console.log('daemon pid=' + process.pid);
       expect(readFleetState(statePath)!.procs.filter(p => p.appId === 'cli_a' && p.pid > 1))
         .toMatchObject([{ name: 'botmux-old-1', pid: unknown.pid, status: 'launching' }]);
       expect(readFleetState(statePath)!.procs.find(p => p.appId === 'cli_b')?.status).toBe('online');
-      await expect(sup.drainCommands([{ id: 'stop', op: 'stop-bot', name: 'botmux-renamed', appId: 'cli_a', botIndex: 0, at: 'T' }]))
-        .rejects.toThrow();
+      await sup.drainCommands([
+        { id: 'stop-a', op: 'stop-bot', name: 'botmux-renamed', appId: 'cli_a', botIndex: 0, at: 'T' },
+        { id: 'stop-b', op: 'stop-bot', name: bots[1].name, appId: 'cli_b', botIndex: 1, at: 'T' },
+      ]);
       expect(pidAlive(unknown.pid!)).toBe(true);
+      expect(readFleetState(statePath)!.procs.find(p => p.appId === 'cli_b')).toMatchObject({ status: 'stopped', pid: 0 });
     } finally { await sup.stopAll(); }
     expect(readFleetState(statePath)!.procs.find(p => p.pid === unknown.pid)?.status).toBe('launching');
   });

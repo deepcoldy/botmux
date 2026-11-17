@@ -224,11 +224,16 @@ export class FleetSupervisor {
     // live procs are reclaimed. (Relying on pid-inequality would miss the corner
     // where the OS recycles the dead supervisor's pid onto the new one.)
     for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
-      const spec = this.specForProc(p);
+      const configured = this.specForProc(p);
+      // A bot removed while its supervisor was down still needs its persisted
+      // retirement finished. With no configured member, allow only a fresh
+      // built-in daemon command match; never infer plugin/dashboard ownership.
+      const retireOnly = !configured && p.status === 'launching' && p.pid > 1;
+      const spec = configured ?? (retireOnly ? { name: p.name, appId: p.appId, botIndex: -1 } : undefined);
       if (spec && (p.status === 'online' || (p.status === 'launching' && p.pid > 1)) && !this.children.has(p.name)) {
         // Include every alias of a configured App ID, not only its chosen name.
         // stopUnowned records failures; preserve the row and continue with peers.
-        void this.stopUnowned(p, spec).catch(() => {});
+        void this.stopUnowned(p, spec, retireOnly).catch(() => {});
       }
     }
     mutateFleetState(this.opts.statePath, (cur) => {
@@ -266,10 +271,10 @@ export class FleetSupervisor {
       || this.knownSpecs.get(proc.name);
   }
 
-  private stopUnowned(proc: FleetProcState, spec: FleetBotSpec): Promise<void> {
+  private stopUnowned(proc: FleetProcState, spec: FleetBotSpec, retireOnly = false): Promise<void> {
     const pending = this.orphanStops.get(proc.name);
     if (pending) return pending;
-    const stop = this.retireUnowned(proc, spec).catch(error => {
+    const stop = this.retireUnowned(proc, spec, retireOnly).catch(error => {
       this.log(`${error.message}; leaving this member untouched`);
       throw error;
     }).finally(() => this.orphanStops.delete(proc.name));
@@ -277,7 +282,7 @@ export class FleetSupervisor {
     return stop;
   }
 
-  private async retireUnowned(proc: FleetProcState, spec: FleetBotSpec): Promise<void> {
+  private async retireUnowned(proc: FleetProcState, spec: FleetBotSpec, retireOnly: boolean): Promise<void> {
     const runtime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     // This PID is still addressable, but it is not an owned, healthy daemon.
     // Keep that distinction durable across a second supervisor crash.
@@ -291,8 +296,11 @@ export class FleetSupervisor {
       command => expected
         ? command.includes(expected.command) && (expected.args ?? []).every(arg => command.includes(arg))
         : builtinFleetEntryMatches(spec.entry === 'dashboard' ? 'dashboard' : 'daemon', command),
-      runtime, /* verifyPersistedCommand */ false);
+      runtime, /* removed members must re-prove their daemon command */ retireOnly);
     if (inspection.status === 'unverifiable') throw new Error(`cannot verify unowned ${proc.name} (pid ${proc.pid})`);
+    if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)) {
+      throw new Error(`cannot prove removed ${proc.name} (pid ${proc.pid}) is a botmux daemon`);
+    }
     if (inspection.status === 'exact') {
       const target = inspection.attestation;
       signalAttestedFleetProcess(target, 'SIGTERM', runtime);
@@ -483,7 +491,11 @@ export class FleetSupervisor {
       const known = this.knownSpecs.get(cmd.name);
       const spec: FleetBotSpec = known?.appId === cmd.appId ? known : { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
       if (cmd.op === 'start-bot') {
-        this.startOneBot(spec);
+        try {
+          this.startOneBot(spec);
+        } catch (error) {
+          this.log(`start-bot ${spec.name} failed: ${error instanceof Error ? error.message : error}`);
+        }
       } else {
         // A renamed bot may still run under its previous handle. Include all
         // aliases so an operator can also retire duplicates from older builds.
@@ -491,7 +503,16 @@ export class FleetSupervisor {
           ? [...(readFleetState(this.opts.statePath)?.procs ?? []), ...this.knownSpecs.values()]
             .filter(p => p.appId === spec.appId).map(p => p.name)
           : [cmd.name];
-        for (const name of new Set(aliases)) await this.stopOneBot(name);
+        for (const name of new Set(aliases)) {
+          try {
+            await this.stopOneBot(name);
+          } catch (error) {
+            // The durable row remains launching/online, so the CLI keeps waiting
+            // instead of seeing a false stop. Do not reject the SIGHUP drain or
+            // skip unrelated commands queued behind this failed alias.
+            this.log(`stop-bot ${name} failed: ${error instanceof Error ? error.message : error}`);
+          }
+        }
       }
     }
   }
