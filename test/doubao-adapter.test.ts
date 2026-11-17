@@ -1,17 +1,19 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   DOUBAO_BUSY_FOOTER,
   DOUBAO_READY_PATTERN,
   createDoubaoAdapter,
+  doubaoContentWithCaptureId,
   doubaoDataRoot,
   doubaoSessionExists,
   doubaoSessionMarkerFromContent,
   doubaoSessionRoots,
-  findDoubaoSessionForSubmit,
+  findDoubaoSessionForSubmit as findDoubaoSessionForSubmitContent,
   parseDoubaoAvailableModels,
   pollDoubaoSessionForSubmit,
   DOUBAO_SUBMIT_CAPTURE_BUDGET_MS,
@@ -24,6 +26,7 @@ const OTHER_SID = '38450174181084930';
 
 const tempDirs: string[] = [];
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -36,12 +39,52 @@ function makeSessionsRoot(): string {
   return root;
 }
 
+function makeSessionsRootFromEnv(): string {
+  const home = mkdtempSync(join(tmpdir(), 'doubao-home-'));
+  tempDirs.push(home);
+  vi.stubEnv('HOME', home);
+  vi.stubEnv('XDG_DATA_HOME', join(home, '.local', 'share'));
+  vi.stubEnv('LOCALAPPDATA', join(home, 'AppData', 'Local'));
+  const dataRoot = doubaoDataRoot(process.env, process.platform)!;
+  const root = join(dataRoot, 'agent_mode', '100', 'workspace', '.sessions');
+  mkdirSync(root, { recursive: true });
+  return root;
+}
+
+function correlateForTest(content: string): string {
+  if (/^botmux_input_id: [0-9a-f]{32}[\t ]*\r?$/m.test(content)) return content;
+  const marker = doubaoSessionMarkerFromContent(content);
+  if (!marker) return content;
+  const captureId = createHash('sha256').update(marker).digest('hex').slice(0, 32);
+  return doubaoContentWithCaptureId(content, captureId);
+}
+
+function findDoubaoSessionForSubmit(
+  content: string,
+  sinceMs: number,
+  roots?: readonly string[],
+  windowBytes?: number,
+): string | undefined {
+  return findDoubaoSessionForSubmitContent(correlateForTest(content), sinceMs, roots, windowBytes);
+}
+
 /** Write an assignment.md the way doubao 2.31 appends a TUI turn. */
 function writeAssignment(root: string, sid: string, prompt: string, mtimeMs = Date.now()): string {
+  prompt = correlateForTest(prompt);
   const dir = join(root, sid, 'agents', 'm_test', 'system');
   mkdirSync(dir, { recursive: true });
   const file = join(dir, 'assignment.md');
   writeFileSync(file, `# Assignment\n- Role: main\n\n## [2026-11-02T03:51:28Z] 需求\n${prompt}\n`);
+  utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
+  return file;
+}
+
+function appendAssignment(root: string, sid: string, prompt: string, mtimeMs = Date.now()): string {
+  prompt = correlateForTest(prompt);
+  const dir = join(root, sid, 'agents', 'm_test', 'system');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, 'assignment.md');
+  appendFileSync(file, `## [2026-11-02T03:52:28Z] 需求\n${prompt}\n`);
   utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
   return file;
 }
@@ -174,6 +217,15 @@ describe('doubao session capture', () => {
     expect(doubaoSessionMarkerFromContent('plain prompt without envelope')).toBeUndefined();
   });
 
+  it('adds a capture id only to enveloped submissions', () => {
+    const captureId = 'a'.repeat(32);
+    expect(doubaoContentWithCaptureId('plain zero-injection input', captureId)).toBe('plain zero-injection input');
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
+    const correlated = doubaoContentWithCaptureId(envelope, captureId);
+    expect(doubaoSessionMarkerFromContent(correlated)).toBe('bmx-first');
+    expect(correlated).toBe(`${envelope}\n\n<botmux_routing>\nbotmux_input_id: ${captureId}\n</botmux_routing>`);
+  });
+
   it.each([
     '<user_message>please explain "<session_id>bmx-first</session_id>"</user_message>',
     '<user_message>\n<session_id>bmx-first</session_id>\n</user_message>',
@@ -205,12 +257,40 @@ describe('doubao session capture', () => {
     expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBe(SID);
   });
 
-  it('does not establish initial ownership from a later assignment turn', () => {
+  it('captures a correlated submission in a later assignment turn', () => {
     const root = makeSessionsRoot();
     const since = Date.now() - 1000;
     const envelope = '<session_id>bmx-first</session_id>\n<user_message>request</user_message>';
     writeAssignment(root, OTHER_SID, `desktop request\n## [2026-11-16] 需求\n${envelope}`, since + 100);
-    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBeUndefined();
+    // Launch-scoped correlation, unlike initial-head ownership, also covers
+    // delayed recovery on a native assignment that already has earlier turns.
+    expect(findDoubaoSessionForSubmit(envelope, since, [root])).toBe(OTHER_SID);
+  });
+
+  it('retains the largest launch read window for delayed recovery', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const captureId = 'c'.repeat(32);
+    const first = doubaoContentWithCaptureId(
+      `<botmux_routing>${'x'.repeat(9000)}</botmux_routing>\n<session_id>bmx-first</session_id>\n<user_message>first</user_message>`,
+      captureId,
+    );
+    writeAssignment(root, SID, first, since + 100);
+    const laterInput = doubaoContentWithCaptureId('<session_id>bmx-first</session_id>\n<user_message>short</user_message>', captureId);
+    const launchWindow = Buffer.byteLength(first, 'utf-8') * 2 + 4096;
+
+    expect(findDoubaoSessionForSubmitContent(laterInput, since, [root], launchWindow)).toBe(SID);
+  });
+
+  it('recovers an earlier delayed turn using the same launch capture id', () => {
+    const root = makeSessionsRoot();
+    const since = Date.now() - 1000;
+    const captureId = 'b'.repeat(32);
+    const first = doubaoContentWithCaptureId('<session_id>bmx-first</session_id>\n<user_message>first</user_message>', captureId);
+    writeAssignment(root, SID, first, since + 100);
+    const laterInput = doubaoContentWithCaptureId('<session_id>bmx-first</session_id>\n<user_message>second</user_message>', captureId);
+
+    expect(findDoubaoSessionForSubmitContent(laterInput, since, [root])).toBe(SID);
   });
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
@@ -453,6 +533,126 @@ describe('doubao submit capture polling', () => {
 });
 
 describe('doubao writeInput', () => {
+  it.each([false, true])('does not capture an unchanged generation for an identical replay (predicted reattach=%s)', async (reattach) => {
+    const root = makeSessionsRootFromEnv();
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>retry</user_message>\n</botmux_skills_refresh>';
+    writeAssignment(root, SID, envelope);
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    adapter.buildArgs({ sessionId: 'bmx-first', resume: false, reattach });
+    const pty = fakeTmuxPty();
+
+    const landed = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        writeAssignment(root, OTHER_SID, pty.log[0]!.slice('paste:'.length));
+        resolve();
+      }, 500);
+    });
+    const result = await adapter.writeInput(pty, envelope);
+    await landed;
+    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+  });
+
+  it('rotates the capture id when another CLI generation starts', async () => {
+    const root = makeSessionsRootFromEnv();
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>identical replay</user_message>';
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    const captureIds: string[] = [];
+
+    for (const sid of [SID, OTHER_SID]) {
+      adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
+      const pty = fakeTmuxPty();
+      const landed = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          writeAssignment(root, sid, pty.log[0]!.slice('paste:'.length));
+          resolve();
+        }, 500);
+      });
+      expect(await adapter.writeInput(pty, envelope)).toEqual({ submitted: true, cliSessionId: sid });
+      await landed;
+      captureIds.push(/^botmux_input_id: ([0-9a-f]{32})$/m.exec(pty.log[0]!)?.[1]!);
+    }
+    expect(captureIds[0]).not.toBe(captureIds[1]);
+  });
+
+
+  it('keeps the replacement launch armed when an older poll finishes', async () => {
+    const root = makeSessionsRootFromEnv();
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>identical replay</user_message>';
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
+    const ptyA = fakeTmuxPty();
+    const landedA = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        writeAssignment(root, SID, ptyA.log[0]!.slice('paste:'.length));
+        resolve();
+      }, 500);
+    });
+    const resultA = adapter.writeInput(ptyA, envelope);
+    // Replace the launch while A is still awaiting its assignment/poll.
+    adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
+    expect(await resultA).toEqual({ submitted: true, cliSessionId: SID });
+    await landedA;
+
+    const ptyB = fakeTmuxPty();
+    const landedB = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        writeAssignment(root, OTHER_SID, ptyB.log[0]!.slice('paste:'.length));
+        resolve();
+      }, 500);
+    });
+    expect(await adapter.writeInput(ptyB, envelope)).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+    await landedB;
+    const idOf = (log: string[]) => /^botmux_input_id: ([0-9a-f]{32})$/m.exec(log[0]!)?.[1];
+    expect(idOf(ptyB.log)).toBeDefined();
+    expect(idOf(ptyB.log)).not.toBe(idOf(ptyA.log));
+  });
+
+  it('rejects a delayed old-generation append seen before the current assignment', async () => {
+    const root = makeSessionsRootFromEnv();
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>identical replay</user_message>';
+    writeAssignment(root, SID, 'old history');
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
+    const pty = fakeTmuxPty();
+    const oldLanded = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        appendAssignment(root, SID, envelope);
+        resolve();
+      }, 400);
+    });
+    const currentLanded = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        writeAssignment(root, OTHER_SID, pty.log[0]!.slice('paste:'.length));
+        resolve();
+      }, 700);
+    });
+
+    const result = await adapter.writeInput(pty, envelope);
+    await Promise.all([oldLanded, currentLanded]);
+    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+  });
+
+  it('captures an appended reattach turn without reviving an unchanged generation', async () => {
+    const root = makeSessionsRootFromEnv();
+    const stale = '<session_id>bmx-first</session_id>\n<user_message>first attempt</user_message>';
+    const current = '<session_id>bmx-first</session_id>\n<user_message>different retry</user_message>';
+    writeAssignment(root, SID, stale);
+    writeAssignment(root, OTHER_SID, 'desktop history without an ownership marker');
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    adapter.buildArgs({ sessionId: 'bmx-first', resume: false, reattach: true });
+    const pty = fakeTmuxPty();
+
+    const landed = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        appendAssignment(root, OTHER_SID, pty.log[0]!.slice('paste:'.length));
+        resolve();
+      }, 500);
+    });
+    const result = await adapter.writeInput(pty, current);
+    await landed;
+    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+  });
+
   it('pastes the whole prompt once and submits with a single Enter', async () => {
     const adapter = createDoubaoAdapter('/bin/doubao');
     // A precise resume disarms id capture, so writeInput returns right after Enter.

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { closeSync, openSync, readdirSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -113,9 +114,28 @@ export function doubaoSessionMarkerFromContent(content: string): string | undefi
   return match?.[1]?.trim() || undefined;
 }
 
-/** Minimum prefix read for short envelopes. Long routing / identity blocks
- *  expand this window from the submitted prefix, without reading the entire
- *  user payload or resumed assignment history. */
+const DOUBAO_INPUT_ID_RE = /^botmux_input_id: ([0-9a-f]{32})[\t ]*\r?$/gm;
+
+function doubaoInputIdFromContent(content: string): string | undefined {
+  // The adapter appends its id after the original envelope, so the last id is
+  // authoritative even if the user payload already contained an example.
+  return [...content.matchAll(DOUBAO_INPUT_ID_RE)].at(-1)?.[1];
+}
+
+/** Correlate every submit from one adapter launch generation without changing
+ *  envelope-less (zero-injection) input. The id is reused across inputs until
+ *  capture succeeds, so a later input can still recover an earlier assignment. */
+export function doubaoContentWithCaptureId(content: string, captureId: string): string {
+  if (!doubaoSessionMarkerFromContent(content)) return content;
+  return `${content}\n\n<botmux_routing>\nbotmux_input_id: ${captureId}\n</botmux_routing>`;
+}
+
+function hasDoubaoInputId(content: string, captureId: string): boolean {
+  return new RegExp(`^botmux_input_id: ${captureId}[\\t ]*\\r?$`, 'm').test(content);
+}
+
+/** Minimum initial-turn read for short envelopes. The full correlated
+ *  submission expands this window without scanning resumed assignment history. */
 const SESSION_MARKER_HEAD_BYTES = 8192;
 
 function readHead(path: string, maxBytes: number, size: number): string {
@@ -182,8 +202,9 @@ function forEachDoubaoAssignment(
  * Two tiers, because concurrent cold starts in one account can submit prompts
  * whose last-line fingerprints are byte-identical (a fixed routing suffix):
  *   1. When the prompt envelope embeds `<session_id>{botmux id}</session_id>`,
- *      match that unique marker at the assignment HEAD — it identifies the
- *      owning botmux session even when fingerprints collide.
+ *      the adapter also appends a fresh `botmux_input_id` for this launch
+ *      generation. Match that id at the assignment HEAD or in the latest turn;
+ *      unlike a session marker or payload, it cannot name an older generation.
  *   2. A zero-injection submit carries no envelope, so fall back to the legacy
  *      tail fingerprint.
  * Either way, ambiguity (not exactly one match) yields undefined rather than a
@@ -193,28 +214,30 @@ export function findDoubaoSessionForSubmit(
   content: string,
   sinceMs: number,
   roots: readonly string[] = doubaoSessionRoots(),
+  windowBytes?: number,
 ): string | undefined {
   const marker = doubaoSessionMarkerFromContent(content);
+  const window = Math.max(Buffer.byteLength(content, 'utf-8') * 2 + 4096, windowBytes ?? 0);
   if (marker) {
-    const markerLine = SESSION_ID_MARKER_RE.exec(content)!;
-    const prefixBytes = Buffer.byteLength(
-      content.slice(0, markerLine.index + markerLine[0].length),
-      'utf-8',
-    );
-    // Match the bounded-read allowance used by the tail path: leave room for
-    // assignment headings and native formatting before the submitted marker.
-    const headBytes = Math.max(SESSION_MARKER_HEAD_BYTES, prefixBytes * 2 + 4096);
+    const captureId = doubaoInputIdFromContent(content);
+    // Marker-only text is not generation evidence. The adapter must correlate
+    // its submissions; an old assignment can share both marker and payload.
+    if (!captureId) return undefined;
+    const headBytes = Math.max(SESSION_MARKER_HEAD_BYTES, window);
     const matches = new Set<string>();
     const complete = forEachDoubaoAssignment(roots, sinceMs, (sid, assignment, st) => {
-      // A sibling's user payload may quote this marker. Only its first marker
-      // identifies the owner of the assignment's initial envelope.
-      if (doubaoSessionMarkerFromContent(readHead(assignment, headBytes, st.size)) === marker) matches.add(sid);
+      // The per-launch id is the ownership proof, so it may appear in a later
+      // turn too. Check both the initial-turn window and the latest appended
+      // window; no file-growth or predicted-reattach assumption is involved.
+      if (hasDoubaoInputId(readHead(assignment, headBytes, st.size), captureId)
+        || hasDoubaoInputId(readTail(assignment, window, st.size), captureId)) {
+        matches.add(sid);
+      }
     });
     return complete && matches.size === 1 ? [...matches][0] : undefined;
   }
   const fingerprint = doubaoSubmitFingerprint(content);
   if (!fingerprint) return undefined;
-  const window = Buffer.byteLength(content, 'utf-8') * 2 + 4096;
   const matches = new Set<string>();
   const complete = forEachDoubaoAssignment(roots, sinceMs, (sid, assignment, st) => {
     if (readTail(assignment, window, st.size).includes(fingerprint)) matches.add(sid);
@@ -316,7 +339,9 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'doubao';
   let cachedBin: string | undefined;
   // A fresh spawn learns its native id from the first submit that lands.
-  let capturePending = false;
+  // Each launch owns an immutable identity; per-input state lives on this
+  // object so an old poll can never clear a replacement launch's capture.
+  let captureState: { id: string; sinceMs?: number; windowBytes: number } | undefined;
   return {
     id: 'doubao',
     bridgeSpec: doubaoBridgeSpec,
@@ -332,7 +357,14 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ resume, resumeSessionId, model, reasoningEffort, disableCliBypass }) {
       const preciseResume = resume && !!resumeSessionId && DOUBAO_SESSION_ID.test(resumeSessionId);
-      capturePending = !preciseResume;
+      // Replace the whole capture object for every launch, including a
+      // predicted reattach that a backend later turns into a fresh spawn.
+      // Inputs from one launch share the id so delayed turns remain recoverable.
+      captureState = preciseResume ? undefined : {
+        id: randomBytes(16).toString('hex'),
+        sinceMs: undefined,
+        windowBytes: 0,
+      };
       const args: string[] = [];
       // `always_allow` = act without per-tool approval (the TUI's dialog is not
       // reachable from Lark). `--dangerously-bypass-approvals-and-sandbox` would
@@ -360,30 +392,47 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      const launchCapture = captureState;
+      const submittedContent = launchCapture
+        ? doubaoContentWithCaptureId(content, launchCapture.id)
+        : content;
       const startedAt = Date.now();
+      if (launchCapture) {
+        // A later input must still be able to recover an earlier, longer turn
+        // from this same launch generation.
+        launchCapture.sinceMs ??= startedAt - 2000;
+        launchCapture.windowBytes = Math.max(launchCapture.windowBytes, Buffer.byteLength(submittedContent, 'utf-8') * 2 + 4096);
+      }
       // Bracketed paste: the composer inserts the whole multi-line envelope as
       // content (large pastes collapse to `[Pasted text #n +N lines]` and are
       // expanded verbatim on submit); only the following Enter submits.
       // Per-line send-keys would turn each embedded newline into Enter.
       if (pty.pasteText && pty.sendSpecialKeys) {
-        pty.pasteText(content);
+        pty.pasteText(submittedContent);
         await delay(300);
         if (pty.sendSpecialKeys('Enter') === false) return { submitted: false };
       } else {
-        if (pty.write(wrapBracketedPaste(content)) === false) return { submitted: false };
+        if (pty.write(wrapBracketedPaste(submittedContent)) === false) return { submitted: false };
         await delay(1000);
         if (pty.write('\r') === false) return { submitted: false };
       }
-      if (!capturePending) return;
+      if (!launchCapture) return;
       // assignment.md is appended once doubao accepts the turn (later on a cold
       // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A miss stays armed
       // for the next input instead of costing the session its resume id, and is
       // reported as "unverified" (void) — never as a failed submit.
       const sid = await pollDoubaoSessionForSubmit(
-        () => findDoubaoSessionForSubmit(content, startedAt - 2000),
+        () => findDoubaoSessionForSubmit(
+          submittedContent,
+          launchCapture.sinceMs ?? startedAt - 2000,
+          undefined,
+          launchCapture.windowBytes,
+        ),
       );
       if (sid) {
-        capturePending = false;
+        // A stale write may still return its own SID for the worker's
+        // generation fence, but it must not disarm the replacement launch.
+        if (captureState === launchCapture) captureState = undefined;
         return { submitted: true, cliSessionId: sid };
       }
     },
