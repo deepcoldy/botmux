@@ -881,7 +881,14 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
     } } as any);
     const publish = (reason: string) => vi.spyOn(cliIdentity, 'recallProvenIdentityContent')
       .mockReturnValue(`BOTMUX_IDENTITY_MODE='denied'\n[reason=${reason}]`);
+    // The attended request starts a login (startBytedcliLogin); refusals that
+    // only want a link go through beginBytedcliLogin. Neither may run here.
     let device: ReturnType<typeof vi.spyOn>;
+    let deviceLink: ReturnType<typeof vi.spyOn>;
+    const expectNoDeviceLogin = () => {
+      expect(device).not.toHaveBeenCalled();
+      expect(deviceLink).not.toHaveBeenCalled();
+    };
     let platformRequest: ReturnType<typeof vi.spyOn>;
     beforeEach(() => {
       __resetPlatformAuthorizationRequestForTest();
@@ -891,7 +898,9 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       });
       platformRequest = vi.spyOn(credentialRequestClient, 'requestCredentialAuthorization')
         .mockResolvedValue({ ok: true, status: 'sent', requestId: 'cr_1', deduped: false });
-      device = vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: DEVICE } as any);
+      device = vi.spyOn(bytedcliAuth, 'startBytedcliLogin')
+        .mockResolvedValue({ state: 'challenge', challenge: { authUrl: DEVICE, completeToken: 'tok-b' } });
+      deviceLink = vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: DEVICE, completeToken: 'tok-b' });
       vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
     });
     afterEach(() => __setPlatformCredentialDepsForTest(null));
@@ -908,7 +917,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(platformRequest.mock.calls[0][0]).toEqual({ unionId: 'on_sender', appId: 'cli_test', tools: ['bytedcli'] });
       expect(dm).not.toHaveBeenCalled();
       expect(ephemeral).not.toHaveBeenCalled();
-      expect(device).not.toHaveBeenCalled();
+      expectNoDeviceLogin();
       expect(replies).toHaveLength(1);
       expect(replies[0]).not.toMatch(/https?:/);
       // Burst of retries: the platform is not asked again.
@@ -925,7 +934,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(body).toMatchObject({ ok: true, status: 'ready' });
       expect(dm).not.toHaveBeenCalled();
       expect(platformRequest).not.toHaveBeenCalled();
-      expect(device).not.toHaveBeenCalled();
+      expectNoDeviceLogin();
     });
 
     it('the platform says nothing is missing: the turn re-asks for the grant at once and the agent is told to retry', async () => {
@@ -986,7 +995,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       const body = await (await ask({ provider: 'bytedcli' })).json();
       expect(body).toMatchObject({ ok: true, status: 'unavailable' });
       expect(dm).not.toHaveBeenCalled();
-      expect(device).not.toHaveBeenCalled();
+      expectNoDeviceLogin();
     });
 
     it('a platform without the endpoint (404): the plain credentials page is DMed with the Meego link, as before', async () => {
@@ -1000,7 +1009,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(dm).toHaveBeenCalledTimes(1);
       expect(dm.mock.calls[0][2]).toContain(PAGE);
       expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
-      expect(device).not.toHaveBeenCalled();
+      expectNoDeviceLogin();
       expect(await (await ask({ provider: 'bytedcli' })).json()).toMatchObject({ status: 'pending' });
       expect(dm).toHaveBeenCalledTimes(1);
     });
@@ -1027,7 +1036,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(body).toMatchObject({ ok: false, status: 'refused', error: 'platform_denied' });
       expect(JSON.stringify(body)).not.toMatch(/https?:/);
       expect(dm).not.toHaveBeenCalled();
-      expect(device).not.toHaveBeenCalled();
+      expectNoDeviceLogin();
       expect(platformRequest).not.toHaveBeenCalled();
     });
 
@@ -1075,9 +1084,26 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
     });
   });
 
+  // bytedcli 0.186+ answers `--begin` with a login it already holds instead of
+  // a link. The wrapper's request used to come back "cannot start ByteCloud
+  // authorization" for a person who was in fact authorized.
+  it('a ByteCloud login that starting finds already in place is ready: no DM, no link, no "cannot start"', async () => {
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'unknown' });
+    const start = vi.spyOn(bytedcliAuth, 'startBytedcliLogin').mockResolvedValue({ state: 'authorized' });
+    vi.spyOn(cliIdentity, 'recallProvenIdentityContent').mockReturnValue(undefined);
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const body = await (await ask({ provider: 'bytedcli' })).json() as { message: string };
+    expect(start).toHaveBeenCalledWith('ou_sender');
+    expect(body).toMatchObject({ ok: true, provider: 'bytedcli', status: 'ready' });
+    expect(body.message).not.toContain('暂时无法发起');
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
   it('an attended ByteCloud refusal also carries the Meego link when that login is missing too: one DM', async () => {
     vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
-    vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: 'https://cloud.example/device?code=B1' } as any);
+    vi.spyOn(bytedcliAuth, 'startBytedcliLogin')
+      .mockResolvedValue({ state: 'challenge', challenge: { authUrl: 'https://cloud.example/device?code=B1', completeToken: 'tok-b' } });
     const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
     const body = await (await ask({ provider: 'bytedcli' })).json();
     expect(body).toMatchObject({ ok: true, status: 'delivered' });

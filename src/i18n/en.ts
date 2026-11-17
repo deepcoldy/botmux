@@ -738,6 +738,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_note': 'Note: this is ByteCloud, separate from the Feishu /login — you need both. The login lasts about 3 weeks.',
   'cmd.login.bytedcli_pending': '⏳ Not authorized yet. Open the link above first, then send /login bytedcli done.',
   'cmd.login.bytedcli_ok': '✅ ByteCloud authorization saved.',
+  'cmd.login.bytedcli_already': '✅ ByteCloud is already authorized; nothing to do.',
   'cmd.login.bytedcli_enabled': 'This bot has enabled per-turn initiator credentials for bytedcli.',
   'cmd.login.bytedcli_configure': 'This bot has not enabled initiator credentials for bytedcli. Ask an administrator to set triggerUserAuth.enabled to true and include bytecloud (or meego for Meego) in triggerUserAuth.capabilities. Note that capabilities replaces tools, so list every capability you want (lark-user / bytecloud / meego); the configuration takes effect in new sessions.',
   'cmd.login.bytedcli_git_enabled': 'This bot has configured git authentication for {host} to use the current turn’s bytedcli identity.',
