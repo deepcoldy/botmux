@@ -20,14 +20,16 @@ describe('optional dashboard reads', () => {
     expect(task).not.toHaveBeenCalled();
     frame(0);
     expect(task).not.toHaveBeenCalled();
-    await vi.runOnlyPendingTimersAsync();
+    // runOnlyPendingTimersAsync 不在 bun:test 兼容层里；这里每处至多一个 setTimeout(0)
+    // 待处理，advanceTimersToNextTimerAsync 两腿等价（零待处理时两者都不抛错，已实测）。
+    await vi.advanceTimersToNextTimerAsync();
     expect(task).toHaveBeenCalledOnce();
     cancel();
     const abandoned = vi.fn();
     const abort = afterNextPaint(abandoned);
     frame(0);
     abort();
-    await vi.runOnlyPendingTimersAsync();
+    await vi.advanceTimersToNextTimerAsync();
     expect(abandoned).not.toHaveBeenCalled();
   });
 
