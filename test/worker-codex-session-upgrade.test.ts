@@ -114,6 +114,7 @@ function harness() {
     // Correlated restart attempt bookkeeping (#1863).
     activeRestartAttemptId: undefined,
     pendingTopicEffortRestart: undefined,
+    pendingNativeResumeTarget: undefined,
     restartWindowLaunch: undefined,
     pendingLaunchConvergence: undefined,
     decideRestartReceipt,

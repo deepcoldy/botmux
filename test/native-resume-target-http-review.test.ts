@@ -447,24 +447,22 @@ describe('native HTTP review: intervention, partial failure and late calls', () 
   });
 
   it('expired mutation acquisition removes the waiter and cannot restart on later release', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     await blockGate();
     const pending = call();
-    // Real HTTP scheduling is not faked; allow request parsing to reach lookup.
-    for (let n = 0; n < 100 && lookup.mock.calls.length === 0; n++) {
-      await new Promise<void>(resolve => setImmediate(resolve));
-    }
-    expect(lookup).toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(10_000);
+    void pending.catch(() => {});
+    // Exercise the actual HTTP acquisition deadline with real I/O. Bun's fake
+    // timer pump does not advance native fetch socket readiness like Node's.
+    // Timer-only gate/coordinator tests separately cover fake-clock ordering.
+    await waitForLookup();
     const response = await pending;
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'native_resume_target_gate_busy' });
     releaseGate!();
     await heldGate;
-    await vi.advanceTimersByTimeAsync(60_000);
+    await new Promise(resolve => setTimeout(resolve, 50));
     expect(send).not.toHaveBeenCalled();
     expect(pool.nativeResumeTargetReadback(ds)).toBeUndefined();
-  });
+  }, 15_000);
 
   it('a timed-out Dashboard POST cannot start a late restart after its HTTP failure', async () => {
     await startDashboard();
