@@ -98,7 +98,7 @@ describe.sequential('browser connection recovery', () => {
     expect(close).toHaveBeenCalledTimes(2);
   });
 
-  it('shares one invalidation across concurrent discovery failures and keeps the rebuilt browser', async () => {
+  it('shares one invalidation promise so concurrent callers wait for the same teardown', async () => {
     const closeDefers: Array<{ resolve: () => void }> = [];
     const close = vi.fn(async () => new Promise<void>(resolve => {
       closeDefers.push({ resolve });
@@ -126,26 +126,67 @@ describe.sequential('browser connection recovery', () => {
       modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
     });
 
-    // Both calls share the same rejected init. The shared-init dedup means the
-    // teardown (and its close()) runs exactly once; the second caller no-ops.
+    // Both calls share the same rejected init and park on the one shared close.
     const first = broker.handleToolCall(call({ operation: 'list_tabs' }));
     const second = broker.handleToolCall(call({ operation: 'list_tabs' }));
     await vi.waitFor(() => expect(closeDefers.length).toBe(1));
-    expect((await second).success).toBe(false);
+    const secondSettled = vi.fn();
+    void second.then(secondSettled);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    // The shared-promise wait must not return early while close() is pending.
+    expect(secondSettled).not.toHaveBeenCalled();
 
-    // Releasing the single close lets the one shared invalidation finish.
+    // A third operation during the cleanup window joins the same wait instead
+    // of replaying the stale rejected init on its own.
+    const thirdSettled = vi.fn();
+    const third = broker.handleToolCall(call({ operation: 'list_tabs' }));
+    void third.then(thirdSettled);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(thirdSettled).not.toHaveBeenCalled();
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(1);
+
+    // Releasing the single close settles every shared waiter; the cleanup window
+    // produced no new setup, and all three operations report the failure.
     closeDefers[0]!.resolve();
     expect((await first).success).toBe(false);
+    expect((await second).success).toBe(false);
+    expect((await third).success).toBe(false);
     expect(close).toHaveBeenCalledOnce();
-    // Teardown and any later close must not park on the test-controlled defer.
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(1);
     close.mockImplementation(async () => {});
 
-    // A retry rebuilds the runtime; later calls reuse that browser instead of
-    // triggering a third setup (the stale caller's cleanup never erased it).
+    // The next operation after the shared teardown rebuilds immediately, and
+    // later calls reuse that browser without a third setup.
     expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
     expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
     expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
     expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+  });
+
+  it('serializes fire-and-forget turn-ended calls in event order', async () => {
+    const starts: number[] = [];
+    const handleTurnEnded = vi.fn(() => new Promise<void>(resolve => {
+      starts.push(Date.now());
+      setTimeout(resolve, 80);
+    }));
+    const f = fakeModules();
+    broker = new CodexBrowserBroker({
+      sessionId: 'turn-ended-tail',
+      family: 'chrome',
+      modules: { ...f.modules, handleTurnEnded },
+    });
+    // Initialize the runtime so pluginModules (and its handleTurnEnded) is wired.
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+
+    // Mirror codex-app-runner's void handleTurnEnded(...): do not await the
+    // first batch before dispatching the second notification.
+    void broker.handleTurnEnded('one').catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await broker.handleTurnEnded('two');
+
+    expect(handleTurnEnded).toHaveBeenCalledTimes(2);
+    // The second batch cannot start until the 80ms first batch fully settles.
+    expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(70);
   });
 
   it.each(['Browser is not available: 1', 'native pipe closed before response', 'Debugger unattached'])(

@@ -227,6 +227,73 @@ export async function handleRpc(){ return null; }`;
     });
     expect(alive).not.toContain(true);
   }, 20_000);
+
+  it('settles an in-flight startup RPC when close() runs before ready, without waiting for the watchdog', async () => {
+    const normal = `export async function handleRpc(){ return { pid: process.pid }; }`;
+    const root = makeRoot(normal);
+    service = new CodexBrowserNodeService(root, () => ({ requestMeta: {} }), resolveNodeExecutable()!, 60_000, 300);
+    const rpc = service.handleRpc({ method: 'probe' })
+      .then(() => 'resolved', (error: Error) => `rejected: ${error.message}`);
+    await service.close();
+    const afterClose = Date.now();
+    const outcome = await rpc;
+    const elapsed = Date.now() - afterClose;
+    // Close must settle the startup generation itself; the 300ms watchdog must
+    // not be the thing that rejects this RPC after close has already returned.
+    expect(elapsed).toBeLessThan(150);
+    expect(outcome).toMatch(/rejected/);
+    expect(outcome).not.toMatch(/startup timed out/);
+  }, 15_000);
+
+  it('makes every concurrent close() await the same child reaping', async () => {
+    const ignoreSigterm = `
+process.on('SIGTERM', () => {});
+export async function handleRpc(){ return { pid: process.pid }; }`;
+    const root = makeRoot(ignoreSigterm);
+    service = new CodexBrowserNodeService(root, () => ({ requestMeta: {} }), writeLauncher(), 60_000, 4_000, 300);
+    await service.handleRpc({ method: 'probe' });
+    const pids = readPids();
+    spawnedPids.push(...pids);
+    const pid = pids[0]!;
+
+    const first = service.close();
+    const second = service.close();
+    await second;
+    let aliveAfterSecond = true;
+    try { process.kill(pid, 0); } catch { aliveAfterSecond = false; }
+    // The second close shares the termination promise: by the time it returns,
+    // the SIGKILL reaping has completed rather than merely being scheduled.
+    expect(aliveAfterSecond).toBe(false);
+    await first;
+  }, 15_000);
+
+  it('leaves no grace or hard-cap timer after close settles', async () => {
+    const normal = `export async function handleRpc(){ return { pid: process.pid }; }`;
+    const root = makeRoot(normal);
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const active = new Set<ReturnType<typeof setTimeout>>();
+    globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: any[]) => {
+      const handle = originalSetTimeout(handler, timeout, ...args);
+      active.add(handle);
+      return handle;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+      if (handle !== undefined) active.delete(handle);
+      originalClearTimeout(handle);
+    }) as typeof clearTimeout;
+    try {
+      service = new CodexBrowserNodeService(root, () => ({ requestMeta: {} }), resolveNodeExecutable()!, 60_000, 4_000, 1_000);
+      await service.handleRpc({ method: 'probe' });
+      active.clear(); // only count timers created by the teardown
+      await service.close();
+      await new Promise(resolve => originalSetTimeout(resolve, 100));
+      expect(active.size).toBe(0);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+  }, 15_000);
 });
 
 describe('Node browser service turn-ended batch semantics', () => {

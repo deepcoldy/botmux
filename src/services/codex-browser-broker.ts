@@ -663,9 +663,11 @@ export class CodexBrowserBroker {
   private runtimeShim?: Json;
   private authenticatedFetch?: CodexBrowserAuthenticatedFetch;
   private pluginModules?: BrowserPluginModules;
-  /** The init promise whose dead-runtime teardown has already run, so concurrent
-   *  callers rejecting the same shared init perform the cleanup exactly once. */
-  private invalidatedInit?: Promise<unknown>;
+  /** The in-flight dead-runtime teardown for a rejected discovery init.
+   *  Concurrent callers failing the same init await the same promise instead
+   *  of returning early, so no caller can reuse the stale rejected init while
+   *  the shared close() is still running. */
+  private invalidation?: { init: Promise<unknown>; done: Promise<void> };
 
   constructor(private readonly opts: CodexBrowserBrokerOptions) {}
 
@@ -683,9 +685,18 @@ export class CodexBrowserBroker {
     }
   }
 
-  /** Bridge the owning app-server's terminal turn notification into the
-   * lifecycle contract expected by the bundled browser runtime. */
+  /** Serializes turn-ended work because the app-server fires these without
+   *  awaiting (void ...catch): local handlers and the Node worker batch must
+   *  run in event order even when notifications arrive back to back. */
+  private turnEndedTail: Promise<void> = Promise.resolve();
+
   async handleTurnEnded(turnId: string): Promise<void> {
+    const run = this.turnEndedTail.then(() => this.runTurnEnded(turnId));
+    this.turnEndedTail = run.catch(() => {});
+    return run;
+  }
+
+  private async runTurnEnded(turnId: string): Promise<void> {
     const event = { session_id: this.opts.sessionId, turn_id: turnId };
     const results = await Promise.allSettled([...this.turnEndedHandlers].map(handler => {
       const timeoutMs = typeof handler.timeoutMs === 'number'
@@ -754,14 +765,17 @@ export class CodexBrowserBroker {
    *  never replayed.
    *
    *  Discovery failures pass the shared `init` promise: concurrent callers that
-   *  rejected the same init then run this teardown exactly once, and a runtime
-   *  rebuilt while the close() was in flight is never erased by the stale
-   *  generation's continuation. The operation path passes no init and keeps the
-   *  original single-caller semantics. */
+   *  rejected the same init await one shared teardown, so by the time any of
+   *  them returns, `this.init` is cleared and the next operation rebuilds rather
+   *  than replaying the stale rejection. A runtime rebuilt while close() was in
+   *  flight is preserved by the modules identity check. The operation path
+   *  passes no init and keeps its original single-caller semantics. */
   private async invalidateDeadRuntime(init?: Promise<unknown>): Promise<void> {
     if (init !== undefined) {
-      if (this.invalidatedInit === init) return;
-      this.invalidatedInit = init;
+      if (this.invalidation?.init === init) return this.invalidation.done;
+      const done = this.invalidateDeadRuntime();
+      this.invalidation = { init, done };
+      return done;
     }
     const modules = this.pluginModules;
     await modules?.close?.();

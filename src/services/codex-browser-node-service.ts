@@ -69,6 +69,9 @@ export function createBrowserWireCodec() {
 export class CodexBrowserNodeService {
   private current?: LaunchContext;
   private starting?: Promise<void>;
+  /** Shared teardown: every close() caller awaits the same reaping cycle, so a
+   *  concurrent caller can never return while the child is still alive. */
+  private closing?: Promise<void>;
   private serial = 0;
   private closed = false;
   private readonly wire = createBrowserWireCodec();
@@ -121,14 +124,18 @@ export class CodexBrowserNodeService {
     // reject from surfacing as an unhandled rejection.
     const startupFailure = new Promise<never>((_, reject) => { failStartup = reject; });
     startupFailure.catch(() => {});
+    let contextFailed = false;
     const watchdog = setTimeout(
       () => failStartup(new Error(`Browser Node runtime is unavailable: startup timed out after ${this.startupTimeoutMs}ms`)),
       this.startupTimeoutMs,
     );
     const failContext = (error: Error): void => {
-      // A previous generation's late exit/error must never reject the next
-      // child's requests or overwrite its startup state.
-      if (this.current !== ctx) return;
+      // Generation isolation comes from the per-context pending map and
+      // startupFailure: this closure can only settle this ctx's own state, so
+      // it must still run after close() cleared `current`. A local flag makes
+      // exit/error/watchdog idempotent without consulting the shared pointer.
+      if (contextFailed) return;
+      contextFailed = true;
       failStartup(error);
       for (const p of ctx.pending.values()) { clearTimeout(p.timer); p.reject(error); }
       ctx.pending.clear();
@@ -175,17 +182,26 @@ export class CodexBrowserNodeService {
 
   /** SIGTERM, wait for the actual exit, then SIGKILL after a bounded grace.
    *  The hard cap only covers an unreapable process (e.g. zombie); callers
-   *  never wait indefinitely. */
+   *  never wait indefinitely. Every backing timer is cleared once its race
+   *  settles, so an early exit leaves no retained Timeout handle. */
   private async terminateContext(ctx: LaunchContext): Promise<void> {
     const { child } = ctx;
     if (child.exitCode !== null || child.signalCode !== null) return;
     child.kill('SIGTERM');
-    const grace = new Promise<void>(resolve => setTimeout(resolve, this.terminateGraceMs));
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const grace = new Promise<void>(resolve => {
+      graceTimer = setTimeout(resolve, this.terminateGraceMs);
+    });
     await Promise.race([ctx.exited, grace]);
+    clearTimeout(graceTimer);
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGKILL');
-      const hardCap = new Promise<void>(resolve => setTimeout(resolve, 5_000));
+      let hardTimer: ReturnType<typeof setTimeout> | undefined;
+      const hardCap = new Promise<void>(resolve => {
+        hardTimer = setTimeout(resolve, 5_000);
+      });
       await Promise.race([ctx.exited, hardCap]);
+      clearTimeout(hardTimer);
     }
   }
 
@@ -236,13 +252,20 @@ export class CodexBrowserNodeService {
   }
 
   async close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
     const ctx = this.current;
     this.current = undefined;
     this.starting = undefined;
-    if (!ctx) return;
-    for (const p of ctx.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Browser Node runtime is closed')); }
-    ctx.pending.clear();
-    await this.terminateContext(ctx);
+    this.closing = (async () => {
+      if (!ctx) return;
+      // Settle this generation's own waiters immediately; its exit/error
+      // handler can no longer reach them once `current` is cleared.
+      const closedError = new Error('Browser Node runtime is closed');
+      for (const p of ctx.pending.values()) { clearTimeout(p.timer); p.reject(closedError); }
+      ctx.pending.clear();
+      await this.terminateContext(ctx);
+    })();
+    return this.closing;
   }
 }
