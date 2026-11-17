@@ -333,6 +333,8 @@ export const messages: Record<string, string> = {
   'cmd.invite.no_defaults': 'No inviteConfig.agents configured. Set the list with /botconfig set inviteConfig {"agents":["bot name or app ID"]}.',
   'cmd.invite.invalid_defaults': '⚠️ Invalid inviteConfig.agents; no bots were invited: {reason}',
   'cmd.invite.roster_unavailable': '⚠️ Chat membership is temporarily unavailable. No default-list invitations were sent; please retry later.',
+  'cmd.invite.owner_changed': '⚠️ Your bot admin access changed. Remaining invitations stopped; completed invitations are kept.',
+  'cmd.invite.defaults_changed': '⚠️ inviteConfig.agents changed. Remaining invitations stopped; completed invitations are kept. Check the list and run /invite all again.',
   'cmd.invite.header': '🤝 /invite results:',
   'cmd.invite.ok': '✅ Added to the chat: {names}',
   'cmd.invite.already': '⏭️ Already in the chat (skipped): {names}',

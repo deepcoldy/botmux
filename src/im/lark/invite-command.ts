@@ -33,7 +33,7 @@ import { stripLeadingMentions } from './message-parser.js';
 import { addBotToChat } from '../../services/groups-store.js';
 import { fetchTeamBotDirectory, hasAnyTeamDirectorySource } from '../../services/team-bot-directory.js';
 import type { TeamBotMatch } from '../../services/team-bot-directory.js';
-import { isBotInChat, listChatBotMembers, replyMessage } from './client.js';
+import { isConfiguredBotInChat, listChatBotMembers, replyMessage } from './client.js';
 import type { ChatBotMember } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
@@ -98,21 +98,33 @@ export function parseInviteArgs(text: string, mentions: any[]): ParsedInviteArgs
   return { appIds: [...new Set(appIds)], badAppTokens, leftover: leftoverTokens.join(' ') };
 }
 
-/** 批量拉人；整批全失败且 >1 个时回退逐个拉（镜像 group-creator 的批处理回退）。 */
-async function addBotsResilient(larkAppId: string, chatId: string, ids: string[]) {
-  let results: { id: string; ok: boolean; error?: string }[] = [];
+type InviteInterruption = 'owner_changed' | 'defaults_changed';
+
+/** 批量拉人；每次写入前复查，整批失败时逐个回退，并保留中断前的实际结果。 */
+async function addBotsResilient(
+  larkAppId: string, chatId: string, ids: string[],
+  beforeWrite: () => InviteInterruption | undefined,
+) {
+  const results: { id: string; ok: boolean; error?: string }[] = [];
+  let interruption: InviteInterruption | undefined;
   for (let i = 0; i < ids.length; i += INVITE_BATCH_SIZE) {
+    interruption = beforeWrite();
+    if (interruption) break;
     const batch = ids.slice(i, i + INVITE_BATCH_SIZE);
     let r = await addBotToChat(larkAppId, chatId, batch);
     if (batch.length > 1 && r.every(x => !x.ok)) {
       // 整批失败可能是单个坏 id 拖累全批 → 逐个隔离重试，让好 id 落进去。
-      const perId: typeof r = [];
-      for (const id of batch) perId.push(...await addBotToChat(larkAppId, chatId, [id]));
-      r = perId;
+      for (const id of batch) {
+        interruption = beforeWrite();
+        if (interruption) break;
+        const retry = await addBotToChat(larkAppId, chatId, [id]);
+        r = [...r.filter(result => result.id !== id), ...retry];
+      }
     }
     results.push(...r);
+    if (interruption) break;
   }
-  return results;
+  return { results, interruption };
 }
 
 const pendingInvites = new Map<string, Promise<void>>();
@@ -196,12 +208,14 @@ export async function tryHandleInviteCommand(
     }
     const botsInfo = readBotsInfoEntries();
     let appIds = args.appIds;
+    let expectedAgents: string | undefined;
     if (usingDefaults) {
       const refs = getBot(larkAppId).config.inviteConfig?.agents;
       if (!refs?.length) {
         await reply('cmd.invite.no_defaults');
         return true;
       }
+      expectedAgents = JSON.stringify(refs);
       try {
         // Resolve the entire list before any invitation; a stale or ambiguous
         // default must not silently invite only part of the intended team.
@@ -227,7 +241,7 @@ export async function tryHandleInviteCommand(
     if (usingDefaults) {
       try {
         for (const appId of appIds) {
-          if (appId !== larkAppId && await isBotInChat(appId, chatId)) rosterAppIds.add(appId);
+          if (appId !== larkAppId && await isConfiguredBotInChat(appId, chatId)) rosterAppIds.add(appId);
         }
       } catch (err) {
         logger.warn(`[invite:${larkAppId}] default target membership unknown: ${err}`);
@@ -326,9 +340,17 @@ export async function tryHandleInviteCommand(
 
     const added: string[] = [];
     const failed: string[] = [];
+    let interruption: InviteInterruption | undefined;
     if (toInvite.length > 0) {
-      const results = await addBotsResilient(larkAppId, chatId, toInvite);
-      for (const r of results) {
+      const outcome = await addBotsResilient(larkAppId, chatId, toInvite, () => {
+        if (!isBotAdmin(larkAppId, senderOpenId)) return 'owner_changed';
+        if (usingDefaults && JSON.stringify(getBot(larkAppId).config.inviteConfig?.agents) !== expectedAgents) {
+          return 'defaults_changed';
+        }
+        return undefined;
+      });
+      interruption = outcome.interruption;
+      for (const r of outcome.results) {
         if (r.ok) added.push(nameOf(r.id));
         else failed.push(t('cmd.invite.failed_item', { name: nameOf(r.id), reason: r.error ?? 'unknown' }, loc));
       }
@@ -340,6 +362,7 @@ export async function tryHandleInviteCommand(
     if (unresolved.length) sections.push(t('cmd.invite.unresolved', { names: [...new Set(unresolved)].join('、') }, loc));
     if (ambiguous.length) sections.push(...ambiguous);
     if (failed.length) sections.push(...failed);
+    if (interruption) sections.push(t(`cmd.invite.${interruption}`, undefined, loc));
     const body = sections.join('\n') || t('cmd.invite.usage', undefined, loc);
     await replyMessage(larkAppId, messageId,
       toInvite.length > 0 || already.length > 0 ? t('cmd.invite.header', undefined, loc) + '\n' + body : body,

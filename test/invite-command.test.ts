@@ -28,7 +28,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     ...actual,
     replyMessage: (...a: any[]) => replyMock(...a),
     listChatBotMembers: (...a: any[]) => rosterMock(...a),
-    isBotInChat: (...a: any[]) => membershipMock(...a),
+    isConfiguredBotInChat: (...a: any[]) => membershipMock(...a),
   };
 });
 vi.mock('../src/services/groups-store.js', async (importOriginal) => {
@@ -264,6 +264,55 @@ describe('/invite all configured defaults', () => {
     await tryHandleInviteCommand('b1', allMessage(), OWNER);
     expect(membershipMock).toHaveBeenCalledOnce();
     expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['permission', 'defaults'])('stops before inviting when %s changes during membership lookup', async change => {
+    defaults(['Build']);
+    membershipMock.mockImplementationOnce(async () => {
+      if (change === 'permission') {
+        getBot('b1').config.allowedUsers = [];
+        getBot('b1').resolvedAllowedUsers = [];
+      } else {
+        getBot('b1').config.inviteConfig = undefined;
+      }
+      return false;
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(membershipMock).toHaveBeenCalledOnce();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['permission', 'defaults'])('stops remaining batches when %s changes after a partial write', async change => {
+    const configs = Array.from({ length: 7 }, (_, i) => ({ larkAppId: `cli_bot${i}` }));
+    defaults(configs.map(bot => bot.larkAppId));
+    configsMock.mockReturnValue(configs);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      if (change === 'permission') {
+        getBot('b1').config.allowedUsers = [];
+        getBot('b1').resolvedAllowedUsers = [];
+      } else {
+        getBot('b1').config.inviteConfig = { agents: ['cli_bot6'] };
+      }
+      return ids.map(id => ({ id, ok: true }));
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls.map(call => call[2])).toEqual([configs.slice(0, 5).map(bot => bot.larkAppId)]);
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain(t('cmd.invite.ok', {
+      names: configs.slice(0, 5).map(bot => bot.larkAppId).join('、'),
+    }, localeForBot('b1')));
+  });
+
+  it('rechecks permissions before individual retries of a failed batch', async () => {
+    defaults(['Review', 'Build']);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      getBot('b1').config.allowedUsers = [];
+      getBot('b1').resolvedAllowedUsers = [];
+      return ids.map(id => ({ id, ok: false, error: 'batch failed' }));
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_review', 'cli_build']]]);
     expect(replyMock).toHaveBeenCalledOnce();
   });
 

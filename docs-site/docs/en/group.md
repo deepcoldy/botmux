@@ -147,6 +147,8 @@ A bot admin sends `@bot /invite all` in a group to add missing members from that
 
 Bare `@bot /invite` still displays usage help. `@bot /invite @target` and `/invite --app cli_xxx` continue to process only explicit targets without reading defaults. `all` cannot be combined with explicit targets. Invitations do not change the group's name, tag or avatar.
 
+Revoking admin access or changing or clearing the default list during execution stops invitations that have not yet been sent. Completed invitations are kept; check access and the list before running `/invite all` again.
+
 ## Create a group in the Dashboard
 
 Prefer not to type commands? Open the **Group Management** page in `botmux dashboard` and click "New Chat":
