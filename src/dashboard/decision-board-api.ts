@@ -280,6 +280,17 @@ export async function handleDecisionBoardApi(
     await post(`${PREFIX}/items/${mm[1]}/seen`, {});
     return true;
   }
+  mm = /^\/items\/(\d{1,9})\/close-in-chat$/.exec(rest);
+  if (method === 'POST' && mm) {
+    const body = await readBody(JSON_BODY_MAX_BYTES);
+    if (!body || body.confirmed !== true || !Number.isSafeInteger(body.baseRev)) {
+      json(res, 400, { ok: false, error: 'bad_request' }); return true;
+    }
+    await post(`${PREFIX}/items/${mm[1]}/close-in-chat`, {
+      confirmed: true, baseRev: body.baseRev, submitter: decisionBoardSubmitter(deps.identity),
+    });
+    return true;
+  }
   mm = /^\/items\/(\d{1,9})\/draft$/.exec(rest);
   if (method === 'PUT' && mm) {
     const body = await readBody(JSON_BODY_MAX_BYTES);

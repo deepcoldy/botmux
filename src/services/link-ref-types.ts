@@ -115,6 +115,8 @@ export class LinkRefError extends Error {
 }
 
 export interface LinkRefTurnEnvelope {
+  /** Register/resolve links without appending model instructions to exact control input. */
+  presentation?: 'registry-only';
   mode: LinkRefMode;
   sources?: LinkRefSourceInput[];
 }

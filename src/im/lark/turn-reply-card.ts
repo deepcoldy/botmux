@@ -9,6 +9,8 @@ import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment,
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
 import { repairCardStrongPunctuation } from './card-strong-punctuation.js';
+import { buildNextStepElement, NEXT_STEP_ELEMENT_ID } from './next-step-card.js';
+import { buildRecapElement } from './turn-recap-card.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
@@ -364,6 +366,31 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       setProcessPreview({ content: notice, shownTools: 0 });
       if (budget <= 0) serialized = serialize();
     }
+  }
+  // The next-step row is optional chrome, added last: it goes on only when the
+  // card as already fitted still fits with it. It never shortens the activity
+  // panel and never pushes the answer itself into an overflow attachment.
+  if (record.nextStep && terminal && record.phase === 'completed' && !pendingAsks.length) {
+    const footerIndex = card.body.elements.findIndex(element =>
+      element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer'
+      || element.element_id === 'botmux_reply_actions');
+    const index = footerIndex < 0 ? card.body.elements.length : footerIndex;
+    card.body.elements.splice(index, 0, buildNextStepElement(record.nextStep, presentation.locale));
+    const withRow = serialize();
+    if (turnReplyCardRequestBytes(withRow, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES) serialized = withRow;
+    else card.body.elements.splice(index, 1);
+  }
+  // The collapsed「本轮回顾」panel goes above that row (or the footer) on the
+  // same terms, after it: when space runs short the row keeps its place.
+  if (record.recap && terminal && record.phase === 'completed' && !pendingAsks.length) {
+    const anchorIndex = card.body.elements.findIndex(element =>
+      element.element_id === NEXT_STEP_ELEMENT_ID || element.element_id === 'botmux_feedback'
+      || element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_reply_actions');
+    const index = anchorIndex < 0 ? card.body.elements.length : anchorIndex;
+    card.body.elements.splice(index, 0, buildRecapElement(record.recap.markdown, presentation.locale));
+    const withPanel = serialize();
+    if (turnReplyCardRequestBytes(withPanel, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES) serialized = withPanel;
+    else card.body.elements.splice(index, 1);
   }
   return serialized;
 }

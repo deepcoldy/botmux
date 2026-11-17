@@ -98,6 +98,8 @@ export interface CodexPendingTurn {
    *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
    *  semantics intentionally serve the outbound-send suppression window. */
   transcriptStartTimeMs?: number;
+  /** Exact native user record corroborated at the actual attribution edge. */
+  nativeUserProof?: { uuid: string; hash: string; timestampMs: number };
   /** Local observation time for a task_started-only provisional claim. Cleared
    *  once the fingerprinted user record corroborates the claim. */
   provisionalTaskStartedAtMs?: number;
@@ -121,6 +123,9 @@ export interface CodexPendingTurn {
    *  began. This closes the race where screen-ready arrives while writeInput
    *  is still polling history, before it can return `submitted: true`. */
   submitVerificationStartedAtMs?: number;
+  /** The worker still owns an ambiguous draft in this CLI generation. Keep
+   * its exact fingerprint for a later manual submit, without claiming success. */
+  inputDeliveryQuarantined?: true;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
   /** Explicit transcript terminal semantics. Undefined keeps the historical
@@ -508,6 +513,7 @@ export class CodexBridgeQueue {
       // The CLI holds this input in its own queue (input_queued); its user
       // record will start it, or cli_settled restarts the lease.
       if (head.cliQueuedAtMs !== undefined) break;
+      if (head.inputDeliveryQuarantined) break;
 
       // An authoritative adapter/history check can legitimately outlive the
       // shorter attribution lease. Do not prune under that in-flight await;
@@ -630,6 +636,12 @@ export class CodexBridgeQueue {
     if (!turn || !turn.rpcActive) return false;
     turn.rpcActive = undefined;
     return true;
+  }
+
+  setInputDeliveryQuarantined(turnId: string, quarantined: boolean, dispatchAttempt?: number): void {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (turn) turn.inputDeliveryQuarantined = quarantined ? true : undefined;
   }
 
   /** Start bounded adapter/history verification before awaiting writeInput. */
@@ -910,6 +922,11 @@ export class CodexBridgeQueue {
       // buffered — a late replay into the wrong turn is worse than a gap).
       const target = this.targetForNativeEvent(ev);
       if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+        // Native tool rows can flush after a stop but before the next submit.
+        // A parse-time timestamp must not turn those old bytes into new work.
+        if (ev.progressCursor && ev.progressCursor.jsonlPath === target.recoveryJsonlPathAtMark
+          && target.recoveryOffsetAtMark !== undefined
+          && ev.progressCursor.offset < target.recoveryOffsetAtMark) return;
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
@@ -1042,6 +1059,7 @@ export class CodexBridgeQueue {
         next!.sourceMessageId = ev.sourceMessageId;
         this.rememberNativeUserMessage(ev);
         next!.transcriptStartTimeMs = ev.timestampMs;
+        next!.nativeUserProof = { uuid: ev.uuid, hash: createHash('sha256').update(ev.text).digest('hex'), timestampMs: ev.timestampMs };
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
         // timestamp), not when the worker marked it. With type-ahead the

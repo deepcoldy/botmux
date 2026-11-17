@@ -21,7 +21,9 @@ import { ScheduleBotGrantsEditor, type ScheduleBotGrantBotOption } from './sched
 import type { ScheduleBotGrant } from '../../global-config.js';
 import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
-import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { readPromptCacheConfig, resolvePromptCachePolicy, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
+import { readProviderRecoveryConfig, type ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -97,10 +99,11 @@ interface DashboardSettings {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
-  /** scheduleDelegation.createEnabled / selfManageEnabled / botGrants. */
+  /** scheduleDelegation switches / botGrants. */
   scheduleBotGrants: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     ignoredCount: number;
     botOptions: ScheduleBotGrantBotOption[];
@@ -119,6 +122,7 @@ interface DashboardSettings {
   workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
+  providerRecovery: ProviderRecoveryConfig | null;
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
@@ -277,6 +281,7 @@ function parseSettings(s: any): DashboardSettings {
     scheduleBotGrants: {
       createEnabled: s?.scheduleBotGrants?.createEnabled === true,
       selfManageEnabled: s?.scheduleBotGrants?.selfManageEnabled === true,
+      childOneShotEnabled: s?.scheduleBotGrants?.childOneShotEnabled === true,
       grants: Array.isArray(s?.scheduleBotGrants?.grants) ? s.scheduleBotGrants.grants : [],
       ignoredCount: Number.isSafeInteger(s?.scheduleBotGrants?.ignoredCount)
         ? Math.max(0, s.scheduleBotGrants.ignoredCount)
@@ -310,6 +315,7 @@ function parseSettings(s: any): DashboardSettings {
         : 60,
     },
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
+    providerRecovery: readProviderRecoveryConfig(s?.providerRecovery) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
@@ -876,7 +882,8 @@ function SettingsPage() {
   );
 }
 
-type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>;
+type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'],
+  'createEnabled' | 'selfManageEnabled' | 'childOneShotEnabled' | 'grants'>>;
 
 /** PUT body for the bot-grant entry. A list write names the list it was edited
  *  from, so the server can refuse it (and the page re-reads) when that is no
@@ -1143,6 +1150,14 @@ export function SettingsBody(props: {
             onChange={value => saveBoolean('crossPrincipalInterruption', value)}
           />
           <ToggleRow
+            title={tr('settings.scheduleChildOneShot')}
+            dataAction="toggle-schedule-child-one-shot"
+            help={tr('settings.scheduleChildOneShotHelp')}
+            checked={settings.scheduleBotGrants.childOneShotEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ childOneShotEnabled: value }); }}
+          />
+          <ToggleRow
             title={tr('settings.scheduleDelegationCreate')}
             dataAction="toggle-schedule-delegation-create"
             help={tr('settings.scheduleDelegationCreateHelp')}
@@ -1296,6 +1311,16 @@ export function SettingsBody(props: {
             value={settings.promptCache}
             disabled={dis || savingKey === 'promptCache'}
             onSave={next => props.onSave('promptCache', { promptCache: next }, s => ({ ...s, promptCache: next }))}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-provider-recovery" title={tr('settings.sectionProviderRecovery')}>
+          <p className="settings-help">{tr('settings.providerRecoveryNote')}</p>
+          <ProviderRecoveryEditor
+            scope="global"
+            value={settings.providerRecovery}
+            promptCacheTtl={resolvePromptCachePolicy(settings.promptCache ?? undefined, undefined).ttl}
+            disabled={dis || savingKey === 'providerRecovery'}
+            onSave={next => props.onSave('providerRecovery', { providerRecovery: next }, s => ({ ...s, providerRecovery: next }))}
           />
         </SettingsBlock>
       </SettingsGroup>

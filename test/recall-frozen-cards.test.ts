@@ -248,9 +248,9 @@ async function drainPinQueue(): Promise<void> {
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 describe('recallFrozenCards', () => {
-  it('is a no-op when frozenCards is undefined and disk is empty', () => {
+  it('is a no-op when frozenCards is undefined and disk is empty', async () => {
     const ds = makeDs(undefined);
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(loadFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID);
     expect(deleteMessageMock).not.toHaveBeenCalled();
@@ -258,9 +258,9 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('is a no-op when in-memory frozenCards is empty', () => {
+  it('is a no-op when in-memory frozenCards is empty', async () => {
     const ds = makeDs(new Map());
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     // Lazy-load short-circuited because Map exists (just empty).
     expect(loadFrozenCardsMock).not.toHaveBeenCalled();
@@ -268,14 +268,14 @@ describe('recallFrozenCards', () => {
     expect(saveFrozenCardsMock).not.toHaveBeenCalled();
   });
 
-  it('deletes every frozen card via the Lark client', () => {
+  it('deletes every frozen card via the Lark client', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_a'));
     map.set('n2', makeFrozen('om_b'));
     map.set('n3', makeFrozen('om_c'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(3);
     const ids = deleteMessageMock.mock.calls.map(c => c[1]).sort();
@@ -283,25 +283,81 @@ describe('recallFrozenCards', () => {
     deleteMessageMock.mock.calls.forEach(c => expect(c[0]).toBe(APP_ID));
   });
 
-  it('clears the in-memory Map and persists empty state', () => {
+  it('repaints each frozen card to 「等待输入」 before withdrawing it', async () => {
+    const map = new Map<string, FrozenCard>();
+    map.set('n1', makeFrozen('om_a'));
+    map.set('n2', makeFrozen('om_b'));
+    const ds = makeDs(map);
+
+    await recallFrozenCards(ds);
+
+    // Lark keeps a withdrawn message's last frame readable, so deleting a card
+    // frozen mid-work would leave a 「工作中」 tombstone in the thread.
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls.map(c => c[1])).toEqual(['om_a', 'om_b']);
+    expect(buildStreamingCardMock.mock.calls.map(c => c[5])).toEqual(['idle', 'idle']);
+    // Serial, and each repaint precedes its own withdraw.
+    const repaints = updateMessageMock.mock.invocationCallOrder;
+    const withdrawals = deleteMessageMock.mock.invocationCallOrder;
+    expect(repaints[0]).toBeLessThan(withdrawals[0]);
+    expect(withdrawals[0]).toBeLessThan(repaints[1]);
+    expect(repaints[1]).toBeLessThan(withdrawals[1]);
+  });
+
+  it('still withdraws a frozen card when its repaint fails', async () => {
+    updateMessageMock.mockRejectedValue(new Error('expired'));
+    const map = new Map<string, FrozenCard>();
+    map.set('n1', makeFrozen('om_a'));
+    map.set('n2', makeFrozen('om_b'));
+    const ds = makeDs(map);
+
+    await expect(recallFrozenCards(ds)).resolves.toEqual(['om_a', 'om_b']);
+    expect(deleteMessageMock).toHaveBeenCalledTimes(2);
+    expect(ds.frozenCards?.size).toBe(0);
+  });
+
+  it('does not withdraw a frozen card restored as live while its repaint is pending', async () => {
+    const ds = makeDs(new Map([['old', makeFrozen('om_old')]]));
+    ds.streamCardId = 'om_new';
+    let release!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const recalling = recallFrozenCards(ds);
+    ds.streamCardId = 'om_old';
+    release();
+    await recalling;
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not withdraw cards after the session object changes during repaint', async () => {
+    const ds = makeDs(new Map([['old', makeFrozen('om_old')]]));
+    let release!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const recalling = recallFrozenCards(ds);
+    ds.session = { ...ds.session };
+    release();
+    await recalling;
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('clears the in-memory Map and persists empty state', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_a'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(ds.frozenCards?.size).toBe(0);
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
   });
 
-  it('lazy-loads from disk when frozenCards is undefined', () => {
+  it('lazy-loads from disk when frozenCards is undefined', async () => {
     const onDisk = new Map<string, FrozenCard>();
     onDisk.set('persisted', makeFrozen('om_persisted'));
     loadFrozenCardsMock.mockReturnValue(onDisk);
 
     const ds = makeDs(undefined);
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(loadFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
@@ -309,7 +365,7 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('swallows deleteMessage rejections without throwing', () => {
+  it('swallows deleteMessage rejections without throwing', async () => {
     deleteMessageMock.mockImplementationOnce(async () => {
       throw new Error('boom');
     });
@@ -318,26 +374,26 @@ describe('recallFrozenCards', () => {
     map.set('n2', makeFrozen('om_ok'));
     const ds = makeDs(map);
 
-    expect(() => recallFrozenCards(ds)).not.toThrow();
+    await expect(recallFrozenCards(ds)).resolves.toEqual(['om_failing', 'om_ok']);
     expect(deleteMessageMock).toHaveBeenCalledTimes(2);
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('is idempotent — second call after the first does nothing', () => {
+  it('is idempotent — second call after the first does nothing', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_only'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1); // still 1
   });
 
   // ── P2 regression: never delete the live card ─────────────────────────────
 
-  it('skips entries whose messageId equals the active streamCardId', () => {
+  it('skips entries whose messageId equals the active streamCardId', async () => {
     // Reproduces the daemon-restart window where freeze persisted an entry
     // for the still-live card before crash. Recall must not delete it.
     const map = new Map<string, FrozenCard>();
@@ -346,7 +402,7 @@ describe('recallFrozenCards', () => {
     const ds = makeDs(map);
     ds.streamCardId = 'om_active';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_old');
@@ -355,32 +411,32 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.has('nonce_old')).toBe(false);
   });
 
-  it('does not persist or call deleteMessage when only the active entry exists', () => {
+  it('does not persist or call deleteMessage when only the active entry exists', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('nonce_active', makeFrozen('om_active'));
     const ds = makeDs(map);
     ds.streamCardId = 'om_active';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).not.toHaveBeenCalled();
     expect(saveFrozenCardsMock).not.toHaveBeenCalled();
     expect(ds.frozenCards?.size).toBe(1);
   });
 
-  it('treats CARD_POSTING_SENTINEL as no active id (deletes everything)', () => {
+  it('treats CARD_POSTING_SENTINEL as no active id (deletes everything)', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_only'));
     const ds = makeDs(map);
     ds.streamCardId = '__posting__';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_only');
   });
 
-  it('withdraws only frozen cards from the live card reply target', () => {
+  it('withdraws only frozen cards from the live card reply target', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('topic_a', makeFrozen('om_card_a', { replyTargetKey: 'thread:om_topic_a' }));
     map.set('topic_b', makeFrozen('om_card_b', { replyTargetKey: 'thread:om_topic_b' }));
@@ -389,7 +445,7 @@ describe('recallFrozenCards', () => {
     ds.streamCardId = 'om_card_b_live';
     ds.streamCardReplyTargetKey = 'thread:om_topic_b';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_card_b');
@@ -466,6 +522,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       // 24th arg: per-chat substitute card control — unavailable for this fixture.
       undefined,
       false,
+      // 26th arg: captured Codex App native-stop target — absent for this Claude fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

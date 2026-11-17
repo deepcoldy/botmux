@@ -10,6 +10,7 @@
 import xtermHeadless from '@xterm/headless';
 const { Terminal } = xtermHeadless;
 import { createHash } from 'node:crypto';
+import { readViewportCells, type ScreenRow } from './terminal-cells.js';
 
 /** Strip box-drawing characters and collapse runs of spaces. */
 function cleanBoxDrawing(line: string): string {
@@ -120,6 +121,11 @@ export class TerminalRenderer {
    */
   rawSnapshot(opts: { preserveFormatting?: boolean } = {}): string {
     return readViewportText(this.terminal, { filter: false, ...opts });
+  }
+
+  /** Current viewport as cells (keeps the dim/inverse attributes text drops). */
+  viewportCells(): ScreenRow[] {
+    return readViewportCells(this.terminal);
   }
 
   private readViewport(filter: boolean): string {

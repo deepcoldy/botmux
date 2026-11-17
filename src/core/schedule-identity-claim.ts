@@ -41,6 +41,7 @@ import type {
 } from '../services/schedule-authority-store.js';
 import type { ScheduledTask, ScheduleRunAsClaim } from '../types.js';
 import { parseScheduleRunAsClaim, scheduledTaskRunAs } from './schedule-run-as.js';
+import { isUntilDoneOpen } from '../services/schedule-until-done.js';
 import type { ClaimTaskRunAsResult } from './scheduler.js';
 
 /** Same shape the schedule mutation route accepts. */
@@ -76,6 +77,31 @@ export function resolveScheduledRunIdentity(
     };
   }
   return { ok: true, openId: runAs.openId, unionId: runAs.unionId, source: runAs.source };
+}
+
+/**
+ * Records the union_id of a creator the task names by open_id only, so the
+ * task resolves an identity without a claim. Only a task whose
+ * `creatorLarkAppId` is this bot qualifies: that field is set where the
+ * open_id was proven to be the creator's own (direct and delegated creation).
+ * A task without it, such as a dashboard token-login task attributed to the
+ * bot owner, keeps the claim-card path. Returns the task a fire should
+ * continue with: the row `record` stored, or `task` itself when nothing was
+ * recorded.
+ */
+export async function backfillOwnerUnionId(input: {
+  task: ScheduledTask;
+  larkAppId: string;
+  lookupUnionId(appId: string, openId: string): Promise<string | undefined>;
+  record(taskId: string, appId: string, openId: string, unionId: string): ScheduledTask | undefined;
+}): Promise<ScheduledTask> {
+  const { task, larkAppId } = input;
+  if (!task.ownerOpenId || task.ownerUnionId || parseScheduleRunAsClaim(task.runAsClaim)) return task;
+  if (task.creatorLarkAppId !== larkAppId) return task;
+  const unionId = await input.lookupUnionId(larkAppId, task.ownerOpenId);
+  if (!unionId) return task;
+  const stored = input.record(task.id, larkAppId, task.ownerOpenId, unionId);
+  return stored?.ownerUnionId ? stored : task;
 }
 
 export type ClaimCardLocation =
@@ -248,6 +274,10 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
   async function noteIdentityGap(input: ScheduleIdentityGapInput): Promise<void> {
     const { appId, task, turnId } = input;
     if (deps.governedTools(appId).length === 0) return;
+    if (task.parsed?.kind === 'once' && !isUntilDoneOpen(task)) {
+      deps.log.info(`[schedule-claim] no card for one-shot task=${task.id} reason=${input.gap.reason}`);
+      return;
+    }
     return serialized(`${appId}:${task.id}`, async () => {
       const record = deps.getCard(appId, task.id);
       if (record?.lastTurnId === turnId) return;

@@ -138,7 +138,8 @@ export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown
 }
 
 /** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
- *  the run-as identity fields, and every executable/authority-bearing precondition field from
+ *  the until-done completion note, the run-as identity fields, and every
+ *  executable/authority-bearing precondition field from
  *  `/api/schedules` rows for anonymous visitors. The supported list projection
  *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
  *  ref/hash are stripped defensively even though authenticated management rows
@@ -159,6 +160,12 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
       runAsClaim: _runAsClaim,
       ...rest
     } = projected as Record<string, unknown>;
+    // An until-done completion note is free text the model wrote about the
+    // business result, as sensitive as the prompt; status/deadline stay.
+    if (rest.untilDone && typeof rest.untilDone === 'object') {
+      const { doneNote: _doneNote, ...untilDone } = rest.untilDone as Record<string, unknown>;
+      return { ...rest, untilDone };
+    }
     return rest;
   });
 }

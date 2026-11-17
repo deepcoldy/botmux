@@ -11,15 +11,18 @@ export { projectImportSnapshotFromSource } from './project-import-snapshot.js';
 import {
   createProjectImportNotifications,
   projectImportOperationId,
+  UNINITIALIZED_PROJECT_GENERATION,
   type ProjectImportCoordinator,
   type ProjectImportNotification,
   type ProjectImportNotificationRuntime,
   type ProjectImportPolicy,
   type ProjectImportSource,
 } from './project-import-notifications.js';
+import { effectiveProjectImportPolicy } from '../core/project-session-association-events.js';
 
 export const PROJECT_IMPORT_DELIVER_ROUTE = '/api/project-import/deliver';
 export const PROJECT_IMPORT_COORDINATORS_ROUTE = '/api/project-workstream/coordinators';
+export const PROJECT_IMPORT_AWAITING_PROJECT_ROUTE = '/api/project-import/awaiting-project';
 
 export type ProjectImportRuntimeSource = ProjectAttachmentSource & { chatType?: 'group' | 'p2p' };
 
@@ -43,7 +46,7 @@ export interface ProjectImportRuntimeDeps {
   dataDir: string;
   getMode(chatId: string): GroupCollaborationModeConfig | undefined;
   getProject(chatId: string): ProjectGroupState | undefined;
-  getSource(appId: string, sessionId: string): Promise<ProjectImportRuntimeSource | undefined>;
+  getSource(appId: string, sessionId: string): Promise<ProjectAttachmentSource & { chatType?: 'group' | 'p2p' } | undefined>;
   listRecoverableSessions(): readonly ProjectImportRecoverableSession[];
   /** Compare-and-set clear the SAME source revision after durable enqueue, or
    * after explicit disable; never clear a newer migration's pending marker. */
@@ -94,10 +97,12 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
     const mode = deps.getMode(chatId);
     if (!mode) return;
     const project = deps.getProject(chatId);
+    const projectExists = !!project && project.larkAppId === mode.coordinatorAppId;
     return {
-      mode: mode.mode, importedSessionPolicy: mode.importedSessionPolicy ?? 'ignore',
-      projectExists: !!project && project.larkAppId === mode.coordinatorAppId,
-      projectGeneration: project?.createdAt ?? '',
+      mode: mode.mode,
+      importedSessionPolicy: effectiveProjectImportPolicy(mode, project),
+      projectExists,
+      projectGeneration: projectExists ? project.createdAt : (!project ? UNINITIALIZED_PROJECT_GENERATION : ''),
       coordinatorAppId: mode.coordinatorAppId,
       workerAppIds: mode.workerAppIds ?? [],
     };
@@ -109,6 +114,8 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
   async function coordinators(chatId: string, appId: string): Promise<ProjectImportCoordinator[]> {
     const project = deps.getProject(chatId);
     const mode = deps.getMode(chatId);
+    // An uninitialized project group has no coordinator to notify yet, and an
+    // import never creates one: delivery waits for a human `project init`.
     if (!project || mode?.mode !== 'project' || mode.coordinatorAppId !== appId
       || project.larkAppId !== appId) return [];
     const local = deps.localCoordinator(project.coordinatorSessionId);
@@ -153,6 +160,15 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
     dataDir: deps.dataDir, now: deps.now, log: deps.log,
     getPolicy: policy, getCurrent: current, getCoordinator: coordinators,
     reconcileDelivery: registration,
+    onAwaitingProject: async notification => {
+      const daemon = deps.findDaemon(notification.coordinatorAppId);
+      if (!daemon) return;
+      await deps.fetchIpc(daemon.ipcPort, PROJECT_IMPORT_AWAITING_PROJECT_ROUTE, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ notification }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    },
     deliver: async (notification, input) => {
       await input.beforeDeliver();
       const daemon = deps.findDaemon(input.target.larkAppId);
@@ -193,7 +209,8 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
       const effective = policy(session.chatId);
       // Fast gate before querying another daemon or resolving source owner.
       if (effective?.mode !== 'project' || effective.importedSessionPolicy !== 'notify'
-        || !effective.projectExists || !effective.workerAppIds?.includes(session.larkAppId)) {
+        || (!effective.projectExists && effective.projectGeneration !== UNINITIALIZED_PROJECT_GENERATION)
+        || !effective.workerAppIds?.includes(session.larkAppId)) {
         deps.markEnqueued?.(session, 'skipped');
         continue;
       }

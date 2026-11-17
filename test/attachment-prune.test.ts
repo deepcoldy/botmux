@@ -123,6 +123,26 @@ describe('pruneBotAttachments', () => {
   it('default max age is a positive multi-day window', () => {
     expect(DEFAULT_ATTACHMENT_MAX_AGE_MS).toBeGreaterThanOrEqual(7 * DAY);
   });
+
+  it('never prunes the reply-delivery evidence index, even when its directory is older than the TTL', () => {
+    // deliveries/ 是 quoted 取证索引而非消息附件下载：14 天 TTL 过后主消息仍须能
+    // 解析附件回执。同桶的普通超龄消息目录照常回收。
+    const bucket = join(root, 'cli_a');
+    mkdirSync(bucket, { recursive: true });
+    const indexDir = join(bucket, 'deliveries');
+    mkdirSync(indexDir, { recursive: true });
+    const indexFile = join(indexDir, 'record.json');
+    writeFileSync(indexFile, JSON.stringify({ version: 1 }));
+    const oldSeconds = (Date.now() - 30 * DAY) / 1000;
+    utimesSync(indexDir, oldSeconds, oldSeconds);
+    utimesSync(indexFile, oldSeconds, oldSeconds);
+    const oldMessage = msgDir('cli_a', 'om_old', 30 * DAY);
+
+    expect(prune('cli_a')).toEqual({ status: 'pruned', removedDirs: 1 });
+    expect(existsSync(indexDir)).toBe(true);
+    expect(existsSync(indexFile)).toBe(true);
+    expect(existsSync(oldMessage)).toBe(false);
+  });
 });
 
 // 默认的保护集合读取是 daemon 自己的会话库：读得出来就按它保护，读不出来就不删。

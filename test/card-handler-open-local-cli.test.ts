@@ -4,11 +4,13 @@
  * Run: pnpm vitest run test/card-handler-open-local-cli.test.ts
  */
 import { mkdtempSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CliId } from '../src/adapters/cli/types.js';
+import type { DaemonToWorker } from '../src/types.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -112,6 +114,45 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.BOTS_CONFIG;
   vi.restoreAllMocks();
+});
+
+describe('card-handler native stop', () => {
+  it('sends an interrupt only for the current Codex App card target', async () => {
+    const { types, handler } = await fresh();
+    const ds = makeDs('codex-app');
+    ds.streamCardId = 'om_card';
+    ds.streamCardNonce = 'nonce';
+    ds.codexAppInterruptTarget = { generation: 'generation', turnEpoch: 2, replyTurnId: 'om_current' };
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      send: vi.fn((message: DaemonToWorker) => {
+        if (message.type === 'codex_app_interrupt') worker.emit('message', {
+          type: 'codex_app_interrupt_result', requestId: message.requestId, status: 'delivered',
+        });
+        return true;
+      }),
+    });
+    ds.worker = worker as unknown as DaemonSession['worker'];
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+    const click = (epoch: number, operator = 'ou_owner') => handler.handleCardAction(
+      action(operator, 'codex-app', { context: { open_message_id: 'om_card' } }, {
+        action: 'stop_turn', card_nonce: 'nonce', codex_app_stop_target: `generation:${epoch}`,
+      }), deps, 'h1',
+    );
+
+    expect((await click(1)).toast.type).toBe('warning');
+    expect(await click(2, 'ou_intruder')).toBeUndefined();
+    ds.streamCardPendingTurnId = 'om_queued';
+    expect((await click(2)).toast.type).toBe('warning');
+    ds.streamCardPendingTurnId = undefined;
+    expect(worker.send).not.toHaveBeenCalled();
+    expect((await click(2)).toast.type).toBe('success');
+    expect(worker.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      type: 'codex_app_interrupt', generation: 'generation', turnEpoch: 2,
+    }));
+    expect(ds.worker).toBe(worker);
+    expect(ds.session.status).toBe('active');
+  });
 });
 
 describe('card-handler open_local_cli', () => {

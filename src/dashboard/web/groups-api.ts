@@ -44,6 +44,8 @@ export interface GroupChat {
   projectCoordinatorAppId?: string;
   projectWorkerAppIds?: string[];
   projectAutoEnrollWorkers?: boolean;
+  /** Group-level import notification switch (`importedSessionPolicy === 'notify'`), default off. */
+  projectImportNotify?: boolean;
   projectProgressCard?: ProjectProgressCardConfig;
   projectRuntime?: ProjectGroupRuntimeSummary;
   memberBots: GroupMemberBot[];

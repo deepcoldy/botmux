@@ -892,9 +892,11 @@ export function listUnmigratedAppIds(dataDir: string, opts: { strict?: boolean }
   return ids;
 }
 
-/** One ref per SQLite store identity. `strict` propagates an unlistable
- *  `session-stores/` dir (fail-closed callers must not mistake an unreadable
- *  store set for an empty one). */
+/** One ref per SQLite store identity. `strict` lists every peer directory so
+ *  unreadable directories and unresolved links cannot silently narrow the
+ *  inventory. A readable peer with no database is still legitimately absent,
+ *  and so is a non-directory entry (e.g. a Finder `.DS_Store`): it cannot hold
+ *  a store, so it must not fail every strict inventory on the machine. */
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
   const refs: StoreFileRef[] = [];
@@ -907,7 +909,22 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
     }
     for (const appId of appIds) {
       const dbPath = storeDbPath(appId, dataDir);
-      if (existsSync(dbPath)) refs.push({ appId, path: dbPath });
+      let present: boolean;
+      if (opts.strict) {
+        let entries: string[];
+        try {
+          entries = readdirSync(dirname(dbPath));
+        } catch (err) {
+          // ENOTDIR = the entry (or what its link resolves to) is a plain file.
+          // A dangling link (ENOENT) or an unsearchable dir (EACCES) still throws.
+          if ((err as NodeJS.ErrnoException).code === 'ENOTDIR') continue;
+          throw err;
+        }
+        present = entries.includes(basename(dbPath));
+      } else {
+        present = existsSync(dbPath);
+      }
+      if (present) refs.push({ appId, path: dbPath });
     }
   }
   return refs;
@@ -5825,6 +5842,37 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
     s => s.chatId === chatId && s.scope === 'chat',
     { chatScopeChatId: chatId },
   );
+}
+
+/**
+ * Reverse-lookup the owning botmux session id from a CLI-native session id,
+ * scanning every bot store read-only. Used by short-lived CLI subprocesses
+ * (e.g. `botmux skill` inside doubao's sbox shell) that never receive
+ * BOTMUX_SESSION_ID but do carry the native conversation id.
+ *
+ * Fail-closed: the native id must match exactly ONE active row of the given
+ * cliId. Zero matches (unknown id) or several (a native id misbound to two
+ * botmux sessions) both return undefined, so the caller never acts on a
+ * sibling session. Read errors propagate — the caller decides whether to fail
+ * closed rather than have an unreadable peer store silently narrow the result.
+ */
+export function findActiveSessionIdByCliSessionId(opts: {
+  cliId: string;
+  cliSessionId: string;
+  dataDir?: string;
+}): string | undefined {
+  const cliSessionId = opts.cliSessionId.trim();
+  if (!cliSessionId) return undefined;
+  const dataDir = opts.dataDir ?? config.session.dataDir;
+  const matches: string[] = [];
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      if (session.cliId === opts.cliId && session.cliSessionId === cliSessionId) {
+        matches.push(session.sessionId);
+      }
+    }
+  }
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 /**

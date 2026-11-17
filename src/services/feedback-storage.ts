@@ -30,6 +30,10 @@ function serialized<Result>(key: string, operation: () => Promise<Result>): Prom
 }
 
 async function openStorage(dataDir: string, config: FeedbackStorageConfig): Promise<FeedbackStorage> {
+  if (config.active.backend === 'supabase') {
+    const { openSupabaseFeedbackStorage } = await import('./feedback-supabase-store.js');
+    return { ...await openSupabaseFeedbackStorage(dataDir, config.active.supabase, config.instanceId), generation: config.generation };
+  }
   if (config.active.backend === 'postgresql') {
     const target = config.active.postgres;
     const password = await readPostgresCredential(dataDir, target);

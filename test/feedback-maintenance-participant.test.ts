@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -69,6 +69,22 @@ async function fixture(
 }
 
 describe('feedback maintenance participant with runtime health', () => {
+  it('does not reopen a frozen PostgreSQL source before the cutover generation changes', async () => {
+    const f = await fixture();
+    await f.checkpoint(true);
+    const { readFeedbackStorageConfig } = await import('../src/services/feedback-storage-config.js');
+    const config = await readFeedbackStorageConfig(f.directory);
+    await writeFile(join(f.directory, 'feedback-storage.json'), JSON.stringify({
+      ...config,
+      active: { backend: 'postgresql', postgres: {
+        host: '127.0.0.1', port: 1, database: 'frozen_source', user: 'test',
+        schema: 'feedback_test', passwordRef: 'env:UNAVAILABLE_FROZEN_SOURCE',
+        tls: { mode: 'disable' }, connectTimeoutMs: 100,
+      } },
+    }), { mode: 0o600 });
+    await f.checkpoint(true);
+    expect(f.outboxRunning()).toBe(false);
+  });
   it.each(['riff', 'mojo', 'remote-runner'])('does not freeze legacy %s execution without a backend stamp', async cliId => {
     const f = await fixture(undefined, {
       session: { session: { status: 'active', cliId }, worker: null } as DaemonSession,

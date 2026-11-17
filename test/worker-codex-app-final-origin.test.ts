@@ -71,11 +71,14 @@ function harness(reattached: boolean | 'native-recovery' = false, ordinary = fal
     currentBotmuxTurnId: 'turn-next', currentBotmuxDispatchAttempt: 99,
     inputDeliveryEvidence: { start: vi.fn() }, cliSpawnGeneration: 1,
     emittedTurnTerminals: new TurnTerminalDeduper(), cancelSubmitFailureChainForTerminal: vi.fn(),
-    submitFailureChains: new Map(), releaseActiveTurnAuthority: () => true, retireTerminatedQueuedTurn: vi.fn(),
+    submitFailureChains: new Map(), releaseActiveTurnAuthority: () => true, scheduleConsumedQueuedTurnAdvance: vi.fn(), retireTerminatedQueuedTurn: vi.fn(),
     terminalReleasesDurableTurn: () => false,
     parseCodexAppControlWireRecord, verifyCodexAppSignedControlMarker, encodeCodexAppControlAck, committedCodexAppSequence,
     codexAppControlChannelId: 1, codexAppControlEndpointEpoch: 'epoch', codexAppControlActiveSocket: socket,
     codexAppControlReplayWindow: new CodexAppControlReplayWindow(), codexAppControlRecordApplicationGate: new CodexAppControlRecordApplicationGate(),
+    // Interrupt bookkeeping introduced with native turn interrupt: empty for the
+    // control-channel teardown probes, which only need it to be a safe no-op.
+    codexAppInterruptRequests: new Map(),
   };
   const wire: any[] = []; const admissions: any[] = []; const heldAcks: Array<() => void> = [];
   const ack = loadWorkerMessageHandler('codex_app_dispatch_persisted', env);

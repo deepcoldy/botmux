@@ -113,11 +113,30 @@ describe('committed project import marker', () => {
     expect(source.projectImportPending).toBe(false);
   });
 
-  it('requires project state rather than treating a configured group as a started project', () => {
+  it('governs an uninitialized project-mode group by the same opt-in switch (default off)', () => {
     mocks.readProject.mockReturnValue(undefined);
+    for (const policy of [undefined, 'ignore' as const]) {
+      mocks.readMode.mockReturnValue({ ...mode, importedSessionPolicy: policy });
+      const off = session({ projectImportPending: true });
+      markProjectImportPending(off);
+      expect(off.projectImportPending).toBe(false);
+    }
+    mocks.readMode.mockReturnValue(mode);
     const source = session();
     markProjectImportPending(source);
-    expect(source.projectImportPending).toBe(false);
+    expect(source.projectImportPending).toBe(true);
+
+    for (const ineligible of [
+      { ...mode, mode: 'standard' as const },
+      { ...mode, coordinatorAppId: undefined },
+      { ...mode, coordinatorAppId: 'cli_worker' },
+      { ...mode, workerAppIds: ['cli_elsewhere'] },
+    ]) {
+      mocks.readMode.mockReturnValue(ineligible);
+      const skipped = session({ projectImportPending: true });
+      markProjectImportPending(skipped);
+      expect(skipped.projectImportPending).toBe(false);
+    }
   });
 
   it.each([
