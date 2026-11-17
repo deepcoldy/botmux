@@ -12222,11 +12222,17 @@ export function closeSession(sessionId: string, opts?: Parameters<typeof closeSe
   if (!controller || controller.store.read(controller.ref)!.lifecycle === 'closed') return closeSessionBody(sessionId, opts);
   const key = JSON.stringify(controller.ref);
   const pending = contractCloseInFlight.get(key); if (pending) return pending;
+  // Snapshot before beginControl: any active non-close operation (cancel/
+  // suspend/restart/resume) is about to be superseded by this close. The
+  // contract retires it as `uncertain`, and its side effects are unproven, so
+  // a close that never dispatches still must not reopen input.
+  const supersededUnsettledOperation = controller.operation();
   const { operation, joined } = controller.beginControl('close'); controller.controlStarted(operation.operationId);
   // A joined close is an earlier attempt that never settled: `uncertain`, or
   // still `applying` because the daemon died mid-close. Its cancel may have
-  // run, so this attempt's pre-dispatch failure cannot prove "no effect".
-  const freshAttempt = !joined;
+  // run, so this attempt's pre-dispatch failure cannot prove "no effect". The
+  // same holds when this close superseded another unsettled operation.
+  const freshAttempt = !joined && !supersededUnsettledOperation;
   const work = controller.flushPrimary().then(() => closeSessionBody(sessionId, opts)).then(async result => {
     controller.controlResult(operation.operationId, result.ok ? 'confirmed'
       : result.effect === 'not_dispatched' && freshAttempt ? 'failed_before_effect'

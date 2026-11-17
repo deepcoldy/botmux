@@ -569,6 +569,41 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     expect(controller.allowsInput()).toBe(false);
   });
 
+  it.each([
+    { kind: 'cancel', phase: 'uncertain' },
+    { kind: 'cancel', phase: 'applying' },
+    { kind: 'suspend', phase: 'uncertain' },
+    { kind: 'restart', phase: 'uncertain' },
+    { kind: 'restart', phase: 'applying' },
+  ] as const)(
+    'keeps input fenced when a close supersedes an unsettled $kind ($phase) and then fails before dispatch',
+    async ({ kind, phase }) => {
+      const { ds, controller } = canonicalFixture();
+      // An unsettled non-close operation owns the session; input is fenced.
+      const prior = controller.beginControl(kind).operation;
+      controller.controlStarted(prior.operationId);
+      if (phase === 'uncertain') {
+        controller.controlResult(prior.operationId, 'uncertain', undefined, 'lost ack');
+      }
+      expect(controller.allowsInput()).toBe(false);
+      // No live worker: the superseding close must wake a control worker, and
+      // the wake fails before any cancel is dispatched.
+      ds.worker = null;
+      ds.remoteCloseState = undefined;
+      __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
+      await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({ ok: false, effect: 'not_dispatched' });
+      // The close cannot prove the superseded operation had no effect, so it
+      // must stay uncertain and keep the session fenced rather than reverting
+      // lifecycle to active / reopening input.
+      const state = controller.store.read(controller.ref);
+      expect(state?.lifecycle).toBe('closing');
+      expect(state?.activeOperationId).toBeTruthy();
+      expect(controller.operation()?.phase).toBe('uncertain');
+      expect(controller.operation(prior.operationId)?.phase).toBe('uncertain');
+      expect(controller.allowsInput()).toBe(false);
+    },
+  );
+
   it('uses an empty, non-deferred resume fork for the control-only wake', async () => {
     const { ds } = createFixture(false);
     const fork = vi.fn((
