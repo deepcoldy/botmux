@@ -220,10 +220,10 @@ describe('resolveCurrentTurnProvenance', () => {
       })).toThrow(/不存在或已被删除/);
     });
 
-    it('rejects a scheduled turn whose task has no ownerOpenId (legacy task)', () => {
+    it('rejects ownerless scheduled tasks, including delegated children, from workflow mutation provenance', () => {
       writeMarker('sess-1', SCHED_TURN_ID);
       writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
-      writeScheduledTask({ ownerOpenId: undefined });
+      writeScheduledTask({ ownerOpenId: undefined, ownerUnionId: undefined });
 
       expect(() => resolveCurrentTurnProvenance({
         dataDir,

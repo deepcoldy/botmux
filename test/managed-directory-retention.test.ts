@@ -90,7 +90,7 @@ describe('managed directory write barrier', () => {
     store.initializeApp(APP, []);
     const task = createTask({
       id: 't1', name: 'task', schedule: 'every 1h', prompt: 'run',
-      workingDir: a, chatId: 'oc_x', larkAppId: APP,
+      workingDir: a, chatId: 'oc_x', larkAppId: APP, owner: { kind: 'ownerless' },
     });
     // The cycle starts after the JSON projection was published, so the
     // authority INSERT is the only reference publication inside the window.
@@ -215,7 +215,7 @@ describe('managed directory write barrier', () => {
       bad: { id: 'bad', name: 'bad', schedule: 'every 1h', prompt: 'p', workingDir: join(assets, 'd'.repeat(40)), chatId: 'oc1' },
     }));
     expect(() => createTask({
-      id: 'good', name: 'good', schedule: 'every 1h', prompt: 'p', workingDir: a, chatId: 'oc2',
+      id: 'good', name: 'good', schedule: 'every 1h', prompt: 'p', workingDir: a, chatId: 'oc2', owner: { kind: 'ownerless' },
     })).not.toThrow();
   });
 
@@ -225,7 +225,7 @@ describe('managed directory write barrier', () => {
     store.initializeApp(app, []);
     const task = createTask({
       id: 'tbegin01', name: 'task', schedule: 'every 1h', prompt: 'run',
-      workingDir: a, chatId: 'oc_x', larkAppId: app,
+      workingDir: a, chatId: 'oc_x', larkAppId: app, owner: { kind: 'ownerless' },
     });
     const rawDb = store as unknown as { db: { exec(sql: string): void } };
     const expectBeginFailureReleases = (call: () => unknown): void => {

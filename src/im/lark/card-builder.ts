@@ -119,7 +119,7 @@ export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
-): { content: string } | undefined {
+): { content: string; alreadyApplied: boolean } | undefined {
   let card: any;
   try { card = JSON.parse(cardJson); } catch { return undefined; }
   if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
@@ -127,9 +127,13 @@ export function buildTurnTerminalFooterPatch(
   if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
     return undefined;
   }
-  return { content: appendTurnTerminalReceiptToFooter(
+  const content = appendTurnTerminalReceiptToFooter(
     footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
-  ) };
+  );
+  // The append is idempotent, so an unchanged footer already carries this
+  // receipt (a replayed terminal). Re-sending its fixed CardKit sequence would
+  // only conflict with later element writes on the same card.
+  return { content, alreadyApplied: content === footer.content };
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
@@ -142,7 +146,7 @@ export function contextCompactThreshold(): number {
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions', 'replyCardNextStep', 'replyCardRecap', 'replyCardRecapModel'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
   { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];
@@ -739,6 +743,7 @@ export function buildSlashListCard(
     cliName: string;
     builtin: string[];
     adapterDefaults?: string[];
+    delegatedCommands?: string[];
     custom: string[];
     discovered: { name: string; description?: string }[];
     workingDir: string;
@@ -750,6 +755,16 @@ export function buildSlashListCard(
   const { cliName, builtin, adapterDefaults = [], custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
   const asCode = (cmds: string[]) => cmds.map((c) => `\`${c}\``).join('  ');
   const elements: any[] = [];
+  if (params.delegatedCommands?.length) {
+    const commands = params.delegatedCommands;
+    elements.push({ tag: 'markdown', content: [
+      `**${t('slashlist.part_delegated', undefined, locale)}**`,
+      asCode(commands.flatMap(cmd => cmd === '/detach' ? [cmd, '/disconnect'] : [cmd])),
+      ...(commands.includes('/adopt') ? [t('help.remote_runner_adopt', undefined, locale)] : []),
+      ...(commands.includes('/detach') ? [t('help.remote_runner_detach', undefined, locale)] : []),
+    ].join('\n') });
+    elements.push({ tag: 'hr' });
+  }
 
   // ① 固定放行（内置透传白名单）
   elements.push({
@@ -1184,6 +1199,7 @@ export function buildStreamingCard(
   /** Terminal-key grid expanded state, owned by the daemon session and carried
    *  through every PATCH so streaming refreshes don't snap the grid shut. */
   keysPanelOpen = false,
+  codexAppStopTarget?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1238,10 +1254,13 @@ export function buildStreamingCard(
   }
   // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
   // starting CLI 未起，limited turn 已失败，只剩后台子任务时 ^C 也停不了后台任务。
-  // remote CLI 无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
+  // Codex App needs the native turn identity captured when this card was rendered.
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && (effectiveCliId !== 'codex-app' || codexAppStopTarget) && !backgroundWait
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
+    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', {
+      action: 'stop_turn', ...actionBase,
+      ...(codexAppStopTarget ? { codex_app_stop_target: codexAppStopTarget } : {}),
+    }));
   }
   if (adoptMode) {
     if (showTakeover) {

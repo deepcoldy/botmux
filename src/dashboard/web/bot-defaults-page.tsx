@@ -661,6 +661,9 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     goalStatusCard: body.goalStatusCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
+    replyCardNextStep: body.replyCardNextStep,
+    replyCardRecap: body.replyCardRecap,
+    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -4585,10 +4588,10 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
-  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
-  const fallback = policy?.fallback ?? 'bot-identity';
+  const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
+  const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4597,6 +4600,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     mcpAdvisory?: string;
     platformBound?: boolean;
     platformCredentialsUrl?: string;
+    crossPrincipalIsolation?: boolean;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -4628,17 +4632,23 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
-    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+    return {
+      enabled: true,
+      capabilities: next.capabilities ?? capabilities,
+      credentialSource: next.credentialSource ?? credentialSource,
+      delegateOnMention: next.delegateOnMention ?? delegateOnMention,
+      allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
+    };
   }
 
-  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  function saveWith(next: Parameters<typeof policyWith>[0]): void {
+    void save(policyWith(next));
   }
 
-  function setDelegateOnMention(next: boolean): void {
-    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
+  function toggleCapability(capability: typeof capabilities[number], on: boolean): void {
+    saveWith({ capabilities: on ? [...new Set([...capabilities, capability])] : capabilities.filter(c => c !== capability) });
   }
 
   return (
@@ -4650,34 +4660,35 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         dataAction="toggle-trigger-user-auth"
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
-        onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
-        )}
+        onChange={checked => void save(checked ? policyWith({}) : null)}
       />
       {enabled ? (
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
-              <label key={tool} className="bd-inline-check">
+            {(['lark-user', 'bytecloud', 'meego'] as const).map(capability => (
+              <label key={capability} className="bd-inline-check">
                 <input
                   type="checkbox"
-                  data-action={`trigger-user-auth-tool-${tool}`}
-                  checked={tools.includes(tool)}
+                  data-action={`trigger-user-auth-capability-${capability}`}
+                  checked={capabilities.includes(capability)}
                   disabled={busy}
-                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                  onChange={event => toggleCapability(capability, event.currentTarget.checked)}
                 />
-                <span>{tool}</span>
+                <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
               </label>
             ))}
           </div>
+          {capabilities.includes('lark-user') || policy?.legacyCapabilities ? null : (
+            <p className="bd-section-note" data-action="trigger-user-auth-lark-user-native-note">{tr('botDefaults.triggerUserAuthLarkUserNativeNote')}</p>
+          )}
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthSource')}</span>
             <select
               data-action="trigger-user-auth-source"
               value={credentialSource}
               disabled={busy}
-              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+              onChange={event => saveWith({ credentialSource: event.currentTarget.value as 'auto' | 'platform' | 'local' })}
             >
               <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
               <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
@@ -4704,10 +4715,21 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
             dataAction="toggle-trigger-user-auth-delegate-on-mention"
             title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
             help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
-            onChange={checked => setDelegateOnMention(checked)}
+            onChange={checked => saveWith({ delegateOnMention: checked })}
           />
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
-          {tools.includes('bytedcli') ? (
+          <ToggleRow
+            checked={allowSpeakerSwitch}
+            disabled={busy || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
+            dataAction="toggle-trigger-user-auth-allow-speaker-switch"
+            title={tr('botDefaults.triggerUserAuthAllowSpeakerSwitch')}
+            help={tr('botDefaults.triggerUserAuthAllowSpeakerSwitchHelp')}
+            onChange={checked => saveWith({ allowSpeakerSwitch: checked })}
+          />
+          {info?.crossPrincipalIsolation === true ? (
+            <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
+          ) : null}
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
+          {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (
@@ -6000,6 +6022,9 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
+  const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
+  const [recap, setRecap] = useState(bot.replyCardRecap === true);
+  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6017,10 +6042,13 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setGoalStatusCard(bot.goalStatusCard === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
+    setNextStep(bot.replyCardNextStep === true);
+    setRecap(bot.replyCardRecap === true);
+    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6298,6 +6326,45 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = replyActions;
                 setReplyActions(checked);
                 void savePatch({ replyCardActions: checked }, 'reply-actions', () => setReplyActions(previous));
+              }}
+            />
+            <ToggleRow
+              checked={nextStep}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-next-step"
+              title={tr('botDefaults.replyCardNextStep')}
+              description={tr('botDefaults.replyCardNextStepDescription')}
+              help={tr('botDefaults.replyCardNextStepHelp')}
+              onChange={checked => {
+                const previous = nextStep;
+                setNextStep(checked);
+                void savePatch({ replyCardNextStep: checked }, 'reply-next-step', () => setNextStep(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recap}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-recap"
+              title={tr('botDefaults.replyCardRecap')}
+              description={tr('botDefaults.replyCardRecapDescription')}
+              help={tr('botDefaults.replyCardRecapHelp')}
+              onChange={checked => {
+                const previous = recap;
+                setRecap(checked);
+                void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recapModel}
+              disabled={busy !== null || !recap}
+              dataAction="toggle-reply-card-recap-model"
+              title={tr('botDefaults.replyCardRecapModel')}
+              description={tr('botDefaults.replyCardRecapModelDescription')}
+              help={tr('botDefaults.replyCardRecapModelHelp')}
+              onChange={checked => {
+                const previous = recapModel;
+                setRecapModel(checked);
+                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>

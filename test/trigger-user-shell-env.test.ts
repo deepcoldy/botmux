@@ -18,6 +18,7 @@ import {
   sessionIdentityBinDir,
   writeSessionIdentity,
 } from '../src/core/cli-identity.js';
+import { capabilityOn } from '../src/services/trigger-user-auth.js';
 
 // worker.ts is a process entrypoint: execute its actual environment-assembly
 // block without starting a worker, rather than recreating that block in a fixture.
@@ -31,14 +32,14 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
   'perBotInjectEnv', 'sandboxRequested', 'effectiveResume',
   'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir',
-  'isMessageListenerTaskAnchor', `${assembly}\nreturn identityShellEnv;`);
+  'isMessageListenerTaskAnchor', 'capabilityOn', `${assembly}\nreturn identityShellEnv;`);
 
 function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false, path?: string, sandboxRequested = false, launch: { cliId?: string; wrapperCli?: string; path?: string } = {}): Record<string, string> {
   return assemble(
     { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } },
     { env: { PATH: path, ...(sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' }) } },
     sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, false, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
-    isMessageListenerTaskAnchor,
+    isMessageListenerTaskAnchor, capabilityOn,
   );
 }
 
@@ -206,7 +207,7 @@ describe.each([
       // tests our contract, not any particular TRAE version's inheritance policy.
       const toolEnv = { PATH: '/usr/bin:/bin', ...shellOverrides(args) };
       expect(toolEnv).not.toHaveProperty('BYTEDCLI_USER_CLOUD_JWT');
-      const run = (env: Record<string, string> = toolEnv) => spawnSync('/bin/sh', [wrapper], {
+      const run = (env: Record<string, string> = toolEnv) => spawnSync('/bin/sh', [wrapper, 'x'], {
         env, encoding: 'utf8', timeout: 5_000,
       });
       const publish = (token: string, turnId: string) => {

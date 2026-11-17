@@ -2372,6 +2372,25 @@ export interface BotConfig {
    */
   replyCardActions?: boolean;
   /**
+   * Per-bot opt-in for the「下一步」row: the CLI's own next-input suggestion
+   * (Claude Code's greyed-out prompt suggestion) as a button above the last
+   * reply card's footer. Default (undefined) keeps reply cards unchanged.
+   */
+  replyCardNextStep?: boolean;
+  /**
+   * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
+   * card's footer: files edited and commands run, plus the CLI's own recap
+   * (Claude Code's transcript away summary) once it writes one. Default
+   * (undefined) keeps reply cards unchanged.
+   */
+  replyCardRecap?: boolean;
+  /**
+   * With replyCardRecap on, also let a small model write the recap for a turn
+   * the CLI left without one (one extra model call per such turn, billed to
+   * the CLI's own credentials; Claude Code only). Default (undefined) off.
+   */
+  replyCardRecapModel?: boolean;
+  /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
    * reuses that sibling's workingDir and skips its own repo-selection card.
@@ -4602,6 +4621,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       goalStatusCard: entry.goalStatusCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,
+      replyCardNextStep: entry.replyCardNextStep === true || undefined,
+      replyCardRecap: entry.replyCardRecap === true || undefined,
+      replyCardRecapModel: entry.replyCardRecapModel === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。

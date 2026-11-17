@@ -224,7 +224,7 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         ownerOpenId: input.ownerOpenId,
       }),
       larkAppId: input.larkAppId,
-      ownerOpenId: input.ownerOpenId,
+      owner: input.ownerOpenId ? { kind: 'human', openId: input.ownerOpenId } : { kind: 'ownerless' },
       nextRunAt: computeNextRun(input.parsed) ?? undefined,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,

@@ -90,7 +90,7 @@ afterAll(() => rmSync(isolated.root, { recursive: true, force: true }));
 
 function add(extra: Record<string, unknown> = {}) {
   return scheduler.addTask({ id: `probe${String(++serial).padStart(3, '0')}`, name: 'probe',
-    schedule: 'every 1m', prompt: 'probe', workingDir: '/tmp', chatId: CHAT, larkAppId: APP, ...extra });
+    schedule: 'every 1m', prompt: 'probe', workingDir: '/tmp', chatId: CHAT, larkAppId: APP, owner: { kind: 'ownerless' }, ...extra });
 }
 function session(): Session {
   return { sessionId: `probe-session-${++serial}`, larkAppId: APP, chatId: CHAT,
@@ -196,7 +196,7 @@ describe('schedule repair adversarial overlap probes', () => {
     const scope = { scheduleAuthorityStore: store, parseScheduledTurnId, authorizeDelegatedScheduleRun,
       assertScheduledAuthorityCurrent,
       identityPublicationConflicted: () => false, delegatedScheduleRuntimeDeps: () => ({
-        runEnabled: true, hostRunScopes: ['bytedcli'], triggerUserAuthTools: ['bytedcli', 'lark-cli'],
+        runEnabled: true, hostRunScopes: ['bytedcli'], triggerUserAuth: { enabled: true, tools: ['bytedcli', 'lark-cli'] },
         adminOpenIds: ['ou_user'],
         resolveTargetOpenId: () => new Promise<string>(resolve => setTimeout(() => resolve('ou_user'), 1_000)),
         listChatMemberOpenIds: async () => ['ou_user'],

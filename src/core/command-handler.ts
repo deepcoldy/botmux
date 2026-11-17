@@ -1,9 +1,11 @@
+import { sessionDelegatedSlashCommands } from './remote-runner-slash.js';
+import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
-import { resetSessionCodexModelSelection } from './worker-pool.js';
+import { resetSessionCodexModelSelection, dshRuntimeForSession } from './worker-pool.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -16,7 +18,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf, capabilityOn } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
@@ -25,7 +27,7 @@ import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
-import { platformTeammateVerdict } from './platform-teammate.js';
+import { askPlatformToAuthorize } from './platform-authorization-request.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -65,7 +67,7 @@ import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } 
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, interruptCodexAppTurn, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -174,8 +176,6 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { readPlatformTeamSync } from '../services/platform-team-store.js';
-import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
@@ -1114,13 +1114,13 @@ async function handleScheduleCommand(
       // workflow commands as them (scheduled-turn-provenance). On the
       // sandboxed relay path the daemon re-checks the creator is still
       // allowed at every run mutation; the default non-sandbox route does
-      // not re-check membership.
-      ownerOpenId: senderOpenId,
-      // union_id is the tenant-stable half of the same identity; it is what a
-      // scheduled turn presents to per-user backends. Only stamped for human
-      // creators (see the call site) — a task created by a bot deliberately
-      // keeps no user identity.
-      ownerUnionId: senderUnionId,
+      // not re-check membership. union_id is the tenant-stable half of the
+      // same identity; it is what a scheduled turn presents to per-user
+      // backends. Only stamped for human creators (see the call site) — a
+      // task created by a bot deliberately keeps no user identity.
+      owner: senderOpenId
+        ? { kind: 'human', openId: senderOpenId, unionId: senderUnionId }
+        : { kind: 'ownerless' },
       deliver: 'origin',
       silent,
     });
@@ -1253,7 +1253,7 @@ async function applyAllowedUsersSet(
 
 function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
   const policy = botConfig.triggerUserAuth;
-  const enabled = triggerUserAuthApplies(policy, 'bytedcli');
+  const enabled = capabilityOn(policy, 'bytecloud');
   const lines = [
     t('cmd.login.bytedcli_ok', undefined, locale),
     t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
@@ -1337,7 +1337,8 @@ async function triggerUserAuthStatusLines(
   senderOpenId: string | undefined,
 ): Promise<string[]> {
   const policy = botCfg.triggerUserAuth;
-  if (!policy?.enabled || !policy.tools.length) return [];
+  const on = (capability: 'lark-user' | 'bytecloud' | 'meego') => capabilityOn(policy, capability);
+  if (!on('lark-user') && !on('bytecloud') && !on('meego')) return [];
   const brand = normalizeBrand(botCfg.brand);
   // lark-cli acts as the person via either the new per-person device-code HOME
   // or a legacy bot-app OAuth token. Both must count (and /login status reads the
@@ -1349,29 +1350,30 @@ async function triggerUserAuthStatusLines(
   const larkAuthorized = senderOpenId !== undefined
     && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
 
-  const bytedStatus = policy.tools.includes('bytedcli') ? await bytedcliLoginStatus(senderOpenId) : undefined;
+  const bytedStatus = on('bytecloud') ? await bytedcliLoginStatus(senderOpenId) : undefined;
   const lines = ['Trigger-user auth: 已开启'];
-  for (const tool of policy.tools) {
-    lines.push(`  ${tool}: ${
-      tool === 'lark-cli'
-        ? larkAuthorized
-          ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
-          // lark-cli no longer degrades to the bot's own identity: an
-          // unauthorized call is refused, and the refusal carries a ready
-          // device-code link. Saying "running as the bot" here would describe a
-          // fallback that the turn path does not have.
-          : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
-        // ByteCloud is a separate identity provider, so this is a genuinely
-        // different verdict from the Lark line above — the same person can be
-        // authorized for one and refused by the other. There is no bot identity
-        // to degrade to here either; the mint path tries the existing HOME even
-        // while a fresh challenge is pending; ask the provider for the current status.
-        : bytedStatus === 'unavailable'
-          ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
-          : bytedStatus === 'authorized'
+  if (on('lark-user')) {
+    lines.push(`  lark-user: ${
+      larkAuthorized
+        ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
+        // lark-cli never degrades to the bot's own identity: an unauthorized
+        // call is refused, and the refusal carries a ready device-code link.
+        : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
+    }`);
+  }
+  if (on('bytecloud')) {
+    // ByteCloud is a separate identity provider from Lark, so this verdict can
+    // differ from the Lark line above; there is no bot identity to degrade to.
+    lines.push(`  bytecloud（bytedcli / codebase / git push / bitscli）: ${
+      bytedStatus === 'unavailable'
+        ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
+        : bytedStatus === 'authorized'
           ? '以你自己的身份调用'
           : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
+  }
+  if (on('meego')) {
+    lines.push('  meego（bytedcli meego）: 以你自己的 Meego 登录调用；还没登录时首次调用会私下发你登录链接，也可以发 /login meego');
   }
   return lines;
 }
@@ -1856,7 +1858,7 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   if (result.ok) {
     const cliName = sessionCliDisplayName(result.ds);
     const resultLoc = localeForBot(result.ds.larkAppId);
-    return resumeSuccessMessage(result, cliName, resultLoc);
+    return resumeSuccessMessage(result, cliName, resultLoc, dshRuntimeForSession(result.ds));
   }
   switch (result.error) {
     case 'not_closed': return t('card.action.resume_not_closed', undefined, loc);
@@ -3083,7 +3085,12 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
           break;
         }
-        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+        if (effectiveCliId === 'codex-app' && !isRemoteBackendSession(ds)) {
+          const status = await interruptCodexAppTurn(ds);
+          await sessionReply(rootId, t(`cmd.stop.app_${status}`, undefined, loc));
+          break;
+        }
+        if (ds.initConfig?.codexRpcInput === true || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
         }
@@ -3315,6 +3322,7 @@ export async function handleCommand(
                   whiteboardId: current.session.whiteboardId,
                   substituteTrigger: current.pendingSubstituteTrigger,
                   codexAppText: current.pendingCodexAppText,
+                  acceptedInput: current.pendingAcceptedInput,
                   codexAppApplicationContext: current.pendingCodexAppApplicationContext,
                   codexAppMessageContext: current.pendingCodexAppMessageContext,
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
@@ -3388,6 +3396,7 @@ export async function handleCommand(
             publishAttentionPatch(current);
             current.pendingPrompt = undefined;
             current.pendingCodexAppText = undefined;
+            current.pendingAcceptedInput = undefined;
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
@@ -3907,6 +3916,8 @@ export async function handleCommand(
         // (same post-acceptance pattern as the daemon's live-worker path).
         markRetryAttempt(ds.session);
         rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+        // The retry is this session's latest turn now: retire the previous card's rows.
+        noteReplyCardTurnStarted(ds, retryTurnId);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
@@ -4330,14 +4341,16 @@ export async function handleCommand(
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
+        const scheduleSenderIsUser = message.senderType === 'user';
         await handleScheduleCommand(
-          scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId,
+          scheduleArgs, rootId, chatId, deps, larkAppId,
           // Non-human senders (bots, and anything else Lark reports as an app)
           // must not hand their own identity to a task: a bot-created task that
           // could query as itself would let any caller of that bot borrow its
-          // access, with the audit trail pointing at the bot. Withholding the
-          // union_id here is what makes such a task fail closed later.
-          message.senderType === 'user' ? message.senderUnionId : undefined,
+          // access, with the audit trail pointing at the bot. Such a task is
+          // ownerless and fails closed later.
+          scheduleSenderIsUser ? message.senderId : undefined,
+          scheduleSenderIsUser ? message.senderUnionId : undefined,
         );
         logger.info(`[${logTag}] Schedule command handled`);
         break;
@@ -4558,12 +4571,11 @@ export async function handleCommand(
         // bare and explicit forms; status/done must not report one either.
         const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
           && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
-        // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
-        // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
+        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 与显式的
+        // /login lark|bytedcli 都请平台给本人发授权卡片，平台没有该端点时回退到平台凭据页。
         const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
         const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const bytedcliGoverned = capabilityOn(botCfg2.triggerUserAuth, 'bytecloud');
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
@@ -4580,8 +4592,8 @@ export async function handleCommand(
             break;
           }
           const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
-          if (!bytedcliGoverned) {
-            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+          if (!capabilityOn(botCfg2.triggerUserAuth, 'meego')) {
+            await sessionReply(rootId, t('cmd.login.meego_native', undefined, loc));
             break;
           }
           if (!isUsableOpenId(loginOpenId)) {
@@ -4600,37 +4612,33 @@ export async function handleCommand(
           }
           break;
         }
+        // A capability that is off is native: this bot never runs it as the
+        // person, so there is nothing to authorize and no link is minted.
+        const nativeLogin = (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ') && !/^bytedcli\s+(done|完成)$/.test(subCmd)) && !bytedcliGoverned ? 'ByteCloud'
+          : (subCmd === 'lark' || subCmd.startsWith('lark ')) && !larkGoverned && !larkBound ? t('trigger_user_auth.provider_lark', undefined, loc)
+            : undefined;
+        if (nativeLogin) {
+          await sessionReply(rootId, t('cmd.login.native', { provider: nativeLogin }, loc));
+          break;
+        }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {
           await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
           break;
         }
-        if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
-          // The platform only issues to the machine owner or a teammate of theirs.
-          // Someone outside every team would authorize there and still get nothing
-          // here, so tell them that up front and offer what does work.
-          const senderUnionId = message.senderUnionId
-            ?? (loginOpenId ? (await resolveUserUnionId(botCfg2.larkAppId, loginOpenId)).unionId : undefined);
-          const owner = platformMachineOwner();
-          const teammate = platformTeammateVerdict({
-            senderUnionId,
-            ownerUnionId: owner.unionId,
-            teams: readPlatformTeamSync(config.session.dataDir),
+        if (platformCredsUrl && (subCmd === '' || explicitGoverned)) {
+          const asked = await askPlatformToAuthorize({
+            botConfig: botCfg2,
+            ...(isUsableOpenId(loginOpenId) ? { openId: loginOpenId } : {}),
+            ...(message.senderUnionId ? { unionId: message.senderUnionId } : {}),
           });
-          if (teammate === 'not_teammate') {
-            const localCommands = [larkGoverned ? '/login lark' : '', bytedcliGoverned ? '/login bytedcli' : '']
-              .filter(Boolean).join(t('cmd.login.platform_not_teammate_or', undefined, loc));
-            await authLinkReply([
-              t('cmd.login.platform_not_teammate_title', undefined, loc), '',
-              t('cmd.login.platform_not_teammate_body', {
-                owner: owner.name ?? t('cmd.login.platform_not_teammate_owner_fallback', undefined, loc),
-              }, loc), '',
-              credSource === 'auto'
-                ? t('cmd.login.platform_not_teammate_local', { commands: localCommands }, loc)
-                : t('cmd.login.platform_not_teammate_platform_only', undefined, loc),
-              t('cmd.login.platform_not_teammate_join', { url: platformCredsUrl }, loc),
-            ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
+          if (asked.kind !== 'legacy') {
+            await sessionReply(rootId, asked.kind === 'sent' ? t('cmd.login.platform_sent', undefined, loc)
+              : asked.kind === 'ready' ? t('cmd.login.platform_ready', undefined, loc)
+                : asked.kind === 'undeliverable' ? t('cmd.login.platform_undeliverable', { url: platformCredsUrl }, loc)
+                  : asked.kind === 'request_cap' ? t('cmd.login.platform_request_cap', { url: platformCredsUrl }, loc)
+                    : t('cmd.login.platform_unavailable', undefined, loc));
             break;
           }
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
@@ -4638,17 +4646,13 @@ export async function handleCommand(
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
             ? t('trigger_user_auth.provider_lark', undefined, loc)
             : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
-          const lines = [
+          await authLinkReply([
             t('cmd.login.platform_title', undefined, loc), '',
             t('cmd.login.platform_step1', { provider }, loc),
             platformCredsUrl, '',
             t('cmd.login.platform_step2', undefined, loc), '',
             t('cmd.login.platform_note', { tool: which }, loc),
-          ];
-          if (credSource === 'auto' && subCmd === '') {
-            lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
-          }
-          await authLinkReply(lines.join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
+          ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
           break;
         }
 
@@ -4677,11 +4681,11 @@ export async function handleCommand(
             if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
           } else if (larkBound) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
-          } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+          } else if (!platformCredsUrl && loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
-          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+          if (!platformCredsUrl && loginOpenId && bytedcliGoverned) {
             const status = await bytedcliLoginStatus(loginOpenId);
             lines.push(t(
               status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
@@ -4690,6 +4694,9 @@ export async function handleCommand(
               undefined,
               loc,
             ));
+          }
+          if (loginOpenId && capabilityOn(botCfg2.triggerUserAuth, 'meego')) {
+            lines.push(t('cmd.login.meego_status', undefined, loc));
           }
           // Legacy bot-app OAuth status when lark-cli is not governed by the
           // per-person device-code flow.
@@ -7054,8 +7061,9 @@ export async function handleCommand(
           : [];
         const mcpServers = listMcpServerNames(workingDir);
 
+        const delegatedCommands = [...sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType)];
         const card = buildSlashListCard(
-          { cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
+          { delegatedCommands, cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
         );
         await sessionReply(rootId, card, 'interactive');
@@ -7071,6 +7079,7 @@ export async function handleCommand(
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
+        const delegatedCommands = sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType);
         const help = [
           t('help.heading_session', undefined, loc),
           ...(['codex', 'codex-app'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? '')
@@ -7124,11 +7133,11 @@ export async function handleCommand(
           t('help.schedule_formats', undefined, loc),
           '',
           t('help.heading_adopt', undefined, loc),
-          t('help.adopt', undefined, loc),
-          t('help.adopt_pane', undefined, loc),
-          t('help.adopt_orca', undefined, loc),
+          ...(delegatedCommands.has('/adopt')
+            ? [t('help.remote_runner_adopt', undefined, loc)]
+            : [t('help.adopt', undefined, loc), t('help.adopt_pane', undefined, loc), t('help.adopt_orca', undefined, loc)]),
           t('help.resume', { cliName }, loc),
-          t('help.detach', undefined, loc),
+          t(delegatedCommands.has('/detach') ? 'help.remote_runner_detach' : 'help.detach', undefined, loc),
           '',
           t('help.heading_collab', undefined, loc),
           t('help.introduce', undefined, loc),

@@ -177,6 +177,28 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+// The「下一步」row's card writes, recorded instead of sent. Only the re-fork
+// cases below put a row on a card; any other turn start finds none to move.
+const nextStepWrites = vi.hoisted(() => [] as string[]);
+vi.mock('../src/core/next-step-io.js', () => {
+  const card = JSON.stringify({ schema: '2.0', body: { elements: [
+    { tag: 'markdown', content: 'answer' },
+    { tag: 'markdown', element_id: 'botmux_reply_footer', content: 'signature' },
+  ] } });
+  return { nextStepIo: {
+    enabled: () => true,
+    locale: () => 'zh',
+    issue: (_ds: unknown, prompt: string) => ({ payload: prompt, sig: 'sig' }),
+    readCard: async () => card,
+    cardId: async (_ds: unknown, messageId: string) => `card_${messageId}`,
+    insert: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`insert ${messageId}`); },
+    replace: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`replace ${messageId}`); },
+    remove: async (_ds: unknown, _cardId: string, messageId: string) => { nextStepWrites.push(`remove ${messageId}`); },
+    now: () => Date.now(),
+    warn: () => {},
+  } };
+});
+
 import { mkdirSync, readFileSync } from 'node:fs';
 
 import { getBot, registerBot } from '../src/bot-registry.js';
@@ -205,6 +227,13 @@ import {
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
+import {
+  nextStepIdle,
+  noteNextStepCard,
+  noteNextStepSuggestion,
+  noteNextStepTurnStarted,
+} from '../src/core/next-step-suggestion.js';
+import { nextStepIo } from '../src/core/next-step-io.js';
 
 const APP = 'ingress_notice_app';
 const CHAT = 'oc_ingress_notice_chat';
@@ -279,6 +308,16 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
   } as unknown as DaemonSession;
   activeSessions.set(sessionKey(anchor, APP), ds);
   return ds;
+}
+
+/** The previous turn ended with a「下一步」row on its card. */
+async function seedNextStepRow(ds: DaemonSession, turnId: string, messageId: string): Promise<void> {
+  nextStepWrites.length = 0;
+  noteNextStepTurnStarted(ds, turnId, nextStepIo);
+  noteNextStepCard(ds, turnId, { kind: 'legacy', messageId }, nextStepIo);
+  noteNextStepSuggestion(ds, turnId, '继续', nextStepIo);
+  await nextStepIdle(ds);
+  expect(nextStepWrites).toEqual([`insert ${messageId}`]);
 }
 
 /** All text replied through the mocked Lark client in this test, joined. */
@@ -700,6 +739,22 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.completedIdleTurnId).toBeUndefined();
   });
 
+  it('takes the previous turn\'s「下一步」row off when a reply re-forks the worker', async () => {
+    const anchor = 'om_thread_refork_next_step';
+    const ds = seedThreadSession(anchor, 'seeded');
+    // The worker went away (suspend / crash) after the previous turn's row went on.
+    await seedNextStepRow(ds, 'om_turn_before', 'om_card_before');
+    await handleThreadReply(makeEventData('om_turn_refork', 'new task', anchor), makeCtx(anchor, 'om_turn_refork'));
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    await nextStepIdle(ds);
+    expect(nextStepWrites).toEqual(['insert om_card_before', 'remove om_card_before']);
+    // The re-forked turn is the latest one: its own card gets its row.
+    noteNextStepCard(ds, 'om_turn_refork', { kind: 'legacy', messageId: 'om_card_refork' }, nextStepIo);
+    noteNextStepSuggestion(ds, 'om_turn_refork', '合码', nextStepIo);
+    await nextStepIdle(ds);
+    expect(nextStepWrites).toEqual(['insert om_card_before', 'remove om_card_before', 'insert om_card_refork']);
+  });
+
   it('cold-resumes the same dormant session and native CLI lineage from its original Lark anchor', async () => {
     const anchor = 'om_thread_dormant_cold_resume';
     const turnId = 'om_dormant_follow_up';
@@ -910,6 +965,26 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.failedIdleTurnId).toBeUndefined();
     expect(ds.silentIdleTurnId).toBeUndefined();
     expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('takes the previous turn\'s「下一步」row off when a document comment re-forks the worker', async () => {
+    const anchor = 'om_doc_refork_next_step';
+    const ds = seedThreadSession(anchor, 'seeded');
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const sub: DocSubscription = { fileToken: 'doc_refork_next_step', fileType: 'docx', sessionAnchor: anchor,
+      sessionId: ds.session.sessionId, scope: 'thread', chatId: CHAT, commentTriggerMode: 'mention-only', ownerOpenId: OWNER, createdAt: Date.now() };
+    putDocSubscription(mocks.dataDir, APP, sub);
+    // The real forkWorker also takes the admission callbacks the mock's type omits.
+    mocks.forkWorker.mockImplementationOnce(((target: any, _input: unknown, _options: unknown, admission: any) => {
+      target.worker = { killed: false, send: vi.fn() };
+      admission.onAdmission('accepted');
+      return target.worker;
+    }) as (ds: any) => void);
+    await seedNextStepRow(ds, 'om_turn_before_comment', 'om_card_before_comment');
+    expect(await __testOnly_handleDocComment({ larkAppId: APP, sub, commentId: 'comment_refork_next_step', text: 'new comment', authorOpenId: OWNER })).toBe(true);
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    await nextStepIdle(ds);
+    expect(nextStepWrites).toEqual(['insert om_card_before_comment', 'remove om_card_before_comment']);
   });
 
   it('successful delivery sends no failure notice', async () => {

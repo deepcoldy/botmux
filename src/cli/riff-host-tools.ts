@@ -208,11 +208,16 @@ export async function callRiffHostTool(binding: RiffHostBinding, request: RiffHo
 export function restoreRiffHostAttachments(result: RiffHostResult): RiffHostResult {
   if (!result.attachments?.length) return result;
   const directory = mkdtempSync(join(tmpdir(), 'botmux-riff-quoted-'));
-  const parsed = JSON.parse(result.stdout) as { attachments?: Array<{ path: string }> };
+  type Holder = { attachments?: Array<{ path: string }>; messages?: Holder[] };
+  const parsed = JSON.parse(result.stdout) as Holder;
+  // Single quoted carries top-level attachments; batch quoted nests them per
+  // message. The host numbers placeholders across both shapes.
+  const references = [parsed, ...(Array.isArray(parsed.messages) ? parsed.messages : [])]
+    .flatMap(holder => (holder && Array.isArray(holder.attachments) ? holder.attachments : []));
   for (const [index, item] of result.attachments.entries()) {
     const path = join(directory, `${index}-${basename(item.name)}`);
     writeFileSync(path, Buffer.from(item.dataBase64, 'base64'), { mode: 0o600 });
-    for (const attachment of parsed.attachments ?? []) {
+    for (const attachment of references) {
       if (attachment.path === item.placeholder) attachment.path = path;
     }
   }
