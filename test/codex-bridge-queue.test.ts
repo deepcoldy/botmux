@@ -745,6 +745,43 @@ describe('CodexBridgeQueue', () => {
       .map(turn => turn.turnId)).toEqual(['verifying']);
   });
 
+  it('keeps a quarantined delivery head past every lease until the flag clears', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('parked', 'draft waiting in the TRAE composer', now);
+    q.beginSubmitVerification('parked', now);
+    now = 500;
+    q.finishSubmitVerification('parked', now);
+    q.setInputDeliveryQuarantined('parked', true);
+    // Past both verification and attribution graces: an ordinary unattributed
+    // head would be pruned here, but a quarantined draft must survive so a
+    // later manual submit can still release the successors held behind it.
+    const expired = now + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS
+      + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads(expired)).toEqual([]);
+    expect(q.hasPendingTurn('parked')).toBe(true);
+    // Clearing the flag makes the same head prunable again instead of
+    // pinning it forever.
+    q.setInputDeliveryQuarantined('parked', false);
+    expect(q.pruneExpiredPreStartHeads(expired).map(turn => turn.turnId)).toEqual(['parked']);
+  });
+
+  it('scopes the quarantine flag to the exact dispatch attempt', () => {
+    const q = new CodexBridgeQueue(() => 100);
+    q.mark('retry', 'first attempt', 100, undefined);
+    q.mark('retry', 'replayed attempt', 100, 1);
+    q.setInputDeliveryQuarantined('retry', true);
+    expect(q.peek().map(turn => [turn.turnId, turn.dispatchAttempt, turn.inputDeliveryQuarantined === true]))
+      .toEqual([['retry', undefined, true], ['retry', 1, false]]);
+    // Clearing a replay attempt must not touch the original attempt's flag:
+    // the worker releases each quarantine with its own dispatchAttempt.
+    q.setInputDeliveryQuarantined('retry', false, 1);
+    expect(q.peek().map(turn => [turn.dispatchAttempt, turn.inputDeliveryQuarantined === true]))
+      .toEqual([[undefined, true], [1, false]]);
+    q.setInputDeliveryQuarantined('retry', false, undefined);
+    expect(q.peek().every(turn => turn.inputDeliveryQuarantined === undefined)).toBe(true);
+  });
+
   it('atomically transitions in-flight verification to a confirmed start lease', () => {
     const q = new CodexBridgeQueue();
     q.mark('verified', 'confirmed after polling', 100);

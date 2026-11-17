@@ -49,7 +49,7 @@ import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
-import { traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
+import { traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 /**
  * Worker process: manages a single CLI PTY session + web terminal.
@@ -16489,6 +16489,7 @@ async function writeAdoptMessage(
             deliveryQuarantine = armInputDeliveryQuarantine(
               submissionBackend,
               { turnId, dispatchAttempt },
+              content,
             );
           }
           scheduleSubmitFailureNotify(
@@ -19966,8 +19967,11 @@ let ambiguousSubmissionRecoveryHold: {
 interface InputDeliveryQuarantine {
   backend: SessionBackend;
   generation: number;
+  draftContent: string;
   turnId?: string;
   dispatchAttempt?: number;
+  draftRescueAttempted?: true;
+  submitWarningSent?: true;
 }
 let inputDeliveryQuarantine: InputDeliveryQuarantine | null = null;
 const inputDeliveryEvidence = new InputDeliveryEvidenceTracker();
@@ -20084,6 +20088,7 @@ function currentInputDeliveryQuarantine(): InputDeliveryQuarantine | null {
 function armInputDeliveryQuarantine(
   target: SessionBackend,
   item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+  draftContent: string,
 ): InputDeliveryQuarantine | null {
   if (cliAdapter?.quarantineUnconfirmedSubmits !== true || backend !== target) return null;
   // The native terminal may have been emitted while writeInput was still
@@ -20095,12 +20100,16 @@ function armInputDeliveryQuarantine(
   const quarantine: InputDeliveryQuarantine = {
     backend: target,
     generation: cliSpawnGeneration,
+    draftContent,
     ...(item.turnId ? { turnId: item.turnId } : {}),
     ...(item.dispatchAttempt !== undefined
       ? { dispatchAttempt: item.dispatchAttempt }
       : {}),
   };
   inputDeliveryQuarantine = quarantine;
+  if (lastInitConfig?.cliId === 'traex' && item.turnId && item.dispatchAttempt === undefined) {
+    codexBridgeQueue.setInputDeliveryQuarantined(item.turnId, true);
+  }
   log(
     `Quarantined input delivery for backend generation ${quarantine.generation} `
     + `after unconfirmed submit turn=${quarantine.turnId ?? '-'} `
@@ -20116,6 +20125,9 @@ function releaseInputDeliveryQuarantine(
 ): boolean {
   if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
   inputDeliveryQuarantine = null;
+  if (quarantine.turnId) {
+    codexBridgeQueue.setInputDeliveryQuarantined(quarantine.turnId, false, quarantine.dispatchAttempt);
+  }
   log(`Released input-delivery quarantine (${reason})`);
   if (opts.redriveTerminal) {
     queueMicrotask(() => {
@@ -21819,6 +21831,23 @@ function scheduleSubmitFailureNotify(
     cliGeneration: cliGenerationAtSchedule,
   }) ?? Date.now();
   const backendAtSchedule = backend;
+  const externalInputGenerationAtWrite = inputDeliveryEvidence.externalInputGenerationAtWrite({
+    turnId: turnIdentity?.turnId,
+    dispatchAttempt: turnIdentity?.dispatchAttempt,
+    cliGeneration: cliGenerationAtSchedule,
+  });
+  const interruptGenerationAtWrite = inputDeliveryEvidence.interruptGenerationAtWrite({
+    turnId: turnIdentity?.turnId,
+    dispatchAttempt: turnIdentity?.dispatchAttempt,
+    cliGeneration: cliGenerationAtSchedule,
+  });
+  const quarantineAtSchedule = lastInitConfig?.cliId === 'traex' && structuredTarget
+    ? currentInputDeliveryQuarantine() : null;
+  const retainTraexReceipt = lastInitConfig?.cliId === 'traex'
+    && structuredTarget && !!recheck && !!bridgeTurnId
+    && !!quarantineAtSchedule && turnIdentity?.dispatchAttempt === undefined
+    && quarantineAtSchedule?.turnId === turnIdentity?.turnId;
+  const draftContent = quarantineAtSchedule?.draftContent ?? msg;
   const deferredAttemptIsCurrent = (): boolean => (
     cliSpawnGeneration === cliGenerationAtSchedule
     && backendAtSchedule !== null
@@ -21860,6 +21889,7 @@ function scheduleSubmitFailureNotify(
       log(`Discarded stale deferred submit recheck (${settlement.staleReason}) turn=${bridgeTurnId ?? '-'} attempt=${turnIdentity?.dispatchAttempt ?? '-'}`);
       return;
     }
+    if (retainTraexReceipt && currentInputDeliveryQuarantine() !== quarantineAtSchedule) return;
     if (settlement.recheckError !== undefined) {
       const err = settlement.recheckError as any;
       log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
@@ -21868,6 +21898,18 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        // history.jsonl is shared by every TRAE pane under one TRAE_HOME, and
+        // the adapter's any-text fallback confirms on a same-text line from a
+        // SIBLING pane without an owned cliSessionId. Releasing the parked-draft
+        // quarantine on that evidence would redrive successors into the still
+        // parked composer as one merged message. Keep read-only polling until
+        // an owned receipt (cliSessionId) or a native structured terminal
+        // releases the quarantine via its exact-turn path.
+        if (retainTraexReceipt && !cliSessionId) {
+          log(`Deferred recheck saw an unattributed same-text receipt — keeping TRAE draft quarantine. preview="${preview}"`);
+          armDeferredRecheck();
+          return;
+        }
         traexFirstSubmitConfirmed = true;
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
           acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
@@ -21895,6 +21937,12 @@ function scheduleSubmitFailureNotify(
         redriveRejectedStructuredReady();
         return;
       case 'suppress-usage-limit':
+        if (retainTraexReceipt) {
+          // A quota notice is not an exact receipt or cancellation of the
+          // parked draft. Keep its later manual-submit path observable.
+          armDeferredRecheck();
+          return;
+        }
         dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
         redriveRejectedStructuredReady();
         log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
@@ -21944,6 +21992,70 @@ function scheduleSubmitFailureNotify(
       cliId: lastInitConfig?.cliId,
       lastActivityAtMs: lastPtyActivityAtMs,
     });
+    // Receipt checks are read-only. A parked TRAE draft gets at most one
+    // additional submit, after a fresh authoritative composer and a second
+    // receipt check; any manual input disables this automatic intervention.
+    const traexRescueEligible = retainTraexReceipt && !quarantineAtSchedule!.draftRescueAttempted && !quarantineAtSchedule!.submitWarningSent
+      && !lastInitConfig?.adoptMode
+      && externalInputGenerationAtWrite !== undefined
+      && externalInputGenerationAtWrite === webTerminalInputGeneration
+      && interruptGenerationAtWrite !== undefined
+      && interruptGenerationAtWrite === cliInterruptGeneration
+      && backendScreenEvidenceIsAuthoritativeForMutation();
+    const traexDraftVisible = traexRescueEligible
+      && traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
+    const traexDraftReady = traexDraftVisible
+      && traexComposerHoldsInput(submitDiagnosisScreen, draftContent);
+    if (traexDraftVisible && !traexDraftReady
+      && Date.now() - activityBaselineMs < FIRST_PROMPT_HARD_TIMEOUT_MS) {
+      // The provisional startup composer can display the pasted draft while its
+      // native thread is still unable to accept Enter. Wait for initialization
+      // instead of spending the sole rescue or warning while recovery is due.
+      log('Deferred recheck: TRAE draft is visible but the native thread is not ready — waiting before rescue');
+      armDeferredRecheck();
+      return;
+    }
+    if (traexDraftReady) {
+      const freshScreen = await traexQuestionCapture();
+      if (!chainIsCurrent() || !deferredAttemptIsCurrent()) return;
+      if (externalInputGenerationAtWrite === webTerminalInputGeneration
+        && interruptGenerationAtWrite === cliInterruptGeneration
+        && freshScreen && traexComposerHoldsInput(freshScreen, draftContent)) {
+        const receipt = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
+          turnId: bridgeTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt,
+          structuredTarget, recheck,
+          usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
+          activityEvidence: () => submitActivityEvidenceSince(activityBaselineMs, turnIdentity),
+          isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent),
+        });
+        if (!chainIsCurrent() || !deferredAttemptIsCurrent()) return;
+        if (currentInputDeliveryQuarantine() !== quarantineAtSchedule) return;
+        if (receipt.stale) return;
+        if (receipt.action.kind === 'suppress-confirmed'
+          || (receipt.action.kind === 'suppress-active' && receipt.action.evidence !== 'pty-output')) {
+          armDeferredRecheck();
+          return;
+        }
+        if (receipt.recheckError === undefined
+          && receipt.action.kind !== 'suppress-usage-limit'
+          && externalInputGenerationAtWrite === webTerminalInputGeneration
+          && interruptGenerationAtWrite === cliInterruptGeneration) {
+          quarantineAtSchedule!.draftRescueAttempted = true;
+          if (cliAdapter?.pressComposerSubmit?.(adapterInputHandle(backendAtSchedule!))) {
+            log('Deferred recheck: unchanged TRAE composer holds the original draft — pressing submit once');
+            armDeferredRecheck();
+            return;
+          }
+        }
+      }
+    }
+    // The one-shot notice does not prove the message can never be submitted.
+    // Retain attribution and keep reading the original receipt while this
+    // exact quarantine exists, so manual submission also releases successors.
+    if (retainTraexReceipt && quarantineAtSchedule!.submitWarningSent) {
+      armDeferredRecheck();
+      return;
+    }
     // 正面忙碌证据：CLI 此刻正在跑一轮（适配器 busyPattern，如 ZCode 的
     // "esc to interrupt"）。输入框里卡着的草稿显示的是空闲页脚，所以忙碌页脚
     // 只可能来自"某个输入已被接受并正在执行"。确认回执在多个 CLI 上要等这一轮
@@ -22033,10 +22145,14 @@ function scheduleSubmitFailureNotify(
     }
     log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
 
-    dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
+    if (!retainTraexReceipt) dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     emitDurableTerminal('submit_unconfirmed');
+    if (retainTraexReceipt) {
+      quarantineAtSchedule!.submitWarningSent = true;
+      armDeferredRecheck();
+    }
     if (turnIdentity?.dispatchAttempt === undefined) {
       const notice = submitUnconfirmedNotice({
         screen: submitDiagnosisScreen,
@@ -23643,7 +23759,7 @@ async function flushPending(): Promise<void> {
             notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
           } else {
             if (submissionBackend && normalWritePrepared) {
-              deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+              deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item, msg);
               if (deliveryQuarantine) inflightInputs.forget(item);
             }
             scheduleSubmitFailureNotify(
@@ -23733,7 +23849,7 @@ async function flushPending(): Promise<void> {
           codexAppLivenessHandle,
         );
         if (!result.failureReason && !recoveryFailureReason && submissionBackend) {
-          deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+          deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item, msg);
           if (deliveryQuarantine) inflightInputs.forget(item);
         }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
@@ -35367,7 +35483,7 @@ function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: nu
   turnExecutionClock.start(turnId, dispatchAttempt, startedAtMs);
   inputDeliveryEvidence.start({
     turnId, dispatchAttempt, cliGeneration: cliSpawnGeneration,
-  }, startedAtMs);
+  }, startedAtMs, webTerminalInputGeneration, cliInterruptGeneration);
   if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
 }
 
