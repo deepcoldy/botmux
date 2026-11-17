@@ -244,7 +244,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
-import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { contentAuditRedactionOutcome, sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
@@ -2086,6 +2086,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2146,6 +2147,7 @@ export function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   return scheduleCardPatch(ds, cardJson);
 }
@@ -2376,6 +2378,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2465,6 +2468,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2554,6 +2558,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -4599,6 +4604,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -6364,6 +6370,7 @@ function reconcilePostedStartingCard(
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -6486,6 +6493,7 @@ async function postTurnStartingStatusCard(
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
 
   ds.streamCardNonce = nonce;
@@ -6646,6 +6654,7 @@ export async function postFreshStreamingCard(
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -12032,6 +12041,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     substituteCardControlFor(ds),
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
+    resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
   );
 }
 
@@ -20634,6 +20644,7 @@ function setupWorkerHandlers(
               substituteCardControlFor(ds),
               ds.keysPanelOpen === true,
               codexAppStopCardTarget(ds),
+              resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
             );
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             await updateMessage(restoredAppId, restoredCardId, streamCardJson, { beforeWrite: () => {
@@ -20766,6 +20777,7 @@ function setupWorkerHandlers(
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
             codexAppStopCardTarget(ds),
+            resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             restoreFreshReadyPrePostIdentityForRetirement();
@@ -21752,6 +21764,7 @@ function setupWorkerHandlers(
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
             codexAppStopCardTarget(ds),
+            resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -21890,6 +21903,7 @@ function setupWorkerHandlers(
             substituteCardControlFor(ds),
             ds.keysPanelOpen === true,
             codexAppStopCardTarget(ds),
+            resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -22020,6 +22034,7 @@ function setupWorkerHandlers(
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson, msg.turnId);
         break;
@@ -22528,6 +22543,7 @@ function setupWorkerHandlers(
               substituteCardControlFor(ds),
               ds.keysPanelOpen === true,
               codexAppStopCardTarget(ds),
+              resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -22641,6 +22657,7 @@ function setupWorkerHandlers(
               substituteCardControlFor(ds),
               ds.keysPanelOpen === true,
               codexAppStopCardTarget(ds),
+              resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
             );
             scheduleCardPatch(ds, frozenCard);
           }

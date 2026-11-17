@@ -6,6 +6,10 @@ import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('exposes folded layout as default-on and preserves explicit classic layout', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).streamingCardFoldedLayout).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { streamingCardFoldedLayout: false }).streamingCardFoldedLayout).toBe(false);
+  });
   it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: false }).cotEnabled).toBe(false);
     expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: false, cotEnabled: true }).cotEnabled).toBe(true);

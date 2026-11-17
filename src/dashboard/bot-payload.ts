@@ -231,6 +231,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
     replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
     hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
+    streamingCardFoldedLayout: j?.streamingCardFoldedLayout !== false,
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,

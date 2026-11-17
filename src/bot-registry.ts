@@ -2270,6 +2270,8 @@ export interface BotConfig {
   replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
   /** Main controls omitted from live streaming cards. Missing means show all. */
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
+  /** Fold low-frequency live-card controls. Default on; false restores the classic layout. */
+  streamingCardFoldedLayout?: boolean;
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -4582,6 +4584,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
       replyCardNativeCot: entry.replyCardNativeCot === true ? true : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
+      streamingCardFoldedLayout: entry.streamingCardFoldedLayout === false ? false : undefined,
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       cotEnabled: normalizeCotEnabled(entry) ? undefined : false,

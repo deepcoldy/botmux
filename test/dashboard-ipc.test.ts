@@ -2557,6 +2557,47 @@ describe('PUT /api/bot-card-prefs — goal status card', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — folded layout', () => {
+  it('defaults to folded, persists classic layout and rejects malformed values', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-folded-layout-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-folded-layout-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).streamingCardFoldedLayout).toBe(true);
+      const off = await put({ streamingCardFoldedLayout: false });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, streamingCardFoldedLayout: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].streamingCardFoldedLayout).toBe(false);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).streamingCardFoldedLayout).toBe(false);
+      const disk = readFileSync(configPath, 'utf-8');
+      const invalid = await put({ streamingCardFoldedLayout: 'false', privateCard: true });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_streaming_card_folded_layout' });
+      expect(readFileSync(configPath, 'utf-8')).toBe(disk);
+      const on = await put({ streamingCardFoldedLayout: true });
+      expect(await on.json()).toMatchObject({ ok: true, streamingCardFoldedLayout: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('streamingCardFoldedLayout');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
   it('persists the default-off toggle and rejects incompatible sandbox config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-browser-'));

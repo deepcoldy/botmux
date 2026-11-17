@@ -68,6 +68,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   disableStreamingCard: boolean;
   replyCardMode: ReplyCardMode;
   hiddenStreamingCardButtons: StreamingCardButtonId[];
+  /** Default true; only false is persisted to restore the classic live-card layout. */
+  streamingCardFoldedLayout: boolean;
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -169,6 +171,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
+      streamingCardFoldedLayout: c.streamingCardFoldedLayout !== false,
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -216,6 +219,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: false,
       replyCardMode: 'legacy',
       hiddenStreamingCardButtons: [],
+      streamingCardFoldedLayout: true,
       pinStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -351,6 +355,7 @@ async function updateBotCardPrefsInternal(
       else entry.replyCardMode = patch.replyCardMode;
     }
     applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
+    applyDefaultTrue(entry, 'streamingCardFoldedLayout', patch.streamingCardFoldedLayout);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -411,6 +416,7 @@ async function updateBotCardPrefsInternal(
         disableStreamingCard: entry.disableStreamingCard === true,
         replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
+        streamingCardFoldedLayout: entry.streamingCardFoldedLayout !== false,
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -480,6 +486,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.hiddenStreamingCardButtons !== undefined) {
     bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);
+  }
+  if (patch.streamingCardFoldedLayout !== undefined) {
+    bot.config.streamingCardFoldedLayout = patch.streamingCardFoldedLayout ? undefined : false;
   }
   if (patch.pinStreamingCard !== undefined) {
     bot.config.pinStreamingCard = patch.pinStreamingCard || undefined;

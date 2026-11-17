@@ -23,7 +23,7 @@ import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-rep
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
-import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
@@ -4291,6 +4291,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -4993,6 +4994,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return { cardJson, unavailable };
       };
@@ -5228,6 +5230,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -5326,6 +5329,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5634,6 +5638,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
