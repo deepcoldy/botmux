@@ -15519,7 +15519,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 }
 
 async function cmdAuth(rest: string[]): Promise<void> {
-  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthExitCode } = await import('./cli/auth-request.js');
+  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthAnswerTag, providerAuthExitCode } = await import('./cli/auth-request.js');
   let parsed;
   try {
     parsed = parseAuthRequestArgs(rest);
@@ -15602,8 +15602,11 @@ async function cmdAuth(rest: string[]): Promise<void> {
       const body = await response.json() as { ok?: boolean; status?: string; message?: string; error?: string };
       if (provider) {
         if (parsed.command === 'request' && parsed.json) console.log(JSON.stringify(body));
-        else if (body.message) console.log(body.message);
-        else console.error(`botmux auth: ${body.error ?? `HTTP ${response.status}`}`);
+        else if (body.message) {
+          console.log(body.message);
+          const tag = providerAuthAnswerTag(response.ok && body.ok === true, body.status);
+          if (tag) console.log(tag);
+        } else console.error(`botmux auth: ${body.error ?? `HTTP ${response.status}`}`);
         process.exitCode = providerAuthExitCode(response.ok && body.ok === true, body.status);
         return;
       }
