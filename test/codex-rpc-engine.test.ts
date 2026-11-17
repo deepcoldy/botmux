@@ -178,6 +178,74 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     }
   }, 20_000);
 
+  it.skipIf(process.platform !== 'linux')('refreshes the recorded group identity at turn boundaries for late tool children', async () => {
+    const childFile = join(tmpdir(), `rpc-turn-refresh-${process.pid}-${Date.now()}`);
+    const sid = `turn-refresh-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    const engine = makeEngine({
+      sessionId: sid,
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '1500' },
+    });
+    let leader: number | undefined;
+    let tool: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      }, { timeout: 10_000 });
+      // The start()-time snapshot predates the delayed tool child.
+      expect(JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]).members
+        .some((member: { pid: number }) => member.pid === tool)).toBe(false);
+      await engine.startThread();
+      await engine.sendTurn('refresh identity at the turn boundary', owner('turn-refresh-1', 1));
+      // The turn/start ack (and turn completion) must re-snapshot membership so a
+      // later leader crash still leaves the successor provable group members.
+      expect(JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]).members
+        .some((member: { pid: number }) => member.pid === tool)).toBe(true);
+      await engine.stopAndWait();
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 20_000);
+
+  it.skipIf(process.platform !== 'linux')('fails start when a verified stale group survives its bounded cleanup', async () => {
+    const childFile = join(tmpdir(), `rpc-unkillable-${process.pid}-${Date.now()}`);
+    const sid = `unkillable-${process.pid}-${Date.now()}`;
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    const engine = makeEngine({ sessionId: sid, env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile } });
+    let leader: number | undefined;
+    let tool: number | undefined;
+    try {
+      await engine.start();
+      leader = engine.appServerPid!;
+      await vi.waitFor(() => {
+        tool = Number(readFileSync(childFile, 'utf8').trim());
+        expect(tool).toBeGreaterThan(0);
+      });
+      // Leader crash with a verified ordinary descendant keeping the group alive.
+      process.kill(leader, 'SIGKILL');
+      await vi.waitFor(() => expect(isAlive(leader!)).toBe(false));
+      expect(existsSync(marker)).toBe(true);
+      const successor = makeEngine({ sessionId: sid }, {
+        // Simulate a group SIGKILL cannot remove: identity is verified, so the
+        // reaper must treat survival after bounded cleanup as fatal, not silently
+        // drop the marker and spawn a second app-server on top of the survivor.
+        killProcessGroup: () => { /* signal swallowed */ },
+      });
+      await expect(successor.start()).rejects.toThrow(/still alive after bounded cleanup/);
+      expect(existsSync(marker)).toBe(true);
+      expect(isAlive(tool!) && !isLinuxZombie(tool!)).toBe(true);
+    } finally {
+      if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(childFile, { force: true });
+      rmSync(marker, { force: true });
+    }
+  }, 15_000);
+
   it('passes the permitted hook-trust flag before the app-server subcommand', async () => {
     const launches: string[][] = [];
     const engine = makeEngine({ bypassHookTrust: true }, {
