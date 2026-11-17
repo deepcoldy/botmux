@@ -624,6 +624,7 @@ import {
   formatAttachmentsHint,
   buildNewTopicCliInput,
   buildFollowUpCliInput,
+  traexRpcContextForSession,
   buildGroupContextBridgeInput,
   buildReforkCliInput,
   getAvailableBots,
@@ -22631,6 +22632,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
       ?? ds.currentReplyTarget?.turnId
       ?? `queued-activation-followup-${randomUUID()}`;
+    const traexRpcContext = traexRpcContextForSession(ds, cliId);
     const followUp = buildFollowUpCliInput(
       buffered.join('\n\n'),
       ds.session.sessionId,
@@ -22651,6 +22653,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
           .join('\n\n'),
+        ...(traexRpcContext ? { traexRpcContext } : {}),
       },
     );
     const reservation = reserveQueuedActivationTailAdmission(ds);
@@ -30262,6 +30265,8 @@ async function handleThreadReplyAdmitted(
       build: async () => {
         const tailBot = getBot(ds.larkAppId);
         const botCfg = tailBot.config;
+        const tailCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
+        const traexRpcContext = traexRpcContextForSession(ds, tailCliId);
         // solo 必须在构造信封之前解析：transcript 下 solo 决定是否去掉
         // <user_message> 壳与 <sender/> 标签。
         const tailSender = await getThreadSender();
@@ -30272,7 +30277,7 @@ async function handleThreadReplyAdmitted(
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+          cliId: tailCliId,
           cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
           sender: tailSender,
           solo: ds.soloSession,
@@ -30289,6 +30294,7 @@ async function handleThreadReplyAdmitted(
           promptInjection: sessionPromptInjection(ds),
           turnId: parsed.messageId,
           linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+          ...(traexRpcContext ? { traexRpcContext } : {}),
         });
         // R5-B1-1: freeze the admission-time steer authorization onto this earliest
         // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -30416,6 +30422,8 @@ async function handleThreadReplyAdmitted(
       } else {
         const pendingBot = getBot(ds.larkAppId);
         const botCfg = pendingBot.config;
+        const pendingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
+        const traexRpcContext = traexRpcContextForSession(ds, pendingCliId);
         // 此分支是 pending 首个 worker 的同步屏障，不能 await 网络（见上方注释），
         // 所以不重算 solo，沿用会话注册时算好的 ds.soloSession。
         const exactFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -30423,7 +30431,7 @@ async function handleThreadReplyAdmitted(
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+          cliId: pendingCliId,
           cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
           sender: followUpSender,
           larkAppId,
@@ -30440,6 +30448,7 @@ async function handleThreadReplyAdmitted(
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+        ...(traexRpcContext ? { traexRpcContext } : {}),
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -30939,6 +30948,7 @@ async function handleThreadReplyAdmitted(
     if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
     if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
+    const traexRpcContext = traexRpcContextForSession(ds, effectiveCliId);
     const cliInput = isBridge
       ? { content: buildGroupContextBridgeInput(promptContent, ds.session.sessionId, {
           larkAppId, chatId: ds.chatId, turnId: parsed.messageId, cliId: effectiveCliId,
@@ -30982,6 +30992,7 @@ async function handleThreadReplyAdmitted(
             promptInjection: sessionPromptInjection(ds),
             solo: ds.soloSession,
             selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+            traexRpcContextEnabled: !!traexRpcContext,
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -31006,6 +31017,7 @@ async function handleThreadReplyAdmitted(
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+        ...(traexRpcContext ? { traexRpcContext } : {}),
         });
     if (!ctx.completionProposalContinuation) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -31230,12 +31242,14 @@ async function handleThreadReplyAdmitted(
         build: async () => {
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
+          const currentCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
+          const traexRpcContext = traexRpcContextForSession(ds, currentCliId);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
             attachments,
             mentions: parsed.mentions,
             isAdoptMode: false,
-            cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+            cliId: currentCliId,
             cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
             sender: stagedSender,
             solo: ds.soloSession,
@@ -31252,6 +31266,7 @@ async function handleThreadReplyAdmitted(
             promptInjection: sessionPromptInjection(ds),
             turnId: parsed.messageId,
             linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+            ...(traexRpcContext ? { traexRpcContext } : {}),
           });
           // R4-B1: freeze the admission-time steer authorization onto the queued
           // opening payload so the worker-null re-fork path carries it exactly like

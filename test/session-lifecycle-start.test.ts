@@ -7502,6 +7502,133 @@ describe('Codex App clean-input feature gate', () => {
   });
 });
 
+describe('TraeX RPC ordinary follow-up FIFO policy', () => {
+  const caller = {
+    requestUserOpenId: 'ou_owner',
+    requestUserUnionId: 'on_owner',
+    requestLarkAppId: 'app_test',
+    senderType: 'user' as const,
+  };
+
+  function traexRpcSession(overrides: Partial<DaemonSession> = {}): {
+    ds: DaemonSession;
+    worker: ReturnType<typeof makeFakeWorker>;
+  } {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'traex',
+      codexRpcInput: true,
+      groupSerialInput: undefined,
+    }));
+    const worker = makeFakeWorker();
+    const base = makeDs();
+    const ds = makeDs({
+      worker,
+      session: { ...base.session, cliId: 'traex' },
+      initConfig: { type: 'init', cliId: 'traex', codexRpcInput: true } as any,
+      ...overrides,
+    });
+    return { ds, worker };
+  }
+
+  it('queues an ordinary interactive follow-up without requiring groupSerialInput', () => {
+    const { ds, worker } = traexRpcSession();
+
+    expect(sendWorkerInput(ds, 'follow-up', 'om_followup', { trustedCaller: caller })).toBe(true);
+
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_followup',
+      queueAfterActiveTurn: true,
+    }));
+  });
+
+  it('queues an ordinary human follow-up even when the legacy Codex-App flag is true', () => {
+    const { ds, worker } = traexRpcSession();
+
+    expect(sendWorkerInput(ds, 'human follow-up', 'om_human_followup', {
+      codexAppSteerable: true,
+      trustedCaller: caller,
+    })).toBe(true);
+
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_human_followup',
+      codexAppSteerable: true,
+      queueAfterActiveTurn: true,
+    }));
+  });
+
+  it.each([
+    {
+      name: 'durable dispatch',
+      turnId: 'om_delivery',
+      opts: { dispatchAttempt: 1, trustedCaller: caller },
+      overrides: {},
+    },
+    {
+      name: 'explicit steer',
+      turnId: 'om_steer',
+      opts: {
+        codexAppSteerable: true as const,
+        trustedCaller: { ...caller, senderType: 'bot' as const },
+      },
+      overrides: {},
+    },
+    {
+      name: 'adopt session',
+      turnId: 'om_adopt',
+      opts: { trustedCaller: caller },
+      overrides: { adoptedFrom: { source: 'tmux' as const, tmuxTarget: '0:1.0' } },
+    },
+    {
+      name: 'different principal',
+      turnId: 'om_other',
+      opts: {
+        trustedCaller: {
+          requestUserOpenId: 'ou_other', requestUserUnionId: 'on_other',
+          requestLarkAppId: 'app_test', senderType: 'user' as const,
+        },
+      },
+      overrides: {
+        activeInteractiveTurn: { turnId: 'om_active', caller },
+      },
+    },
+  ])('does not misclassify $name as an ordinary FIFO follow-up', ({ turnId, opts, overrides }) => {
+    const { ds, worker } = traexRpcSession(overrides as Partial<DaemonSession>);
+
+    expect(sendWorkerInput(ds, 'control-or-excluded', turnId, opts)).toBe(true);
+
+    expect(worker.send).toHaveBeenLastCalledWith(expect.not.objectContaining({
+      queueAfterActiveTurn: true,
+    }));
+  });
+
+  it('preserves public schedule input queue policy', () => {
+    const { ds, worker } = traexRpcSession();
+    expect(sendWorkerInput(ds, 'scheduled', 'schedule:abcdef12:turn', {
+      trustedCaller: { ...caller, source: 'schedule_creator', taskId: 'abcdef12' },
+    })).toBe(true);
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({ queueAfterActiveTurn: true }));
+  });
+
+  it('does not change non-TraeX RPC input defaults', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex', codexRpcInput: true }));
+    const worker = makeFakeWorker();
+    const base = makeDs();
+    const ds = makeDs({
+      worker,
+      session: { ...base.session, cliId: 'codex' },
+      initConfig: { type: 'init', cliId: 'codex', codexRpcInput: true } as any,
+    });
+
+    expect(sendWorkerInput(ds, 'follow-up', 'om_codex', { trustedCaller: caller })).toBe(true);
+
+    expect(worker.send).toHaveBeenLastCalledWith(expect.not.objectContaining({
+      queueAfterActiveTurn: true,
+    }));
+  });
+});
+
 describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', () => {
   // A tmux-adopted claude-code session whose bridge worker has exited. When a
   // new Lark turn arrives, the daemon's worker-null branch now routes adopt

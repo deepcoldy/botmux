@@ -8,12 +8,37 @@ function xmlEscape(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-export function renderSkillCatalogBlock(manifest: SessionSkillManifest | null | undefined): string {
+export function compactSkillTriggerSummary(description: string): string {
+  const normalized = description.trim().replace(/\s+/g, ' ');
+  const firstSentence = normalized.match(/^[\s\S]*?(?:[。！？]|[.!?](?=\s|$))/)?.[0];
+  return firstSentence ?? normalized;
+}
+
+export function renderSkillCatalogBlock(
+  manifest: SessionSkillManifest | null | undefined,
+  opts: { compact?: boolean } = {},
+): string {
   if (!manifest || manifest.prioritySkills.length === 0) return '';
+  if (opts.compact) {
+    const skills = manifest.prioritySkills.map((skill) => {
+      const tags = skill.tags.length > 0 ? ` tags="${xmlEscape(skill.tags.join(','))}"` : '';
+      const trigger = skill.description
+        ? ` trigger="${xmlEscape(compactSkillTriggerSummary(skill.description))}"`
+        : '';
+      return `  <skill name="${xmlEscape(skill.name)}"${tags}${trigger} />`;
+    });
+    return [
+      `<botmux_skills mode="${manifest.policyMode}">`,
+      '  <instruction>Trigger index; run `botmux skill show <name>` before use.</instruction>',
+      ...skills,
+      '</botmux_skills>',
+    ].join('\n');
+  }
   const skills = manifest.prioritySkills.map((skill) => {
     const tags = skill.tags.length > 0 ? ` tags="${xmlEscape(skill.tags.join(','))}"` : '';
-    const description = skill.description
-      ? `\n    <description>${xmlEscape(skill.description)}</description>`
+    const descriptionText = skill.description ?? '';
+    const description = descriptionText
+      ? `\n    <description>${xmlEscape(descriptionText)}</description>`
       : '';
     return `  <skill name="${xmlEscape(skill.name)}"${tags}>${description}\n    <read>botmux skill show ${xmlEscape(skill.name)}</read>\n  </skill>`;
   });

@@ -556,6 +556,44 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
 });
 
 describe('CodexRpcEngine — failure/recovery paths', () => {
+  it('runs onDispatch only once the turn/start frame is on the socket', async () => {
+    const engine = makeEngine({ sessionId: 'turn-dispatch-hook' });
+    await engine.start();
+    await engine.startThread();
+    const onDispatch = vi.fn();
+    await expect(engine.sendTurn('hello', owner('om_dispatched', 1), { onDispatch }))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+    expect(onDispatch).toHaveBeenCalledTimes(1);
+
+    const notDispatched = vi.fn();
+    (engine as any).ws = undefined; // send() throws before the frame leaves
+    await expect(engine.sendTurn('never left', owner('om_not_dispatched', 1), { onDispatch: notDispatched }))
+      .rejects.toMatchObject({ deliveryDisposition: 'not_sent' });
+    expect(notDispatched).not.toHaveBeenCalled();
+    engine.stop();
+  }, 20_000);
+
+  it('reports native context compaction for the thread, ignoring other items', () => {
+    const onContextCompacted = vi.fn();
+    const engine = makeEngine({ sessionId: 'context-compaction', onContextCompacted });
+    (engine as any).threadId = 'thread-compacting';
+    const notify = (method: string, params: unknown) =>
+      (engine as any).onMessage(JSON.stringify({ jsonrpc: '2.0', method, params }));
+    notify('thread/compacted', { threadId: 'thread-compacting', turnId: 'native-9' });
+    notify('item/completed', { threadId: 'thread-compacting', turnId: 'native-9', item: { type: 'contextCompaction', id: 'c1' } });
+    notify('item/completed', { threadId: 'thread-compacting', turnId: 'native-9', item: { type: 'agentMessage', id: 'm1' } });
+    expect(onContextCompacted.mock.calls).toEqual([['thread-compacting'], ['thread-compacting']]);
+    engine.stop();
+  });
+
+  it('classifies a call before thread start as definitely not sent', async () => {
+    const engine = makeEngine();
+    await expect(engine.sendTurn('never dispatched', owner('om_no_thread', 1))).rejects.toMatchObject({
+      name: 'CodexRpcDeliveryError', code: 'rpc_turn_start_not_sent', deliveryDisposition: 'not_sent',
+    });
+    engine.stop();
+  });
+
   it('P1-5: a wedged turn/start times out → onDead fires (fatal recovery, not a silent hang)', async () => {
     let deadCount = 0;
     const engine = makeEngine({

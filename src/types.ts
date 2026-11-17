@@ -544,6 +544,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Last settled fixed context for one TraeX native thread. */
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   nativeGoalStatusCard?: import('./core/goal-status-card.js').GoalStatusCardRecord;
   nativeGoalCardOrigin?: import('./core/goal-status-card.js').GoalStatusCardOrigin;
   sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
@@ -2303,7 +2305,10 @@ type DaemonToWorkerBase =
     dispatchAttempt?: number;
   };
 
-export type DaemonToWorker = DaemonToWorkerTransport & { sessionCommand?: import('./services/session-contract.js').SessionCommandContext };
+export type DaemonToWorker = DaemonToWorkerTransport & {
+  sessionCommand?: import('./services/session-contract.js').SessionCommandContext;
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
+};
 
 type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
@@ -2556,6 +2561,7 @@ export type WorkerToDaemonBase =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
