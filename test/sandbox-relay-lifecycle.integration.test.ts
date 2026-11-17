@@ -287,7 +287,7 @@ exec '${realTmux}' -S '${socket}' "$@"
   const workers = new Set<ChildProcess>();
   const tmuxCommand = (args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
   const lab = {
-    sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script,
+    sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script, socket,
     reports: (): Report[] => readJsonLines<Report>(reportFile()),
     starts: (): Report[] => lab.reports().filter(entry => entry.event === 'start'),
     paneAlive: (): boolean => tmuxCommand(['has-session', '-t', paneTarget]).status === 0,
@@ -364,7 +364,13 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     start(
       bootId: string,
-      startOpts: { env?: NodeJS.ProcessEnv; crashHook?: boolean; flavour?: SandboxFlavour; envPolicy?: { mode: 'strict' } } = {},
+      startOpts: {
+        env?: NodeJS.ProcessEnv;
+        crashHook?: boolean;
+        flavour?: SandboxFlavour;
+        envPolicy?: { mode: 'strict' };
+        adoptTarget?: string;
+      } = {},
     ): { worker: ChildProcess; logs: () => string; errors: () => string[] } {
       if (startOpts.flavour) applyFlavour(startOpts.flavour);
       const workerEnv = { ...env, ...startOpts.env };
@@ -383,7 +389,11 @@ exec '${realTmux}' -S '${socket}' "$@"
       worker.on('message', (message: { type?: string; message?: string }) => {
         if (message?.type === 'error') errors.push(String(message.message));
       });
-      worker.send({ ...init(bootId), ...(startOpts.envPolicy ? { envPolicy: startOpts.envPolicy } : {}) });
+      worker.send({
+        ...init(bootId),
+        ...(startOpts.adoptTarget ? { adoptMode: true, adoptTmuxTarget: startOpts.adoptTarget } : {}),
+        ...(startOpts.envPolicy ? { envPolicy: startOpts.envPolicy } : {}),
+      });
       return { worker, logs: () => logs, errors: () => errors };
     },
     async stop(worker: ChildProcess, how: 'SIGTERM' | 'transfer' | 'close'): Promise<void> {
@@ -815,6 +825,47 @@ describe('unsandboxed session across a real worker lifecycle', () => {
       await lab.stop(second.worker, 'close');
       expect(lab.paneAlive()).toBe(false);
       expect(existsSync(lab.sessionRoot)).toBe(false);
+    } finally {
+      await lab.dispose();
+    }
+  }, 120_000);
+
+  it.skipIf(!realTmux)('tmux × dead adopted pane: keeps off-screen history out of the fatal IPC error', async () => {
+    const lab = createLab({ flavour: 'off', backend: 'tmux' });
+    const marker = `offscreen-${randomUUID()}`;
+    const adoptSession = 'adopted-dead';
+    const adoptTarget = `${adoptSession}:0.0`;
+    const tmux = (args: string[]) => spawnSync(realTmux!, ['-S', lab.socket, ...args], { encoding: 'utf8' });
+    try {
+      // Build a long-lived user's pane, then scroll a private line off the
+      // visible screen before the CLI dies. The marker must remain within the
+      // 50-line history window so removing the fresh-only gate makes this red.
+      expect(tmux(['new-session', '-d', '-s', adoptSession, '-x', '80', '-y', '24', '/bin/sh']).status).toBe(0);
+      expect(tmux(['set-option', '-t', adoptSession, 'remain-on-exit', 'on']).status).toBe(0);
+      const adoptScript = join(lab.dataDir, 'adopt-dead.sh');
+      writeFileSync(adoptScript, `printf '%s\\n' '${marker}'
+i=0
+while [ "$i" -lt 30 ]; do
+  printf 'f-%s\\n' "$i"
+  i=$((i+1))
+done
+exit 3
+`);
+      expect(tmux(['send-keys', '-t', adoptTarget, `exec /bin/sh ${adoptScript}`, 'Enter']).status).toBe(0);
+      await vi.waitFor(() => {
+        const probe = tmux(['display-message', '-p', '-t', adoptTarget, '#{pane_dead}']);
+        expect(probe.stdout.trim(), tmux(['capture-pane', '-p', '-t', adoptTarget]).stdout).toBe('1');
+      }, { timeout: 20_000 });
+      expect(tmux(['capture-pane', '-p', '-t', adoptTarget]).stdout).not.toContain(marker);
+      expect(tmux(['capture-pane', '-p', '-S', '-50', '-t', adoptTarget]).stdout).toContain(marker);
+
+      const first = lab.start('boot-adopt', { adoptTarget });
+      await workerExit(first);
+      await vi.waitFor(() => expect(first.errors().length, first.logs()).toBeGreaterThan(0), { timeout: 20_000 });
+      const fatal = first.errors().join('\n');
+      expect(fatal, first.logs()).toContain('tmux pane');
+      expect(fatal).toContain('f-29'); // viewport evidence is still reported
+      expect(fatal).not.toContain(marker);
     } finally {
       await lab.dispose();
     }

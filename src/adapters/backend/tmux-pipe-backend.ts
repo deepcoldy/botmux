@@ -325,7 +325,11 @@ export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDea
  *  pane tmux has not reaped yet reads as status-less; its exit code then comes
  *  from the kernel, as on the teardown path (#2453), so the message does not
  *  call a plain non-zero exit a possible signal death. */
-function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly string[]): PipePaneDeathEvidence {
+function collectPipePaneDeathEvidence(
+  paneTarget: string,
+  socketArgs: readonly string[],
+  includeHistory: boolean,
+): PipePaneDeathEvidence {
   let paneDead = false;
   let paneDeadStatus: string | null = null;
   try {
@@ -347,11 +351,14 @@ function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly s
     return { paneDead: false, paneDeadStatus: null, lastScreen: null };
   }
   let lastScreen: string | null = null;
+  // History is fresh-create-only: reattach/adopt targets may be long-lived user
+  // panes whose off-screen commands and output must not enter the chat error.
+  const historyArgs = includeHistory ? ['-S', `-${PANE_DEATH_SCREEN_HISTORY_LINES}`] : [];
   try {
     const out = String(
       execFileSync(
         'tmux',
-        [...socketArgs, 'capture-pane', '-p', '-S', `-${PANE_DEATH_SCREEN_HISTORY_LINES}`, '-t', paneTarget],
+        [...socketArgs, 'capture-pane', '-p', ...historyArgs, '-t', paneTarget],
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
       ) ?? '',
     );
@@ -906,7 +913,7 @@ export class TmuxPipeBackend implements SessionBackend {
           if (!this.createSession) {
             this.fireExit(1, null);
           }
-          const evidence = collectPipePaneDeathEvidence(this.paneTarget, this.tmuxArgs);
+          const evidence = collectPipePaneDeathEvidence(this.paneTarget, this.tmuxArgs, this.createSession);
           throw evidence.paneDead ? buildPipePaneStartupError(err, evidence) : err;
         }
         const detail = (err?.stderr?.toString?.() ?? '').trim() || err?.message || String(err);
