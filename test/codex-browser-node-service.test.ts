@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexBrowserNodeService, createBrowserWireCodec } from '../src/services/codex-browser-node-service.js';
+import { CodexBrowserNodeService, createBrowserWireCodec, DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS } from '../src/services/codex-browser-node-service.js';
 import { resolveNodeExecutable, spawnSyncBunTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const fixture = `
@@ -31,11 +31,11 @@ export async function handleRpc(request) {
 describe('Node browser service boundary', () => {
   let service: CodexBrowserNodeService | undefined;
   const roots: string[] = [];
-  function setup() {
+  function setup(requestTimeoutMs?: number) {
     const root=mkdtempSync(join(tmpdir(),'botmux-node-browser-'));roots.push(root);
     mkdirSync(join(root,'scripts'));writeFileSync(join(root,'scripts/browser-service.mjs'),fixture);
     const runtime:any={requestMeta:{turn:'first'},config:{read:vi.fn(async p=>({p,ok:true}))},createElicitation:vi.fn(async()=>({action:'decline'})),fetch:vi.fn(async()=>new Response('output',{status:201}))};
-    service=new CodexBrowserNodeService(root,()=>runtime,resolveNodeExecutable()!);
+    service=new CodexBrowserNodeService(root,()=>runtime,resolveNodeExecutable()!,requestTimeoutMs);
     return {root,runtime};
   }
   afterEach(async()=>{await service?.close();service=undefined;roots.splice(0).forEach(p=>rmSync(p,{recursive:true,force:true}));});
@@ -82,5 +82,25 @@ describe('Node browser service boundary', () => {
     const r=spawnSyncBunTsEvalWithRepoImports(source,{cwd:process.cwd(),encoding:'utf8',timeout:20000});
     expect(r.status,r.stderr.toString()).toBe(0);
     expect(JSON.parse(r.stdout.toString()).reactor).toBe(true);
+  });
+  it('times out a silent call without killing the shared child',async()=>{
+    setup(300);
+    const started=Date.now();
+    await expect(service!.handleRpc({method:'wait'})).rejects.toThrow('Browser Node runtime request timed out');
+    expect(Date.now()-started).toBeGreaterThanOrEqual(250);
+    // The child stays connected: a later call succeeds on the same process.
+    const proof:any=await service!.handleRpc({method:'probe'});
+    expect(proof.reactor).toBe(true);
+  });
+  it('waits for a slow owner-side approval instead of cutting it off',async()=>{
+    const {runtime}=setup(2_000);
+    runtime.createElicitation=vi.fn(()=>new Promise(resolve=>setTimeout(()=>resolve({action:'accept',meta:{persist:'session'}}),400)));
+    await expect(service!.handleRpc({method:'approval',params:{message:'origin prompt'}})).resolves.toMatchObject({action:'accept'});
+    expect(runtime.createElicitation).toHaveBeenCalledOnce();
+  });
+  it('keeps the default request budget no shorter than the broker tool timeout',()=>{
+    // The broker allows 600s Lark approvals and 60s operations inside a 660s
+    // tool timeout; the child watchdog must not reject those calls first.
+    expect(DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(660_000);
   });
 });

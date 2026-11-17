@@ -7,6 +7,14 @@ type Json = Record<string, any>;
 type Runtime = Json & { fetch: typeof fetch };
 const MAX_PENDING = 128;
 const MAX_LINE_BYTES = 32 * 1024 * 1024;
+/**
+ * Match the broker's outer TOOL_TIMEOUT_MS budget in codex-browser-broker.ts.
+ * A shorter watchdog would cut off work the typed tool still advertises:
+ * per-operation timeouts reach 60s and a Lark approval can run for 600s.
+ * Liveness is still detected immediately when the child exits, so this only
+ * bounds a child that stays alive without answering.
+ */
+export const DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS = 660_000;
 
 // Encode objects as entries, so page-controlled keys cannot impersonate a wire
 // tag. The browser service also returns byte arrays (for example screenshots).
@@ -44,7 +52,12 @@ export class CodexBrowserNodeService {
   private closed = false;
   private readonly wire = createBrowserWireCodec();
   private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
-  constructor(private readonly root: string, private readonly runtime: () => Runtime, private readonly nodeCommand = 'node') {}
+  constructor(
+    private readonly root: string,
+    private readonly runtime: () => Runtime,
+    private readonly nodeCommand = 'node',
+    private readonly requestTimeoutMs = DEFAULT_BROWSER_NODE_REQUEST_TIMEOUT_MS,
+  ) {}
 
   async handleRpc(request: { method: string; params?: unknown }): Promise<unknown> {
     await this.start();
@@ -116,7 +129,7 @@ export class CodexBrowserNodeService {
     if (this.pending.size >= MAX_PENDING) return Promise.reject(new Error('Browser runtime request capacity exceeded'));
     const id = ++this.serial;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('Browser Node runtime request timed out')); }, 45_000);
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('Browser Node runtime request timed out')); }, this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try { this.send({ type: 'request', id, method, params, meta: this.runtime().requestMeta }); }
       catch (error) { this.pending.delete(id); clearTimeout(timer); reject(error as Error); }
@@ -135,7 +148,9 @@ export class CodexBrowserNodeService {
         const response = await r.fetch(params.url, {
           method: params.method, headers: params.headers,
           ...(params.body ? { body: Buffer.from(params.body, 'base64') } : {}),
-          signal: AbortSignal.timeout(30_000),
+          // Match the authenticated-fetch MCP transport's own 40s budget instead
+          // of aborting calls that transport would still allow.
+          signal: AbortSignal.timeout(40_000),
         });
         return { status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body: Buffer.from(await response.arrayBuffer()).toString('base64') };
       }
