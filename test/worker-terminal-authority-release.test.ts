@@ -10,6 +10,7 @@ import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { SessionController } from '../src/core/session-controller.js';
 
 /**
@@ -46,7 +47,9 @@ function harness(opts: { markerPath?: string } = {}) {
     thinkingTurn: undefined,
     sandboxRelayCapability: null,
     completeManagedTurnOriginRevocation: vi.fn(),
-    terminalReleasesDurableTurn: () => false,
+    terminalReleasesDurableTurn,
+    durableTurnInFlight: false,
+    inflightInputs: { onTurnComplete: vi.fn() },
     remoteRunnerRecoveredTurnInFlight: false,
     flushPending: vi.fn(),
     queueMicrotask: (fn: () => void) => fn(),
@@ -78,6 +81,8 @@ function harness(opts: { markerPath?: string } = {}) {
     'dropQueuedTurnRecord',
     'turnTerminalEmitted',
     'retireTerminatedMarkerTurn',
+    'markReplyInputConsumed',
+    'scheduleConsumedQueuedTurnAdvance',
   ];
   if (opts.markerPath) {
     // Real PID-marker round trip: the disk copy is what a lagging advance reads.
@@ -138,6 +143,82 @@ describe('turn terminal releases the active turn authority', () => {
     expect(h.retiredTurnIds.has('om_absorbed')).toBe(true);
     // A silent scheduled fire must be deliverable again.
     expect(h.activeTurnBlocks({ turnId: 'schedule:task:1', queueAfterActiveTurn: true })).toBe(false);
+  });
+
+  it('hands authority to a queued input the CLI consumed before the running turn ended', () => {
+    const h = harness();
+    startTurn(h, 'om_B');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_C' });
+    // Claude reads C right after B stops; no prompt-ready edge follows.
+    h.markReplyInputConsumed('om_C');
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
+
+    h.emitTurnTerminal('om_B', 'completed', undefined, undefined, 'nothing_to_send');
+
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+    expect(h.currentBotmuxTurnId).toBe('om_C');
+    expect(h.queuedTypeAheadTurns).toEqual([]);
+  });
+
+  it('hands authority to a queued input the CLI consumes after the running turn ended', () => {
+    const h = harness();
+    startTurn(h, 'om_B');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_C' });
+    h.emitTurnTerminal('om_B', 'completed');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+
+    h.markReplyInputConsumed('om_C');
+
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+    expect(h.currentBotmuxTurnId).toBe('om_C');
+  });
+
+  it('keeps a queued input the CLI has not consumed waiting for its own start', () => {
+    const h = harness();
+    startTurn(h, 'om_B');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_C' });
+    h.emitTurnTerminal('om_B', 'completed');
+
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+    expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_C' }]);
+  });
+
+  it('skips a consumed input folded into the finished turn when its terminal lands in the same drain', () => {
+    const h = harness();
+    const microtasks: Array<() => void> = [];
+    h.queueMicrotask = (fn: () => void) => { microtasks.push(fn); };
+    startTurn(h, 'om_host');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_absorbed', inputConsumed: true }, { turnId: 'om_C', inputConsumed: true });
+
+    h.emitTurnTerminal('om_host', 'completed');
+    h.emitTurnTerminal('om_absorbed', 'completed');
+    for (const fn of microtasks.splice(0)) fn();
+
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+    expect(h.retiredTurnIds.has('om_absorbed')).toBe(true);
+  });
+
+  it('releases the durable in-flight barrier before a consumed queued turn takes over', () => {
+    const h = harness();
+    const microtasks: Array<() => void> = [];
+    h.queueMicrotask = (fn: () => void) => { microtasks.push(fn); };
+    h.durableTurnInFlight = true;
+    h.setCaptureIdentity('om_B', 1);
+    h.markActiveTurnStarted({ turnId: 'om_B', dispatchAttempt: 1 });
+    h.queuedTypeAheadTurns.push({ turnId: 'om_C', inputConsumed: true });
+
+    h.emitTurnTerminal('om_B', 'completed', undefined, 1);
+
+    // The deferred advance must not swap the capture tuple before the durable
+    // release block inside emitTurnTerminal compares it against the terminal.
+    expect(h.durableTurnInFlight).toBe(false);
+    expect(h.inflightInputs.onTurnComplete).toHaveBeenCalledTimes(1);
+    expect(h.currentBotmuxTurnId).toBe('om_B');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+
+    for (const fn of microtasks.splice(0)) fn();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+    expect(h.currentBotmuxTurnId).toBe('om_C');
   });
 
   it('frees an authority still held by a turn whose terminal already went out', () => {
