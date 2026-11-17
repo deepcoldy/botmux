@@ -142,7 +142,7 @@ export async function retryOrdinaryRecoveryNotice(
     // synchronously instead of reporting `deferred` and failing later, after
     // this click was already recorded as accepted.
     const accepted = ds.worker && !ds.worker.killed
-      ? sendWorkerInput(ds, { content }, turnId, { trustedCaller: recoveredCaller, atMostOnce: true, failedTurn: 'resend' })
+      ? sendWorkerInput(ds, { content }, turnId, { trustedCaller: recoveredCaller, atMostOnce: true, failedTurnResendOf: logicalTurnId })
       : forkWorker(ds, { content }, {
         resume: ds.hasHistory, turnId, trustedCaller: recoveredCaller, atMostOnce: true,
       }, {

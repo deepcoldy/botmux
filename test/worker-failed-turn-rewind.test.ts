@@ -9,6 +9,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from '../src/services/unsent-input-journal.js';
+import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { resolvePurgeResumeTarget } from '../src/services/transcript-image-purge.js';
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
 import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript } from '../src/core/context-rewind.js';
@@ -64,7 +66,8 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
   mkdirSync(dirname(jsonl), { recursive: true });
   writeFileSync(jsonl, transcript);
   const send = vi.fn();
-  const pendingMessages: Array<{ content: string; turnId?: string }> = [];
+  const journal = join(root, 'unsent.json');
+  const pendingMessages: Array<{ content: string; turnId?: string; noReplay?: true }> = [];
   const written: string[] = [];
   const scope: Record<string, unknown> = {
     send,
@@ -99,23 +102,36 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     planFailedTurnRewindRequest,
     runFailedTurnRewindMaintenance,
     rewoundContent,
-    saveUnsentInputsForSuccessor: vi.fn(),
-    interruptRewoundInputOnceRecorded: null,
-    handleTermAction: vi.fn(async () => {}),
-    turnTerminalEmitted: vi.fn(() => false),
+    // The real hand-over to the next worker, on a journal of its own.
+    unsentInputJournalPath: () => journal,
+    appendUnsentInputs,
+    isUnsentInputReplayable,
+    saveUnsentInputs,
+    settleTakenUnsentInputs,
+    predecessorUnsentInputsTaken: false,
+    appendedUnsentInputs: new WeakSet(),
+    restoredUnsentInputs: new Set(),
+    isCodexAppCliId: () => false,
+    emitTurnTerminal: vi.fn(),
+    // A worker const, not a function: the harness only loads functions.
+    FAILED_TURN_REWIND_STOPPED: 'stopped_before_start',
     ...overrides,
   };
   // The real restart fences input synchronously: from here on a message waits
   // in the queue for the replacement CLI.
   const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => { scope.cliRestartInProgress = true; });
   scope.restartCliProcess ??= restartCliProcess;
+  scope.saveUnsentInputsForSuccessor ??= loadWorkerFunction('saveUnsentInputsForSuccessor', scope);
   const start = loadWorkerFunction<(turnId: string | undefined, d: FailedTurnRewindDirective, enqueue: () => void) => void>(
     'startFailedTurnRewind', scope,
   );
   const writeEdge = loadWorkerFunction<(item: unknown) => 'write' | 'stopped'>('failedTurnRewindWriteEdge', scope);
-  const stopHeld = loadWorkerFunction<(key: string) => boolean>('stopHeldFailedTurnRewind', scope);
-  const stop = () => stopHeld('ctrlc');
-  const recorded = loadWorkerFunction<(turnId: string) => void>('interruptRewoundInputIfStopped', scope);
+  const stop = loadWorkerFunction<() => boolean>('stopHeldFailedTurnRewind', scope);
+  const putBackBeforeWrites = loadWorkerFunction<() => boolean>('putBackStoppedRewindCutBeforeWrites', scope);
+  const offQueue = loadWorkerFunction<(reason: string, cliGone: boolean) => void>('settleFailedTurnRewindOffQueue', scope);
+  const goAway = () => (scope.saveUnsentInputsForSuccessor as (reason: string) => void)('shutdown');
+  /** What the session's next worker would type in. */
+  const successorInputs = () => takeUnsentInputs(journal).inputs.map(({ content, turnId }) => ({ content, turnId }));
   // What the message case's enqueue does: queue behind a restart, write otherwise.
   const enqueue = vi.fn(() => {
     if (scope.cliRestartInProgress) pendingMessages.push({ content: '继续', turnId: 'trg_new' });
@@ -123,12 +139,15 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
   });
   start('trg_new', d, enqueue);
   const reports = () => send.mock.calls.map(([m]) => m).filter(m => m.type === 'failed_turn_rewind');
-  const restartOpts = () => restartCliProcess.mock.calls[0]![1];
+  const restartOpts = (call = 0) => restartCliProcess.mock.calls[call]![1];
   const cutAfterExit = () => restartOpts().beforeRespawn!({ pid: 4242, processScope: [4242] });
   const settle = (result: 'spawned' | 'failed' | 'superseded') => restartOpts().onRespawnSettled!(result);
   /** flushPending reaching the held message: what it writes, if anything. */
   const reachWriteEdge = () => writeEdge(pendingMessages[0]);
-  return { jsonl, scope, pendingMessages, written, enqueue, restartCliProcess, reports, restartOpts, cutAfterExit, settle, reachWriteEdge, stop, recorded };
+  return {
+    jsonl, scope, pendingMessages, written, enqueue, restartCliProcess, reports, restartOpts, cutAfterExit, settle,
+    reachWriteEdge, stop, putBackBeforeWrites, offQueue, goAway, successorInputs,
+  };
 }
 
 describe('startFailedTurnRewind', () => {
@@ -174,26 +193,40 @@ describe('startFailedTurnRewind', () => {
 
   it('puts the cut turn back when the CLI cannot be started again, and leaves the message to the next worker', async () => {
     const original = failedTranscript();
-    const { jsonl, scope, pendingMessages, cutAfterExit, settle, reports } = setup(original);
+    const { jsonl, cutAfterExit, settle, reports, successorInputs } = setup(original);
     await cutAfterExit();
     expect(readFileSync(jsonl, 'utf8')).toBe(HISTORY);
     settle('failed');
     expect(readFileSync(jsonl, 'utf8')).toBe(original);
-    expect(pendingMessages).toEqual([{ content: '继续', turnId: 'trg_new' }]);
     // The worker exits after a failed spawn: the message must not die with it.
-    expect(scope.saveUnsentInputsForSuccessor).toHaveBeenCalledTimes(1);
+    expect(successorInputs()).toEqual([{ content: '继续', turnId: 'trg_new' }]);
     expect(reports()).toEqual([{ type: 'failed_turn_rewind', turnId: 'trg_new', failedTurnId: 'board:app:hint-1', outcome: 'declined', reason: expect.stringMatching(/cut restored/) }]);
   });
 
-  it('when the cut cannot be put back, the saved message keeps carrying the failed input', async () => {
-    const { scope, pendingMessages, cutAfterExit, settle, reports } = setup(failedTranscript(), { restoreRewoundTranscript: () => false });
+  it('when the cut cannot be put back, the saved message keeps carrying the failed input, and the daemon hears it was cut', async () => {
+    const { cutAfterExit, settle, reports, successorInputs } = setup(failedTranscript(), { restoreRewoundTranscript: () => false });
     await cutAfterExit();
     settle('failed');
-    expect(pendingMessages).toEqual([{ content: MERGED, turnId: 'trg_new' }]);
-    expect(scope.saveUnsentInputsForSuccessor).toHaveBeenCalledTimes(1);
-    // Not reported as cut: the next worker delivers it merged, so a later
-    // input must not bring the failed input back once more.
-    expect(reports()).toEqual([{ type: 'failed_turn_rewind', turnId: 'trg_new', failedTurnId: 'board:app:hint-1', outcome: 'declined', reason: expect.stringMatching(/NOT restored/) }]);
+    expect(successorInputs()).toEqual([{ content: MERGED, turnId: 'trg_new' }]);
+    // As at the write edge: the input now carrying the failed one is the
+    // session's last input, and a later input must not bring it back again.
+    expect(reports()).toEqual([{ type: 'failed_turn_rewind', turnId: 'trg_new', failedTurnId: 'board:app:hint-1', outcome: 'rewound', reason: expect.stringMatching(/handed to the next worker/) }]);
+  });
+
+  it('a worker going away hands a held message on — merged once cut, as it came before — and reports it', async () => {
+    const cut = setup(failedTranscript());
+    await cut.cutAfterExit();
+    cut.goAway();
+    expect(cut.successorInputs()).toEqual([{ content: MERGED, turnId: 'trg_new' }]);
+    expect(cut.reports()).toEqual([expect.objectContaining({ outcome: 'rewound' })]);
+
+    const early = setup(failedTranscript());
+    early.goAway();
+    expect(early.successorInputs()).toEqual([{ content: '继续', turnId: 'trg_new' }]);
+    expect(early.reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
+    // Nothing cut afterwards: the message no longer waits for this CLI.
+    await early.cutAfterExit();
+    expect(readFileSync(early.jsonl, 'utf8')).toBe(failedTranscript());
   });
 
   it('a stop while the message is held before the cut: nothing is cut and the message never reaches the CLI', async () => {
@@ -207,35 +240,178 @@ describe('startFailedTurnRewind', () => {
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
   });
 
-  it('a stop after the cut lets the message in and interrupts it once recorded: the failed input stays in the conversation', async () => {
-    const { scope, pendingMessages, cutAfterExit, settle, reachWriteEdge, stop, recorded, reports } = setup(failedTranscript());
+  it('a stop after the cut keeps the message from the CLI and puts the failed turn back once the resumed CLI is gone', async () => {
+    const original = failedTranscript();
+    const { jsonl, scope, pendingMessages, restartCliProcess, restartOpts, cutAfterExit, settle, reachWriteEdge, stop, reports } = setup(original);
     await cutAfterExit();
     settle('spawned');
+    // Arrived behind it while the CLI restarted: still runs afterwards.
+    pendingMessages.push({ content: '还在吗', turnId: 'om_later' });
     expect(stop()).toBe(true);
-    // Not dropped: it carries the failed input, which is no longer in the transcript.
-    expect(pendingMessages).toEqual([{ content: MERGED, turnId: 'trg_new' }]);
-    expect(reachWriteEdge()).toBe('write');
-    expect(reports()).toEqual([expect.objectContaining({ outcome: 'rewound' })]);
-    expect(scope.handleTermAction).not.toHaveBeenCalled();
-    recorded('trg_other');
-    recorded('trg_new');
-    await Promise.resolve();
-    expect(scope.handleTermAction).toHaveBeenCalledWith('ctrlc');
-    recorded('trg_new');
-    await Promise.resolve();
-    expect(scope.handleTermAction).toHaveBeenCalledTimes(1);
+    expect(reachWriteEdge()).toBe('stopped');
+    // Never written, merged or plain: nothing of it can have run.
+    expect(scope.cliRestartInProgress).toBe(true);
+    // The resumed CLI holds the conversation without the failed turn: it is
+    // restarted around the restore, the rest of the queue kept for it.
+    expect(restartCliProcess).toHaveBeenCalledTimes(2);
+    expect(restartOpts(1)).toMatchObject({ exactResumeSessionId: SID, preservePending: true, skipRestartBudget: true, immediate: true });
+    // Still in flight for the daemon until the restore ran.
+    expect(reports()).toEqual([]);
+    // Claude Code writes its cost state when it exits, resumed or not.
+    const exitRecord = line({ type: 'cost-state', sessionId: SID, totalCostUsd: 0 });
+    appendFileSync(jsonl, exitRecord);
+    await restartOpts(1).beforeRespawn!({ pid: 4243, processScope: [4243] });
+    expect(readFileSync(jsonl, 'utf8')).toBe(HISTORY + exitRecord + original.slice(HISTORY.length));
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/stopped after the cut; cut restored/) })]);
+    expect(pendingMessages.map(item => item.turnId)).toEqual(['trg_new', 'om_later']);
   });
 
-  it('a stopped message that ended as soon as it was recorded is not interrupted afterwards', async () => {
-    const { scope, cutAfterExit, settle, reachWriteEdge, stop, recorded } = setup(failedTranscript());
+  it('a stop after the cut once the CLI is back restarts at once: a flush under way (startup commands) writes nothing more', async () => {
+    const original = failedTranscript();
+    const { jsonl, scope, pendingMessages, restartCliProcess, restartOpts, cutAfterExit, settle, stop } = setup(original);
     await cutAfterExit();
     settle('spawned');
+    // The restart that resumed the CLI is over.
+    scope.cliRestartInProgress = false;
+    expect(stop()).toBe(true);
+    expect(restartCliProcess).toHaveBeenCalledTimes(2);
+    expect(scope.cliRestartInProgress).toBe(true);
+    expect(pendingMessages).toEqual([]);
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+    await restartOpts(1).beforeRespawn!({ pid: 4243, processScope: [4243] });
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+  });
+
+  it('a stop after the cut while no CLI is up (it exited) waits for the next one: its restart can prove that one gone', async () => {
+    const { scope, pendingMessages, restartCliProcess, cutAfterExit, settle, stop, putBackBeforeWrites } = setup(failedTranscript());
+    await cutAfterExit();
+    settle('spawned');
+    scope.cliRestartInProgress = false;
+    scope.backend = null;
+    expect(stop()).toBe(true);
+    expect(restartCliProcess).toHaveBeenCalledTimes(1);
+    expect(pendingMessages.map(item => item.turnId)).toEqual(['trg_new']);
+    // The CLI is back: its first flush puts the cut back.
+    scope.backend = { getChildPid: () => 4244 };
+    expect(putBackBeforeWrites()).toBe(true);
+    expect(restartCliProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it('a stop after the cut is acted on before the resumed CLI gets anything, startup commands included', async () => {
+    const original = failedTranscript();
+    const { jsonl, scope, pendingMessages, restartCliProcess, restartOpts, cutAfterExit, settle, stop, putBackBeforeWrites, reports } = setup(original);
+    await cutAfterExit();
+    settle('spawned');
+    pendingMessages.push({ content: '还在吗', turnId: 'om_later' });
+    // Nothing to do while nothing was stopped.
+    expect(putBackBeforeWrites()).toBe(false);
     stop();
+    expect(putBackBeforeWrites()).toBe(true);
+    expect(pendingMessages).toEqual([{ content: '还在吗', turnId: 'om_later' }]);
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+    expect(restartCliProcess).toHaveBeenCalledTimes(2);
+    await restartOpts(1).beforeRespawn!({ pid: 4243, processScope: [4243] });
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
+    // Once only.
+    expect(putBackBeforeWrites()).toBe(false);
+  });
+
+  it('a stop after the cut while the replacement is still coming up: the restore waits for the CLI to have exited', async () => {
+    const { jsonl, restartOpts, cutAfterExit, settle, reachWriteEdge, stop, reports } = setup(failedTranscript(), {
+      waitForProcessQuiescence: vi.fn()
+        .mockImplementationOnce(() => Promise.resolve())
+        .mockImplementationOnce(() => Promise.reject(new Error('process 4243 did not exit'))),
+    });
+    await cutAfterExit();
+    stop();
+    settle('superseded');
     reachWriteEdge();
-    (scope.turnTerminalEmitted as ReturnType<typeof vi.fn>).mockReturnValue(true);
-    recorded('trg_new');
-    await Promise.resolve();
-    expect(scope.handleTermAction).not.toHaveBeenCalled();
+    await restartOpts(1).beforeRespawn!({ pid: 4243, processScope: [4243] });
+    // Not rewritten under a CLI that may still write: the failed turn stays
+    // in the daemon's record only.
+    expect(readFileSync(jsonl, 'utf8')).toBe(HISTORY);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/NOT restored, CLI exit unproven/) })]);
+  });
+
+  it('a stop after the cut, then the restart fails: the cut is put back and the stopped message does not reach the next worker', async () => {
+    const original = failedTranscript();
+    const { jsonl, scope, pendingMessages, cutAfterExit, settle, stop, reports, successorInputs } = setup(original);
+    await cutAfterExit();
+    pendingMessages.push({ content: '还在吗', turnId: 'om_later' });
+    expect(stop()).toBe(true);
+    settle('failed');
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(successorInputs()).toEqual([{ content: '还在吗', turnId: 'om_later' }]);
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
+  });
+
+  it('a stop before the cut, then the restart fails: the stopped message does not reach the next worker', async () => {
+    const original = failedTranscript();
+    const { jsonl, scope, cutAfterExit, settle, stop, successorInputs } = setup(original);
+    stop();
+    await cutAfterExit();
+    settle('failed');
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(successorInputs()).toEqual([]);
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+  });
+
+  it('a cut message the next worker cannot get (at-most-once) is not reported as handed on', async () => {
+    const { pendingMessages, cutAfterExit, goAway, reports, successorInputs } = setup(failedTranscript());
+    await cutAfterExit();
+    pendingMessages[0]!.noReplay = true;
+    goAway();
+    expect(successorInputs()).toEqual([]);
+    // The daemon keeps its record of the failed turn: its card still retries it.
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/not saved for the next worker/) })]);
+  });
+
+  it('a held message already gone from the queue when the worker goes away is still reported', async () => {
+    const { pendingMessages, cutAfterExit, goAway, reports } = setup(failedTranscript());
+    await cutAfterExit();
+    // A retired runtime's queue is cleared before the worker exits.
+    pendingMessages.length = 0;
+    goAway();
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/left the queue before the worker went away/) })]);
+  });
+
+  it.each([['before', false], ['after', true]] as const)('a message stopped %s the cut does not reach the next worker when this one goes away', async (_when, cutFirst) => {
+    const { scope, pendingMessages, cutAfterExit, settle, stop, goAway, reports, successorInputs } = setup(failedTranscript());
+    if (cutFirst) {
+      await cutAfterExit();
+      settle('spawned');
+    }
+    pendingMessages.push({ content: '还在吗', turnId: 'om_later' });
+    stop();
+    goAway();
+    expect(successorInputs()).toEqual([{ content: '还在吗', turnId: 'om_later' }]);
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
+  });
+
+  it('a held message dropped off the queue is settled: the cut is put back once the CLI is gone, the daemon told either way', async () => {
+    const original = failedTranscript();
+    const exited = setup(original);
+    await exited.cutAfterExit();
+    exited.settle('spawned');
+    // Still queued: nothing to settle yet.
+    exited.offQueue('dropped on a CLI exit', true);
+    expect(exited.reports()).toEqual([]);
+    // An at-most-once input is not replayed after a CLI exit.
+    exited.pendingMessages.length = 0;
+    exited.offQueue('dropped on a CLI exit', true);
+    expect(readFileSync(exited.jsonl, 'utf8')).toBe(original);
+    expect(exited.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
+
+    // Dropped while a CLI may still run on the transcript: left as it is.
+    const running = setup(original);
+    await running.cutAfterExit();
+    running.pendingMessages.length = 0;
+    running.offQueue('dropped by a restart', false);
+    expect(readFileSync(running.jsonl, 'utf8')).toBe(HISTORY);
+    expect(running.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/NOT restored/) })]);
   });
 
   it('a stop once the message was written is an ordinary stop', async () => {
@@ -331,6 +507,68 @@ describe('startFailedTurnRewind', () => {
     const { pendingMessages, cutAfterExit } = setup(failedTranscript(), {}, directive({ mode: 'resend', content: FAILED_INPUT }));
     await cutAfterExit();
     expect(pendingMessages).toEqual([{ content: FAILED_INPUT, turnId: 'trg_new' }]);
+  });
+});
+
+describe('flushPending at a stopped message whose cut must be put back', () => {
+  const CUT = { path: '/nonexistent', offset: 0, backupPath: '/nonexistent.bak', sessionId: SID, preserveScratchTree: false, plainContent: '继续', reason: 'cut' };
+  function flushWithHeld(held: { stopped: boolean }) {
+    const harness = workerSubmitHarness();
+    const { scope } = harness;
+    const stopped = { turnId: 'trg_new', content: MERGED };
+    const later = { turnId: 'om_later', content: '还在吗' };
+    scope.pendingMessages.splice(0, scope.pendingMessages.length, stopped, later);
+    scope.FAILED_TURN_REWIND_STOPPED = 'stopped_before_start';
+    scope.failedTurnRewindInFlight = { queued: stopped, cut: CUT, report: vi.fn(), ...held };
+    // A tmux teardown is asynchronous: the backend is still there when the
+    // restart has fenced input.
+    scope.restartCliProcess = vi.fn(async () => { scope.cliRestartInProgress = true; });
+    // The resumed CLI's first flush runs the bot's startup commands, which
+    // Claude Code records as turns: they would keep the cut from going back.
+    scope.hasRunStartupCommands = false;
+    scope.runStartupCommands = vi.fn(async () => true);
+    scope.runInitialNativeRename = vi.fn(async () => {});
+    return { ...harness, later };
+  }
+
+  it('puts the cut back before the resumed CLI gets anything, startup commands included', async () => {
+    const { scope, flush, later } = flushWithHeld({ stopped: true });
+    await flush();
+    expect(scope.runStartupCommands).not.toHaveBeenCalled();
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(scope.restartCliProcess).toHaveBeenCalledTimes(1);
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+    expect(scope.pendingMessages).toEqual([later]);
+  });
+
+  it('settles a held message that left the queue without reaching the CLI: the daemon is not left waiting for it', async () => {
+    // Dropped meanwhile (a restart that keeps no queued input): seen by the next flush.
+    const dropped = flushWithHeld({ stopped: false });
+    dropped.scope.pendingMessages.shift();
+    const droppedHeld = dropped.scope.failedTurnRewindInFlight;
+    await dropped.flush();
+    expect(droppedHeld.report).toHaveBeenCalledWith('declined', expect.stringMatching(/left the queue.*cut NOT restored/));
+    expect(dropped.scope.failedTurnRewindInFlight).toBeNull();
+
+    // Refused at the write gate: settled as the flush ends.
+    const refused = flushWithHeld({ stopped: false });
+    const refusedHeld = refused.scope.failedTurnRewindInFlight;
+    refused.scope.workerSessionEventScope = {
+      canSubmit: (turnId: string) => turnId !== 'trg_new', enterTurn: () => {},
+    };
+    await refused.flush().catch(() => {});
+    expect(refused.scope.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_input_rejected', turnId: 'trg_new' }));
+    expect(refusedHeld.report).toHaveBeenCalledWith('declined', expect.stringMatching(/refused before it reached the CLI/));
+  });
+
+  it('a stop that lands while the flush is under way: nothing more is written once the restore restart started', async () => {
+    const { scope, flush, later } = flushWithHeld({ stopped: false });
+    scope.runStartupCommands = vi.fn(async () => { scope.failedTurnRewindInFlight.stopped = true; return true; });
+    await flush();
+    expect(scope.restartCliProcess).toHaveBeenCalledTimes(1);
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(scope.emitTurnTerminal).toHaveBeenCalledWith('trg_new', 'cancelled', 'stopped_before_start', undefined);
+    expect(scope.pendingMessages).toEqual([later]);
   });
 });
 

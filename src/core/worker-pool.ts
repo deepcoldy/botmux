@@ -3470,7 +3470,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
               ...(trustedCaller ? { trustedCaller } : {}),
               // Only Claude Code transcripts can be cut; other CLIs keep their
               // continuation exactly as it was.
-              ...(sessionCliId(ds, botCfg) === 'claude-code' ? { failedTurn: 'resend' as const } : {}),
+              ...(sessionCliId(ds, botCfg) === 'claude-code' ? { failedTurnResendOf: dispatch.logicalTurnId } : {}),
             },
           );
         }
@@ -15942,7 +15942,7 @@ function failedTurnRewindForInput(
   turnId: string | undefined,
   cliId: string | undefined,
   opts: {
-    failedTurn?: 'resend';
+    failedTurnResendOf?: string;
     purgeUndersizedImages?: true;
     dispatchAttempt?: number;
     durablePrimaryInbox?: true;
@@ -15956,11 +15956,21 @@ function failedTurnRewindForInput(
   if (isRemoteBackendSession(ds) || isSharedAdoptSession(ds) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return undefined;
   }
-  const mode = opts.failedTurn ?? 'merge';
+  const mode = opts.failedTurnResendOf !== undefined ? 'resend' : 'merge';
   // An input already on its way to carry this failed turn on (its CLI restart
   // is running): another one would run the failed input twice.
   const record = ds.session.lastFailedTurn;
   if (record && failedTurnRewindInFlight(ds, record.turnId)) return undefined;
+  // A retry re-sends the turn it was made for, never whatever failed last: an
+  // old card pressed after another turn failed must not cut and re-send that
+  // other turn. The record qualifies when it is that turn, or the turn a
+  // chain of cuts that started from it carries it on in now.
+  if (mode === 'resend' && record) {
+    const chain = ds.session.failedTurnRewindChain;
+    const same = record.turnId === opts.failedTurnResendOf
+      || (chain?.turnId === record.turnId && chain.originTurnId === opts.failedTurnResendOf);
+    if (!same) return undefined;
+  }
   if (mode === 'merge' && !mergeKeepsFailedInputDelivered(ds, record, turnId, opts.trustedCaller)) {
     return undefined;
   }
@@ -16041,6 +16051,7 @@ export function applyFailedTurnRewindResult(
     : ds.session.lastFailureCard?.turnId === result.failedTurnId ? ds.session.lastFailureCard.messageId : undefined;
   ds.session.failedTurnRewindChain = {
     turnId: result.turnId,
+    originTurnId: continues ? previous!.originTurnId ?? result.failedTurnId : result.failedTurnId,
     failures: continues ? previous!.failures + 1 : 1,
     ...(card ? { cardMessageId: card } : {}),
   };
@@ -16077,12 +16088,13 @@ export function sendWorkerInput(
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
     queueAfterActiveTurn?: true;
-    /** This input retries the session's failed turn (failure card button,
-     *  /retry, automatic continuation): when that turn failed without any
-     *  output, the worker cuts it and re-sends its input instead of this
-     *  content. Any other input is sent together with such a failed input
-     *  (core/failed-turn-rewind.ts). */
-    failedTurn?: 'resend';
+    /** This input retries this failed turn (failure card button, /retry,
+     *  a recovery card, automatic continuation of that logical turn): when
+     *  the session's failed record is that turn — or what a chain of cuts
+     *  carried it on to — and it failed without any output, the worker cuts
+     *  it and re-sends its input instead of this content. Any other input is
+     *  sent together with such a failed input (core/failed-turn-rewind.ts). */
+    failedTurnResendOf?: string;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));

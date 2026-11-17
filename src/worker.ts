@@ -9900,6 +9900,7 @@ function unsentInputJournalPath(): string | undefined {
 /** Parent exit: hand the queue's unwritten inputs to the next worker of this
  *  session. Its CLI usually outlives us (persistent pane) and never saw them. */
 function saveUnsentInputsForSuccessor(reason: string): void {
+  handOverFailedTurnRewind();
   const path = unsentInputJournalPath();
   if (!path || lastInitConfig?.adoptMode || isCodexAppCliId(lastInitConfig?.cliId)) return;
   try {
@@ -17296,7 +17297,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
-  if ((key === 'ctrlc' || key === 'esc') && stopHeldFailedTurnRewind(key)) return;
+  if ((key === 'ctrlc' || key === 'esc') && stopHeldFailedTurnRewind()) return;
   if (!backend) return;
   const criticalInterrupt = isCriticalInterruptKey(key);
   if (criticalInterrupt && (traexQuotaPending?.failedTurn
@@ -22384,6 +22385,9 @@ function promotePendingHumanInterruption(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  // Dropped from the queue since the last flush (a restart that keeps no
+  // queued input, an IPC that removed it): settled before anything else.
+  settleFailedTurnRewindOffQueue('left the queue before it reached the CLI', false);
   const guardTraexFirstAdmission = traexFirstInputAdmissionPending || traexNativeStartupInputPending;
   const firstAdmissionWebInputGeneration = webTerminalInputGeneration;
   const firstAdmissionBackend = backend;
@@ -22410,6 +22414,7 @@ async function flushPending(): Promise<void> {
   if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
+  if (putBackStoppedRewindCutBeforeWrites()) return;
   if (pendingMessages[0]?.traexAutoModelContinuation) armTraexContinuationGrantWait();
   if (
     ambiguousSubmissionRecoveryHold
@@ -22899,6 +22904,8 @@ async function flushPending(): Promise<void> {
       if (failedTurnRewindWriteEdge(item) === 'stopped') {
         // Stopped while the failed-turn rewind held it: it never ran.
         if (item.turnId) emitTurnTerminal(item.turnId, 'cancelled', FAILED_TURN_REWIND_STOPPED, item.dispatchAttempt);
+        // Putting a cut back restarts the CLI: the rest waits for it.
+        if (cliRestartInProgress) break;
         continue;
       }
       cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
@@ -23727,6 +23734,8 @@ async function flushPending(): Promise<void> {
   } finally {
     if (cliSubmissionInFlight) settleSubmission(cliSubmissionInFlight.item);
     isFlushing = false;
+    // Dequeued and refused before its write edge (execution reconciliation).
+    settleFailedTurnRewindOffQueue('refused before it reached the CLI', false);
     // A fast provider final can restore readiness while the flush mutex is
     // held. Consume that terminal edge after release, once, so the next exact
     // FIFO turn cannot be stranded. A blocked flush writes zero items and never
@@ -31322,6 +31331,8 @@ async function spawnCliBody(
         if (dropPendingOnExit(pendingMessages[i])) pendingMessages.splice(i, 1);
       }
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
+      // The CLI is gone: a cut its rewind made can be put back right away.
+      settleFailedTurnRewindOffQueue('dropped on a CLI exit', true);
     }
     backend = null;
     revokePromptReadiness();
@@ -35446,8 +35457,6 @@ function emitTurnTerminal(
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
     : {};
   const directFailure = status === 'failed' && turnFailedWithoutOutput(turnId, errorCode);
-  // Ended before the CLI recorded it: nothing left to interrupt.
-  if (interruptRewoundInputOnceRecorded?.turnId === turnId) interruptRewoundInputOnceRecorded = null;
   const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
     type: 'turn_terminal',
     sessionId,
@@ -35664,7 +35673,6 @@ function acknowledgeNativeInputConsumed(
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
   inflightInputs.onTurnStarted(turnId);
-  interruptRewoundInputIfStopped(turnId);
   send({
     type: 'native_input_consumed', turnId, proofKind,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
@@ -35788,21 +35796,25 @@ function startTranscriptImagePurge(
  *  message reaches the CLI's write edge (see startFailedTurnRewind). */
 interface FailedTurnRewindInFlight {
   queued: PendingCliInput | undefined;
-  /** The cut, once it landed: what to undo if the restart then fails. */
-  cut?: { path: string; offset: number; backupPath: string; plainContent: string; reason: string };
-  /** The user pressed stop before the cut: nothing is cut, the message is
-   *  never written. */
+  /** The cut, once it landed: what to undo if the restart then fails or the
+   *  user stops the message. */
+  cut?: FailedTurnCut;
+  /** The user pressed stop while the message was held: it is never written,
+   *  and a cut that landed is put back — the conversation ends as it was
+   *  before the message came (see stopHeldFailedTurnRewind). */
   stopped: boolean;
-  /** The user pressed stop after the cut: the message carries the failed
-   *  input, so it goes in and is interrupted once the CLI has recorded it —
-   *  the failed input stays in the conversation, as with any stopped turn. */
-  interruptAfterWrite?: TermActionKey;
   report: (outcome: 'rewound' | 'declined', reason: string) => void;
 }
+interface FailedTurnCut {
+  path: string;
+  offset: number;
+  backupPath: string;
+  sessionId: string;
+  preserveScratchTree: boolean;
+  plainContent: string;
+  reason: string;
+}
 let failedTurnRewindInFlight: FailedTurnRewindInFlight | null = null;
-/** A message a failed-turn rewind wrote although the user had stopped it
- *  after the cut: interrupt it once the CLI recorded its input. */
-let interruptRewoundInputOnceRecorded: { turnId: string; key: TermActionKey } | null = null;
 
 /** Turn code of a message the user stopped while a failed-turn rewind still
  *  held it behind the CLI restart: it never reached the CLI. */
@@ -35822,7 +35834,8 @@ const FAILED_TURN_REWIND_STOPPED = 'stopped_before_start';
  *  write edge (failedTurnRewindWriteEdge): until then its record of the failed
  *  turn stays the one to retry. A restart that fails after the cut puts the
  *  cut bytes back; a stop pressed while the message is held keeps it from the
- *  CLI, as a stop would have ended the turn it starts. */
+ *  CLI and puts back a cut that landed, as a stop would have ended the turn
+ *  it starts before anything of it ran. */
 function startFailedTurnRewind(
   turnId: string | undefined,
   directive: FailedTurnRewindDirective,
@@ -35877,30 +35890,31 @@ function startFailedTurnRewind(
     preserveScratchTreeForRespawn: plan.preserveScratchTree,
     beforeRespawn: async retiring => {
       const outcome = await runFailedTurnRewindMaintenance({
-        waitForQuiescence: () => waitForProcessQuiescence(retiring.pid, {
-          now: () => Date.now(),
-          wait: ms => delay(ms),
-          provablyGone: pid => !pidNotProvablyGone(pid),
-        }, { ownedPids: retiring.processScope }),
+        waitForQuiescence: () => waitForRetiringCliQuiescence(retiring),
         inspect: () => inspectLastClaudeTurn(plan.target.jsonlPath),
         rewind: offset => rewindClaudeTranscript(plan.target.jsonlPath, offset, Date.now(), { backup: 'removed' }),
         planned: { offset: plan.offset, ...(plan.uuid ? { uuid: plan.uuid } : {}) },
         failedInput: directive.failedInput,
-        // Held behind the restart fence, so nothing can have written it yet.
-        messageStillQueued: () => !state.stopped && !!state.queued && pendingMessages.includes(state.queued),
+        // Held behind the restart fence, so nothing can have written it yet —
+        // unless it was settled meanwhile (stopped, dropped, handed on).
+        messageStillQueued: () => failedTurnRewindInFlight === state && !state.stopped
+          && !!state.queued && pendingMessages.includes(state.queued),
       });
       if (outcome.kind === 'declined') {
         report('declined', state.stopped ? 'stopped before the cut' : outcome.reason);
         return;
       }
       const queued = state.queued!;
-      state.cut = {
+      const cut: FailedTurnCut = {
         path: plan.target.jsonlPath,
         offset: plan.offset,
         backupPath: outcome.result.backupPath,
+        sessionId: plan.target.sessionId,
+        preserveScratchTree: plan.preserveScratchTree,
         plainContent: queued.content,
         reason: `cut ${outcome.result.removedBytes} bytes, backup ${outcome.result.backupPath}`,
       };
+      state.cut = cut;
       queued.content = rewoundContent(directive.content, outcome.suffix);
     },
     onRespawnSettled: result => {
@@ -35913,26 +35927,20 @@ function startFailedTurnRewind(
       // The worker exits right after a failed spawn. Leave the conversation
       // as it was: the failed turn back in the transcript, the daemon's record
       // of it still the one to retry.
-      if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
       const cut = state.cut;
-      let restored = !cut;
-      if (cut) {
-        try {
-          restored = restoreRewoundTranscript(cut.path, cut.offset, cut.backupPath);
-        } catch (err) {
-          log(`Restoring the cut failed turn failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-        if (restored && state.queued) state.queued.content = cut.plainContent;
+      if (cut && putBackFailedTurnCut(cut)) {
+        state.cut = undefined;
+        if (state.queued) state.queued.content = cut.plainContent;
+        report('declined', 'restart failed after the cut; cut restored');
       }
       // Without this the held message dies with the worker; the next worker
       // writes what it finds here (the old flow never restarted, so it was
-      // always delivered).
+      // always delivered). The hand-over settles the rewind: a cut that could
+      // not be put back travels with the saved message, a stopped message
+      // ends here.
       saveUnsentInputsForSuccessor('failed-turn rewind restart failed');
-      // A cut that could not be put back leaves the saved message carrying
-      // the failed input (merged): the next worker delivers it.
-      if (!cut) report('declined', 'restart failed before the cut');
-      else if (restored) report('declined', 'restart failed after the cut; cut restored');
-      else report('declined', `restart failed after the cut; cut NOT restored, the saved message carries it (backup ${cut.backupPath})`);
+      if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
+      report('declined', `restart failed ${cut ? 'after' : 'before'} the cut`);
     },
   });
   const before = pendingMessages.length;
@@ -35941,60 +35949,162 @@ function startFailedTurnRewind(
   state.queued = pendingMessages.length > before && last?.turnId === turnId ? last : undefined;
 }
 
+/** The CLI a restart retired has stopped, its children included — before
+ *  anything rewrites the transcript it wrote. */
+function waitForRetiringCliQuiescence(retiring: { pid?: number; processScope: number[] }): Promise<void> {
+  return waitForProcessQuiescence(retiring.pid, {
+    now: () => Date.now(),
+    wait: ms => delay(ms),
+    provablyGone: pid => !pidNotProvablyGone(pid),
+  }, { ownedPids: retiring.processScope });
+}
+
+/** Put a failed-turn cut back while no CLI is running on the transcript. */
+function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
+  try {
+    return restoreRewoundTranscript(cut.path, cut.offset, cut.backupPath);
+  } catch (err) {
+    log(`Restoring the cut failed turn failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+/** A message the user stopped while a failed-turn rewind held it, taken out
+ *  of the queue: it ended without reaching the CLI. */
+function dropStoppedRewindMessage(item: PendingCliInput): void {
+  const index = pendingMessages.indexOf(item);
+  if (index >= 0) pendingMessages.splice(index, 1);
+  if (item.turnId) emitTurnTerminal(item.turnId, 'cancelled', FAILED_TURN_REWIND_STOPPED, item.dispatchAttempt);
+}
+
 /** At the CLI write edge of a message a failed-turn rewind held: report what
- *  the CLI is about to get, or — when the user stopped it before the cut —
- *  keep it from the CLI (the caller ends its turn as cancelled). */
+ *  the CLI is about to get, or — when the user stopped it — keep it from the
+ *  CLI (the caller ends its turn as cancelled). A cut that landed is then put
+ *  back (restartToPutBackCut), the caller writing nothing more meanwhile. */
 function failedTurnRewindWriteEdge(item: PendingCliInput): 'write' | 'stopped' {
   const held = failedTurnRewindInFlight;
   if (!held || held.queued !== item) return 'write';
   failedTurnRewindInFlight = null;
-  if (held.stopped) {
-    held.report('declined', 'stopped before it reached the CLI');
-    return 'stopped';
+  if (!held.stopped) {
+    if (held.cut) held.report('rewound', held.cut.reason);
+    return 'write';
   }
-  if (held.cut) held.report('rewound', held.cut.reason);
-  if (held.interruptAfterWrite && item.turnId) {
-    interruptRewoundInputOnceRecorded = { turnId: item.turnId, key: held.interruptAfterWrite };
-  }
-  return 'write';
+  if (held.cut) restartToPutBackCut(held, held.cut);
+  else held.report('declined', 'stopped before it reached the CLI');
+  return 'stopped';
 }
 
-/** A stop (Ctrl-C / Esc) while a failed-turn rewind holds its message behind
- *  the CLI restart: nothing is running for it to interrupt yet, and without
- *  this the message would start right after. Before the cut the message is
- *  simply never written (the failed turn stays where it was). After the cut
- *  it carries the failed input, which would otherwise leave the conversation
- *  with it: it goes in and is interrupted once the CLI recorded it — the turn
- *  a stop would have interrupted anyway. Returns whether it was taken. */
-function stopHeldFailedTurnRewind(key: TermActionKey): boolean {
+/** First thing a flush does, before it writes anything — startup commands
+ *  included, which Claude Code records as turns of their own and which would
+ *  so keep the cut from being put back: a message the user stopped after the
+ *  cut ends here and the cut is put back (restartToPutBackCut). Returns
+ *  whether it did, the flush then writing nothing. */
+function putBackStoppedRewindCutBeforeWrites(): boolean {
   const held = failedTurnRewindInFlight;
-  if (!held?.queued || !pendingMessages.includes(held.queued) || held.stopped) return false;
-  if (held.cut) {
-    held.interruptAfterWrite = key;
-    log(`Stop while a failed-turn rewind holds ${(held.queued.turnId ?? '-').slice(0, 16)} after the cut: interrupting it once recorded`);
-  } else {
-    held.stopped = true;
-    log(`Stop while a failed-turn rewind holds ${(held.queued.turnId ?? '-').slice(0, 16)}: it will not be written`);
-  }
+  if (!held?.stopped || !held.cut || !held.queued || !pendingMessages.includes(held.queued)) return false;
+  failedTurnRewindInFlight = null;
+  dropStoppedRewindMessage(held.queued);
+  restartToPutBackCut(held, held.cut);
   return true;
 }
 
-/** The CLI recorded `turnId`'s input: deliver the stop the user pressed while
- *  a failed-turn rewind held it (see stopHeldFailedTurnRewind). */
-function interruptRewoundInputIfStopped(turnId: string): void {
-  const pending = interruptRewoundInputOnceRecorded;
-  if (!pending || pending.turnId !== turnId) return;
-  interruptRewoundInputOnceRecorded = null;
-  queueMicrotask(() => {
-    // The record and the turn's end can land in one transcript read (a
-    // failure answered at once): a key sent then would hit an idle prompt.
-    if (turnTerminalEmitted(turnId)) {
-      log(`Not interrupting ${turnId.slice(0, 16)}: it ended before the stop could reach it`);
-      return;
-    }
-    log(`Interrupting ${turnId.slice(0, 16)}: stopped while its failed-turn rewind held it`);
-    void handleTermAction(pending.key);
+/** The CLI resumed without the cut failed turn, and the message that was to
+ *  carry it was stopped: restart the CLI around putting the cut back, with
+ *  everything queued kept for the replacement. The stopped turn has ended
+ *  already (the daemon no longer counts the rewind as in flight: an input
+ *  arriving meanwhile goes in as it came, behind the restored turn); the
+ *  daemon hears how the restore went once it ran. */
+function restartToPutBackCut(held: FailedTurnRewindInFlight, cut: FailedTurnCut): void {
+  const notRestored = (why: string) => `stopped after the cut; cut NOT restored, ${why} (backup ${cut.backupPath})`;
+  void restartCliProcess('put back a cut failed turn: its message was stopped', {
+    immediate: true,
+    preservePending: true,
+    skipRestartBudget: true,
+    exactResumeSessionId: cut.sessionId,
+    preserveScratchTreeForRespawn: cut.preserveScratchTree,
+    beforeRespawn: async retiring => {
+      try {
+        await waitForRetiringCliQuiescence(retiring);
+      } catch (err) {
+        held.report('declined', notRestored(`CLI exit unproven: ${err instanceof Error ? err.message : String(err)}`));
+        return;
+      }
+      held.report('declined', putBackFailedTurnCut(cut) ? 'stopped after the cut; cut restored' : notRestored('the transcript moved on'));
+    },
+    onRespawnSettled: result => {
+      held.report('declined', notRestored(`restart ${result} before the restore`));
+      if (result === 'failed') saveUnsentInputsForSuccessor('restart restoring a cut failed turn failed');
+    },
   });
+}
+
+/** The message a failed-turn rewind holds left the queue other than at the
+ *  CLI's write edge — dropped on a CLI exit (an at-most-once input is never
+ *  replayed), by a restart that drops queued input (seen at the next flush),
+ *  or refused right before the write. Without this the daemon waits for the rewind's outcome for the
+ *  life of the worker and refuses the failed turn's retries meanwhile. A cut
+ *  that landed is put back when no CLI runs on the transcript (`cliGone`);
+ *  otherwise the failed turn is left to the daemon's record of it, which the
+ *  failure card retries. */
+function settleFailedTurnRewindOffQueue(reason: string, cliGone: boolean): void {
+  const held = failedTurnRewindInFlight;
+  if (!held || (held.queued && pendingMessages.includes(held.queued))) return;
+  failedTurnRewindInFlight = null;
+  const cut = held.cut;
+  if (!cut) held.report('declined', `${reason} before the cut`);
+  else if (cliGone && putBackFailedTurnCut(cut)) held.report('declined', `${reason}; cut restored`);
+  else held.report('declined', `${reason}; cut NOT restored (backup ${cut.backupPath})`);
+}
+
+/** The worker hands its unwritten input to the next one (or drops it with
+ *  no journal to write): the message a failed-turn rewind holds goes along —
+ *  carrying the failed input once the cut landed, so the daemon hears
+ *  `rewound` now, as it would at the write edge — unless the user stopped
+ *  it: it then ends here, cancelled, and no worker writes it. */
+function handOverFailedTurnRewind(): void {
+  const held = failedTurnRewindInFlight;
+  if (!held) return;
+  // Gone from the queue already (a retired runtime's queue is cleared).
+  if (!held.queued || !pendingMessages.includes(held.queued)) {
+    settleFailedTurnRewindOffQueue('left the queue before the worker went away', false);
+    return;
+  }
+  failedTurnRewindInFlight = null;
+  // Only a replayable input is saved for the next worker (an at-most-once one
+  // never is): one that is not dies with this worker.
+  const handedOn = !!unsentInputJournalPath() && isUnsentInputReplayable(held.queued);
+  if (held.stopped) {
+    dropStoppedRewindMessage(held.queued);
+    held.report('declined', held.cut
+      ? `stopped after the cut; the worker is going away, cut NOT restored (backup ${held.cut.backupPath})`
+      : 'stopped before it reached the CLI');
+  } else if (held.cut) {
+    held.report(handedOn ? 'rewound' : 'declined', handedOn
+      ? `${held.cut.reason}; handed to the next worker`
+      : `not saved for the next worker; cut NOT restored (backup ${held.cut.backupPath})`);
+  } else {
+    held.report('declined', handedOn ? 'handed to the next worker as it came' : 'not saved for the next worker');
+  }
+}
+
+/** A stop (Ctrl-C / Esc — Claude Code's interrupt key either way) while a
+ *  failed-turn rewind holds its message behind the CLI restart: nothing is
+ *  running for it to interrupt yet, and without this the message would start
+ *  right after. It is never written instead; a cut that already landed is
+ *  put back before the CLI gets anything more (putBackStoppedRewindCutBeforeWrites),
+ *  so the failed turn stays in the conversation as it would have without the
+ *  message. Returns whether it was taken. */
+function stopHeldFailedTurnRewind(): boolean {
+  const held = failedTurnRewindInFlight;
+  if (!held?.queued || !pendingMessages.includes(held.queued) || held.stopped) return false;
+  held.stopped = true;
+  log(`Stop while a failed-turn rewind holds ${(held.queued.turnId ?? '-').slice(0, 16)}: it will not be written${held.cut ? '; the cut is put back' : ''}`);
+  // The CLI is back already: a flush may be under way (startup commands) —
+  // restart now rather than at its write edge. While the restart still runs,
+  // or no CLI is up (it exited; its restart proves the next one's exit), the
+  // next flush does it first thing.
+  if (held.cut && !cliRestartInProgress && backend) putBackStoppedRewindCutBeforeWrites();
+  return true;
 }
 
 function publishLocalProcessAttestation(

@@ -10142,6 +10142,27 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     });
   });
 
+  it('a continuation re-sends only its own turn: a later failure of the session is not cut and re-sent in its place', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    // Another turn failed without output while the continuation waited.
+    ds.session.lastFailedTurn = {
+      turnId: 'om_newer', userPrompt: 'NEWER_TASK', cliInput: 'NEWER_TASK',
+      failedAt: new Date().toISOString(), errorCode: 'provider_server_error', status: 'failed',
+      retryable: true, directFailure: true, retryCount: 0,
+    };
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    expect(continuation.failedTurnRewind).toBeUndefined();
+  });
+
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     armSilentScheduledTurn(ds, SCHEDULED_TURN);

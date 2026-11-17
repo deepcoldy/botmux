@@ -158,7 +158,7 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     expect(s.ds.lastCliInput).toBe(`${HINT}\n\n继续`);
     expect(s.ds.lastCliInputTurnId).toBe('trg_2');
     expect(s.ds.session.lastFailedTurn).toBeUndefined();
-    expect(s.ds.session.failedTurnRewindChain).toEqual({ turnId: 'trg_2', failures: 1, cardMessageId: 'om_card_1' });
+    expect(s.ds.session.failedTurnRewindChain).toEqual({ turnId: 'trg_2', originTurnId: 'trg_1', failures: 1, cardMessageId: 'om_card_1' });
 
     // It fails the same way: the card is updated in place, no second card.
     await s.failed('trg_2', { directFailure: true });
@@ -172,7 +172,7 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     const third = s.input('trg_3', '继续');
     expect(third.failedTurnRewind).toMatchObject({ failedTurnId: 'trg_2', content: `${HINT}\n\n继续` });
     await s.rewound('trg_3', 'trg_2');
-    expect(s.ds.session.failedTurnRewindChain).toEqual({ turnId: 'trg_3', failures: 2, cardMessageId: 'om_card_1' });
+    expect(s.ds.session.failedTurnRewindChain).toEqual({ turnId: 'trg_3', originTurnId: 'trg_1', failures: 2, cardMessageId: 'om_card_1' });
     expect(s.ds.lastUserPrompt).toBe(`${HINT}\n\n继续`);
     await s.failed('trg_3', { directFailure: true });
     expect(s.failureCards()).toHaveLength(1);
@@ -251,19 +251,49 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     expect(s.ds.session.failedTurnRewindChain).toMatchObject({ turnId: 'trg_2', cardMessageId: 'om_card_2' });
     s.input('trg_3', '继续');
     await s.rewound('trg_3', 'trg_2');
-    expect(s.ds.session.failedTurnRewindChain).toEqual({ turnId: 'trg_3', failures: 2, cardMessageId: 'om_card_2' });
+    expect(s.ds.session.failedTurnRewindChain).toEqual({ turnId: 'trg_3', originTurnId: 'trg_1', failures: 2, cardMessageId: 'om_card_2' });
   });
 
   it('a retry or an automatic continuation re-sends the failed input alone', async () => {
     const s = session();
     rememberLastCliInput(s.ds, HINT, HINT, 'trg_1');
     await s.failed('trg_1', { directFailure: true });
-    const retry = s.input('retry-1', '[BOTMUX_CONTINUE] 继续', { failedTurn: 'resend' });
+    const retry = s.input('retry-1', '[BOTMUX_CONTINUE] 继续', { failedTurnResendOf: 'trg_1' });
     expect(retry.content).toBe('[BOTMUX_CONTINUE] 继续');
     expect(retry.failedTurnRewind).toEqual({ failedTurnId: 'trg_1', failedInput: HINT, mode: 'resend', content: HINT });
     await s.rewound('retry-1', 'trg_1');
     expect(s.ds.lastCliInput).toBe(HINT);
-    expect(s.ds.session.failedTurnRewindChain).toMatchObject({ turnId: 'retry-1', failures: 1 });
+    expect(s.ds.session.failedTurnRewindChain).toMatchObject({ turnId: 'retry-1', originTurnId: 'trg_1', failures: 1 });
+  });
+
+  // An old card (or a continuation of an older turn) pressed after another
+  // turn failed: it must not cut and re-send that other turn.
+  it('a retry re-sends only the turn it was made for, never whatever failed last', async () => {
+    const s = session();
+    rememberLastCliInput(s.ds, 'ORIGINAL_TASK', 'ORIGINAL_TASK', 'om_A');
+    await s.failed('om_A', { directFailure: true });
+    rememberLastCliInput(s.ds, 'NEWER_TASK', 'NEWER_TASK', 'trg_new');
+    await s.failed('trg_new', { directFailure: true });
+    expect(s.ds.session.lastFailedTurn?.turnId).toBe('trg_new');
+    const old = s.input('bmx-recovery-retry-A', 'ORIGINAL_TASK', { failedTurnResendOf: 'om_A' });
+    expect(old.content).toBe('ORIGINAL_TASK');
+    expect(old.failedTurnRewind).toBeUndefined();
+  });
+
+  it('a retry aimed at a failed turn follows it along the chain of cuts that carried it on', async () => {
+    const s = session();
+    rememberLastCliInput(s.ds, HINT, HINT, 'trg_1');
+    await s.failed('trg_1', { directFailure: true });
+    s.input('trg_2', '继续');
+    await s.rewound('trg_2', 'trg_1');
+    await s.failed('trg_2', { directFailure: true });
+    expect(s.ds.session.failedTurnRewindChain).toMatchObject({ turnId: 'trg_2', originTurnId: 'trg_1' });
+    // The automatic continuation (or recovery card) of trg_1 re-sends what trg_2 carries now.
+    expect(s.input('bmx-recovery-2', '[BOTMUX_RECOVERY] 继续', { failedTurnResendOf: 'trg_1' }).failedTurnRewind).toEqual({
+      failedTurnId: 'trg_2', failedInput: `${HINT}\n\n继续`, mode: 'resend', content: `${HINT}\n\n继续`,
+    });
+    await s.rewound('bmx-recovery-2', 'trg_2');
+    expect(s.ds.session.failedTurnRewindChain).toMatchObject({ turnId: 'bmx-recovery-2', originTurnId: 'trg_1', failures: 2 });
   });
 
   it('a declined cut changes nothing: the failed turn and its record stay, the input went in as it was', async () => {
@@ -301,7 +331,7 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     arm(s.ds);
     expect(s.input('trg_2', '继续').failedTurnRewind).toBeUndefined();
     // A retry of the failed input itself is not a fold.
-    expect(s.input('retry-1', HINT, { failedTurn: 'resend' }).failedTurnRewind).toMatchObject({ mode: 'resend' });
+    expect(s.input('retry-1', HINT, { failedTurnResendOf: 'trg_1' }).failedTurnRewind).toMatchObject({ mode: 'resend' });
   });
 
   it('folds a failed input only into a turn of the same sender, or of nobody in particular', async () => {
@@ -374,7 +404,7 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     s.input('trg_2', '继续');
     expect(failedTurnRewindInFlight(s.ds, 'trg_1')).toBe(true);
     // An automatic continuation (or anything else) meanwhile goes in plainly.
-    expect(s.input('bmx-recovery-1', '[BOTMUX_RECOVERY] 继续', { failedTurn: 'resend' }).failedTurnRewind).toBeUndefined();
+    expect(s.input('bmx-recovery-1', '[BOTMUX_RECOVERY] 继续', { failedTurnResendOf: 'trg_1' }).failedTurnRewind).toBeUndefined();
     await s.rewound('trg_2', 'trg_1');
     expect(failedTurnRewindInFlight(s.ds, 'trg_1')).toBe(false);
   });
@@ -403,7 +433,7 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     s.ds.suppressedFinalOutputTurns?.clear();
     expect(s.input('trg_2', '继续').failedTurnRewind).toBeUndefined();
     // Its own retry still re-sends it.
-    expect(s.input('retry-1', HINT, { failedTurn: 'resend' }).failedTurnRewind).toMatchObject({ mode: 'resend' });
+    expect(s.input('retry-1', HINT, { failedTurnResendOf: 'trg_1' }).failedTurnRewind).toMatchObject({ mode: 'resend' });
   });
 
   it.each([

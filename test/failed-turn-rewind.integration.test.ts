@@ -48,7 +48,7 @@ async function waitUntil(check: () => boolean, logs: string[], timeoutMs = 45_00
 type Row = Record<string, any>;
 const HINT = '【决策看板 · 提示】巡检发现 1 项可以推进或关闭';
 
-function startWorker() {
+function startWorker(init: Partial<Extract<DaemonToWorker, { type: 'init' }>> = {}) {
   root = mkdtempSync(join(tmpdir(), 'botmux-failed-turn-rewind-'));
   const workDir = join(root, 'work');
   const dataDir = join(root, 'data');
@@ -67,7 +67,7 @@ function startWorker() {
   const prompts = join(root, 'prompts.jsonl');
   const down = join(root, 'provider-down');
   const slowResume = join(root, 'slow-resume');
-  const slowTurn = join(root, 'slow-turn');
+  const dieOnResume = join(root, 'die-on-resume');
   writeFileSync(down, '');
   const fakeClaude = join(root, 'fake-claude');
   // Each launch (the first and every --resume) draws a prompt; each submitted
@@ -81,6 +81,14 @@ let running;
 // A resumed launch can take a while to draw its prompt (a long transcript).
 const slow = process.argv.includes('--resume') && fs.existsSync(${JSON.stringify(slowResume)});
 setTimeout(() => process.stdout.write('❯ '), slow ? 4000 : 0);
+// A resumed launch that crashes before it draws its prompt.
+if (process.argv.includes('--resume') && fs.existsSync(${JSON.stringify(dieOnResume)})) setTimeout(() => process.exit(1), 1500);
+// Claude Code 2.1.326 writes its cost state when it exits, even a resumed
+// CLI that never got an input: no uuid, outside the conversation.
+for (const signal of ['SIGHUP', 'SIGTERM']) process.on(signal, () => {
+  fs.appendFileSync(T, JSON.stringify({ type: 'cost-state', sessionId: 'fake', totalCostUsd: 0 }) + '\\n');
+  process.exit(0);
+});
 // Without raw mode the pty turns Ctrl-C into SIGINT (Claude reads it raw).
 process.on('SIGINT', () => {
   fs.appendFileSync(${JSON.stringify(prompts)}, JSON.stringify({ sigint: true }) + '\\n');
@@ -105,14 +113,26 @@ process.stdin.on('data', chunk => {
   const prompt = typed.replace(/\\x1b\\[20[01]~/g, '').trim();
   typed = '';
   fs.appendFileSync(${JSON.stringify(prompts)}, JSON.stringify({ prompt }) + '\\n');
+  // A slash command (a bot's startup command): recorded as Claude Code does,
+  // a user record of its own and its local output, no model turn.
+  const command = /^(\\/[\\w:.-]+)(?:\\s+(.*))?$/.exec(prompt);
+  if (command) {
+    const record = () => {
+      put({ type: 'user', isMeta: true, message: { role: 'user', content: '<local-command-caveat>The command below was run directly in Claude Code</local-command-caveat>' } });
+      put({ type: 'user', message: { role: 'user', content: '<command-name>' + command[1] + '</command-name>\\n<command-args>' + (command[2] || '') + '</command-args>' } });
+      put({ type: 'user', message: { role: 'user', content: '<local-command-stdout>ok</local-command-stdout>' } });
+      process.stdout.write('\\r\\n❯ ');
+    };
+    record();
+    return;
+  }
   put({ type: 'user', message: { role: 'user', content: prompt } });
   // 2.1.31x+ copies each request body into a blob record: message.role user,
   // no uuid, no timestamp.
   fs.appendFileSync(T, JSON.stringify({ type: 'api-request-blob', hash: 'h' + Date.now(),
     message: { role: 'user', content: [{ type: 'text', text: '<system-reminder>ctx</system-reminder>' }] } }) + '\\n');
   const failing = fs.existsSync(${JSON.stringify(down)});
-  // A slow turn leaves time to stop it.
-  const turnMs = fs.existsSync(${JSON.stringify(slowTurn)}) ? 8000 : 300;
+  const turnMs = 300;
   running = setTimeout(() => {
     running = undefined;
     if (failing) {
@@ -154,6 +174,7 @@ process.stdin.on('data', chunk => {
     type: 'init', sessionId: sid, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: workDir, cliId: 'claude-code', cliPathOverride: fakeClaude, cliSessionId,
     backendType: 'pty', prompt: '', resume: true, larkAppId: 'app_test', larkAppSecret: 'test-only', locale: 'zh',
+    ...init,
   } satisfies DaemonToWorker);
   const rows = (): Row[] => readFileSync(transcript, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
   const received = () => readFileSync(prompts, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
@@ -166,7 +187,7 @@ process.stdin.on('data', chunk => {
   const timeline = () => events().filter(entry => 'prompt' in entry || 'interrupt' in entry)
     .map(entry => ('prompt' in entry ? flat(entry.prompt as string) : '<interrupt>'));
   return { messages, logs, rows, received, launches, sigints, timeline,
-    slowResume: () => writeFileSync(slowResume, ''), slowTurns: () => writeFileSync(slowTurn, ''),
+    slowResume: () => writeFileSync(slowResume, ''), dieOnResume: () => writeFileSync(dieOnResume, ''),
     providerUp: () => { if (existsSync(down)) unlinkSync(down); } };
 }
 
@@ -266,7 +287,47 @@ describe('a turn that failed without output is cut before the next input (real w
     expect(w.launches()).toBe(1);
     expect(second.terminal.status).toBe('failed');
   }, 120_000);
-  it('a stop pressed while the CLI restarts for the cut: before the cut nothing runs; after it, the failed input still reaches the conversation', async () => {
+  it('a bot with startup commands: a stop after the resumed CLI ran them still puts the failed turn back', async () => {
+    const w = startWorker({ startupCommands: ['/effort high'] });
+    const first = await send(w, 'board:app:hint-1', HINT, undefined);
+    const commandRecords = () => userTurns(w).filter(text => text.startsWith('<command-name>/effort')).length;
+    const before = commandRecords();
+    const failedTurnRewind = planFailedTurnRewind({ record: first.record, turnId: 'trg_1', content: '继续', mode: 'merge' });
+    child!.send({ type: 'message', content: '继续', turnId: 'trg_1', failedTurnRewind } satisfies DaemonToWorker);
+    // Claude Code records the command the moment it runs: a turn of its own
+    // after the cut, before the message reaches the CLI.
+    await waitUntil(() => commandRecords() > before, w.logs);
+    child!.send({ type: 'term_action', key: 'ctrlc' } satisfies DaemonToWorker);
+    child!.send({ type: 'message', content: '还在吗', turnId: 'trg_2' } satisfies DaemonToWorker);
+    w.providerUp();
+    await waitUntil(() => !!terminalOf(w, 'trg_2'), w.logs, 90_000);
+    expect(terminalOf(w, 'trg_1')).toMatchObject({ status: 'cancelled', errorCode: 'stopped_before_start' });
+    expect(w.messages).toContainEqual(expect.objectContaining({
+      type: 'failed_turn_rewind', turnId: 'trg_1', outcome: 'declined', reason: expect.stringMatching(/stopped after the cut; cut restored/),
+    }));
+    expect(w.received().filter(text => !text.startsWith('/')).map(flat)).toEqual([flat(HINT), '还在吗']);
+    expect(userTurns(w).filter(text => !text.startsWith('<')).map(flat)).toEqual(['hi', flat(HINT), '还在吗']);
+    expect(apiErrors(w)).toBe(1);
+  }, 180_000);
+
+  it('an at-most-once input dropped when the resumed CLI dies before it is written: the cut goes back, the daemon hears it', async () => {
+    const w = startWorker();
+    const first = await send(w, 'board:app:hint-1', HINT, undefined);
+    w.slowResume();
+    w.dieOnResume();
+    const failedTurnRewind = planFailedTurnRewind({ record: first.record, turnId: 'bmx-recovery-retry-1', content: HINT, mode: 'resend' });
+    // A recovery card's retry: never replayed once its CLI exited.
+    child!.send({ type: 'message', content: HINT, turnId: 'bmx-recovery-retry-1', atMostOnce: true, failedTurnRewind } satisfies DaemonToWorker);
+    await waitUntil(() => w.messages.some(msg => msg.type === 'failed_turn_rewind' && msg.turnId === 'bmx-recovery-retry-1'), w.logs, 60_000);
+    expect(w.messages).toContainEqual(expect.objectContaining({
+      type: 'failed_turn_rewind', turnId: 'bmx-recovery-retry-1', outcome: 'declined', reason: expect.stringMatching(/dropped on a CLI exit; cut restored/),
+    }));
+    expect(w.received().map(flat)).toEqual([flat(HINT)]);
+    expect(userTurns(w).map(flat)).toEqual(['hi', flat(HINT)]);
+    expect(apiErrors(w)).toBe(1);
+  }, 120_000);
+
+  it('a stop pressed while the CLI restarts for the cut: the message never runs, the failed turn stays in the conversation, the next input runs', async () => {
     // Before the cut: the message never runs and the failed turn stays.
     {
       const w = startWorker();
@@ -291,9 +352,10 @@ describe('a turn that failed without output is cut before the next input (real w
     }
 
     // After the cut, with the next input already queued behind it: the
-    // message goes in carrying the failed input and is interrupted once the
-    // CLI recorded it; the queued input runs after it. The failed input is
-    // never lost from the conversation.
+    // message is not written either — nothing of it can run, not even a tool
+    // call it would make at once — and the cut is put back once the resumed
+    // CLI is gone (it writes its cost state on the way out). The queued input
+    // runs after, on the conversation as it was before the message came.
     const w = startWorker();
     const first = await send(w, 'board:app:hint-1', HINT, undefined);
     w.slowResume();
@@ -302,14 +364,19 @@ describe('a turn that failed without output is cut before the next input (real w
     await waitUntil(() => userTurns(w).length === 1, w.logs);
     // The daemon sends the next input plainly while the first is in flight.
     child!.send({ type: 'message', content: '还在吗', turnId: 'trg_2' } satisfies DaemonToWorker);
-    w.slowTurns();
     w.providerUp();
     child!.send({ type: 'term_action', key: 'ctrlc' } satisfies DaemonToWorker);
     await waitUntil(() => !!terminalOf(w, 'trg_2'), w.logs, 90_000);
-    expect(w.messages).toContainEqual(expect.objectContaining({ type: 'failed_turn_rewind', turnId: 'trg_1', outcome: 'rewound' }));
-    expect(w.timeline()).toEqual([flat(HINT), flat(`${HINT}\n\n继续`), '<interrupt>', '还在吗']);
-    expect(userTurns(w).map(flat)).toEqual(['hi', flat(`${HINT}\n\n继续`), '[Request interrupted by user]', '还在吗']);
+    expect(terminalOf(w, 'trg_1')).toMatchObject({ status: 'cancelled', errorCode: 'stopped_before_start' });
+    expect(w.messages).toContainEqual(expect.objectContaining({ type: 'failed_turn_rewind', turnId: 'trg_1', outcome: 'declined' }));
+    expect(w.timeline()).toEqual([flat(HINT), '还在吗']);
+    expect(w.sigints()).toBe(0);
+    expect(userTurns(w).map(flat)).toEqual(['hi', flat(HINT), '还在吗']);
+    // The failed turn came back with its error: the daemon's record of it
+    // still holds, and a retry finds it.
+    expect(apiErrors(w)).toBe(1);
     expect(terminalOf(w, 'trg_2')).toMatchObject({ status: 'completed' });
-    expect(apiErrors(w)).toBe(0);
+    // The first launch, the resume after the cut, the resume after the restore.
+    expect(w.launches()).toBe(3);
   }, 240_000);
 });

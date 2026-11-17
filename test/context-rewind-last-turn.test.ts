@@ -163,6 +163,91 @@ describe('restoreRewoundTranscript', () => {
     expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
     expect(readFileSync(path).equals(grown)).toBe(true);
   });
+
+  it('puts the turn back after what a CLI wrote outside the conversation since the cut, as its latest turn', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const before = readFileSync(path);
+    const { offset } = inspectLastClaudeTurn(path);
+    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 24), { backup: 'removed' });
+    // What Claude Code 2.1.326 appends when a resumed CLI that got no input exits.
+    const onExit = `${JSON.stringify({ type: 'cost-state', sessionId: 's', totalCostUsd: 0 })}\n${JSON.stringify({ type: 'mode', mode: 'normal' })}\n`;
+    writeFileSync(path, readFileSync(path, 'utf8') + onExit);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    // Appended, never rewritten in place: a write cut short cannot interleave.
+    expect(readFileSync(path).equals(Buffer.concat([before.subarray(0, offset), Buffer.from(onExit), before.subarray(offset)]))).toBe(true);
+    expect(inspectLastClaudeTurn(path)).toMatchObject({ outcome: 'error_only', uuid: 'u1' });
+    // A second restore finds the turn already back and changes nothing.
+    const restored = readFileSync(path);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(readFileSync(path).equals(restored)).toBe(true);
+  });
+
+  it('puts the turn back after the local slash commands a resumed CLI ran (a bot\'s startup commands), as its latest turn', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const before = readFileSync(path);
+    const { offset } = inspectLastClaudeTurn(path);
+    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 27), { backup: 'removed' });
+    // What Claude Code 2.1.326 records for `/effort high`, then its exit.
+    const ran = [
+      { type: 'file-history-snapshot', messageId: 'm', snapshot: {} },
+      { parentUuid: 'p', type: 'user', uuid: 'c0', isMeta: true, message: { role: 'user', content: '<local-command-caveat>The command below was run directly in Claude Code</local-command-caveat>' } },
+      { parentUuid: 'c0', type: 'user', uuid: 'c1', message: { role: 'user', content: '<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>high</command-args>' } },
+      { parentUuid: 'c1', type: 'user', uuid: 'c2', message: { role: 'user', content: '<local-command-stdout>Set effort level to high</local-command-stdout>' } },
+      { type: 'cost-state', sessionId: 's', totalCostUsd: 0 },
+    ].map(record => `${JSON.stringify(record)}\n`).join('');
+    writeFileSync(path, readFileSync(path, 'utf8') + ran);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    expect(readFileSync(path).equals(Buffer.concat([before.subarray(0, offset), Buffer.from(ran), before.subarray(offset)]))).toBe(true);
+    expect(inspectLastClaudeTurn(path)).toMatchObject({ outcome: 'error_only', uuid: 'u1' });
+  });
+
+  it('also takes a command output recorded as a local_command system record (earlier Claude Code builds)', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const { offset } = inspectLastClaudeTurn(path);
+    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 29), { backup: 'removed' });
+    // The shape of test/fixtures/claude-background-tasks/after-clear.jsonl.
+    const ran = [
+      { parentUuid: 'p', type: 'user', uuid: 'c1', message: { role: 'user', content: '<command-name>/effort</command-name>' } },
+      { parentUuid: 'c1', type: 'system', subtype: 'local_command', uuid: 'c2', isMeta: false, content: '<local-command-stdout></local-command-stdout>' },
+    ].map(record => `${JSON.stringify(record)}\n`).join('');
+    writeFileSync(path, readFileSync(path, 'utf8') + ran);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(true);
+    expect(inspectLastClaudeTurn(path)).toMatchObject({ outcome: 'error_only', uuid: 'u1' });
+  });
+
+  it('refuses once a slash command after the cut got a model turn', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const { offset } = inspectLastClaudeTurn(path);
+    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 28), { backup: 'removed' });
+    const answered = [
+      { parentUuid: 'p', type: 'user', uuid: 'c1', message: { role: 'user', content: '<command-name>/review</command-name>' } },
+      reply('审查结果'),
+    ].map(record => `${JSON.stringify(record)}\n`).join('');
+    writeFileSync(path, readFileSync(path, 'utf8') + answered);
+    const grown = readFileSync(path);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(readFileSync(path).equals(grown)).toBe(true);
+  });
+
+  it('refuses a message written after the cut even when it has no uuid', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const { offset } = inspectLastClaudeTurn(path);
+    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 26), { backup: 'removed' });
+    writeFileSync(path, `${readFileSync(path, 'utf8')}${JSON.stringify({ type: 'user', message: { role: 'user', content: '新的一轮' } })}\n`);
+    const grown = readFileSync(path);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(readFileSync(path).equals(grown)).toBe(true);
+  });
+
+  it('refuses when what follows the cut ends in a partial line', () => {
+    const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
+    const { offset } = inspectLastClaudeTurn(path);
+    const { backupPath } = rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 14, 25), { backup: 'removed' });
+    writeFileSync(path, `${readFileSync(path, 'utf8')}{"type":"cost-state"`);
+    const partial = readFileSync(path);
+    expect(restoreRewoundTranscript(path, offset!, backupPath)).toBe(false);
+    expect(readFileSync(path).equals(partial)).toBe(true);
+  });
 });
 
 describe('rewindClaudeTranscript backup: removed', () => {

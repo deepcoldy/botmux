@@ -310,6 +310,8 @@ describe('retry_turn — happy path', () => {
     expect(sendWorkerInputMock.mock.calls[0][1]).toMatchObject({
       content: 'wrapped: do the thing',
     });
+    // A cut of a turn that failed without output re-sends this card's turn.
+    expect(sendWorkerInputMock.mock.calls[0][3]).toMatchObject({ failedTurnResendOf: TURN });
     expect(res?.toast?.type).toBe('success');
   });
 

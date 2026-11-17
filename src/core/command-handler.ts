@@ -3907,7 +3907,7 @@ export async function handleCommand(
           if (ds.worker && !ds.worker.killed) {
             // A turn that failed without any output is cut first, so the
             // retry replaces it instead of stacking on top.
-            accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurn: 'resend' });
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
           } else {
             accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }

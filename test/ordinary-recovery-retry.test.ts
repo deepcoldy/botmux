@@ -131,6 +131,14 @@ describe('who may press retry', () => {
     expect(ds.session.ordinaryRecoveryNotices[0].retried).toMatchObject({ byOpenId: 'ou_asker', state: 'accepted', turnId });
   });
 
+  it('re-sends the turn of its own card, never a later failure of the session', async () => {
+    const ds = session();
+    // Another turn failed after this card was posted.
+    ds.session.lastFailedTurn = { turnId: 'om_NEWER', userPrompt: 'NEWER_TASK', cliInput: 'NEWER_TASK', failedAt: '2026-11-17T03:00:00.000Z', directFailure: true };
+    await click(ds, 'ou_asker');
+    expect(sendWorkerInputMock.mock.calls[0][3]).toMatchObject({ failedTurnResendOf: 'om_A' });
+  });
+
   it('lets a bot admin retry on the sender\'s behalf (the message still runs as the sender)', async () => {
     const ds = session();
     const reply = await click(ds, 'ou_admin');

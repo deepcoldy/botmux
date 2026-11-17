@@ -1177,6 +1177,9 @@ export interface Session {
    *  instead of a new card per failure. */
   failedTurnRewindChain?: {
     turnId: string;
+    /** The failed turn the chain started from: a retry or continuation aimed
+     *  at it may re-send what the chain carries now. */
+    originTurnId: string;
     /** Consecutive failures of this input before `turnId` (the first is 1). */
     failures: number;
     cardMessageId?: string;

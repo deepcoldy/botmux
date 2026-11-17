@@ -12,7 +12,7 @@
  * （groupContextEpoch），换新 id 会让整段群历史——包括想丢掉的那条——重新注入。
  */
 
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import {
   extractTurnStartText,
   isMeaningfulQueuedCommand,
@@ -513,11 +513,64 @@ function rewindOpenTranscript(
   return { backupPath, removedBytes: st.size - offset };
 }
 
+/** Most bytes of records a CLI may append after a cut and still allow it to be
+ *  undone (a few metadata lines; a conversation would be far bigger). */
+const RESTORE_TAIL_LIMIT_BYTES = 1 << 20;
+
+/** Records outside the conversation tree: no uuid of their own, not a
+ *  message. Claude Code writes `cost-state` when it exits, even a resumed CLI
+ *  that never got an input (2.1.326). */
+function isMetadataLine(record: Record<string, unknown>): boolean {
+  return record.type !== 'user' && record.type !== 'assistant' && record.type !== 'system'
+    && record.type !== 'attachment' && record.uuid === undefined && record.parentUuid === undefined;
+}
+
+/** What Claude Code records for a local slash command (a bot's startup
+ *  command such as `/effort high`): a caveat, the command, its output — user
+ *  records with no model turn behind them (2.1.326), the output also as a
+ *  `system` / `local_command` record (earlier builds). */
+const LOCAL_COMMAND_RECORD_RE = /^<(?:local-command-caveat|command-name|local-command-stdout|local-command-stderr)>/;
+const LOCAL_COMMAND_OUTPUT_RE = /^<(?:local-command-stdout|local-command-stderr)>/;
+function isLocalCommandRecord(record: Record<string, unknown>): boolean {
+  if (record.type === 'system') {
+    return record.subtype === 'local_command' && typeof record.content === 'string'
+      && LOCAL_COMMAND_OUTPUT_RE.test(record.content.trimStart());
+  }
+  if (record.type !== 'user') return false;
+  const content = (record.message as { content?: unknown } | undefined)?.content;
+  const text = typeof content === 'string' ? content
+    : Array.isArray(content) && content.length === 1 && (content[0] as { type?: unknown })?.type === 'text'
+      ? String((content[0] as { text?: unknown }).text ?? '') : undefined;
+  return text !== undefined && LOCAL_COMMAND_RECORD_RE.test(text.trimStart());
+}
+
+/** A record a CLI may have written after a cut that still lets the cut turn
+ *  go back as the conversation's latest turn. */
+function mayFollowRestoredTurn(line: string): boolean {
+  try {
+    const ev: unknown = JSON.parse(line);
+    if (!ev || typeof ev !== 'object') return false;
+    const record = ev as Record<string, unknown>;
+    return isMetadataLine(record) || isLocalCommandRecord(record);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Undo a cut made with `backup: 'removed'`: append the removed bytes back,
- * provided nothing was written after the cut (the file still ends at
- * `offset`). Same descriptor discipline as the cut itself. Returns whether the
- * transcript is whole again.
+ * Undo a cut made with `backup: 'removed'`: put the removed bytes back. What
+ * the CLI appended since may only be metadata outside the conversation and
+ * local slash commands (see {@link mayFollowRestoredTurn}). The removed bytes
+ * are appended after them, never written back in place: the turn's first
+ * record still names its old parent, and a resumed Claude Code (2.1.326)
+ * continues from the last record in the file — so the conversation runs
+ * through the restored turn again, the commands left on a side branch (a
+ * resumed CLI runs its startup commands anew anyway). Appending also means a
+ * write cut short (the worker dies) leaves a partial last line, never bytes
+ * interleaved with the ones before. Anything else after the cut — a model
+ * turn, a partial line, the turn already put back — means the transcript
+ * moved on and nothing is changed. Same descriptor discipline as the cut
+ * itself. Returns whether the transcript holds the cut turn again.
  */
 export function restoreRewoundTranscript(path: string, offset: number, backupPath: string): boolean {
   const pre = lstatSync(path);
@@ -525,27 +578,21 @@ export function restoreRewoundTranscript(path: string, offset: number, backupPat
   const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
   try {
     assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
-    if (fstatSync(fd).size !== offset) return false;
-    const backupFd = openSync(backupPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    try {
-      const size = fstatSync(backupFd).size;
-      const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
-      let copied = 0;
-      while (copied < size) {
-        const n = readSync(backupFd, buf, 0, Math.min(buf.length, size - copied), copied);
-        if (n <= 0) throw new Error(`unexpected EOF while restoring ${backupPath}`);
-        let written = 0;
-        while (written < n) {
-          const w = writeSync(fd, buf, written, n - written, offset + copied + written);
-          if (w <= 0) throw new Error('short write while restoring a rewound transcript');
-          written += w;
-        }
-        copied += n;
-      }
-      return fstatSync(fd).size === offset + size;
-    } finally {
-      closeSync(backupFd);
+    const size = fstatSync(fd).size;
+    if (size < offset || size - offset > RESTORE_TAIL_LIMIT_BYTES) return false;
+    const tail = Buffer.alloc(size - offset);
+    if (tail.length > 0 && readSync(fd, tail, 0, tail.length, offset) !== tail.length) return false;
+    // Whole lines only: the text after the last newline must be empty.
+    const lines = tail.toString('utf8').split('\n');
+    if (lines.pop() !== '' || !lines.every(mayFollowRestoredTurn)) return false;
+    const removed = readFileSync(backupPath);
+    let written = 0;
+    while (written < removed.length) {
+      const w = writeSync(fd, removed, written, removed.length - written, size + written);
+      if (w <= 0) throw new Error('short write while restoring a rewound transcript');
+      written += w;
     }
+    return fstatSync(fd).size === size + removed.length;
   } finally {
     closeSync(fd);
   }
