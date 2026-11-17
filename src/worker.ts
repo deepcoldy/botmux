@@ -24753,7 +24753,13 @@ function probeBusyPatternIdle(
       if (!be.settleCurrentScreen) {
         log(`${source} idle probe: busy marker absent, marking prompt ready`);
         markPromptReadyFromBusyProbe(be);
-        return isPromptReady;
+        // Publication can still be refused by an input-safety gate (the argv
+        // first-turn-start gate, a quarantine, …). Re-arm the probe explicitly
+        // in that case and keep reporting "taken over": the first-prompt
+        // timeout must not fall through to flushPending() and write queued
+        // input into a CLI whose own gate just withheld readiness.
+        if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
+        return true;
       }
 
       // A busy-marker probe reads the backend's cached screen. ZMX refreshes
@@ -24793,7 +24799,10 @@ function probeBusyPatternIdle(
     if (!be.settleCurrentScreen) {
       log(`${source} idle probe: session state store no longer busy, marking prompt ready`);
       markPromptReadyFromBusyProbe(be);
-      return isPromptReady;
+      // Same takeover contract as the busy-marker branch above: a refused
+      // publication re-arms the probe but never lets callers flush through.
+      if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
+      return true;
     }
     const revisionBeforeSettle = backendScreenRevision;
     log(`${source} idle probe: session state store no longer busy, settling authoritative screen before prompt ready`);
@@ -24922,7 +24931,11 @@ function maybeForceReadyOnStaleBusyMarker(source: string, be: SessionBackend): b
     + 'and the screen frozen; releasing prompt ready');
   busyReadyFallbackGate.reset();
   markPromptReadyFromBusyProbe(be);
-  return isPromptReady;
+  // The bounded fallback only fires on positive composer evidence; if an
+  // input-safety gate still refuses, keep the probe chain alive and preserve
+  // the "taken over" return contract for the tick / timeout callers.
+  if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
+  return true;
 }
 
 /** Resolve the actual worker argv boundary before handing it to the adapter. */
