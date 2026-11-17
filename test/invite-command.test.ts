@@ -316,6 +316,52 @@ describe('/invite all configured defaults', () => {
     expect(replyMock).toHaveBeenCalledOnce();
   });
 
+  it.each(['permission', 'defaults'])('rechecks %s between individual fallback invitations', async change => {
+    defaults(['Review', 'Build']);
+    addBotMock.mockResolvedValueOnce([
+      { id: 'cli_review', ok: false, error: 'batch failed' },
+      { id: 'cli_build', ok: false, error: 'batch failed' },
+    ]);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      if (change === 'permission') {
+        getBot('b1').config.allowedUsers = [];
+        getBot('b1').resolvedAllowedUsers = [];
+      } else {
+        getBot('b1').config.inviteConfig = undefined;
+      }
+      return ids.map(id => ({ id, ok: true }));
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([
+      ['b1', 'oc_1', ['cli_review', 'cli_build']],
+      ['b1', 'oc_1', ['cli_review']],
+    ]);
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain(t('cmd.invite.ok', { names: 'cli_review' }, localeForBot('b1')));
+  });
+
+  it('rechecks admin access after queueing before reading membership again', async () => {
+    defaults(['Build']);
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      entered();
+      await pending;
+      return ids.map(id => ({ id, ok: true }));
+    });
+    const first = tryHandleInviteCommand('b1', allMessage(), OWNER);
+    await started;
+    const second = tryHandleInviteCommand('b1', allMessage(), OWNER);
+    getBot('b1').config.allowedUsers = [];
+    getBot('b1').resolvedAllowedUsers = [];
+    release();
+    await Promise.all([first, second]);
+    expect(membershipMock).toHaveBeenCalledOnce();
+    expect(addBotMock).toHaveBeenCalledOnce();
+    expect(replyMock).toHaveBeenLastCalledWith('b1', 'om_inv', t('cmd.invite.owner_only', undefined, localeForBot('b1')));
+  });
+
   it('repeated commands only invite bots still missing after a partial batch failure', async () => {
     defaults(['Review', 'Build']);
     addBotMock.mockResolvedValueOnce([{ id: 'cli_review', ok: true }, { id: 'cli_build', ok: false, error: 'denied' }]);
