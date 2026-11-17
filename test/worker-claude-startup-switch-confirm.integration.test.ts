@@ -263,16 +263,6 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
       prompt: FIRST_PROMPT, turnId: 'om_test', larkAppId: 'app_test', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    // The dialog delay starts when the fake CLI receives /effort, not when
-    // this parent spawns a worker. Cold worker imports plus its readiness
-    // fallback consumed ~36s of F's 60s notice budget in CI, leaving less
-    // than one hold poll after the 24s dialog delay. Establish the actual
-    // command submission before starting the scenario's observation window.
-    await waitFor(
-      () => events().some(e => e.kind === 'submit' && e.text === '/effort max'),
-      75_000,
-      'the startup /effort submission',
-    );
     const promptSubmitted = () => events().some(e => e.kind === 'submit' && e.text === FIRST_PROMPT);
     if (scenario.hook) {
       if (scenario.awaitDialogPending) {
