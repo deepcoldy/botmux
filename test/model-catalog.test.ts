@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -208,8 +208,9 @@ describe('detectModels（live 探测，fail-soft）', () => {
 
     const p1 = catalog.detectModels('codex', { adapterFactory: factory });
     const p2 = catalog.detectModels('codex', { adapterFactory: factory });
-    // 两个调用都已进入：factory 只被同步调起一次（in-flight 复用）
-    expect(calls).toBe(1);
+    // Executable discovery may now yield; overlapping requests still share
+    // the catalog probe once both asynchronous lookups reach the cache.
+    await vi.waitFor(() => expect(calls).toBe(1));
 
     release(['live-only']);
     const [r1, r2] = await Promise.all([p1, p2]);

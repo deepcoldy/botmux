@@ -39,7 +39,7 @@ export interface DetectModelsOptions {
   /** 时钟注入（TTL 判定用），默认 Date.now。 */
   readonly now?: () => number;
   /** 适配器工厂注入，默认 createCliAdapterSync。 */
-  readonly adapterFactory?: (cliId: CliId, pathOverride?: string) => CliAdapter;
+  readonly adapterFactory?: (cliId: CliId, pathOverride?: string) => CliAdapter | Promise<CliAdapter>;
   /** Aiden AIPROXY 探测器注入，默认调用 `aiden x models --codex --json`。 */
   readonly aidenCodexDetector?: () => Promise<readonly string[] | null>;
   /** Bot-specific runtime identity; never returned to clients. */
@@ -49,7 +49,7 @@ export interface DetectModelsOptions {
   /** Trusted executable selected from the target Bot's persisted native runtime. */
   readonly runtimeExecutable?: string;
   /** Command resolver injection for deterministic cache-identity tests. */
-  readonly resolveExecutable?: (command: string) => string;
+  readonly resolveExecutable?: (command: string) => string | Promise<string>;
 }
 
 export interface DetectedModelCatalog {
@@ -113,13 +113,13 @@ interface DetectCacheEntry {
   readonly modelCapabilities?: readonly DebugModelCapabilities[];
 }
 
-function runtimeCacheIdentity(
+async function runtimeCacheIdentity(
   executable: string | undefined,
-  resolveExecutable: (command: string) => string,
-): string {
+  resolveExecutable: (command: string) => string | Promise<string>,
+): Promise<string> {
   if (!executable) return 'default';
   try {
-    const resolved = realpathSync(resolveExecutable(executable));
+    const resolved = realpathSync(await resolveExecutable(executable));
     const stat = statSync(resolved);
     return `${resolved}:${stat.size}:${stat.mtimeMs}`;
   } catch {
@@ -150,7 +150,7 @@ async function detectModelCatalogWith(
 
     const adapter = opt.key === 'aiden-x-codex'
       ? undefined
-      : factory(opt.cliId, opts?.runtimeExecutable);
+      : await factory(opt.cliId, opts?.runtimeExecutable);
     // Confirm discovery capability before resolving/fingerprinting a command.
     // This keeps non-discoverable CLIs (for example claude-code) shell-free.
     if (opt.key !== 'aiden-x-codex'
@@ -168,7 +168,7 @@ async function detectModelCatalogWith(
       : '';
     const runtimeIdentity = opt.key === 'aiden-x-codex'
       ? 'aiden'
-      : runtimeCacheIdentity(
+      : await runtimeCacheIdentity(
           opts?.runtimeExecutable ?? rawCliExecutable(opt.cliId),
           opts?.resolveExecutable ?? resolveCommand,
         );
