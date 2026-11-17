@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
-import { loadBotConfigs } from '../../bot-registry.js';
+import { loadBotConfigs, LARK_REQUEST_TIMEOUT_MS } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -959,7 +959,13 @@ export async function isConfiguredBotInChat(larkAppId: string, chatId: string): 
   const entry = getAllBotClients({ refresh: true }).find(bot => bot.appId === larkAppId);
   if (!entry) throw new Error(`Bot not configured for Lark: ${larkAppId}`);
   return executeWithLarkGate(larkAppId, 'isConfiguredBotInChat', async () => {
-    const response = await larkGet(entry.client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+    const response = await larkGet(
+      entry.client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`,
+      {},
+      // Probe clients do not inherit the registry client's axios timeout.
+      { timeoutMs: LARK_REQUEST_TIMEOUT_MS },
+    );
     if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
     return response.data.is_in_chat;
   });

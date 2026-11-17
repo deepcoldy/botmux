@@ -27,9 +27,9 @@ const TARGET = 'cli_target';
 const OWNER = 'ou_owner';
 let fixture: string;
 
-function message() {
+function message(chatId = 'oc_group') {
   return {
-    message_id: 'om_invite', chat_id: 'oc_group', chat_type: 'group',
+    message_id: 'om_invite', chat_id: chatId, chat_type: 'group',
     content: JSON.stringify({ text: '@_user_1 /invite all' }),
     mentions: [{ key: '@_user_1', id: { open_id: 'ou_inviter' }, name: 'Inviter' }],
   };
@@ -58,6 +58,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   __testOnly_resetAllBotClients();
   __testOnly_resetBotRegistry();
   vi.unstubAllEnvs();
@@ -103,6 +104,82 @@ describe('/invite all with the production registry and membership client', () =>
     await tryHandleInviteCommand(INVITER, message(), OWNER);
     expect(transport.create).not.toHaveBeenCalled();
     await tryHandleInviteCommand(INVITER, message(), OWNER);
+    expect(transport.create).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when the membership request exceeds its transport deadline', async () => {
+    vi.useFakeTimers();
+    transport.read.mockImplementationOnce((_app: string, request: { timeout?: number }) =>
+      new Promise((_resolve, reject) => {
+        if (typeof request.timeout === 'number' && request.timeout > 0) {
+          setTimeout(() => reject(new Error('request timed out')), request.timeout);
+        }
+      }));
+    const command = tryHandleInviteCommand(INVITER, message('oc_timeout'), OWNER);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transport.read).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(transport.reply).toHaveBeenCalledOnce();
+    expect(transport.create).not.toHaveBeenCalled();
+    await expect(command).resolves.toBe(true);
+  });
+
+  it('does not duplicate invitations when a queued command times out during membership lookup', async () => {
+    vi.useFakeTimers();
+    let releaseRead!: () => void;
+    transport.read.mockImplementationOnce(() => new Promise(resolve => {
+      releaseRead = () => resolve({ code: 0, data: { is_in_chat: false } });
+    }));
+    const first = tryHandleInviteCommand(INVITER, message('oc_slow_read'), OWNER);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transport.read).toHaveBeenCalledOnce();
+    const second = tryHandleInviteCommand(INVITER, message('oc_slow_read'), OWNER);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(transport.reply).toHaveBeenCalledOnce();
+    await expect(second).resolves.toBe(true);
+    expect(transport.read).toHaveBeenCalledOnce();
+    expect(transport.create).not.toHaveBeenCalled();
+
+    const third = tryHandleInviteCommand(INVITER, message('oc_slow_read'), OWNER);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(transport.reply).toHaveBeenCalledTimes(2);
+    await expect(third).resolves.toBe(true);
+    expect(transport.read).toHaveBeenCalledOnce();
+    expect(transport.create).not.toHaveBeenCalled();
+
+    releaseRead();
+    await expect(first).resolves.toBe(true);
+    expect(transport.create).toHaveBeenCalledOnce();
+    transport.read.mockResolvedValueOnce({ code: 0, data: { is_in_chat: true } });
+    await tryHandleInviteCommand(INVITER, message('oc_slow_read'), OWNER);
+    expect(transport.read).toHaveBeenCalledTimes(2);
+    expect(transport.create).toHaveBeenCalledOnce();
+  });
+
+  it('does not duplicate invitations when a queued command times out during an earlier write', async () => {
+    vi.useFakeTimers();
+    let releaseCreate!: () => void;
+    transport.create.mockImplementationOnce(() => new Promise(resolve => {
+      releaseCreate = () => resolve({ code: 0, data: {} });
+    }));
+    const first = tryHandleInviteCommand(INVITER, message('oc_slow_write'), OWNER);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transport.create).toHaveBeenCalledOnce();
+    const second = tryHandleInviteCommand(INVITER, message('oc_slow_write'), OWNER);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(transport.reply).toHaveBeenCalledOnce();
+    await expect(second).resolves.toBe(true);
+    expect(transport.read).toHaveBeenCalledOnce();
+    expect(transport.create).toHaveBeenCalledOnce();
+
+    releaseCreate();
+    await expect(first).resolves.toBe(true);
+    transport.read.mockResolvedValueOnce({ code: 0, data: { is_in_chat: true } });
+    await tryHandleInviteCommand(INVITER, message('oc_slow_write'), OWNER);
+    expect(transport.read).toHaveBeenCalledTimes(2);
     expect(transport.create).toHaveBeenCalledOnce();
   });
 });

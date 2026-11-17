@@ -127,21 +127,62 @@ async function addBotsResilient(
   return { results, interruption };
 }
 
-const pendingInvites = new Map<string, Promise<void>>();
+const INVITE_QUEUE_WAIT_MS = 5000;
+class InviteQueueTimeoutError extends Error {}
 
-/** Recheck membership after an earlier command finishes, including failed ones. */
-async function serializeInvite<T>(key: string, run: () => Promise<T>): Promise<T> {
-  const previous = pendingInvites.get(key);
-  let release!: () => void;
-  const pending = new Promise<void>(resolve => { release = resolve; });
-  pendingInvites.set(key, pending);
-  await previous;
-  try {
-    return await run();
-  } finally {
-    release();
-    if (pendingInvites.get(key) === pending) pendingInvites.delete(key);
+interface InviteQueueItem {
+  execute: () => Promise<void>;
+  expire: () => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+}
+interface InviteQueue {
+  active: boolean;
+  waiters: InviteQueueItem[];
+}
+const inviteQueues = new Map<string, InviteQueue>();
+
+function deleteInviteQueueIfIdle(key: string, queue: InviteQueue) {
+  if (!queue.active && queue.waiters.length === 0 && inviteQueues.get(key) === queue) inviteQueues.delete(key);
+}
+
+function startNextInvite(key: string, queue: InviteQueue) {
+  if (queue.active) return;
+  const next = queue.waiters.shift();
+  if (!next) {
+    deleteInviteQueueIfIdle(key, queue);
+    return;
   }
+  queue.active = true;
+  if (next.timer) clearTimeout(next.timer);
+  const finish = () => {
+    queue.active = false;
+    startNextInvite(key, queue);
+  };
+  void next.execute().then(finish, finish);
+}
+
+/** Strictly serialize side effects; a stuck predecessor turns later commands into bounded retries, never concurrent writes. */
+function serializeInvite<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const queue = inviteQueues.get(key) ?? { active: false, waiters: [] };
+  inviteQueues.set(key, queue);
+  return new Promise<T>((resolve, reject) => {
+    const item: InviteQueueItem = {
+      execute: async () => {
+        try { resolve(await run()); } catch (err) { reject(err); }
+      },
+      expire: () => {
+        const index = queue.waiters.indexOf(item);
+        if (index < 0) return;
+        queue.waiters.splice(index, 1);
+        reject(new InviteQueueTimeoutError());
+        deleteInviteQueueIfIdle(key, queue);
+      },
+      timer: undefined,
+    };
+    item.timer = setTimeout(item.expire, INVITE_QUEUE_WAIT_MS);
+    queue.waiters.push(item);
+    startNextInvite(key, queue);
+  });
 }
 
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
@@ -372,5 +413,11 @@ export async function tryHandleInviteCommand(
       `unresolved=[${unresolved}] ambiguous=${ambiguous.length} failed=[${failed}]`,
     );
     return true;
+  }).catch(async err => {
+    if (err instanceof InviteQueueTimeoutError) {
+      await reply('cmd.invite.queue_timeout');
+      return true;
+    }
+    throw err;
   });
 }

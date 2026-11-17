@@ -335,6 +335,7 @@ export const messages: Record<string, string> = {
   'cmd.invite.no_defaults': '尚未配置 inviteConfig.agents，可用 /botconfig set inviteConfig {"agents":["机器人名称或 App ID"]} 设置名单。',
   'cmd.invite.invalid_defaults': '⚠️ inviteConfig.agents 配置无效，未拉入任何机器人：{reason}',
   'cmd.invite.roster_unavailable': '⚠️ 暂时无法查询群成员，未执行默认名单邀请。请稍后重试。',
+  'cmd.invite.queue_timeout': '⚠️ 上一个拉人请求仍在处理中，本次未执行邀请。请稍后重试。',
   'cmd.invite.owner_changed': '⚠️ 管理员权限已变更，已停止后续邀请；已完成的邀请保留。',
   'cmd.invite.defaults_changed': '⚠️ inviteConfig.agents 已变更，已停止后续邀请；已完成的邀请保留，请确认名单后重新执行 /invite all。',
   'cmd.invite.header': '🤝 /invite 结果：',
