@@ -2231,8 +2231,10 @@ export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined 
     return { recoveryAt: recovery.nextAttemptAt, ...(recovery.nextAttemptAt <= Date.now() ? { due: true } : {}) };
   }
   const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
-  return streamCardExecutionLabel(cliId, sessionExecutionActivity(ds), readGlobalConfig().dashboard?.modelQueueNotify === true)
-    ?? idleCardLabel(ds);
+  const observed = sessionExecutionActivity(ds);
+  const notifyQueue = cliId === 'traex' && observed?.phase === 'model_queue'
+    && readGlobalConfig().dashboard?.modelQueueNotify === true;
+  return streamCardExecutionLabel(cliId, observed, notifyQueue) ?? idleCardLabel(ds);
 }
 
 /** Push the current-turn execution observation to Dashboard rows. `null`
