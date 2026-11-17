@@ -13,6 +13,7 @@ function coldStartPreflight(controller: TraexAutoModelController, loads = new Ma
     workingDir: '/tmp', model: 'core' };
   const scope: Record<string, any> = {
     traexAutoModelController: controller,
+    lastInitConfig: cfg,
     cliSpawnGeneration: 1, CliSpawnSupersededError,
     traexAutoModelRuntimeEligible: () => true,
     traexAutoModelPreflightEnabled,
@@ -37,6 +38,7 @@ function warmPreflight(controller: TraexAutoModelController, loads: Map<string, 
   const item: any = { content: 'independent', turnId: 'next' };
   const scope: Record<string, any> = {
     traexAutoModelController: controller, pendingMessages: [item],
+    traexAutoModelRuntimeEligible: () => true,
     cliSpawnGeneration: 1, traexAutoModelPreflightPending: undefined,
     currentTraexLoadSnapshot: vi.fn(async () => ({ loads, reasoningEfforts: new Map([['backup', ['xhigh']]]) })),
     TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS: 8_000,
