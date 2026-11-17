@@ -444,7 +444,7 @@ export class SessionController {
     // runtime's, and the daemon keeps the turn looking idle until it ends.
     const liveRuntime = runtime && (message.type === 'prompt_ready' || message.type === 'screen_update')
       ? this.continuedInto(runtime, channel) : runtime;
-    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
+    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'claude_effort', 'native_reasoning', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
       && !this.store.acceptObservation(this.ref, channel, liveRuntime, context.sequence)) return { kind: 'reject', reason: 'stale_observation_sequence' };
     let event: ContractEvent | undefined;
     if (message.type === 'ready') event = { type: 'worker_online', worker: channel };

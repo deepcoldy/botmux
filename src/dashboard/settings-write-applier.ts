@@ -64,6 +64,7 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   reapOrphanTmuxServers: boolean;
   tmuxOrphanSessionSweep: boolean;
   tmuxOrphanSessionBareWrapperKill: boolean;
@@ -279,6 +280,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
+  | 'invalid_terminalEffortWriteback'
   | 'invalid_reapOrphanTmuxServers'
   | 'invalid_tmuxOrphanSessionSweep'
   | 'invalid_tmuxOrphanSessionBareWrapperKill'
@@ -554,6 +556,10 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_codexRpcInput' };
     }
     patch.codexRpcInput = obj.codexRpcInput;
+  }
+  if ('terminalEffortWriteback' in obj) {
+    if (typeof obj.terminalEffortWriteback !== 'boolean') return { ok: false, error: 'invalid_terminalEffortWriteback' };
+    patch.terminalEffortWriteback = obj.terminalEffortWriteback;
   }
   if ('autoUpgradeCodexSessions' in obj) {
     if (typeof obj.autoUpgradeCodexSessions !== 'boolean') {

@@ -42,6 +42,31 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 describe('Antigravity ACP transport', () => {
+  it('reports native currentValue after a successful settings update rather than the requested level', async () => {
+    const f = fixture('effort-override'); const values: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, effort: 'high', onReasoningEffort: level => values.push(level) }, new AbortController().signal);
+    expect(values).toEqual(['low', 'medium']);
+  });
+
+  it('does not report an unconfirmed selection when the native settings request is rejected', async () => {
+    const f = fixture('effort-denied'); const values: unknown[] = [];
+    await expect(runAntigravityAcp({ ...f.options, effort: 'medium', onReasoningEffort: level => values.push(level) }, new AbortController().signal)).rejects.toThrow();
+    expect(values).toEqual(['low']);
+    expect(f.calls().some(c => c.method === 'session/prompt')).toBe(false);
+  });
+
+  it('clears effort on a native config_option_update to default', async () => {
+    const f = fixture('effort-clear'); const values: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, effort: 'high', onReasoningEffort: level => values.push(level) }, new AbortController().signal);
+    expect(values).toEqual(['low', 'high', null]);
+  });
+
+  it('an optional display observer failure does not stop the native business turn', async () => {
+    const f = fixture();
+    expect(await runAntigravityAcp({ ...f.options, effort: 'high', onReasoningEffort: () => { throw new Error('observer unavailable'); } },
+      new AbortController().signal)).toBe('中文 complete answer');
+  });
+
   it.each(['early-runtime', 'early-history-runtime'])('retains coalesced runtime updates without replaying load history: %s', async mode => {
     const f = fixture(mode); const runtime: Array<{ model?: string }> = [];
     expect(await runAntigravityAcp({ ...f.options, nativeSessionId: 'exact-native', onRuntime: value => runtime.push(value) }, new AbortController().signal))
