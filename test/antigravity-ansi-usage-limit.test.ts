@@ -5,12 +5,12 @@ import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
-function classifier(raw: () => string, cliId = 'antigravity') {
+function classifier(raw: () => string, cliId = 'antigravity', authoritative = true) {
   const capture = vi.fn(raw);
   const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
-    backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative,
     stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
@@ -177,5 +177,35 @@ describe('raw ANSI tmux quota classification', () => {
     expect(classify('', 'idle').usageLimit).toMatchObject({
       source: 'antigravity-error-composer', relativeResetKey: expect.stringContaining('new-episode'),
     });
+  });
+
+  it.each(['empty', 'failed'])('does not clear a limit from display-only evidence when native capture is %s', mode => {
+    const display = quota + `\nError ID: ${id}` + composer
+      + '\n>\n────\n? for shortcuts';
+    const { classify } = classifier(() => {
+      if (mode === 'failed') throw new Error('native capture unavailable');
+      return '';
+    });
+    const result = classify(display, 'idle');
+    expect(result.usageLimitRecovery).toBeUndefined();
+    expect(result.status).toBe('limited');
+  });
+
+  it('does not accept recovery evidence from a backend that cannot prove screen authority', () => {
+    const ready = '\n────\n>\n────\n? for shortcuts';
+    const { classify, capture } = classifier(() => ready, 'antigravity', false);
+    expect(classify(ready, 'idle')).toEqual({ status: 'idle' });
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '> drafted next request\n────\n? for shortcuts',
+    '>\n────\n? for shortcuts\nnew output after the footer',
+  ])('does not clear a limit using a historical ready footer or a drafted composer (%#)', tail => {
+    const screen = quota + `\nError ID: ${id}` + composer + '\n' + tail;
+    const { classify } = classifier(() => screen);
+    const result = classify('', 'idle');
+    expect(result.usageLimitRecovery).toBeUndefined();
+    expect(result.status).toBe('limited');
   });
 });
