@@ -894,7 +894,9 @@ export function listUnmigratedAppIds(dataDir: string, opts: { strict?: boolean }
 
 /** One ref per SQLite store identity. `strict` lists every peer directory so
  *  unreadable directories and unresolved links cannot silently narrow the
- *  inventory. A readable peer with no database is still legitimately absent. */
+ *  inventory. A readable peer with no database is still legitimately absent,
+ *  and so is a non-directory entry (e.g. a Finder `.DS_Store`): it cannot hold
+ *  a store, so it must not fail every strict inventory on the machine. */
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
   const refs: StoreFileRef[] = [];
@@ -907,9 +909,21 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
     }
     for (const appId of appIds) {
       const dbPath = storeDbPath(appId, dataDir);
-      const present = opts.strict
-        ? readdirSync(dirname(dbPath)).includes(basename(dbPath))
-        : existsSync(dbPath);
+      let present: boolean;
+      if (opts.strict) {
+        let entries: string[];
+        try {
+          entries = readdirSync(dirname(dbPath));
+        } catch (err) {
+          // ENOTDIR = the entry (or what its link resolves to) is a plain file.
+          // A dangling link (ENOENT) or an unsearchable dir (EACCES) still throws.
+          if ((err as NodeJS.ErrnoException).code === 'ENOTDIR') continue;
+          throw err;
+        }
+        present = entries.includes(basename(dbPath));
+      } else {
+        present = existsSync(dbPath);
+      }
       if (present) refs.push({ appId, path: dbPath });
     }
   }

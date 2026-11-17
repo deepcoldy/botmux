@@ -704,6 +704,21 @@ describe('findActiveSessionIdByCliSessionId (doubao sbox reverse lookup)', () =>
     })).toBe('s1');
   });
 
+  it('ignores a stray non-directory entry (e.g. a Finder .DS_Store) in every strict inventory', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    writeFileSync(join(tempDir, 'session-stores', '.DS_Store'), 'finder metadata');
+    expect(findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toBe('s1');
+    // The same strict listing backs the pre-existing fail-closed inventories.
+    expect([...listActiveSessionIdsAcrossStores(tempDir)]).toEqual(['s1']);
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies.matches.map(s => s.sessionId)).toEqual(['s1']);
+    expect(copies.unreadableStores).toBe(0);
+  });
+
   it('maps a native id back to its unique active botmux session across stores', () => {
     seedPersistedSessionRows(tempDir, 'appCaptureA', {
       s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
