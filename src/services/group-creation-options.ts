@@ -6,8 +6,10 @@ export interface GroupCreationDefaults {
   tag?: string;
   /** `name` renders the group name; `logo` reuses the session-group logo gradient. */
   avatar?: GroupAvatarMode;
-  /** `/g <text>` is a task by default: the chat is named from it and this
-   *  bot starts a session there. `false` keeps `/g <text>` a plain group name. */
+  /** Opt-in task mode: when `true`, `/g <text>` names the chat from the text
+   *  and this bot starts a session on it there. Absent / `false` keeps the
+   *  released behavior — `/g <text>` only names a plain group. `--start` /
+   *  `--no-start` override it for one command. */
   autoStart?: boolean;
 }
 
@@ -44,7 +46,7 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
 
 export interface GroupCreationArgs extends GroupCreationDefaults {
   name: string;
-  /** Every line left after removing the options: the task unless `autoStart` is false. */
+  /** Every line left after removing the options: the task when `autoStart` is true. */
   body: string;
   roleProfileId?: string;
 }
@@ -52,10 +54,12 @@ export interface GroupCreationArgs extends GroupCreationDefaults {
 type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile' | 'start';
 
 /** Discriminated union — value flags only declare `apply`, opt-out flags only
- *  declare `clear`. Keeps every spec truthful about what it supports. */
+ *  declare `clear`, opt-in switches only declare `set`. Keeps every spec
+ *  truthful about what it supports. */
 type FlagSpec =
   | { kind: 'value'; key: OutputKey; apply(bag: Record<string, unknown>, value: string): void }
-  | { kind: 'optOut'; key: OutputKey; clear(bag: Record<string, unknown>): void };
+  | { kind: 'optOut'; key: OutputKey; clear(bag: Record<string, unknown>): void }
+  | { kind: 'optIn'; key: OutputKey; set(bag: Record<string, unknown>): void };
 
 const FLAG_SPECS: Record<string, FlagSpec> = {
   'agents': {
@@ -76,6 +80,8 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
     kind: 'value', key: 'role-profile',
     apply(bag, value) { bag.roleProfileId = value; },
   },
+  // Same key: `--start --no-start` in one command is a duplicate, not a race.
+  'start': { kind: 'optIn', key: 'start', set(bag) { bag.autoStart = true; } },
   'no-start': { kind: 'optOut', key: 'start', clear(bag) { bag.autoStart = false; } },
 };
 
@@ -141,9 +147,10 @@ export function parseGroupCreationArgs(rawArgs: string, defaults?: GroupCreation
     if (seen.has(spec.key)) throw new Error(`Duplicate option: --${name}`);
     seen.add(spec.key);
 
-    if (spec.kind === 'optOut') {
+    if (spec.kind === 'optOut' || spec.kind === 'optIn') {
       if (next === '=') throw new Error(`--${name} takes no value`);
-      spec.clear(bag);
+      if (spec.kind === 'optOut') spec.clear(bag);
+      else spec.set(bag);
       removals.push([m.index, nameEnd]);
       continue;
     }
@@ -193,6 +200,26 @@ export function parseGroupCreationArgs(rawArgs: string, defaults?: GroupCreation
   delete bag.roleProfileId;
   const parsed = parseGroupCreationDefaults(bag);
   return { ...parsed, name: firstLine, body: body.trim(), roleProfileId };
+}
+
+const GROUP_COMMAND_PREFIX = /^\/(?:group|g)(?=\s|$)/i;
+
+/**
+ * Whether a `/g` command text starts a task for a bot with these
+ * `groupCreation` defaults: `--start` on its first line, or `autoStart: true`
+ * without `--no-start`. Routing uses it to accept a multi-line `/g` only then;
+ * any other multi-line `/g` stays discussion text for the CLI, as before task
+ * mode existed. Unparseable options or defaults → false (legacy routing).
+ */
+export function groupCommandStartsTask(commandText: string, defaults: unknown): boolean {
+  const text = commandText.trim();
+  if (!GROUP_COMMAND_PREFIX.test(text)) return false;
+  try {
+    const base = defaults === undefined ? undefined : parseGroupCreationDefaults(defaults);
+    return parseGroupCreationArgs(text.replace(GROUP_COMMAND_PREFIX, ''), base).autoStart === true;
+  } catch {
+    return false;
+  }
 }
 
 /** What /g should do beyond creating the chat, derived from the parsed args. */

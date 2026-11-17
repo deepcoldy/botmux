@@ -1324,7 +1324,7 @@ export const messages: Record<string, string> = {
   'help.skills': '/skills ...    - 查看/管理本 bot 的技能策略（attach/detach 需 owner）',
   'help.reply_mode': '/reply-mode [status|inherit|chat|chat-topic|topic|new-topic] - 查看/切换普通群或私聊的回复/会话模式',
   'help.heading_group': '🆕 一键新建会话群：',
-  'help.group': '/group <群名>  (别名 /g)  - 自动建群、邀请你进群（整群=一个 CLI 会话）；默认渐变 logo 头像，后面写的内容默认当任务：按任务起群名并在新群自动开工（--no-start 只建群）；不写内容时按首条消息自动起名',
+  'help.group': '/group <群名>  (别名 /g)  - 自动建群、邀请你进群（整群=一个 CLI 会话）；默认渐变 logo 头像，不写群名时按首条消息自动起名；加 --start 则把后面的内容当任务，按任务起群名并在新群自动开工',
   'help.project': '/project enable|status|disable - 在当前普通群启用、查看或退出项目群模式（owner 专用）',
   'help.context_sharing': '/context-sharing on|off|status - 开启、关闭或查看本群的后台上下文共享（owner 专用，不启动额外模型回合）',
   'help.list_slash': '/list-slash-command  (别名 /slash)  - 列出当前可用的 slash 命令（固定放行 / CLI 默认 / 自定义配置 / 自动发现）',

@@ -329,11 +329,11 @@ Written and hot-applied — no restart needed.
 
 ## 🆕 One-Click New Session Group
 
-`/group <task>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <task>` can add multiple bots into the new group at once.
+`/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once.
 
 Like session groups, the new group gets a gradient logo avatar by default, and without a name it is renamed from its first message.
 
-The text is a task by default: `/g Investigate the wrong price` names the group from the task, forwards the quote and attachments into it, and has the bot start working there; quote a message and send just `/g` to use the quoted message as the task. Use `/g --no-start <name>` for a plain group.
+With `--start` the text is a task: `/g --start Investigate the wrong price` names the group from the task, forwards the quote and attachments into it, and has the bot start working there; quote a message and send just `/g --start` to use the quoted message as the task. With `groupCreation.autoStart: true` a bot starts tasks by default; use `/g --no-start <name>` for a plain group once.
 
 Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
 

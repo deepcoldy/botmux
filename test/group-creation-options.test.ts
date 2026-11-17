@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatSlashGroupName, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
+import { formatSlashGroupName, groupCommandStartsTask, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
 
 describe('/g customization', () => {
   it('preserves punctuation, spaces and the first non-empty name line', () => {
@@ -111,7 +111,7 @@ describe('formatSlashGroupName', () => {
   });
 });
 
-describe('/g task mode (default; --no-start / autoStart: false)', () => {
+describe('/g task mode (opt-in: --start / autoStart: true; --no-start overrides)', () => {
   it('keeps the whole multi-line body without the options', () => {
     const args = parseGroupCreationArgs('修复价格展示 --tag Work\n第二行细节');
     expect(args.autoStart).toBeUndefined();
@@ -135,8 +135,27 @@ describe('/g task mode (default; --no-start / autoStart: false)', () => {
     // Options-only first line: the name falls through to the task's first line.
     expect(parseGroupCreationArgs('--no-start\n项目群\n--tag x')).toMatchObject({ autoStart: false, name: '项目群', body: '项目群\n--tag x' });
   });
-  it('--start is not an option', () => {
-    expect(parseGroupCreationArgs('--start 任务').body).toBe('--start 任务');
+  it('task mode stays off unless asked for: no default, --start opts one command in', () => {
+    expect(parseGroupCreationArgs('支付排障').autoStart).toBeUndefined();
+    expect(parseGroupCreationArgs('--start 任务')).toMatchObject({ autoStart: true, name: '任务', body: '任务' });
+    expect(parseGroupCreationArgs('任务 --start', { autoStart: false }).autoStart).toBe(true);
+    expect(() => parseGroupCreationArgs('--start=yes 任务')).toThrow(/takes no value/);
+    expect(() => parseGroupCreationArgs('--start --no-start 任务')).toThrow(/Duplicate option/);
+  });
+  it('groupCommandStartsTask: only a /g that will start a task (routing accepts multi-line only then)', () => {
+    expect(groupCommandStartsTask('/g 修复价格\n第二行', undefined)).toBe(false);
+    expect(groupCommandStartsTask('/g 修复价格\n第二行', { avatar: 'name' })).toBe(false);
+    expect(groupCommandStartsTask('/g --start 修复价格\n第二行', undefined)).toBe(true);
+    expect(groupCommandStartsTask('/GROUP 修复价格 --start', undefined)).toBe(true);
+    expect(groupCommandStartsTask('/g 修复价格\n第二行', { autoStart: true })).toBe(true);
+    expect(groupCommandStartsTask('/g --no-start 项目群\n说明', { autoStart: true })).toBe(false);
+    // Options live on the first line only, so a later `--start` is task text.
+    expect(groupCommandStartsTask('/g 修复价格\n--start', undefined)).toBe(false);
+    expect(groupCommandStartsTask('/gx --start 任务', undefined)).toBe(false);
+    expect(groupCommandStartsTask('修复 /g --start', undefined)).toBe(false);
+    // Unparseable options or defaults fall back to the legacy routing.
+    expect(groupCommandStartsTask('/g --start --start 任务', undefined)).toBe(false);
+    expect(groupCommandStartsTask('/g 任务\n细节', { autoStart: 'yes' })).toBe(false);
   });
   it('validates autoStart in bot defaults', () => {
     expect(parseGroupCreationDefaults({ autoStart: false })).toEqual({ autoStart: false });

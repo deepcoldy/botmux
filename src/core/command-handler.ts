@@ -5947,12 +5947,14 @@ export async function handleCommand(
           await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
           break;
         }
-        // `/g <text>` is a task unless `--no-start` / groupCreation.autoStart
-        // = false: the chat is named from it and this bot starts a fresh
-        // session there. A quoted message may carry the whole task. A bare
-        // `/g` with neither stays a plain group titled from its first message.
-        const taskText = groupArgs.autoStart !== false ? groupArgs.body : '';
-        const quoteId = groupArgs.autoStart !== false ? groupTaskQuoteId(message) : undefined;
+        // Task mode is opt-in (`--start`, or groupCreation.autoStart: true
+        // without `--no-start`): the chat is named from the text and this bot
+        // starts a fresh session there; a quoted message may carry the whole
+        // task. Otherwise `/g <text>` keeps its released meaning — a plain
+        // group named <text> — and a bare `/g` is titled from its first message.
+        const taskMode = groupArgs.autoStart === true;
+        const taskText = taskMode ? groupArgs.body : '';
+        const quoteId = taskMode ? groupTaskQuoteId(message) : undefined;
         const autoStart = !!taskText || !!quoteId;
         // The task reaches a CLI like any message: authorize, run the
         // prompt.submit gate and charge quota before any external side effect.
@@ -6090,10 +6092,10 @@ export async function handleCommand(
           const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
           await sessionReply(rootId, t(autoStart ? 'cmd.group.started' : 'cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
           logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'}`);
-          // Intentionally NO auto-bootstrap (repo-select card / chat-scope
-          // session) here: the group name rarely carries enough context to seed
-          // a useful prompt. The user starts a real conversation with the bot in
-          // the new group, which spawns the session on first message.
+          // Outside task mode there is intentionally NO auto-bootstrap
+          // (repo-select card / chat-scope session): a group name rarely
+          // carries enough context to seed a useful prompt. The user starts a
+          // real conversation in the new group, which spawns the session.
         } catch (err: any) {
           logger.error(`[${logTag}] /group failed: ${err?.message ?? err}`);
           await sessionReply(rootId, t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));

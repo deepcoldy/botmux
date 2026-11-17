@@ -1327,7 +1327,7 @@ export const messages: Record<string, string> = {
   'help.skills': '/skills ...    - View/manage this bot\'s skill policy (attach/detach require owner)',
   'help.reply_mode': '/reply-mode [status|inherit|chat|chat-topic|topic|new-topic] - Show/change regular-group or DM reply/session mode',
   'help.heading_group': '🆕 One-shot session group:',
-  'help.group': '/group <name>  (alias /g)  - Auto-create a group and invite you (the whole group = one CLI session); gradient logo avatar by default, the text after it is a task by default: the group is named from it and the bot starts on it in the new group (--no-start: plain group); with no text it is named from the first message',
+  'help.group': '/group <name>  (alias /g)  - Auto-create a group and invite you (the whole group = one CLI session); gradient logo avatar by default, and without a name it is named from the first message; add --start to treat the text as a task: the group is named from it and the bot starts on it in the new group',
   'help.project': '/project enable|status|disable - Enable, inspect, or leave project-group mode in this ordinary group (owner only)',
   'help.context_sharing': '/context-sharing on|off|status - Enable, disable, or inspect passive context sharing for this group (owner only; starts no extra model turn)',
   'help.list_slash': '/list-slash-command  (alias /slash)  - List the slash commands available now (fixed allowlist / CLI defaults / custom config / auto-discovered)',
