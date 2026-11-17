@@ -4748,6 +4748,55 @@ describe('PUT /api/bot-ask-option-layout — per-bot ask option layout', () => {
   });
 });
 
+describe('IPC server shutdown after an abandoned request body', () => {
+  it('closes the listener even when a 413 left the rest of a body unread', async () => {
+    // `readJsonBody` answers 413 from the declared content-length after resuming
+    // the request without reading it to the end. On Bun, with this fetch
+    // keep-alive client, that leaves an accepted socket open until the runtime
+    // reclaims it about 6 s later, and server.close() only stops accepting — its
+    // callback waits for such sockets, so close() sits out those seconds. Repeat
+    // the round a few times because the wedge is timing dependent, and bound each
+    // close well below that reclaim delay so a regression trips it with margin.
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-close-abandoned-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-close-abandoned-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'x', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      // Eight rounds: the wedge is timing dependent and shows up in roughly a
+      // third of the rounds, so four rounds would let a regression through.
+      for (let round = 0; round < 8; round++) {
+        const server = await startIpcServer({ port: 0, host: '127.0.0.1' });
+        const base = `http://127.0.0.1:${server.port}`;
+        // Keep-alive warm-up first: the wedge needs a socket the server keeps
+        // open across requests, not a one-shot connection.
+        for (let i = 0; i < 3; i++) await (await fetch(`${base}/api/bot-default-oncall`)).text();
+        const oversized = await fetch(`${base}/api/bot-reply-style`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          // Far past the route's cap: the bigger the unread remainder, the more
+          // reliably the abandoned socket wedges, so the guard is not a coin flip.
+          body: JSON.stringify({ replyStyle: { recipePrompt: 'x'.repeat(REPLY_STYLE_REQUEST_MAX_BYTES * 32) } }),
+        });
+        expect(oversized.status).toBe(413);
+        await oversized.text();
+        const closed = await Promise.race([
+          server.close().then(() => true),
+          new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2_000)),
+        ]);
+        expect(closed).toBe(true);
+      }
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
 describe('POST /api/grants/chat', () => {
   it('requires loopback HMAC before invoking the permission service', async () => {
     const handler = vi.fn();

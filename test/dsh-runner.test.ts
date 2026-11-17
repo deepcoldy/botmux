@@ -564,16 +564,36 @@ describe('dsh-runner', () => {
   }, 30_000);
 
   it('still terminates a turn that emits progress forever', async () => {
-    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300']);
+    // Progress arrives every 90ms; the 1s idle window leaves room for a loaded
+    // host's scheduling gaps, so only the 4s hard limit can end this turn.
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '1000']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('close', code => resolve(code)));
     h.child.stdin.write(makeFrame('never-ending task'));
     expect(await exitPromise).toBe(1);
 
     const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
     expect(finals).toHaveLength(1);
     expect(finals[0].payload.content).toContain('hard limit');
+  }, 30_000);
+
+  it('a watchdog that fires before the runtime accepts the prompt ends the turn with a final and recycles (no crash)', async () => {
+    // The runtime has not ACKed the prompt when the 300ms idle watchdog fires
+    // (a loaded host). That rejected turn must neither surface as an unhandled
+    // rejection (exit 1, no reply) nor wait for an ACK that may never come:
+    // here it would only arrive after the test's own timeout.
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300'], { FAKE_DSH_PROMPT_ACK_DELAY_MS: '60000' });
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const closed = new Promise<number | null>(resolve => h!.child.on('close', code => resolve(code)));
+    h.child.stdin.write(makeFrame('slow to accept'));
+    expect(await closed).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('timed out after 300ms');
+    expect(h.stderr).not.toMatch(/unhandled|Unhandled/);
   }, 30_000);
 
   it('does not extend the watchdog for notifications without this turn receipt', async () => {

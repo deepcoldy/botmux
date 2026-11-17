@@ -51,6 +51,7 @@ async function drain(): Promise<void> {
             nativeSessionId = id;
             output.marker('thread', { threadId: id });
           },
+          onRuntime: runtime => output.marker('runtime', { threadId: nativeSessionId, ...runtime }),
           onText: display,
           onTool: title => display(`[tool] ${title}`),
         }, controller.signal);

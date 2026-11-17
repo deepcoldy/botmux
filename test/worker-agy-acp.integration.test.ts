@@ -79,6 +79,9 @@ describe('worker Antigravity ACP delivery', () => {
     expect(worker.calls().filter(call => call.method === 'session/prompt')).toHaveLength(1);
     expect(worker.calls().find(call => call.method === 'session/prompt')?.params).toMatchObject({ prompt: [{ type: 'text', text: content }] });
     expect(worker.messages.some(message => message.type === 'final_output' && message.content === '中文 complete answer')).toBe(true);
+    expect(worker.messages.filter(message => message.type === 'active_runtime')).toContainEqual({
+      type: 'active_runtime', model: 'gemini-test', reasoningEffort: 'low',
+    });
     worker.child.send({ type: 'message', content: 'second prompt', turnId: 'om_followup' } satisfies DaemonToWorker);
     await waitFor(worker, () => worker.messages.some(message => message.type === 'final_output' && message.turnId === 'om_followup'));
     expect(worker.calls().filter(call => call.method === 'session/new')).toHaveLength(1);
