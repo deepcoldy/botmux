@@ -20,6 +20,8 @@ import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible } from '../src/adapters/cli/traex.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { restartInterruptionNote, restartInterruptionNotice, restartNoteMayPrefix, prefixRestartNote } from '../src/services/restart-interruption.js';
+import { codexRpcEligible } from '../src/codex-rpc-lifecycle.js';
+import { sandboxEnabled } from '../src/adapters/backend/sandbox.js';
 
 function wireAutoModelSettings(scope: Record<string, any>): Record<string, any> {
   Object.assign(scope, {
@@ -1228,11 +1230,16 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModelRuntimeEligible: () => eligible,
       deliveredPluginSkillCatalogFingerprint: 'delivered',
       resolvePluginGenerationBot: () => ({ larkAppId: 'app' }), readGlobalConfig: () => ({}),
-      prepareCliPluginGeneration: prepare, config: { session: { dataDir: '/data' } }, log: vi.fn() };
+      prepareCliPluginGeneration: prepare, config: { session: { dataDir: '/data' } },
+      codexRpcEligible, sandboxEnabled, log: vi.fn() };
     loadWorkerFunction<(cfg: any, adapter: any) => void>('refreshCliPluginGeneration', scope)(
       { ...cfg, sessionId: 'session', workingDir: '/workspace', prompt: '' }, { id: cfg.cliId });
     expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
       previousSkillCatalogFingerprint: preserved ? 'delivered' : undefined,
+      // These minimal Auto-restart cfgs never satisfy codexRpcEligible, so the
+      // TraeX RPC compact/defer flags must stay off on the legacy catalog path.
+      compactCatalog: false,
+      deferCatalogToContextManager: false,
     }));
   });
 

@@ -53,6 +53,7 @@ describe('a busy-time write is not proof that the model read the message', () =>
       deferTurnInputCommitUntilSubmission: () => false,
       maybeQueuePostSubmitNativeSessionTitle: () => false,
       writeCliPidMarker: vi.fn(() => published.push(structuredClone(scope.queuedTypeAheadTurns))),
+      scheduleConsumedQueuedTurnAdvance: vi.fn(),
     });
     if (claudeDataDir) scope.cliAdapter.claudeDataDir = claudeDataDir;
     scope.pendingMessages.splice(0, 1, { turnId: 'om_b', content: 'B from the main chat' });
@@ -101,10 +102,11 @@ function markerWorker(dataDir: string) {
     inflightInputs: { onTurnStarted: vi.fn() },
     lastWrittenCliInput: undefined,
     send: vi.fn(),
+    queueMicrotask: (fn: () => void) => fn(),
   };
   for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk',
     'markerIdentityTurnId', 'turnTerminalEmitted', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive',
-    'markReplyInputConsumed', 'acknowledgeNativeInputConsumed']) {
+    'markReplyInputConsumed', 'acknowledgeNativeInputConsumed', 'scheduleConsumedQueuedTurnAdvance']) {
     scope[name] = loadWorkerFunction(name, scope);
   }
   return { scope, markerPath };

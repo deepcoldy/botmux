@@ -92,6 +92,9 @@ export function workerSubmitHarness() {
     shouldStopPendingBatch: () => true,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
+  // Real write-edge transport fold: a no-op unless an item carries a parked
+  // TraeX RPC catalog and no RPC engine will write it.
+  scope.inlineParkedTraexSkillCatalog = loadWorkerFunction('inlineParkedTraexSkillCatalog', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
   // Real predicates for flushPending's native-consumption proof (traex harness →

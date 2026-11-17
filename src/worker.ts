@@ -831,10 +831,19 @@ import {
 } from './core/managed-origin-capability.js';
 import { isLinuxIsolationLauncher } from './core/linux-isolation.js';
 import {
+  CodexRpcDeliveryError,
   CodexRpcEngine,
   type CodexRpcTurnIdentity,
   type CodexRpcTurnTerminal,
 } from './codex-rpc-engine.js';
+import {
+  appendTraexSkillCatalog,
+  prepareTraexNativeContext,
+  settleTraexNativeContextReceipt,
+  TraexContextBudgetError,
+  type PreparedTraexNativeContext,
+  type TraexNativeContextReceipt,
+} from './core/traex-native-context.js';
 import {
   beginRuntimeWriteCycle,
   isCliBackendGenerationCurrent,
@@ -1745,6 +1754,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           cliGeneration: engineCliGeneration,
         });
       },
+      onContextCompacted: (compactedThreadId) => invalidateTraexNativeContextReceipt(compactedThreadId),
       onDead: () => {
         // Death can race after the final awaited response but before the engine
         // is published below. Record it against this exact engagement even when
@@ -1786,6 +1796,15 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     assertRpcEngagementCurrent();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
+      // Only this fresh first turn is sent from here; a resumed prompt is
+      // queued and prepared by flushPending's RPC write edge. Keep cfg.prompt
+      // and the deferred catalog untouched: a not-sent/failed engagement falls
+      // back to paste, which must still write the self-contained prompt.
+      const firstTurnCatalog = cfg.cliId === 'traex' ? deferredPluginSkillCatalog : null;
+      const initialTraexContext = cfg.cliId === 'traex'
+        ? prepareFreshTraexFirstTurn(cfg.prompt, threadId, cfg.traexNativeContextReceipt)
+        : undefined;
+      const firstTurnPrompt = initialTraexContext?.content ?? cfg.prompt;
       const firstIdentity: CodexRpcTurnIdentity = {
         turnId: cfg.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
         ...(cfg.dispatchAttempt !== undefined
@@ -1803,9 +1822,14 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // Three-state delivery (P1-1, exactly-once priority): 'accepted' (ack or
       // rollout evidence), 'not-sent' (frame never dispatched → safe paste), or
       // 'ambiguous' (dispatched, unconfirmed → engaged but NEVER resend).
-      const first = await engine.sendFirstTurn(cfg.prompt, firstIdentity,
-        (tid) => codexRolloutProbe(cfg.cliId, tid, cfg.prompt, 12_000));
+      const first = await engine.sendFirstTurn(firstTurnPrompt, firstIdentity,
+        (tid) => codexRolloutProbe(cfg.cliId, tid, firstTurnPrompt, 12_000));
       freshDeliveryOwned = first.outcome !== 'not-sent';
+      if (freshDeliveryOwned && firstTurnCatalog && deferredPluginSkillCatalog === firstTurnCatalog) {
+        // The frame left with the catalog inside it; never attach it again.
+        deferredPluginSkillCatalog = null;
+        deferredPluginSkillCatalogDigest = undefined;
+      }
       // restart/close may have settled this exact attempt as ambiguous while the
       // rollout probe was pending. Fence before ANY durable/bridge/global engine
       // mutation; a superseded delivery is never pasted or re-queued.
@@ -1825,6 +1849,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
         // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
         acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId, cfg.dispatchAttempt);
+        publishTraexNativeContextReceipt(initialTraexContext, firstIdentity.turnId, 'accepted');
+      } else if (first.outcome === 'ambiguous') {
+        publishTraexNativeContextReceipt(initialTraexContext, firstIdentity.turnId, 'unknown');
       }
       // Fresh RPC delivery bypasses flushPending(), which is the normal owner
       // of this durable head-of-line gate. Claim it here only after the frame is
@@ -1848,7 +1875,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           // gate until a structured terminal or engine teardown instead of
           // guessing a latest turn.
           codexBridgeMarkPendingTurn(
-            cfg.prompt,
+            firstTurnPrompt,
             firstIdentity.turnId,
             firstIdentity.dispatchAttempt,
             awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
@@ -1873,7 +1900,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           // retire the bridge mark before fallback output is harvested.
           activateRpcTurnLifecycle(
             firstIdentity,
-            cfg.prompt,
+            firstTurnPrompt,
             false,
             firstGeneration,
             true,
@@ -1891,7 +1918,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // guessed. If no structured terminal becomes visible, exact engine
         // teardown is the expected fallback and drops this attempt's mark.
         codexBridgeMarkPendingTurn(
-          cfg.prompt,
+          firstTurnPrompt,
           firstIdentity.turnId,
           firstIdentity.dispatchAttempt,
           awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
@@ -1946,6 +1973,12 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // native viewer and duplicate side effects. Tear down exact local state
       // and fail the worker generation so durable recovery owns the next step.
       log('Codex RPC app-server died after the fresh delivery boundary; aborting init without paste fallback');
+      clearRpcEnginePidMarker();
+      try { engine?.stop(); } catch { /* best effort */ }
+      stopCodexRpcEngine();
+      throw err;
+    }
+    if (err instanceof TraexContextBudgetError) {
       clearRpcEnginePidMarker();
       try { engine?.stop(); } catch { /* best effort */ }
       stopCodexRpcEngine();
@@ -2590,19 +2623,52 @@ let scratchSubmountOverflowNotified = false;
 let cliTranscriptEverExisted = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
+let deferredPluginSkillCatalogDigest: string | undefined;
 let deliveredPluginSkillCatalogFingerprint: string | undefined;
 let deferredPluginSkillCatalogFingerprint: string | undefined;
+
+/** A catalog parked as an RPC sidecar travels outside `content`. If the item
+ * is later written through a plain-text transport (paste fallback after the
+ * app-server went away), fold it back in instead of silently dropping it. */
+function inlineParkedTraexSkillCatalog(item: PendingCliInput): void {
+  if (!item.traexSkillCatalog || (lastInitConfig?.cliId === 'traex' && codexRpcEngine)) return;
+  item.logicalContent ??= item.content;
+  item.content = `${item.content}\n\n${item.traexSkillCatalog}`;
+  delete item.traexSkillCatalog;
+  delete item.traexSkillCatalogDigest;
+}
+
+/** Budget the fresh first RPC turn and attach the pending refreshed catalog to
+ * the copy that is sent. A fresh thread has no accepted receipt of its own, so
+ * nothing is omitted; the caller's prompt and deferred catalog stay intact for
+ * a paste fallback. */
+function prepareFreshTraexFirstTurn(
+  prompt: string,
+  threadId: string,
+  receipt: TraexNativeContextReceipt | undefined,
+): PreparedTraexNativeContext {
+  const prepared = prepareTraexNativeContext(prompt, threadId, receipt);
+  return deferredPluginSkillCatalog
+    ? appendTraexSkillCatalog(prepared, deferredPluginSkillCatalog, receipt, deferredPluginSkillCatalogDigest)
+    : prepared;
+}
 
 function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
   if (!deferredPluginSkillCatalog || lastInitConfig?.adoptMode) return;
   item.logicalContent ??= item.content;
-  item.content = `${item.content}\n\n${deferredPluginSkillCatalog}`;
+  if (lastInitConfig?.cliId === 'traex' && codexRpcEngine) {
+    item.traexSkillCatalog = deferredPluginSkillCatalog;
+    item.traexSkillCatalogDigest = deferredPluginSkillCatalogDigest;
+  } else {
+    item.content = `${item.content}\n\n${deferredPluginSkillCatalog}`;
+  }
   if (item.codexAppInput) {
     item.codexAppInput = withCodexAppContext(item.codexAppInput,
       'botmux_plugin_skills', deferredPluginSkillCatalog, 'application');
   }
   deliveredPluginSkillCatalogFingerprint = deferredPluginSkillCatalogFingerprint;
   deferredPluginSkillCatalog = null;
+  deferredPluginSkillCatalogDigest = undefined;
   deferredPluginSkillCatalogFingerprint = undefined;
   log('Attached refreshed plugin Skill catalog at the CLI write edge');
 }
@@ -2673,6 +2739,10 @@ function refreshCliPluginGeneration(
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
     promptInjection: cfg.promptInjection,
+    compactCatalog: cfg.cliId === 'traex'
+      && codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() }),
+    deferCatalogToContextManager: cfg.cliId === 'traex'
+      && codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() }),
     previousSkillCatalogFingerprint: preserveUnchangedCatalog || sameAutoSession
       ? deliveredPluginSkillCatalogFingerprint : undefined,
   });
@@ -2696,6 +2766,7 @@ function refreshCliPluginGeneration(
   cfg.skillPluginDir = generation.skillPluginDir;
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
+  deferredPluginSkillCatalogDigest = generation.skillCatalogDigest;
   deferredPluginSkillCatalogFingerprint = generation.deferredSkillCatalog ? generation.skillCatalogFingerprint : undefined;
   if (!generation.deferredSkillCatalog) deliveredPluginSkillCatalogFingerprint = generation.skillCatalogFingerprint;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
@@ -23041,6 +23112,7 @@ async function flushPending(): Promise<void> {
       if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
       else workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
       cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
+      inlineParkedTraexSkillCatalog(item);
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
       // before the turn is written. Doing it at IPC-receive time collapsed two
@@ -23319,6 +23391,7 @@ async function flushPending(): Promise<void> {
       let result: Awaited<ReturnType<typeof writeAdapter.writeInput>> | undefined;
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
+      let rpcContext: PreparedTraexNativeContext | undefined;
       try {
         if (item.taskContinuation && !writeRpcEngine) {
           emitTurnTerminal(
@@ -23372,6 +23445,24 @@ async function flushPending(): Promise<void> {
             engine: writeRpcEngine,
             cliGeneration: writeGeneration,
           };
+          if (lastInitConfig?.cliId === 'traex') {
+            // The queued item is always self-contained; omit fixed blocks only
+            // here, against the receipt that is current for this exact write.
+            const nativeThreadId = writeRpcEngine.activeThreadId ?? lastInitConfig.cliSessionId ?? '';
+            rpcContext = prepareTraexNativeContext(
+              msg,
+              nativeThreadId,
+              lastInitConfig.traexNativeContextReceipt,
+            );
+            if (item.traexSkillCatalog) {
+              rpcContext = appendTraexSkillCatalog(
+                rpcContext,
+                item.traexSkillCatalog,
+                lastInitConfig.traexNativeContextReceipt,
+                item.traexSkillCatalogDigest,
+              );
+            }
+          }
           installAwaitingRpcActivation(
             rpcTurnIdentity,
             rpcTurnGeneration,
@@ -23383,8 +23474,22 @@ async function flushPending(): Promise<void> {
           // surfaces as a normal submit-failure notice.
           let rpcNativeTurnId: string | undefined;
           await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
-            prepareNormalWrite();
-            rpcNativeTurnId = (await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!)).nativeTurnId;
+            const activeNativeTurnId = writeRpcEngine.activeNativeTurnId;
+            if (activeNativeTurnId) {
+              throw new CodexRpcDeliveryError(
+                `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+                'rpc_turn_start_active',
+                'not_sent',
+              );
+            }
+            // Commit attribution/durable ownership only once the frame is on
+            // the socket: a not_sent rejection (dead socket, concurrent start)
+            // then leaves nothing to undo and the retained head retries cleanly.
+            rpcNativeTurnId = (await writeRpcEngine.sendTurn(
+              rpcContext?.content ?? msg,
+              rpcTurnIdentity!,
+              { onDispatch: prepareNormalWrite },
+            )).nativeTurnId;
           });
           // The await may overlap an engine/pane replacement. Fence the captured
           // generation BEFORE touching the global bridge queue; a stale ack must
@@ -23406,6 +23511,7 @@ async function flushPending(): Promise<void> {
           acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
             writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
             item.dispatchAttempt);
+          publishTraexNativeContextReceipt(rpcContext, rpcTurnIdentity.turnId, 'accepted');
           // Only the ACKed, still-current generation may create bridge state.
           // While turn/start was pending, codexBridgeIngest left its cursor
           // untouched; marking now therefore still precedes replay of any
@@ -23416,9 +23522,11 @@ async function flushPending(): Promise<void> {
           // so the lifecycle gate stays asserted for the full server-side run
           // instead of relying on the bounded 20s confirmation lease (which
           // would expire mid-turn on a long-running or approval-pending turn).
+          // Fingerprint the text the thread actually received: an omitted
+          // role block would otherwise make the transcript user record unmatchable.
           const activated = activateRpcTurnLifecycle(
             rpcTurnIdentity,
-            msg,
+            rpcContext?.content ?? msg,
             false,
             rpcTurnGeneration,
           );
@@ -23510,22 +23618,72 @@ async function flushPending(): Promise<void> {
           }
           break;
         }
+        if (rpcTurnIdentity
+          && rpcTurnGeneration
+          && err instanceof TraexContextBudgetError) {
+          clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
+          emitTurnTerminal(
+            rpcTurnIdentity.turnId,
+            'failed',
+            err.code,
+            rpcTurnIdentity.dispatchAttempt,
+          );
+          send({
+            type: 'user_notify',
+            message: `TraeX 固定上下文为 ${err.fixedContextBytes} bytes，超过本轮 ${err.budgetBytes} bytes 上限；消息未发送，也未截断用户正文、身份或授权边界。`,
+            turnId: rpcTurnIdentity.turnId,
+          });
+          break;
+        }
+        if (rpcTurnIdentity
+          && rpcTurnGeneration
+          && err instanceof CodexRpcDeliveryError
+          && err.deliveryDisposition === 'not_sent') {
+          clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
+          pendingMessages.unshift(item);
+          log(
+            `Codex RPC turn/start was not sent; retained the FIFO head `
+            + `turn=${rpcTurnIdentity.turnId} attempt=${rpcTurnIdentity.dispatchAttempt ?? '-'} `
+            + `native=${writeRpcEngine?.activeNativeTurnId ?? '-'} generation=${writeGeneration} `
+            + `code=${err.code} disposition=${err.deliveryDisposition}`,
+          );
+          send({
+            type: 'user_notify',
+            message: `${cliName()} RPC 消息尚未发送，已保留在队列中；将按原顺序继续，不会并发启动新一轮。`,
+            turnId: rpcTurnIdentity.turnId,
+            ...(rpcTurnIdentity.dispatchAttempt !== undefined
+              ? { dispatchAttempt: rpcTurnIdentity.dispatchAttempt }
+              : {}),
+          });
+          break;
+        }
         if (rpcTurnIdentity && rpcTurnGeneration && writeRpcEngine) {
+          const deliveryError = err instanceof CodexRpcDeliveryError ? err : undefined;
+          if (deliveryError?.deliveryDisposition === 'ambiguous') {
+            publishTraexNativeContextReceipt(
+              rpcContext,
+              rpcTurnIdentity.turnId,
+              'unknown',
+            );
+          }
           const replayAnchorMs = awaitingRpcActivationReplayAnchorMs(
             rpcTurnIdentity,
             rpcTurnGeneration,
           );
           clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
           bridgeTurnId = codexBridgeMarkPendingTurn(
-            msg,
+            rpcContext?.content ?? msg,
             rpcTurnIdentity.turnId,
             rpcTurnIdentity.dispatchAttempt,
             replayAnchorMs,
           );
           installRpcLifecycleFailClosedOwner(rpcTurnIdentity, rpcTurnGeneration);
           log(
-            `Codex RPC turn/start became ambiguous (${err?.message ?? err}); `
-            + `held exact owner ${rpcTurnIdentity.turnId} and blocked successors`,
+            `Codex RPC turn/start became ambiguous; held exact owner and blocked successors `
+            + `turn=${rpcTurnIdentity.turnId} attempt=${rpcTurnIdentity.dispatchAttempt ?? '-'} `
+            + `native=${writeRpcEngine.activeNativeTurnId ?? '-'} generation=${writeGeneration} `
+            + `code=${deliveryError?.code ?? 'rpc_turn_start_unknown'} disposition=ambiguous `
+            + `detail=${err?.message ?? err}`,
           );
           send({
             type: 'user_notify',
@@ -35554,6 +35712,8 @@ function emitTurnTerminal(
   // same-principal steer must not clear the newer turn's authority.
   if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
     releaseTerminatedActiveTurnAuthority();
+  } else {
+    scheduleConsumedQueuedTurnAdvance();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt);
   if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
@@ -35750,6 +35910,22 @@ function markReplyInputConsumed(turnId: string | undefined): void {
   if (!queued || queued.inputConsumed) return;
   queued.inputConsumed = true;
   writeCliPidMarker();
+  scheduleConsumedQueuedTurnAdvance();
+}
+
+/** Claude starts a type-ahead input on its own once the running turn stops,
+ *  without a prompt-ready edge in between. Once the running turn's authority
+ *  is released and the CLI has natively consumed the next queued input, that
+ *  input owns the CLI, so it takes the turn authority. Deferred so terminals of
+ *  inputs folded into the finished turn, emitted in the same drain, retire
+ *  their records first. */
+function scheduleConsumedQueuedTurnAdvance(): void {
+  queueMicrotask(() => {
+    if (activeTurnAuthority.snapshot()) return;
+    if (currentBotmuxTurnId && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)) return;
+    const next = queuedTypeAheadTurns.find(queued => !turnTerminalEmitted(queued.turnId, queued.dispatchAttempt));
+    if (next?.inputConsumed) advanceQueuedTypeAheadTurn('queued_input_consumed');
+  });
 }
 
 /** Establish the boot identity synchronously, before the first input receipt.
@@ -35787,6 +35963,31 @@ function acknowledgeNativeInputConsumed(
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
+}
+
+/** Compaction may have dropped the turn that carried the fixed context. The
+ * receipt no longer proves the thread holds it, so the next RPC write sends it
+ * again (an `unknown` receipt never omits anything). */
+function invalidateTraexNativeContextReceipt(threadId: string | undefined): void {
+  const receipt = lastInitConfig?.traexNativeContextReceipt;
+  if (lastInitConfig?.cliId !== 'traex' || receipt?.status !== 'accepted') return;
+  if (threadId && receipt.nativeThreadId !== threadId) return;
+  const invalidated = { ...receipt, status: 'unknown' as const };
+  lastInitConfig.traexNativeContextReceipt = invalidated;
+  log(`TraeX native thread ${receipt.nativeThreadId} compacted; fixed context will be resent`);
+  send({ type: 'traex_native_context_receipt', receipt: invalidated });
+}
+
+function publishTraexNativeContextReceipt(
+  prepared: PreparedTraexNativeContext | undefined,
+  turnId: string,
+  status: 'accepted' | 'unknown',
+): void {
+  if (lastInitConfig?.cliId !== 'traex' || lastInitConfig.codexRpcInput !== true || !prepared) return;
+  const receipt = settleTraexNativeContextReceipt(prepared, turnId, status);
+  if (!receipt) return;
+  lastInitConfig.traexNativeContextReceipt = receipt;
+  send({ type: 'traex_native_context_receipt', receipt });
 }
 
 /** Codex tmux/paste mode proves acceptance by matching the exact submitted
