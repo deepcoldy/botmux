@@ -198,6 +198,12 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // history came back.
     resumeRequiresCliSessionId: true,
     altScreen: false,
+    // dsh-tui runs full-screen on tmux's alternate screen and repaints its
+    // transcript itself, so there is no xterm/tmux scrollback to page. A
+    // read-only web terminal can only reach history by forwarding the wheel
+    // back to the CLI as SGR mouse reports (1003+1006), which the TUI already
+    // handles — opt into that narrow, rate-limited relay.
+    readOnlyRemoteScroll: true,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
     get authPaths(): string[] { return dshAuthPaths(); },
