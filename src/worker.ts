@@ -467,7 +467,7 @@ import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './service
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
-import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
+import { antigravityTransport, assertAntigravityTransportBackend, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
   mapAntigravityCompactOffsetToFull,
@@ -25528,6 +25528,7 @@ async function spawnCliBody(
   // sessions; ZMX validates its version plus full-list control plane; Herdr
   // uses a non-destructive version check.
   let effectiveBackend = cfg.backendType;
+  assertAntigravityTransportBackend(agyTransport, effectiveBackend);
   const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId);
   if (backendCliError) {
     throw new Error(
