@@ -6198,6 +6198,7 @@ async function reconcileTraexModelCatalog(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   isCurrent: () => boolean,
   turnId?: string,
+  dispatchAttempt?: number,
 ): Promise<boolean> {
   const available = snapshot?.catalogModels;
   if (!isCurrent()) return false;
@@ -6217,6 +6218,7 @@ async function reconcileTraexModelCatalog(
       type: 'traex_model_pool_prune', requestId,
       expectedPolicyKey: traexAutoModelPolicyKey(cfg.traexAutoModel ?? controller.config),
       availableModels: [...available], ...(turnId ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     } satisfies WorkerToDaemon);
   });
   if (!isCurrent()) return false;
@@ -6416,7 +6418,8 @@ async function preflightTraexAutoModelBeforeSpawn(
     // Preserve the existing fail-open launch; retry only while startup/input
     // is still unresolved, and never interrupt a model that began working.
     const stillNeeded = () => current()
-      && (!backend || controller.awaitingModelActivity() || controller.capacityCurrentlyBlocking());
+      && (!backend || traexNativeStartupInputIsPending()
+        || controller.awaitingModelActivity() || controller.capacityCurrentlyBlocking());
     const token = { controller, generation: options.spawnGeneration, turnId: ownerTurnId };
     traexCatalogRetryPending = token;
     send({ type: 'user_notify', ...(cfg.turnId ? { turnId: cfg.turnId } : {}),
@@ -6425,7 +6428,7 @@ async function preflightTraexAutoModelBeforeSpawn(
       .then(async result => {
         if (!stillNeeded()) return;
         if (result) {
-          if (!await reconcileTraexModelCatalog(result, controller, cfg, stillNeeded, ownerTurnId)) return;
+          if (!await reconcileTraexModelCatalog(result, controller, cfg, stillNeeded, ownerTurnId, cfg.dispatchAttempt)) return;
           rememberTraexModelLoadSnapshot(result);
           if (ownerTurnId && controller.capacityCurrentlyBlocking()) {
             const choice = controller.resolveModelLoads(ownerTurnId, result.loads);
@@ -6443,7 +6446,7 @@ async function preflightTraexAutoModelBeforeSpawn(
       });
     return;
   }
-  if (!await reconcileTraexModelCatalog(snapshot, controller, cfg, current, cfg.turnId)) {
+  if (!await reconcileTraexModelCatalog(snapshot, controller, cfg, current, cfg.turnId, cfg.dispatchAttempt)) {
     if (cfg.traexAutoModel?.catalogUnavailable) throw new Error(t('worker.traex_auto_model.catalog_empty'));
     throw new CliSpawnSupersededError();
   }
@@ -6834,7 +6837,7 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
         && controller === traexAutoModelController && token.generation === cliSpawnGeneration
         && pendingMessages[0] === head && isPromptReady && !cliRestartInProgress
         && !activeTurnAuthority.snapshot()?.started;
-      if (!await reconcileTraexModelCatalog(snapshot, controller, lastInitConfig!, current, head.turnId)) {
+      if (!await reconcileTraexModelCatalog(snapshot, controller, lastInitConfig!, current, head.turnId, head.dispatchAttempt)) {
         if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
         return;
       }

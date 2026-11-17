@@ -19943,14 +19943,28 @@ function setupWorkerHandlers(
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
       case 'traex_model_pool_prune': {
+        const executionCurrent = () => {
+          if (!msg.turnId || !sessionController) return true;
+          // executions(ref, turnId) means the exact undefined attempt, not all
+          // attempts. Keep pre-bootstrap maintenance possible, but never let a
+          // missing/mismatched attempt borrow a different execution's authority.
+          const executions = sessionController.store.executions(sessionController.ref)
+            .filter(execution => execution.ref.turnId === msg.turnId);
+          if (executions.length === 0) return true;
+          const matching = executions.filter(execution =>
+            execution.ref.dispatchAttempt === msg.dispatchAttempt);
+          return matching.length > 0
+            && !executions.some(execution => execution.ref.dispatchAttempt !== undefined
+              && (msg.dispatchAttempt === undefined || execution.ref.dispatchAttempt > msg.dispatchAttempt))
+            && matching.every(execution => !execution.cancelRequested && !execution.terminal
+              && !['succeeded', 'failed', 'cancelled'].includes(execution.phase));
+        };
         const current = () => ownsWorkerSession()
           && ds.workerGeneration === workerGeneration && effectiveCliId === 'traex'
           && !ds.initConfig?.adoptMode && !ds.initConfig?.wrapperCli
           && !ds.initConfig?.existingAppServerEndpoint && !isRemoteBackendSession(ds)
           && (!msg.turnId || ds.currentTurnId === undefined || ds.currentTurnId === msg.turnId)
-          && (!msg.turnId || !sessionController
-            || !sessionController.store.executions(sessionController.ref, msg.turnId).some(execution =>
-              ['succeeded', 'failed', 'cancelled'].includes(execution.phase)));
+          && executionCurrent();
         let result: import('../services/traex-model-pool-prune.js').TraexModelPoolPruneResult;
         try {
           result = await pruneSavedTraexModelPool({
