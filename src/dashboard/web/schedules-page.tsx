@@ -6,6 +6,7 @@ import {
   type RefObject,
 } from 'react';
 import { Cron } from 'croner';
+import { scheduleSupportLines } from '../../core/schedule-followup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { ModalDialog } from './modal-dialog.js';
 import { useStoreSelector, useT, useDashboardLocale } from './react-hooks.js';
@@ -1268,6 +1269,7 @@ function ScheduleRowCard(props: {
           {s.calendar ? <span>{tr('schedules.form.calendar')}: {scheduleCalendarLabel(s.calendar, s.calendarCheck?.displayNames ?? s.lastCalendarCheck?.displayNames, locale)} · {tr(`schedules.calendarDayType.${s.calendarDayType ?? 'workday'}`)} · {tr('schedules.calendarNext')}: {fmtScheduleDate(s.nextEligibleRunAt, scheduleTimeZone)} · {s.calendarCheck?.reason ? tr(`schedules.calendarReason.${s.calendarCheck.reason}`) : ''}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
+          {scheduleSupportLines(s, locale).slice(1).map(line => <span key={line} className="schedule-support-detail">{line}</span>)}
           {repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}
         </div>
       </OverviewListMain>
@@ -1321,11 +1323,12 @@ function ScheduleRowCard(props: {
   );
 }
 
-function SchedulesPage() {
+export function SchedulesPage() {
   const tr = useT();
-  const { scheduleRows, scheduleTimeZone } = useStoreSelector(snapshot => ({
+  const { scheduleRows, scheduleTimeZone, schedulesReady } = useStoreSelector(snapshot => ({
     scheduleRows: [...snapshot.schedules.values()] as ScheduleRow[],
     scheduleTimeZone: snapshot.scheduleTimeZone,
+    schedulesReady: snapshot.schedulesReady,
   }));
   const [filters, setFilters] = useState<ScheduleFilters>({ q: '', kind: '', enabledOnly: false });
   const [pending, setPending] = useState<string | null>(null);
@@ -1548,7 +1551,7 @@ function SchedulesPage() {
           <p className="eyebrow">{tr('nav.schedules')}</p>
           <h1>{tr('schedules.title')}</h1>
         </div>
-        <CreateActionButton onClick={openCreate} disabled={bots.length === 0}>{tr('schedules.create')}</CreateActionButton>
+        <CreateActionButton data-action="create-schedule" onClick={openCreate} disabled={!schedulesReady || bots.length === 0}>{tr('schedules.create')}</CreateActionButton>
       </div>
       <form id="sched-filters" className="filters dashboard-toolbar">
         <input
@@ -1593,7 +1596,9 @@ function SchedulesPage() {
       </form>
       <section className="overview-block schedules-list-section">
         <div className="schedules-list-wrap">
-          {rows.length === 0 ? (
+          {!schedulesReady ? (
+            <div id="schedules-tbody" className="empty schedules-list-empty" role="status">{tr('common.loading')}</div>
+          ) : rows.length === 0 ? (
             <div id="schedules-tbody" className="empty schedules-list-empty">{tr('schedules.empty')}</div>
           ) : (
             <OverviewList id="schedules-tbody" className="schedules-list">

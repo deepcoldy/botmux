@@ -231,6 +231,24 @@ bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.
 bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
 
+CI also runs the eligible unit files on Bun in four independent shards, retaining
+one process per file. The stable `bun-test` check verifies complete coverage and
+publishes per-file wall times. See [Bun CI shards and timing artifacts](docs/bun-ci-shards.md)
+for local reproduction and refreshing the separate Bun duration table.
+
+The TraeX Auto and startup-readiness fixtures cache an isolated JavaScript
+emission per test file. They copy current source and compiler/dependency inputs,
+then emit that private tree with the project's TypeScript compiler. Normal build
+and type checks still run through `bun run build`; this test-local emission only
+avoids paying Node+tsx transformation at every worker startup.
+
+Hooks and workers use the same read-only snapshot on Node with real PTY/tmux.
+New spawns verify the selected inputs and snapshot, and teardown removes the
+cache after the workers stop. Source changes during capture or compilation fail
+the fixture; each compilation has its own output directory. Symlinked source
+inputs use source execution. Set `BOTMUX_TEST_WORKER_SOURCE=1` for reproduction;
+`BOTMUX_TEST_WORKER_BINARY` remains the single-file executable path.
+
 > **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
 > submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by
 > `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every

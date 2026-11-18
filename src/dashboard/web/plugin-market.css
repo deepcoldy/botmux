@@ -19,6 +19,11 @@
 .plugin-store-introduction p { margin: 0; overflow-wrap: anywhere; }
 .plugin-store-introduction .plugin-store-audience { padding: 0 0 10px; }
 .plugin-settings-access { padding: 16px 24px; }
+[data-plugin-prerequisites] { padding: 0 24px 16px; min-width: 0; }
+.plugin-prerequisite-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; }
+.plugin-prerequisite-row > div { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.plugin-prerequisite-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 4px 0 0; overflow-wrap: anywhere; }
+.plugin-prerequisite-row .btn-link { flex-shrink: 0; }
 .plugin-advanced { border-top: 1px solid var(--border-soft); }
 .plugin-advanced > summary { padding: 16px 24px; color: var(--muted); cursor: pointer; font-size: 13px; }
 .plugin-advanced > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
@@ -54,6 +59,7 @@
   .plugin-store-grid { grid-template-columns: minmax(0, 1fr); }
   .plugin-store-dialog { width: calc(100vw - 20px); max-width: calc(100vw - 20px); max-height: calc(100dvh - 24px); }
   .plugin-store-dialog-head, .plugin-store-dialog-body, .plugin-store-dialog-foot { padding: 16px; }
+  [data-plugin-prerequisites] { padding: 0 16px 16px; }
   .plugin-store-dialog .plugin-action-grid { grid-template-columns: minmax(0, 1fr); }
   .plugin-store-dialog .plugin-tab-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }

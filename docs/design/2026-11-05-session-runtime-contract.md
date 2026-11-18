@@ -112,6 +112,21 @@ Readiness has separate worker-online and prompt-ready facets. `workerReady`,
 `cliReady` and `cliReadyGeneration` are compatible read projections. Screen idle,
 IPC receipt and prompt readiness do not settle a business execution.
 
+Ordinary IM delivery tracking admits the exact execution before sending IPC,
+including follow-ups and recovery/board turns. The frozen admission travels with
+every transport retry. Cold-start receipt publication waits until the worker's
+contract identity and execution registry are initialized; the preload only
+publishes legacy receipts and keeps contract-enabled init messages buffered.
+An admitted commit clears the delivery tracker while the execution can remain
+queued. After a worker retires, its late commit may clear only that child's
+matching tracked admission, with session, producer, generation and full attempt
+identity verified. It cannot update the replacement runtime or settle its input.
+If the commit ACK was lost, a successful native terminal accepted by the
+contract gateway also clears that child's exact delivery, including a proven
+historical runtime or retired worker. Settlement still matches the original
+worker object and frozen execution, preserving the replacement input. Failure, cancellation and
+reconciliation boundaries do not supply this fallback admission proof.
+
 Operations progress through `planned`, `applying`, `confirmed`,
 `failed_before_effect`, `rejected` or `uncertain`. They retain their operation ID,
 target runtime/attempt and prior lifecycle. Timeout retains an uncertain

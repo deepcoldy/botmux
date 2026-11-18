@@ -28,6 +28,7 @@ import {
   buildTurnContinuePrompt,
 } from '../src/services/turn-failure-notice.js';
 import { t } from '../src/i18n/index.js';
+import { formatClockTime } from '../src/utils/clock-time.js';
 import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-config.js';
 
 let cardTestHome: string;
@@ -327,6 +328,13 @@ describe('buildTurnFailedCard', () => {
     expect(btn.value.turn_id).toBe('turn-abc123');
     expect(btn.value.session_id).toBe('sess-fail');
     expect(btn.value.root_id).toBe('om_root_fail');
+  });
+
+  it("names the provider's own recovery time when its error gave one", () => {
+    const at = new Date('2026-11-13T11:10:16Z');
+    const line = t('card.turn_failed.provider_eta', { eta: formatClockTime(at.getTime()) });
+    expect(bodyText(build({ providerRetryAt: at }))).toContain(line);
+    expect(bodyText(build())).not.toContain(line);
   });
 
   it('omits the retry button when the policy denied retry', () => {

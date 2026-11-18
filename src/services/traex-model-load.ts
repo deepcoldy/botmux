@@ -4,6 +4,9 @@ import { isCodexReasoningEffort, type CodexReasoningEffort } from './codex-reaso
 export interface TraexModelLoadSnapshot {
   loads: Map<string, number>;
   reasoningEfforts: Map<string, readonly CodexReasoningEffort[]>;
+  /** Present only after a valid, nonempty catalog has been read to its end.
+   * Absence is inconclusive, never evidence that a model was removed. */
+  catalogModels?: ReadonlySet<string>;
 }
 
 function publicModelIdentities(entry: Record<string, any>): string[] {
@@ -57,14 +60,22 @@ export function parseTraexModelLoads(raw: unknown): Map<string, number> {
  * Read-only native catalog request. It creates no thread/turn and sends no
  * inference prompt. Own and terminate the stdio helper; never start/restart
  * the user's shared daemon. Null means unavailable, never "zero load".
+ *
+ * `onUnavailable` receives why a read returned null: how far the helper got
+ * before a timeout, or which protocol step failed. Only fixed labels, exit
+ * codes and error codes — never helper output, paths or environment.
  */
 export async function readTraexModelLoadSnapshot(input: {
   cliBin: string;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  onUnavailable?: (reason: string) => void;
 }): Promise<TraexModelLoadSnapshot | null> {
+  if (input.signal?.aborted) return Promise.resolve(null);
   return new Promise(resolve => {
+    const startedAtMs = Date.now();
     const child = spawn(input.cliBin, ['app-server', '--listen', 'stdio://'], {
       env: input.env, cwd: input.cwd, stdio: ['pipe', 'pipe', 'ignore'],
     });
@@ -72,14 +83,23 @@ export async function readTraexModelLoadSnapshot(input: {
     let bytes = 0;
     let buffer = '';
     let pages = 0;
+    let stage = 'helper started, no reply yet';
     const cursors = new Set<string>();
     let nextId = 2;
     const snapshot: TraexModelLoadSnapshot = { loads: new Map(), reasoningEfforts: new Map() };
-    const timeout = setTimeout(() => finish(null), input.timeoutMs ?? 8_000);
+    const catalogModels = new Set<string>();
+    const timeoutMs = input.timeoutMs ?? 8_000;
+    const timeout = setTimeout(() => fail(`timed out after ${timeoutMs}ms (${stage})`), timeoutMs);
+    function fail(reason: string) {
+      if (settled) return;
+      input.onUnavailable?.(`${reason}; ${Date.now() - startedAtMs}ms after launch`);
+      finish(null);
+    }
     function finish(result: TraexModelLoadSnapshot | null) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      input.signal?.removeEventListener('abort', onAbort);
       child.stdin.end();
       child.kill('SIGTERM');
       const reap = setTimeout(() => child.kill('SIGKILL'), 1_000);
@@ -87,25 +107,28 @@ export async function readTraexModelLoadSnapshot(input: {
       child.once('exit', () => clearTimeout(reap));
       resolve(result);
     }
+    function onAbort() { fail('aborted'); }
     function send(value: object) {
       if (!settled) child.stdin.write(`${JSON.stringify(value)}\n`, error => {
-        if (error) finish(null);
+        if (error) fail(`stdin write failed (${(error as NodeJS.ErrnoException).code ?? 'error'})`);
       });
     }
     function page(cursor?: string) {
       pages += 1;
+      stage = `waiting for model/list page ${pages}`;
       send({ id: nextId, method: 'model/list', params: {
         includeHidden: true, forceRefresh: pages === 1, limit: 100,
         ...(cursor ? { cursor } : {}),
       } });
     }
-    child.on('error', () => finish(null));
-    child.on('exit', () => finish(null));
-    child.stdin.on('error', () => finish(null));
+    child.on('error', error => fail(`helper failed to start (${(error as NodeJS.ErrnoException).code ?? 'error'})`));
+    child.on('exit', (code, signal) => fail(`helper exited (code=${code}, signal=${signal}) while ${stage}`));
+    child.stdin.on('error', error => fail(`stdin failed (${(error as NodeJS.ErrnoException).code ?? 'error'})`));
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       bytes += Buffer.byteLength(chunk);
-      if (settled || bytes > 8 * 1024 * 1024) { finish(null); return; }
+      if (settled) return;
+      if (bytes > 8 * 1024 * 1024) { fail('response exceeded 8 MiB'); return; }
       buffer += chunk;
       let end: number;
       while ((end = buffer.indexOf('\n')) >= 0 && !settled) {
@@ -114,22 +137,37 @@ export async function readTraexModelLoadSnapshot(input: {
         let message: any;
         try { message = JSON.parse(line); } catch { continue; }
         if (message.id === 1) {
-          if (message.error) { finish(null); return; }
+          if (message.error) { fail('initialize returned an error'); return; }
           send({ method: 'initialized', params: {} });
           page();
         } else if (message.id === nextId) {
-          if (message.error) { finish(null); return; }
+          if (message.error) { fail(`model/list page ${pages} returned an error`); return; }
+          const data = message.result?.data;
+          if (!Array.isArray(data) || data.some((entry: unknown) =>
+            !entry || typeof entry !== 'object' || Array.isArray(entry)
+            || publicModelIdentities(entry as Record<string, any>).length === 0)) {
+            fail(`model/list page ${pages} was malformed`); return;
+          }
+          for (const entry of data) {
+            for (const identity of publicModelIdentities(entry)) catalogModels.add(identity);
+          }
           const pageSnapshot = parseTraexModelLoadSnapshot(message.result);
           for (const [key, value] of pageSnapshot.loads) snapshot.loads.set(key, value);
           for (const [key, value] of pageSnapshot.reasoningEfforts) snapshot.reasoningEfforts.set(key, value);
           const cursor = message.result?.nextCursor;
-          if (typeof cursor === 'string' && cursor && !cursors.has(cursor)) {
+          if (cursor !== undefined && cursor !== null
+            && (typeof cursor !== 'string' || !cursor || cursors.has(cursor) || pages >= 100)) {
+            fail(`model/list page ${pages} had an invalid or repeated cursor`); return;
+          }
+          if (typeof cursor === 'string' && cursor) {
             cursors.add(cursor); nextId += 1; page(cursor);
           }
-          else finish(snapshot.loads.size || snapshot.reasoningEfforts.size ? snapshot : null);
+          else if (catalogModels.size > 0) finish({ ...snapshot, catalogModels });
+          else fail('model/list returned an empty catalog');
         }
       }
     });
+    input.signal?.addEventListener('abort', onAbort, { once: true });
     send({ id: 1, method: 'initialize', params: {
       clientInfo: { name: 'botmux-model-load', version: '1' },
       capabilities: { experimentalApi: true },

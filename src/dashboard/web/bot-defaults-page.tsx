@@ -1,3 +1,4 @@
+import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
@@ -6,6 +7,8 @@ import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
 import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
+import { afterNextPaint } from './deferred-task.js';
+import { LazyTabPanel } from './lazy-tab-panel.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -14,7 +17,9 @@ import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { BlockedUsersEditor } from './blocked-users-editor.js';
 import { QuietPresetSection } from './quiet-preset-section.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
-import type { PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { resolvePromptCachePolicy, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
+import type { ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import {
   BOT_DEFAULTS_TABS,
   BOT_DEFAULTS_TAB_LABEL_KEYS,
@@ -28,6 +33,7 @@ import {
   fetchCliOptions,
   fetchCardBrandLabelEnabled,
   fetchGlobalPromptCache,
+  fetchGlobalProviderRecovery,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -658,6 +664,9 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     goalStatusCard: body.goalStatusCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
+    replyCardNextStep: body.replyCardNextStep,
+    replyCardRecap: body.replyCardRecap,
+    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -1135,13 +1144,7 @@ function BotDefaultsCard(props: {
         </div>
       ) : null}
       <div className="bd-body bd-tab-panels">
-        <div
-          id="bd-panel-common"
-          role="tabpanel"
-          aria-labelledby="bd-tab-common"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'common'}
-        >
+        <LazyTabPanel id="common" active={props.activeTab === 'common'}>
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('agent')}>
               <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} lock={props.linkedAgent} />
@@ -1151,14 +1154,8 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile" id={botDefaultsSectionDomId('role')}><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-sessions"
-          role="tabpanel"
-          aria-labelledby="bd-tab-sessions"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'sessions'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="sessions" active={props.activeTab === 'sessions'}>
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
@@ -1176,17 +1173,15 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('prompt-cache')}><PromptCacheSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* 暂态故障自动续跑只接 Claude Code 的普通轮次（Codex 容量续跑另有开关）。 */}
+            {bot.cliId === 'claude-code' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('provider-recovery')}><ProviderRecoverySection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-security"
-          role="tabpanel"
-          aria-labelledby="bd-tab-security"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'security'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="security" active={props.activeTab === 'security'}>
           <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
@@ -1204,14 +1199,8 @@ function BotDefaultsCard(props: {
             <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-cards"
-          role="tabpanel"
-          aria-labelledby="bd-tab-cards"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'cards'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="cards" active={props.activeTab === 'cards'}>
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('card-behavior')}><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('long-task-reminder')}><LongTaskReminderSection bot={bot} patchBot={patchBot} /></section>
@@ -1222,14 +1211,8 @@ function BotDefaultsCard(props: {
             <section className="bd-tile" id={botDefaultsSectionDomId('ask-option-layout')}><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('brand')}><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-advanced"
-          role="tabpanel"
-          aria-labelledby="bd-tab-advanced"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'advanced'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="advanced" active={props.activeTab === 'advanced'}>
           <BdTabGrid>
             {/* 远端 CLI（riff/mojo）：backendType 与 CLI 选择 1:1 绑定 ——
                 reconcileRiffBackendType 在 spawn 层按 isRemoteBackendId(cliId)
@@ -1263,7 +1246,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
-        </div>
+        </LazyTabPanel>
       </div>
     </article>
   );
@@ -1627,7 +1610,7 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         onChange={forwardMode => updateDraft({ ...policy, forwardMode })} />
     </div>
     {(policy.flowMode ?? 'direct') === 'classify' && <div className="bd-oncall-field">
-      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。飞书侧栏：打开 Oncall 平台表单，暂不支持自动关联人工群和转交当前对话。">分类填写方式</FieldTitle>
+      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。卡片中的分类包含自定义字段时，确认按钮直接打开侧栏，保留区域、分类、等级和问题描述；原发起人提交成功后，自动显示进群入口并按交接设置同步当前会话。单独选择“飞书侧栏”仍为有限支持。">分类填写方式</FieldTitle>
       <DropdownField dataInput="oncallFormDisplay" ariaLabel="分类填写方式" disabled={busy || (policy.flowMode ?? 'direct') !== 'classify'} value={policy.formDisplay ?? 'thread_card'}
         options={[{ value: 'thread_card', label: '群内卡片（推荐）', hint: '在原群聊或话题内填写；所有成员可见，仅发起人操作' }, { value: 'native', label: '飞书侧栏（有限支持）', hint: '在 Oncall 平台表单中填写；暂不自动关联人工群或转交对话' }, { value: 'private_card', label: '仅本人可见卡片', hint: '仅点击者可见；只支持普通群，不支持话题群和私聊' }]}
         onChange={formDisplay => updateDraft({ ...policy, formDisplay })} />
@@ -2029,6 +2012,7 @@ const DEFAULT_OWNER_REMINDER = {
   intervalMinutes: 30,
   text: '该会话已等待处理，请继续跟进。',
   states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
+  quietHours: DEFAULT_OWNER_REMINDER_QUIET_HOURS,
 };
 
 function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
@@ -2038,6 +2022,7 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
   const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
   const [text, setText] = useState(initial.text);
   const [states, setStates] = useState<OwnerReminderState[]>([...initial.states]);
+  const [quietHours, setQuietHours] = useState(initial.quietHours ?? DEFAULT_OWNER_REMINDER_QUIET_HOURS);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -2047,6 +2032,7 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
     setIntervalValue(String(next.intervalMinutes));
     setText(next.text);
     setStates([...next.states]);
+    setQuietHours(next.quietHours ?? DEFAULT_OWNER_REMINDER_QUIET_HOURS);
   }, [props.bot.sessionOwnerReminder]);
 
   function toggleState(state: OwnerReminderState, checked: boolean): void {
@@ -2070,7 +2056,11 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
       setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
       return;
     }
-    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+    if (!normalizeOwnerReminderQuietHours(quietHours)) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderQuietHoursInvalid')}` });
+      return;
+    }
+    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states, quietHours };
     await saveBotField({
       request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`, payload),
       setStatus,
@@ -2095,6 +2085,24 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
         <label>
           <span>{tr('botDefaults.ownerReminderInterval')}</span>
           <input type="number" min={1} max={10080} step={1} data-input="ownerReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <ToggleRow
+        checked={quietHours.enabled}
+        disabled={busy}
+        dataAction="toggle-owner-reminder-quiet-hours"
+        title={tr('botDefaults.ownerReminderQuietHours')}
+        help={tr('botDefaults.ownerReminderQuietHoursHelp')}
+        onChange={checked => setQuietHours(current => ({ ...current, enabled: checked }))}
+      />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.ownerReminderQuietHoursStart')}</span>
+          <input type="time" value={quietHours.start} disabled={busy} onChange={event => setQuietHours({ ...quietHours, start: event.currentTarget.value })} />
+        </label>
+        <label>
+          <span>{tr('botDefaults.ownerReminderQuietHoursEnd')}</span>
+          <input type="time" value={quietHours.end} disabled={busy} onChange={event => setQuietHours({ ...quietHours, end: event.currentTarget.value })} />
         </label>
       </div>
       <div className="bd-subsection">
@@ -2446,19 +2454,21 @@ function botDescriptionErrorText(
   return responseErrorText(res);
 }
 
-function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
+export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const { bot } = props;
   const [snapshot, setSnapshot] = useState<BotDescriptionSnapshot | null>(null);
   const [drafts, setDrafts] = useState<BotDescriptionDrafts>({});
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const busy = loading || saving;
   const [status, setStatus] = useState<StatusMessage>(null);
   const [loginVisible, setLoginVisible] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
 
   const loadDescriptions = useCallback(async (previousDrafts?: BotDescriptionDrafts) => {
-    setBusy(true);
+    setLoading(true);
     setStatus({ text: `⏳ ${tr('botDefaults.descriptionLoading')}`, ok: true });
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`);
@@ -2488,18 +2498,17 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     } catch (e: any) {
       setStatus({ text: `✗ ${tr('botDefaults.descriptionLoadFailed', { error: caughtErrorText(e) })}` });
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
     return null;
   }, [bot.larkAppId, tr]);
 
-  useEffect(() => {
-    void loadDescriptions();
-  }, [loadDescriptions]);
-
   const openEditor = useCallback(() => {
     setOpen(true);
-  }, []);
+    // Reading descriptions bootstraps a remote Open Platform Web session. It
+    // is not needed to display or edit the rest of the Bot configuration.
+    if (!snapshot && !busy) void loadDescriptions();
+  }, [snapshot, busy, loadDescriptions]);
 
   const save = useCallback(async () => {
     const normalized = normalizeBotDescriptions(drafts);
@@ -2512,7 +2521,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
       setStatus({ text: `✗ ${tr(key, { lang: normalized.lang ?? '' })}` });
       return;
     }
-    setBusy(true);
+    setSaving(true);
     setStatus({ text: `⏳ ${tr('botDefaults.descriptionPublishing')}`, ok: true });
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`, {
@@ -2545,7 +2554,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     } catch (e: any) {
       setStatus({ text: `✗ ${tr('botDefaults.descriptionFailed', { error: caughtErrorText(e) })}` });
     } finally {
-      setBusy(false);
+      setSaving(false);
     }
   }, [bot.larkAppId, drafts, loadDescriptions, snapshot?.primaryLang, tr]);
 
@@ -2584,13 +2593,13 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
         <div
           className="bot-defaults-page bd-description-overlay"
           onClick={event => {
-            if (event.currentTarget === event.target && !busy) setOpen(false);
+            if (event.currentTarget === event.target && !saving) setOpen(false);
           }}
         >
           <div className="bd-description-modal" role="dialog" aria-modal="true" aria-labelledby="bd-description-title">
             <div className="bd-description-modal-head">
               <h3 id="bd-description-title">{tr('botDefaults.descriptionTitle')}</h3>
-              <button type="button" className="feishu-login-close" aria-label={tr('feishuLogin.close')} disabled={busy} onClick={() => setOpen(false)}>x</button>
+              <button type="button" className="feishu-login-close" data-action="close-bot-description" aria-label={tr('feishuLogin.close')} disabled={saving} onClick={() => setOpen(false)}>x</button>
             </div>
             {status ? (
               <small className={statusClass(status, 'bd-description-modal-status')} data-description-modal-status>
@@ -2635,7 +2644,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
               })}
             </div>
             <div className="bd-description-actions">
-              <button type="button" disabled={busy} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
+              <button type="button" data-action="cancel-bot-description" disabled={saving} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
               <button type="button" className="primary" disabled={busy || rows.length === 0} onClick={() => void save()}>{tr('botDefaults.descriptionSave')}</button>
             </div>
           </div>
@@ -3034,10 +3043,12 @@ export function BotAgentSection(props: {
     let stale = false;
     setDetectedModels(null);
     setDetectingModels(true);
-    fetchDetectedModels(cliKey, bot.larkAppId)
-      .then(result => { if (!stale) setDetectedModels(result); })
-      .finally(() => { if (!stale) setDetectingModels(false); });
-    return () => { stale = true; };
+    const cancel = afterNextPaint(() => {
+      void fetchDetectedModels(cliKey, bot.larkAppId)
+        .then(result => { if (!stale) setDetectedModels(result); })
+        .finally(() => { if (!stale) setDetectingModels(false); });
+    });
+    return () => { stale = true; cancel(); };
     // Runtime/path/env-policy/env edits save into the bot row first. A new row
     // identity is the probe revision; env values themselves stay write-only.
   }, [cliKey, bot]);
@@ -4578,10 +4589,10 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
-  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
-  const fallback = policy?.fallback ?? 'bot-identity';
+  const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
+  const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4590,6 +4601,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     mcpAdvisory?: string;
     platformBound?: boolean;
     platformCredentialsUrl?: string;
+    crossPrincipalIsolation?: boolean;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -4621,17 +4633,23 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
-    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+    return {
+      enabled: true,
+      capabilities: next.capabilities ?? capabilities,
+      credentialSource: next.credentialSource ?? credentialSource,
+      delegateOnMention: next.delegateOnMention ?? delegateOnMention,
+      allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
+    };
   }
 
-  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  function saveWith(next: Parameters<typeof policyWith>[0]): void {
+    void save(policyWith(next));
   }
 
-  function setDelegateOnMention(next: boolean): void {
-    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
+  function toggleCapability(capability: typeof capabilities[number], on: boolean): void {
+    saveWith({ capabilities: on ? [...new Set([...capabilities, capability])] : capabilities.filter(c => c !== capability) });
   }
 
   return (
@@ -4643,34 +4661,35 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         dataAction="toggle-trigger-user-auth"
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
-        onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
-        )}
+        onChange={checked => void save(checked ? policyWith({}) : null)}
       />
       {enabled ? (
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
-              <label key={tool} className="bd-inline-check">
+            {(['lark-user', 'bytecloud', 'meego'] as const).map(capability => (
+              <label key={capability} className="bd-inline-check">
                 <input
                   type="checkbox"
-                  data-action={`trigger-user-auth-tool-${tool}`}
-                  checked={tools.includes(tool)}
+                  data-action={`trigger-user-auth-capability-${capability}`}
+                  checked={capabilities.includes(capability)}
                   disabled={busy}
-                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                  onChange={event => toggleCapability(capability, event.currentTarget.checked)}
                 />
-                <span>{tool}</span>
+                <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
               </label>
             ))}
           </div>
+          {capabilities.includes('lark-user') || policy?.legacyCapabilities ? null : (
+            <p className="bd-section-note" data-action="trigger-user-auth-lark-user-native-note">{tr('botDefaults.triggerUserAuthLarkUserNativeNote')}</p>
+          )}
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthSource')}</span>
             <select
               data-action="trigger-user-auth-source"
               value={credentialSource}
               disabled={busy}
-              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+              onChange={event => saveWith({ credentialSource: event.currentTarget.value as 'auto' | 'platform' | 'local' })}
             >
               <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
               <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
@@ -4697,10 +4716,21 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
             dataAction="toggle-trigger-user-auth-delegate-on-mention"
             title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
             help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
-            onChange={checked => setDelegateOnMention(checked)}
+            onChange={checked => saveWith({ delegateOnMention: checked })}
           />
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
-          {tools.includes('bytedcli') ? (
+          <ToggleRow
+            checked={allowSpeakerSwitch}
+            disabled={busy || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
+            dataAction="toggle-trigger-user-auth-allow-speaker-switch"
+            title={tr('botDefaults.triggerUserAuthAllowSpeakerSwitch')}
+            help={tr('botDefaults.triggerUserAuthAllowSpeakerSwitchHelp')}
+            onChange={checked => saveWith({ allowSpeakerSwitch: checked })}
+          />
+          {info?.crossPrincipalIsolation === true ? (
+            <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
+          ) : null}
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
+          {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (
@@ -5993,6 +6023,9 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
+  const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
+  const [recap, setRecap] = useState(bot.replyCardRecap === true);
+  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6010,10 +6043,13 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setGoalStatusCard(bot.goalStatusCard === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
+    setNextStep(bot.replyCardNextStep === true);
+    setRecap(bot.replyCardRecap === true);
+    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6291,6 +6327,45 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = replyActions;
                 setReplyActions(checked);
                 void savePatch({ replyCardActions: checked }, 'reply-actions', () => setReplyActions(previous));
+              }}
+            />
+            <ToggleRow
+              checked={nextStep}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-next-step"
+              title={tr('botDefaults.replyCardNextStep')}
+              description={tr('botDefaults.replyCardNextStepDescription')}
+              help={tr('botDefaults.replyCardNextStepHelp')}
+              onChange={checked => {
+                const previous = nextStep;
+                setNextStep(checked);
+                void savePatch({ replyCardNextStep: checked }, 'reply-next-step', () => setNextStep(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recap}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-recap"
+              title={tr('botDefaults.replyCardRecap')}
+              description={tr('botDefaults.replyCardRecapDescription')}
+              help={tr('botDefaults.replyCardRecapHelp')}
+              onChange={checked => {
+                const previous = recap;
+                setRecap(checked);
+                void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recapModel}
+              disabled={busy !== null || !recap}
+              dataAction="toggle-reply-card-recap-model"
+              title={tr('botDefaults.replyCardRecapModel')}
+              description={tr('botDefaults.replyCardRecapModelDescription')}
+              help={tr('botDefaults.replyCardRecapModelHelp')}
+              onChange={checked => {
+                const previous = recapModel;
+                setRecapModel(checked);
+                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>
@@ -9069,6 +9144,50 @@ function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
         onSave={save}
       />
       <StatusSpan status={status} attr={{ 'data-prompt-cache-status': '' }} />
+    </section>
+  );
+}
+
+function ProviderRecoverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [globals, setGlobals] = useState<{ providerRecovery: ProviderRecoveryConfig | null; promptCache: PromptCacheConfig | null }>(
+    { providerRecovery: null, promptCache: null });
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchGlobalProviderRecovery().then(value => { if (alive) setGlobals(value); });
+    return () => { alive = false; };
+  }, []);
+
+  async function save(value: ProviderRecoveryConfig | null): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/provider-recovery`, { providerRecovery: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = body.providerRecovery && typeof body.providerRecovery === 'object'
+          ? body.providerRecovery as ProviderRecoveryConfig : null;
+        props.patchBot(props.bot.larkAppId, { providerRecovery: next });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionProviderRecovery')}</h3>
+      <small className="bd-section-note">{tr('botDefaults.providerRecoveryNote')}</small>
+      <ProviderRecoveryEditor
+        scope="bot"
+        value={props.bot.providerRecovery ?? null}
+        globalValue={globals.providerRecovery}
+        promptCacheTtl={resolvePromptCachePolicy(globals.promptCache ?? undefined, props.bot.promptCache ?? undefined).ttl}
+        disabled={busy}
+        onSave={save}
+      />
+      <StatusSpan status={status} attr={{ 'data-provider-recovery-status': '' }} />
     </section>
   );
 }

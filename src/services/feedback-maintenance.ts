@@ -98,7 +98,7 @@ export function startFeedbackMaintenanceParticipant(
           // Lazy import keeps `pg` out of the daemon/send module-load graph.
           const { closeFeedbackStorage, getFeedbackStorage } = await import('./feedback-storage.js');
           await closeFeedbackStorage(dataDir);
-          if (config.active.backend === 'postgresql') await getFeedbackStorage(dataDir);
+          if (config.generation !== maintenance.generation && config.active.backend !== 'sqlite') await getFeedbackStorage(dataDir);
           ready = true;
         }
       } else if (stoppedOutbox) {
@@ -192,7 +192,7 @@ export async function freezeFeedbackSource(dataDir: string, migrationId: string)
     }
     const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
     if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
-    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations', 'feedback_event_stream']);
+    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations', 'feedback_event_stream', 'feedback_event_stream_counter']);
     const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
     if (tables.some(table => !known.has(table.name))) throw new Error('feedback_source_schema_unsupported');
     if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_restorations'").get()
@@ -263,4 +263,12 @@ export async function releaseFeedbackMaintenance(dataDir: string, migrationId: s
     throw new Error('feedback_maintenance_generation_pending');
   }
   withFileLockSync(controlPath(dataDir), () => writeControl(dataDir, { ...report, generation, state: 'complete' }));
+}
+
+export function cancelFeedbackMaintenance(dataDir: string, migrationId: string, generation: number): void {
+  withFileLockSync(controlPath(dataDir), () => {
+    const control = readControl(dataDir);
+    if (!control || control.migrationId !== migrationId || control.generation !== generation) throw new Error('feedback_migration_identity_conflict');
+    writeControl(dataDir, { ...control, state: 'complete' });
+  });
 }

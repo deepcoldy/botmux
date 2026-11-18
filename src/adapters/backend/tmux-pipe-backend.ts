@@ -152,6 +152,14 @@ export interface PipePaneDeathEvidence {
 
 const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
 const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+/** History lines read above the visible screen for the post-mortem. When the
+ *  pane dies, tmux writes its remain-on-exit banner ("Pane is dead (status N,
+ *  …)") on the bottom row with a linefeed, scrolling the whole screen up one
+ *  line. A CLI that died at startup usually printed a single line at the top —
+ *  exactly the line that scrolls into history — so a visible-only capture
+ *  kept tmux's banner and lost the reason (#3470). The tail cap still bounds
+ *  what is reported. */
+const PANE_DEATH_SCREEN_HISTORY_LINES = 50;
 
 /** After #{pane_dead} flips, #{pane_dead_status} is populated a beat later
  *  (`1:` → `1:77` observed on tmux 3.3a; the gap widens under a loaded server).
@@ -317,7 +325,11 @@ export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDea
  *  pane tmux has not reaped yet reads as status-less; its exit code then comes
  *  from the kernel, as on the teardown path (#2453), so the message does not
  *  call a plain non-zero exit a possible signal death. */
-function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly string[]): PipePaneDeathEvidence {
+function collectPipePaneDeathEvidence(
+  paneTarget: string,
+  socketArgs: readonly string[],
+  includeHistory: boolean,
+): PipePaneDeathEvidence {
   let paneDead = false;
   let paneDeadStatus: string | null = null;
   try {
@@ -339,11 +351,14 @@ function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly s
     return { paneDead: false, paneDeadStatus: null, lastScreen: null };
   }
   let lastScreen: string | null = null;
+  // History is fresh-create-only: reattach/adopt targets may be long-lived user
+  // panes whose off-screen commands and output must not enter the chat error.
+  const historyArgs = includeHistory ? ['-S', `-${PANE_DEATH_SCREEN_HISTORY_LINES}`] : [];
   try {
     const out = String(
       execFileSync(
         'tmux',
-        [...socketArgs, 'capture-pane', '-p', '-t', paneTarget],
+        [...socketArgs, 'capture-pane', '-p', ...historyArgs, '-t', paneTarget],
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
       ) ?? '',
     );
@@ -943,7 +958,7 @@ export class TmuxPipeBackend implements SessionBackend {
           if (!this.createSession) {
             this.fireExit(1, null);
           }
-          const evidence = collectPipePaneDeathEvidence(this.paneTarget, this.tmuxArgs);
+          const evidence = collectPipePaneDeathEvidence(this.paneTarget, this.tmuxArgs, this.createSession);
           throw evidence.paneDead ? buildPipePaneStartupError(err, evidence) : err;
         }
         const detail = (err?.stderr?.toString?.() ?? '').trim() || err?.message || String(err);

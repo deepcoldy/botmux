@@ -18,6 +18,7 @@ import type { ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolveNodeExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
 import { killProcessTree } from './helpers/process-tree.js';
+import { standaloneSleep } from './helpers/standalone-sleep.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -27,6 +28,11 @@ const PROMPT = 'lazy-rollout-task';
 /** Slack for one load-dependent step; deterministic sleeps are added on top. */
 const WAIT_MS = 15_000;
 const SLOW_LAUNCH_MS = 8_000;
+
+// The startup probe is a sleep renamed to `codex`; uutils' multicall /bin/sleep
+// (e.g. Ubuntu 26.04) refuses to run under that name.
+const sleepBin = standaloneSleep();
+if (!sleepBin.path) console.warn(`[codex-lazy-rollout] startup-probe case will SKIP: ${sleepBin.reason}`);
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -126,7 +132,7 @@ setInterval(() => {}, 1000);
     // resolver. A renamed sleep keeps its real argv and OS comm without a C
     // compiler; explicit debug/version filtering is covered separately.
     const probe = join(root, 'codex');
-    copyFileSync('/bin/sleep', probe);
+    copyFileSync(sleepBin.path!, probe);
     cliPath = join(root, 'launcher');
     writeFileSync(cliPath, `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -281,7 +287,7 @@ describe('Codex history match that lands before the lazily-created rollout', () 
     // runner's timeout fires first and hides which step was slow.
   }, 4 * WAIT_MS + SLOW_LAUNCH_MS);
 
-  it.skipIf(process.platform !== 'linux')('recovers a retired startup probe and collects both turns exactly once', async () => {
+  it.skipIf(process.platform !== 'linux' || !sleepBin.path)('recovers a retired startup probe and collects both turns exactly once', async () => {
     const run = await startWorker(OWN_SID, { startupProbe: true });
     await run.waitFor('the turn reply', () => run.finals().some(m => m.turnId === 'om_lazy'));
     expect(run.finals().filter(m => m.turnId === 'om_lazy')).toEqual([

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { workerTestModules, useWorkerTestModulesCleanup } from './helpers/worker-test-modules.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
@@ -26,11 +26,12 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'provisional-thread-start';
 
+useWorkerTestModulesCleanup();
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'provisional-thread-start'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
@@ -41,6 +42,7 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
 }
 
 async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise<void> {
+  const modules = workerTestModules({ forceSource: !!process.env.BOTMUX_TEST_WORKER_BINARY });
   const root = mkdtempSync('/tmp/bmx-traex-startup-');
   const sessionId = randomUUID();
   const nativeId = randomUUID();
@@ -59,9 +61,12 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   const captureStarted = join(root, 'capture-started');
   const captureReleased = join(root, 'capture-released');
   const idleHeld = join(root, 'idle-held');
+  const startupVetoed = join(root, 'startup-vetoed');
+  const threadReady = join(root, 'thread-ready');
   const fakeCli = join(root, 'traex');
   const nativeViewport = mode.startsWith('native-viewport');
   const heldIdle = mode === 'resumed-repository-notice-held-idle';
+  const provisionalThread = mode === 'provisional-thread-start';
   let nextFrame = 0;
   function paint(rows: string[]): number {
     const id = ++nextFrame;
@@ -90,7 +95,7 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     : mode === 'loaded-banner'
       ? ['│ model: GPT-6-Astra xhigh /model to change │', '│ directory: /tmp/loading │',
         ...COMPOSER.map(row => row.replace(' · ~ · ', ' · /tmp/loading · '))]
-      : mode === 'shortcut-only-footer'
+      : mode === 'shortcut-only-footer' || provisionalThread
         // TraeX 0.214.1 cold start: empty composer plus a bare shortcut hint,
         // with no model/context footer until the model list fetch resolves.
         ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '  permissions: YOLO mode',
@@ -139,7 +144,7 @@ fs.writeSync(fd, JSON.stringify({type:'session_meta', payload:{id:${JSON.stringi
 fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
 process.stdin.setRawMode(true);
 process.stdout.write('\\x1b[?2004h');
-let lastFrame = 0, input = '', receipt = false, text = '';
+let lastFrame = 0, input = '', receipt = false, text = '', reportedReady = false;
 function paint() {
   const frame = JSON.parse(fs.readFileSync(${JSON.stringify(frameFile)}, 'utf8'));
   if (frame.id === lastFrame) return;
@@ -157,6 +162,12 @@ paint();
 // tmux pipe-pane may subscribe after the first draw. Repaint during boot;
 // after 900ms the fixture stays silent, so later redraws cannot rescue readySeen.
 for (const delay of [200, 500, 900]) setTimeout(() => { lastFrame = 0; paint(); }, delay);
+// A standalone worker cannot import the source observer below. Its fixture
+// instead completes a native initialization stage after the quiescence window;
+// the parent observes that event or early bytes, then releases thread readiness.
+if (${JSON.stringify(provisionalThread && !!process.env.BOTMUX_TEST_WORKER_BINARY)}) {
+  setTimeout(() => fs.writeFileSync(${JSON.stringify(startupVetoed)}, 'initialization stage completed'), 10_000);
+}
 process.stdin.on('data', chunk => {
   fs.appendFileSync(${JSON.stringify(inputFile)}, chunk);
   input += chunk.toString();
@@ -165,6 +176,10 @@ process.stdin.on('data', chunk => {
 });
 setInterval(() => {
   paint();
+  if (${JSON.stringify(provisionalThread)} && !reportedReady && fs.existsSync(${JSON.stringify(threadReady)})) {
+    reportedReady = true;
+    process.stdout.write('\\x1b]7501;state=idle:app=traex\\x07');
+  }
   if (!receipt && text && fs.existsSync(${JSON.stringify(confirmFile)})) {
     receipt = true;
     fs.appendFileSync(${JSON.stringify(history)}, JSON.stringify({session_id:${JSON.stringify(nativeId)}, text, ts:Date.now()/1000})+'\\n');
@@ -177,14 +192,32 @@ setInterval(() => {
     HOME: root, ...(mode === 'per-bot-home' ? {} : { TRAE_HOME: traeHome }), SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
     CLI_EXTRA_ARGS: '', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test',
   });
+  // Keep the inherited test fences, not the invoking bot's plugin/identity/
+  // wrapper capabilities. The fixture owns only its disposable native home.
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_SESSION_ID'
+      && key !== 'BOTMUX_FENCED_RUN' && !key.includes('TEST') && !key.includes('FENCE')) delete env[key];
+  }
+  env.BOTMUX_WRAPPER_BIN = join(root, 'wrapper-bin');
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
-  let workerScript = resolve('src/worker.ts');
-  if (nativeViewport || heldIdle) {
-    workerScript = join(root, 'worker-native-viewport.ts');
+  let workerScript = join(root, `worker-bootstrap.${modules.scriptExtension}`);
+  const preload = `
+await import(${JSON.stringify(modules.path('worker-ipc-preload.ts'))});
+`;
+  writeFileSync(workerScript, `
+(async () => {
+${preload}
+await import(${JSON.stringify(modules.path('worker.ts'))});
+process.send?.({ type: 'worker_ipc_ready' });
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`);
+  if (nativeViewport || heldIdle || provisionalThread) {
+    workerScript = join(root, `worker-native-viewport.${modules.scriptExtension}`);
     writeFileSync(workerScript, `
 (async () => {
-const { TmuxPipeBackend } = await import(${JSON.stringify(resolve('src/adapters/backend/tmux-pipe-backend.ts'))});
+${preload}
+const { TmuxPipeBackend } = await import(${JSON.stringify(modules.path('adapters/backend/tmux-pipe-backend.ts'))});
 const originalOnData = TmuxPipeBackend.prototype.onData;
 TmuxPipeBackend.prototype.onData = function (callback) {
   let pending = '', dropping = false;
@@ -210,8 +243,27 @@ TmuxPipeBackend.prototype.onData = function (callback) {
   });
 };
 const fs = await import('node:fs');
+if (${JSON.stringify(provisionalThread)}) {
+  const { IdleDetector } = await import(${JSON.stringify(modules.path('utils/idle-detector.ts'))});
+  const originalOnIdle = IdleDetector.prototype.onIdle;
+  const originalReset = IdleDetector.prototype.reset;
+  let idleEdgeObserved = false;
+  IdleDetector.prototype.onIdle = function (callback) {
+    return originalOnIdle.call(this, source => {
+      idleEdgeObserved = true;
+      return callback(source);
+    });
+  };
+  IdleDetector.prototype.reset = function (options) {
+    // Observe the real callback's veto, not log text or a fixed sleep. Removing
+    // the guard instead produces actual input bytes and makes the test fail.
+    if (idleEdgeObserved && !options?.inputCycle) fs.writeFileSync(${JSON.stringify(startupVetoed)}, 'veto');
+    idleEdgeObserved = false;
+    return originalReset.call(this, options);
+  };
+}
 if (${JSON.stringify(heldIdle)}) {
-  const { IdleDetector } = await import(${JSON.stringify(resolve('src/utils/idle-detector.ts'))});
+  const { IdleDetector } = await import(${JSON.stringify(modules.path('utils/idle-detector.ts'))});
   const originalOnIdle = IdleDetector.prototype.onIdle;
   IdleDetector.prototype.onIdle = function (callback) {
     let held = false;
@@ -242,7 +294,8 @@ TmuxPipeBackend.prototype.captureViewportAsync = async function () {
   }
   return screen;
 };
-await import(${JSON.stringify(resolve('src/worker.ts'))});
+await import(${JSON.stringify(modules.path('worker.ts'))});
+process.send?.({ type: 'worker_ipc_ready' });
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `);
   }
@@ -255,16 +308,28 @@ await import(${JSON.stringify(resolve('src/worker.ts'))});
     }
   }
   try {
-    const options = { cwd: resolve('.'), env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any };
+    const options = { cwd: resolve('.'), env, serialization: 'json' as const, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
       ? spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], options)
-      : spawnNodeTsScript(workerScript, [], options);
+      : modules.spawn(workerScript, [], options);
     child.on('message', message => messages.push(message as WorkerToDaemon));
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    // Source fixtures ACK after the full handler is installed, so cold tsx
+    // imports do not consume the CLI's first-frame window. Standalone mode
+    // uses its real preload ACK; only its harmless bootstrap probes repeat.
+    const bootstrapDeadline = Date.now() + 30_000;
+    while (!messages.some(message => message.type === 'worker_ipc_ready')) {
+      if (Date.now() >= bootstrapDeadline || child.exitCode != null) throw new Error(`worker IPC bootstrap\n${logs.join('')}`);
+      if (process.env.BOTMUX_TEST_WORKER_BINARY) {
+        child.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
+      }
+      await new Promise(resolveWait => setTimeout(resolveWait, 50));
+    }
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
       workingDir: dataDir, cliId: 'traex', cliPathOverride: fakeCli, backendType,
+      ...(provisionalThread ? { cliVersion: '0.214.1' } : {}),
       ...(mode === 'resume' || mode === 'session-lock' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
       ...(mode === 'per-bot-home' ? { env: { TRAE_HOME: traeHome } } : {}),
       prompt: 'only-this-traex-startup-input', turnId: 'om_first',
@@ -272,6 +337,15 @@ await import(${JSON.stringify(resolve('src/worker.ts'))});
       larkAppId: 'app_test', larkAppSecret: 'test',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(seenFile), 'first frame', mode === 'session-lock' ? 60_000 : 12_000);
+    if (provisionalThread) {
+      await waitFor(() => existsSync(startupVetoed) || existsSync(inputFile)
+        || messages.some(message => message.type === 'prompt_ready'), 'startup admission attempted');
+      expect(existsSync(inputFile), logs.join('')).toBe(false);
+      expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+      // Thread initialization completes independently of the already visible
+      // hint-only composer. Its native idle must re-drive the first admission.
+      writeFileSync(threadReady, 'ready');
+    }
     if (mode === 'session-lock') {
       await waitFor(() => messages.some(message => message.type === 'stuck_warning'
         && message.reason === 'input_held' && message.matchedPattern === 'session lock'),

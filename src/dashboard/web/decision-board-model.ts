@@ -564,9 +564,20 @@ export function orderSubmitCandidates(candidates: readonly SubmitCandidate[], fi
   });
 }
 
-/** 提交请求的 items：去掉取消勾选（继续留作草稿）的项，每项带确认框看到的草稿版本。 */
+/**
+ * 已完成 / 已关闭的事项不再收决定：服务端拒绝给它存草稿、拒绝提交它的草稿。管家改状态时不清草稿，
+ * 所以这类事项上可能还留着一份草稿——页面上只能清空，不能再提交。
+ */
+export function isBoardItemEnded(state: BoardState): boolean {
+  return state === 'done' || state === 'closed';
+}
+
+/**
+ * 提交请求的 items：去掉取消勾选（继续留作草稿）的项和已结束的项（带上它服务端会拒掉整批），
+ * 每项带确认框看到的草稿版本。
+ */
 export function submitPayloadItems(candidates: readonly SubmitCandidate[], excluded: ReadonlySet<number>): Array<{ seq: number; draftUpdatedAt: number }> {
-  return candidates.filter(c => !excluded.has(c.seq)).map(c => ({ seq: c.seq, draftUpdatedAt: c.draftUpdatedAt }));
+  return candidates.filter(c => !excluded.has(c.seq) && !isBoardItemEnded(c.state)).map(c => ({ seq: c.seq, draftUpdatedAt: c.draftUpdatedAt }));
 }
 
 export function textPreview(text: string, max = 80): string {

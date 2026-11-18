@@ -5,13 +5,8 @@
  *
  *   1. **Default off, and off means absent.** A bot without the field takes no
  *      part in credential resolution at all.
- *   2. **No "borrow another person's login" setting exists.** The fallback
- *      accepts only "the bot's own identity" or "fail" — asking for the machine
- *      login is refused with a message saying so, not silently normalized.
- *
- * Plus the asymmetry between the two CLIs: `bytedcli` has no non-human
- * identity, so for it "unauthorized" always means the call cannot run, even
- * when the configured fallback says `bot-identity`.
+ *   2. **No "borrow another person's login" setting exists.** The legacy
+ *      `fallback` field is parsed and ignored; nothing asks for a machine login.
  *
  * Run:  npx vitest run --project unit test/trigger-user-auth.test.ts
  */
@@ -35,7 +30,6 @@ describe('parseTriggerUserAuthConfig', () => {
       enabled: false,
       credentialSource: 'auto',
       tools: [...TRIGGER_USER_AUTH_TOOLS],
-      fallback: 'bot-identity',
     });
   });
 
@@ -53,26 +47,30 @@ describe('parseTriggerUserAuthConfig', () => {
       .toEqual(['bytedcli']);
   });
 
-  it('defaults the fallback to the bot\'s own identity', () => {
-    expect(parseTriggerUserAuthConfig({ enabled: true })?.fallback).toBe('bot-identity');
-  });
-
-  it('accepts fallback: none', () => {
-    expect(parseTriggerUserAuthConfig({ enabled: true, fallback: 'none' })?.fallback).toBe('none');
-  });
-
-  // The whole point of the feature is to stop using someone else's login, so
-  // there must be no config value that asks for it — and the refusal has to say
-  // why, or an operator will read it as a typo and keep trying.
-  it('refuses a machine-login fallback and explains that it never exists', () => {
-    for (const asked of ['device', 'machine', 'runtime', 'device-identity']) {
-      let thrown: Error | undefined;
-      try { parseTriggerUserAuthConfig({ enabled: true, fallback: asked }); }
-      catch (e) { thrown = e as Error; }
-      expect(thrown).toBeInstanceOf(TriggerUserAuthConfigError);
-      expect(thrown!.message).toContain(asked);
-      expect(thrown!.message).toContain('never available');
+  it('parses a legacy fallback without error and ignores it', () => {
+    for (const fallback of ['bot-identity', 'none', 'device', 42]) {
+      const config = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], fallback });
+      expect(config).not.toHaveProperty('fallback');
+      expect(config?.tools).toEqual(['bytedcli']);
     }
+  });
+
+  it('leaves `capabilities` unset for a tools-only config', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }))
+      .not.toHaveProperty('capabilities');
+  });
+
+  it('`capabilities` overrides `tools`, which then follows the capabilities', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], capabilities: ['meego', 'meego'] }))
+      .toMatchObject({ capabilities: ['meego'], tools: ['bytedcli'] });
+    expect(parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user', 'bytecloud'] }))
+      .toMatchObject({ capabilities: ['lark-user', 'bytecloud'], tools: ['lark-cli', 'bytedcli'] });
+    expect(parseTriggerUserAuthConfig({ enabled: true, capabilities: [] })).toMatchObject({ capabilities: [], tools: [] });
+  });
+
+  it('rejects unknown or mistyped capabilities by name', () => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user', 'bits'] })).toThrow(/bits/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, capabilities: 'meego' })).toThrow(/capabilities/);
   });
 
   // A typo'd tool name must not leave the operator believing a boundary is

@@ -4,6 +4,7 @@ import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
 import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
+import { turnAnswersInChat } from './failed-turn-rewind.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
@@ -99,7 +100,7 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string },
+  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -118,6 +119,9 @@ export function recordFailedTurnTerminal(
     originalTurnId: ds.session.failedTurnRecovery?.turnId === terminal.turnId
       ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId,
   });
+  // Where its answer was to go is known only now (HTTP and suppression state
+  // is dropped once the terminal settles): freeze it for the rewind decision.
+  if (record?.directFailure && !context.silent && turnAnswersInChat(ds, terminal.turnId)) record.answersInChat = true;
   if (record) { ds.session.lastFailedTurn = record; store.updateSession(ds.session); }
 }
 

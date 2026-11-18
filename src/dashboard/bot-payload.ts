@@ -8,7 +8,7 @@ import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
-import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, capabilitiesOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
@@ -85,7 +85,16 @@ export function brandMapByAppId(
  * builds every bot row, so one bad policy must not take the whole page down.
  */
 function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig | null {
-  try { return parseTriggerUserAuthConfig(raw); } catch { return null; }
+  try {
+    const parsed = parseTriggerUserAuthConfig(raw);
+    // The page edits capabilities, whichever form the config was stored in; `legacyCapabilities`
+    // says they were derived from `tools`, so the page does not describe them as an explicit choice.
+    return parsed && {
+      ...parsed,
+      capabilities: parsed.capabilities ?? [...capabilitiesOf({ ...parsed, enabled: true })],
+      ...(parsed.capabilities ? {} : { legacyCapabilities: true }),
+    };
+  } catch { return null; }
 }
 
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
@@ -232,6 +241,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     goalStatusCard: j?.goalStatusCard === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
+    replyCardNextStep: j?.replyCardNextStep === true,
+    replyCardRecap: j?.replyCardRecap === true,
+    replyCardRecapModel: j?.replyCardRecapModel === true,
     cotEnabled: normalizeCotEnabled(j),
     replyCardShowTools: j?.replyCardShowTools !== false,
     replyCardNativeCot: j?.replyCardNativeCot === true,
@@ -271,6 +283,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
+    providerRecovery: j?.providerRecovery && typeof j.providerRecovery === 'object' ? j.providerRecovery : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,

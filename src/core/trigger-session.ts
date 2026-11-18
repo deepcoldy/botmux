@@ -18,6 +18,7 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
+import { excludedTurnActivityAt } from './turn-outcome.js';
 import {
   closeSessionForBackgroundCleanup,
   forkWorker,
@@ -194,6 +195,20 @@ export function isTrustedPayloadRequest(req: TriggerRequest): boolean {
 export function trustedPayloadSessionInScope(requestChatId: string | undefined, sessionChatId: string): boolean {
   if (requestChatId) return sessionChatId === requestChatId;
   return sessionChatId.startsWith('http_async_') || sessionChatId.startsWith('http_wait_');
+}
+
+/** Zero-injection prompt of an external trigger: the caller's instruction,
+ *  then the event data as-is. An event without data (no rawText, payload
+ *  absent or `{}`) sends the instruction alone — rendering the missing payload
+ *  as `{}` put a stray "{}" line under every bare "继续" a connector sent. A
+ *  request with neither still renders its (empty) payload, as before: an empty
+ *  input is not a turn the CLI would start. */
+export function buildZeroInjectionTriggerPrompt(req: Pick<TriggerRequest, 'instruction' | 'envelope'>): string {
+  const { rawText, payload } = req.envelope;
+  const emptyPayload = payload === undefined || payload === null
+    || (typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0);
+  const data = rawText ?? (emptyPayload ? undefined : JSON.stringify(payload));
+  return [req.instruction, data].filter(Boolean).join('\n\n') || JSON.stringify(payload ?? {});
 }
 
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
@@ -734,6 +749,7 @@ function waitForSessionFinalOutput(
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      createdAt: Date.now(),
       resolve: (text: string) => {
         clearTimeout(timer);
         ds.pendingWaitPromises?.delete(triggerId);
@@ -1009,7 +1025,7 @@ async function triggerSessionTurnAdmitted(
   const dryRun = !!req.options?.dryRun;
   const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
-    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
@@ -1408,7 +1424,12 @@ async function triggerSessionTurnAdmitted(
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
     const recordAcceptedInput = (): void => {
-      markSessionActivity(target);
+      // Registration and accepted-input publication can cross a millisecond
+      // boundary. Reuse the exact per-turn timestamp that the excluded-terminal
+      // hold will read, so this round cannot stay pending behind its own later
+      // wall-clock acceptance time. Never take max(lastMessageAt): a subsequent
+      // human input owns that later timestamp.
+      markSessionActivity(target, excludedTurnActivityAt(target, triggerId) ?? Date.now());
       rememberInput(target, prompt, content);
     };
 

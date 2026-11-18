@@ -12,7 +12,7 @@ The backend version selection is independent of production credentials and schem
 
 ## Configure
 
-On a new interactive `botmux start`, select SQLite or PostgreSQL. Existing installations continue without a prompt. PostgreSQL accepts a JSON configuration file containing a credential reference:
+On a new interactive `botmux start`, select SQLite, PostgreSQL or Supabase. Existing installations continue without a prompt. PostgreSQL accepts a JSON configuration file containing a credential reference:
 
 ### Username and password
 
@@ -103,6 +103,12 @@ Candidate settings do not change the active backend. `BOTMUX_FEEDBACK_CONFIG_FIL
 For a verified empty installation, run `botmux feedback storage enable-empty --yes`. Existing rows require migration. Empty initialization uses the same fenced cutover machinery.
 
 ## Migrate existing feedback
+
+Supabase uses the official `@supabase/supabase-js` SDK and an installation-bound
+transactional RPC, rather than a PostgreSQL connection string. SQLite and
+PostgreSQL sources can migrate to it. See [Supabase migration](feedback-supabase-migration.md)
+for candidate configuration, SQL bootstrap, maintenance, verification and recovery.
+Generating the bootstrap SQL does not execute it or switch the active backend.
 
 Webhook claims persist a request-stage marker in existing outbox error metadata.
 A claim abandoned before request admission can be recovered as known-unsent,

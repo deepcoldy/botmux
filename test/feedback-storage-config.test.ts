@@ -31,6 +31,79 @@ afterEach(async () => {
   delete process.env.BOTMUX_TEST_PG_PASSWORD;
 });
 describe('feedback storage configuration', () => {
+  it('saves a Supabase candidate with private key references without changing the active store', async () => {
+    const path = await directory();
+    const current = await readFeedbackStorageConfig(path);
+    const candidate = {
+      backend: 'supabase' as const,
+      supabase: { url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'botmux_feedback', requestTimeoutMs: 5000 },
+    };
+    const saved = await saveFeedbackStorageCandidate(path, current.generation, candidate);
+    expect(saved.active).toEqual({ backend: 'sqlite' });
+    expect(saved.candidate).toEqual(candidate);
+    expect((await getFeedbackStorage(path)).store).toBeDefined();
+  });
+  it('does not reuse a saved Supabase key when the target origin changes', async () => {
+    const path = await directory();
+    const { configureFeedbackStorageCandidate } = await import('../src/services/feedback-storage-management.js');
+    const candidate = { backend: 'supabase' as const, supabase: {
+      url: 'https://first.supabase.co', keyRef: '', schema: 'feedback', requestTimeoutMs: 5000,
+    } };
+    const current = await readFeedbackStorageConfig(path);
+    const saved = await configureFeedbackStorageCandidate(path, { expectedGeneration: current.generation, candidate, supabaseKey: 'sb_secret_first' });
+    await expect(configureFeedbackStorageCandidate(path, {
+      expectedGeneration: saved.generation, candidate: { ...candidate, supabase: { ...candidate.supabase, url: 'https://second.supabase.co' } },
+    })).rejects.toThrow('feedback_supabase_key_required');
+    expect(await readFeedbackStorageConfig(path)).toEqual(saved);
+  });
+  it('does not report a stale Supabase connection test as success after configuration changes', async () => {
+    const path = await directory();
+    const { configureFeedbackStorageCandidate, testFeedbackStorageConnection } = await import('../src/services/feedback-storage-management.js');
+    const current = await readFeedbackStorageConfig(path);
+    const saved = await configureFeedbackStorageCandidate(path, {
+      expectedGeneration: current.generation, supabaseKey: 'sb_secret_test_key',
+      candidate: { backend: 'supabase', supabase: { url: 'https://example.supabase.co', schema: 'feedback', keyRef: '', requestTimeoutMs: 5000 } },
+    });
+    const originalFetch = globalThis.fetch;
+    let release!: () => void;
+    let entered!: () => void;
+    const requested = new Promise<void>(resolve => { entered = resolve; });
+    globalThis.fetch = async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      return new Response(JSON.stringify({ version: 1, result: { version: 1, instance_id: current.instanceId, state: 'empty' } }), { headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const pending = testFeedbackStorageConnection(path).then(() => 'success', error => error.message);
+      await requested;
+      await saveFeedbackStorageCandidate(path, saved.generation, { backend: 'sqlite' });
+      release();
+      expect(await pending).toBe('feedback_storage_generation_conflict');
+    } finally { globalThis.fetch = originalFetch; }
+  });
+  it('blocks candidate changes while a migration owns the shared cutover slot', async () => {
+    const path = await directory();
+    const current = await readFeedbackStorageConfig(path);
+    const saved = await saveFeedbackStorageCandidate(path, current.generation, { backend: 'supabase', supabase: {
+      url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000,
+    } });
+    const { prepareSupabaseFeedbackMigration } = await import('../src/services/feedback-supabase-migration.js');
+    await prepareSupabaseFeedbackMigration(path, { requestId: 'owns-cutover', expectedGeneration: saved.generation, maintenanceConfirmed: true });
+    await expect(saveFeedbackStorageCandidate(path, saved.generation, target)).rejects.toThrow('feedback_migration_conflict');
+    expect(await readFeedbackStorageConfig(path)).toEqual(saved);
+  });
+  it.each([
+    { url: 'not-a-url', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'http://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'https://user:password@example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'https://example.supabase.co', keyRef: 'exposed-key', schema: 'feedback', requestTimeoutMs: 5000 },
+    { url: 'https://example.supabase.co', keyRef: 'env:SUPABASE_KEY', schema: 'public', requestTimeoutMs: 5000 },
+  ])('rejects unsafe Supabase connection configuration without switching storage', async supabase => {
+    const path = await directory();
+    const current = await readFeedbackStorageConfig(path);
+    await expect(saveFeedbackStorageCandidate(path, current.generation, { backend: 'supabase', supabase })).rejects.toThrow('feedback_storage_target_invalid');
+    expect(await readFeedbackStorageConfig(path)).toEqual(current);
+  });
   it('keeps captured stores live when only the candidate configuration changes', async () => {
     const path = await directory();
     const first = await getFeedbackStorage(path);

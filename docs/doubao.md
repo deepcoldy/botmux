@@ -88,9 +88,15 @@ botmux restart
 
 最终文本自动来自 Doubao 的本地原生日志：`assignment.md` 中的用户需求与 `trajectory.jsonl` 中的终态 assistant 回答。工具结果和带 `tool_calls` 的中间旁白不当作最终回答。**不要求模型执行 `botmux send` 才能收到结果**，HTTP wait 模式也通过同一 bridge 返回 `output.content`。
 
+运行中的工具调用和工具结果会接入 Botmux 现有的执行过程展示，例如读取文件、搜索代码、执行命令。更新以原生日志落盘为准；这些进度事件不会提前结束任务或替代最终回复，也不读取模型的私有推理字段。
+
+要在普通回复卡片内直接显示工具执行过程，可为 Doubao Bot 配置 `replyCardMode: "unified"`，并保持 `cotEnabled` 与 `replyCardShowTools` 开启。`legacy` 模式沿用飞书原生进度气泡；仅收到气泡创建成功的回执，不代表客户端已经展示工具明细。
+
 Doubao Bot 的 `replyDelivery` 缺省为 `transcript`（其它 CLI 缺省仍是 `send`）：系统提示不教模型调用 `botmux send`，最终回复只从上述日志收取。原因是 Doubao 的工具命令由账号级常驻进程 `doubao --type=service` 执行，同一台机器上所有 Doubao 终端共用它；该进程的环境变量和进程树沿用**第一个**拉起它的终端。模型在工具里执行 `botmux send` 时，botmux 会按那棵进程树判断归属，可能把回复投到另一个会话、另一个群，甚至以另一个 Bot 的身份发出。不建议显式改回 `send`；确有需要时，请保证这台机器上只有一个 Doubao 会话，并在切换后重启常驻进程。
 
 首轮的原生 Session ID 在提交后最多等待 20 秒捕获（常驻进程冷启动时，`assignment.md` 要 7～8 秒才写入）。
+
+最终回复里的独立 `RichMediaCard` / `MediaCard` 图片引用和 Markdown 图片，会在本机非隔离会话中自动上传并展示。支持项目工作区内图片、当前用户拥有的系统临时目录截图，以及由精确原生 Session ID 唯一定位的账户产物目录 `agent_mode/<account>/workspace` 内图片。该产物目录是账户级范围，包含同账户其他会话的产物，并非单个 session 的隔离边界；Session ID 缺失、无匹配或跨账户匹配不唯一时不启用此目录。每轮最多 16 张、单张不超过 8 MiB；代码示例不会作为图片上传。远程后端、沙箱、readIsolation 和 apiOnly 会话不读取宿主图片；文件不存在、超限或上传失败时保留文字回退，发送重试复用已上传的图片。
 
 沙箱组合：oncall（`sandbox: true` 或 `"oncall"`，含 legacy readIsolation）下 Doubao 的 `~/.local/share/doubao_cli` 以目录级 bind 挂到真实宿主路径，转写桥正常工作，缺省 transcript 不受影响。全根 COW 的 `sandbox: "scratch"` 会把整个容器根挂成 merged overlay 且不应用 authPaths，Doubao 写入的会话树宿主侧桥读不到，首轮 ID 捕获与转写回收都会落空——此组合下 `replyDelivery` 自动回落 `send`（Dashboard 显示不支持 transcript，显式写 `transcript` 会被拒绝），即回到模型自己 `botmux send` 的旧行为，因此仍带有上文的共享常驻进程串号风险；多 Bot 共用机器上不建议让 Doubao 跑 scratch。`promptInjection: none`（零注入）在 scratch 下会被直接拒绝（它强制 transcript，没有 send 退路）。
 
@@ -154,7 +160,7 @@ JSON
 - **模型启动报错**：在原生 `/model` 确认可用显示名；移除 `model` 验证默认模型。自动模型探测失败时可能退回静态候选，候选不代表账号一定有权限。
 - **终端答完但 HTTP 没结果**：检查是不是旧 Botmux 构建，原生日志是否可读、Session ID 是否捕获、CLI 是否改变了落盘格式。不要通过手工改写日志来伪造完成。
 - **无法恢复**：核对账号、原生记录与 ID；换机器/换 HOME/删记录后不保证恢复。新建会话比猜测其他会话 ID 更安全。
-- **思考等级**：适配器内部接受 `low/medium/high/xhigh/max`，但当前 Bot 配置加载和 `/effort` 能力登记未开放 Doubao；不要依赖 `bots.json.reasoningEffort` 生效。`ultra` 无映射，原生 `none/minimal` 也未暴露为 Bot 配置选项。
+- **思考等级**：Bot 默认思考强度（Dashboard「Agent 配置」或 `bots.json.reasoningEffort`）和话题指令头 `/t /effort <档位>` 支持 `low/medium/high/xhigh/max`，新会话启动时以 `--effort` 传给 Doubao CLI。档位不区分模型，实际效果由所选模型决定。`ultra` 没有对应档位，写了会被忽略；原生 `none/minimal` 也不作为 Bot 配置选项。
 - **停止后没收到回答 / 回答串到下一轮**：经卡片 ⏹ 或 `/stop` 停止时，与打断几乎同时写出的迟到终态不会补发，可在 Web 终端查看或重新提问，不属于丢消息。若是用 **Web 终端物理 Esc**、或在**轮次运行中按卡片 Esc 快捷键**打断后出现回答错位（这两个按键不经过 Botmux 停止通道），请在**发送下一条消息之前**补点一次卡片 ⏹ 或发 `/stop` 对齐队列；若已经发出下一条消息，就不要再补点（会结算到新轮），直接继续对话即可。
 - **未声明支持**：既有终端 `/adopt` 的 Doubao 专用转写桥接、会话 fork、纯模型零工具（model-only）接口，以及所有原生审批/异常终态。原生 `-p` 会运行 Agent，不等于 model-only。
 - **验证范围**：已实测 macOS 的 PTY/tmux 输入、Esc 打断、精确恢复、真实 worker IPC 和 core-only HTTP 最终回复/重启续聊。Linux 路径逻辑有覆盖，但 Linux 原生运行与 bwrap 文件沙箱未实机验收；飞书客户端实际卡片/点击体验不能由本机 HTTP 测试替代。
