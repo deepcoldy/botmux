@@ -245,22 +245,28 @@ describe('PromptInjectionSection — reason-specific unsupported note', () => {
   it.each([
     [{ cliId: 'opencode' }, 'cli_unsupported'],
     [{ cliId: 'cursor', sandboxMode: 'scratch' as const }, 'scratch_unsupported_for_cli'],
-    [{ cliId: 'antigravity', backendType: 'zmx' }, 'zmx_unsupported_for_antigravity'],
+    [{ cliId: 'antigravity', backendType: 'zmx', sandboxMode: 'scratch' as const }, 'scratch_unsupported_for_backend'],
   ])('%j → %s', (over, reason) => {
     const view = mount(React.createElement(PromptInjectionSection, { bot: bot({ promptInjection: 'default', ...over }), patchBot: vi.fn() }));
     const note = view.root.findByProps({ 'data-zero-prompt-unsupported': reason });
     expect(note).toBeTruthy();
   });
 
-  it('each reason renders its own sentence, and a supported CLI renders none of them', () => {
+  it('each reason renders its own sentence, and supported combinations render none of them', () => {
     const texts = (['opencode', 'cursor', 'antigravity'] as const).map((cliId, i) => {
-      const over = [{}, { sandboxMode: 'scratch' as const }, { backendType: 'zmx' }][i];
+      const over = [{}, { sandboxMode: 'scratch' as const }, { backendType: 'zmx', sandboxMode: 'scratch' as const }][i];
       const view = mount(React.createElement(PromptInjectionSection, { bot: bot({ cliId, promptInjection: 'default', ...over }), patchBot: vi.fn() }));
       return JSON.stringify(view.root.findByProps({ className: 'bd-section-note' }).props.children);
     });
     expect(new Set(texts).size).toBe(3);
-    const ok = mount(React.createElement(PromptInjectionSection, { bot: bot({ cliId: 'claude-code', promptInjection: 'default' }), patchBot: vi.fn() }));
-    expect(ok.root.findAll(node => node.props['data-zero-prompt-unsupported'] !== undefined && typeof node.type === 'string')).toEqual([]);
+    for (const supported of [
+      { cliId: 'claude-code' },
+      { cliId: 'antigravity', backendType: 'zmx' },
+      { cliId: 'antigravity', backendType: 'tmux', sandboxMode: 'scratch' as const },
+    ]) {
+      const ok = mount(React.createElement(PromptInjectionSection, { bot: bot({ promptInjection: 'default', ...supported }), patchBot: vi.fn() }));
+      expect(ok.root.findAll(node => node.props['data-zero-prompt-unsupported'] !== undefined && typeof node.type === 'string')).toEqual([]);
+    }
   });
 });
 

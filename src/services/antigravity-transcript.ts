@@ -89,11 +89,12 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
 import { beginJsonlDrain, iterateJsonlLines, scanJsonlFromOffset } from './jsonl-cursor.js';
+import { openDatabaseSyncNow } from './sqlite-compat.js';
 
 const CONVERSATION_ID_RE = /^[A-Za-z0-9._-]+$/;
 const COMPACT_TRANSCRIPT_NAME = 'transcript.jsonl';
@@ -104,8 +105,62 @@ function defaultBrainDir(): string {
 }
 
 function conversationLogPath(conversationId: string | undefined, brainDir: string, name: string): string | null {
-  if (!conversationId || !CONVERSATION_ID_RE.test(conversationId)) return null;
+  if (!conversationId || conversationId === '.' || conversationId === '..' || !CONVERSATION_ID_RE.test(conversationId)) return null;
   return join(brainDir, conversationId, '.system_generated', 'logs', name);
+}
+
+/** Extract `<conversationId>` from `<brainDir>/<conversationId>/.system_generated/logs/transcript(_full).jsonl`. */
+export function conversationIdFromAntigravityTranscriptPath(path: string | undefined): string | null {
+  if (!path) return null;
+  const fileName = basename(path);
+  if (fileName !== COMPACT_TRANSCRIPT_NAME && fileName !== FULL_TRANSCRIPT_NAME) return null;
+  const logsDir = dirname(path);
+  if (basename(logsDir) !== 'logs') return null;
+  const sysDir = dirname(logsDir);
+  if (basename(sysDir) !== '.system_generated') return null;
+  const cid = basename(dirname(sysDir));
+  if (!cid || cid === '.' || cid === '..' || !CONVERSATION_ID_RE.test(cid)) return null;
+  return cid;
+}
+
+/** Highest `step_index` near the tail of a transcript file, or undefined if unreadable/absent. */
+export function readLatestAntigravityTranscriptStepIndex(transcriptPath: string): number | undefined {
+  if (!existsSync(transcriptPath)) return undefined;
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return undefined;
+      let chunkSize = Math.min(stats.size, 64 * 1024);
+      while (chunkSize <= stats.size) {
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, stats.size - chunkSize);
+        const rawLines = buf.toString('utf8').split('\n');
+        const lines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
+        let maxIdx: number | undefined;
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const trimmed = lines[i]!.trim();
+          if (!trimmed) continue;
+          try {
+            const rec = JSON.parse(trimmed);
+            if (Number.isSafeInteger(rec?.step_index) && rec.step_index >= 0) {
+              maxIdx = maxIdx === undefined ? rec.step_index : Math.max(maxIdx, rec.step_index);
+            }
+          } catch {
+            continue;
+          }
+        }
+        if (maxIdx !== undefined) return maxIdx;
+        if (chunkSize >= stats.size || chunkSize >= 1024 * 1024) break;
+        chunkSize = Math.min(stats.size, chunkSize * 4);
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 /** Absolute COMPACT transcript path (transcript.jsonl) for a conversation id,
@@ -303,6 +358,9 @@ export function unwrapAntigravityUserInput(content: string): string {
  *  user turn confirms it (it gets emitted). */
 export interface AntigravityTranscriptState {
   provisionalFinal?: CodexBridgeEvent;
+  /** Trajectory `step_index` of `provisionalFinal` when present, used by
+   *  non-screen execution-state confirmation (`zmx`). */
+  provisionalFinalStepIndex?: number;
   /** A background task (manage_task / schedule / RUNNING background GENERIC)
    *  is outstanding: the transcript itself proves the turn is not done, so the
    *  quiet-tick flush is refused until the completion SYSTEM_MESSAGE or the
@@ -338,6 +396,131 @@ export interface AntigravityDrainOptions {
   /** Worker-only: release the held trailing candidate after the viewport
    *  quiet-tick probe confirmed the TUI is idle and on the ready marker. */
   flushTrailingFinal?: boolean;
+  /** Optional classifier consulted when a new explicit `USER_INPUT` arrives while
+   *  `state.provisionalFinal` is held. Returning `'discard_aborted'` emits a
+   *  `turn_aborted` boundary instead of leaking an aborted interim candidate. */
+  classifyProvisionalBeforeNextTurn?: (stepIndex: number | undefined) => 'confirm' | 'discard_aborted';
+}
+
+const COMPLETION_EXEC_REASONS = new Set<number>([3, 4, 6, 8, 9, 10, 11]);
+
+function skipProtoVarint(buf: Uint8Array, pos: number): number | null {
+  for (let count = 0; count < 10; count++) {
+    const idx = pos + count;
+    if (idx >= buf.length) return null;
+    if ((buf[idx]! & 0x80) === 0) return idx + 1;
+  }
+  return null;
+}
+
+function readProtoVarint(buf: Uint8Array, pos: number): { value: number; next: number } | null {
+  let raw = 0n;
+  let shift = 0n;
+  for (let count = 0; count < 10; count++) {
+    const idx = pos + count;
+    if (idx >= buf.length) return null;
+    const byte = buf[idx]!;
+    raw |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      const signed = count === 9 ? BigInt.asIntN(64, raw) : raw;
+      const num = Number(signed);
+      if (!Number.isSafeInteger(num)) return null;
+      return { value: num, next: idx + 1 };
+    }
+    shift += 7n;
+  }
+  return null;
+}
+
+function parseExecRunBlob(blob: Uint8Array): {
+  terminationReason: number;
+  lastStepIdx: number;
+  proceededWithAutoContinue: boolean;
+} | null {
+  if (blob.length === 0) return null;
+  let terminationReason = 0;
+  let lastStepIdx = 0;
+  let proceededWithAutoContinue = false;
+  let pos = 0;
+  while (pos < blob.length) {
+    const tag = readProtoVarint(blob, pos);
+    if (!tag || tag.value === 0) return null;
+    pos = tag.next;
+    const fieldNo = Math.floor(tag.value / 8);
+    const wireType = tag.value & 7;
+    if (wireType === 0 && (fieldNo === 1 || fieldNo === 3 || fieldNo === 4)) {
+      const val = readProtoVarint(blob, pos);
+      if (!val) return null;
+      pos = val.next;
+      if (fieldNo === 1) terminationReason = val.value;
+      else if (fieldNo === 3) lastStepIdx = val.value;
+      else if (fieldNo === 4) proceededWithAutoContinue = val.value !== 0;
+    } else if (wireType === 0) {
+      const next = skipProtoVarint(blob, pos);
+      if (next === null) return null;
+      pos = next;
+    } else if (wireType === 1) {
+      if (pos + 8 > blob.length) return null;
+      pos += 8;
+    } else if (wireType === 2) {
+      const len = readProtoVarint(blob, pos);
+      if (!len || len.value < 0 || len.next + len.value > blob.length) return null;
+      pos = len.next + len.value;
+    } else if (wireType === 5) {
+      if (pos + 4 > blob.length) return null;
+      pos += 4;
+    } else {
+      return null;
+    }
+  }
+  return terminationReason > 0 ? { terminationReason, lastStepIdx, proceededWithAutoContinue } : null;
+}
+
+function defaultClassifyProvisionalFromSiblingConvDb(
+  transcriptPath: string,
+  candidateStepIndex: number | undefined,
+): 'confirm' | 'discard_aborted' {
+  if (candidateStepIndex === undefined || !Number.isSafeInteger(candidateStepIndex) || candidateStepIndex < 0) {
+    return 'confirm';
+  }
+  const cid = conversationIdFromAntigravityTranscriptPath(transcriptPath);
+  if (!cid) return 'confirm';
+  // `<geminiCliDir>/brain/<cid>/.system_generated/logs/transcript(_full).jsonl`
+  const brainDir = resolve(dirname(transcriptPath), '..', '..', '..');
+  if (basename(brainDir) !== 'brain') return 'confirm';
+  const geminiCliDir = dirname(brainDir);
+  const convDir = join(geminiCliDir, 'conversations');
+  const convDbPath = join(convDir, `${cid}.db`);
+  try {
+    if (!lstatSync(convDir).isDirectory() || !lstatSync(convDbPath).isFile()) return 'confirm';
+  } catch {
+    return 'confirm';
+  }
+  const db = openDatabaseSyncNow(convDbPath, { readOnly: true });
+  if (!db) return 'discard_aborted';
+  try {
+    try { db.exec('PRAGMA busy_timeout = 2000;'); } catch { /* ignore */ }
+    const rows = db.prepare('SELECT data FROM executor_metadata ORDER BY idx ASC').all() as Array<{ data?: unknown }>;
+    for (const row of rows) {
+      const bytes = Buffer.isBuffer(row?.data)
+        ? row.data
+        : row?.data instanceof Uint8Array
+          ? row.data
+          : null;
+      if (!bytes) return 'discard_aborted';
+      const parsed = parseExecRunBlob(bytes);
+      if (!parsed) return 'discard_aborted';
+      if (parsed.lastStepIdx >= candidateStepIndex) {
+        if (parsed.proceededWithAutoContinue) return 'discard_aborted';
+        return COMPLETION_EXEC_REASONS.has(parsed.terminationReason) ? 'confirm' : 'discard_aborted';
+      }
+    }
+    return 'discard_aborted';
+  } catch {
+    return 'discard_aborted';
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
 }
 
 function recordTimestampMs(rec: any): number {
@@ -348,7 +531,10 @@ function recordTimestampMs(rec: any): number {
 function cloneState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
   const candidate = state?.provisionalFinal;
   return {
-    ...(candidate ? { provisionalFinal: { ...candidate } } : {}),
+    ...(candidate ? {
+      provisionalFinal: { ...candidate },
+      ...(state?.provisionalFinalStepIndex !== undefined ? { provisionalFinalStepIndex: state.provisionalFinalStepIndex } : {}),
+    } : {}),
     ...(state?.hasPendingTask ? { hasPendingTask: true } : {}),
   };
 }
@@ -380,6 +566,7 @@ function foldRecord(
   timestampMs: number,
   events: CodexBridgeEvent[],
   state: AntigravityTranscriptState,
+  options: AntigravityDrainOptions,
 ): AntigravityTranscriptState {
   const type = obj?.type;
   const keepPending = (s: AntigravityTranscriptState): AntigravityTranscriptState =>
@@ -390,9 +577,22 @@ function foldRecord(
     // ignored entirely (and neither confirms nor cancels a candidate).
     if (obj.source !== undefined && obj.source !== 'USER_EXPLICIT') return state;
     // A new explicit user turn proves the previous loop really ended AND no
-    // background task from it is outstanding: release its held final BEFORE
-    // the user event so turns stay interleaved, and reset the turn state.
-    if (state.provisionalFinal) events.push(state.provisionalFinal);
+    // background task from it is outstanding. Verify the closed execution was
+    // not aborted (`USER_CANCELED` / `ERROR`) before releasing its held final!
+    if (state.provisionalFinal) {
+      const classify = options.classifyProvisionalBeforeNextTurn
+        ?? (stepIdx => defaultClassifyProvisionalFromSiblingConvDb(path, stepIdx));
+      if (classify(state.provisionalFinalStepIndex) === 'discard_aborted') {
+        events.push({
+          kind: 'turn_aborted',
+          uuid: `agy-abort:${path}:${state.provisionalFinalStepIndex ?? lineStart}`,
+          text: '',
+          timestampMs: state.provisionalFinal.timestampMs,
+        });
+      } else {
+        events.push(state.provisionalFinal);
+      }
+    }
     const raw = typeof obj.content === 'string' ? obj.content : '';
     const text = unwrapAntigravityUserInput(raw);
     if (text) {
@@ -429,8 +629,12 @@ function foldRecord(
     // replaces an earlier held one). The pending-task flag rides along — the
     // quiet flush checks it and refuses while a task is outstanding.
     const finalText = hasTruncatedContent(obj) ? `${text}\n\n${ANTIGRAVITY_TRUNCATED_REPLY_NOTICE}` : text;
+    const stepIndex = Number.isSafeInteger(obj?.step_index) && obj.step_index >= 0
+      ? (obj.step_index as number)
+      : undefined;
     return {
       provisionalFinal: { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText },
+      ...(stepIndex !== undefined ? { provisionalFinalStepIndex: stepIndex } : {}),
       ...(state.hasPendingTask ? { hasPendingTask: true } : {}),
     };
   }
@@ -505,7 +709,7 @@ export function drainAntigravityTranscript(
   for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state);
+    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options);
   }
 
   // The final object may sit at EOF without a trailing \n until the next turn.
@@ -513,7 +717,7 @@ export function drainAntigravityTranscript(
   if (pendingTail.length > 0) {
     try {
       const obj = JSON.parse(pendingTail);
-      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state);
+      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options);
       newOffset = size;
       pendingTail = '';
     } catch {
@@ -527,6 +731,7 @@ export function drainAntigravityTranscript(
   if (options.flushTrailingFinal && state.provisionalFinal && !state.hasPendingTask) {
     events.push(state.provisionalFinal);
     state.provisionalFinal = undefined;
+    state.provisionalFinalStepIndex = undefined;
   }
   return { events, newOffset, pendingTail, state };
 }

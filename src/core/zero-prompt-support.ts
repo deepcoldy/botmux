@@ -37,38 +37,29 @@ export function isScratchSandbox(opts?: {
  * the REAL host directories, so the daemon tails the same files the CLI
  * writes (this also keeps cursor's store.db fcntl locks working).
  *
- * The full-root COW `sandbox: 'scratch'` mode is rejected for these three for
- * now: it bind-mounts a merged overlay as / and ignores authPaths, so their
+ * The full-root COW `sandbox: 'scratch'` mode is rejected for cursor and doubao:
+ * it bind-mounts a merged overlay as / and ignores authPaths, so their
  * transcripts land in the upper tree the host-side structured bridge does not
- * resolve yet (the existing structured bridges codex/grok have the same open
- * gap). Fail loudly here rather than silently dropping every reply.
+ * resolve yet. Antigravity resolves its transcript, submit log, `--log-file`,
+ * CoT/runtime and usage strictly through the per-session scratch view (and fails
+ * closed when that view is absent).
  *
- * doubao is rejected under scratch despite being an ALWAYS-bridge CLI:
- * #2828 made transcript its DEFAULT reply mode, and its
- * `agent_mode/<uid>/workspace/.sessions` tree has no scratch host-view
- * mapping (only codex/trae get an env redirect and claude a data-dir remap),
- * so under scratch both the first-turn id capture and transcript harvest
- * resolve nothing — the reply-delivery capability gate rejects the same
- * combination independently.
+ * Scratch itself only supports `pty` and `tmux` backends (`zmx`, `herdr` and
+ * `zellij` cannot host a scratch sandbox), so `scratch` combined with any
+ * non-`pty`/`tmux` local backend is explicitly rejected here as well.
  *
- * This capability predicate only sees the CONFIG/session value, so the
- * machine-wide `BOTMUX_SANDBOX=scratch` switch (which is not materialised into
- * cfg) is enforced separately by an authoritative throw in spawnCli after it
- * resolves the real mode via resolveSandboxMode.
- *
- * Backend: antigravity additionally rejects the `zmx` backend. Its held
- * provisional final is released only by the quiet-tick viewport gate, and
- * screen evidence is deliberately non-authoritative under zmx
- * (backendScreenEvidenceIsAuthoritativeForMutation) — the final would then be
- * held until the next user turn at best. cursor is unaffected (it emits the
- * final immediately rather than through that gate). */
+ * Backend: antigravity supports `zmx` (outside `scratch`) by confirming its held
+ * provisional final and settling cancelled turns from Antigravity's own SQLite
+ * execution stores (`executor_metadata` + `conversation_summaries`) rather than
+ * trusting `zmx history` geometry. */
 const ZERO_PROMPT_LOCAL_BACKENDS = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
+const SCRATCH_SUPPORTED_BACKENDS = ['pty', 'tmux'] as const;
 
 export type ZeroPromptUnsupportedReason =
   | 'cli_unsupported'
   | 'backend_unsupported'
   | 'scratch_unsupported_for_cli'
-  | 'zmx_unsupported_for_antigravity';
+  | 'scratch_unsupported_for_backend';
 
 export interface ZeroPromptSupportOpts {
   backendType?: string; codexRpcInput?: boolean;
@@ -90,11 +81,15 @@ export function zeroPromptInjectionUnsupportedReason(
     && !ZERO_PROMPT_LOCAL_BACKENDS.includes(opts.backendType as typeof ZERO_PROMPT_LOCAL_BACKENDS[number])) {
     return 'backend_unsupported';
   }
-  if ((cliId === 'cursor' || cliId === 'antigravity' || cliId === 'doubao') && isScratchSandbox(opts)) {
+  if ((cliId === 'cursor' || cliId === 'doubao') && isScratchSandbox(opts)) {
     return 'scratch_unsupported_for_cli';
   }
-  if (cliId === 'antigravity' && opts?.backendType === 'zmx') {
-    return 'zmx_unsupported_for_antigravity';
+  if (
+    isScratchSandbox(opts)
+    && opts?.backendType
+    && !SCRATCH_SUPPORTED_BACKENDS.includes(opts.backendType as typeof SCRATCH_SUPPORTED_BACKENDS[number])
+  ) {
+    return 'scratch_unsupported_for_backend';
   }
   return null;
 }

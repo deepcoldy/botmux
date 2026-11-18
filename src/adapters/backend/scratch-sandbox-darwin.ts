@@ -40,6 +40,7 @@ import {
   readdirSync,
   statSync,
   lstatSync,
+  unlinkSync,
   realpathSync,
   symlinkSync,
   readlinkSync,
@@ -69,6 +70,7 @@ const CLONE_TIMEOUT_BESTEFFORT_MS = 20_000;
 const CORE_CLONE_HOME_DIRS = new Set([
   '.claude',
   '.codex',
+  '.gemini',
   '.trae',
   '.trae-cn',
   '.claude-runtime',
@@ -286,6 +288,12 @@ export interface PrepareMacScratchOpts {
   home: string;
   cliBin: string;
   cliArgs: string[];
+  /** Optional lazy argv resolver when CLI flags (e.g. Antigravity `--log-file`
+   *  and `--settings`) must point inside the materialised clone rather than the host. */
+  resolveCliArgs?: (ctx: { clonedHome: string; chdirInSandbox: string }) => string[];
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real CLI executable. */
+  cliNameLink?: { name: string; target: string };
   /** Credential/secret REAL host paths (read+write denied in the child). */
   denyPaths?: readonly string[];
   mcpGatewaySocketPath?: string;
@@ -415,9 +423,21 @@ export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): M
     try { symlinkSync(target, link); } catch { /* already materialised */ }
   };
 
+  const nonSymlinkExists = (p: string): boolean => {
+    try {
+      const lst = lstatSync(p);
+      return !lst.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+
   /** Clone a subtree; on failure degrade to a symlink + write-seal. When
-   *  `required` (core CLI dirs / the project leaf) failure is fatal. */
+   *  `required` (core CLI dirs / the project leaf) failure is fatal.
+   *  Preserves an already-materialised non-symlink entry when re-preparing
+   *  around a suspended session's surviving scratch tree. */
   const cloneOrDegrade = (src: string, dst: string, kind: 'core' | 'besteffort'): void => {
+    if (nonSymlinkExists(dst)) return;
     const timeout = kind === 'core' ? CLONE_TIMEOUT_CORE_MS : CLONE_TIMEOUT_BESTEFFORT_MS;
     if (clonePath(src, dst, timeout)) return;
     // Fallback to a read-native symlink, sealed against writes.
@@ -439,6 +459,25 @@ export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): M
     }
 
     if (ent.isSymbolicLink()) {
+      if (CORE_CLONE_HOME_DIRS.has(name) && !authorityRoots.has(realEntry)) {
+        // Core CLI state dir (e.g. ~/.gemini) symlinked on the host: copying the
+        // raw symlink would point outside homeCloneRoot where Seatbelt denies
+        // writes (or would leak to a host-writable target). Dereference and COW
+        // clone on the same APFS volume, failing closed on broken/cross-volume.
+        let realTarget: string;
+        try {
+          realTarget = realpathSync(realEntry);
+          if (!statSync(realTarget).isDirectory() || !sameVolume(realTarget, homeCloneRoot)) {
+            failedCore.push(realEntry);
+            continue;
+          }
+        } catch {
+          failedCore.push(realEntry);
+          continue;
+        }
+        cloneOrDegrade(realTarget, linkInClone, 'core');
+        continue;
+      }
       let target: string;
       try { target = readlinkSync(realEntry); } catch { continue; }
       symlinkEntry(target, linkInClone);
@@ -524,8 +563,24 @@ export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): M
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   chmodSync(shim, 0o755);
+  if (opts.cliNameLink?.name && opts.cliNameLink.target && opts.cliNameLink.name !== 'botmux') {
+    let targetReal = opts.cliNameLink.target;
+    try { targetReal = realpathSync(targetReal); } catch { /* keep lexical */ }
+    const aliasPath = join(shimBin, opts.cliNameLink.name);
+    try { unlinkSync(aliasPath); } catch { /* ignore */ }
+    try { symlinkSync(targetReal, aliasPath); } catch { /* ignore */ }
+  }
 
   // ── 4. env ─────────────────────────────────────────────────────────────────
+  const canonicalExecDirs: string[] = [];
+  const pushExecDir = (p: string): void => {
+    try {
+      const d = dirname(realpathSync(p));
+      if (isAbsolute(d) && !canonicalExecDirs.includes(d)) canonicalExecDirs.push(d);
+    } catch { /* ignore */ }
+  };
+  pushExecDir(process.execPath);
+  pushExecDir(opts.cliBin);
   const env: Record<string, string> = {
     HOME: homeCloneRoot,
     TMPDIR: tmp,
@@ -535,7 +590,7 @@ export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): M
     TRAE_HOME: join(homeCloneRoot, '.trae'),
     SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
-    PATH: [shimBin, process.env.PATH ?? ''].filter(Boolean).join(':'),
+    PATH: [shimBin, ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
   };
   if (process.env.BOTMUX_DAEMON_IPC_PORT) env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
   let sandboxMcpSocket: string | undefined;
@@ -598,7 +653,16 @@ export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): M
 
   let execBin: string;
   try { execBin = realpathSync(opts.cliBin); } catch { execBin = opts.cliBin; }
-  const args = ['-f', profilePath, execBin, ...opts.cliArgs];
+  const resolvedCliArgs = opts.resolveCliArgs
+    ? opts.resolveCliArgs({ clonedHome: homeCloneRoot, chdirInSandbox })
+    : opts.cliArgs;
+  // Mirror Linux bwrap's authoritative `--setenv`: shell-wrapped persistent
+  // backends (tmux/zellij) inherit the server's ambient HOME and prepend the
+  // sealed ~/.botmux/bin wrapper ahead of PATH before invoking `sandbox-exec`.
+  // Applying `env` inside `sandbox-exec` guarantees the sandboxed CLI always
+  // sees the isolated clone HOME, session TMPDIR, and relay shim PATH.
+  const sandboxEnvArgs = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+  const args = ['-f', profilePath, '/usr/bin/env', '-u', 'BOTS_CONFIG', ...sandboxEnvArgs, execBin, ...resolvedCliArgs];
 
   const meta: MacScratchMeta = {
     v: 2,
@@ -646,6 +710,12 @@ export function attachMacScratchSession(opts: { sessionId: string; dataDir: stri
   let meta: MacScratchMeta | null = null;
   try { meta = JSON.parse(readFileSync(join(sessionRoot, META_NAME), 'utf8')); } catch { return null; }
   if (!meta || meta.platform !== 'darwin') return null;
+  try {
+    if (!lstatSync(meta.clonedHome).isDirectory()) return null;
+    if (meta.work && !lstatSync(meta.work.cloned).isDirectory()) return null;
+  } catch {
+    return null;
+  }
   try { mkdirSync(meta.outbox, { recursive: true }); } catch { /* */ }
   return {
     outbox: meta.outbox,

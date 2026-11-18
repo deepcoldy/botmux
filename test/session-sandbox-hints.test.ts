@@ -142,12 +142,14 @@ describe('zeroPromptInjectionUnsupportedReason', () => {
     [undefined, {}, 'cli_unsupported'],
     ['claude-code', { backendType: 'riff' }, 'backend_unsupported'],
     ['cursor', { sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],
-    ['antigravity', { sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],
-    ['antigravity', { backendType: 'zmx' }, 'zmx_unsupported_for_antigravity'],
+    ['antigravity', { sandbox: 'scratch' }, null],
+    ['antigravity', { backendType: 'tmux', sandbox: 'scratch' }, null],
+    ['antigravity', { backendType: 'zmx' }, null],
     ['cursor', { backendType: 'zmx' }, null],
-    // Order: an unsupported backend wins over the scratch / zmx specifics.
+    // Order: an unsupported remote backend wins over scratch specifics; zmx + scratch is rejected.
     ['antigravity', { backendType: 'riff', sandbox: 'scratch' }, 'backend_unsupported'],
-    ['antigravity', { backendType: 'zmx', sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],
+    ['antigravity', { backendType: 'zmx', sandbox: 'scratch' }, 'scratch_unsupported_for_backend'],
+    ['cursor', { backendType: 'zmx', sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],
   ] as const)('%s %j → %s', (cliId, opts, expected) => {
     expect(zeroPromptInjectionUnsupportedReason(cliId, opts)).toBe(expected);
     // The boolean predicate every caller uses is exactly "no reason".

@@ -393,18 +393,18 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
   });
 
-  it('judges zero injection on the effective backend (daemon default when not overridden)', async () => {
+  it('judges zero injection on the effective backend and sandbox (daemon default when not overridden)', async () => {
     process.env.BACKEND_TYPE = 'zmx';
     try {
-      // antigravity zero injection cannot run on zmx; with no override the session uses it.
-      const { store } = await loaded({ cliId: 'antigravity' });
+      // antigravity on zmx alone is supported; zmx + scratch is unsupported.
+      const { store } = await loaded({ cliId: 'antigravity', sandbox: 'scratch' });
       const zero = store.findConfigField('promptInjection')!;
       expect(await store.applyConfigField('app_default', zero, 'none'))
         .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
       const backend = store.findConfigField('backendType')!;
       expect((await store.applyConfigField('app_default', backend, 'tmux')).ok).toBe(true);
       expect((await store.applyConfigField('app_default', zero, 'none')).ok).toBe(true);
-      // Clearing the override falls back to zmx: refused while zero injection is on.
+      // Clearing the override falls back to zmx under scratch: refused while zero injection is on.
       expect(await store.applyConfigField('app_default', backend, null))
         .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
       expect(readConfig().backendType).toBe('tmux');
@@ -1933,7 +1933,7 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
   });
 
-  it.each(['cursor', 'doubao', 'antigravity'])('invariant backstop: updateBotSandboxMode rejects switching a zero-injection %s bot to scratch (rmwBotEntry path, no promptInjection write)', async cliId => {
+  it.each(['cursor', 'doubao'])('invariant backstop: updateBotSandboxMode rejects switching a zero-injection %s bot to scratch (rmwBotEntry path, no promptInjection write)', async cliId => {
     const { registry } = await loaded({ cliId, promptInjection: 'none' });
     const sandboxStore = await import('../src/services/sandbox-store.js');
     const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
@@ -1944,6 +1944,18 @@ describe('bot-config store', () => {
     // oncall keeps zero injection working
     expect((await sandboxStore.updateBotSandboxMode('app_default', 'oncall')).ok).toBe(true);
     expect(readConfig()).toMatchObject({ promptInjection: 'none', sandbox: 'oncall' });
+  });
+
+  it('allows switching a zero-injection antigravity bot on pty/tmux to scratch, while rejecting zmx + scratch', async () => {
+    await loaded({ cliId: 'antigravity', backendType: 'tmux', promptInjection: 'none' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'scratch')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'antigravity', backendType: 'tmux', promptInjection: 'none', sandbox: 'scratch' });
+
+    await loaded({ cliId: 'antigravity', backendType: 'zmx', promptInjection: 'none' });
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    expect(readConfig().sandbox).toBeUndefined();
   });
 
   it('repair exit: a stored zero-injection cursor+scratch entry can leave scratch', async () => {

@@ -9,10 +9,16 @@ import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { getSession } from './session-store.js';
 import { config } from '../config.js';
-import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
+import {
+  persistedScratchMappings,
+  resolveScratchHomeSubpathStrict,
+  scratchViewPath,
+  type ScratchPathMapping,
+} from './scratch-host-view.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
-import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
+import { antigravityFullTranscriptPath, resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
@@ -362,23 +368,63 @@ const foundWrap = (found: string | null | undefined, v: (p: string) => string): 
  * then use real-host paths — fail open). Never falls back to real paths for a
  * covered-but-absent clone: the mapping still rewrites and reads get ENOENT.
  */
-function sessionScratchMappings(q: TranscriptPathQuery): ScratchPathMapping[] | undefined {
-  let session;
-  try { session = getSession(q.sessionId); } catch { return undefined; }
-  if (session?.sandbox !== 'scratch') return undefined;
+function resolveSessionScratchState(
+  sessionId: string,
+): { scratch: false; mappings?: undefined } | { scratch: true; mappings: ScratchPathMapping[] | undefined } {
+  let persisted: ScratchPathMapping[] | undefined;
   try {
-    return persistedScratchMappings(config.session.dataDir, q.sessionId);
+    persisted = persistedScratchMappings(config.session.dataDir, sessionId);
   } catch {
-    return undefined;
+    persisted = undefined;
   }
+  let session;
+  try { session = getSession(sessionId); } catch { session = undefined; }
+  if (session?.sandbox === 'scratch') {
+    return { scratch: true, mappings: persisted };
+  }
+  if (persisted && persisted.length > 0) {
+    return { scratch: true, mappings: persisted };
+  }
+  if (session && session.backendType !== 'riff' && session.backendType !== 'remote-runner') {
+    try {
+      const effectiveMode = resolveSandboxMode({
+        configSandbox: session.sandbox,
+        envValue: process.env.BOTMUX_SANDBOX,
+      });
+      if (effectiveMode === 'scratch') {
+        return { scratch: true, mappings: undefined };
+      }
+    } catch {
+      // Invalid BOTMUX_SANDBOX → fail closed rather than exposing host transcripts.
+      return { scratch: true, mappings: undefined };
+    }
+  }
+  return { scratch: false };
+}
+
+/** Resolve the Antigravity conversation SQLite DB path for a session, failing
+ *  closed (`null`) when a scratch session's isolated view is missing or invalid. */
+export function resolveSessionAntigravityDbPath(q: { sessionId: string; cliSessionId?: string }): string | null {
+  if (!antigravityFullTranscriptPath(q.cliSessionId, '/')) return null;
+  const scratchState = resolveSessionScratchState(q.sessionId);
+  const relDb = join('.gemini', 'antigravity-cli', 'conversations', `${q.cliSessionId!}.db`);
+  if (!scratchState.scratch) {
+    return join(homedir(), relDb);
+  }
+  return resolveScratchHomeSubpathStrict(scratchState.mappings, relDb);
 }
 
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {
   const sid = q.cliSessionId || q.sessionId;
   // Scratch: every host-derived root below is read through the per-session
   // merged overlay (Linux) or clone tree (macOS). Never read the real lower
-  // transcript for a scratch session (it belongs to a different state).
-  const svMappings = sessionScratchMappings(q);
+  // transcript for a scratch session — fail closed (`null`) if scratch metadata
+  // or the isolated tree is missing/cleaned up.
+  const scratchState = resolveSessionScratchState(q.sessionId);
+  if (scratchState.scratch && (!scratchState.mappings || scratchState.mappings.length === 0)) {
+    return null;
+  }
+  const svMappings = scratchState.mappings;
   const v = (hostPath: string): string => scratchViewPath(svMappings, hostPath);
   switch (q.cliId) {
     case 'minimax': {
@@ -511,11 +557,21 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
     }
     case 'antigravity': {
       // The conversation id is interpolated into the brain path; the helper
-      // validates the charset (traversal / separators). Read it through the
-      // per-session scratch overlay like every other host-derived root; the
-      // untruncated transcript_full.jsonl wins over the compact log, and the
-      // existence check keeps the null-when-absent contract every branch honors.
-      const p = resolveAntigravityTranscriptPath(q.cliSessionId, { mapPath: v });
+      // validates the charset (traversal / separators). Under scratch, resolve
+      // strictly within the isolated view so symlinked `$HOME` or cross-HOME
+      // symlinks can never read back host history.
+      if (scratchState.scratch) {
+        if (!antigravityFullTranscriptPath(q.cliSessionId, '/')) return null;
+        for (const name of ['transcript_full.jsonl', 'transcript.jsonl'] as const) {
+          const resolved = resolveScratchHomeSubpathStrict(
+            svMappings,
+            join('.gemini', 'antigravity-cli', 'brain', q.cliSessionId!, '.system_generated', 'logs', name),
+          );
+          if (resolved && existsSync(resolved)) return { path: resolved, kind: 'antigravity' };
+        }
+        return null;
+      }
+      const p = resolveAntigravityTranscriptPath(q.cliSessionId);
       return p ? { path: p, kind: 'antigravity' } : null;
     }
     default:

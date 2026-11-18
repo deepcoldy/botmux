@@ -37,13 +37,12 @@ describe('supportsZeroPromptInjection', () => {
     expect(supportsZeroPromptInjection('codex', { backendType: 'riff' })).toBe(false);
   });
 
-  it('rejects antigravity on zmx (quiet-final viewport gate is non-authoritative there) but keeps cursor (immediate final)', () => {
-    expect(supportsZeroPromptInjection('antigravity', { backendType: 'zmx' })).toBe(false);
-    expect(supportsZeroPromptInjection('antigravity', { backendType: 'zmx', sandbox: false })).toBe(false);
-    // cursor emits the assistant_final immediately and does not route through
-    // the antigravity quiet-tick viewport gate.
+  it('supports antigravity and cursor on zmx, while rejecting zmx + scratch', () => {
+    expect(supportsZeroPromptInjection('antigravity', { backendType: 'zmx' })).toBe(true);
+    expect(supportsZeroPromptInjection('antigravity', { backendType: 'zmx', sandbox: false })).toBe(true);
+    expect(supportsZeroPromptInjection('antigravity', { backendType: 'zmx', sandbox: 'oncall' })).toBe(true);
+    expect(supportsZeroPromptInjection('antigravity', { backendType: 'zmx', sandbox: 'scratch' })).toBe(false);
     expect(supportsZeroPromptInjection('cursor', { backendType: 'zmx' })).toBe(true);
-    // Other local backends remain fine for antigravity.
     expect(supportsZeroPromptInjection('antigravity', { backendType: 'zellij' })).toBe(true);
     expect(supportsZeroPromptInjection('antigravity', { backendType: 'tmux' })).toBe(true);
   });
@@ -70,17 +69,19 @@ describe('supportsZeroPromptInjection', () => {
     expect(supportsZeroPromptInjection('antigravity', { sandbox: false, readIsolation: true })).toBe(true);
   });
 
-  it('rejects cursor/antigravity/doubao under the full-root scratch COW sandbox (structured bridge cannot resolve the merged tree yet)', () => {
+  it('allows antigravity under scratch (pty/tmux) while keeping cursor/doubao and non-pty/tmux scratch combinations rejected', () => {
     expect(supportsZeroPromptInjection('cursor', { sandbox: 'scratch' })).toBe(false);
-    expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch', backendType: 'pty' })).toBe(false);
+    expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch' })).toBe(true);
+    expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch', backendType: 'pty' })).toBe(true);
+    expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch', backendType: 'tmux' })).toBe(true);
+    expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch', backendType: 'zmx' })).toBe(false);
+    expect(supportsZeroPromptInjection('antigravity', { sandbox: 'scratch', backendType: 'zellij' })).toBe(false);
     // #2828: doubao 的 .sessions 树没有 scratch host-view 映射，零注入会强制
     // transcript 而桥读不到 merged 树 → 整轮静默，写配置/ spawn 两处都必须拒。
     expect(supportsZeroPromptInjection('doubao', { sandbox: 'scratch' })).toBe(false);
     // Explicit off is fine.
     expect(supportsZeroPromptInjection('antigravity', { sandbox: 'off' })).toBe(true);
     expect(supportsZeroPromptInjection('doubao', { sandbox: 'off' })).toBe(true);
-    // The classic structured CLIs keep their existing scratch behaviour
-    // (their host-view gap predates this PR and is not widened here).
     expect(supportsZeroPromptInjection('codex', { sandbox: 'scratch' })).toBe(true);
   });
 });

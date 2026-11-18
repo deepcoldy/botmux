@@ -5073,7 +5073,14 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       saved: tr('botDefaults.sandboxSaved'),
       // On this route only scratch can trip the zero-injection invariant.
       errorText: res => res.body?.error === 'zero_prompt_unsupported'
-        ? tr('botDefaults.promptInjectionUnsupportedScratch')
+        ? tr(
+            zeroPromptInjectionUnsupportedReason(bot.cliId, {
+              backendType: resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType),
+              sandbox: 'scratch',
+            }) === 'scratch_unsupported_for_backend'
+              ? 'botDefaults.promptInjectionUnsupportedScratchBackend'
+              : 'botDefaults.promptInjectionUnsupportedScratch',
+          )
         : configErrorText(res, tr),
       onSaved: body => patchBot(bot.larkAppId, {
         sandbox: body.sandbox === true,
@@ -6685,7 +6692,7 @@ const ZERO_PROMPT_UNSUPPORTED_COPY: Record<ZeroPromptUnsupportedReason, string> 
   cli_unsupported: 'botDefaults.promptInjectionUnsupportedCli',
   backend_unsupported: 'botDefaults.promptInjectionUnsupportedBackend',
   scratch_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedScratch',
-  zmx_unsupported_for_antigravity: 'botDefaults.promptInjectionUnsupportedZmx',
+  scratch_unsupported_for_backend: 'botDefaults.promptInjectionUnsupportedScratchBackend',
 };
 
 /** 「高级」tab 里 herdr 放置配置区块是否展示：有效后端（bot 覆盖 → daemon 默认 →

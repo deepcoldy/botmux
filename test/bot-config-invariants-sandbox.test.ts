@@ -141,8 +141,8 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
     })).toBeUndefined();
   });
 
-  it('flags zero injection under scratch for CLIs that lose it there (cursor/doubao/antigravity); repair exits stay writable', () => {
-    for (const cliId of ['cursor', 'doubao', 'antigravity']) {
+  it('flags zero injection under scratch for CLIs/backends that lose it there (cursor/doubao and scratch+zmx); repair exits stay writable', () => {
+    for (const cliId of ['cursor', 'doubao']) {
       expect(botConfigInvariantError({ cliId, promptInjection: 'none', sandbox: 'scratch' })).toBe('zero_prompt_unsupported');
       // repair exits: leave scratch, or turn zero injection off
       expect(botConfigInvariantError({ cliId, promptInjection: 'none', sandbox: 'oncall' })).toBeUndefined();
@@ -150,7 +150,12 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
       expect(botConfigInvariantError({ cliId, promptInjection: 'default', sandbox: 'scratch' })).toBeUndefined();
       expect(botConfigInvariantError({ cliId, sandbox: 'scratch' })).toBeUndefined();
     }
-    // scratch does not take zero injection away from these
+    // zmx + scratch is rejected for zero-injection bots; leaving scratch or switching to tmux/pty repairs it
+    expect(botConfigInvariantError({ cliId: 'antigravity', backendType: 'zmx', promptInjection: 'none', sandbox: 'scratch' })).toBe('zero_prompt_unsupported');
+    expect(botConfigInvariantError({ cliId: 'antigravity', backendType: 'zmx', promptInjection: 'none', sandbox: 'oncall' })).toBeUndefined();
+    expect(botConfigInvariantError({ cliId: 'antigravity', backendType: 'tmux', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
+    // scratch does not take zero injection away from these on supported backends
+    expect(botConfigInvariantError({ cliId: 'antigravity', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
     expect(botConfigInvariantError({ cliId: 'codex', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
     expect(botConfigInvariantError({ cliId: 'claude-code', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
     // a CLI with no zero injection at all is not made worse by scratch; its edits are not locked here
