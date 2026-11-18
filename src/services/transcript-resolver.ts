@@ -50,6 +50,13 @@ export interface TranscriptPathQuery {
 export interface ResolvedTranscriptPath {
   path: string;
   kind: TranscriptKind;
+  /** Set when the path runs through a tree the session's CLI can write to (a
+   *  sandboxed bot's BOT_HOME, a scratch view): the directory, outside that
+   *  tree, below which every component must be a real directory and the leaf
+   *  a regular file. The check made here is only as good as the moment it is
+   *  made, so a reader of such a path re-checks the file it actually opened
+   *  (see context-rewind's transcript reads). */
+  writableTreeRoot?: string;
 }
 
 const sessionPathCache = new Map<string, { path: string | null; atMs: number }>();
@@ -211,6 +218,45 @@ function botHomeCliDataDir(
     return cliDataDir;
   } catch {
     return null; // unsafe app id — never build a path from it
+  }
+}
+
+/** The root of the CLI-writable tree `path` runs through, if any: for a
+ *  scratch view, the view's own root (the session cannot replace the view it
+ *  lives in); for a path under a bot's BOT_HOME, the `bots` directory holding
+ *  it, so BOT_HOME itself is checked too (the resolver rejects a replaced app
+ *  root for the same reason). Decided from where the path lies, never from
+ *  the tree's current state: a check that fails here must not drop the root
+ *  and leave the path unguarded. */
+export function claudeWritableTreeRoot(
+  path: string,
+  scratch: ScratchPathMapping[] | undefined,
+  larkAppId: string | undefined,
+): string | undefined {
+  const within = (root: string) => {
+    const rel = relative(resolve(root), resolve(path));
+    return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  };
+  if (scratch) {
+    // Longest view prefix first, like scratchViewPath's host-side lookup. A
+    // scratch path outside every view is not one this resolver hands out;
+    // should it happen, the longest view is still the tree to check against.
+    const views = scratch.map(m => m.to).sort((a, b) => b.length - a.length);
+    return views.find(within) ?? views[0];
+  }
+  const bots = botsDirOf(larkAppId);
+  return bots && within(bots) ? bots : undefined;
+}
+
+/** `<botmuxHome>/bots`, derived exactly like botHomeCliDataDir but without
+ *  looking at the disk. */
+function botsDirOf(larkAppId: string | undefined): string | undefined {
+  const sessionDataDir = process.env.SESSION_DATA_DIR;
+  if (!larkAppId || !sessionDataDir) return undefined;
+  try {
+    return dirname(botHomePath(dirname(sessionDataDir), larkAppId));
+  } catch {
+    return undefined; // unsafe app id: botHomeCliDataDir never builds a path from it either
   }
 }
 
@@ -399,7 +445,9 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = svMappings
         ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
         : claudeJsonlWithBotHomeFallback(sid, sq, dataRoot);
-      return path ? { path, kind: 'claude' } : null;
+      if (!path) return null;
+      const writableTreeRoot = claudeWritableTreeRoot(path, svMappings, q.larkAppId);
+      return { path, kind: 'claude', ...(writableTreeRoot ? { writableTreeRoot } : {}) };
     }
     case 'aiden': {
       const homeRoot = v(join(homedir(), '.claude'));
