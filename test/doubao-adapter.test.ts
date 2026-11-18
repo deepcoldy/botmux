@@ -4,6 +4,44 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+type ExecFileOpts = {
+  timeout?: number;
+  maxBuffer?: number;
+  env?: NodeJS.ProcessEnv;
+  windowsHide?: boolean;
+};
+type ExecFileCall = { file: string; args: string[]; opts: ExecFileOpts };
+type ExecFileHandler = (
+  file: string,
+  args: string[],
+  opts: ExecFileOpts,
+  cb: (err: Error | null, stdout: string, stderr: string) => void,
+) => void;
+
+const execFileCalls: ExecFileCall[] = [];
+let execFileHandler: ExecFileHandler | null = null;
+
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execFile: (...rawArgs: unknown[]) => {
+      if (!execFileHandler) {
+        return (actual.execFile as (...args: unknown[]) => unknown)(...rawArgs);
+      }
+      const [file, args, opts, cb] = rawArgs as [
+        string,
+        string[],
+        ExecFileOpts,
+        (err: Error | null, stdout: string, stderr: string) => void,
+      ];
+      execFileCalls.push({ file, args, opts });
+      execFileHandler(file, args, opts, cb);
+      return undefined;
+    },
+  };
+});
+
 import {
   DOUBAO_BUSY_FOOTER,
   DOUBAO_READY_PATTERN,
@@ -15,6 +53,8 @@ import {
   doubaoSessionRoots,
   findDoubaoSessionForSubmit as findDoubaoSessionForSubmitContent,
   parseDoubaoAvailableModels,
+  parseDoubaoModelListJson,
+  parseDoubaoVersion,
   pollDoubaoSessionForSubmit,
   DOUBAO_SUBMIT_CAPTURE_BUDGET_MS,
 } from '../src/adapters/cli/doubao.js';
@@ -26,6 +66,8 @@ const OTHER_SID = '38450174181084930';
 
 const tempDirs: string[] = [];
 afterEach(() => {
+  execFileCalls.length = 0;
+  execFileHandler = null;
   vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -683,5 +725,167 @@ describe('doubao model discovery', () => {
     const out = 'Error: Unsupported --model value. Available models: Auto, Doubao 2.1 Lite, Doubao 2.1 Pro, GPT-6.1 Sol. Start doubao without --model and use /model to view available models.';
     expect(parseDoubaoAvailableModels(out)).toEqual(['Auto', 'Doubao 2.1 Lite', 'Doubao 2.1 Pro', 'GPT-6.1 Sol']);
     expect(parseDoubaoAvailableModels('Error: not logged in')).toBeNull();
+  });
+
+  it('parses semver triples from doubao --version output', () => {
+    expect(parseDoubaoVersion('doubao 2.37.1\n')).toEqual([2, 37, 1]);
+    expect(parseDoubaoVersion('doubao 2.36.2')).toEqual([2, 36, 2]);
+    expect(parseDoubaoVersion('\u001b[32mv2.37.1\u001b[0m')).toEqual([2, 37, 1]);
+    expect(parseDoubaoVersion('doubao 2.37.1-rc.1')).toEqual([2, 37, 1]);
+    expect(parseDoubaoVersion('')).toBeNull();
+    expect(parseDoubaoVersion('doubao unknown')).toBeNull();
+    expect(parseDoubaoVersion('doubao 1.2.3.4')).toBeNull();
+  });
+
+  it('parses doubao model list --json output, trimming and deduplicating names', () => {
+    const payload = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: {
+        type: 'model_list',
+        models: [
+          { id: '9', name: ' Auto ', is_default: false },
+          { id: 'seed-lite-7b', name: '豆包 2.1 Lite', is_default: false },
+          { id: 'blank', name: '   ' },
+          { id: 'missing-name' },
+          { id: 'dup', name: 'Auto' },
+          { id: '5262373378', name: 'GPT 6.1 Sol' },
+        ],
+      },
+    });
+    expect(parseDoubaoModelListJson(payload)).toEqual(['Auto', '豆包 2.1 Lite', 'GPT 6.1 Sol']);
+    expect(parseDoubaoModelListJson('not json')).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: true, result: { models: [{ name: 'Auto' }] } }))).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: {} }))).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: { models: [] } }))).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: { models: [{ name: '  ' }, { id: 'x' }] } }))).toBeNull();
+  });
+
+  it('does not spawn a subprocess on adapter construction or buildArgs', () => {
+    execFileHandler = (_file, _args, _opts, cb) => cb(null, '', '');
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    adapter.buildArgs({ sessionId: 's', resume: false });
+    expect(execFileCalls).toEqual([]);
+  });
+
+  it('uses `model list --json` on doubao >= 2.37.1, ignoring stderr logs and preserving env/order', async () => {
+    const catalogJson = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: {
+        type: 'model_list',
+        models: [
+          { id: '9', name: 'Auto', is_default: false },
+          { id: 'seed-lite-7b', name: '豆包 2.1 Lite', is_default: false },
+          { id: '5', name: 'Doubao 2.1 Pro', is_default: false },
+          { id: '5', name: 'Doubao 2.1 Pro', is_default: false },
+        ],
+      },
+    });
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        cb(null, 'doubao 2.37.1\n', '');
+        return;
+      }
+      cb(
+        null,
+        `${catalogJson}\n`,
+        '[cli-chat] {"level":"info","eventName":"cli_task_started"}\n',
+      );
+    };
+
+    const customEnv = Object.freeze({ PATH: '/usr/bin', DOUBAO_CLI_NO_UPDATE_CHECK: '0' });
+    const { detectModels } = createDoubaoAdapter('/bin/doubao');
+    await expect(detectModels!({ env: customEnv })).resolves.toEqual([
+      'Auto',
+      '豆包 2.1 Lite',
+      'Doubao 2.1 Pro',
+    ]);
+    expect(execFileCalls.map(c => ({ file: c.file, args: c.args }))).toEqual([
+      { file: '/bin/doubao', args: ['--version'] },
+      { file: '/bin/doubao', args: ['model', 'list', '--json'] },
+    ]);
+    for (const call of execFileCalls) {
+      expect(call.opts.timeout).toBe(10_000);
+      expect(call.opts.env?.DOUBAO_CLI_NO_UPDATE_CHECK).toBe('1');
+    }
+    expect(customEnv.DOUBAO_CLI_NO_UPDATE_CHECK).toBe('0');
+  });
+
+  it.each(['doubao 2.38.0', 'doubao 3.0.0'])('routes newer %s to `model list --json`', async (versionLine) => {
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        cb(null, versionLine, '');
+        return;
+      }
+      cb(null, JSON.stringify({ is_error: false, result: { models: [{ name: 'Auto' }] } }), '');
+    };
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    await expect(adapter.detectModels!()).resolves.toEqual(['Auto']);
+    expect(execFileCalls.map(c => c.args)).toEqual([['--version'], ['model', 'list', '--json']]);
+  });
+
+  it.each(['doubao 2.36.2', 'doubao 2.37.0'])('keeps the legacy --model probe on %s (< 2.37.1)', async (versionLine) => {
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        cb(null, `${versionLine}\n`, '');
+        return;
+      }
+      cb(
+        new Error('Command failed with exit code 1'),
+        '',
+        'Error: Unsupported --model value. Available models: Auto, Doubao 2.1 Pro. Start doubao without --model and use /model to view available models.',
+      );
+    };
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    await expect(adapter.detectModels!()).resolves.toEqual(['Auto', 'Doubao 2.1 Pro']);
+    expect(execFileCalls.map(c => c.args)).toEqual([
+      ['--version'],
+      ['--model', '__botmux_model_probe__', '-p', 'probe'],
+    ]);
+    expect(execFileCalls[1]!.opts.timeout).toBe(10_000);
+    expect(execFileCalls[1]!.opts.env?.DOUBAO_CLI_NO_UPDATE_CHECK).toBe('1');
+  });
+
+  it('returns null when legacy < 2.37.1 probe prints an unparseable error', async () => {
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') cb(null, 'doubao 2.36.2', '');
+      else cb(new Error('exit 1'), '', 'Error: not logged in');
+    };
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    await expect(adapter.detectModels!()).resolves.toBeNull();
+  });
+
+  it('returns null without running model discovery when --version fails or is unparseable', async () => {
+    execFileHandler = (_file, _args, _opts, cb) => cb(new Error('spawn ENOENT'), '', '');
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    await expect(adapter.detectModels!()).resolves.toBeNull();
+    expect(execFileCalls).toHaveLength(1);
+
+    execFileCalls.length = 0;
+    execFileHandler = () => { throw new Error('sync exec error'); };
+    await expect(adapter.detectModels!()).resolves.toBeNull();
+    expect(execFileCalls).toHaveLength(1);
+
+    execFileCalls.length = 0;
+    execFileHandler = (_file, _args, _opts, cb) => cb(null, 'doubao unknown version', '');
+    await expect(adapter.detectModels!()).resolves.toBeNull();
+    expect(execFileCalls).toHaveLength(1);
+  });
+
+  it.each([
+    ['command error', new Error('exit 2'), JSON.stringify({ is_error: false, result: { models: [{ name: 'Auto' }] } })],
+    ['malformed JSON', null, '{not-json'],
+    ['is_error envelope', null, JSON.stringify({ is_error: true, result: { models: [{ name: 'Auto' }] } })],
+    ['empty models list', null, JSON.stringify({ is_error: false, result: { models: [] } })],
+  ])('returns null on 2.37.1 `model list --json` failure (%s)', async (_label, listErr, listStdout) => {
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') cb(null, 'doubao 2.37.1', '');
+      else cb(listErr, listStdout, '');
+    };
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    await expect(adapter.detectModels!()).resolves.toBeNull();
   });
 });

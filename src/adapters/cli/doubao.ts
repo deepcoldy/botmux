@@ -313,6 +313,88 @@ export function parseDoubaoAvailableModels(output: string): string[] | null {
   return models.length > 0 ? models : null;
 }
 
+const DOUBAO_MODEL_LIST_MIN_VERSION: readonly [number, number, number] = [2, 37, 1];
+const DOUBAO_DETECT_TIMEOUT_MS = 10_000;
+
+/** Parse `major.minor.patch` from `doubao --version` output (e.g. `doubao 2.37.1`). */
+export function parseDoubaoVersion(output: string): [number, number, number] | null {
+  const cleaned = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const m = /(?:^|[^.\d])v?(\d+)\.(\d+)\.(\d+)(?![.\d])/.exec(cleaned);
+  if (!m) return null;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  const patch = Number(m[3]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) {
+    return null;
+  }
+  return [major, minor, patch];
+}
+
+function isDoubaoVersionAtLeast(
+  version: readonly [number, number, number],
+  min: readonly [number, number, number],
+): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (version[i]! !== min[i]!) return version[i]! > min[i]!;
+  }
+  return true;
+}
+
+/** Parse `doubao model list --json` stdout (`result.models[].name`, doubao >= 2.37.1),
+ *  trimming whitespace, dropping blanks, and deduplicating in first-seen order. */
+export function parseDoubaoModelListJson(stdout: string): string[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const envelope = parsed as { is_error?: unknown; result?: unknown };
+  if (envelope.is_error) return null;
+  if (typeof envelope.result !== 'object' || envelope.result === null) return null;
+  const models = (envelope.result as { models?: unknown }).models;
+  if (!Array.isArray(models)) return null;
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const entry of models) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const rawName = (entry as { name?: unknown }).name;
+    if (typeof rawName !== 'string') continue;
+    const name = rawName.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names.length > 0 ? names : null;
+}
+
+function execDoubaoProbe(
+  bin: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  maxBuffer = 64 * 1024,
+): Promise<{ err: Error | null; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    try {
+      execFile(bin, [...args], {
+        timeout: DOUBAO_DETECT_TIMEOUT_MS,
+        maxBuffer,
+        windowsHide: true,
+        env,
+      }, (err, stdout, stderr) => {
+        resolve({
+          err: err ?? null,
+          stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
+          stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
+        });
+      });
+    } catch (err) {
+      resolve({ err: err instanceof Error ? err : new Error(String(err)), stdout: '', stderr: '' });
+    }
+  });
+}
+
 /** Doubao CLI (`@bytedance-dev/doubao-cli` / `@bytedance/doubao-cli`).
  *
  *  Interactive TUI (alternate screen). Session ids are server-assigned and never
@@ -451,20 +533,33 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     skillsDir: '~/Doubao/skills',
     modelChoices: CLI_MODEL_CHOICES['doubao'],
 
-    async detectModels() {
-      // Models are account-dependent display names. An unsupported --model makes
-      // doubao print the authoritative list and exit 1 before any session or
-      // model call is created.
-      const bin = cachedBin ??= resolveCommand(rawBin);
-      return new Promise<readonly string[] | null>(resolve => {
-        execFile(bin, ['--model', '__botmux_model_probe__', '-p', 'probe'], {
-          timeout: 10_000,
-          maxBuffer: 64 * 1024,
-          env: { ...process.env, DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
-        }, (_err, stdout, stderr) => {
-          try { resolve(parseDoubaoAvailableModels(`${stdout ?? ''}\n${stderr ?? ''}`)); } catch { resolve(null); }
-        });
-      });
+    async detectModels(options) {
+      // Doubao CLI 2.37.1+ adds read-only `doubao model list --json`
+      // (`result.models[].name`) and localizes its invalid `--model` diagnostic
+      // into Chinese, so the legacy English error probe resolves null on 2.37.1+.
+      // Check `doubao --version` asynchronously on demand first (never on adapter
+      // construction or session startup): >= 2.37.1 uses `model list --json`;
+      // older versions keep the unsupported `--model` probe unchanged.
+      try {
+        const bin = cachedBin ??= resolveCommand(rawBin);
+        const env: NodeJS.ProcessEnv = {
+          ...(options?.env ?? process.env),
+          DOUBAO_CLI_NO_UPDATE_CHECK: '1',
+        };
+        const versionRes = await execDoubaoProbe(bin, ['--version'], env);
+        if (versionRes.err) return null;
+        const version = parseDoubaoVersion(versionRes.stdout || versionRes.stderr);
+        if (!version) return null;
+        if (isDoubaoVersionAtLeast(version, DOUBAO_MODEL_LIST_MIN_VERSION)) {
+          const listRes = await execDoubaoProbe(bin, ['model', 'list', '--json'], env, 1024 * 1024);
+          if (listRes.err) return null;
+          return parseDoubaoModelListJson(listRes.stdout);
+        }
+        const probeRes = await execDoubaoProbe(bin, ['--model', '__botmux_model_probe__', '-p', 'probe'], env);
+        return parseDoubaoAvailableModels(`${probeRes.stdout}\n${probeRes.stderr}`);
+      } catch {
+        return null;
+      }
     },
   };
 }
