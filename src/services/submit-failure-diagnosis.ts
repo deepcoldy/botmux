@@ -125,11 +125,13 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
 }
 
 /** Whether Claude's last input box still holds `input`: the chip of a multi-line
- *  paste, or its opening or closing text (compared without whitespace and the `\` of typed
+ *  paste, or the opening or closing text of its `<user_message>` body, else of the whole input (compared without whitespace and the `\` of typed
  *  soft newlines, so wrapped or multi-line drafts still match). */
 export function claudeComposerHoldsInput(screenText: string, input: string): boolean {
   const compact = (text: string) => text.replace(/[\s\\]+/g, '');
-  const compactInput = compact(input);
+  const open = input.indexOf('<user_message>');
+  const close = input.lastIndexOf('</user_message>');
+  const compactInput = compact(open >= 0 && close > open ? input.slice(open + '<user_message>'.length, close) : input);
   const head = compactInput.slice(0, 40);
   const tail = compactInput.slice(-40);
   for (const bodyText of claudeComposerBodies(stripAnsiScreenText(screenText))) {

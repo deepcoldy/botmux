@@ -384,6 +384,18 @@ describe('claudeComposerHoldsInput', () => {
       expect(diagnoseSubmitFailure({ screenText: screen, cliId: 'claude-code', nowMs: NOW }).reason).toBe('draft_parked');
     });
 
+    it('matches by the user_message body when the envelope is shared', () => {
+      const wrap = (body: string) => `<botmux_formatting>fmt</botmux_formatting>\n<user_message>\n${body}\n</user_message>\n<sender id="ou_1" />\n<mentions>\n  @bot\n</mentions>`;
+      const bodyA = Array.from({ length: 20 }, (_, i) => `alpha row ${i} of the first draft`).join('\n');
+      const bodyB = Array.from({ length: 20 }, (_, i) => `bravo row ${i} of the second draft`).join('\n');
+      const screenOf = (wrapped: string) => {
+        const rows = wrapped.split('\n').slice(-12);
+        return [RULE.slice(0, 3) + ' ↑ 18 more ' + RULE, ...rows.map(r => `  ${r}\\`), RULE, '  ⏵⏵ bypass permissions on · 1 shell'].join('\n');
+      };
+      expect(claudeComposerHoldsInput(screenOf(wrap(bodyA)), wrap(bodyA))).toBe(true);
+      expect(claudeComposerHoldsInput(screenOf(wrap(bodyA)), wrap(bodyB))).toBe(false);
+    });
+
     it('does not match a different scrolled draft', () => {
       expect(claudeComposerHoldsInput(scrolledScreen, 'something else entirely, long enough to compare against')).toBe(false);
     });
