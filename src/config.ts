@@ -269,6 +269,12 @@ export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.
   return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS, 5_000);
 }
 
+/** Per `git worktree add` budget, including checkout hooks. Other Git
+ * commands and worktree target lock waits retain their own timeouts. */
+export function resolveWorktreeCreateTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_CREATE_TIMEOUT_MS, 60_000);
+}
+
 export const config = {
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },

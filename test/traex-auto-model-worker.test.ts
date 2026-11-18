@@ -1091,13 +1091,23 @@ describe('Worker read-only capacity query', () => {
     expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(expect.objectContaining({ toModel: 'backup' }), { resumeCurrentTurn: true });
   });
   it.each([
-    { currentBotmuxTurnId: 'passthrough' }, { commandLineWritesPending: 1 },
-    { traexAutoModelTurnReplayForbidden: true }, { isFlushing: true },
-  ])('ignores a completed query after the input boundary changed (%j)', async changed => {
+    [{ currentBotmuxTurnId: 'passthrough' }, 'botmuxTurnChanged'], [{ commandLineWritesPending: 1 }, 'commandWritesPending'],
+    [{ traexAutoModelTurnReplayForbidden: true }, 'replayForbidden'], [{ isFlushing: true }, 'flushing'],
+  ] as const)('ignores a completed query after the input boundary changed (%j), naming the change', async (changed, label) => {
     const h = query(); Object.assign(h.scope, changed);
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    // The ordered fallback that follows must not look like a skipped choice.
+    expect(h.scope.log).toHaveBeenCalledWith(`TraeX model load reply discarded (${label}; snapshot=present)`);
+  });
+  it('logs why a capacity load read was unavailable', () => {
+    const h = query();
+    const options = h.read.mock.calls[0]![0] as { onUnavailable?: (reason: string) => void };
+    options.onUnavailable?.('timed out after 8000ms (waiting for model/list page 1); 8001ms after launch');
+    expect(h.scope.log).toHaveBeenCalledWith(
+      'TraeX model load read unavailable: timed out after 8000ms (waiting for model/list page 1); 8001ms after launch',
+    );
   });
   it.each([
     { currentBotmuxTurnId: 'passthrough' }, { commandLineWritesPending: 1 },

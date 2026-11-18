@@ -12,7 +12,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
@@ -20,7 +20,7 @@ import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies, credentialSourceOf, capabilityOn } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
-import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { startBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
 import { meegoLoginCommand } from './provider-auth-request.js';
@@ -156,7 +156,7 @@ import { markProjectImportPending, noteProjectAssociationChanged } from './proje
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
-import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -1251,11 +1251,15 @@ async function applyAllowedUsersSet(
   await reply(msg);
 }
 
-function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
+function bytedcliLoginSuccessReply(
+  botConfig: BotConfig,
+  locale: Locale,
+  headline: 'cmd.login.bytedcli_ok' | 'cmd.login.bytedcli_already' = 'cmd.login.bytedcli_ok',
+): string {
   const policy = botConfig.triggerUserAuth;
   const enabled = capabilityOn(policy, 'bytecloud');
   const lines = [
-    t('cmd.login.bytedcli_ok', undefined, locale),
+    t(headline, undefined, locale),
     t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
   ];
   if (enabled && policy?.gitHost) {
@@ -3998,7 +4002,7 @@ export async function handleCommand(
         }
         // The canonical resolver follows the frozen config profile and the sandbox
         // BOT_HOME redirect — the paths the CLI actually wrote.
-        const rewindJsonl = ds.session.cliSessionId
+        const rewindTranscript = ds.session.cliSessionId
           ? resolveSessionTranscriptPath({
               cliId: 'claude-code',
               sessionId: ds.session.sessionId,
@@ -4006,8 +4010,18 @@ export async function handleCommand(
               cwd: getSessionWorkingDir(ds),
               larkAppId: ds.larkAppId,
               fresh: true,
-            })?.path ?? null
+            })
           : null;
+        const rewindJsonl = rewindTranscript?.path ?? null;
+        // Every read and the cut re-check the file they open against the tree
+        // the CLI can write to; the resolver's own check is from before. The
+        // backup of such a transcript goes to a daemon-owned directory.
+        const rewindScope = rewindTranscript?.writableTreeRoot
+          ? {
+              writableTreeRoot: rewindTranscript.writableTreeRoot,
+              backupDir: join(config.session.dataDir, 'rewind-backups', ds.session.sessionId),
+            }
+          : {};
         if (!rewindJsonl) {
           await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
           break;
@@ -4018,7 +4032,7 @@ export async function handleCommand(
         // top-level catch only logs, so without this local catch the user gets
         // NO reply while the CLI may already have been stopped.
         try {
-          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT);
+          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT, rewindScope);
           const formatCheckpointAt = (iso?: string): string => {
             if (!iso) return '-';
             const d = new Date(iso);
@@ -4066,7 +4080,6 @@ export async function handleCommand(
             break;
           }
           const rewindSessionKey = ds.session.sessionId;
-          const rewindSize = statSync(rewindJsonl).size;
           const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
           if (rewindMatch[2] && pendingPreview && (
             pendingPreview.index !== rewindIndex
@@ -4083,7 +4096,8 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
               index: rewindIndex,
               turns: rewindIndex,
-              bytes: rewindSize - rewindTarget.offset,
+              // From the scan's own descriptor: never a second read by path.
+              bytes: rewindTarget.removedBytes,
               preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
             }, loc));
             break;
@@ -4153,49 +4167,56 @@ export async function handleCommand(
               if (!await waitForTranscriptQuiet(rewindJsonl)) {
                 return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
               }
-              // Re-resolve the target by identity: the file may have gained a turn
-              // between preview and confirm, which shifts every index.
-              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
-              // index must still match: a turn that landed after the preview would
-              // otherwise be removed silently along with the previewed ones.
-              if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
-                return { ok: false as const, code: 'moved' as const };
-              }
-              // Persist replay-state clearing BEFORE the cut: if this throws
-              // (sqlite busy, disk full), nothing has been truncated and the
-              // live session keeps its previous /retry state.
-              const savedReplay = {
-                lastUserPrompt: current.session.lastUserPrompt,
-                lastCliInput: current.session.lastCliInput,
-                lastCliInputTurnId: current.session.lastCliInputTurnId,
-                lastFailedTurn: current.session.lastFailedTurn,
-              };
-              current.session.lastUserPrompt = undefined;
-              current.session.lastCliInput = undefined;
-              current.session.lastCliInputTurnId = undefined;
-              current.session.lastFailedTurn = undefined;
-              try {
-                sessionStore.updateSession(current.session);
-              } catch (err) {
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                return asError(err, 'could not persist rewind state');
-              }
-              let result: RewindResult;
-              try {
-                result = rewindClaudeTranscript(rewindJsonl, target.offset);
-              } catch (err) {
-                // Cut never happened — restore the replay fields so the failed
-                // attempt leaves the session as it was.
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
-                return asError(err);
-              }
+              // The re-scan and the cut go through ONE open descriptor: the
+              // offset is cut on exactly the file it was read from, never on
+              // whatever the path names by the time of the cut.
+              const cut = withOpenTranscript(rewindJsonl, rewindScope, transcript => {
+                // Re-resolve the target by identity: the file may have gained a turn
+                // between preview and confirm, which shifts every index.
+                const target = findCheckpoint(transcript.scan(50), pendingPreview.target);
+                // index must still match: a turn that landed after the preview would
+                // otherwise be removed silently along with the previewed ones.
+                if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
+                  return { ok: false as const, code: 'moved' as const };
+                }
+                // Persist replay-state clearing BEFORE the cut: if this throws
+                // (sqlite busy, disk full), nothing has been truncated and the
+                // live session keeps its previous /retry state.
+                const savedReplay = {
+                  lastUserPrompt: current.session.lastUserPrompt,
+                  lastCliInput: current.session.lastCliInput,
+                  lastCliInputTurnId: current.session.lastCliInputTurnId,
+                  lastFailedTurn: current.session.lastFailedTurn,
+                };
+                const restoreReplay = () => {
+                  current.session.lastUserPrompt = savedReplay.lastUserPrompt;
+                  current.session.lastCliInput = savedReplay.lastCliInput;
+                  current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
+                  current.session.lastFailedTurn = savedReplay.lastFailedTurn;
+                };
+                current.session.lastUserPrompt = undefined;
+                current.session.lastCliInput = undefined;
+                current.session.lastCliInputTurnId = undefined;
+                current.session.lastFailedTurn = undefined;
+                try {
+                  sessionStore.updateSession(current.session);
+                } catch (err) {
+                  restoreReplay();
+                  return asError(err, 'could not persist rewind state');
+                }
+                try {
+                  if (rewindScope.backupDir) mkdirSync(rewindScope.backupDir, { recursive: true, mode: 0o700 });
+                  return { ok: true as const, result: transcript.cut(target.offset) };
+                } catch (err) {
+                  // Cut never happened — restore the replay fields so the failed
+                  // attempt leaves the session as it was.
+                  restoreReplay();
+                  try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
+                  return asError(err);
+                }
+              });
+              if (!cut.ok) return cut;
+              const result: RewindResult = cut.result;
               // The CLI will cold-resume from the truncated transcript under the SAME
               // native session id, so group-context coverage still marks the dropped
               // turn's background as delivered and it is not re-injected.
@@ -4858,16 +4879,29 @@ export async function handleCommand(
                   : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
             break;
           }
-          const started = await beginBytedcliLogin(loginOpenId);
-          if (!started) {
-            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
+          // Someone already logged in is told so, whatever the CLI version.
+          // Same order as the wrapper's request: finish a link they already
+          // approved, then ask whether a login is in force, only then start.
+          const pendingChallenge = pendingBytedcliChallenge(loginOpenId);
+          const alreadyAuthorized = (pendingChallenge
+            && (await completeBytedcliLogin(loginOpenId, pendingChallenge)).state === 'authorized')
+            || (await describeBytedcliAuth(loginOpenId)).state === 'authorized';
+          // Newer bytedcli also answers `--begin` with the login it already
+          // holds instead of a link: that is success, not a failure to start.
+          const started = alreadyAuthorized ? { state: 'authorized' as const } : await startBytedcliLogin(loginOpenId);
+          if (started.state === 'authorized') {
+            await sessionReply(rootId, bytedcliLoginSuccessReply(botCfg2, loc, 'cmd.login.bytedcli_already'));
+            break;
+          }
+          if (started.state === 'failed') {
+            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: started.detail }, loc));
             break;
           }
           await authLinkReply([
             t('cmd.login.bytedcli_title', undefined, loc),
             '',
             t('cmd.login.bytedcli_step1', undefined, loc),
-            started.authUrl,
+            started.challenge.authUrl,
             '',
             t('cmd.login.bytedcli_step2', undefined, loc),
             '',

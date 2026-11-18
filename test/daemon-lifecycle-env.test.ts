@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
 import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
+import { resolveWorktreeCreateTimeoutMs } from '../src/config.js';
 
 it('reloads final-output handoff and clears a removed switch on managed restart', () => {
   expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '0' }, 'BOTMUX_FINAL_OUTPUT_HANDOFF=1'))
@@ -155,6 +156,34 @@ describe('resolveDaemonEnv()', () => {
     ].join('\n'))).toMatchObject({
       BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '',
     });
+  });
+
+  it('re-reads the worktree create timeout from .env on a session-origin restart, including rollback', () => {
+    // Same lifecycle gap as the sender-resolve timeout above: this key is not
+    // scrubbed at the CLI pane boundary, so a restart from inside a session
+    // inherits the OLD daemon's value and the daemon's dotenv load never
+    // overrides an inherited key. The lifecycle snapshot must resolve it from
+    // the persisted file; otherwise editing ~/.botmux/.env has no effect and
+    // deleting the key can never restore the documented 60s default.
+    const inheritedWithStaleValue = {
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '60000',
+    };
+
+    const edited = resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_WORKTREE_CREATE_TIMEOUT_MS=90000',
+    ].join('\n'));
+    expect(edited).toMatchObject({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '90000' });
+    // End-to-end consumption: the restarted daemon resolves the fresh budget.
+    expect(resolveWorktreeCreateTimeoutMs(edited)).toBe(90_000);
+
+    // Rollback: key removed from the file resolves to '' and the consumer
+    // falls back to its 60s default instead of keeping the stale value.
+    const removed = resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=1500',
+    ].join('\n'));
+    expect(removed).toMatchObject({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '' });
+    expect(resolveWorktreeCreateTimeoutMs(removed)).toBe(60_000);
   });
 
   it('keeps ordinary shell overrides ahead of .env', () => {

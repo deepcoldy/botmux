@@ -18,6 +18,7 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
+import { excludedTurnActivityAt } from './turn-outcome.js';
 import {
   closeSessionForBackgroundCleanup,
   forkWorker,
@@ -734,6 +735,7 @@ function waitForSessionFinalOutput(
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      createdAt: Date.now(),
       resolve: (text: string) => {
         clearTimeout(timer);
         ds.pendingWaitPromises?.delete(triggerId);
@@ -1408,7 +1410,12 @@ async function triggerSessionTurnAdmitted(
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
     const recordAcceptedInput = (): void => {
-      markSessionActivity(target);
+      // Registration and accepted-input publication can cross a millisecond
+      // boundary. Reuse the exact per-turn timestamp that the excluded-terminal
+      // hold will read, so this round cannot stay pending behind its own later
+      // wall-clock acceptance time. Never take max(lastMessageAt): a subsequent
+      // human input owns that later timestamp.
+      markSessionActivity(target, excludedTurnActivityAt(target, triggerId) ?? Date.now());
       rememberInput(target, prompt, content);
     };
 

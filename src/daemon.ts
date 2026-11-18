@@ -192,7 +192,7 @@ import {
 } from './services/durable-lark-primary-runtime.js';
 import {
   deliverDurableLarkOutbox,
-  durableLarkOutboxMessage,
+  durableLarkOutboxMessage, durableReplyFileContent,
   type DurableLarkOutboxTarget,
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
@@ -35733,7 +35733,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   sendStartupWelcomeMessages(durableCoordinationRuntime?.mode ?? 'disabled');
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
-      request: DurableSessionSendRequest,
+      request: DurableSessionSendRequest, replyFileDigest?: string,
     ): Promise<DurableSessionSendResult> => {
       const runtime = durablePrimaryRuntimeByApp.get(request.daemonSession.larkAppId);
       if (!runtime) throw new Error('durable primary output runtime is unavailable');
@@ -35755,7 +35755,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         sessionKey: canonicalKey,
         larkAppId: request.daemonSession.larkAppId,
         target: request.target,
-        content: request.content,
+        content: replyFileDigest ? await durableReplyFileContent(durableCoordinationRuntime.store,
+          `out_${request.providerUuid}`, replyFileDigest, request.content) : request.content,
         msgType: request.msgType,
         providerUuid: request.providerUuid,
         hookContext: request.hookContext,
@@ -35801,8 +35802,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       hookContext: {
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
+        ...(request.replyFileDigest ? { replyFileDigest: request.replyFileDigest } : {}),
       },
-    }));
+    }, request.replyFileDigest));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
     const quarantinedDashboardSessionKeys = new Set<string>();
     setDurableSessionListHandler(async () => {
@@ -36133,6 +36135,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
+    getQuietHours: () => getBot(cfg.larkAppId).config.sessionOwnerReminder?.quietHours,
     canSend: ds => larkTransportEnabled({
       chatId: ds.chatId,
       apiOnly: getBot(ds.larkAppId).config.apiOnly,

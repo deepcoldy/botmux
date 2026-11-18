@@ -84,10 +84,13 @@ These variables (including the app secret) are used only by the Dashboard proces
 | `BOTMUX_RECOVERY_FORK_BATCH` | `5` | When botmux restarts and recovers sessions, how many it relaunches per batch, so they don't all start at once and swamp the machine. Minimum `1` |
 | `BOTMUX_RECOVERY_FORK_DELAY_MS` | `250` | Pause (ms) between recovery batches. Minimum `0` |
 | `BOTMUX_WORKTREE_SLUG_AI_ENABLED` | Off | Set `true` to name new worktree branches with AI. See "Name worktrees with AI" below |
+| `BOTMUX_WORKTREE_CREATE_TIMEOUT_MS` | `60000` | Timeout (ms) for each `git worktree add`, including checkout and `post-checkout` hooks. Must be an integer from `1` to `2147483647`; invalid values use the default |
 | `BOTMUX_ALLOW_UNKNOWN_SCOPES` | Unset | Set `1` to request Feishu scopes not yet in botmux's scope list (syntax check only). A stopgap when Feishu ships a new scope before a botmux release |
 | `BOTMUX_CODEX_NODE_REPL_PATH` | Unset | Absolute path to an installed Codex `node_repl` executable, for opt-in browser features when no MCP runtime is configured |
 
 `BOTMUX_ASK_TIMEOUT_MS` and `BOTMUX_PERMISSION_TIMEOUT_MS` are read by the CLI inside the session, which inherits them from `~/.botmux/.env` by default. Because they start with `BOTMUX`, they are botmux-reserved and can't be set per bot in the session environment. When a bot uses [strict process environment](/en/bots-json#strict-env), they don't reach the session and the defaults apply.
+
+Set `BOTMUX_WORKTREE_CREATE_TIMEOUT_MS=180000` in `~/.botmux/.env` and restart botmux to give slow checkout hooks a 3-minute budget. This applies to shared creation flows: automatic session worktrees, the repository picker, `/repo wt`, `/tw`, multi-repository worktrees, isolated member worktrees, and restoration of deleted worktrees. It only changes each `git worktree add` budget, not fetch, push, cleanup, target lock waits, or the total creation time. Existing worktree reuse rules remain unchanged. When creation throws, ordinary automatic creation falls back to the default directory, the local `oncall` sandbox refuses to start, and explicit requests report the error to the caller.
 
 ### Name worktrees with AI (optional)
 

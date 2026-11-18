@@ -575,6 +575,7 @@ import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.j
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
+import { claudeProjectsRootForLaunch, type ClaudeProjectsRoot } from './services/claude-projects-root.js';
 import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
@@ -815,6 +816,7 @@ import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { runnerFinalOutcome } from './services/runner-final-outcome.js';
+import { MinimaxFinalReceiver } from './services/minimax-final-control.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
@@ -2129,6 +2131,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     delete context.scope.execution;
     return { ...msg, sessionContract: context };
   }
+  // turnId on a screen is presentation context, not execution authority.
+  // The sampler can outlive both the turn and an in-process identity rebind.
+  if (msg.type === 'screen_update') {
+    const context = workerSessionEventScope.envelope(origin ?? workerSessionEventScope.screenObservationOrigin());
+    delete context.scope.execution;
+    return { ...msg, sessionContract: context };
+  }
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
@@ -2140,12 +2149,6 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
-    if (execution) context.scope.execution = execution;
-  }
-  if (msg.type === 'screen_update' && context.scope.execution
-    && (msg.turnId !== context.scope.execution.turnId || msg.dispatchAttempt !== context.scope.execution.dispatchAttempt)) {
-    delete context.scope.execution;
-    const execution = workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
     if (execution) context.scope.execution = execution;
   }
   // Physical process proof is available before an opening attempt is bound.
@@ -6216,6 +6219,7 @@ function setCaptureIdentity(
   forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
@@ -6901,6 +6905,18 @@ function observeTraexAutoModelCapacity(screen: string): void {
         || currentBotmuxTurnId !== action.turnId || commandLineWritesPending > 0
         || isFlushing || traexQuotaPending || controller.recoveryStopped(action.turnId)
         || traexAutoModelTurnReplayForbidden) {
+        // Discarding is not a failed read: name what changed, or the ordered
+        // fallback that follows looks like an unexplained skip of the
+        // lowest-load choice.
+        const changed = Object.entries({
+          backend: backend !== target, generation: generation !== cliSpawnGeneration,
+          controller: controller !== traexAutoModelController, restarting: cliRestartInProgress,
+          turnNotStarted: !active?.started, turnChanged: !!active && active.turnId !== action.turnId,
+          durableAttempt: active?.dispatchAttempt !== undefined, promptReady: isPromptReady,
+          botmuxTurnChanged: currentBotmuxTurnId !== action.turnId, commandWritesPending: commandLineWritesPending > 0,
+          flushing: isFlushing, quotaPending: !!traexQuotaPending, replayForbidden: traexAutoModelTurnReplayForbidden,
+        }).filter(([, held]) => held).map(([name]) => name);
+        log(`TraeX model load reply discarded (${changed.join(', ') || 'recovery stopped'}; snapshot=${snapshot ? 'present' : 'none'})`);
         // A rejected reply must not strand the controller's pending check.
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
@@ -6963,6 +6979,7 @@ function currentTraexLoadSnapshot(timeoutMs: number, cfg = lastInitConfig): Prom
     cwd: config.workingDir,
     timeoutMs,
     signal: abort.signal,
+    onUnavailable: reason => log(`TraeX model load read unavailable: ${reason}`),
     env: {
       ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
       ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
@@ -9346,6 +9363,10 @@ let bridgeCliCwd: string | undefined;
  *  bridge start (from the adapter's claudeDataDir); defaults to `~/.claude` so
  *  the adopt path and any non-seed caller behave exactly as before. */
 let bridgeDataDir: string = DEFAULT_CLAUDE_DATA_DIR;
+/** Projects root of the Claude config dir this worker launches its CLI with,
+ *  resolved at launch: the only root an in-place transcript rewrite (the image
+ *  purge) trusts. Never derived from the transcript path itself. */
+let claudeProjectsRoot: ClaudeProjectsRoot | undefined;
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
@@ -19375,6 +19396,10 @@ function handleVisibleStartupInteraction(data: string): boolean {
 // in the terminal-OSC decode set.
 const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
+const minimaxFinalReceiver = new MinimaxFinalReceiver(
+  payload => { void handleTrustedCodexAppMarker('final', payload); },
+  message => log(`${cliName()} ${message}`),
+);
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
 /** ANSI-stripped PTY tail scanned for Pi's "updated while this session was
@@ -20227,6 +20252,9 @@ function handleAppRunnerOscMarker(body: string): void {
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
+      payload && typeof payload === 'object' ? payload : undefined,
+      { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
   if (!payload || typeof payload !== 'object') return;
   // PR #597 routes every runner marker (thread/state/diagnostic/activity/final
   // and master's lifecycle/steer) through the single trusted handler; codex-app
@@ -23997,6 +24025,7 @@ async function flushPending(): Promise<void> {
               msg,
               {
                 turnId: item.turnId,
+                dispatchAttempt: item.dispatchAttempt,
                 ...(lastInitConfig?.cliId === 'codex'
                   && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
                   ? { correlateTranscript: true as const } : {}),
@@ -31418,6 +31447,10 @@ async function spawnCliBody(
     const bridgeClaudeDataDir = scratchMappings
       ? scratchViewPath(scratchMappings, claudeDataDir)
       : claudeDataDir;
+    // A per-bot config dir lives in the sandbox's writable bot home.
+    claudeProjectsRoot = claudeProjectsRootForLaunch(bridgeClaudeDataDir, claudeProjectsRoot, {
+      noFollow: isolationBotHome !== undefined,
+    });
     // On macOS the clone cwd is a different path and Claude keys its project
     // dir by the realpath of ITS cwd; Linux keeps the identical path. Resolve
     // via the glob-aware helper so a long (>200-char) truncated+hashed project
@@ -31989,6 +32022,7 @@ async function spawnCliBody(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
     lastCliExitServerReplaced = exitMarksServerReplaced({
       intentionalRestart,
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
@@ -32521,6 +32555,7 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
+  if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   // Invalidate an in-flight async spawn before any other teardown hook runs. The
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
@@ -36653,9 +36688,11 @@ function startTranscriptImagePurge(
       ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend).claudeJsonlPath
       : undefined,
   );
-  // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl. Pin the independently known
-  // projects root so an ancestor alias in the path cannot redefine containment.
-  const purgeOptions = (jsonlPath: string) => ({ trustedProjectsRoot: dirname(dirname(jsonlPath)) });
+  // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl, checked against the root
+  // resolved when the CLI was launched — not one derived from the path itself,
+  // which a link at or above `projects` would move along. Without a pinned
+  // root (null) nothing is trusted and the purge declines.
+  const purgeOptions = { trustedProjectsRoot: claudeProjectsRoot ?? null };
   const plan = planPurgeRequest({
     cliId: lastInitConfig?.cliId,
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
@@ -36665,7 +36702,7 @@ function startTranscriptImagePurge(
     childPid: backend?.getChildPid?.(),
     sandboxMode: lastResolvedSandboxMode,
     platform: process.platform,
-    scan: scanTarget => purgeUndersizedImages(scanTarget.jsonlPath, { ...purgeOptions(scanTarget.jsonlPath), dryRun: true }),
+    scan: scanTarget => purgeUndersizedImages(scanTarget.jsonlPath, { ...purgeOptions, dryRun: true }),
   });
   if (plan.kind === 'decline') {
     log(`Transcript image purge declined (${plan.logReason})`);
@@ -36692,7 +36729,7 @@ function startTranscriptImagePurge(
           wait: ms => delay(ms),
           provablyGone: pid => !pidNotProvablyGone(pid),
         }, { ownedPids: retiring.processScope }),
-        purge: () => purgeUndersizedImages(plan.target.jsonlPath, purgeOptions(plan.target.jsonlPath)),
+        purge: () => purgeUndersizedImages(plan.target.jsonlPath, purgeOptions),
       });
       log(`Transcript image purge ${outcome.kind}: ${'report' in outcome ? describePurgeReport(outcome.report) : outcome.detail}`);
     },
@@ -36845,8 +36882,14 @@ async function sendFatalWorkerErrorAndExit(
   }
   const rawMessage = err instanceof Error ? err.message : String(err);
   const message = chatSafeFatalErrorMessage(err);
-  // The daemon posts `message` into the chat; the full text stays in this log.
-  if (message !== rawMessage) log(`Fatal worker error (full text, local log only): ${rawMessage}`);
+  // The daemon posts `message` into the chat; the full text always lands in
+  // this log as well. Only logging it when the chat copy differed left a
+  // startup failure whose message was already chat-safe (a pane that died
+  // before pipe-pane: exit status + last screen) with no reason at all in the
+  // worker's own log — just "Failed fresh launch: retired …" (#3470).
+  log(message !== rawMessage
+    ? `Fatal worker error (full text, local log only): ${rawMessage}`
+    : `Fatal worker error: ${rawMessage}`);
   const sandboxNamespace = sandboxNamespaceDiagnosis(rawMessage);
   await sendAndFlush({
     type: 'error',

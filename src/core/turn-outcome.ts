@@ -56,6 +56,7 @@ const finalTexts = new WeakMap<DaemonSession, Map<string, string>>();
 const finalKinds = new WeakMap<DaemonSession, Map<string, 'answer' | 'diagnostic'>>();
 const terminalStatuses = new WeakMap<DaemonSession, Map<string, TurnOutcomeTerminal['status']>>();
 const turnStarts = new WeakMap<DaemonSession, Map<string, number>>();
+const excludedActivityAt = new WeakMap<DaemonSession, Map<string, number>>();
 const outcomeSeq = new WeakMap<DaemonSession, number>();
 /** 没写盘的「无最终输出」：它的最终回复晚到时仍可补登成已交付。 */
 const heldBackNoOutput = new WeakMap<DaemonSession, { turnId: string; at: number }>();
@@ -299,6 +300,32 @@ export function noteLateFinalReply(
 export function holdLastTurnThrough(ds: DaemonSession, at: number): SessionLastTurn | undefined {
   const current = normalizeLastTurn(ds.session.lastTurn);
   if (!resultStillCurrent(ds, current) || at <= lastTurnCurrentThrough(current)) return undefined;
+  const lastTurn: SessionLastTurn = { ...current, heldThrough: at };
+  return commitLastTurn(ds, lastTurn) ? lastTurn : undefined;
+}
+
+export function excludedTurnActivityAt(ds: DaemonSession, turnId: string): number | undefined {
+  const asyncAt = ds.asyncTriggerResults?.get(turnId)?.createdAt;
+  const waitAt = ds.pendingWaitPromises?.get(turnId)?.createdAt;
+  const cachedAt = excludedActivityAt.get(ds)?.get(turnId);
+  const startedAt = turnStartedAt(ds, turnId);
+  const at = asyncAt ?? waitAt ?? cachedAt ?? startedAt;
+  return at !== undefined && Number.isFinite(at) && at >= 0 ? at : undefined;
+}
+
+/** An excluded HTTP/async/maintenance round has ended without replacing the
+ * previous visible result. Advance only to THIS turn's own activity timestamp,
+ * never the session-global lastMessageAt: a newer human input may already have
+ * published a later timestamp while currentTurnId still names this excluded
+ * round. Async results carry their durable createdAt; HTTP wait records the
+ * same fact at registration. The bounded in-memory cache preserves it across
+ * terminal retries after the live wait entry is deleted; turnStartedAt covers
+ * daemon-authored maintenance rounds. */
+export function holdLastTurnThroughExcludedTerminal(ds: DaemonSession, turnId: string): SessionLastTurn | undefined {
+  const at = excludedTurnActivityAt(ds, turnId);
+  const current = normalizeLastTurn(ds.session.lastTurn);
+  if (at === undefined || !Number.isFinite(at) || at < 0 || !current || at <= lastTurnCurrentThrough(current)) return undefined;
+  remember(excludedActivityAt, ds, turnId, at);
   const lastTurn: SessionLastTurn = { ...current, heldThrough: at };
   return commitLastTurn(ds, lastTurn) ? lastTurn : undefined;
 }

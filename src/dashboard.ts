@@ -16,6 +16,7 @@ import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.j
 import { createHostPluginMarket, PluginMarketError } from './dashboard/plugin-market.js';
 import { pluginRecordHash } from './core/plugins/mutation-guard.js';
 import { withPluginServiceLock } from './core/plugins/service-manager.js';
+import { assertPluginPrerequisitesReady } from './core/plugins/prerequisites.js';
 import { createConfigApi } from './core/plugins/runtime.js';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
@@ -2989,6 +2990,9 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
 }
 
 async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  // The live check runs plugin code for up to 20s. Keep it outside the config
+  // lease: the caller's plugin service lock already pins the registry record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
@@ -3009,6 +3013,9 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
   if (defaults.includes(pluginId)) throw new Error('请先关闭全局启用，再按 Bot 配置');
+  // Never hold bots.json's cross-process lock (5s waiter budget) across the
+  // plugin's live check (up to 20s); the service lock still pins the record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   return runDurableConfigMutation({
     scope: 'bots',
     path,

@@ -1,3 +1,4 @@
+import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
@@ -1609,7 +1610,7 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         onChange={forwardMode => updateDraft({ ...policy, forwardMode })} />
     </div>
     {(policy.flowMode ?? 'direct') === 'classify' && <div className="bd-oncall-field">
-      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。飞书侧栏：打开 Oncall 平台表单，暂不支持自动关联人工群和转交当前对话。">分类填写方式</FieldTitle>
+      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。卡片中的分类包含自定义字段时，确认按钮直接打开侧栏，保留区域、分类、等级和问题描述；原发起人提交成功后，自动显示进群入口并按交接设置同步当前会话。单独选择“飞书侧栏”仍为有限支持。">分类填写方式</FieldTitle>
       <DropdownField dataInput="oncallFormDisplay" ariaLabel="分类填写方式" disabled={busy || (policy.flowMode ?? 'direct') !== 'classify'} value={policy.formDisplay ?? 'thread_card'}
         options={[{ value: 'thread_card', label: '群内卡片（推荐）', hint: '在原群聊或话题内填写；所有成员可见，仅发起人操作' }, { value: 'native', label: '飞书侧栏（有限支持）', hint: '在 Oncall 平台表单中填写；暂不自动关联人工群或转交对话' }, { value: 'private_card', label: '仅本人可见卡片', hint: '仅点击者可见；只支持普通群，不支持话题群和私聊' }]}
         onChange={formDisplay => updateDraft({ ...policy, formDisplay })} />
@@ -2011,6 +2012,7 @@ const DEFAULT_OWNER_REMINDER = {
   intervalMinutes: 30,
   text: '该会话已等待处理，请继续跟进。',
   states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
+  quietHours: DEFAULT_OWNER_REMINDER_QUIET_HOURS,
 };
 
 function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
@@ -2020,6 +2022,7 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
   const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
   const [text, setText] = useState(initial.text);
   const [states, setStates] = useState<OwnerReminderState[]>([...initial.states]);
+  const [quietHours, setQuietHours] = useState(initial.quietHours ?? DEFAULT_OWNER_REMINDER_QUIET_HOURS);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -2029,6 +2032,7 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
     setIntervalValue(String(next.intervalMinutes));
     setText(next.text);
     setStates([...next.states]);
+    setQuietHours(next.quietHours ?? DEFAULT_OWNER_REMINDER_QUIET_HOURS);
   }, [props.bot.sessionOwnerReminder]);
 
   function toggleState(state: OwnerReminderState, checked: boolean): void {
@@ -2052,7 +2056,11 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
       setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
       return;
     }
-    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+    if (!normalizeOwnerReminderQuietHours(quietHours)) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderQuietHoursInvalid')}` });
+      return;
+    }
+    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states, quietHours };
     await saveBotField({
       request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`, payload),
       setStatus,
@@ -2077,6 +2085,24 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
         <label>
           <span>{tr('botDefaults.ownerReminderInterval')}</span>
           <input type="number" min={1} max={10080} step={1} data-input="ownerReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <ToggleRow
+        checked={quietHours.enabled}
+        disabled={busy}
+        dataAction="toggle-owner-reminder-quiet-hours"
+        title={tr('botDefaults.ownerReminderQuietHours')}
+        help={tr('botDefaults.ownerReminderQuietHoursHelp')}
+        onChange={checked => setQuietHours(current => ({ ...current, enabled: checked }))}
+      />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.ownerReminderQuietHoursStart')}</span>
+          <input type="time" value={quietHours.start} disabled={busy} onChange={event => setQuietHours({ ...quietHours, start: event.currentTarget.value })} />
+        </label>
+        <label>
+          <span>{tr('botDefaults.ownerReminderQuietHoursEnd')}</span>
+          <input type="time" value={quietHours.end} disabled={busy} onChange={event => setQuietHours({ ...quietHours, end: event.currentTarget.value })} />
         </label>
       </div>
       <div className="bd-subsection">

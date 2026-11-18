@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
-import { loadBotConfigs } from '../../bot-registry.js';
+import { loadBotConfigs, LARK_REQUEST_TIMEOUT_MS } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -951,6 +951,26 @@ export async function isBotInChat(larkAppId: string, chatId: string): Promise<bo
   });
 }
 
+/** Strict membership probe for a configured bot, including another daemon's bot. */
+export async function isConfiguredBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isConfiguredBotInChat');
+  // Each daemon registers only its own bot. Use the existing credential-aware
+  // probe cache without registering another daemon's bot in this process.
+  const entry = getAllBotClients({ refresh: true }).find(bot => bot.appId === larkAppId);
+  if (!entry) throw new Error(`Bot not configured for Lark: ${larkAppId}`);
+  return executeWithLarkGate(larkAppId, 'isConfiguredBotInChat', async () => {
+    const response = await larkGet(
+      entry.client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`,
+      {},
+      // Probe clients do not inherit the registry client's axios timeout.
+      { timeoutMs: LARK_REQUEST_TIMEOUT_MS },
+    );
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
+}
+
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
 }
@@ -1422,6 +1442,7 @@ export async function unpinMessage(larkAppId: string, messageId: string): Promis
  */
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
   cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
@@ -1433,6 +1454,7 @@ export async function sendEphemeralCard(
     } catch (err) {
       throw new Error(`Invalid ephemeral card JSON: ${err}`);
     }
+    if (options?.beforeWrite) await options.beforeWrite();
     const res: any = await (c as any).request({
       method: 'POST',
       url: '/open-apis/ephemeral/v1/send',
@@ -2081,14 +2103,14 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
   });
 }
 
-export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
+export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
   return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
     const c = getBotUploadClient(larkAppId);
-    const buf = readFileSync(filePath);
-    const ext = extname(filePath).toLowerCase();
+    const buf = typeof source === 'string' ? readFileSync(source) : source.bytes;
+    const fileName = basename(typeof source === 'string' ? source : source.name);
+    const ext = extname(fileName).toLowerCase();
     const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-    const fileName = basename(filePath);
     // `duration` (ms) only applies to opus voice uploads — it sets the length
     // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
     const duration = fileType === 'opus' && opts?.duration
@@ -2100,7 +2122,7 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
     });
     const fileKey = res?.file_key;
     if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded file ${filePath} → ${fileKey}`);
+    logger.info(`Uploaded file ${fileName} → ${fileKey}`);
     return fileKey;
   });
 }
