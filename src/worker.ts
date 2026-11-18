@@ -31180,6 +31180,29 @@ async function spawnCliBody(
     + (scopePayloadLauncherActive ? 1 : 0);
   const unwrapLaunchLayers = (pid: number): UnwrappedLaunchLayers =>
     unwrapBotmuxLaunchLayers(pid, { relay: relayMayFrontPane });
+  // Under bwrap the payload is the sandbox supervisor and stays the pid for
+  // session discovery. Tool processes descend from the CLI inside it, which
+  // predates every turn, so the lineage proof needs the CLI leaf attested too.
+  // Codex and TRAE rebind ownership to their leaf through their own resolvers.
+  const attestSandboxedCliLeaf = (payloadPid: number): void => {
+    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex') return;
+    const targetCliId = cfg.cliId as CliId;
+    const generation = cliSpawnGeneration;
+    const intervalMs = 200;
+    scheduleWrapperRealCliPid(payloadPid, {
+      intervalMs,
+      maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
+      findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH),
+      isDirectLeaf: (lp) => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId,
+      getBackend: () => backend,
+      getChildPid: () => (generation === cliSpawnGeneration ? payloadPid : null),
+      applyRealPid: (leafPid) => {
+        log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+        publishLocalProcessAttestation(leafPid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
   const bindLaunchPayload = (resolved: UnwrappedLaunchLayers, panePid: number): void => {
     if (resolved.pid !== panePid) {
       // Preserve a deeper wrapper/native CLI resolution that already won; a
@@ -31192,6 +31215,7 @@ async function spawnCliBody(
       }
     }
     resolveBehindWrapper(resolved.pid, panePid);
+    attestSandboxedCliLeaf(resolved.pid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {
     let resolved = unwrapLaunchLayers(panePid);

@@ -161,7 +161,7 @@ function runWorkerWiring(late: boolean, options: {
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
-    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
+    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid, cliIdForComm,
     sessionScopePayloadPid: vi.fn((pid: number) => {
       scopeProbes++;
       return options.scopePayloadPid !== undefined
@@ -521,6 +521,22 @@ describe('worker wrapper PID wiring', () => {
     });
     expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
     expect(result.backend.cliPid).toBe(150);
+  });
+
+  it.each([false, true])('attests the Claude Code leaf inside bwrap but keeps the sandbox payload bound (late PID=%s)', late => {
+    // Live chain below the scope supervisor (100): launcher sh 150 → bwrap 151
+    // → bwrap init 152 → claude.exe 153. Tools descend from 153, which predates
+    // every turn, so the lineage proof must root at it.
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
+    });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code', CODEX_LEAF_SEARCH_DEPTH);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
   });
 
   it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {

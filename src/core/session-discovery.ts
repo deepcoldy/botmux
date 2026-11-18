@@ -77,6 +77,8 @@ export interface AdoptableSession {
 
 const CLI_COMM_MAP: Record<string, CliId> = {
   claude: 'claude-code',
+  // Claude Code's npm package runs its native `bin/claude.exe`; that is the comm.
+  'claude.exe': 'claude-code',
   // Seed / Relay are Claude Code forks (Relay is Seed's new release
   // name). Both rebrand process.title to their product name, so a running
   // session's `/proc/<pid>/comm` is literally `seed` / `relay` (verified on a
