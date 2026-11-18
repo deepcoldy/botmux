@@ -98,7 +98,7 @@ function readSubmissions(path: string): Array<{ pid: number; text: string }> {
 }
 
 describe('TraeX quarantine after bounded warning', () => {
-  it('recovers only the owned late receipt without replaying the ambiguous input', async () => {
+  async function runRepro(opts: { freshFallback?: boolean } = {}): Promise<void> {
     const botmuxSessionId = randomUUID();
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-desync-repro-'));
     tempDirs.add(root);
@@ -107,6 +107,7 @@ describe('TraeX quarantine after bounded warning', () => {
     const cliDir = join(traeHome, 'cli');
     const rolloutDir = join(cliDir, 'sessions', '2026', '10', '03');
     const nativeSessionId = '00000000-0000-7000-8000-000000000333';
+    const retiredResumeId = '00000000-0000-7000-8000-000000000444';
     const rolloutPath = join(
       rolloutDir,
       `rollout-2026-10-03T00-00-00-${nativeSessionId}.jsonl`,
@@ -116,7 +117,9 @@ describe('TraeX quarantine after bounded warning', () => {
     const releasePath = join(root, 'release-composer');
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(rolloutDir, { recursive: true });
-    writeFileSync(rolloutPath, '');
+    // The fresh-fallback variant proves the resume target missing BEFORE spawn;
+    // the fake then opens a different fresh rollout when the CLI starts.
+    if (!opts.freshFallback) writeFileSync(rolloutPath, '');
     writeFileSync(historyPath, '');
     writeFileSync(submissionsPath, '');
 
@@ -124,6 +127,9 @@ describe('TraeX quarantine after bounded warning', () => {
     const fakeTraex = join(root, 'fake-traex');
     writeFileSync(fakeTraex, `#!/usr/bin/env node
 const fs = require('node:fs');
+// Tier-2 fresh demotion needs two failed resume launches before the surviving
+// fresh process opens its new rollout. The test drives the matching restarts.
+if (${opts.freshFallback === true} && process.argv.includes('resume')) process.exit(1);
 // A live fd is the adapter's proof that this process owns the history SID.
 const rolloutFd = fs.openSync(${JSON.stringify(rolloutPath)}, 'a');
 const historyPath = ${JSON.stringify(historyPath)};
@@ -190,13 +196,22 @@ setInterval(() => {
       cliId: 'traex',
 
       cliPathOverride: fakeTraex,
-      cliSessionId: nativeSessionId,
+      cliSessionId: opts.freshFallback ? retiredResumeId : nativeSessionId,
       resume: true,
       backendType: workerBinary ? 'tmux' : 'pty',
       prompt: '',
       larkAppId: 'app_test',
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
+
+    if (opts.freshFallback) {
+      for (let exitCount = 1; exitCount <= 2; exitCount++) {
+        await waitFor(child,
+          () => messages.filter(message => message.type === 'claude_exit').length >= exitCount,
+          logs, `resume launch failure ${exitCount}`, 15_000);
+        child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+      }
+    }
 
     await waitFor(
       child,
@@ -205,6 +220,9 @@ setInterval(() => {
       'initial prompt readiness',
       30_000,
     );
+    if (opts.freshFallback) {
+      expect(logs.join('')).toContain('Resume fallback: dropping --resume');
+    }
 
     child.send({
       type: 'message',
@@ -257,5 +275,9 @@ setInterval(() => {
       firstSubmission, { pid: firstSubmission.pid, text: 'successor after late completion' },
     ]);
     expect(logs.join('')).toContain('owned late submit receipt');
-  }, 120_000);
+  }
+
+  it('recovers only the owned late receipt without replaying the ambiguous input', () => runRepro(), 120_000);
+
+  it('uses the fresh native identity after a restart-loop demotion', () => runRepro({ freshFallback: true }), 120_000);
 });

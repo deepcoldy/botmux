@@ -286,7 +286,7 @@ import {
   ClaudeStopFailureTranscriptEvidence, drainClaudeStopFailureOutbox, handleClaudeStopFailureReport,
 } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
-import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence.js';
+import { InputDeliveryEvidenceTracker, inputDeliveryObservedSessionIdAtSpawn } from './services/input-delivery-evidence.js';
 import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
@@ -3181,6 +3181,12 @@ const adoptWriteQueue = new AsyncSerialQueue();
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
+/** Current native identity used by input-delivery recovery. Seeded from the
+ * spawn's ACTUAL effective target (undefined after fresh demotion or while a
+ * persistent reattach still lacks live proof), then moved forward by
+ * persistCliSessionId. Unlike lastInitConfig.cliSessionId, this cannot keep
+ * pointing at a resume target the live pane already abandoned. */
+let inputDeliveryObservedCliSessionId: string | undefined;
 let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
 let lastSpawnArgvDurableInitialPrompt = false;
@@ -20565,14 +20571,14 @@ function armInputDeliveryQuarantine(
     // queue entry.
     // The ordinary recheck may accept a sibling's same-text history line;
     // recovery after attribution is gone requires positive pane ownership.
-    const nativeSessionId = lastInitConfig?.cliSessionId;
+    const nativeSessionId = inputDeliveryObservedCliSessionId;
     const receipts = createQueuedActivationReceiptObserver(SUBMIT_DEFERRED_RECHECK_MS);
     quarantine.cancelReceipt = () => receipts.clear();
     receipts.watch('quarantined-input', {
       isCurrent: () => inputDeliveryQuarantine === quarantine
         && backend === target && cliSpawnGeneration === quarantine.generation
         && !cliRestartInProgress
-        && (!nativeSessionId || lastInitConfig?.cliSessionId === nativeSessionId),
+        && (!nativeSessionId || inputDeliveryObservedCliSessionId === nativeSessionId),
       recheck: async () => {
         // While attribution is live, its existing confirmation/terminal path
         // owns recovery. In particular, do not race its awaited recheck.
@@ -20580,7 +20586,7 @@ function armInputDeliveryQuarantine(
           && (codexBridgeQueue.hasPendingTurn(quarantine.turnId, quarantine.dispatchAttempt)
             || codexBridgeQueue.hasTerminalTurn(quarantine.turnId, quarantine.dispatchAttempt))) return false;
         const result = await recheck();
-        const expectedSessionId = nativeSessionId ?? lastInitConfig?.cliSessionId;
+        const expectedSessionId = nativeSessionId ?? inputDeliveryObservedCliSessionId;
         return typeof result === 'object' && result && result.ownershipProven === true
           && !!result.cliSessionId
           && (!expectedSessionId || result.cliSessionId === expectedSessionId)
@@ -22008,6 +22014,7 @@ function persistCliSessionId(cliSessionId: string): void {
   // During an interactive fork the CLI temporarily resumes the parent. Its
   // early PID/transcript observations must never acknowledge the pending fork.
   if (nativeSessionForkPending()) return;
+  inputDeliveryObservedCliSessionId = cliSessionId;
   const published = publishCliSessionIdToDaemon({
     cliSessionId,
     // Snapshot only worker-owned, durable local Codex roots. Never infer an
@@ -28118,6 +28125,7 @@ async function spawnCliBody(
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
   lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
+  inputDeliveryObservedCliSessionId = inputDeliveryObservedSessionIdAtSpawn(willReattachPersistent, effectiveCliSessionId);
   lastSpawnEffectiveAdapterSessionId = effectiveAdapterSessionId;
   // Inputs whose turn had already started when the previous CLI died: a
   // resumed conversation holds them (the restart note asks it to continue), so

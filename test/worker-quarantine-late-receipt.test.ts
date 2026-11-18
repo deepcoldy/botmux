@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
+import { inputDeliveryObservedSessionIdAtSpawn } from '../src/services/input-delivery-evidence.js';
 import type { SubmitRecheckResult } from '../src/adapters/cli/types.js';
 
 const cleanups: Array<() => void> = [];
@@ -15,6 +16,7 @@ function harness() {
   Object.assign(scope, {
     inputDeliveryQuarantine: null,
     lastInitConfig: { cliId: 'traex', cliSessionId: 'owned-session' },
+    inputDeliveryObservedCliSessionId: 'owned-session',
     deferTurnInputCommitUntilSubmission: () => false,
     maybeQueuePostSubmitNativeSessionTitle: () => false,
     createQueuedActivationReceiptObserver,
@@ -159,6 +161,7 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
     // Fresh session: the native session id is learned only after the first
     // owned receipt, so at arm time there is no expected id to bind against.
     h.scope.lastInitConfig = { cliId: 'traex' };
+    h.scope.inputDeliveryObservedCliSessionId = undefined;
     await warnAndDrop(h);
     const original = h.scope.inputDeliveryQuarantine;
     // A sibling's same-text history line: the traex recheck can prove submit
@@ -183,9 +186,31 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
     expect(h.scope.cliAdapter.writeInput.mock.calls[1][1]).toBe('next input');
   });
 
+  it.each([
+    { scenario: 'fresh demotion', reattach: false, effectiveResumeTarget: undefined, effectiveResume: false },
+    { scenario: 'persistent reattach', reattach: true, effectiveResumeTarget: 'retired-resume-target', effectiveResume: true },
+  ])('uses the learned live identity after $scenario', async ({ reattach, effectiveResumeTarget, effectiveResume }) => {
+    const h = harness();
+    h.scope.lastInitConfig = { cliId: 'traex', cliSessionId: 'retired-resume-target' };
+    h.scope.inputDeliveryObservedCliSessionId = inputDeliveryObservedSessionIdAtSpawn(reattach, effectiveResumeTarget);
+    h.scope.lastSpawnEffectiveResume = effectiveResume;
+    h.scope.lastSpawnEffectiveCliSessionId = effectiveResumeTarget;
+    await warnAndDrop(h);
+    // The independent PID watcher learns the live identity while quarantined;
+    // the retired init object remains untouched for ordinary resume semantics.
+    h.scope.inputDeliveryObservedCliSessionId = 'fresh-native-session';
+    h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true, cliSessionId: 'fresh-native-session' });
+    h.scope.cliAdapter.writeInput.mockResolvedValue({ submitted: true });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+    expect(h.scope.lastInitConfig.cliSessionId).toBe('retired-resume-target');
+  });
+
   it('with no known native session id, an owned receipt without a session id cannot release', async () => {
     const h = harness();
     h.scope.lastInitConfig = { cliId: 'traex' };
+    h.scope.inputDeliveryObservedCliSessionId = undefined;
     await warnAndDrop(h);
     const original = h.scope.inputDeliveryQuarantine;
     h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true });
@@ -197,11 +222,13 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
   it('binds to a native session id learned while quarantined', async () => {
     const h = harness();
     h.scope.lastInitConfig = { cliId: 'traex' };
+    h.scope.inputDeliveryObservedCliSessionId = undefined;
     await warnAndDrop(h);
     const original = h.scope.inputDeliveryQuarantine;
     // The binding can be learned after arm (e.g. rollout attach); from then on
     // a receipt owned by a different native session must not release the queue.
     h.scope.lastInitConfig.cliSessionId = 'learned-session';
+    h.scope.inputDeliveryObservedCliSessionId = 'learned-session';
     h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true, cliSessionId: 'other-owned-session' });
     await vi.advanceTimersByTimeAsync(40_000);
     expect(h.scope.inputDeliveryQuarantine).toBe(original);
@@ -226,7 +253,10 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
       if (change === 'generation') h.scope.cliSpawnGeneration++;
       if (change === 'restart') h.scope.cliRestartInProgress = true;
       if (change === 'replacement') h.scope.inputDeliveryQuarantine = { ...original, dispatchAttempt: 2 };
-      if (change === 'native-session') h.scope.lastInitConfig.cliSessionId = 'new-session';
+      if (change === 'native-session') {
+        h.scope.lastInitConfig.cliSessionId = 'new-session';
+        h.scope.inputDeliveryObservedCliSessionId = 'new-session';
+      }
       const current = h.scope.inputDeliveryQuarantine;
       // A receipt that passes every recheck-LAYER filter (owned, id matches the
       // arm-time session): the isCurrent fence is the only thing that may reject.
@@ -250,7 +280,10 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
       if (change === 'generation') h.scope.cliSpawnGeneration++;
       if (change === 'restart') h.scope.cliRestartInProgress = true;
       if (change === 'replacement') h.scope.inputDeliveryQuarantine = { ...original, dispatchAttempt: 2 };
-      if (change === 'native-session') h.scope.lastInitConfig.cliSessionId = 'new-session';
+      if (change === 'native-session') {
+        h.scope.lastInitConfig.cliSessionId = 'new-session';
+        h.scope.inputDeliveryObservedCliSessionId = 'new-session';
+      }
       const current = h.scope.inputDeliveryQuarantine;
       resolve({ submitted: true, ownershipProven: true, cliSessionId: 'old-session' });
       await vi.advanceTimersByTimeAsync(60_000);
