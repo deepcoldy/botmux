@@ -373,8 +373,17 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   const resolvedBin = (): string => (cachedBin ??= resolveCommand(rawBin));
   let launchNotice: CliLaunchNotice | undefined;
+  const pressSubmit = (pty: PtyHandle): boolean => {
+    try {
+      if (pty.sendSpecialKeys) return pty.sendSpecialKeys('Enter') !== false;
+      return pty.write('\r') !== false;
+    } catch {
+      return false;
+    }
+  };
   return {
     id: 'traex',
+    pressComposerSubmit: pressSubmit,
     // Native /goal starts work and can cold-start an empty topic.
     defaultPassthroughCommands: ['/goal'],
     // codex_core-based TUI: hook-review flow + legacy-data migration picker.
@@ -415,19 +424,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
         : [];
-      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
-      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
-      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
-      // shape, so this is identical to the codex adapter's branch.
-      if (remoteWsUrl && remoteThreadId) {
-        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
-        // so an interactive update dialog would freeze the resume. TraeX shares
-        // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
-      }
-      // Releases before the baseline reject the hook-trust flag at argv parsing
-      // and exit; leave it out for them (they have no hook-trust gate to pass
-      // either) and tell the user to upgrade. Unknown version → pass it as before.
       let hookTrustFlag = !disableCliBypass && !!bypassHookTrust;
       if (hookTrustFlag) {
         const support = probeTraexHookTrustSupport(resolvedBin());
@@ -441,6 +437,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           };
         }
       }
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return [
+          ...(hookTrustFlag ? [TRAEX_HOOK_TRUST_FLAG] : []),
+          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
+          ...modelNudgeArgs, remoteThreadId,
+        ];
+      }
+      // Releases before the baseline reject the hook-trust flag at argv parsing
+      // and exit; leave it out for them (they have no hook-trust gate to pass
+      // either) and tell the user to upgrade. Unknown version → pass it as before.
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
@@ -517,7 +530,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (pickerFailure) return { submitted: false, failureReason: pickerFailure };
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
+      // A boolean false from sendSpecialKeys (e.g. tmux send-keys timing out
+      // under load) is not proof the Enter was lost: the key may still have
+      // reached the pane, and writeInput's history polling plus its recheck
+      // closure own that uncertainty. Only a thrown transport error fails the
+      // write here; the strict boolean contract stays on pressComposerSubmit,
+      // whose one-shot rescue must not guess.
       const trySendEnter = (): boolean => {
+        if (context?.submitGuard && !context.submitGuard.current()) return false;
         try {
           if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
           else pty.write('\r');

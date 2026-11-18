@@ -320,7 +320,8 @@ import { listProjectGroups, type ProjectGroupState } from './services/project-gr
 import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets } from './dashboard/cli-executable-resolver.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
   buildSkillInstallAuditSummary,
@@ -1255,6 +1256,7 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   /** Experimental, default OFF: reap tmux servers orphaned by a previous
    *  daemon generation at daemon startup (automatic process kill). */
   reapOrphanTmuxServers: boolean;
@@ -1943,6 +1945,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    terminalEffortWriteback: dashboard.terminalEffortWriteback === true,
     reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     tmuxOrphanSessionSweep: dashboard.tmuxOrphanSessionSweep !== false, // default ON report-only; explicit false disables
     tmuxOrphanSessionBareWrapperKill: dashboard.tmuxOrphanSessionBareWrapperKill === true, // default OFF narrow kill
@@ -5223,10 +5226,7 @@ const server = createServer(async (req, res) => {
       const latest = latestResult.value;
       let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
       try {
-        configuredUpdateTargets = selectCodexRuntimeUpdateTargets(
-          loadBotConfigs(),
-          (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
-        );
+        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigs());
       } catch {
         // Config unreadable or an adapter unavailable: fail closed and hide
         // persisted badges whose continued relevance cannot be established.
@@ -6301,14 +6301,23 @@ const server = createServer(async (req, res) => {
         botConfig = undefined;
       }
       const probeContext = modelCatalogProbeContext(key, botConfig, process.env);
+      const resolveExecutable = createDashboardExecutableResolver(probeContext.probeEnv ?? process.env);
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
-        adapterFactory: requestedCliId => createCliAdapterSync(
-          requestedCliId,
-          requestedCliId === probeContext.cliId ? probeContext.runtimeExecutable : undefined,
-        ),
+        resolveExecutable,
+        supportsModelDiscovery: requestedCliId => {
+          // Capability fields are static for a CLI. An absolute placeholder
+          // keeps even eager constructors (for example pi) from resolving the
+          // real command before this preflight has proved discovery is needed.
+          const adapter = createCliAdapterSync(requestedCliId, '/__botmux_model_capability_probe__');
+          return Boolean(adapter.detectModelCapabilities || adapter.detectModels);
+        },
+        adapterFactory: async (requestedCliId, pathOverride) => {
+          const command = pathOverride ?? rawCliExecutable(requestedCliId);
+          return createCliAdapterSync(requestedCliId, command ? await resolveExecutable(command) : undefined);
+        },
       });
       return jsonRes(res, 200, body);
     }

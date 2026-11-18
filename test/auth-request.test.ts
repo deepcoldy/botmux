@@ -222,7 +222,7 @@ describe('auth request CLI', () => {
     responseBody = { ok: true, provider: 'meego', status: 'delivered', delivery: 'dm', message: 'botmux: 链接已私聊发给发起人' };
     const result = await run(['request', '--provider', 'meego']);
     expect(result.code).toBe(3);
-    expect(result.stdout.trim()).toBe('botmux: 链接已私聊发给发起人');
+    expect(result.stdout.trim()).toBe('botmux: 链接已私聊发给发起人\n[reason=authorization_requested]');
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
       url: '/api/sessions/session/auth-request', body: { provider: 'meego' },
@@ -231,16 +231,34 @@ describe('auth request CLI', () => {
     expect(requests[0].body).not.toHaveProperty('scopes');
 
     responseBody = { ok: true, provider: 'meego', status: 'ready', message: 'botmux: Meego 已登录' };
-    expect((await run(['request', '--provider', 'meego'])).code).toBe(0);
+    const ready = await run(['request', '--provider', 'meego']);
+    expect(ready.code).toBe(0);
+    expect(ready.stdout.trim()).toBe('botmux: Meego 已登录');
     status = 409;
     responseBody = { ok: false, status: 'refused', error: 'delegated', message: 'botmux: 本轮不能为发起人发起 Meego 授权' };
     const refused = await run(['request', '--provider', 'meego']);
+    // Same exit code as a delivered entry, but nothing went to the person: no tag.
     expect(refused.code).toBe(3);
-    expect(refused.stdout).toContain('本轮不能');
+    expect(refused.stdout.trim()).toBe('botmux: 本轮不能为发起人发起 Meego 授权');
 
     status = 200;
     await run(['request', '--provider', 'meego', '--tenant', 'dcar']);
     expect(requests.at(-1)?.body).toMatchObject({ provider: 'meego', tenant: 'dcar' });
+  });
+
+  it.each([
+    ['pending', 3, '[reason=authorization_requested]'],
+    ['undeliverable', 3, '[reason=authorization_requested]'],
+    ['unavailable', 4, '[reason=authorization_unavailable]'],
+  ])('a provider answer %s ends with its reason tag; --json stays pure JSON', async (answer, code, tag) => {
+    prepareLarkToolEnv({ env, dataDir, sessionId: 'session', appId: 'cli_auth' });
+    responseBody = { ok: true, provider: 'bytedcli', status: answer, message: `botmux: ${answer}` };
+    const result = await run(['request', '--provider', 'bytedcli']);
+    expect(result.code).toBe(code);
+    expect(result.stdout.trim().split('\n')).toEqual([`botmux: ${answer}`, tag]);
+    const json = await run(['request', '--json', '--provider', 'bytedcli']);
+    expect(json.code).toBe(code);
+    expect(JSON.parse(json.stdout)).toEqual(responseBody);
   });
 
   it('forwards allowUnknown flag to the daemon auth-request endpoint', async () => {

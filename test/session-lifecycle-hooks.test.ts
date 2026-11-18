@@ -398,6 +398,49 @@ describe('worker-pool lifecycle hook integration', () => {
     }));
   });
 
+  // resume_fallback has its own branch (the daemon owns the latch + history
+  // gate), so pin that it still honours the transport gate every other
+  // user_notify passes through, and that attention follows the content gate.
+  it('resume_fallback: a silent turn gets attention but no Lark notice; noise raises nothing', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const attention = () => emitHookEventMock.mock.calls.filter(([event]) => event === 'session.requires_attention').length;
+    const report = (turnId: string, extra: Record<string, unknown> = {}) => ({
+      type: 'user_notify', kind: 'resume_fallback', turnId, resumeTier: 'no-exact-id', message: 'fresh', ...extra,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      session: { ...makeDs().session, lastCliInput: 'fix the build' },
+      silentScheduledTurns: new Map([['om_silent', Date.now()]]),
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', report('om_silent'));
+    await flush();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(attention()).toBe(1);
+    expect(ds.resumeFreshFallbackNotified).toBeUndefined();
+
+    // The latch survived the silent run: the next visible turn is told once.
+    worker.emit('message', report('om_visible'));
+    await flush();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(attention()).toBe(2);
+
+    // Already told, and nothing-lost: logged only, no hook, no message.
+    worker.emit('message', report('om_again'));
+    worker.emit('message', report('om_again', { resumeTier: 'probe-missing', resumeLost: false }));
+    await flush();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(attention()).toBe(2);
+  });
+
   it.each([undefined, false, true])('routes accepted steer feedback with silentTurnReactions=%s without raising attention', async (silent) => {
     botConfig.silentTurnReactions = silent;
     const sessionReply = vi.fn(async () => 'om_reply');

@@ -52,6 +52,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>

@@ -65,6 +65,7 @@ const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injec
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: (...a: any[]) => mockSendWorkerInput(...a),
   getCurrentCliVersion: vi.fn(() => 'test'),

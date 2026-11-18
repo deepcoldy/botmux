@@ -83,7 +83,12 @@ export function installWorkerIpcPreload(host: IpcHost): void {
     }
     bufferedMessages.push(raw);
     const turnId = ordinaryColdStartTurnId(raw);
-    if (turnId) host.send?.({ type: 'turn_input_received', turnId });
+    // Contract-enabled boots need the worker's single envelope sequencer and
+    // admitted execution identity. Replay after it initializes instead of
+    // publishing an unscoped receipt the daemon necessarily rejects.
+    if (turnId && !(raw as Record<string, unknown>).sessionContract) {
+      host.send?.({ type: 'turn_input_received', turnId });
+    }
   };
 
   host.prependListener('message', bufferMessage);

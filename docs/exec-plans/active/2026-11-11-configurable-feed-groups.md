@@ -14,13 +14,13 @@ flowchart LR
 ## 功能与文件
 
 - `src/services/chat-feed-groups.ts`：有界名称与范围校验、限定范围的先加后删；保留旧调用合同。
-- `src/core/dashboard-ipc-server.ts`：新增 `PUT /api/groups/:chatId/feed-groups`，强制提供 `managedLabels`。
+- `src/core/dashboard-ipc-server.ts`：新增 `PUT /api/groups/:chatId/feed-groups`，必须显式提供 `managedLabels`（数组或 `null`），缺省一律拒绝。
 - `test/chat-feed-groups.test.ts`：自定义名称、范围隔离、无效配置无写入、部分失败、权限与身份测试。
 - 独立 group-rename 插件：可配置四个默认分组、互斥与关闭清理；固定快捷命令和通用 `/label <key>`；运行时配置重读及原事件去重、水位保留。
 
 ## 合同
 
-请求为 `{ actorOpenId, label: string | null, managedLabels: string[] }`。名称区分大小写，不允许空白首尾或控制字符，每个至多 50 个 Unicode 字符，最多 50 个不同名称。非空目标必须属于范围；空范围加 null 为无写入清理。只操作发令人在当前应用下可管理的个人分组，不借用 owner 授权。所有参数在凭证解析及网络访问前校验。
+请求为 `{ actorOpenId, label: string | null, managedLabels: string[] | null }`，`managedLabels` 必须显式提供：数组只清理范围内的分组；`null` 清理发令人全部普通分组（不含 rule 类型），目标名只做名称校验；缺省回 400，不回落到旧合同。名称区分大小写，不允许空白首尾或控制字符，每个至多 50 个 Unicode 字符，最多 50 个不同名称。非空目标必须属于范围；空范围加 null 为无写入清理。只操作发令人在当前应用下可管理的个人分组，不借用 owner 授权。所有参数在凭证解析及网络访问前校验。
 
 新路径与旧路径共享既有串行队列、鉴权、超时和取消逻辑。新增调用不影响其它 IM、CLI、PTY/Tmux、话题/群会话、sandbox 或 workflow 的执行路径。
 

@@ -311,6 +311,27 @@ describe('wrappers: a switched-off capability runs the real binary natively', ()
         expect(botmuxCalls()).toBe('auth request --provider bytedcli\n');
       });
 
+    // The reason tag is botmux's to give (only it knows whether an entry went
+    // out: a refused request exits 3 as well). The wrapper relays the whole
+    // answer, tag line included, and never adds one from the exit code.
+    it.each([
+      ['an entry handed to the person (3)', 3, ['botmux: 授权入口已私发给发起人', '[reason=authorization_requested]']],
+      ['the provider down (4)', 4, ['botmux: 暂时无法发起授权', '[reason=authorization_unavailable]']],
+      ['a refusal to start authorization (3)', 3, ['botmux: 本轮不能为发起人发起 ByteCloud 授权（delegated turn），命令未执行。']],
+    ] as const)('botmux\'s answer for %s reaches the agent verbatim, with no tag of the wrapper\'s own', (_label, rc, answer) => {
+      const bin = join(dir, 'answer-bin');
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, 'botmux'), `#!/bin/sh\nprintf '%s\\n' ${answer.map(line => `'${line}'`).join(' ')}\nexit ${rc}\n`, { mode: 0o755 });
+      const tags = answer.filter(line => line.startsWith('[reason='));
+      for (const [prepare, args] of [[denied, ['codebase', 'mr', 'list']], [publishPerson, ['auth', 'login']]] as const) {
+        prepare();
+        const r = run(installFor('bytedcli'), [...args], { PATH: `${bin}:/usr/bin:/bin` });
+        expect(r.status).toBe(77);
+        expect(r.err.trimEnd().split('\n').slice(-answer.length)).toEqual(answer);
+        expect(r.err.match(/\[reason=authorization_[a-z]+\]/g) ?? []).toEqual(tags);
+      }
+    });
+
     it.each(['platform_not_teammate', 'platform_forbidden'])(
       'a [reason=%s] refusal is final: botmux is not asked and the published text is shown', reason => {
         writeSessionIdentity(dir, 'sess', { tool: 'bytedcli', mode: 'denied', turnId: 't1', openId: 'ou_1', message: `botmux: 平台没有签发 [reason=${reason}]` }, 'single');

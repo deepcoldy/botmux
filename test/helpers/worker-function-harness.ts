@@ -1,5 +1,5 @@
 /**
- * Execute ONE real top-level function of src/worker.ts against an injected
+ * Execute ONE real function or named callback of src/worker.ts against an injected
  * module scope, without importing the worker (its module body installs process
  * IPC/signal handlers and starts runtime services).
  *
@@ -24,8 +24,17 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
+import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
+import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
+import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
+import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
 import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
 import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
+import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
+import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
+import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
@@ -54,9 +63,25 @@ function workerSourceFile(): ts.SourceFile {
 
 function transpiledWorkerFunction(name: string): string {
   const source = workerSourceFile();
-  const declaration = source.statements.find(statement => ts.isFunctionDeclaration(statement)
-    && statement.name?.text === name);
-  if (!declaration) throw new Error(`Missing top-level worker function: ${name}`);
+  let declaration = source.statements.find((statement): statement is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(statement) && statement.name?.text === name);
+  // Some lifecycle callbacks capture their spawn-local ownership boundary.
+  // Execute the real callback with that boundary injected just like globals,
+  // without importing the worker or modelling its timeout decision.
+  if (!declaration) {
+    const visit = (node: ts.Node): void => {
+      if (declaration) return;
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name
+        && node.initializer && ts.isArrowFunction(node.initializer) && ts.isBlock(node.initializer.body)) {
+        const arrow = node.initializer;
+        declaration = ts.factory.createFunctionDeclaration(
+          arrow.modifiers, undefined, name, arrow.typeParameters, arrow.parameters, arrow.type, node.initializer.body,
+        );
+      } else ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  if (!declaration) throw new Error(`Missing worker function or callback: ${name}`);
   // Rewrite before transpilation's module classification: an import.meta in
   // an otherwise standalone function would inject module-only boilerplate.
   const transformed = ts.transform(declaration, [context => node => {
@@ -86,16 +111,44 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'confirmedTerminalEffortChoice') return () => undefined;
+    if (key === 'noteTerminalEffortInput') return () => {};
+    if (key === 'claudeEffortObserver') {
+      if (!dependencies.has(key)) dependencies.set(key, new ClaudeEffortObserver());
+      return dependencies.get(key);
+    }
+    if (key === 'terminalEffortTracker') {
+      if (!dependencies.has(key)) dependencies.set(key, new TerminalEffortChoiceTracker());
+      return dependencies.get(key);
+    }
+    if (key === 'config') return { terminalEffortWriteback: false };
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
     if (key === 'executionObserverSupported') return executionObserverSupported;
+    if (key === 'isNativeReasoningEffort') return isNativeReasoningEffort;
+    if (key === 'readNativeReasoningFooter') return readNativeReasoningFooter;
+    if (key === 'readGrokRuntimeObservation') return readGrokRuntimeObservation;
     if (typeof key === 'string' && Object.hasOwn(runtimeReservation, key)) return (runtimeReservation as Record<string, unknown>)[key];
     if (key === 'isRemoteBackendType') return isRemoteBackendType;
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
+    if (key === 'traexCatalogEmptyNoticeTurns') return scope.traexCatalogEmptyNoticeTurns ??= new WeakMap();
     if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
+    if (key === 'busyReadyDeferral') return scope.busyReadyDeferral ??= new BusyReadyDeferralTracker();
+    if (key === 'busyReadyLogThrottle') return scope.busyReadyLogThrottle ??= new BusyReadyLogThrottle();
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
+    if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;
+    if (key === 'traexAutoModelPolicyKey') return traexAutoModelPolicyKey;
+    if (key === 'reconcileTraexModelCatalog') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
+    if (key === 'currentTraexLoadSnapshot') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
-    if (typeof key === 'string' && ['readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

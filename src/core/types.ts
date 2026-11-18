@@ -8,6 +8,7 @@ import type {
   CotEntry,
   Session,
   DaemonToWorker,
+  WorkerToDaemon,
   LarkAttachment,
   LarkMention,
   ModelFallbackState,
@@ -207,6 +208,17 @@ export interface DaemonSession {
   /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
   lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
+  /**
+   * This session already received its ONE "resume fell back to a fresh
+   * session" notice.
+   *
+   * Daemon-side on purpose: `/restart` forks a new worker, so a worker-level
+   * latch would re-post the notice on every restart. The worker reports the
+   * demotion fact each time (and the daemon logs every report); only the
+   * user-visible notice is spent once. In-memory only — a daemon restart is a
+   * new conversation surface as far as this once-per-session courtesy goes.
+   */
+  resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   /**
@@ -576,6 +588,15 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Wall-clock of the most recent `turn_terminal` observed for this session,
+   *  and the turn it named. The terminal edge is the daemon's authority that a
+   *  turn is over, so these drive the post-terminal display settle (see
+   *  schedulePostTerminalStatusSettle) and the periodic stale-card self-heal.
+   *  In-memory only. */
+  lastTurnTerminalAt?: number;
+  lastTurnTerminalTurnId?: string;
+  lastTurnTerminalDispatchAttempt?: number;
+  lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -642,6 +663,7 @@ export interface DaemonSession {
   messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
+  codexAppInterruptTarget?: Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }>['target'];
   /**
    * Authenticated human principal that owns the currently executing interactive
    * turn. Set only after a worker accepts the turn and cleared by its exact
@@ -725,6 +747,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */

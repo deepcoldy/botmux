@@ -235,6 +235,53 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     expect(late).toEqual({ submitted: true });
   });
 
+  // A tmux send-keys timeout makes sendSpecialKeys return false even though the
+  // key may still have reached the pane. writeInput must treat only a thrown
+  // error as failure: keep polling history, and still hand back a recheck
+  // closure when nothing lands — otherwise the worker's parked-draft recovery
+  // chain is skipped (no recheck → attribution mark dropped at the warning).
+  it('keeps polling after a false Enter return when the key actually landed', async () => {
+    const adapter = createTraexAdapter('/bin/traex');
+    let pasted = '';
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { pasted = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'Enter') {
+          mkdirSync(join(traeHome, 'cli'), { recursive: true });
+          appendFileSync(historyPath, historyLine(SID_1, pasted));
+        }
+        return false;
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'enter reported false but landed');
+
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('still returns a recheck closure after a false Enter return with no history line', async () => {
+    seedHistory(SID_1, 'prior turn');
+    const adapter = createTraexAdapter('/bin/traex');
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      write: vi.fn(),
+      pasteText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => false),
+    };
+
+    const result = await adapter.writeInput(pty, 'enter reported false and lost');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any).recheck).toBe('function');
+  });
+
+  it('honors a rejected fallback write for one-shot composer rescue', () => {
+    const pty: PtyHandle & { write: ReturnType<typeof vi.fn> } = { write: vi.fn(() => false) };
+
+    expect(createTraexAdapter('/bin/traex').pressComposerSubmit?.(pty)).toBe(false);
+    expect(pty.write).toHaveBeenCalledExactlyOnceWith('\r');
+  });
+
   // ── Session-id ownership (only RETURN a pid-owned id) ──
 
   it('returns the session id when THIS pid provably owns the rollout', async () => {

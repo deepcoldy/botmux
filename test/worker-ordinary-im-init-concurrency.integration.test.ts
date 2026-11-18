@@ -184,6 +184,29 @@ setInterval(() => {
 });
 
 describe('ordinary IM during real worker init', () => {
+  it('publishes the first contract receipt with its admission before backend startup', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-scoped-init-')); tempDirs.add(root);
+    const sessionId = `scoped-init-${randomUUID()}`; const dataDir = join(root, 'session'); mkdirSync(dataDir);
+    const messages: WorkerToDaemon[] = []; const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
+      env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    children.add(child); child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    const execution = { executionId: 'admitted-init', turnId: 'om_scoped_initial' };
+    const producer = { workerId: 'scoped-worker', generation: 1 };
+    child.send({ type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root', workingDir: dataDir,
+      cliId: 'pi', cliPathOverride: '/nonexistent-scoped-test-cli', backendType: 'pty', prompt: 'question',
+      larkAppId: 'cli_scoped_test', larkAppSecret: 'secret', turnId: execution.turnId,
+      sessionContract: { version: 2, session: { appId: 'cli_scoped_test', sessionId }, worker: producer, executions: [] },
+      sessionCommand: { version: 2, execution } } satisfies DaemonToWorker);
+    await waitFor(() => messages.some(message => message.type === 'turn_input_received'), logs);
+    const receipt = messages.find(message => message.type === 'turn_input_received')!;
+    expect(receipt).toMatchObject({ turnId: execution.turnId, sessionContract: {
+      producer, session: { appId: 'cli_scoped_test', sessionId }, scope: { execution } } });
+  }, 15_000);
+
   it('queues a concurrent follow-up instead of rejecting it before cliAdapter is ready', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-init-concurrency-'));
     tempDirs.add(root);

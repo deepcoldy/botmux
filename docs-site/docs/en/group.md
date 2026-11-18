@@ -129,6 +129,26 @@ You can also send `/botconfig set groupCreation <JSON>` in Lark, and `/botconfig
 - `--no-agents`, `--no-tag` and `--avatar off` only drop defaults; they never remove bots you explicitly @-mentioned.
 - Without `groupCreation` and without options, only the current bot and the bots you @-mentioned join.
 
+### Add missing bots to an existing group
+
+Each bot can store its own invitation list in its `bots.json` entry:
+
+```json
+{
+  "inviteConfig": {
+    "agents": ["cli_review_app", "cli_build_app"]
+  }
+}
+```
+
+Use `@bot /botconfig set inviteConfig {"agents":["Review","Build"]}` to save changes immediately, or `@bot /botconfig unset inviteConfig` to clear them. This setting is independent of `/g`'s `groupCreation`; group-creation defaults are neither inherited nor migrated.
+
+A bot admin sends `@bot /invite all` in a group to add missing members from that bot's `inviteConfig.agents`. Names and app IDs resolve as they do for `/g`, and must refer to configured Lark bots in this deployment. Each app ID is invited once; the current bot and existing members are skipped. An unknown or ambiguous entry, or an unavailable membership check, prevents invitations for the entire list. An empty list prompts configuration first. After a partial invitation failure, repeat the command to add the remaining bots.
+
+Bare `@bot /invite` still displays usage help. `@bot /invite @target` and `/invite --app cli_xxx` continue to process only explicit targets without reading defaults. `all` cannot be combined with explicit targets. Invitations do not change the group's name, tag or avatar.
+
+Revoking admin access or changing or clearing the default list during execution stops invitations that have not yet been sent. Completed invitations are kept; check access and the list before running `/invite all` again.
+
 ## Create a group in the Dashboard
 
 Prefer not to type commands? Open the **Group Management** page in `botmux dashboard` and click "New Chat":

@@ -51,8 +51,12 @@ async function drain(): Promise<void> {
             nativeSessionId = id;
             output.marker('thread', { threadId: id });
           },
+          onRuntime: runtime => output.marker('runtime', { threadId: nativeSessionId, ...runtime }),
           onText: display,
           onTool: title => display(`[tool] ${title}`),
+          onReasoningEffort: reasoningEffort => {
+            if (nativeSessionId) output.marker('reasoning_observed', { nativeSessionId, reasoningEffort });
+          },
         }, controller.signal);
         if (!closing) output.marker('final', { content, turnId: turn.turnId, startedAtMs, completedAtMs: Date.now() });
       } catch (error) {

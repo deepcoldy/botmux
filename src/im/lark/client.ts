@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
-import { loadBotConfigs } from '../../bot-registry.js';
+import { loadBotConfigs, LARK_REQUEST_TIMEOUT_MS } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -24,6 +24,7 @@ import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
 import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
+import { readMessageWithinContext } from './message-read-context.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_CONTACT_INVALID_PARAM,
@@ -950,6 +951,26 @@ export async function isBotInChat(larkAppId: string, chatId: string): Promise<bo
   });
 }
 
+/** Strict membership probe for a configured bot, including another daemon's bot. */
+export async function isConfiguredBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isConfiguredBotInChat');
+  // Each daemon registers only its own bot. Use the existing credential-aware
+  // probe cache without registering another daemon's bot in this process.
+  const entry = getAllBotClients({ refresh: true }).find(bot => bot.appId === larkAppId);
+  if (!entry) throw new Error(`Bot not configured for Lark: ${larkAppId}`);
+  return executeWithLarkGate(larkAppId, 'isConfiguredBotInChat', async () => {
+    const response = await larkGet(
+      entry.client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`,
+      {},
+      // Probe clients do not inherit the registry client's axios timeout.
+      { timeoutMs: LARK_REQUEST_TIMEOUT_MS },
+    );
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
+}
+
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
 }
@@ -1271,11 +1292,16 @@ export async function getChatMode(
  * know whether the withdraw actually happened (e.g. grant-card withdraw) can
  * fall back instead of assuming success. Fire-and-forget callers can ignore it.
  */
-export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
+export async function deleteMessage(
+  larkAppId: string,
+  messageId: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
+): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
   return executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
     const c = getBotClient(larkAppId);
     try {
+      if (options?.beforeWrite) await options.beforeWrite();
       const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
       if (res && typeof res.code === 'number' && res.code !== 0) {
         logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
@@ -1748,28 +1774,31 @@ export async function getMessageDetail(
   messageId: string,
   options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
-  const c = getBotClient(larkAppId);
-  // card_msg_content_type=user_card_content returns the original card JSON
-  // (including v2 schema/body/elements) instead of Lark's simplified fallback
-  // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
-  // fetches, but merge_forward enumeration MUST pass false — Lark returns
-  // HTTP 500 when the param is combined with a merge_forward message_id.
-  // Without the param, sub-messages still come back in the "Format A"
-  // simplified card shape which extractCardContent handles.
-  const userCardContent = options.userCardContent ?? true;
-  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
-    // Opt into server-side sender names (sender_name / sender_i18n_names, for
-    // user AND bot senders); without it the server omits them. Matters here for
-    // merge_forward sub-messages, whose senders appear nowhere else.
-    with_sender_name: 'true',
-    // Explicit ID type makes Feishu return app_id for bot mentions.
-    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
-  }, options);
-  if (res.code !== 0) {
-    throw larkApiError('get message', res);
-  }
-  return res.data;
+  const key = options.signal ? undefined : JSON.stringify([larkAppId, messageId, options.userCardContent ?? true, options.timeoutMs ?? null, options.userIdType ?? null]);
+  return readMessageWithinContext(key, async () => {
+    const c = getBotClient(larkAppId);
+    // card_msg_content_type=user_card_content returns the original card JSON
+    // (including v2 schema/body/elements) instead of Lark's simplified fallback
+    // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
+    // fetches, but merge_forward enumeration MUST pass false — Lark returns
+    // HTTP 500 when the param is combined with a merge_forward message_id.
+    // Without the param, sub-messages still come back in the "Format A"
+    // simplified card shape which extractCardContent handles.
+    const userCardContent = options.userCardContent ?? true;
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+      // Opt into server-side sender names (sender_name / sender_i18n_names, for
+      // user AND bot senders); without it the server omits them. Matters here for
+      // merge_forward sub-messages, whose senders appear nowhere else.
+      with_sender_name: 'true',
+      ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
+    }, options);
+    if (res.code !== 0) {
+      throw larkApiError('get message', res);
+    }
+    return res.data;
+  });
+
 }
 
 /** Parse the sender union_id from an IM message fetched with

@@ -302,7 +302,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
   });
 
   it('retains a dispatched-but-not-started queued activation turn', () => {
-    const ds = dsWith({ session: { queuedActivationTurnId: 'turn-Q' } as any });
+    const ds = dsWith({ sessionExtra: { queuedActivationTurnId: 'turn-Q' } as any });
     publish('turn-Q');
     releaseActiveIdentityTurn(dir, SESSION, 'turn-Q');
     expect(collectSessionTurnGarbage(ds)).toEqual([]);
@@ -341,7 +341,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
   });
 
   it('retains a prepared/non-terminal codex app dispatch ledger entry', () => {
-    const ds = dsWith({ session: {
+    const ds = dsWith({ sessionExtra: {
       codexAppDispatchLedger: [{ turnId: 'turn-ledger', state: 'prepared' }],
     } as any });
     publish('turn-ledger');
