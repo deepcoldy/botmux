@@ -25,9 +25,15 @@ import { CLI_MODEL_CHOICES } from '../adapters/cli/model-choices.js';
 import type { DebugModelCapabilities } from '../adapters/cli/model-catalog-json.js';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { detectAidenCodexModels } from './aiden-model-catalog.js';
+import { codexConfigIdentity } from './codex-service-tier-catalog.js';
 import { createHash } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
-import { isCodexReasoningEffort, reasoningEffortsForCliModel } from './codex-reasoning-effort.js';
+import {
+  catalogReasoningEffortsForModel,
+  isCodexReasoningCliId,
+  isCodexReasoningEffort,
+  reasoningEffortsForCliModel,
+} from './codex-reasoning-effort.js';
 
 export type ModelSource = 'static' | 'live';
 
@@ -183,7 +189,9 @@ async function detectModelCatalogWith(
               executable,
               opts?.resolveExecutable ?? resolveCommand,
             );
-        const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}`;
+        // Codex reads its catalogue under CODEX_HOME/config.toml; key on it too.
+        const configIdentity = isCodexReasoningCliId(opt.cliId) ? codexConfigIdentity(probeEnv ?? process.env) : '';
+        const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}\0${configIdentity}`;
         const cached = cache.get(cacheKey);
         if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
           return { models: cached.models, ...(cached.modelCapabilities ? { modelCapabilities: cached.modelCapabilities } : {}) };
@@ -326,6 +334,13 @@ export async function buildModelChoicesResponse(
   const reasoningEffortsByModel = Object.fromEntries(
     (live?.modelCapabilities ?? [])
       .map(entry => {
+        // Codex: the same catalogue-first judgment as save validation and the
+        // worker's launch check, so every level offered here survives them.
+        if (isCodexReasoningCliId(selectedCliId)) {
+          return catalogReasoningEffortsForModel(entry.slug, live?.modelCapabilities)
+            ? [entry.slug, [...reasoningEffortsForCliModel(selectedCliId, entry.slug, live?.modelCapabilities)]] as const
+            : null;
+        }
         const detected = (entry.reasoningEfforts ?? []).filter(isCodexReasoningEffort);
         const enforced = reasoningEffortsForCliModel(selectedCliId, entry.slug);
         return detected.length > 0

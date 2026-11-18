@@ -14,6 +14,8 @@ import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+  // No live model catalogue: reasoning levels fall back to the static table.
+  loadCodexServiceTierCatalog: vi.fn(async () => null),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {

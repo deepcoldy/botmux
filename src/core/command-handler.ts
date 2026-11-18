@@ -150,6 +150,7 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { loadSessionCodexReasoningCatalog } from '../services/codex-bot-reasoning-catalog.js';
 import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
@@ -1952,10 +1953,15 @@ export async function handleCommand(
         // Do not interrupt a business turn just to change its next launch.
         try {
           const beforeView = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+          // A pinned Codex level is judged against the live catalogue of the
+          // runtime this session launches (its frozen CLI/runtime/profile).
+          const reasoningCatalog = args[0] !== '--follow-bot' && args[1]
+            ? await loadSessionCodexReasoningCatalog(ds.session, getBot(ds.larkAppId).config)
+            : null;
           const changed = writeSessionModelPin(ds, args[0] === '--follow-bot' ? undefined : {
             model: args[0]!, ...(args[1] ? { effort: args[1] as import('../services/codex-reasoning-effort.js').CodexReasoningEffort } : {}),
             source: 'command', setBy: message.senderId, setAt: new Date().toISOString(),
-          });
+          }, { reasoningCatalog });
           if (changed === false) { await sessionReply(rootId, '本话题未固定，无需解除。'); break; }
           const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
           if (!ds.session.modelPin && beforeView?.shadowedBy) {

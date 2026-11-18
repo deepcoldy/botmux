@@ -60,11 +60,15 @@ import {
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import {
+  cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
   reasoningEffortsForCliModel,
+  type ReasoningCatalog,
 } from './codex-reasoning-effort.js';
+import { loadBotCodexReasoningCatalog } from './codex-bot-reasoning-catalog.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
 import { botOneShotEnv } from '../core/session-env-resolve.js';
@@ -529,6 +533,29 @@ async function applyConfigFieldInternal(
       };
     }
   }
+  // A write that sets the Codex model/effort pair is judged against the live
+  // catalogue of the bot's runtime, the one the Dashboard offers levels from.
+  // Probed outside the bots.json lock, like the service-tier check above.
+  const effortPairWrite = spec.configKey === 'reasoningEffort' || spec.configKey === 'model'
+    || spec.configKey === 'cliId' || spec.kind === 'cli';
+  const pairEffort = spec.configKey === 'reasoningEffort'
+    ? isCodexReasoningEffort(effective) ? effective : undefined
+    : bot.config.reasoningEffort;
+  let reasoningCatalog: ReasoningCatalog | null = null;
+  if (effortPairWrite && pairEffort && isCodexReasoningCliId(nextCliId)) {
+    const nextSelection = spec.kind === 'cli' && typeof effective === 'string'
+      ? resolveCliSelection(effective)
+      : undefined;
+    const sameCli = nextCliId === bot.config.cliId;
+    reasoningCatalog = await loadBotCodexReasoningCatalog({
+      ...bot.config,
+      cliId: nextCliId,
+      wrapperCli: nextSelection ? nextSelection.wrapperCli : bot.config.wrapperCli,
+      // A runtime path configured for another CLI is not a Codex binary.
+      cliRuntime: sameCli ? bot.config.cliRuntime : undefined,
+      cliPathOverride: sameCli ? bot.config.cliPathOverride : undefined,
+    });
+  }
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
     // Snapshot for the pane-argv budget check on env / envUnset below (the
@@ -610,8 +637,11 @@ async function applyConfigFieldInternal(
         && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
       return { write: false, result: 'reasoning_effort_not_supported' };
     }
+    // Re-saving an unrelated field must not reject a pair config load keeps.
     if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
-        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+        && !(effortPairWrite
+          ? cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort, reasoningCatalog)
+          : cliModelMayKeepReasoningEffort(nextCliId, nextModel, nextReasoningEffort))) {
       return { write: false, result: 'reasoning_effort_not_supported_by_model' };
     }
     const currentServiceTier = isCodexServiceTier(entry.serviceTier)

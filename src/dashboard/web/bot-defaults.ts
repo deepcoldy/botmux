@@ -677,6 +677,24 @@ export function mergeModelCandidates(
  * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
  * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
  */
+/**
+ * Levels the live catalogue reported for a Codex model (`reasoningEffortsByModel`
+ * from /api/cli-options/models), matched like the server-side judgment: exact
+ * slug first, then case-insensitively. undefined = the catalogue has no word on
+ * this model, and the static table applies.
+ */
+export function liveCodexReasoningEfforts(
+  byModel: Readonly<Record<string, readonly string[]>> | undefined,
+  model: string,
+): readonly string[] | undefined {
+  const name = model.trim();
+  if (!byModel || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(byModel, name)) return byModel[name];
+  const lower = name.toLowerCase();
+  const key = Object.keys(byModel).find(slug => slug.trim().toLowerCase() === lower);
+  return key === undefined ? undefined : byModel[key];
+}
+
 export async function fetchDetectedModels(
   key: string,
   appId?: string,

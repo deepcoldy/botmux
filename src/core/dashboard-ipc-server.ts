@@ -81,13 +81,16 @@ import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { emitHookEventLocal, parseHookCommand } from '../services/hook-runner.js';
 import {
+  catalogReasoningEffortsForModel,
+  cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
   isBackendVariantCliId,
+  isCodexReasoningCliId,
   isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
-import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
+import { loadCodexServiceTierCatalog, validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
 import { botOneShotProbeEnv, sessionNetworkPolicyEnvView } from './session-env-resolve.js';
 import { resolvePairedBackendId } from './remote-cli-ids.js';
 import {
@@ -11539,6 +11542,17 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   const preflightCatalog = preflightNeedsCatalog
     ? await detectModelCapabilitiesViaExec(probeResult.availability.resolvedPath ?? preflight.runtime?.executable ?? preflight.legacyPath ?? 'traex', preflight.env)
     : null;
+  // Codex: the Dashboard offers levels from this runtime's live catalogue
+  // (`codex debug models`), so the save judges the pair against the same
+  // catalogue; a wrapper or profile picks its own provider, and without a
+  // resolved binary there is nothing to ask — both keep the static table.
+  const preflightProfile = profilePresent
+    ? requestedProfile
+    : typeof preflightEntry.codexProfile === 'string' && preflightEntry.codexProfile.trim() ? preflightEntry.codexProfile : undefined;
+  const preflightCodexCatalog = isCodexReasoningCliId(preflight.selection.cliId) && preflightEffort
+    && !preflight.selection.wrapperCli && !preflightProfile && probeResult.availability.resolvedPath
+    ? await loadCodexServiceTierCatalog({ cliBin: probeResult.availability.resolvedPath, env: preflight.env })
+    : null;
   const preflightTier = supportsServiceTier
     ? (serviceTierFieldPresent ? serviceTier ?? undefined : preflightEntry.serviceTier)
     : undefined;
@@ -11736,10 +11750,27 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       }
       const effortModels = selected.cliId === 'traex' && model.toLowerCase() === TRAEX_AUTO_MODEL_ID
         ? nextTraexAutoModel!.models : [model || undefined];
+      // Re-saving the bot's own launch unchanged (the Agent form always sends
+      // the effort) is judged by the keep-rule config load applied to it, so a
+      // catalogue that is briefly unreachable cannot turn a save into a reject.
+      // Only while nothing that picks the catalogue changed (CLI, wrapper,
+      // runtime, profile) and the catalogue read for this save has no word on
+      // the model: an explicit answer is judged as it stands.
+      const entryRuntimePath = (entry.cliRuntime as { executable?: string } | undefined)?.executable
+        ?? (typeof entry.cliPathOverride === 'string' && entry.cliPathOverride ? entry.cliPathOverride : undefined);
+      const effortCatalog = nextProfile ? null : preflightCodexCatalog;
+      const savedPairUnchanged = selected.cliId === entry.cliId
+        && (selected.wrapperCli ?? undefined) === (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim() ? entry.wrapperCli : undefined)
+        && (effectivePath || undefined) === entryRuntimePath
+        && (nextProfile || undefined) === (typeof entry.codexProfile === 'string' && entry.codexProfile ? entry.codexProfile : undefined)
+        && (model || undefined) === (typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : undefined)
+        && nextReasoningEffort === entry.reasoningEffort
+        && !catalogReasoningEffortsForModel(model, effortCatalog);
       if (nextReasoningEffort && effortModels.some(candidate =>
         !(model.toLowerCase() === TRAEX_AUTO_MODEL_ID && candidate && nextTraexAutoModel?.modelSettings && Object.prototype.hasOwnProperty.call(nextTraexAutoModel.modelSettings, candidate)) &&
         !(fixedTraexEfforts ? fixedTraexEfforts.includes(nextReasoningEffort)
-          : cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort)))) {
+          : savedPairUnchanged ? cliModelMayKeepReasoningEffort(selected.cliId, candidate, nextReasoningEffort)
+          : cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort, effortCatalog)))) {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       const nextServiceTier = supportsServiceTier
