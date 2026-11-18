@@ -38,8 +38,8 @@ function draft() {
   const d = new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_actor', source, messageId: 'om_form', visibility: 'thread',
     description: 'synthetic question', choices: { regions: { cn: [] } }, region: 'cn', typeId: 34, priority: 'P2',
     targetFingerprint: JSON.stringify(loadOncallGroupTarget(dir, 'app')), nativeFormLink: 'https://oncall.example.test/chat',
-    nativeSubmission: { sourceLocation: rows[0].source_location, username: 'actor', preparedAtMs: now,
-      policyFingerprint: JSON.stringify(mocks.bot.config.oncallGroup), forwardMode: 'merge' } });
+    nativeSubmission: { attempts: [{ sourceLocation: rows[0].source_location, username: 'actor', preparedAtMs: now,
+      policyFingerprint: JSON.stringify(mocks.bot.config.oncallGroup), forwardMode: 'merge', typeId: 34, region: 'cn' }] } });
   vi.setSystemTime(now + 5000); return d;
 }
 const current = (d: any) => new OncallFormStore(dir).use('app', d.id, 'ou_actor', async value => ({ ...value }), { allowClosed: true });

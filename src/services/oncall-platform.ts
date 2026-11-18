@@ -168,29 +168,57 @@ export async function createNativeOncallLink(target: OncallGroupTarget, secret: 
   return link.href;
 }
 
+export interface NativeOncallResultQuery {
+  sourceLocation: string;
+  username: string;
+  typeId: number;
+  region: string;
+  preparedAtMs?: number;
+}
 export interface NativeOncallResult { flowId: string; openChatId: string; createdAtMs: number }
+export interface NativeOncallResultCandidate<T extends NativeOncallResultQuery = NativeOncallResultQuery> {
+  attempt: T;
+  result: NativeOncallResult;
+}
 
-/** Exact source and actor matching; an ambiguous result is never guessed. */
-export async function readNativeOncallResult(target: OncallGroupTarget, secret: string,
-  expected: { sourceLocation: string; username: string; typeId: number; region: string; preparedAtMs?: number },
-  fetcher: typeof fetch = fetch): Promise<NativeOncallResult | undefined> {
-  if (!secret || !expected.username || !expected.sourceLocation) throw new Error('Oncall 提单结果查询配置不完整');
-  const source = new URL(expected.sourceLocation);
+function nativeSourceMatcher(sourceLocation: string) {
+  const source = new URL(sourceLocation);
   const formId = source.searchParams.get('bm_form');
-  const matchesSource = (value: unknown): boolean => {
-    if (!formId) return value === expected.sourceLocation;
-    try {
-      const actual = new URL(String(value));
-      return actual.origin === source.origin && actual.pathname === source.pathname
-        && actual.searchParams.getAll('bm_form').length === 1 && actual.searchParams.get('bm_form') === formId;
-    } catch { return false; }
+  return {
+    formId,
+    matches(value: unknown): boolean {
+      if (!formId) return value === sourceLocation;
+      try {
+        const actual = new URL(String(value));
+        return actual.origin === source.origin && actual.pathname === source.pathname
+          && actual.searchParams.getAll('bm_form').length === 1 && actual.searchParams.get('bm_form') === formId;
+      } catch { return false; }
+    },
   };
+}
+
+/** Match every published selection in one complete scan. Multiple distinct
+ * orders remain ambiguous; one order may match several equivalent attempts. */
+export async function readNativeOncallResultCandidates<T extends NativeOncallResultQuery>(
+  target: OncallGroupTarget, secret: string, expected: T | readonly T[],
+  fetcher: typeof fetch = fetch): Promise<NativeOncallResultCandidate<T>[]> {
+  const queries: readonly T[] = Array.isArray(expected) ? expected : [expected as T];
+  if (!queries.length) return [];
+  if (!secret || queries.some(item => !item.username || !item.sourceLocation)) throw new Error('Oncall 提单结果查询配置不完整');
+  const username = queries[0]!.username;
+  if (queries.some(item => item.username !== username)) throw new Error('同一表单的提单人不一致');
+  const sources = queries.map(item => nativeSourceMatcher(item.sourceLocation));
+  const formId = sources[0]!.formId;
+  if (sources.some(item => item.formId !== formId) || (!formId && queries.length !== 1)) {
+    throw new Error('同一批原生提单缺少统一关联标识');
+  }
   // Lark/platform may normalize channel parameters. Match the opaque form ID
   // inside source_location, rather than requiring an identical query string.
   // Legacy unmarked forms retain exact-source matching for verified migration.
-  const found = new Map<number, any>();
-  const since = new Date((expected.preparedAtMs ?? Date.now() - 24 * 60 * 60_000) + 8 * 60 * 60_000)
-    .toISOString().slice(0, 19).replace('T', ' ');
+  const found = new Map<number, { row: any; attempts: T[] }>();
+  const fallbackPreparedAtMs = Date.now() - 24 * 60 * 60_000;
+  const preparedAtMs = Math.min(...queries.map(item => item.preparedAtMs ?? fallbackPreparedAtMs));
+  const since = new Date(preparedAtMs + 8 * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
   for (let page = 1; ; page++) {
     if (page > 10) throw new Error('Oncall 查询结果过多，请管理员核对');
     let response: Response;
@@ -200,8 +228,8 @@ export async function readNativeOncallResult(target: OncallGroupTarget, secret: 
         body: JSON.stringify({ filter_fields: [
           { field: 'tenant_id', value: [target.tenantId], operator: 'in' },
           ...(formId ? [{ field: 'create_time', value: since, operator: 'greater_or_equals' }]
-            : [{ field: 'source_location', value: [expected.sourceLocation], operator: 'in' }]),
-          { field: 'originator_user', value: expected.username, operator: 'equals' },
+            : [{ field: 'source_location', value: [queries[0]!.sourceLocation], operator: 'in' }]),
+          { field: 'originator_user', value: username, operator: 'equals' },
           { field: 'stage', value: ['launch_oncall'], operator: 'in' },
         ], current_page: page, page_size: formId ? 100 : 2, sort: { field: 'create_time', operator: 'asc' } }),
       });
@@ -209,16 +237,22 @@ export async function readNativeOncallResult(target: OncallGroupTarget, secret: 
     if (!response.ok) throw new Error('Oncall 服务账号缺少工单查询权限或连接失败');
     const body = await response.json();
     if (body?.code !== 0 || !Array.isArray(body.data)) throw new Error('Oncall 提单结果格式无效');
-    for (const row of body.data) if (matchesSource(row?.source_location)) found.set(row.id, row);
-    if (found.size > 1) throw new Error('同一表单存在多个工单，请管理员核对');
+    for (const row of body.data) {
+      const sourceAttempts = queries.filter((_, index) => sources[index]!.matches(row?.source_location));
+      if (!sourceAttempts.length) continue;
+      if (row.tenant_id !== target.tenantId || row.originator_user !== username || row.stage !== 'launch_oncall'
+        || !Number.isSafeInteger(row.id) || row.id <= 0) throw new Error('Oncall 提单结果与原表单不匹配');
+      const attempts = sourceAttempts.filter(item => row.oncall_question_type_id === item.typeId && row.region === item.region);
+      const previous = found.get(row.id);
+      found.set(row.id, { row, attempts: [...(previous?.attempts ?? []), ...attempts]
+        .filter((item, index, all) => all.indexOf(item) === index) });
+      if (found.size > 1) throw new Error('同一表单存在多个工单，请管理员核对');
+    }
     if (!formId || body.data.length < 100) break;
   }
-  if (!found.size) return;
-  const row = [...found.values()][0];
-  if (row.tenant_id !== target.tenantId || !matchesSource(row.source_location)
-    || row.originator_user !== expected.username || row.oncall_question_type_id !== expected.typeId
-    || row.region !== expected.region || row.stage !== 'launch_oncall'
-    || !Number.isSafeInteger(row.id) || row.id <= 0) throw new Error('Oncall 提单结果与原表单不匹配');
+  if (!found.size) return [];
+  const { row, attempts } = [...found.values()][0]!;
+  if (!attempts.length) return [];
   const timestamp = String(row.create_time ?? '');
   // This platform's unqualified timestamps are China Standard Time, in both
   // T- and space-separated forms. Qualify them explicitly: an unqualified
@@ -228,8 +262,16 @@ export async function readNativeOncallResult(target: OncallGroupTarget, secret: 
     ? `${timestamp.replace(' ', 'T')}+08:00` : timestamp;
   const createdAtMs = Date.parse(qualified);
   if (!Number.isFinite(createdAtMs)) throw new Error('Oncall 提单时间无效');
-  if (!row.chat_id) return; // The ticket may exist before its group is ready.
+  if (!row.chat_id) return []; // The ticket may exist before its group is ready.
   const openChatId = await get(target, secret, '', 'platform/chat_id_to_open_chat_id', { chat_id: String(row.chat_id) }, fetcher);
   if (typeof openChatId !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(openChatId)) throw new Error('Oncall 人工群标识无效');
-  return { flowId: String(row.id), openChatId, createdAtMs };
+  const result = { flowId: String(row.id), openChatId, createdAtMs };
+  return attempts.map(attempt => ({ attempt, result }));
+}
+
+/** Exact source and actor matching; an ambiguous result is never guessed. */
+export async function readNativeOncallResult(target: OncallGroupTarget, secret: string,
+  expected: NativeOncallResultQuery, fetcher: typeof fetch = fetch): Promise<NativeOncallResult | undefined> {
+  const matches = await readNativeOncallResultCandidates(target, secret, expected, fetcher);
+  return matches[0]?.result;
 }

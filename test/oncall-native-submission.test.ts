@@ -59,7 +59,7 @@ async function open() {
   return new OncallFormStore(dir).pendingNativeSubmissions('app')[0];
 }
 function submitted(d: any) {
-  rows = [{ id: 1234, tenant_id: 12, source_location: d.nativeSubmission.sourceLocation, originator_user: 'actor',
+  rows = [{ id: 1234, tenant_id: 12, source_location: d.nativeSubmission.attempts[0]!.sourceLocation, originator_user: 'actor',
     oncall_question_type_id: 34, region: 'cn', stage: 'launch_oncall', chat_id: '1234567890123',
     create_time: new Date(started + 2000).toISOString() }]; vi.setSystemTime(started + 5000);
 }
@@ -70,7 +70,7 @@ describe('native submission completion', () => {
     const d = await open(); submitted(d);
     const page = new URL(new URL(d.nativeFormLink!).searchParams.get('url')!);
     expect([...page.searchParams.keys()][0]).toBe('bm_form'); expect(page.searchParams.get('bm_form')).toBe(d.id);
-    expect(d.nativeSubmission.sourceLocation).toContain(d.id);
+    expect(d.nativeSubmission.attempts[0]!.sourceLocation).toContain(d.id);
     await retryPendingOncallHandoffs('app');
     const request = new OncallGroupStore(dir).getRequest(source)!;
     expect(request).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination', forwardMode: 'merge',
@@ -156,12 +156,12 @@ describe('platform completion protocol', () => {
       if (url.includes('/oncall_flow/list')) { const page = JSON.parse(options.body).current_page; calls.push(page); return json(page === 1 ? others : [wanted]); }
       return json('oc_destination');
     });
-    await readNativeOncallResult(target, 'service-secret', { sourceLocation: d.nativeSubmission.sourceLocation, username: 'actor', typeId: 34, region: 'cn' }, fetcher);
+    await readNativeOncallResult(target, 'service-secret', { sourceLocation: d.nativeSubmission.attempts[0]!.sourceLocation, username: 'actor', typeId: 34, region: 'cn' }, fetcher);
     expect(calls).toEqual([1, 2]);
   });
   it('queries the verified actor and preparation window with a bounded result set', async () => {
     const d = await open(); submitted(d);
-    await readNativeOncallResult(target, 'service-secret', { sourceLocation: d.nativeSubmission.sourceLocation, username: 'actor', typeId: 34, region: 'cn', preparedAtMs: started }, fetcher);
+    await readNativeOncallResult(target, 'service-secret', { sourceLocation: d.nativeSubmission.attempts[0]!.sourceLocation, username: 'actor', typeId: 34, region: 'cn', preparedAtMs: started }, fetcher);
     const call = fetcher.mock.calls.find(([url]) => url.includes('/oncall_flow/list'))!;
     const payload = JSON.parse((call[1] as any).body);
     expect(payload).toMatchObject({ current_page: 1, page_size: 100, filter_fields: expect.arrayContaining([
