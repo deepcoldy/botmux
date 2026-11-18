@@ -338,7 +338,8 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
     "enabled": true,
     "intervalMinutes": 30,
     "text": "This session is waiting for you. Please follow up.",
-    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"]
+    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"],
+    "quietHours": { "enabled": false, "start": "22:00", "end": "09:00" }
   }
 }
 ```
@@ -349,10 +350,12 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 | `intervalMinutes` | Reminder interval in minutes, default 30, range 1–10080 |
 | `text` | Reminder text, up to 500 characters, no `<at>` tags |
 | `states` | Which states trigger reminders: `idle` (CLI idle), `dormant` (session suspended), `pending_repo` (waiting for a repo choice), `tui_prompt` (waiting for a terminal choice), `agent_attention` (the agent asked for a person), `limited` (quota limited). Pick at least one when enabled |
+| `quietHours` | Optional. Off by default. If enabled, the default window is 22:00 to 09:00 the next day. Use `HH:mm` in the Botmux service's local time zone. The window can cross midnight |
 
 - Only sessions split by topic are reminded (topic groups, topics inside regular groups, and DMs with `p2pMode: "thread"`). A session shared by a whole group or a whole DM is not reminded. The session needs an owner.
 - While the state stays the same, it reminds once every `intervalMinutes`; a state change or a new message in the session restarts the timer.
-- When writing it by hand, include all four fields. A missing or invalid field makes the whole block count as unset (that is, off).
+- Quiet hours include the start time and end at the specified end time. Session activity and state are still tracked during the window. The first scan after it ends sends reminders that are still due.
+- Include `enabled`, `intervalMinutes`, `text`, and `states` when configuring by hand. If you provide `quietHours`, include all three of its fields and use different start and end times. An invalid configuration makes the full reminder setting count as unset.
 
 **`noProgressNotify`**: posts a reminder card when a turn shows no confirmed progress for a long time. It's only a reminder: it never restarts, interrupts or retries the task.
 

@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
+import {
+  DEFAULT_OWNER_REMINDER_QUIET_HOURS,
+  isOwnerReminderQuietTime,
+  normalizeOwnerReminderQuietHours,
+  type SessionOwnerReminderQuietHours,
+} from './session-owner-reminder-quiet-hours.js';
 
 export const SESSION_OWNER_REMINDER_STATES = [
   'idle',
@@ -17,6 +23,7 @@ export interface SessionOwnerReminderConfig {
   intervalMinutes: number;
   text: string;
   states: SessionOwnerReminderState[];
+  quietHours?: SessionOwnerReminderQuietHours;
 }
 
 export interface SessionOwnerReminderRecord {
@@ -35,6 +42,7 @@ export const DEFAULT_SESSION_OWNER_REMINDER: SessionOwnerReminderConfig = {
   intervalMinutes: 30,
   text: '该会话已等待处理，请继续跟进。',
   states: [...SESSION_OWNER_REMINDER_STATES],
+  quietHours: { ...DEFAULT_OWNER_REMINDER_QUIET_HOURS },
 };
 
 const MIN_INTERVAL_MINUTES = 1;
@@ -64,11 +72,16 @@ export function normalizeSessionOwnerReminderConfig(
   const states = [...new Set(value.states.filter(isState))];
   if (states.length !== value.states.length) return undefined;
   if (value.enabled && states.length === 0) return undefined;
+  const quietHours = value.quietHours === undefined
+    ? { ...DEFAULT_OWNER_REMINDER_QUIET_HOURS }
+    : normalizeOwnerReminderQuietHours(value.quietHours);
+  if (!quietHours) return undefined;
   return {
     enabled: value.enabled,
     intervalMinutes: value.intervalMinutes as number,
     text,
     states,
+    quietHours,
   };
 }
 
@@ -140,6 +153,7 @@ export interface SessionOwnerReminderControllerDeps {
   save(records: SessionOwnerReminderRecords): void;
   send(ds: DaemonSession, text: string, uuid: string): Promise<void>;
   canSend(ds: DaemonSession): boolean;
+  getQuietHours?(): SessionOwnerReminderQuietHours | undefined;
   onError?(ds: DaemonSession, error: unknown): void;
 }
 
@@ -166,8 +180,9 @@ export class SessionOwnerReminderController {
   async scan(
     sessions: Iterable<DaemonSession>,
     config: SessionOwnerReminderConfig,
-    now: number = Date.now(),
+    scanAt?: number,
   ): Promise<void> {
+    const now = scanAt ?? Date.now();
     const current = this.deps.load();
     const before = recordsSnapshot(current);
     if (!config.enabled || config.states.length === 0) {
@@ -222,6 +237,10 @@ export class SessionOwnerReminderController {
       const dueBase = record.lastRemindedAt ?? record.actionableSince;
       if (now - dueBase < intervalMs) continue;
       if (record.retryAfterAt !== undefined && now < record.retryAfterAt) continue;
+      // Keep observing activity and eligibility during quiet hours. Only
+      // delivery is deferred, so the next scan can send a still-due reminder.
+      const quietHours = this.deps.getQuietHours ? this.deps.getQuietHours() : config.quietHours;
+      if (isOwnerReminderQuietTime(quietHours, scanAt ?? Date.now())) continue;
 
       try {
         await this.deps.send(
