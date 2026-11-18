@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach } from 'vitest';
-import { nodeTsRunnerPrefix, spawnNodeTsScript } from './ts-runner.js';
+import { nodeTsRunnerPrefix } from './ts-runner.js';
+import { workerTestModules, useWorkerTestModulesCleanup } from './worker-test-modules.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { resolveCodexRpcInput } from '../../src/services/codex-rpc-input-policy.js';
 import { killWorkerTmuxSession } from './worker-tmux-session.js';
@@ -55,6 +56,7 @@ export const contractHandles: SessionContractStore[] = [];
 export const contractEvents: Promise<unknown>[] = [];
 /** Each suite registers the shared worker/pane/contract cleanup once. */
 export function useTraexAutoModelIntegrationCleanup(): void {
+  useWorkerTestModulesCleanup();
   afterEach(async () => {
     for (const child of children.splice(0)) {
       // Host replies to messages the worker sent just before the kill may
@@ -306,6 +308,7 @@ setInterval(() => {
     })}\n`);
   }
   const binary = process.env.BOTMUX_TEST_WORKER_BINARY;
+  const modules = workerTestModules({ forceSource: !!binary });
   const backendType = withContract || binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
   if (backendType === 'tmux') panes.push(`bmx-${sessionId.slice(0, 8)}`);
   const options = {
@@ -314,7 +317,7 @@ setInterval(() => {
       CLI_EXTRA_ARGS: startupExtraArgs ?? '', SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any,
   };
-  let entry = resolve('src/worker.ts');
+  let entry = modules.path('worker.ts');
   if (!binary && (activityMode || delaySecondModelOrderNoticeMs > 0)) {
     // Test-only worker bootstrap, generated into the fixture's cleaned root.
     // - activityMode: heartbeats + capture timing for admission measurements;
@@ -323,8 +326,8 @@ setInterval(() => {
     //   notice rides the worker IPC channel while the relaunched CLI's
     //   submission rides the PTY channel; the notice leads the 3rd submission
     //   by only a few seconds locally, so 4s reliably inverts their arrival.
-    const tmuxImport = JSON.stringify(pathToFileURL(resolve('src/adapters/backend/tmux-pipe-backend.ts')).href);
-    const workerImport = JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href);
+    const tmuxImport = JSON.stringify(pathToFileURL(modules.path('adapters/backend/tmux-pipe-backend.ts')).href);
+    const workerImport = JSON.stringify(pathToFileURL(modules.path('worker.ts')).href);
     const heartbeatProbe = activityMode ? `
 let previous = performance.now();
 setInterval(() => {
@@ -344,7 +347,7 @@ TmuxPipeBackend.prototype.captureViewportAsync = async function () {
 const __modelOrderNoticeFragment = ${JSON.stringify(modelOrderNoticeFragment)};
 let __modelOrderNotices = 0;
 const __realSend = process.send?.bind(process);
-if (__realSend) process.send = function (msg: any, callback?: any): boolean {
+if (__realSend) process.send = function (msg, callback) {
   if (msg && msg.type === 'user_notify' && typeof msg.message === 'string'
     && msg.message.includes(__modelOrderNoticeFragment)) {
     __modelOrderNotices++;
@@ -353,14 +356,15 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
       return true;
     }
   }
-  return __realSend(msg, callback) as boolean;
-} as typeof process.send;
+  return __realSend(msg, callback);
+};
 ` : '';
-    entry = join(root, activityMode ? 'observed-worker.mts' : 'delayed-notice-worker.mts');
+    entry = join(root, `${activityMode ? 'observed-worker' : 'delayed-notice-worker'}.${modules.scriptExtension}`);
     writeFileSync(entry, `${delayedNoticeSend}${heartbeatProbe}await import(${workerImport});
 `);
   }
-  const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(entry, [], options);
+  const spawnWorker = () => binary ? spawn(binary, ['__worker'], options) : modules.spawn(entry, [], options);
+  const child = spawnWorker();
   children.push(child);
   const measurements: any[] = [];
   const hostErrors: unknown[] = [];
@@ -473,6 +477,6 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
         sessionCommand: { version: 2, execution } }) } : {}) };
     child.send(message);
   };
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake, removeCliAfterCatalog,
+  return { child, spawnWorker, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake, removeCliAfterCatalog,
     sendInput, controller, hostErrors, terminalDeliveries, noticeDeliveries, options, entry, ds, poolConfigPath };
 }
