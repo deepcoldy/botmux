@@ -2061,7 +2061,7 @@ function armRpcStartupDialogDismiss(): void {
  * callbacks capture it and must re-check after every await before touching
  * transcript lifecycle or user-visible state. */
 let workerSessionEventScope: WorkerSessionEventScope | undefined;
-const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>();
+const pendingRuntimeReservations = new Map<string, (mayStart: boolean, nativeResumeTargetInUse?: boolean) => void>();
 const contractWriteBackends = new WeakSet<SessionBackend>();
 function hasCurrentSessionRuntime(): boolean { return !workerSessionEventScope || workerSessionEventScope.isCurrentContext(); }
 function fenceContractBackendWrites(): void {
@@ -25755,7 +25755,7 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
-      if (outcome === 'refused' && !superseded
+      if (outcome === 'refused_native_target_in_use' && !superseded
         && pendingNativeResumeTarget?.attemptId === activeRestartAttemptId) {
         throw new Error('native_resume_target_in_use');
       }
@@ -37634,7 +37634,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'runtime_contract_reserved': {
       const binding = workerSessionEventScope?.currentBinding();
       if (binding?.bindingId === msg.bindingId) binding.proposedRuntime = msg.runtime;
-      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart);
+      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart, msg.nativeResumeTargetInUse === true);
       break;
     }
     case 'execution_contract_assigned': {

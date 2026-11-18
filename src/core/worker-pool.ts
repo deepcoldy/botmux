@@ -25250,12 +25250,14 @@ function setupWorkerHandlers(
           await sessionController.flushPrimary();
           const state = sessionController.store.read(sessionController.ref)!;
           if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
+          const nativeTargetInUse = !nativeResumeTargetMayStart(ds, msg.operationId);
           worker.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId,
             runtime: sessionController.store.binding(sessionController.ref, msg.bindingId)?.ref,
             mayStart: sessionController.bindingMayStart(msg.bindingId)
               && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
               && (!state.activeOperationId || state.activeOperationId === msg.operationId)
-              && nativeResumeTargetMayStart(ds, msg.operationId) });
+              && !nativeTargetInUse,
+            ...(nativeTargetInUse ? { nativeResumeTargetInUse: true } : {}) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
           // A refused reservation (e.g. a TraeX continuation the contract could

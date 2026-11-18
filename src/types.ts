@@ -2152,7 +2152,7 @@ type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
   /** One small-model recap of `prompt`, answered by recap_result. */
   | { type: 'recap_request'; requestId: string; prompt: string }
-  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; nativeResumeTargetInUse?: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   /** The host refused this binding; the worker returns to its predecessor. */

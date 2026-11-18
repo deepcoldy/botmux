@@ -21,7 +21,7 @@ export const RUNTIME_RESERVATION_SLOW_LOG_MS = 15_000;
  *  fatal startup reason. */
 export const RUNTIME_RESERVATION_UNCONFIRMED = 'runtime reservation was not confirmed by the daemon';
 
-export type RuntimeReservationOutcome = 'granted' | 'refused' | 'expired';
+export type RuntimeReservationOutcome = 'granted' | 'refused' | 'refused_native_target_in_use' | 'expired';
 
 export class RuntimeReservationExpiredError extends Error {
   constructor() {
@@ -33,7 +33,7 @@ export class RuntimeReservationExpiredError extends Error {
 /** Register the answer handler for `bindingId` in `pending` (the daemon's
  *  `runtime_contract_reserved` calls it) and resolve with what came of it. */
 export function awaitRuntimeReservation(
-  pending: Map<string, (mayStart: boolean) => void>,
+  pending: Map<string, (mayStart: boolean, nativeResumeTargetInUse?: boolean) => void>,
   bindingId: string,
   onSlow: () => void,
 ): Promise<RuntimeReservationOutcome> {
@@ -48,6 +48,8 @@ export function awaitRuntimeReservation(
     const deadline = setTimeout(() => settle('expired'), RUNTIME_RESERVATION_DEADLINE_MS);
     slow.unref?.();
     deadline.unref?.();
-    pending.set(bindingId, mayStart => settle(mayStart ? 'granted' : 'refused'));
+    pending.set(bindingId, (mayStart, nativeResumeTargetInUse) => settle(
+      mayStart ? 'granted' : nativeResumeTargetInUse ? 'refused_native_target_in_use' : 'refused',
+    ));
   });
 }

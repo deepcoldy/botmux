@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { chatSafeFatalErrorMessage } from '../src/core/startup-failure-reason.js';
 import { shouldRunStartupCommandsOnSpawn } from '../src/core/startup-commands.js';
 import { decideRestartFollowup } from '../src/core/restart-followup-policy.js';
+import { awaitRuntimeReservation } from '../src/services/runtime-reservation.js';
 
 const sourceId = '00000000-0000-4000-8000-000000000001';
 const targetId = '00000000-0000-4000-8000-000000000002';
@@ -165,6 +166,15 @@ describe('strict native restart process boundaries', () => {
       expect(fatal?.message).toBe('native_resume_target_unavailable');
       expect(JSON.stringify(f.outgoing)).not.toContain('PRIVATE');
       expect(f.logs.join('\n')).toContain('PRIVATE');
+    }
+  });
+
+  it('keeps ordinary reservation refusals distinct from a proven target conflict', async () => {
+    for (const [targetInUse, expected] of [[false, 'refused'], [true, 'refused_native_target_in_use']] as const) {
+      const pending = new Map<string, (mayStart: boolean, targetInUse?: boolean) => void>();
+      const outcome = awaitRuntimeReservation(pending, 'binding', () => {});
+      pending.get('binding')!(false, targetInUse);
+      expect(await outcome).toBe(expected);
     }
   });
 
@@ -375,7 +385,7 @@ describe('real daemon correlated restart sender', () => {
         metadata: {}, sessionController: runtimeController(ordinaryWorker),
         sameWorker: (left: unknown, right: unknown) => left === right, logger: { warn: vi.fn() }, t: 'ordinary' },
       { type: 'runtime_binding_started', bindingId: 'binding-ordinary', operationId: 'attempt' });
-      expect(second.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'runtime_contract_reserved', mayStart: false }));
+      expect(second.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'runtime_contract_reserved', mayStart: false, nativeResumeTargetInUse: true }));
 
       first.scope.activeSessionsRegistry.set('late-target-owner', { session: { status: 'active', cliSessionId: targetId } });
       first.scope.nativeResumeTargetMayStart = loadWorkerPoolFunction('nativeResumeTargetMayStart', first.scope);
@@ -385,7 +395,7 @@ describe('real daemon correlated restart sender', () => {
       await runRuntimeBindingStarted({ ...first.scope, ds: first.ds, worker: first.worker, contractWorker, metadata: {},
         sessionController, sameWorker: (left: unknown, right: unknown) => left === right, logger: { warn: vi.fn() }, t: 'owned' },
       { type: 'runtime_binding_started', bindingId: 'binding-1', operationId: 'attempt' });
-      expect(first.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'runtime_contract_reserved', mayStart: false }));
+      expect(first.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'runtime_contract_reserved', mayStart: false, nativeResumeTargetInUse: true }));
       first.ds.session.cliSessionId = targetId;
       const handler = loadWorkerPoolMessageHandlers(['restart_result'], { ...first.scope, ds: first.ds, worker: first.worker,
         nativeResumeTargetFailure, t: 'owned' });

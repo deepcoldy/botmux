@@ -14,6 +14,12 @@ import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-mo
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
   if (key === 'controllerForSession') return controllerForSession;
+  if (key === 'nativeResumeTargetMayStart' || key === 'nativeResumeTargetConflict' || key === 'releaseNativeResumeTargetClaim') {
+    return loadWorkerPoolFunction(key, scope);
+  }
+  if (key === 'nativeResumeTargetClaims' || key === 'nativeResumeRestartReadiness' || key === 'activeSessionsRegistry') {
+    return scope[key] ??= new Map();
+  }
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
