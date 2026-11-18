@@ -304,7 +304,8 @@ vi.mock('../src/core/shared-adopt.js', () => ({ isSharedAdoptSession: vi.fn(() =
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -339,6 +340,18 @@ function transcript(): string {
     userTurn('C', 'uC'), assistant('c'),
   ].map(line).join(''));
   return path;
+}
+
+/** Replace `path` with a FIFO and start a writer that opens it after `delaySec`.
+ *  A blocking open on the read side then returns once the writer shows up
+ *  instead of freezing the test process forever, so a regression fails on the
+ *  elapsed-time / reply assertions rather than hanging the run. */
+const fifoWriters: ChildProcess[] = [];
+function replaceWithFifo(path: string, delaySec: number): void {
+  rmSync(path, { force: true });
+  const mk = spawnSync('mkfifo', [path]);
+  if (mk.status !== 0) throw new Error(`mkfifo failed: ${mk.stderr}`);
+  fifoWriters.push(spawn('sh', ['-c', `sleep ${delaySec}; exec 3>"$1"`, 'sh', path], { stdio: 'ignore' }));
 }
 
 /** Fake worker: exits (async) only when told to; while "alive" it can still append. */
@@ -390,6 +403,8 @@ beforeEach(() => {
   suspendWorker.mockImplementation((ds: any) => { ds.worker = null; return true; });
 });
 afterEach(() => {
+  // Only the writers this file spawned; one still blocked in open() is killed.
+  for (const w of fifoWriters.splice(0)) if (w.exitCode === null && w.signalCode === null) w.kill('SIGKILL');
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   rewindState.jsonl = '';
   rewindState.truncateError = '';
@@ -545,6 +560,49 @@ describe('/rewind command', () => {
     await run(deps, '/rewind');
     expect(lastReply(deps)).toContain('找不到当前会话的 transcript');
   });
+
+  it('会话记录是软链：列表和预览都回复失败，链接目标的内容不进回复', async () => {
+    const target = transcript();
+    writeFileSync(target, line(userTurn('LINK_TARGET_TEXT', 'uT')) + line(assistant('t')) + line(userTurn('LINK_TARGET_2', 'uT2')));
+    rewindState.jsonl = join(dirname(target), 'link.jsonl');
+    symlinkSync(target, rewindState.jsonl);
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind');
+    await run(deps, '/rewind 1');
+    const replies = deps.sessionReply.mock.calls.map(c => String((c as unknown[])[1]));
+    expect(replies).toHaveLength(2);
+    for (const reply of replies) {
+      expect(reply).toContain('回退失败');
+      expect(reply).not.toContain('LINK_TARGET');
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('会话记录是命名管道：立即回复失败，不卡在管道上', async () => {
+    rewindState.jsonl = transcript();
+    replaceWithFifo(rewindState.jsonl, 3);
+    const deps = makeDeps(makeDs());
+    const started = Date.now();
+    await run(deps, '/rewind');
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(lastReply(deps)).toContain('回退失败');
+  }, 20_000);
+
+  it.skipIf(process.platform === 'win32')('停 CLI 后会话记录被换成命名管道：确认时的重扫回复失败，不卡住', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation((d: any) => {
+      d.worker = null;
+      replaceWithFifo(rewindState.jsonl, 4);
+      return true;
+    });
+    const started = Date.now();
+    await run(deps, '/rewind 1 confirm');
+    // The quiet wait alone takes ~0.6s; a blocking open would last until the
+    // writer shows up at 4s.
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(lastReply(deps)).toContain('回退失败');
+  }, 20_000);
 
   it('截断前持久化 replay 状态失败：拒绝回退且文件不动', async () => {
     rewindState.jsonl = transcript();

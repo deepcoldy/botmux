@@ -1,7 +1,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   assertSameInode,
   findCheckpoint,
@@ -10,6 +12,7 @@ import {
   summarizeUserText,
   waitForTranscriptQuiet,
 } from '../src/core/context-rewind.js';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
 
@@ -93,12 +96,59 @@ describe('scanClaudeTranscriptCheckpoints', () => {
     expect(scanClaudeTranscriptCheckpoints(path).map(cp => cp.uuid)).toEqual(['u1']);
   });
 
+  it('removedBytes 是回退到该轮会删掉的字节数（含末尾未写完的半行）', () => {
+    const path = fixture([userTurn('a', 'u1'), assistant, userTurn('b', 'u2'), assistant]);
+    appendFileSync(path, JSON.stringify(userTurn('写了一半', 'u3')));
+    const size = statSync(path).size;
+    const cps = scanClaudeTranscriptCheckpoints(path);
+    expect(cps.map(cp => [cp.uuid, cp.removedBytes])).toEqual(cps.map(cp => [cp.uuid, size - cp.offset]));
+    expect(cps.map(cp => cp.uuid)).toEqual(['u2', 'u1']);
+  });
+
   it('最多返回 limit 个，且 index=1 仍是最新', () => {
     const path = fixture([userTurn('a', 'u1'), userTurn('b', 'u2'), userTurn('c', 'u3')]);
     const checkpoints = scanClaudeTranscriptCheckpoints(path, 2);
     expect(checkpoints.map(cp => cp.preview)).toEqual(['c', 'b']);
     expect(checkpoints.map(cp => cp.index)).toEqual([1, 2]);
   });
+});
+
+describe('scanClaudeTranscriptCheckpoints 只读普通文件', () => {
+  it('路径是软链：拒绝读取，链接目标的内容不会变成检查点预览', () => {
+    const target = fixture([userTurn('LINK_TARGET_TEXT', 'uT'), assistant]);
+    const link = join(dirs.at(-1)!, 'link.jsonl');
+    symlinkSync(target, link);
+    let checkpoints: unknown;
+    expect(() => { checkpoints = scanClaudeTranscriptCheckpoints(link); }).toThrow();
+    expect(JSON.stringify(checkpoints ?? null)).not.toContain('LINK_TARGET_TEXT');
+  });
+
+  // 没有写端的命名管道会让阻塞式 open(2) 永远等下去；放进子进程跑，回归时
+  // 以超时失败，而不是把整个测试进程卡死。
+  it.skipIf(process.platform === 'win32')('路径是命名管道：立即拒绝，不在管道上阻塞', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rewind-fifo-'));
+    dirs.push(dir);
+    const fifo = join(dir, 'session.jsonl');
+    const mk = spawnSync('mkfifo', [fifo]);
+    expect(mk.status, String(mk.stderr)).toBe(0);
+    const mod = pathToFileURL(resolve('src/core/context-rewind.ts')).href;
+    const snippet = `
+      const { scanClaudeTranscriptCheckpoints } = await import(${JSON.stringify(mod)});
+      let outcome;
+      try {
+        outcome = { returned: scanClaudeTranscriptCheckpoints(${JSON.stringify(fifo)}) };
+      } catch (err) {
+        outcome = { error: String(err && err.message || err) };
+      }
+      console.log(JSON.stringify(outcome));
+    `;
+    const res = spawnSyncTsEvalWithRepoImports(snippet, { encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL' });
+    expect(res.signal, `child blocked on the FIFO; stderr=${res.stderr}`).toBeNull();
+    expect(res.status, String(res.stderr)).toBe(0);
+    const out = JSON.parse(String(res.stdout).trim().split('\n').pop()!);
+    expect(out.returned).toBeUndefined();
+    expect(out.error).toMatch(/non-regular/);
+  }, 90_000);
 });
 
 describe('resumable', () => {

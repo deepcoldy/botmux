@@ -12,7 +12,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
@@ -4070,7 +4070,6 @@ export async function handleCommand(
             break;
           }
           const rewindSessionKey = ds.session.sessionId;
-          const rewindSize = statSync(rewindJsonl).size;
           const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
           if (rewindMatch[2] && pendingPreview && (
             pendingPreview.index !== rewindIndex
@@ -4087,7 +4086,8 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
               index: rewindIndex,
               turns: rewindIndex,
-              bytes: rewindSize - rewindTarget.offset,
+              // From the scan's own descriptor: never a second read by path.
+              bytes: rewindTarget.removedBytes,
               preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
             }, loc));
             break;

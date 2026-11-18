@@ -41,6 +41,8 @@ export interface RewindCheckpoint {
    *  随后降级成新会话（换原生 id ⟹ 群上下文换代、整段背景重新注入），正好违背回退的
    *  目的。这种检查点不允许回退。 */
   resumable: boolean;
+  /** 回退到这一轮会删掉的字节数，按本次扫描从同一个文件描述符读到的内容计。 */
+  removedBytes: number;
 }
 
 const CHUNK_BYTES = 1 << 20;
@@ -78,15 +80,31 @@ function isCompactBoundary(ev: TranscriptEvent): boolean {
 }
 
 /**
+ * 打开 transcript 只读：不跟随链接、不在 FIFO 上阻塞，打开后从描述符确认是普通文件。
+ * 沙盒会话的 transcript 在 agent 可写的 BOT_HOME 下，路径在解析之后、打开之前可以被
+ * 换掉；之后的读取和大小都只取自这个描述符，不再按路径另读。
+ */
+function openTranscriptForRead(path: string): number {
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`refusing to read non-regular file ${path}`);
+  } catch (err) {
+    closeSync(fd);
+    throw err;
+  }
+  return fd;
+}
+
+/**
  * 扫描 transcript，返回最近 `limit` 个检查点（新的在前，index=1 为最近一轮）。
  * 流式读取，不把整个文件读进内存。
  */
 export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): RewindCheckpoint[] {
-  const fd = openSync(path, 'r');
+  const fd = openTranscriptForRead(path);
   const buf = Buffer.allocUnsafe(CHUNK_BYTES);
   let pending: Buffer = Buffer.alloc(0);
   let pendingStart = 0;
-  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction'>[] = [];
+  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction' | 'removedBytes'>[] = [];
   let lastCompactionOffset = -1;
   let sawConversation = false;
 
@@ -162,9 +180,17 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): Rewin
     closeSync(fd);
   }
 
+  // Everything read, including a trailing partial line: that is what a cut at
+  // any checkpoint would remove right now.
+  const scannedBytes = pendingStart + pending.length;
   const tail = found.slice(-Math.max(1, limit));
   return tail
-    .map((c, i) => ({ ...c, index: tail.length - i, beforeCompaction: c.offset < lastCompactionOffset }))
+    .map((c, i) => ({
+      ...c,
+      index: tail.length - i,
+      beforeCompaction: c.offset < lastCompactionOffset,
+      removedBytes: scannedBytes - c.offset,
+    }))
     .reverse();
 }
 
