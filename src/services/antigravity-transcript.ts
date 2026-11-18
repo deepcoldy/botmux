@@ -343,7 +343,7 @@ export interface AntigravityDrainOptions {
   adoptMode?: boolean;
 }
 
-function recordTimestampMs(rec: any): number {
+export function recordTimestampMs(rec: any): number {
   const ms = Date.parse(rec?.created_at);
   return Number.isFinite(ms) ? ms : Date.now();
 }

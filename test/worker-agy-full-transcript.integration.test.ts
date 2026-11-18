@@ -314,6 +314,27 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
     expect(worker.adoptCliPid && processAlive(worker.adoptCliPid)).toBe(true);
   }, 45_000);
 
+  it.skipIf(!hasTmux)('keeps a local terminal turn out of the active Lark thinking bubble', async () => {
+    const worker = await startWorker({ fullDelayMs: 3, adopt: true, holdReady: true });
+    await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.output, 15_000);
+    worker.child.send({ type: 'message', content: 'Lark turn still running', turnId: 'om_active_lark' });
+    await waitFor(() => existsSync(worker.transcript)
+      && readFileSync(worker.transcript, 'utf8').includes(worker.logs.middleSentinel), worker.output);
+    // Positive control: the Lark turn's own thinking still reaches its bubble.
+    await waitFor(() => worker.messages.some((m: any) => m.type === 'thinking_update'
+      && m.turnId === 'om_active_lark'
+      && m.entries.some((e: any) => (e.text ?? '').includes('合成思考'))), worker.output, 10_000);
+    // holdReady keeps the Lark turn active (no ready screen). A local request
+    // starts a second, terminal-only turn in the same transcript.
+    worker.typeInPane('Terminal-only local request');
+    await waitFor(() => readFileSync(worker.transcript, 'utf8').includes('SECOND-MIDDLE-ONLY'), worker.output);
+    await new Promise(r => setTimeout(r, 2_500));
+    const larkThinking = worker.messages
+      .filter((m): m is any => m.type === 'thinking_update' && m.turnId === 'om_active_lark')
+      .flatMap(m => m.entries.map((e: any) => e.text ?? ''));
+    expect(larkThinking.some(t => t.includes('SECOND-MIDDLE-ONLY'))).toBe(false);
+  }, 45_000);
+
   it.skipIf(!hasTmux)('recovers a written reply after the worker restarts while the pane stays open', async () => {
     const worker = await startWorker({ fullDelayMs: 3, adopt: true, fullLogExists: true, holdReady: true });
     await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.output, 15_000);
