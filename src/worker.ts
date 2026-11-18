@@ -28700,7 +28700,7 @@ async function spawnCliBody(
     // dsh runner only; other adapters ignore the field.
     dshProfile: cfg.dshProfile,
     reasoningEffort: launchReasoningEffort,
-    ...(cfg.cliId === 'codex-app' ? {
+    ...(isCodexAppCliId(cfg.cliId) ? {
       // The runner needs this only for a missing-thread fresh fallback. Match
       // codexLaunchReasoningEffort: a wrapper/profile/remote provider cannot
       // be attested by the bare local catalogue.
