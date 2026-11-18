@@ -117,7 +117,7 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
-import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
+import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -4252,9 +4252,11 @@ function sessionAgentConfig(
   // Effort is frozen per session, but whether it is *supported* depends on the
   // model this spawn actually uses — which is resolved live above, not frozen.
   // TraeX efforts are syntax-checked at load time; its live catalog owns capability.
+  // Codex drops only what its table refutes: a level on a model the table does
+  // not know may be catalogue-verified, and the worker's launch check decides.
   if (ds.session.reasoningEffort && !modelChoice.traexAutoModel
       && ds.session.cliId !== 'traex'
-      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)
+      && !cliModelMayKeepReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)
       && !(config.terminalEffortWriteback && hasConfirmedNativeGrokEffort(ds.session, model))) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
@@ -8726,8 +8728,15 @@ export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?
 }
 
 /** Persist first; a failed runtime apply must never claim that the pin was lost. */
-export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefined): boolean {
+/** `reasoningCatalog`: the bot runtime's live catalogue, when the writer loaded
+ *  one, so a pinned Codex level is judged like a Dashboard-saved one. */
+export function writeSessionModelPin(
+  ds: DaemonSession,
+  pin: ModelPin | undefined,
+  opts: { reasoningCatalog?: import('../services/codex-reasoning-effort.js').ReasoningCatalog | null } = {},
+): boolean {
   if (!pin && !ds.session.modelPin) return false;
+  const explicitEffort = pin?.effort !== undefined;
   if (pin) pin = retainPinEffort(pin, ds.session.modelPin);
   if (isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) throw new Error('会话正在迁移、重启或修改推理强度，请稍后重试');
   if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
@@ -8745,7 +8754,13 @@ export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefine
   if (pin) {
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
     if (cfg.cliId && cliId !== cfg.cliId) throw new Error('会话 CLI 与 bot CLI 不匹配，不能设置固定');
-    const error = validateModelPin(pin, { cliId, backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? cfg.backendType });
+    // An effort carried over from the previous pin of this model was judged
+    // when it was pinned (possibly against the catalogue); re-judge it by the
+    // keep-rule instead of re-asking a writer that may hold no catalogue.
+    const error = validateModelPin(explicitEffort ? pin : { model: pin.model },
+      { cliId, backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? cfg.backendType }, opts.reasoningCatalog)
+      ?? (!explicitEffort && pin.effort && !cliModelMayKeepReasoningEffort(cliId, pin.model, pin.effort)
+        ? `模型 ${pin.model} 不支持推理强度 ${pin.effort}` : undefined);
     if (error) throw new Error(error);
   }
   const before = ds.session.modelPin;

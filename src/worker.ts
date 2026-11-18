@@ -276,7 +276,7 @@ import { DSH_TUI_RESUME_ENV_KEYS, dshTuiResumeScope } from './core/dsh-tui-env.j
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { writeSessionEnvStamp } from './services/session-env-stamp.js';
 import { resumeFallbackNotice } from './services/resume-fallback-notice.js';
-import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, resolveCodexLaunchReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
@@ -430,7 +430,7 @@ import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
-import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
+import { loadCodexServiceTierCatalog, validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { probeTraexHookTrustSupport, traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
@@ -602,6 +602,7 @@ import { prepareSandboxWritableFiles } from './adapters/backend/sandbox-writable
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
+import { codexLaunchCatalogEnv } from './services/codex-launch-catalog-env.js';
 import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { paneLaunchDir } from './adapters/backend/pane-launch.js';
@@ -1658,6 +1659,48 @@ async function prepareCodexNativeTitleGeneration(
  *  (verified), hence the first turn must persist the rollout BEFORE the pane
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
+/**
+ * Launch-time gate for a Codex reasoning level (resolveCodexLaunchReasoningEffort):
+ * judged with the binary and environment this launch uses, so a level the
+ * Dashboard offered from the same catalogue passes, and one nothing vouches
+ * for (a hand edit, a model the catalogue does not list) is left out instead of
+ * being sent to the model. Returns the level for THIS launch; cfg and the
+ * saved setting are untouched, so a catalogue briefly unreachable never
+ * erases a choice for later launches.
+ */
+async function codexLaunchReasoningEffort(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  cliBin: string,
+  env: NodeJS.ProcessEnv,
+): Promise<Extract<DaemonToWorker, { type: 'init' }>['reasoningEffort']> {
+  const decision = await resolveCodexLaunchReasoningEffort({
+    cliId: cfg.cliId,
+    model: cfg.model,
+    effort: cfg.reasoningEffort,
+    // A wrapper or Codex profile picks the provider, and a remote backend runs
+    // the CLI elsewhere; the local catalogue cannot speak for those, so only
+    // the static table applies.
+    loadCatalog: cfg.wrapperCli?.trim() || cfg.codexProfile || isRemoteBackendType(cfg.backendType)
+      ? null
+      : () => loadCodexServiceTierCatalog({ cliBin, env }),
+  });
+  if (decision.dropped) {
+    const model = cfg.model?.trim() || '(CLI default)';
+    log(`Codex reasoning effort ${decision.dropped.effort} is not supported by model=${model}`
+      + ` per the ${decision.dropped.catalog ? 'live catalog' : 'static table'}`
+      + ` (supported: ${decision.dropped.supported.join('/') || 'none'}); launching without it`);
+    // The saved setting is kept, so say why this launch does not honour it.
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      message: `本次启动未使用思考强度 ${decision.dropped.effort}：${decision.dropped.catalog
+        ? `codex 模型目录显示 ${model} 不支持该档位`
+        : `拿不到可用于 ${model} 的 codex 模型目录，按内置档位表该档位不受支持`}，已按 CLI 默认强度启动；设置未改动。`,
+    });
+  }
+  return decision.effort;
+}
+
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
   followBotTraeHome(cfg);
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
@@ -1763,9 +1806,15 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
       sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, userNative: larkUserNative(cfg.triggerUserAuth) });
     for (const key of protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy)) delete engineEnv[key];
+    // The app-server stamps the level only on a fresh thread/start (a resume
+    // sends none and restores the thread's own); judge it with this
+    // app-server's binary and env before it gets there.
+    const engineReasoningEffort = cfg.cliId === 'codex' && cfg.reasoningEffort && !wantResume
+      ? await codexLaunchReasoningEffort(cfg, cliBin, engineEnv)
+      : cfg.reasoningEffort;
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
-      model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
+      model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: engineReasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
       bypassHookTrust: cfg.cliId === 'traex'
         && cfg.disableCliBypass !== true
@@ -28502,6 +28551,25 @@ async function spawnCliBody(
     }
   }
 
+  // Codex: judge the level against the catalogue of this exact launch (the
+  // binary and env the service-tier check below also uses). A remote viewer
+  // carries no level, and a reattach or adopted pane launches nothing.
+  const launchReasoningEffort = isCodexFamilyCliId(cfg.cliId) && cfg.reasoningEffort && !remoteWsUrl
+      && !cfg.adoptMode && !willReattachPersistent
+    ? await codexLaunchReasoningEffort(
+      cfg,
+      cfg.cliId === 'codex' ? cliAdapter.resolvedBin : resolveCommandReal(cfg.cliPathOverride ?? 'codex'),
+      // Same CODEX_HOME the child gets below (read-isolation home, then the
+      // instance-pool binding): the catalogue depends on its config.toml.
+      codexLaunchCatalogEnv({
+        base: buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        botEnv: perBotInjectEnv,
+        isolatedCodexHome: isolationBotHome && !claudeDataDir ? isolatedCodexHome : undefined,
+        instanceBinding: cfg.cliInstanceBinding,
+      }),
+    )
+    : cfg.reasoningEffort;
+
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
   // buildArgs runs first; these are pure path derivations, so naming them early
@@ -28606,7 +28674,7 @@ async function spawnCliBody(
     turnTimeoutMs: cfg.turnTimeoutMs,
     // dsh runner only; other adapters ignore the field.
     dshProfile: cfg.dshProfile,
-    reasoningEffort: cfg.reasoningEffort,
+    reasoningEffort: launchReasoningEffort,
     codexProfile: cfg.codexProfile,
     serviceTier: cfg.serviceTier,
     disableCliBypass: cfg.disableCliBypass === true,
@@ -31049,7 +31117,7 @@ async function spawnCliBody(
           cliId: cfg.cliId,
           model: cfg.model,
           modelBackendVariant: cfg.modelBackendVariant,
-          reasoningEffort: cfg.reasoningEffort,
+          reasoningEffort: launchReasoningEffort,
           retryPaneAgentStart: opts.retryPaneAgentStart,
         });
       },

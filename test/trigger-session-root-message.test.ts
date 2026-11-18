@@ -398,6 +398,22 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(activeSessions.get(sessionKey(ROOT, APP))?.session.reasoningEffort).toBe('xhigh');
   });
 
+  it('lets a Codex trigger inherit the bot\'s saved catalogue-only pair and still rejects a refuted override', async () => {
+    // gpt-6.3-sol stands for a model the static table has no row for: config
+    // load keeps its catalogue-verified max, so the trigger must not reject it.
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex', workingDir: '/tmp', model: 'gpt-6.3-sol', reasoningEffort: 'max' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const inherited = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    expect(inherited).toMatchObject({ ok: true });
+
+    const overridden = request();
+    (overridden.options as any) = { model: 'gpt-5.5' };
+    await expect(triggerSessionTurn(overridden, { larkAppId: APP, activeSessions: new Map() }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'bad_request' });
+  });
+
   it.each([
     { model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
     { model: 'auto', reasoningEffort: 'ultra', traexAutoModel: { enabled: true, models: ['DeepSeek-V4-Pro'] } },
