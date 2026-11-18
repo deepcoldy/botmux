@@ -2420,6 +2420,9 @@ export interface WorkerFinalOutput {
   durationMs?: number;
   /** Literal CLI input time, from the same execution window as durationMs. */
   executionStartedAtMs?: number;
+  /** Model observed for this exact reply. Presentation only. */
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Durable receiver attempt attribution. Final output suppression is
    *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
   dispatchAttempt?: number;

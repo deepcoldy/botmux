@@ -64,15 +64,11 @@ function getProcessChildPids(pid: number, procRoot = '/proc'): number[] {
 }
 
 /**
- * Scan for open conversation databases and brain directories. Linux uses
- * procfs, including child processes. macOS uses lsof: agy can keep the brain
- * directory open even when it has closed the conversation database.
- *
- * Fails closed (`null`) when zero or multiple distinct conversation UUIDs are
- * open across the process tree (for example during startup `ListConversations`
- * summary indexing or after `/fork` retains the parent DB alongside the child).
- * Multiple SQLite sidecar descriptors (`.db`, `.db-wal`, `.db-shm`) for the
- * same conversation collapse to one UUID.
+ * Agy holds a presence lock on the active conversation in the TUI process.
+ * Prefer that descriptor because old brain directories and databases can
+ * remain open after a conversation switch. Older builds without presence
+ * descriptors fall back to a unique brain or database identity across the
+ * process tree (procfs on Linux, lsof on macOS).
  */
 export function findAntigravityConversationIdByPid(
   pid: number,
@@ -80,10 +76,23 @@ export function findAntigravityConversationIdByPid(
   procRoot = '/proc',
 ): string | null {
   if (!Number.isFinite(pid) || pid <= 0) return null;
-  const links = process.platform === 'linux' || procRoot !== '/proc'
-    ? [pid, ...getProcessChildPids(pid, procRoot)].flatMap(child => getProcessFds(child, procRoot))
+  const useProcfs = process.platform === 'linux' || procRoot !== '/proc';
+  const links = useProcfs
+    ? getProcessFds(pid, procRoot)
     : listProcessOpenFiles(pid) ?? [];
   const databases = conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+  const presencePrefix = `${join(dirname(databases), 'presence')}/`;
+  const active = new Set<string>();
+  for (const link of links) {
+    if (!link.startsWith(presencePrefix) || !link.endsWith('.lock')) continue;
+    const id = link.slice(presencePrefix.length, -'.lock'.length);
+    if (UUID_RE.test(id)) active.add(id.toLowerCase());
+  }
+  if (active.size > 0) return active.size === 1 ? [...active][0] : null;
+
+  if (useProcfs) {
+    for (const child of getProcessChildPids(pid, procRoot)) links.push(...getProcessFds(child, procRoot));
+  }
   const databasePrefix = `${databases}/`;
   const brainPrefix = `${join(dirname(databases), 'brain')}/`;
   let found: string | null = null;

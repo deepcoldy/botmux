@@ -128,6 +128,8 @@ export interface CodexPendingTurn {
   inputDeliveryQuarantined?: true;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Explicit transcript terminal semantics. Undefined keeps the historical
    *  assistant-final => completed behaviour. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
@@ -384,6 +386,7 @@ export class CodexBridgeQueue {
     dispatchAttempt?: number,
     recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
     linkRefMode?: 'observe' | 'enabled',
+    requireExactInput = false,
   ): void {
     this.queue.push({
       turnId,
@@ -391,7 +394,7 @@ export class CodexBridgeQueue {
       ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
-      ...(/^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
+      ...(requireExactInput || /^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
       recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
@@ -1138,6 +1141,8 @@ export class CodexBridgeQueue {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         target.finalText = ev.text;
+        target.replyModel = ev.replyModel;
+        target.replyReasoningEffort = ev.replyReasoningEffort;
         target.terminalStatus = ev.terminalStatus;
         target.terminalErrorCode = ev.terminalErrorCode;
         target.terminalErrorSummary = ev.terminalErrorSummary;

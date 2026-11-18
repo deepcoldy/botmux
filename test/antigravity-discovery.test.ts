@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
@@ -35,6 +35,25 @@ describe('antigravity-discovery', () => {
 
     symlinkSync(join(cliHome, 'brain', second), join(fd, '5'));
     expect(findAntigravityConversationIdByPid(4100, join(cliHome, 'conversations'), procRoot)).toBeNull();
+  });
+
+  it('follows the TUI presence lock while an old conversation remains open', () => {
+    const procRoot = join(tmpDir, 'proc');
+    const cliHome = join(tmpDir, 'antigravity-cli');
+    const convDir = join(cliHome, 'conversations');
+    const fd = join(procRoot, '4100', 'fd');
+    const oldId = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
+    const newId = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
+    mkdirSync(fd, { recursive: true });
+    symlinkSync(join(cliHome, 'brain', oldId), join(fd, '3'));
+    symlinkSync(join(cliHome, 'presence', `${oldId}.lock`), join(fd, '4'));
+    expect(findAntigravityConversationIdByPid(4100, convDir, procRoot)).toBe(oldId);
+
+    symlinkSync(join(cliHome, 'presence', `${newId}.lock`), join(fd, '5'));
+    expect(findAntigravityConversationIdByPid(4100, convDir, procRoot)).toBeNull();
+    unlinkSync(join(fd, '4'));
+    symlinkSync(join(cliHome, 'brain', newId), join(fd, '6'));
+    expect(findAntigravityConversationIdByPid(4100, convDir, procRoot)).toBe(newId);
   });
 
   it('finds conversation ID matching cwd from summaries DB', () => {

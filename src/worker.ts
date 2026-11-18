@@ -13330,7 +13330,15 @@ function codexBridgeStartTimer(): void {
           if (!codexBridgeRolloutPath && codexBridgeQueue.peek().length > 0) {
             const pid = currentAntigravityObservedPid();
             const path = pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
-            if (path) codexBridgeAttach(path, 'split-live');
+            if (path) {
+              const mark = codexBridgeQueue.peek()[0]?.markTimeMs;
+              // Without a pre-write cursor, replay only a log born after the
+              // mark. An older log can contain the same local prompt in the
+              // same second as the Lark submit.
+              const born = statSync(path, { throwIfNoEntry: false })?.birthtimeMs;
+              const fresh = mark !== undefined && born !== undefined && born >= mark;
+              codexBridgeAttach(path, fresh ? 'split-live' : 'baseline-existing');
+            }
           }
         } else if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
           // A managed process can announce a new ID before its transcript
@@ -13774,6 +13782,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
           codexBridgeQueue.absorb(history);
           codexBridgeQueue.ingest(live);
+          if (restored > 0 && structuredBridgeIs('antigravity') && lastInitConfig?.adoptMode) {
+            structuredBridgeDriverState = result.state;
+          }
           if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
           // The restart-interruption scan only reads the transcript's final
           // 16MB. When the dead turn's user/start boundary (or a boundary at
@@ -15163,7 +15174,8 @@ function codexBridgeMarkPendingTurn(
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   structuredTurnsWithSubmitNotice.delete(turnId);
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark, linkRefMode);
+  const requireExactInput = lastInitConfig?.adoptMode === true && structuredBridgeIs('antigravity');
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark, linkRefMode, requireExactInput);
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
@@ -15735,6 +15747,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     // `/adopt`, including both the App prompt and its final reply.
     const adoptMode = terminalAdoptMode
       || (sharedAppServerBridge && turn.isLocal === true && !zeroPromptTerminalSync());
+    const replyRuntime = adoptMode && turn.replyModel
+      ? { replyModel: turn.replyModel, ...(turn.replyReasoningEffort ? { replyReasoningEffort: turn.replyReasoningEffort } : {}) }
+      : {};
     const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = bridgeGateInputForTurn(sessionId, turn, {
@@ -15846,6 +15861,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
         type: 'final_output',
         ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
         content: fields.content,
+        ...replyRuntime,
         lastUuid: turn.turnId,
         turnId: turn.turnId,
         ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -15860,6 +15876,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
       content: postContent,
+      ...replyRuntime,
       lastUuid: turn.turnId,
       turnId: turn.turnId,
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
@@ -25041,6 +25058,8 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
       codexAdoptPendingPid = cfg.adoptCliPid;
     }
     codexBridgeStartTimer();
+  } else if (cfg.cliId === 'antigravity') {
+    prepareAntigravityAdoptBridge();
   } else if (cfg.cliId === 'mtr') {
     const adoptStartMs = Date.now();
     codexAdoptStartMs = adoptStartMs;

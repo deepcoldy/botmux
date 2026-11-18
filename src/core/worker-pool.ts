@@ -704,7 +704,13 @@ export function getDaemonReplyCardUsageSnapshot(
 /** Presentation and timing have their own IPC/snapshot contract, separate from /usage. */
 export function getDaemonReplyCardRenderSnapshot(
   ds: DaemonSession,
-  options: { turnId?: string; dispatchAttempt?: number; finalTiming?: { durationMs?: number; executionStartedAtMs?: number } } = {},
+  options: {
+    turnId?: string;
+    dispatchAttempt?: number;
+    finalTiming?: { durationMs?: number; executionStartedAtMs?: number };
+    replyModel?: string;
+    replyReasoningEffort?: string;
+  } = {},
   effectiveCliId?: CliId,
 ): ReplyCardRenderSnapshot {
   let cfg: { showReplyTiming?: boolean } = {};
@@ -718,7 +724,15 @@ export function getDaemonReplyCardRenderSnapshot(
     durationMs: options.finalTiming?.durationMs, completed: options.finalTiming !== undefined, nowMs: Date.now(),
   }) : undefined;
   const consoleUrl = buildReplyConsoleUrl();
-  return { usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId), footerPreferences: normalizeReplyFooter(cfg),
+  const usage = getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+  if (options.replyModel) {
+    usage.model = options.replyModel;
+    if (effectiveCliId === 'codex' || options.replyReasoningEffort) {
+      usage.reasoningEffort = options.replyReasoningEffort;
+      usage.reasoningEffortSource = options.replyReasoningEffort ? 'last-execution' : undefined;
+    }
+  }
+  return { usage, footerPreferences: normalizeReplyFooter(cfg),
     ...(consoleUrl ? { consoleUrl } : {}), ...(timing ? { timing } : {}) };
 }
 
@@ -26740,6 +26754,8 @@ function deliverFinalOutput(
       renderSnapshot ??= getDaemonReplyCardRenderSnapshot(ds, {
         turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
         finalTiming: { durationMs: msg.durationMs ?? msg.codexAppSettlement?.durationMs, executionStartedAtMs: msg.executionStartedAtMs },
+        replyModel: msg.replyModel,
+        replyReasoningEffort: msg.replyReasoningEffort,
       }, effectiveCliId);
       const localTurnTitle = msg.kind === 'local-turn-headless'
         ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))

@@ -84,18 +84,30 @@ function followupReply(): string {
   return lines.join('\n');
 }
 
-async function startWorker(opts: { fullDelayMs: number; adopt?: boolean; seedHistory?: boolean }) {
+async function startWorker(opts: {
+  fullDelayMs: number;
+  adopt?: boolean;
+  seedHistory?: boolean;
+  fullLogExists?: boolean;
+  holdReady?: boolean;
+}) {
   const sessionId = `agy-full-${randomUUID()}`;
   const root = mkdtempSync(join(tmpdir(), 'botmux-agy-full-'));
   roots.add(root);
   const dataDir = join(root, 'session');
   const cliHome = join(root, '.gemini', 'antigravity-cli');
   const nativeId = randomUUID();
+  const nextNativeId = randomUUID();
   const logsDir = join(cliHome, 'brain', nativeId, '.system_generated', 'logs');
   const conversationDb = join(cliHome, 'conversations', `${nativeId}.db`);
-  for (const dir of [dataDir, logsDir, join(cliHome, 'conversations')]) mkdirSync(dir, { recursive: true });
+  const nextConversationDb = join(cliHome, 'conversations', `${nextNativeId}.db`);
+  const nextLogsDir = join(cliHome, 'brain', nextNativeId, '.system_generated', 'logs');
+  const presenceDir = join(cliHome, 'presence');
+  for (const dir of [dataDir, logsDir, join(cliHome, 'conversations'), presenceDir]) mkdirSync(dir, { recursive: true });
+  if (opts.fullLogExists) writeFileSync(join(logsDir, 'transcript_full.jsonl'), '');
   const history = join(cliHome, 'history.jsonl');
   const cliPidFile = join(root, 'fake-cli.pid');
+  const switchReceipt = join(root, 'conversation-switched');
   cliPidFiles.add(cliPidFile);
 
   // Records after each turn's USER_INPUT, prepared up front; the fake CLI
@@ -104,7 +116,7 @@ async function startWorker(opts: { fullDelayMs: number; adopt?: boolean; seedHis
   const second = followupReply();
   const secondFull = {
     step_index: 27, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
-    created_at: '2026-10-24T14:10:00Z', content: second,
+    created_at: '2026-10-24T14:10:00Z', content: second, model: 'gemini-4-carbon-low',
   };
   const secondCompact = { ...secondFull, content: cutLikeCompactLog(second), truncated_fields: ['content'] };
   const prep = join(root, 'prep');
@@ -120,10 +132,11 @@ async function startWorker(opts: { fullDelayMs: number; adopt?: boolean; seedHis
 const fs = require('node:fs');
 fs.writeFileSync(${JSON.stringify(cliPidFile + '.tmp')}, String(process.pid));
 fs.renameSync(${JSON.stringify(cliPidFile + '.tmp')}, ${JSON.stringify(cliPidFile)});
-// agy holds its conversation db open; botmux discovers the id from /proc/<pid>/fd.
+// Keep the old database open across a native conversation switch.
 const convFd = fs.openSync(${JSON.stringify(conversationDb)}, 'a');
-const compact = ${JSON.stringify(join(logsDir, 'transcript.jsonl'))};
-const full = ${JSON.stringify(join(logsDir, 'transcript_full.jsonl'))};
+let presenceFd = fs.openSync(${JSON.stringify(join(presenceDir, `${nativeId}.lock`))}, 'a');
+let compact = ${JSON.stringify(join(logsDir, 'transcript.jsonl'))};
+let full = ${JSON.stringify(join(logsDir, 'transcript_full.jsonl'))};
 const prep = ${JSON.stringify(prep)};
 const history = ${JSON.stringify(history)};
 const workspace = ${JSON.stringify(dataDir)};
@@ -139,7 +152,17 @@ process.stdin.on('data', chunk => {
   while ((at = buf.indexOf('\\r')) >= 0) {
     const payload = buf.slice(0, at);
     buf = buf.slice(at + 1);
-    if (payload.trim()) submit(++turn, payload);
+    if (payload === '/new') {
+      fs.mkdirSync(${JSON.stringify(nextLogsDir)}, { recursive: true });
+      fs.openSync(${JSON.stringify(nextConversationDb)}, 'a');
+      fs.closeSync(presenceFd);
+      presenceFd = fs.openSync(${JSON.stringify(join(presenceDir, `${nextNativeId}.lock`))}, 'a');
+      compact = ${JSON.stringify(join(nextLogsDir, 'transcript.jsonl'))};
+      full = ${JSON.stringify(join(nextLogsDir, 'transcript_full.jsonl'))};
+      fs.writeFileSync(${JSON.stringify(switchReceipt)}, '');
+    } else if (payload === '/fixture-ready') {
+      process.stdout.write('\\x1b[2J\\x1b[H' + ready + '\\n');
+    } else if (payload.trim()) submit(++turn, payload);
   }
 });
 function submit(n, payload) {
@@ -154,7 +177,7 @@ function submit(n, payload) {
     fs.appendFileSync(compact, user + fs.readFileSync(prep + '/turn' + n + '.compact.jsonl', 'utf8'));
     setTimeout(() => {
       fs.appendFileSync(full, user + fs.readFileSync(prep + '/turn' + n + '.full.jsonl', 'utf8'));
-      setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[H' + ready + '\\n'), 300);
+      if (!${opts.holdReady === true}) setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[H' + ready + '\\n'), 300);
     }, n === 1 ? fullDelayMs : 3);
   }, 300);
 }
@@ -174,45 +197,60 @@ setInterval(() => { void convFd; }, 1_000);
     adoptCliPid = Number(readFileSync(cliPidFile, 'utf8'));
   }
 
-  const messages: WorkerToDaemon[] = [];
-  const output: string[] = [];
-  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
-    cwd: resolve('.'),
-    env: {
-      ...process.env,
-      ...(opts.adopt ? tmuxEnv : {}),
-      HOME: root,
-      SESSION_DATA_DIR: dataDir,
-      BOTMUX_SESSION_ID: sessionId,
-      BOTMUX_TIME_SCALE: '0.05',
-      LARK_APP_ID: 'app_test',
-      LARK_APP_SECRET: 'secret',
-    },
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-  });
-  children.add(child);
-  child.on('message', raw => messages.push(raw as WorkerToDaemon));
-  child.stdout?.on('data', chunk => output.push(chunk.toString()));
-  child.stderr?.on('data', chunk => output.push(chunk.toString()));
-  child.send({
-    type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: dataDir, cliId: 'antigravity', cliPathOverride: fakeCli,
-    ...(adoptCliPid !== undefined ? {
-      backendType: 'tmux', adoptMode: true, adoptTmuxTarget: 'agy-adopt:0.0', adoptCliPid, prompt: '',
-    } : {
-      backendType: 'pty', promptInjection: 'none',
-      prompt: 'ACTIVATION_UNIQUE_MARKER 请对比两种工具调用方式', turnId: 'om_initial',
-    }),
-    larkAppId: 'app_test', larkAppSecret: 'secret',
-  } satisfies DaemonToWorker);
-
-  const finals = () => messages.filter((m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output');
-  return { child, messages, output, finals, logs, second, adoptCliPid };
+  const spawnWorker = (restored = false) => {
+    const messages: WorkerToDaemon[] = [];
+    const output: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        ...(opts.adopt ? tmuxEnv : {}),
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        BOTMUX_TIME_SCALE: '0.05',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => output.push(chunk.toString()));
+    child.stderr?.on('data', chunk => output.push(chunk.toString()));
+    child.send({
+      type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: dataDir, cliId: 'antigravity', cliPathOverride: fakeCli,
+      ...(adoptCliPid !== undefined ? {
+        backendType: 'tmux', adoptMode: true, adoptTmuxTarget: 'agy-adopt:0.0', adoptCliPid, prompt: '',
+        adoptRestoredFromMetadata: restored,
+      } : {
+        backendType: 'pty', promptInjection: 'none',
+        prompt: 'ACTIVATION_UNIQUE_MARKER 请对比两种工具调用方式', turnId: 'om_initial',
+      }),
+      larkAppId: 'app_test', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    const finals = () => messages.filter((m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output');
+    return { child, messages, output, finals };
+  };
+  const worker = spawnWorker();
+  const typeInPane = (command: string) => {
+    execFileSync('tmux', ['send-keys', '-t', 'agy-adopt:0.0', command, 'Enter'], { env: tmuxEnv });
+  };
+  const switchConversation = async () => {
+    typeInPane('/new');
+    await waitFor(() => existsSync(switchReceipt), worker.output);
+  };
+  return {
+    ...worker, logs, second, adoptCliPid, switchConversation, spawnWorker, typeInPane, history,
+    transcript: join(logsDir, 'transcript_full.jsonl'),
+    journal: join(dataDir, 'turn-marks', `${sessionId}.json.structured`),
+  };
 }
 
 describe('worker harvests Antigravity replies from transcript_full.jsonl', () => {
   it('delivers the complete long reply when agy writes both logs', async () => {
-    const worker = await startWorker({ fullDelayMs: 3 });
+    const worker = await startWorker({ fullDelayMs: 3, fullLogExists: true });
     await waitFor(() => worker.finals().length > 0, worker.output, 45_000);
     const [final] = worker.finals();
     expect(final.turnId).toBe('om_initial');
@@ -242,7 +280,11 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
   }, 120_000);
 
   const hasTmux = spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0;
-  it.skipIf(!hasTmux).each([true, false])('posts the adopted pane reply once (existing transcript: %s)', async seedHistory => {
+  it.skipIf(!hasTmux).each([
+    { seedHistory: true, rotate: false },
+    { seedHistory: false, rotate: false },
+    { seedHistory: true, rotate: true },
+  ])('posts the adopted pane replies once (existing transcript: $seedHistory, switch: $rotate)', async ({ seedHistory, rotate }) => {
     const worker = await startWorker({ fullDelayMs: 3, adopt: true, seedHistory });
     await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.output, 15_000);
     expect(worker.finals()).toHaveLength(0);
@@ -250,9 +292,40 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
     worker.child.send({ type: 'message', content, turnId: 'om_adopted' } satisfies DaemonToWorker);
     await waitFor(() => worker.finals().length > 0, worker.output, 20_000);
     expect(worker.finals()).toEqual([expect.objectContaining({
-      turnId: 'om_adopted', content: expect.stringContaining(worker.logs.middleSentinel),
+      turnId: 'om_adopted', content: expect.stringContaining(worker.logs.middleSentinel), replyModel: 'gemini-4-carbon-high',
+    })]);
+    if (rotate) await worker.switchConversation();
+    worker.child.send({
+      type: 'message', content: 'Second message from Lark', turnId: 'om_adopted_followup',
+    } satisfies DaemonToWorker);
+    await waitFor(() => worker.finals().length > 1, worker.output, 20_000);
+    expect(worker.finals().slice(1)).toEqual([expect.objectContaining({
+      turnId: 'om_adopted_followup', content: expect.stringContaining('SECOND-MIDDLE-ONLY'), replyModel: 'gemini-4-carbon-low',
     })]);
     expect(worker.messages.some(m => m.type === 'adopt_preamble')).toBe(false);
     expect(worker.adoptCliPid && processAlive(worker.adoptCliPid)).toBe(true);
   }, 45_000);
+
+  it.skipIf(!hasTmux)('recovers a written reply after the worker restarts while the pane stays open', async () => {
+    const worker = await startWorker({ fullDelayMs: 3, adopt: true, fullLogExists: true, holdReady: true });
+    await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.output, 15_000);
+    const content = 'Recover the pending Lark reply';
+    worker.child.send({ type: 'message', content, turnId: 'om_before_restart' } satisfies DaemonToWorker);
+    await waitFor(() => readFileSync(worker.transcript, 'utf8').includes(worker.logs.middleSentinel), worker.output);
+    expect(readFileSync(worker.journal, 'utf8')).toContain('om_before_restart');
+    expect(worker.finals()).toHaveLength(0);
+    const exited = new Promise<void>(resolveExit => worker.child.once('exit', () => resolveExit()));
+    worker.child.kill('SIGKILL');
+    await exited;
+
+    const replacement = worker.spawnWorker(true);
+    await waitFor(() => replacement.messages.some(m => m.type === 'ready'), replacement.output, 15_000);
+    worker.typeInPane('/fixture-ready');
+    await waitFor(() => replacement.finals().length > 0, replacement.output, 15_000);
+    expect(replacement.finals()).toEqual([expect.objectContaining({
+      turnId: 'om_before_restart', content: expect.stringContaining(worker.logs.middleSentinel), replyModel: 'gemini-4-carbon-high',
+    })]);
+    expect(readFileSync(worker.history, 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(worker.adoptCliPid && processAlive(worker.adoptCliPid)).toBe(true);
+  }, 50_000);
 });

@@ -406,7 +406,9 @@ function foldRecord(
     const text = unwrapAntigravityUserInput(raw);
     if (text) {
       const next = adoptMode ? { sourceTurnId: uuid } : {};
-      events.push({ uuid, timestampMs, kind: 'user', text, ...next });
+      events.push({ uuid, timestampMs, kind: 'user', text, ...next,
+        ...(adoptMode ? { inputTextAliases: [] } : {}),
+      });
       return next;
     }
     return {};
@@ -440,9 +442,13 @@ function foldRecord(
     // replaces an earlier held one). The pending-task flag rides along — the
     // quiet flush checks it and refuses while a task is outstanding.
     const finalText = hasTruncatedContent(obj) ? `${text}\n\n${ANTIGRAVITY_TRUNCATED_REPLY_NOTICE}` : text;
+    const model = adoptMode && typeof obj.model === 'string' ? obj.model.trim() : '';
     return {
       ...turn,
-      provisionalFinal: { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText, ...turn },
+      provisionalFinal: {
+        uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText, ...turn,
+        ...(model && !model.endsWith('-worker-agy') ? { replyModel: model } : {}),
+      },
       ...(state.hasPendingTask ? { hasPendingTask: true } : {}),
     };
   }
