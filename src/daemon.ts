@@ -117,6 +117,7 @@ import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
+import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -35968,6 +35969,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 文档订阅恢复 + 评论轮询：都是主动调飞书文档 API 的路径。apiOnly（core-only）
   // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
+  const ownerGroupFollower = cfg.apiOnly ? undefined : startOwnerGroupFollow(cfg.larkAppId, config.session.dataDir);
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
   let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
   let oncallHandoffRunning = false;
@@ -37100,6 +37102,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
+    ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;
     clearInterval(oncallHandoffTimer);
@@ -37390,6 +37393,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;
     clearInterval(oncallHandoffTimer);

@@ -1,3 +1,4 @@
+import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
@@ -2473,6 +2474,8 @@ export interface BotConfig {
    * Defaults 或飞书 /botconfig 配置；仅作用于被动入群，团队建群/federation 不读此开关。
    */
   autoInviteOwnerOnGroupAdd?: boolean;
+  /** Default OFF. Use the configured owner's user authorization to follow newly joined groups. */
+  ownerGroupFollow?: OwnerGroupFollowConfig;
   /**
    * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
    * message auto-starts a session even without an @mention (the default role +
@@ -4638,6 +4641,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoStartOnGroupJoinAnchor: entry.autoStartOnGroupJoinAnchor === 'latest-message' ? 'latest-message' : undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
+      ownerGroupFollow: (() => { try { return normalizeOwnerGroupFollowConfig(entry.ownerGroupFollow); } catch { return undefined; } })(),
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()

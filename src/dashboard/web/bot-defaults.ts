@@ -79,6 +79,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
+      'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -583,6 +584,7 @@ export type BotDefaultsRow = {
   herdr?: import('../../adapters/backend/types.js').HerdrBackendConfig | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
+  ownerGroupFollow?: import('../../services/owner-group-follow-policy.js').OwnerGroupFollowConfig | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
