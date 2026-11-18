@@ -113,6 +113,23 @@ function transpiledWorkerFunction(name: string): string {
   }).outputText;
 }
 
+/**
+ * Lazy in-scope defaults for worker module-level state that extracted
+ * functions/cases reference via `with (scope)`. A harness that does not stub
+ * these would otherwise resolve them to undefined and throw (e.g. iterating an
+ * undefined Map). Explicitly supplied scope values always win. Returns
+ * `undefined` for keys this does not own so callers keep their own fallbacks.
+ */
+function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | symbol): unknown {
+  if (key === 'inFlightKeepaliveFingerprints') {
+    return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
+  }
+  if (key === 'KEEPALIVE_HOOK_CLAIM_MS') {
+    return (scope.KEEPALIVE_HOOK_CLAIM_MS ??= 30_000);
+  }
+  return undefined;
+}
+
 export function loadWorkerFunction<T extends (...args: any[]) => any>(
   name: string,
   scope: Record<string, unknown>,
@@ -146,6 +163,10 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
     if (key === 'busyReadyDeferral') return scope.busyReadyDeferral ??= new BusyReadyDeferralTracker();
     if (key === 'busyReadyLogThrottle') return scope.busyReadyLogThrottle ??= new BusyReadyLogThrottle();
+    // Module-level keep-alive provenance state shared with the message-handler
+    // proxy; explicit scope stubs still take precedence.
+    const keepaliveDefault = defaultScopedWorkerState(scope, key);
+    if (keepaliveDefault !== undefined) return keepaliveDefault;
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
@@ -200,6 +221,11 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
     has: (_target, key) => key !== Symbol.unscopables,
     get: (target, key) => {
       if (key in target) return target[key as string];
+      // Same lazy module-state defaults as loadWorkerFunction so extracted IPC
+      // cases (e.g. prompt_submitted reading the keep-alive map) resolve even
+      // when the harness scope does not stub them.
+      const scopedDefault = defaultScopedWorkerState(scope, key);
+      if (scopedDefault !== undefined) return scopedDefault;
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
       return (globalThis as any)[key];
     },

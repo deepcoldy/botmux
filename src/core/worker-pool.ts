@@ -6506,6 +6506,10 @@ const postTerminalCardSettles = new WeakMap<DaemonSession, {
   revision: number;
   pending: boolean;
   delivered: boolean;
+  /** Set when genuine live work arrives while the idle correction PATCH is
+   *  still in flight. The settle callback applies one working repaint after
+   *  the idle write settles, so the handoff is not lost to ordering. */
+  repaintRequested?: boolean;
 }>();
 
 /** Drop a pending fallback. Any real screen frame, and scheduling for a newer
@@ -6529,6 +6533,150 @@ function postTerminalSettleAlreadyApplied(ds: DaemonSession, turnId: string | un
  *  terminal means the session is producing again. */
 function sessionHasLiveTurn(ds: DaemonSession): boolean {
   return !!ds.currentTurnId && ds.currentTurnId !== ds.lastTurnTerminalTurnId;
+}
+
+/**
+ * Whether a busy frame is genuine LIVE work that started after the last
+ * completed terminal. Three explicit forms (turnId-presence alone is not enough
+ * because a prompt-cache keep-alive also clears the turn id without being new
+ * work — it must NOT reopen the card):
+ *
+ *  - `directSubmit`: the worker's Web Terminal / sandbox hook submit, explicitly
+ *    marked (the only clearTurnId frame that represents real new work).
+ *  - A frame naming a turn newer than the terminalized one.
+ *  - A newer dispatch attempt of the same turn (a live retry).
+ */
+function isLiveWorkFrameAfterTerminal(
+  ds: DaemonSession,
+  frame: { turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+): boolean {
+  if (ds.lastTurnTerminalStatus !== 'completed') return false;
+  if (frame.directSubmit === true) return true;
+  if (frame.turnId && frame.turnId !== ds.lastTurnTerminalTurnId) return true;
+  if (frame.turnId === ds.lastTurnTerminalTurnId
+    && frame.dispatchAttempt !== undefined
+    && ds.lastTurnTerminalDispatchAttempt !== undefined
+    && frame.dispatchAttempt > ds.lastTurnTerminalDispatchAttempt) return true;
+  return false;
+}
+
+/**
+ * Whether the session has live work on the fly after the last completed
+ * terminal that the settle/self-heal must not idle-correct over. Covers managed
+ * turns (current turn pointer / dispatch high-water) and a direct-submit
+ * episode recorded in `postTerminalLiveWorkAt`.
+ */
+function sessionHasLiveWorkAfterTerminal(ds: DaemonSession): boolean {
+  if (ds.lastTurnTerminalStatus !== 'completed') return false;
+  if (sessionHasLiveTurn(ds)) return true;
+  const highWater = ds.turnDispatchAttemptHighWater;
+  if (highWater && highWater.turnId === ds.lastTurnTerminalTurnId
+    && highWater.dispatchAttempt !== undefined
+    && ds.lastTurnTerminalDispatchAttempt !== undefined
+    && highWater.dispatchAttempt > ds.lastTurnTerminalDispatchAttempt) return true;
+  return ds.postTerminalLiveWorkAt !== undefined
+    && ds.lastTurnTerminalAt !== undefined
+    && ds.postTerminalLiveWorkAt >= ds.lastTurnTerminalAt;
+}
+
+/**
+ * Whether a screen/screenshot busy frame is STALE residual evidence from the
+ * turn that already reported a completed terminal, with no live-work episode
+ * opened since. Suppressed frames include both viewport residue tagged with the
+ * terminalized (turn, attempt) AND untagged prompt-cache keep-alive frames:
+ * neither may drive the card.
+ *
+ * Once a live-work episode is open (direct-submit, newer turn, or retry — see
+ * sessionHasLiveWorkAfterTerminal), ALL subsequent busy frames belong to that
+ * live work until the next terminal closes it, even if a screenshot still
+ * carries the previous capture identity: checking the persistent epoch here
+ * (not just the current frame's tag) lets follow-up frames inherit the episode.
+ *
+ * The caller still updates non-card execution state (screen content, usage
+ * limit, background count, in-memory status); only card-facing writes and the
+ * revision bump are suppressed.
+ */
+function isStalePostTerminalBusyFrame(
+  ds: DaemonSession,
+  projectedStatus: StreamStatus,
+  frame: { turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+): boolean {
+  if (ds.lastTurnTerminalStatus !== 'completed') return false;
+  if (!POST_TERMINAL_BUSY_STATUSES.has(projectedStatus)) return false;
+  // A live-work episode is already open: this frame (screen or screenshot,
+  // whatever its tag) is part of it, not residual evidence.
+  if (sessionHasLiveWorkAfterTerminal(ds)) return false;
+  if (isLiveWorkFrameAfterTerminal(ds, frame)) return false;
+  return true;
+}
+
+/**
+ * Record that genuine live work reopened the session after a completed terminal.
+ * Every live-work form opens the liveness epoch (direct-submit, a newer managed
+ * turn whose beginNewTurn has not landed yet, or a retry attempt) so the settle
+ * and self-heal recognize it even before the structural pointers catch up; the
+ * first frame wins and later frames do not refresh the timestamp, so the sweep
+ * ages against the true episode start. Also requests a working repaint against
+ * any post-terminal idle correction (delivered or in-flight).
+ */
+function notePostTerminalLiveWork(
+  ds: DaemonSession,
+  frame: { turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+): void {
+  if (ds.lastTurnTerminalStatus !== 'completed') return;
+  if (!isLiveWorkFrameAfterTerminal(ds, frame)) return;
+  // Stamp the episode start once. Any of the three live-work forms opens it;
+  // subsequent frames of the same episode must not move the sweep age baseline.
+  if (ds.postTerminalLiveWorkAt === undefined) ds.postTerminalLiveWorkAt = Date.now();
+  const receipt = postTerminalCardSettles.get(ds);
+  if (receipt && receipt.cardId === ds.streamCardId) receipt.repaintRequested = true;
+}
+
+/**
+ * Close the post-terminal live-work episode. Called when the live work ends
+ * through a path that does NOT emit a managed completed terminal:
+ *  - a real idle/limited screen frame (the CLI returned to its prompt — the
+ *    natural end of a direct-submit episode whose local failure terminal the
+ *    worker deliberately suppresses);
+ *  - any local-* terminal (completed/failed/cancelled).
+ * Without these exits the epoch would stay open forever and a later keep-alive
+ * busy frame would be misread as episode continuation, flipping an idle card
+ * back to working and disabling the stuck-working self-heal.
+ */
+function closePostTerminalLiveWorkEpisode(ds: DaemonSession): void {
+  ds.postTerminalLiveWorkAt = undefined;
+}
+
+/**
+ * Open the post-terminal live-work episode from the worker's explicit
+ * `direct_submit_started` provenance signal. Unlike notePostTerminalLiveWork
+ * this does not depend on a screen frame (which may never arrive when
+ * prompt_ready is stuck), so it works in the exact failure mode that leaves a
+ * card stranded after a terminal. Also requests a working repaint against any
+ * delivered/in-flight idle correction; the actual card write still happens on
+ * the next frame or the settle callback, never from this signal alone.
+ */
+function markDirectSubmitEpisode(ds: DaemonSession): void {
+  if (ds.lastTurnTerminalStatus !== 'completed') return;
+  if (ds.postTerminalLiveWorkAt === undefined) ds.postTerminalLiveWorkAt = Date.now();
+  const receipt = postTerminalCardSettles.get(ds);
+  if (receipt && receipt.cardId === ds.streamCardId) receipt.repaintRequested = true;
+}
+
+/**
+ * Whether an accepted (non-stale) live busy frame must force a visible card
+ * re-render against a post-terminal idle correction.
+ *
+ * The correction is display-only: it PATCHed the card to idle while leaving
+ * `lastScreenStatus` at the execution value (`working`). Live work then re-asserts
+ * `working`, but the same-turn "PATCH only on a status edge" branch would skip
+ * the render. A delivered receipt repaints immediately; a pending one is handled
+ * in its settle callback via repaintRequested (see notePostTerminalLiveWork).
+ */
+function deliveredPostTerminalCorrectionNeedsBusyRepaint(ds: DaemonSession): boolean {
+  const receipt = postTerminalCardSettles.get(ds);
+  return !!receipt && receipt.delivered && receipt.repaintRequested === true
+    && receipt.cardId === ds.streamCardId;
 }
 
 function ownsSettleTarget(
@@ -6561,6 +6709,10 @@ function settleStaleBusyCardStatus(
   try {
     if (!ownsSettleTarget(ds, requireLiveWorker, ownsWorker)) return false;
     if (ds.suppressRecoveryCard || hasUnsettledAcceptedInput(ds)) return false;
+    // Genuine live work already reopened after the terminal (a newer managed
+    // turn, a retry attempt, or a direct-submit episode): its working card is
+    // correct, so neither the fallback nor the self-heal may idle-correct it.
+    if (sessionHasLiveWorkAfterTerminal(ds)) return false;
     const highWater = ds.turnDispatchAttemptHighWater;
     if (highWater && highWater.turnId === turnId
       && highWater.dispatchAttempt !== ds.lastTurnTerminalDispatchAttempt) return false;
@@ -6587,6 +6739,7 @@ function settleStaleBusyCardStatus(
       revision: ds.streamCardStatusRevision ?? 0,
       pending: true,
       delivered: false,
+      repaintRequested: false,
     };
     postTerminalCardSettles.set(ds, receipt);
     const terminalAttempt = ds.lastTurnTerminalDispatchAttempt;
@@ -6598,7 +6751,22 @@ function settleStaleBusyCardStatus(
         && receipt.revision === (ds.streamCardStatusRevision ?? 0)
         && !hasUnsettledAcceptedInput(ds) && !ds.usageLimit
         && (ds.backgroundTaskCount ?? 0) === 0,
-      onSettled: delivered => { receipt.pending = false; receipt.delivered = delivered; },
+      onSettled: delivered => {
+        receipt.pending = false;
+        receipt.delivered = delivered;
+        // In-flight handoff: live work arrived while this idle PATCH was still
+        // pending and asked for a working repaint. Two orderings are both fine:
+        //  - the idle fence rejected it (a live-work frame moved the revision),
+        //    so the card never went idle and we now render working directly;
+        //  - it delivered idle first, then we repaint the current working state.
+        // buildStreamingCardJson reads the live lastScreenStatus ('working').
+        if (receipt.repaintRequested
+          && sessionHasLiveWorkAfterTerminal(ds)
+          && isRealStreamingCardId(ds.streamCardId)) {
+          scheduleCardPatch(ds, buildStreamingCardJson(ds), turnId);
+        }
+        receipt.repaintRequested = false;
+      },
     });
     if (!accepted) { receipt.pending = false; return false; }
     const ageSeconds = Math.max(1, Math.round(ageMs / 1_000));
@@ -20935,6 +21103,20 @@ function setupWorkerHandlers(
         }
         break;
       }
+      case 'direct_submit_started': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored direct_submit_started from stale worker generation`);
+          break;
+        }
+        // Provenance-only: open the live-work episode even when no prompt_ready
+        // / working screen frame follows (stuck-after-terminal). No card write.
+        markDirectSubmitEpisode(ds);
+        break;
+      }
       case 'turn_progress': {
         if (!ownsLifecycleMutation() || (msg.stage !== 'model_output'
           && msg.stage !== 'tool_started' && msg.stage !== 'tool_returned')) break;
@@ -22226,7 +22408,21 @@ function setupWorkerHandlers(
         // Any real screen frame supersedes the post-terminal fallback: the card
         // is once again driven by live worker evidence.
         if (!ownsLifecycleMutation()) break;
-        cancelPostTerminalStatusSettle(ds);
+        // Project the frame's effective status once: reused for the in-memory
+        // status assignment below and the stale-post-terminal gate.
+        const projectedScreenStatus = resolveUsageAwareScreenStatus(
+          ds, msg.status, msg.usageLimit, msg.content,
+        );
+        // A busy frame from a turn that already reported a completed terminal
+        // (with no newer turn admitted) is stale viewport evidence. It must not
+        // cancel the post-terminal correction or drive the card/revision; the
+        // caller still refreshes non-card state further down.
+        const stalePostTerminalBusy = isStalePostTerminalBusyFrame(ds, projectedScreenStatus, {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+          directSubmit: msg.directSubmit,
+        });
+        if (!stalePostTerminalBusy) cancelPostTerminalStatusSettle(ds);
         // Wait for worker init, independently of Web Terminal availability.
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
@@ -22251,25 +22447,58 @@ function setupWorkerHandlers(
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit, msg.content);
+        ds.lastScreenStatus = projectedScreenStatus;
         workersWithScreenStatus.add(worker);
+        // Open/record the post-terminal live-work epoch for a direct-submit,
+        // newer-turn or newer-attempt busy frame. Idempotent; keepalive and
+        // residual frames (stalePostTerminalBusy) never reach here as live work.
+        if (!stalePostTerminalBusy && POST_TERMINAL_BUSY_STATUSES.has(projectedScreenStatus)) {
+          notePostTerminalLiveWork(ds, {
+            turnId: msg.turnId,
+            dispatchAttempt: msg.dispatchAttempt,
+            directSubmit: msg.directSubmit,
+          });
+        }
+        // A real idle/limited frame is the natural end of a live-work episode
+        // (e.g. a direct-submit whose local failure terminal is suppressed):
+        // close it so a later keep-alive busy frame cannot be mistaken for
+        // continuation and re-open a settled idle card.
+        if (!POST_TERMINAL_BUSY_STATUSES.has(projectedScreenStatus)) {
+          closePostTerminalLiveWorkEpisode(ds);
+        }
+        // A non-stale live busy frame arriving against a display-only idle
+        // correction must repaint the card back to busy even though the
+        // execution status value itself does not change (it stayed 'working').
+        const forcePostTerminalBusyRepaint = !stalePostTerminalBusy
+          && POST_TERMINAL_BUSY_STATUSES.has(projectedScreenStatus)
+          && deliveredPostTerminalCorrectionNeedsBusyRepaint(ds);
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
         stampIdleSinceAt(ds, prevStatus);
-        bumpStreamCardStatusRevision(ds);
-        try {
-          const published = cb.onScreenStatus?.(ds, {
-            prevStatus,
-            status: ds.lastScreenStatus as ScreenStatus,
-            turnId: screenTurnId,
-          });
-          void Promise.resolve(published).catch((err: any) => {
-            logger.debug(`[${t}] runtime status card bridge failed: ${err?.message ?? err}`);
-          });
-        } catch (err: any) {
-          logger.debug(`[${t}] runtime status card bridge threw: ${err?.message ?? err}`);
+        // Stale post-terminal busy frames must not move the card revision: a
+        // bump here would invalidate the in-flight post-terminal idle
+        // correction's write fence (its receipt pins this revision). The card
+        // write segment below is skipped for the same reason.
+        if (!stalePostTerminalBusy) bumpStreamCardStatusRevision(ds);
+        // The onScreenStatus bridge repaints card elements and notifies
+        // workflow wake state. A stale busy frame has nothing new to publish —
+        // the turn already settled and a real idle frame (not gated) owns the
+        // workflow/usage transitions — so skip it entirely here.
+        if (!stalePostTerminalBusy) {
+          try {
+            const published = cb.onScreenStatus?.(ds, {
+              prevStatus,
+              status: ds.lastScreenStatus as ScreenStatus,
+              turnId: screenTurnId,
+            });
+            void Promise.resolve(published).catch((err: any) => {
+              logger.debug(`[${t}] runtime status card bridge failed: ${err?.message ?? err}`);
+            });
+          } catch (err: any) {
+            logger.debug(`[${t}] runtime status card bridge threw: ${err?.message ?? err}`);
+          }
         }
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
@@ -22385,6 +22614,13 @@ function setupWorkerHandlers(
           deferredScheduleIdleTurnIds.add(deferredTurnId);
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
+
+        // Stale post-terminal busy frames have refreshed all non-card state
+        // above. Skip the whole card segment (reply cards, rate-limit notices,
+        // streaming-card POST/PATCH): the post-terminal idle correction owns
+        // the visible card now, and repainting busy would fight it. A new turn
+        // (sessionHasLiveTurn) or a real idle/limited frame clears this gate.
+        if (stalePostTerminalBusy) break;
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
 
@@ -22679,6 +22915,9 @@ function setupWorkerHandlers(
           // Same turn — PATCH only on a header change: the status, or the
           // background-task count it shows. Image PATCHes go through the
           // screenshot_uploaded path; text is no longer a card body mode.
+          // The post-terminal repaint is the one same-value exception: the
+          // display-only idle correction left a delivered receipt while
+          // execution stayed busy, so the first live busy frame must render.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
           const label = streamCardLabel(ds);
           const activity = typeof label === 'object' && 'activity' in label ? label.activity : undefined;
@@ -22686,8 +22925,12 @@ function setupWorkerHandlers(
           // Spinner frames and elapsed time alone do not trigger a PATCH.
           // A config-only label change has no activity edge; keep the periodic
           // repaint available even when this frame itself needs no PATCH.
+          // The post-terminal repaint is the one same-value exception: the
+          // display-only idle correction left a delivered receipt while
+          // execution stayed busy, so the first live busy frame must render.
           syncUsageRefreshTimer(ds);
-          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount && prevActivity === activity) break;
+          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
+            && prevActivity === activity && !forcePostTerminalBusyRepaint) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
@@ -22721,6 +22964,9 @@ function setupWorkerHandlers(
             codexAppStopCardTarget(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
+          // The forced repaint consumed the post-terminal divergence marker;
+          // drop it so later ordinary working→working ticks don't repaint.
+          if (forcePostTerminalBusyRepaint) postTerminalCardSettles.delete(ds);
           // Keep the live usage climbing during a long working phase; stop once
           // the turn settles (idle/limited). State-boundary invariant — one
           // choke point re-evaluates arm/clear after this status assignment.
@@ -22774,7 +23020,26 @@ function setupWorkerHandlers(
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
-        bumpStreamCardStatusRevision(ds);
+        // Same per-frame stale gate as screen_update: a residual busy screenshot
+        // from the terminalized (turn, attempt) must not bump the card revision
+        // (which would invalidate the post-terminal idle correction's fence) or
+        // repaint the card below. Non-card execution state above still updates.
+        const stalePostTerminalShot = isStalePostTerminalBusyFrame(ds, ds.lastScreenStatus, {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+        });
+        // Record liveness for a newer-turn / newer-attempt screenshot so the
+        // settle and self-heal treat it as live work (screenshot frames carry
+        // no direct-submit marker; untagged ones are keepalive and stay stale).
+        if (!stalePostTerminalShot && POST_TERMINAL_BUSY_STATUSES.has(ds.lastScreenStatus)) {
+          notePostTerminalLiveWork(ds, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt });
+        }
+        // Symmetric to screen_update: an idle/limited screenshot closes the
+        // live-work episode so a later keep-alive cannot re-open the card.
+        if (!POST_TERMINAL_BUSY_STATUSES.has(ds.lastScreenStatus)) {
+          closePostTerminalLiveWorkEpisode(ds);
+        }
+        if (!stalePostTerminalShot) bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already
@@ -22811,6 +23076,10 @@ function setupWorkerHandlers(
           persistStreamCardState(ds);
           break;
         }
+        // A stale post-terminal screenshot keeps the execution status updated
+        // above but must not overwrite the card image/cache or schedule a busy
+        // PATCH — the post-terminal idle correction owns the visible card now.
+        if (stalePostTerminalShot) break;
         noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.currentImageKey = msg.imageKey;
         ds.currentImageSource = { imageKey: msg.imageKey, ...frameVerdict.source };
@@ -24200,7 +24469,19 @@ function setupWorkerHandlers(
           ds.lastTurnTerminalTurnId = msg.turnId;
           ds.lastTurnTerminalDispatchAttempt = msg.dispatchAttempt;
           ds.lastTurnTerminalStatus = msg.status;
+          // A fresh terminal starts a clean post-terminal window: any earlier
+          // direct-submit live-work episode belongs to the previous window.
+          ds.postTerminalLiveWorkAt = undefined;
           schedulePostTerminalStatusSettle(ds, msg);
+        }
+        // A Web Terminal typed turn (`local-*`) never moves currentTurnId, so the
+        // managed-turn gate above does not run for it. Any of its terminals
+        // (completed/failed/cancelled) ends the live-work episode it opened —
+        // including the failure path whose terminal the worker suppresses down
+        // to a notice: clear the epoch so a later stuck-working self-heal is not
+        // permanently suppressed by stale liveness.
+        if (isTerminalTypedTurnId(msg.turnId)) {
+          closePostTerminalLiveWorkEpisode(ds);
         }
         const terminalCliId = workerCliId(ds);
         if (terminalCliId !== undefined) turnTerminalReportingCliIds.add(terminalCliId);
