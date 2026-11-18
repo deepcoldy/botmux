@@ -85,10 +85,16 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       complete('long stream complete'); continue;
     }
-    if (prompt === 'split-utf8') {
-      const frame = Buffer.from(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId,
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '你好🌍' } } } }) + '\n');
-      for (const byte of frame) if (!process.stdout.write(Buffer.from([byte]))) await once(process.stdout, 'drain');
+    if (prompt === 'two-large-answers') {
+      for (const messageId of ['first', 'second']) {
+        for (let i = 0; i < 100; i++) {
+          const text = (messageId === 'first' ? '甲' : '乙\0').repeat(20_000);
+          if (!update({ sessionUpdate: 'agent_message_chunk', messageId, content: { type: 'text', text } })) {
+            await once(process.stdout, 'drain');
+          }
+        }
+        if (messageId === 'first') update({ sessionUpdate: 'tool_call', toolCallId: 'tool-between' });
+      }
       send({ id: promptId, result: { stopReason: 'end_turn' } }); continue;
     }
     if (prompt === 'unknown-response') { send({ id: 999, result: {} }); continue; }

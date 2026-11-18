@@ -5,6 +5,7 @@ import { delimiter, dirname, resolve } from 'node:path';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { MinimaxTurnBudget, parseMinimaxTurnTimeout } from './services/minimax-turn-budget.js';
 import { runMcodeExec } from './services/mcode-exec.js';
+import { writeMinimaxFinal } from './services/minimax-final-control.js';
 import { runMinimaxAcp } from './services/minimax-acp.js';
 import { bridgeMinimaxForm, bridgeMinimaxPermission } from './services/minimax-user-input.js';
 
@@ -123,7 +124,7 @@ async function drain(): Promise<void> {
             }
           },
         }, controller.signal);
-        if (!closing) output.marker('final', { content: result.content, usage: result.usage,
+        if (!closing) writeMinimaxFinal(output, { content: result.content, usage: result.usage,
           ...(turn.turnId ? { turnId: turn.turnId } : {}), startedAtMs, completedAtMs: Date.now() });
       } catch (error) {
         if (!closing) {
@@ -132,9 +133,9 @@ async function drain(): Promise<void> {
           const message = errorCode === 'turn_budget_exhausted'
             ? `MiniMax Code 单轮总预算已耗尽（${timeoutMs}ms）。模型输出和工具进度不会重置此预算；可在机器人设置中调大或清空单轮总预算后重新拉起会话。`
             : controller.signal.aborted ? 'MiniMax Code 本轮执行已中断。'
-            : `MiniMax Code 执行失败：${error instanceof Error ? error.message : String(error)}`;
+            : `MiniMax Code 执行失败：${(error instanceof Error ? error.message : String(error)).slice(0, 16_384)}`;
           finishDisplay(); displayText(message); finishDisplay();
-          output.marker('final', { content: message, errorCode, ...(turn.turnId ? { turnId: turn.turnId } : {}),
+          writeMinimaxFinal(output, { content: message, errorCode, ...(turn.turnId ? { turnId: turn.turnId } : {}),
             startedAtMs, completedAtMs: Date.now() });
         }
       } finally {
