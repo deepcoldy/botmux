@@ -36849,6 +36849,9 @@ function startFailedTurnRewind(
       ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend).claudeJsonlPath
       : undefined,
   );
+  // The projects root this worker pinned when it launched the CLI: both reads
+  // that can lead to a cut trust only a transcript inside it.
+  const projectsRoot = claudeProjectsRoot;
   const plan = planFailedTurnRewindRequest({
     cliId: lastInitConfig?.cliId,
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
@@ -36866,7 +36869,7 @@ function startFailedTurnRewind(
               : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
                 ? 'a turn is running' : undefined,
     directive,
-    inspect: inspectLastTurnInProjectsRoot,
+    inspect: path => inspectLastTurnInProjectsRoot(path, projectsRoot),
   });
   if (plan.kind === 'decline') {
     report('declined', plan.reason);
@@ -36886,7 +36889,7 @@ function startFailedTurnRewind(
     beforeRespawn: async retiring => {
       const outcome = await runFailedTurnRewindMaintenance({
         waitForQuiescence: () => waitForRetiringCliQuiescence(retiring),
-        inspect: () => inspectLastTurnInProjectsRoot(plan.target.jsonlPath),
+        inspect: () => inspectLastTurnInProjectsRoot(plan.target.jsonlPath, projectsRoot),
         rewind: (offset, file) => rewindClaudeTranscript(plan.target.jsonlPath, offset, Date.now(), {
           backup: 'removed', ...(file ? { expectFile: file } : {}),
         }),

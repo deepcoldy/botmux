@@ -13,6 +13,7 @@ import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTa
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { resolvePurgeResumeTarget } from '../src/services/transcript-image-purge.js';
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
+import { pinClaudeProjectsRoot } from '../src/services/claude-projects-root.js';
 import { restoreRewoundTranscript, rewindClaudeTranscript } from '../src/core/context-rewind.js';
 import {
   inspectLastTurnInProjectsRoot,
@@ -74,6 +75,8 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     send,
     log: () => {},
     bridgeJsonlPath: jsonl,
+    // Pinned when the CLI was launched, from its config dir.
+    claudeProjectsRoot: pinClaudeProjectsRoot(join(root, 'claude')),
     backend: { getChildPid: () => 4242 },
     lastInitConfig: { cliId: 'claude-code' },
     isRemoteBackendType: () => false,
@@ -490,7 +493,9 @@ describe('startFailedTurnRewind', () => {
     const original = failedTranscript();
     const { jsonl, cutAfterExit, reports } = setup(original, {
       // As if another file had been put at the path between the read and the cut.
-      inspectLastTurnInProjectsRoot: (path: string) => ({ ...inspectLastTurnInProjectsRoot(path), file: { dev: -1, ino: -1 } }),
+      inspectLastTurnInProjectsRoot: (path: string, root: Parameters<typeof inspectLastTurnInProjectsRoot>[1]) => ({
+        ...inspectLastTurnInProjectsRoot(path, root), file: { dev: -1, ino: -1 },
+      }),
     });
     await cutAfterExit();
     expect(readFileSync(jsonl, 'utf8')).toBe(original);
@@ -509,6 +514,27 @@ describe('startFailedTurnRewind', () => {
     await cutAfterExit();
     expect(readFileSync(join(elsewhere, 'cwd-key', `${SID}.jsonl`), 'utf8')).toBe(original);
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/outside its projects directory/) })]);
+  });
+
+  it('does not cut once the projects directory itself became a link: the root stays the one pinned at launch', async () => {
+    const original = failedTranscript();
+    const { jsonl, cutAfterExit, reports } = setup(original);
+    const projects = dirname(dirname(jsonl));
+    const elsewhere = join(dirname(dirname(projects)), 'elsewhere-projects');
+    renameSync(projects, elsewhere);
+    symlinkSync(elsewhere, projects);
+    await cutAfterExit();
+    expect(readFileSync(join(elsewhere, 'cwd-key', `${SID}.jsonl`), 'utf8')).toBe(original);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/outside its projects directory/) })]);
+  });
+
+  it('trusts no transcript without a projects root pinned at launch', () => {
+    const original = failedTranscript();
+    const { jsonl, restartCliProcess, written, reports } = setup(original, { claudeProjectsRoot: undefined });
+    expect(restartCliProcess).not.toHaveBeenCalled();
+    expect(written).toEqual(['继续']);
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
   });
 
   it('does not cut once the message is no longer waiting: its input would be lost', async () => {

@@ -28,8 +28,7 @@ import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { normaliseForFingerprint } from '../services/claude-transcript.js';
 import type { PurgeResumeTarget } from '../services/transcript-image-purge.js';
-import { realpathSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { isInClaudeProjectsRoot, type ClaudeProjectsRoot } from '../services/claude-projects-root.js';
 import { inspectLastClaudeTurn, type FileIdentity, type LastTurnInspection, type RewindResult } from './context-rewind.js';
 
 /** The failed input, then the newer one, as one turn. A newer input identical
@@ -161,19 +160,14 @@ export function transcriptTurnFailedWithoutOutput(jsonlPath: string, writtenInpu
   return lastTurnIsFailedInput(inspectLastClaudeTurn(jsonlPath), writtenInput);
 }
 
-/** The last turn of a transcript that sits inside its projects directory —
- *  the check the image purge applies: a project directory swapped for a link
- *  to somewhere else is refused (the file itself is never followed, see
- *  {@link inspectLastClaudeTurn}). The root is taken from the path itself, so
- *  a link at or above the projects directory moves it along; what keeps a cut
- *  from landing outside is that it needs the session's exact failed turn in
- *  the file it reads, and that a restore writes only the inode it cut. */
-export function inspectLastTurnInProjectsRoot(jsonlPath: string): LastTurnInspection {
-  const root = dirname(dirname(jsonlPath));
-  const lexical = relative(resolve(root), resolve(jsonlPath));
-  const realRoot = realpathSync(root);
-  const realFile = realpathSync(jsonlPath);
-  if (lexical.startsWith('..') || isAbsolute(lexical) || !realFile.startsWith(`${realRoot}${sep}`)) {
+/** The last turn of a transcript inside the projects root the worker pinned
+ *  when it launched the CLI (services/claude-projects-root.ts, the check the
+ *  image purge applies): never a root derived from the transcript's own path,
+ *  which a link at or above `projects` would move along. No pinned root:
+ *  nothing is trusted. The file itself is never followed either, see
+ *  {@link inspectLastClaudeTurn}. */
+export function inspectLastTurnInProjectsRoot(jsonlPath: string, root: ClaudeProjectsRoot | undefined): LastTurnInspection {
+  if (!root || !isInClaudeProjectsRoot(jsonlPath, root)) {
     throw new Error('transcript outside its projects directory');
   }
   return inspectLastClaudeTurn(jsonlPath);
