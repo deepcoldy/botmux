@@ -12,7 +12,8 @@
  * （groupContextEpoch），换新 id 会让整段群历史——包括想丢掉的那条——重新注入。
  */
 
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, readlinkSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   extractTurnStartText,
   isMeaningfulQueuedCommand,
@@ -43,6 +44,17 @@ export interface RewindCheckpoint {
    *  随后降级成新会话（换原生 id ⟹ 群上下文换代、整段背景重新注入），正好违背回退的
    *  目的。这种检查点不允许回退。 */
   resumable: boolean;
+  /** 回退到这一轮会删掉的字节数，按本次扫描从同一个文件描述符读到的内容计。 */
+  removedBytes: number;
+}
+
+/** 会话记录所在的、会话里的 CLI 可写的那棵树（见 transcript-resolver 的
+ *  writableTreeRoot）。给出时，打开之后还要证明打开的就是树里那个文件。 */
+export interface TranscriptTreeScope {
+  writableTreeRoot?: string;
+  /** 截断前的备份放在这里，而不是 transcript 旁边。给了 writableTreeRoot 时必填：
+   *  那棵树里不再创建任何文件，备份只进会话 CLI 写不到的目录。 */
+  backupDir?: string;
 }
 
 const CHUNK_BYTES = 1 << 20;
@@ -84,15 +96,103 @@ function isCompactBoundary(ev: TranscriptEvent): boolean {
 }
 
 /**
+ * 证明描述符 `fd` 就是 `path` 在 `root` 之下、一路没有经过链接所指的那个文件。
+ * O_NOFOLLOW 只管路径最后一段，所以要在打开之后、读写之前核对实际打开的对象：
+ * 有 /proc 时由内核给出它的位置，必须正好是「root 的真实位置 + 路径的后缀」；
+ * 没有时逐级 lstat，root 之下每一级都得是目录本身、末级是普通文件且与 fd 同 inode。
+ */
+export function assertOpenedInsideTree(
+  fd: number,
+  path: string,
+  root: string,
+  openedPath: (fd: number) => string = descriptor => readlinkSync(`/proc/self/fd/${descriptor}`),
+): void {
+  const rel = relative(resolve(root), resolve(path));
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`refusing to use ${path}: not under ${root}`);
+  }
+  let opened: string | undefined;
+  try { opened = openedPath(fd); } catch { opened = undefined; }
+  if (opened !== undefined) {
+    if (opened !== join(realpathSync(root), rel)) {
+      throw new Error(`refusing to use ${path}: the opened file is not the one under ${root}`);
+    }
+    return;
+  }
+  const parts = rel.split(sep);
+  let current = resolve(root);
+  for (let i = 0; i < parts.length; i++) {
+    current = join(current, parts[i]!);
+    const st = lstatSync(current);
+    const leaf = i === parts.length - 1;
+    if (leaf ? !st.isFile() : !st.isDirectory()) {
+      throw new Error(`refusing to use ${path}: ${current} is not a ${leaf ? 'regular file' : 'directory'}`);
+    }
+    if (leaf) assertSameInode(st, fstatSync(fd), path);
+  }
+}
+
+/**
+ * 打开 transcript：不跟随链接、不在 FIFO 上阻塞，打开后从描述符确认是普通文件，
+ * 路径经过 CLI 可写的树时再确认打开的就是树里那个文件。之后的读取、大小和截断都只
+ * 经这个描述符，不再按路径另开。
+ */
+function openTranscript(path: string, scope: TranscriptTreeScope, access: number): number {
+  const fd = openSync(path, access | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`refusing to read non-regular file ${path}`);
+    if (scope.writableTreeRoot) assertOpenedInsideTree(fd, path, scope.writableTreeRoot);
+    return fd;
+  } catch (err) {
+    closeSync(fd);
+    throw err;
+  }
+}
+
+/**
  * 扫描 transcript，返回最近 `limit` 个检查点（新的在前，index=1 为最近一轮）。
  * 流式读取，不把整个文件读进内存。
  */
-export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): RewindCheckpoint[] {
-  const fd = openSync(path, 'r');
+export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope: TranscriptTreeScope = {}): RewindCheckpoint[] {
+  const fd = openTranscript(path, scope, fsConstants.O_RDONLY);
+  try {
+    return scanDescriptor(fd, limit);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** 一个打开着的 transcript：扫描和截断都经同一个描述符，截断的一定是扫描读的那个文件。 */
+export interface OpenTranscript {
+  scan(limit?: number): RewindCheckpoint[];
+  cut(offset: number, now?: number): RewindResult;
+}
+
+/** 打开 transcript（读写，规则同 {@link scanClaudeTranscriptCheckpoints}），在 `use`
+ *  返回前一直持有这个描述符。按扫描结果算出的偏移只在这个描述符上截断：路径在两步
+ *  之间被换成别的文件也碰不到它，inode 号也不会在持有期间被别的文件复用。 */
+export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, use: (transcript: OpenTranscript) => T): T {
+  const fd = openTranscript(path, scope, fsConstants.O_RDWR);
+  try {
+    return use({
+      scan: (limit = 20) => scanDescriptor(fd, limit),
+      cut: (offset, now = Date.now()) => {
+        // The backup is created next to the path: it must still name the
+        // file held here (held open, its inode cannot have been reused).
+        assertSameInode(lstatSync(path), fstatSync(fd), path);
+        return rewindOpenTranscript(fd, path, offset, now, scope);
+      },
+    });
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function scanDescriptor(fd: number, limit: number): RewindCheckpoint[] {
   const buf = Buffer.allocUnsafe(CHUNK_BYTES);
   let pending: Buffer = Buffer.alloc(0);
   let pendingStart = 0;
-  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction'>[] = [];
+  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction' | 'removedBytes'>[] = [];
   let lastCompactionOffset = -1;
   let sawConversation = false;
 
@@ -146,10 +246,13 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): Rewin
     });
   };
 
-  try {
+  let readPos = 0;
+  {
     for (;;) {
-      const n = readSync(fd, buf, 0, CHUNK_BYTES, null);
+      // Positional: a descriptor shared with a later cut keeps no file offset.
+      const n = readSync(fd, buf, 0, CHUNK_BYTES, readPos);
       if (n <= 0) break;
+      readPos += n;
       const chunk = buf.subarray(0, n);
       const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
       const base = pendingStart;
@@ -164,13 +267,19 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): Rewin
       pendingStart = base + pos;
     }
     // A trailing line without '\n' is a write in progress, not a checkpoint.
-  } finally {
-    closeSync(fd);
   }
 
+  // Everything read, including a trailing partial line: that is what a cut at
+  // any checkpoint would remove right now.
+  const scannedBytes = pendingStart + pending.length;
   const tail = found.slice(-Math.max(1, limit));
   return tail
-    .map((c, i) => ({ ...c, index: tail.length - i, beforeCompaction: c.offset < lastCompactionOffset }))
+    .map((c, i) => ({
+      ...c,
+      index: tail.length - i,
+      beforeCompaction: c.offset < lastCompactionOffset,
+      removedBytes: scannedBytes - c.offset,
+    }))
     .reverse();
 }
 
@@ -450,7 +559,7 @@ export function rewindClaudeTranscript(
     /** The file the cut was planned on ({@link LastTurnInspection.file}): a
      *  different inode at the path now is refused. */
     expectFile?: FileIdentity;
-  } = {},
+  } & TranscriptTreeScope = {},
 ): RewindResult {
   const pre = lstatSync(path);
   if (!pre.isFile()) throw new Error(`refusing to rewind non-regular file ${path}`);
@@ -460,6 +569,7 @@ export function rewindClaudeTranscript(
     // Pin the descriptor to the inode lstat inspected (regular-file swap TOCTOU).
     assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
     if (opts.expectFile) assertSameInode(opts.expectFile, fstatSync(fd), path);
+    if (opts.writableTreeRoot) assertOpenedInsideTree(fd, path, opts.writableTreeRoot);
     return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
     closeSync(fd);
@@ -523,7 +633,7 @@ function rewindOpenTranscript(
   path: string,
   offset: number,
   now: number,
-  opts: { beforeBackup?: () => void; backup?: 'full' | 'removed' } = {},
+  opts: { beforeBackup?: () => void; backup?: 'full' | 'removed' } & TranscriptTreeScope = {},
 ): RewindResult {
   const st = fstatSync(fd);
   if (!Number.isInteger(offset) || offset <= 0 || offset > st.size) {
@@ -535,8 +645,15 @@ function rewindOpenTranscript(
     if (byte[0] !== 10) throw new Error(`rewind offset ${offset} is not at a line boundary`);
   }
   const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+  // A tree the session's CLI can write to gets no file from here: neither a
+  // check before creating it nor a cleanup after can keep a path in such a
+  // tree pointing where it pointed.
+  if (opts.writableTreeRoot && !opts.backupDir) {
+    throw new Error(`refusing to rewind ${path}: no backup directory outside the CLI-writable tree`);
+  }
   const removedOnly = opts.backup === 'removed';
-  const backupPath = `${path}.rewind-${stamp}${removedOnly ? '.removed' : ''}.bak`;
+  const backupSuffix = `.rewind-${stamp}${removedOnly ? '.removed' : ''}.bak`;
+  const backupPath = opts.backupDir ? join(opts.backupDir, `${basename(path)}${backupSuffix}`) : `${path}${backupSuffix}`;
   opts.beforeBackup?.();
   const removed = copyBackupFromDescriptor(fd, backupPath, st.size, removedOnly ? offset : 0, removedOnly);
   ftruncateSync(fd, offset);
