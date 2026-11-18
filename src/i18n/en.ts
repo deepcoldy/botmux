@@ -2352,6 +2352,8 @@ export const messages: Record<string, string> = {
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ Enable "Daily auto-update" first.',
   'settings.sectionAccess': 'Access',
   'settings.sectionCards': 'Card behaviour',
+  'settings.modelQueueNotify': 'Model queue notification',
+  'settings.modelQueueNotifyHelp': 'Off by default. Show explicit TRAE CLI model capacity queue status on live cards for all bots on this machine. Takes effect on the next card refresh.',
   'settings.sectionMaintenance': 'Maintenance',
   'settings.publicReadOnly': 'Public read-only',
   'settings.publicReadOnlyHelp': 'Allow tokenless access to read-only APIs.',

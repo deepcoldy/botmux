@@ -62,6 +62,7 @@ interface DashboardSettings {
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
   stuckCardInitiatorKeys: boolean;
+  modelQueueNotify: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -214,7 +215,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
   return null;
 }
 
-function parseSettings(s: any): DashboardSettings {
+export function parseSettings(s: any): DashboardSettings {
   return {
     groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
     worktreeRoot: typeof s?.worktreeRoot === 'string' ? s.worktreeRoot : '',
@@ -243,6 +244,7 @@ function parseSettings(s: any): DashboardSettings {
     cardBrandLabel: s?.cardBrandLabel !== false,
     // default ON — only an explicit persisted false disables (server snapshot)
     stuckCardInitiatorKeys: s?.stuckCardInitiatorKeys !== false,
+    modelQueueNotify: s?.modelQueueNotify === true,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -916,7 +918,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'terminalEffortWriteback' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'terminalEffortWriteback' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'modelQueueNotify' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -997,6 +999,14 @@ export function SettingsBody(props: {
           />
         </SettingsBlock>
         <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
+          <ToggleRow
+            title={tr('settings.modelQueueNotify')}
+            help={tr('settings.modelQueueNotifyHelp')}
+            checked={settings.modelQueueNotify}
+            disabled={dis || savingKey === 'modelQueueNotify'}
+            dataAction="toggle-model-queue-notify"
+            onChange={value => saveBoolean('modelQueueNotify', value)}
+          />
           <ToggleRow
             title={tr('settings.cardBrandLabel')}
             help={tr('settings.cardBrandLabelHelp')}

@@ -2250,7 +2250,10 @@ export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined 
     return { recoveryAt: recovery.nextAttemptAt, ...(recovery.nextAttemptAt <= Date.now() ? { due: true } : {}) };
   }
   const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
-  return streamCardExecutionLabel(cliId, sessionExecutionActivity(ds)) ?? idleCardLabel(ds);
+  const observed = sessionExecutionActivity(ds);
+  const notifyQueue = cliId === 'traex' && observed?.phase === 'model_queue'
+    && readGlobalConfig().dashboard?.modelQueueNotify === true;
+  return streamCardExecutionLabel(cliId, observed, notifyQueue) ?? idleCardLabel(ds);
 }
 
 /** Push the current-turn execution observation to Dashboard rows. `null`
@@ -22244,6 +22247,8 @@ function setupWorkerHandlers(
         const screenTurnId = screenTurnProven ? msg.turnId : undefined;
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
+        const prevLabel = streamCardLabel(ds);
+        const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit, msg.content);
@@ -22675,7 +22680,14 @@ function setupWorkerHandlers(
           // background-task count it shows. Image PATCHes go through the
           // screenshot_uploaded path; text is no longer a card body mode.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
-          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount) break;
+          const label = streamCardLabel(ds);
+          const activity = typeof label === 'object' && 'activity' in label ? label.activity : undefined;
+          // Capacity entry/exit keeps status=working but changes the card header.
+          // Spinner frames and elapsed time alone do not trigger a PATCH.
+          // A config-only label change has no activity edge; keep the periodic
+          // repaint available even when this frame itself needs no PATCH.
+          syncUsageRefreshTimer(ds);
+          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount && prevActivity === activity) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),

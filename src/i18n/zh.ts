@@ -2355,6 +2355,8 @@ export const messages: Record<string, string> = {
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ 需先开启「每日自动更新」',
   'settings.sectionAccess': '访问控制',
   'settings.sectionCards': '卡片行为',
+  'settings.modelQueueNotify': '排队通知',
+  'settings.modelQueueNotifyHelp': '默认关闭。开启后，TRAE CLI 的状态卡显示明确的模型容量排队状态。对本机所有 Bot 生效，保存后随卡片刷新生效。',
   'settings.sectionMaintenance': '维护',
   'settings.publicReadOnly': '公开只读模式',
   'settings.publicReadOnlyHelp': '允许无 token 访问只读 API。',

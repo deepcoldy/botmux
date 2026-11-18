@@ -146,13 +146,14 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
     const engine = makeEngine({
       sessionId: sid,
-      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '1500' },
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_ON_SIGNAL: '1' },
     });
     let leader: number | undefined;
     let tool: number | undefined;
     try {
       await engine.start();
       leader = engine.appServerPid!;
+      process.kill(leader, 'SIGUSR2');
       await vi.waitFor(() => {
         tool = Number(readFileSync(childFile, 'utf8').trim());
         expect(tool).toBeGreaterThan(0);
@@ -184,18 +185,19 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
     const engine = makeEngine({
       sessionId: sid,
-      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '1500' },
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_ON_SIGNAL: '1' },
     });
     let leader: number | undefined;
     let tool: number | undefined;
     try {
       await engine.start();
       leader = engine.appServerPid!;
+      process.kill(leader, 'SIGUSR2');
       await vi.waitFor(() => {
         tool = Number(readFileSync(childFile, 'utf8').trim());
         expect(tool).toBeGreaterThan(0);
       }, { timeout: 10_000 });
-      // The start()-time snapshot predates the delayed tool child.
+      // The start()-time snapshot predates the explicitly released tool child.
       expect(JSON.parse(readFileSync(marker, 'utf8').split('\n')[2]).members
         .some((member: { pid: number }) => member.pid === tool)).toBe(false);
       await engine.startThread();
@@ -255,12 +257,16 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     // sendFirstTurn ack path is the last chance to record it.
     const engine = makeEngine({
       sessionId: sid,
-      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '300' },
+      env: {
+        ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile,
+        FAKE_GROUP_CHILD_ON_SIGNAL: '1', FAKE_NO_TURN_TERMINAL: '1',
+      },
     });
     let leader: number | undefined;
     try {
       await engine.start();
       leader = engine.appServerPid!;
+      process.kill(leader, 'SIGUSR2');
       await vi.waitFor(() => {
         const tool = Number(readFileSync(childFile, 'utf8').trim());
         expect(tool).toBeGreaterThan(0);
@@ -1105,13 +1111,14 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     // branch's capture is the only remaining chance to record this tool child.
     const engine = makeEngine({
       sessionId: sid,
-      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_DELAY_MS: '300', FAKE_HANG_TURN: '1' },
+      env: { ...process.env, FAKE_GROUP_CHILD_PID_FILE: childFile, FAKE_GROUP_CHILD_ON_SIGNAL: '1', FAKE_HANG_TURN: '1' },
       requestTimeoutMs: 400,
     });
     let leader: number | undefined;
     try {
       await engine.start();
       leader = engine.appServerPid!;
+      process.kill(leader, 'SIGUSR2');
       await vi.waitFor(() => {
         const tool = Number(readFileSync(childFile, 'utf8').trim());
         expect(tool).toBeGreaterThan(0);
