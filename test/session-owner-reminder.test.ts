@@ -44,11 +44,24 @@ const enabled = {
 
 describe('session owner reminder configuration', () => {
   it('normalizes a valid per-Bot configuration and rejects unsafe mention markup', () => {
-    expect(normalizeSessionOwnerReminderConfig(enabled)).toEqual(enabled);
+    expect(normalizeSessionOwnerReminderConfig(enabled)).toEqual({
+      ...enabled,
+      quietHours: { enabled: false, start: '22:00', end: '09:00' },
+    });
     expect(normalizeSessionOwnerReminderConfig({
       ...enabled,
       text: '<at user_id="ou_other"></at> ping',
     })).toBeUndefined();
+  });
+
+  it.each([
+    { enabled: true, start: '9:00', end: '12:00' },
+    { enabled: true, start: '22:00', end: '24:00' },
+    { enabled: true, start: '22:00', end: '22:00' },
+    { enabled: 'true', start: '22:00', end: '09:00' },
+    null,
+  ])('rejects invalid quiet-hours settings: %j', quietHours => {
+    expect(normalizeSessionOwnerReminderConfig({ ...enabled, quietHours })).toBeUndefined();
   });
 
   it('builds the same owner mention used by Locate and a stable cycle delivery id', () => {
@@ -111,6 +124,74 @@ describe('SessionOwnerReminderController', () => {
     expect(send).toHaveBeenCalledTimes(2);
     await controller.scan([ds], enabled, 10_000 + 91 * 60_000);
     expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ['22:00', '09:00', 22, 33],
+    ['12:00', '14:00', 12, 14],
+  ])('defers reminders during %s–%s while tracking new activity', async (start, end, fromHour, toHour) => {
+    const clock = (hour: number, minute = 0) => new Date(2026, 10, 18, hour, minute).getTime();
+    const cfg = { ...enabled, quietHours: { enabled: true, start, end } };
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => structuredClone(records),
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const due = session();
+    const active = session();
+    active.session.sessionId = 's2';
+    await controller.scan([due, active], cfg, clock(fromHour - 1, 30));
+    await controller.scan([due, active], cfg, clock(fromHour));
+    expect(send).not.toHaveBeenCalled();
+    expect(records.s1.lastRemindedAt).toBeUndefined();
+
+    if (toHour > 24) {
+      await controller.scan([due, active], cfg, clock(24));
+      expect(send).not.toHaveBeenCalled();
+    }
+
+    active.lastMessageAt = clock(toHour - 1, 59);
+    await controller.scan([due, active], cfg, active.lastMessageAt);
+    expect(send).not.toHaveBeenCalled();
+
+    await controller.scan([due, active], cfg, clock(toHour));
+    await controller.scan([due, active], cfg, clock(toHour, 1));
+    expect(send.mock.calls.map(([ds]) => ds.session.sessionId)).toEqual(['s1']);
+
+    await controller.scan([active], cfg, clock(toHour, 29));
+    expect(send.mock.calls.map(([ds]) => ds.session.sessionId)).toEqual(['s1', 's2']);
+  });
+
+  it('uses the current quiet-hours setting before each send within a scan', async () => {
+    const quietHours = { enabled: false, start: '22:00', end: '09:00' };
+    const cfg = { ...enabled, quietHours };
+    let currentQuietHours = quietHours;
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn(async () => {
+      // Saving settings replaces the live config while the first send awaits I/O.
+      await Promise.resolve();
+      currentQuietHours = { ...quietHours, enabled: true };
+    });
+    const controller = new SessionOwnerReminderController({
+      load: () => structuredClone(records),
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+      getQuietHours: () => currentQuietHours,
+    });
+    const first = session();
+    const second = session();
+    second.session.sessionId = 's2';
+
+    const observedAt = new Date(2026, 10, 18, 22).getTime();
+    await controller.scan([first, second], cfg, observedAt);
+    await controller.scan([first, second], cfg, observedAt + 30 * 60_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(records.s1.lastRemindedAt).toBeDefined();
+    expect(records.s2.lastRemindedAt).toBeUndefined();
   });
 
   it('resets the quiet period when any projected runtime state changes', async () => {
