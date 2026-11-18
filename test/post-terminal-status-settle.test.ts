@@ -662,10 +662,11 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     expect(lastPatchedStatus()).toBe('idle'); // fence passed, correction delivered
   });
 
-  it('P1: an untagged direct-submit busy frame is live work and still bumps the revision', async () => {
+  it('P1: an untagged direct-submit busy frame is live work, bumps revision and repaints the card', async () => {
     const ds = setupTerminalDs();
     (ds.worker as any).emit('message', terminalMsg(TURN));
     await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle'); // display-only correction delivered
     const rev = ds.streamCardStatusRevision ?? 0;
 
     untaggedFrame(ds); // clearTurnId frame: no managed turn, real new work
@@ -673,12 +674,15 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
 
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
     expect(ds.lastScreenStatus).toBe('working');
+    // The visible card must come back to working, not stay on the idle correction.
+    expect(lastPatchedStatus()).toBe('working');
   });
 
-  it('P3: a newer dispatch attempt of the same terminalized turn is live work, not stale', async () => {
+  it('P3: a newer dispatch attempt of the same terminalized turn is live work and repaints the card', async () => {
     const ds = setupTerminalDs();
     (ds.worker as any).emit('message', { ...terminalMsg(TURN), dispatchAttempt: 1 });
     await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle');
     expect(ds.lastTurnTerminalDispatchAttempt).toBe(1);
     const rev = ds.streamCardStatusRevision ?? 0;
 
@@ -688,6 +692,24 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('forces only one busy repaint: subsequent same-value working ticks do not re-patch', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    untaggedFrame(ds); // first live busy frame after correction: forced repaint
+    await vi.advanceTimersByTimeAsync(0);
+    const patchesAfterFirstRepaint = updateMessageMock.mock.calls.length;
+    expect(lastPatchedStatus()).toBe('working');
+
+    // More working→working frames with no status edge must not repaint again.
+    untaggedFrame(ds);
+    untaggedFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updateMessageMock.mock.calls.length).toBe(patchesAfterFirstRepaint);
   });
 
   it('P2: a stale tagged screenshot_uploaded frame neither bumps revision nor touches the card image', async () => {
@@ -724,3 +746,4 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     expect(ds.currentImageKey).toBe('img-direct');
   });
 });
+

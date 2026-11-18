@@ -6569,6 +6569,25 @@ function isStalePostTerminalBusyFrame(
   return true;
 }
 
+/**
+ * Whether an accepted (non-stale) busy frame must force a visible card re-render
+ * after a post-terminal idle correction was already delivered.
+ *
+ * The correction is display-only: it PATCHed the card to idle on purpose while
+ * leaving `lastScreenStatus` at the execution value (`working`). When genuine
+ * new work then arrives — Web Terminal direct-submit (untagged) or a newer
+ * dispatch attempt — the frame passes the stale gate and re-asserts `working`,
+ * but `prevStatus === lastScreenStatus === 'working'`, so the normal
+ * same-turn "PATCH only on a status edge" branch skips the render and the card
+ * stays visually idle. The delivered receipt is the precise marker of that
+ * display/execution divergence: force exactly one header re-render here, then
+ * clear it so ordinary working→working ticks do not repaint on every frame.
+ */
+function deliveredPostTerminalCorrectionNeedsBusyRepaint(ds: DaemonSession): boolean {
+  const receipt = postTerminalCardSettles.get(ds);
+  return !!receipt && receipt.delivered && receipt.cardId === ds.streamCardId;
+}
+
 function ownsSettleTarget(
   ds: DaemonSession,
   requireLiveWorker: boolean,
@@ -22304,6 +22323,12 @@ function setupWorkerHandlers(
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = projectedScreenStatus;
         workersWithScreenStatus.add(worker);
+        // A non-stale live busy frame arriving after a delivered display-only
+        // idle correction must repaint the card back to busy even though the
+        // execution status value itself does not change (it stayed 'working').
+        const forcePostTerminalBusyRepaint = !stalePostTerminalBusy
+          && POST_TERMINAL_BUSY_STATUSES.has(projectedScreenStatus)
+          && deliveredPostTerminalCorrectionNeedsBusyRepaint(ds);
         ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
@@ -22747,6 +22772,9 @@ function setupWorkerHandlers(
           // Same turn — PATCH only on a header change: the status, or the
           // background-task count it shows. Image PATCHes go through the
           // screenshot_uploaded path; text is no longer a card body mode.
+          // The post-terminal repaint is the one same-value exception: the
+          // display-only idle correction left a delivered receipt while
+          // execution stayed busy, so the first live busy frame must render.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
           const label = streamCardLabel(ds);
           const activity = typeof label === 'object' && 'activity' in label ? label.activity : undefined;
@@ -22754,8 +22782,12 @@ function setupWorkerHandlers(
           // Spinner frames and elapsed time alone do not trigger a PATCH.
           // A config-only label change has no activity edge; keep the periodic
           // repaint available even when this frame itself needs no PATCH.
+          // The post-terminal repaint is the one same-value exception: the
+          // display-only idle correction left a delivered receipt while
+          // execution stayed busy, so the first live busy frame must render.
           syncUsageRefreshTimer(ds);
-          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount && prevActivity === activity) break;
+          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
+            && prevActivity === activity && !forcePostTerminalBusyRepaint) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
@@ -22789,6 +22821,9 @@ function setupWorkerHandlers(
             codexAppStopCardTarget(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
+          // The forced repaint consumed the post-terminal divergence marker;
+          // drop it so later ordinary working→working ticks don't repaint.
+          if (forcePostTerminalBusyRepaint) postTerminalCardSettles.delete(ds);
           // Keep the live usage climbing during a long working phase; stop once
           // the turn settles (idle/limited). State-boundary invariant — one
           // choke point re-evaluates arm/clear after this status assignment.
