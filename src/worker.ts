@@ -18296,15 +18296,12 @@ let injectionFlushing = false;
 const KEEPALIVE_HOOK_CLAIM_MS = 30_000;
 const inFlightKeepaliveFingerprints = new Map<string, number>();
 
-/** Drop keep-alive entries whose UserPromptSubmit hook never arrived within the
- *  bounded claim window. Entries are otherwise retained until an exact
- *  fingerprint match (or process teardown): an unrelated injection must not
- *  clear a keep-alive whose independent HTTP hook is simply late. */
-function purgeExpiredKeepaliveFingerprints(now: number = Date.now()): void {
-  for (const [fp, at] of inFlightKeepaliveFingerprints) {
-    if (now - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
-  }
-}
+// NOTE: keep-alive expiry is inlined at each call site rather than factored
+// into a module-level helper. prompt_submitted / flushPendingInjections are
+// extracted by test/helpers/worker-function-harness via `with (scope)`, where a
+// newly referenced module symbol resolves to undefined unless every harness
+// scope stubs it. Inlining the loop keeps the extracted cases free of new free
+// variables (the same constraint that governs dispatch-user-route fixtures).
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
@@ -18361,8 +18358,11 @@ async function flushPendingInjections(): Promise<void> {
       // misread as a human direct-submit. Entries leave only on exact match,
       // expiry purge, or process teardown.
       if (item.kind === 'keepalive') {
-        purgeExpiredKeepaliveFingerprints();
-        inFlightKeepaliveFingerprints.set(fingerprintPromptText(cmd), Date.now());
+        const purgeAt = Date.now();
+        for (const [fp, at] of inFlightKeepaliveFingerprints) {
+          if (purgeAt - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
+        }
+        inFlightKeepaliveFingerprints.set(fingerprintPromptText(cmd), purgeAt);
       }
       revokePromptReadiness();
       idleDetector?.reset();
@@ -39296,7 +39296,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // window are treated as abandoned (their hook was lost) and purged, so a
       // missing fingerprint or no match always falls through to a real submit.
       const now = Date.now();
-      purgeExpiredKeepaliveFingerprints(now);
+      for (const [fp, at] of inFlightKeepaliveFingerprints) {
+        if (now - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
+      }
       const fromKeepalive = typeof msg.fingerprint === 'string'
         && inFlightKeepaliveFingerprints.has(msg.fingerprint);
       if (fromKeepalive) inFlightKeepaliveFingerprints.delete(msg.fingerprint!);

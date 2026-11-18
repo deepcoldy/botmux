@@ -213,12 +213,6 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
       writtenInputs: { takeSubmitted: () => undefined },
       inFlightKeepaliveFingerprints,
       KEEPALIVE_HOOK_CLAIM_MS: 30_000,
-      // Same semantics as the worker's module-level purge helper.
-      purgeExpiredKeepaliveFingerprints: (now: number = Date.now()) => {
-        for (const [fp, at] of inFlightKeepaliveFingerprints) {
-          if (now - at >= 30_000) inFlightKeepaliveFingerprints.delete(fp);
-        }
-      },
       send: (m: WorkerToDaemon) => { sent.push(m); },
       __sent: sent,
       ...overrides,
