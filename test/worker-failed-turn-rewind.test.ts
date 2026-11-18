@@ -538,12 +538,13 @@ describe('startFailedTurnRewind', () => {
       expect(reports()).toEqual([]);
     });
 
-    it('is not cut when there is no backup directory outside the tree', async () => {
+    it('is left alone, without restarting the CLI, when there is no backup directory outside the tree', () => {
       previousDataDir = process.env.SESSION_DATA_DIR;
       delete process.env.SESSION_DATA_DIR;
       const original = failedTranscript();
-      const { jsonl, cutAfterExit, reports } = setup(original, {}, directive(), { tree: true });
-      await cutAfterExit();
+      const { jsonl, restartCliProcess, written, reports } = setup(original, {}, directive(), { tree: true });
+      expect(restartCliProcess).not.toHaveBeenCalled();
+      expect(written).toEqual(['继续']);
       expect(readFileSync(jsonl, 'utf8')).toBe(original);
       expect(readdirSync(dirname(jsonl))).toEqual([`${SID}.jsonl`]);
       expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/no backup directory/) })]);

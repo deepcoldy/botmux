@@ -36867,7 +36867,7 @@ function startFailedTurnRewind(
   // backup goes to a directory of the daemon's, as with /rewind.
   const projectsRoot = claudeProjectsRoot;
   const transcriptScope = failedTurnTranscriptScope();
-  const plan = planFailedTurnRewindRequest({
+  const requested = planFailedTurnRewindRequest({
     cliId: lastInitConfig?.cliId,
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
       && !isRemoteBackendType(effectiveBackendType),
@@ -36886,6 +36886,11 @@ function startFailedTurnRewind(
     directive,
     inspect: path => inspectLastTurnInProjectsRoot(path, projectsRoot, transcriptScope),
   });
+  // A transcript in a CLI-writable tree is only cut with its backup outside
+  // that tree: without a backup directory, do not restart the CLI for nothing.
+  const plan = requested.kind === 'proceed' && transcriptScope.writableTreeRoot && !transcriptScope.backupDir
+    ? { kind: 'decline' as const, reason: 'no backup directory outside the CLI-writable tree' }
+    : requested;
   if (plan.kind === 'decline') {
     report('declined', plan.reason);
     enqueueMessage();
