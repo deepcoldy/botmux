@@ -1,3 +1,4 @@
+import { MinimaxFinalReceiver } from '../src/services/minimax-final-control.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -28,6 +29,7 @@ function rawWorker(adapter: ReturnType<typeof createMinimaxAdapter>, backend: { 
     cliAdapter: adapter, SubmissionWriteError, commandLineWriteTail: Promise.resolve(), commandLineWritesPending: 0,
     backend, lastInitConfig: { cliId: 'minimax', adoptMode: false }, isPromptReady: true,
     isFlushing: false, cliRestartInProgress: false, currentBotmuxTurnId: undefined,
+    minimaxFinalReceiver: new MinimaxFinalReceiver(() => {}),
     pendingRawInputs: [], captureRevision: 0, captureIdentityAnnounced: false,
     renderer: undefined, usageLimitTracker: { beginTurn() {} }, currentUsageLimitSnapshot: () => undefined,
     applyMojoLivePatch() {}, tmuxScrolledHalfPages: 0, traexAutoModelController: undefined,

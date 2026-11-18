@@ -18973,7 +18973,10 @@ function handleVisibleStartupInteraction(data: string): boolean {
 // in the terminal-OSC decode set.
 const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
-const minimaxFinalReceiver = new MinimaxFinalReceiver(payload => { void handleTrustedCodexAppMarker('final', payload); });
+const minimaxFinalReceiver = new MinimaxFinalReceiver(
+  payload => { void handleTrustedCodexAppMarker('final', payload); },
+  message => log(`${cliName()} ${message}`),
+);
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
 /** ANSI-stripped PTY tail scanned for Pi's "updated while this session was

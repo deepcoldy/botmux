@@ -92,6 +92,21 @@ describe('MiniMax final marker downstream settlement', () => {
 });
 
 describe('MiniMax fragmented final settlement', () => {
+  it('logs stale turn and attempt markers without settling the active turn', () => {
+    const deliver = vi.fn(), log = vi.fn();
+    const receiver = new MinimaxFinalReceiver(deliver, log);
+    const owner = { turnId: 'turn-b', dispatchAttempt: 2 };
+    receiver.accept('final', { turnId: 'turn-a', content: 'old' }, owner);
+    receiver.accept('final', { ...owner, dispatchAttempt: 1, content: 'late' }, owner);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(log.mock.calls.map(call => call[0])).toEqual([
+      'rejected final marker with mismatched turn (marker=turn-a, current=turn-b)',
+      'rejected final marker with mismatched dispatch attempt (marker=1, current=2)',
+    ]);
+    receiver.accept('final', { ...owner, content: 'ok' }, owner);
+    expect(deliver).toHaveBeenCalledExactlyOnceWith({ ...owner, content: 'ok' });
+  });
+
   it.each(['gap', 'timeout', 'exit', 'interleaved', 'invalid-start', 'missing-start'])(
     'settles the identified turn exactly once on %s and preserves the next turn', scenario => {
       vi.useFakeTimers();

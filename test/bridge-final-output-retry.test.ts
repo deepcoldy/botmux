@@ -362,13 +362,20 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     ds.adoptedFrom = undefined;
     ds.session.cliId = 'minimax';
     getBot('app_test').config.cliId = 'minimax';
-    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('temporary send failure')).mockResolvedValue('om_file');
+    let firstSend!: () => void;
+    const attempted = new Promise<void>(resolve => { firstSend = resolve; });
+    const sessionReply = vi.fn().mockImplementationOnce(async () => {
+      firstSend();
+      throw new Error('temporary send failure');
+    }).mockResolvedValue('om_file');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const msg = { ...finalOutputMsg(), content: size === 3_000_000
       ? 'a'.repeat(size - 21) + ' https://example.org/' : '甲\0'.repeat(size / 4) };
     const complete = vi.fn();
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
     deliver(ds, msg, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    await attempted;
     await vi.advanceTimersByTimeAsync(0);
     expect(complete).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
@@ -390,11 +397,18 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   it('reports failed MiniMax attachment publication after upload retries are exhausted', async () => {
     const ds = makeDs(); ds.adoptedFrom = undefined; ds.session.cliId = 'minimax';
     getBot('app_test').config.cliId = 'minimax';
-    uploadReplyFile.mockRejectedValue(new Error('upload unavailable'));
+    let firstUpload!: () => void;
+    const attempted = new Promise<void>(resolve => { firstUpload = resolve; });
+    uploadReplyFile.mockImplementation(async () => {
+      firstUpload();
+      throw new Error('upload unavailable');
+    });
     const sessionReply = vi.fn(); const complete = vi.fn();
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
     deliver(ds, { ...finalOutputMsg(), content: '文'.repeat(1_000_000) }, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    await attempted;
     await vi.advanceTimersByTimeAsync(30_000);
     expect(uploadReplyFile).toHaveBeenCalledTimes(3);
     expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'MiniMax reply.md delivery failed' });

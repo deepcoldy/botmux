@@ -180,6 +180,7 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { prepareReplyFile, type PreparedReplyFile } from '../im/lark/reply-file.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../im/lark/turn-reply-card-size.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
 import { localAddressContextForBot, replayVettedBody, sendableCardLink } from '../im/lark/local-address-context.js';
@@ -25980,7 +25981,7 @@ function deliverFinalOutput(
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
-  imageFallback: ReplyImageState & { replyFile?: { digest: string; key: string } } = { omitImages: false },
+  imageFallback: ReplyImageState & { replyFile?: PreparedReplyFile } = { omitImages: false },
   handoff?: HandoffDeliveryContext,
   outputControl?: OutputDeliveryControl,
 ): void {
@@ -26785,17 +26786,14 @@ function deliverFinalOutput(
           };
       let providerOutput = canonicalOutput;
       if (sendReplyFile) {
-        const text = sanitizeLocalAddressText(safeAssistantText,
-          localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
-        const bytes = Buffer.from(text, 'utf8');
-        const digest = createHash('sha256').update(bytes).digest('hex');
         if (!ownsOpenSession()) { onComplete?.(false); return; }
-        if (imageFallback.replyFile?.digest !== digest) {
-          const key = await uploadFile(ds.larkAppId, { name: 'reply.md', bytes });
-          imageFallback.replyFile = { digest, key };
-        }
+        const fileState = await prepareReplyFile(safeAssistantText,
+          localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir), imageFallback.replyFile);
+        imageFallback.replyFile = fileState;
         if (!ownsOpenSession()) { onComplete?.(false); return; }
-        const file = { msgType: 'file', content: JSON.stringify({ file_key: imageFallback.replyFile.key }),
+        fileState.key ??= await uploadFile(ds.larkAppId, { name: 'reply.md', bytes: fileState.bytes });
+        if (!ownsOpenSession()) { onComplete?.(false); return; }
+        const file = { msgType: 'file', content: JSON.stringify({ file_key: fileState.key }),
           providerUuid: deliveryReplyOptions.uuid };
         const frozen = outputControl?.freezeTransport('minimax-reply-file', file) ?? file;
         providerOutput = { ...canonicalOutput, content: frozen.content, msgType: frozen.msgType };

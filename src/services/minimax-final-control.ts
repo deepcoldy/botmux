@@ -17,7 +17,10 @@ export class MinimaxFinalReceiver {
   private timer?: ReturnType<typeof setTimeout>;
   private settled?: Turn;
 
-  constructor(private readonly deliver: (payload: Payload) => void) {}
+  constructor(
+    private readonly deliver: (payload: Payload) => void,
+    private readonly logMismatch?: (message: string) => void,
+  ) {}
 
   private clearPending(): void {
     clearTimeout(this.timer);
@@ -50,8 +53,14 @@ export class MinimaxFinalReceiver {
       return false;
     }
     if (!payload) { this.interrupt(); return true; }
-    if (payload.turnId !== undefined && payload.turnId !== current.turnId) return true;
-    if (payload.dispatchAttempt !== undefined && payload.dispatchAttempt !== current.dispatchAttempt) return true;
+    if (payload.turnId !== undefined && payload.turnId !== current.turnId) {
+      this.logMismatch?.(`rejected final marker with mismatched turn (marker=${String(payload.turnId).slice(0, 12)}, current=${current.turnId?.slice(0, 12) ?? '-'})`);
+      return true;
+    }
+    if (payload.dispatchAttempt !== undefined && payload.dispatchAttempt !== current.dispatchAttempt) {
+      this.logMismatch?.(`rejected final marker with mismatched dispatch attempt (marker=${String(payload.dispatchAttempt).slice(0, 12)}, current=${current.dispatchAttempt ?? '-'})`);
+      return true;
+    }
     if (current.turnId && this.settled && sameTurn(current, this.settled)) return true;
     if (kind === 'final') {
       if (typeof payload.content === 'string') this.finish(current, payload);
