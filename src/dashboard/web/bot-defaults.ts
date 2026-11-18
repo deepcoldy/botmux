@@ -129,6 +129,9 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'promptCache.ttl', 'promptCache.keepalive', 'promptCache.idleMinutes', 'promptCache.maxPings',
       'promptCache.activeHours', 'promptCache.minContextTokens',
     ] },
+  { id: 'provider-recovery', tab: 'sessions', titleKey: 'botDefaults.sectionProviderRecovery', fieldKeys: [
+      'providerRecovery.enabled', 'providerRecovery.maxWaitMinutes',
+    ] },
   { id: 'startup-commands', tab: 'sessions', titleKey: 'botDefaults.sectionStartupCommands' },
   { id: 'summary-trigger', tab: 'sessions', titleKey: 'botDefaults.sectionSummaryTrigger', fieldKeys: [
       'botDefaults.summaryMemory', 'botDefaults.summaryLimit', 'botDefaults.summarySinceHours', 'botDefaults.summaryMemoryPath',
@@ -137,7 +140,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
   {
     id: 'grant',
@@ -163,7 +166,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
+      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
+      'botDefaults.replyCardRecap', 'botDefaults.replyCardRecapModel',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
@@ -428,14 +432,19 @@ export type BotDefaultsRow = {
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
-    fallback: 'bot-identity' | 'none';
+    tools?: Array<'lark-cli' | 'bytedcli'>;
+    /** Per-capability switches. The daemon fills it for stored tools-only configs. */
+    capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
+    /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
+    legacyCapabilities?: boolean;
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;
+    /** One command can run as another speaker of a multi-person turn. Absent = off. */
+    allowSpeakerSwitch?: boolean;
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
@@ -485,6 +494,9 @@ export type BotDefaultsRow = {
   goalStatusCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
+  replyCardNextStep?: boolean;
+  replyCardRecap?: boolean;
+  replyCardRecapModel?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;
@@ -542,6 +554,8 @@ export type BotDefaultsRow = {
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */
   promptCache?: import('../../services/prompt-cache-policy.js').PromptCacheConfig | null;
+  /** Per-bot automatic continuation after provider failures; null/absent = inherit. */
+  providerRecovery?: import('../../services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   idleSuspendMinutes?: number | null;
@@ -878,6 +892,28 @@ export async function fetchGlobalPromptCache(): Promise<import('../../services/p
     return readPromptCacheConfig(body?.settings?.promptCache) ?? null;
   } catch {
     return null;
+  }
+}
+
+/** Machine-wide `providerRecovery` and `promptCache` from GET /api/settings
+ *  (the bot section resolves its blanks and the cache-following default
+ *  against them); nulls when unset or unreadable. */
+export async function fetchGlobalProviderRecovery(): Promise<{
+  providerRecovery: import('../../services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
+  promptCache: import('../../services/prompt-cache-policy.js').PromptCacheConfig | null;
+}> {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return { providerRecovery: null, promptCache: null };
+    const body = await r.json().catch(() => ({}));
+    const { readProviderRecoveryConfig } = await import('../../services/provider-recovery-policy.js');
+    const { readPromptCacheConfig } = await import('../../services/prompt-cache-policy.js');
+    return {
+      providerRecovery: readProviderRecoveryConfig(body?.settings?.providerRecovery) ?? null,
+      promptCache: readPromptCacheConfig(body?.settings?.promptCache) ?? null,
+    };
+  } catch {
+    return { providerRecovery: null, promptCache: null };
   }
 }
 

@@ -108,11 +108,13 @@ export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   dispatch: (content: string, msgType: string) => Promise<string>;
   beforeEffect?: () => void | Promise<void>;
+  onResult?: (index: number, outcome: { messageId: string } | { failed: true }) => void | Promise<void>;
 };
 
 export type SendFileAttachmentsResult = {
   sent: string[];                              // message ids of delivered attachments
   failed: { path: string; error: string }[];  // attachments that failed to upload/send
+  trackingErrors?: { index: number; error: string }[];
 };
 
 /**
@@ -130,17 +132,24 @@ export async function sendFileAttachments(
 ): Promise<SendFileAttachmentsResult> {
   const sent: string[] = [];
   const failed: { path: string; error: string }[] = [];
-  for (const fp of files) {
+  const trackingErrors: { index: number; error: string }[] = [];
+  for (const [index, fp] of files.entries()) {
+    let outcome: { messageId: string } | { failed: true };
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, fp);
       await deps.beforeEffect?.();
-      sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
+      const messageId = await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file');
+      sent.push(messageId);
+      outcome = { messageId };
     } catch (err: unknown) {
       failed.push({ path: fp, error: describeSendFailure(err) });
+      outcome = { failed: true };
     }
+    try { await deps.onResult?.(index, outcome); }
+    catch (error) { trackingErrors.push({ index, error: error instanceof Error ? error.message : String(error) }); }
   }
-  return { sent, failed };
+  return { sent, failed, ...(trackingErrors.length ? { trackingErrors } : {}) };
 }
 
 const VIDEO_EXTENSIONS = new Set(['.mp4']);
@@ -357,11 +366,13 @@ export type SendVideoAttachmentsDeps = {
    * action/provider identity; later bare media sends would duplicate on replay. */
   maxMessages?: number;
   beforeEffect?: () => void | Promise<void>;
+  onResult?: (index: number, outcome: { messageId: string } | { failed: true }) => void | Promise<void>;
 };
 
 export type SendVideoAttachmentsResult = {
   sent: string[];
   failed: { path: string; coverPath: string; error: string }[];
+  trackingErrors?: { index: number; error: string }[];
 };
 
 export async function sendVideoAttachments(
@@ -376,11 +387,13 @@ export async function sendVideoAttachments(
   }
   const sent: string[] = [];
   const failed: { path: string; coverPath: string; error: string }[] = [];
+  const trackingErrors: { index: number; error: string }[] = [];
   // The first video that actually goes out uses `primaryDispatch` (quote chain);
   // every later one uses plain `dispatch`. Tracked on success only, so if the
   // first video's upload fails the next one inherits the primary slot.
   let primaryUsed = false;
-  for (const video of videos) {
+  for (const [index, video] of videos.entries()) {
+    let outcome: { messageId: string } | { failed: true };
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, video.videoPath);
@@ -396,15 +409,19 @@ export async function sendVideoAttachments(
       const messageId = await send(content, 'media');
       primaryUsed = true;
       sent.push(messageId);
+      outcome = { messageId };
     } catch (err: unknown) {
       failed.push({
         path: video.videoPath,
         coverPath: video.coverPath,
         error: describeSendFailure(err),
       });
+      outcome = { failed: true };
     }
+    try { await deps.onResult?.(index, outcome); }
+    catch (error) { trackingErrors.push({ index, error: error instanceof Error ? error.message : String(error) }); }
   }
-  return { sent, failed };
+  return { sent, failed, ...(trackingErrors.length ? { trackingErrors } : {}) };
 }
 
 export type DispatchPrimaryOptions = {

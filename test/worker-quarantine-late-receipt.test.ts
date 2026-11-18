@@ -44,6 +44,7 @@ async function warnAndDrop(h: ReturnType<typeof harness>) {
   await h.flush();
   expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
   expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+  expect(h.scope.inputDeliveryQuarantine.draftContent).toBe('payload');
   await vi.advanceTimersByTimeAsync(40_000);
   expect(h.queue.hasPendingTurn('delivery', 1)).toBe(false);
   expect(h.scope.emitTurnTerminal).toHaveBeenCalledWith('delivery', 'failed', 'submit_unconfirmed', 1);
@@ -54,6 +55,22 @@ async function warnAndDrop(h: ReturnType<typeof harness>) {
 }
 
 describe('quarantine receipt outlives bounded warning and bridge attribution', () => {
+  it('keeps the parked draft and exact bridge quarantine alongside its late receipt observer', async () => {
+    const h = harness();
+    h.queue.mark('parked', 'original draft', 0);
+    const quarantine = h.scope.armInputDeliveryQuarantine(
+      h.scope.backend, { turnId: 'parked' }, 'original draft', h.recheck,
+    );
+    expect(quarantine.draftContent).toBe('original draft');
+    expect(quarantine.cancelReceipt).toBeTypeOf('function');
+    expect(h.queue.peek()[0]?.inputDeliveryQuarantined).toBe(true);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    h.scope.releaseInputDeliveryQuarantine(quarantine, 'exact submit proof');
+    expect(h.queue.peek()[0]?.inputDeliveryQuarantined).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.recheck).not.toHaveBeenCalled();
+  });
+
   it('also recovers when attribution expiry wins the race against the warning callback', async () => {
     const h = harness();
     await h.flush();

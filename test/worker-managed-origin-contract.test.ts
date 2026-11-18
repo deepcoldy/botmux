@@ -12,9 +12,10 @@ import { SessionController } from '../src/core/session-controller.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { sameRuntime, sameWorker } from '../src/services/session-contract.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import * as tokens from '../src/utils/user-token.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
@@ -46,7 +47,7 @@ function fixture({ preAdmit = false, cliId = 'codex-app' } = {}) {
     commands.push({ ...message, sessionCommand: controller.command(message) }); callback?.(null); return true; } }; ds.worker = worker;
   const hostEnv: any = { ds, worker, sessionController: controller, contractWorker: workerRef, botCfg: {}, sessionCliId: () => cliId,
     logger: { warn: vi.fn(), debug: vi.fn(), info: vi.fn() }, t: 'managed-origin', currentGatewayCallerOpenId: () => undefined,
-    currentTurnProcessIdentities: () => ['100:1000'], noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(), sameTrustedPrincipal };
+    currentTurnProcessIdentities: () => ['100:1000'], noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(), sameTrustedPrincipal, sameWorker, sameRuntime, randomBytes, cb: {} };
   hostEnv.handleLegacyWorkerMessage = loadWorkerPoolClosure('handleLegacyWorkerMessage', hostEnv);
   const realLegacy = hostEnv.handleLegacyWorkerMessage;
   hostEnv.handleLegacyWorkerMessage = async (message: any) => {
@@ -104,6 +105,63 @@ describe('managed origin publication through the session contract', () => {
     expect(h.env.writeCliPidMarker).toHaveBeenCalled(); expect(h.authority.identity().caller).toEqual(h.caller);
     expect(h.ds.managedTurnOrigin).toBeUndefined();
     expect(h.hostEnv.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Dropped managed_turn_origin from current worker turn=\S+ reason=(stale_runtime_scope|execution_scope_unproven)$/));
+  });
+  it('republishes the opening turn origin with the runtime once the daemon assigns it, in the daemon reply order', async () => {
+    const h = fixture({ preAdmit: true });
+    h.env.currentBotmuxDispatchAttempt = undefined; h.env.retiredTurnIds = new Set();
+    const turnId = h.execution.turnId;
+    const opening = h.scope.beginRuntime();
+    h.scope.run(opening, () => {
+      h.env.send({ type: 'runtime_binding_started', bindingId: opening.bindingId });
+      h.scope.enterTurn(turnId);
+      h.env.publishSandboxRelayCapability();
+      h.scope.recordSubmission(turnId);
+      h.env.send({ type: 'turn_execution_started', turnId, startedAtMs: Date.now() });
+      opening.identity = { backend: 'tmux', physicalId: '200:2000', proof: 'process_start', nativeSessionId: 'opening-native' };
+      h.env.send({ type: 'runtime_binding', bindingId: opening.bindingId, identity: opening.identity });
+    }, h.execution);
+    await h.drain();
+    const assigned = h.commands.filter(m => m.type === 'runtime_contract_assigned' && m.bindingId === opening.bindingId);
+    expect(assigned).toHaveLength(1);
+    expect(assigned[0].executions).toEqual([]);
+    await loadWorkerMessageHandler('runtime_contract_assigned', h.env)(assigned[0]);
+    await h.drain();
+    const origins = h.wire.filter(m => m.type === 'managed_turn_origin');
+    expect(origins.at(-1).sessionContract.scope).toMatchObject({ runtime: assigned[0].runtime, execution: h.execution });
+    expect(h.ds.managedTurnOrigin).toMatchObject({ turnId, callerOpenId: 'ou_human', capability: h.env.sandboxRelayCapability.token });
+  });
+  it('delivers a capability rotated under a rebind that has no runtime yet, so the turn-end revocation clears the origin', async () => {
+    const h = fixture({ preAdmit: true });
+    for (const name of ['completeManagedTurnOriginRevocation', 'unlinkManagedOriginCapabilityFiles']) h.env[name] = loadWorkerFunction(name, h.env);
+    const turnId = h.execution.turnId;
+    h.scope.run(h.current, () => {
+      h.scope.enterTurn(turnId);
+      h.env.publishSandboxRelayCapability();
+      h.scope.recordSubmission(turnId);
+      h.env.send({ type: 'turn_execution_started', turnId, startedAtMs: Date.now() });
+    }, h.execution);
+    await h.drain();
+    const first = h.ds.managedTurnOrigin?.capability;
+    const rebind = h.scope.beginRuntime(undefined, h.current.physicalId);
+    h.scope.run(rebind, () => {
+      h.env.send({ type: 'runtime_binding_started', bindingId: rebind.bindingId });
+      rebind.identity = { backend: 'tmux', physicalId: '101:1001', proof: 'process_start', nativeSessionId: 'native' };
+      h.env.send({ type: 'runtime_binding', bindingId: rebind.bindingId, identity: rebind.identity, continuesBindingId: h.current.bindingId });
+      h.env.publishSandboxRelayCapability();
+    });
+    await h.drain();
+    const rotated = h.env.sandboxRelayCapability.token;
+    expect(rotated).not.toBe(first);
+    expect(h.ds.managedTurnOrigin?.capability).toBe(rotated);
+    h.env.currentBotmuxDispatchAttempt = undefined; h.env.retiredTurnIds = new Set();
+    const assigned = loadWorkerMessageHandler('runtime_contract_assigned', h.env);
+    for (const message of h.commands.filter(m => m.type === 'runtime_contract_assigned' && m.bindingId === rebind.bindingId)) await assigned(message);
+    await h.drain();
+    expect(h.ds.managedTurnOrigin?.capability).toBe(h.env.sandboxRelayCapability.token);
+    h.scope.run(h.current, () => h.env.completeManagedTurnOriginRevocation(h.env.sandboxRelayCapability, turnId, undefined), h.execution);
+    await h.drain();
+    expect(h.ds.managedTurnOrigin?.turnId).toBeUndefined();
+    expect(h.hostEnv.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('Ignored stale live capability'));
   });
 });
 
@@ -185,7 +243,7 @@ it('authorizes the real bound auth-request route from the human origin produced 
   expect(h.ds.managedTurnOrigin?.callerOpenId).toBe('ou_human');
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's1' ? h.ds : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: h.ds.larkAppId, larkAppSecret: 'test-secret',
-    triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_human', type: 'user', source: 'sender', updatedAt: 0 });
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
   const oauth = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://accounts.feishu.cn/oauth/device?user_code=test',

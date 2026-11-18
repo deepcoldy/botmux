@@ -85,6 +85,15 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
   replyCardActions: boolean;
+  /** Next-input suggestion button on the last reply card of a turn.
+   *  Default false; only an explicit true enables it. */
+  replyCardNextStep: boolean;
+  /** Collapsed「本轮回顾」panel on the last reply card of a turn.
+   *  Default false; only an explicit true enables it. */
+  replyCardRecap: boolean;
+  /** Small-model recap for turns the CLI left without one (extra model call).
+   *  Default false; only an explicit true enables it. */
+  replyCardRecapModel: boolean;
   /** In-card activity in unified replies, native CoT in legacy replies.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
@@ -172,6 +181,9 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       goalStatusCard: c.goalStatusCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
+      replyCardNextStep: c.replyCardNextStep === true,
+      replyCardRecap: c.replyCardRecap === true,
+      replyCardRecapModel: c.replyCardRecapModel === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
       senderTagHideEmail: c.senderTagHideEmail === true,
@@ -216,6 +228,9 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       goalStatusCard: false,
       privateCard: false,
       replyCardActions: false,
+      replyCardNextStep: false,
+      replyCardRecap: false,
+      replyCardRecapModel: false,
       cotEnabled: true,
       senderTag: true,
       senderTagHideEmail: false,
@@ -357,6 +372,9 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'goalStatusCard', patch.goalStatusCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
+    apply(entry, 'replyCardNextStep', patch.replyCardNextStep);
+    apply(entry, 'replyCardRecap', patch.replyCardRecap);
+    apply(entry, 'replyCardRecapModel', patch.replyCardRecapModel);
     // [legacy-thinkingCard] 显式拨开关时清旧名（懒迁移）；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
     if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
@@ -406,6 +424,9 @@ async function updateBotCardPrefsInternal(
         goalStatusCard: entry.goalStatusCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
+        replyCardNextStep: entry.replyCardNextStep === true,
+        replyCardRecap: entry.replyCardRecap === true,
+        replyCardRecapModel: entry.replyCardRecapModel === true,
         cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         senderTagHideEmail: entry.senderTagHideEmail === true,
@@ -483,6 +504,15 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.replyCardActions !== undefined) {
     bot.config.replyCardActions = patch.replyCardActions || undefined;
+  }
+  if (patch.replyCardNextStep !== undefined) {
+    bot.config.replyCardNextStep = patch.replyCardNextStep || undefined;
+  }
+  if (patch.replyCardRecap !== undefined) {
+    bot.config.replyCardRecap = patch.replyCardRecap || undefined;
+  }
+  if (patch.replyCardRecapModel !== undefined) {
+    bot.config.replyCardRecapModel = patch.replyCardRecapModel || undefined;
   }
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;

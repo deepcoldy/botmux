@@ -317,7 +317,6 @@ describe('prepareTriggerUserCliEnv returns the turn git-config carrier', () => {
     const policy = {
       enabled: true,
       tools: ['bytedcli'],
-      fallback: 'bot-identity',
       gitHost: 'git.example.com',
     };
     try {
@@ -359,7 +358,6 @@ describe('prepareTurnGitConfigEnv resets every spawn site channel', () => {
   const identityPolicy = () => ({
     enabled: true,
     tools: ['bytedcli'],
-    fallback: 'bot-identity' as const,
     gitHost: 'git.example.com',
   });
 
@@ -764,12 +762,12 @@ describe('renderIdentityWrapper', () => {
   });
 
   it.each([
-    [[], {}, 'cn-tok'],
+    [['x'], {}, 'cn-tok'],
     [['--site', 'i18n-tt', 'auth', 'userinfo'], {}, 'i18n-tok'],
     [['--json', '--site=eu-ttp', 'x'], {}, 'i18n-tok'],
     [['--site', 'i18n-bd'], {}, 'bd-tok'],
     [['--site', 'i18n'], {}, 'bd-tok'],
-    [[], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'bd-tok'],
+    [['x'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'bd-tok'],
     [['x'], { BYTEDCLI_CLOUD_SITE: 'us-ttp-usts' }, 'tx-tok'],
     [['--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'cn-tok'],
     [['--site', 'boe'], {}, 'cn-tok'],
@@ -784,7 +782,7 @@ describe('renderIdentityWrapper', () => {
     const wrapperPath = join(dir, 'bytedcli');
     writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
     writeSessionIdentity(dir, SESSION, {
-      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok', cn: 'cn-tok' },
     }, 'single');
     const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, [...args]);
     // The regional variables stay internal; the arguments reach the tool unchanged.
@@ -799,9 +797,10 @@ describe('renderIdentityWrapper', () => {
     writeFileSync(wrapper, renderIdentityWrapper('bytedcli', tool));
     writeSessionIdentity(dir, SESSION, {
       tool: 'bytedcli', cloudJwt: 'cn-tok',
-      regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+      regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok', cn: 'cn-tok' },
     }, 'single');
-    return runWrapper(wrapper, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, args);
+    // A bare invocation is the usage path and carries no identity; give the call an operand.
+    return runWrapper(wrapper, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, args.length ? args : ['x']);
   }
 
   // Required layer: bytedcli 0.178 normalized canonical sites and their
@@ -883,7 +882,7 @@ describe('renderIdentityWrapper', () => {
   });
 
   it('refuses only the partition without a token; the others and the default site still run', () => {
-    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', cn: 'cn-tok' } };
     expect(bytedcliRun(identity, ['--site', 'i18n-tt', 'aa'])).toMatchObject({ status: 0, stdout: 'i18n-tok' });
     expect(bytedcliRun(identity, ['aa'])).toMatchObject({ status: 0, stdout: 'cn-tok' });
     expect(bytedcliRun(identity, ['--site', 'cn', 'aa'])).toMatchObject({ status: 0, stdout: 'cn-tok' });
@@ -928,7 +927,7 @@ describe('renderIdentityWrapper', () => {
   });
 
   it('lets a non-empty --site override the variable, as bytedcli does', () => {
-    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    const identity = { cloudJwt: 'i18n-tok', regionalCloudJwts: { i18n: 'i18n-tok', cn: 'cn-tok' } };
     expect(bytedcliRun(identity, ['--site', 'cn', 'aa'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }))
       .toMatchObject({ status: 0, stdout: 'cn-tok' });
   });
@@ -939,21 +938,24 @@ describe('renderIdentityWrapper', () => {
     [['codebase', 'mr', 'list']],
     [['-j', '--profile', 'p', 'meego', 'workitem']],
     [['help', 'aa']],
-    [['--help']],
-    [['-h']],
     [['aa', 'query', '--help']],
-    [['--version']],
-    [['-V']],
     // Root help / version flags answer before any command runs.
     [['-h', 'aa']],
     [['--version', 'aa']],
     [['-V', 'aa', 'query']],
-    [[]],
     [['--json']],
   ] as const)('runs what never uses the partition token without that token: %j', args => {
     expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }))
       .toMatchObject({ status: 0, stdout: 'cn-tok' });
   });
+
+  // A bare call or a lone help / version flag runs in a throwaway HOME without any credential.
+  it.each([[['--help']], [['-h']], [['--version']], [['-V']], [[]]] as const)(
+    'runs a bare call or a lone help / version flag without any token: %j', args => {
+      expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }))
+        .toMatchObject({ status: 0, stdout: '' });
+    },
+  );
 
   it.each([
     [['--profile', 'codebase', 'aa']],
@@ -978,7 +980,8 @@ describe('renderIdentityWrapper', () => {
     [['--profile', 'p', 'aa', '--cloud-site', 'us-ttp'], {}],
     [['--site', 'cn', 'aa', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }],
   ] as const)('does not refuse for a --site that belongs to the command: %j %j', (args, env) => {
-    expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], env)).toMatchObject({ status: 0, stdout: 'cn-tok' });
+    expect(bytedcliRun({ cloudJwt: 'cn-tok', regionalCloudJwts: { cn: 'cn-tok' } }, [...args], env))
+      .toMatchObject({ status: 0, stdout: 'cn-tok' });
   });
 
   // The global site — before the command, else the variable — is what bytedcli
@@ -1586,8 +1589,8 @@ describe('tool-owning process identity environment', () => {
     mkdirSync(bin);
     writeFileSync(join(bin, 'bytedcli'), '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n', { mode: 0o755 });
     const env: NodeJS.ProcessEnv = { HOME: dir, PATH: `${bin}:/usr/bin:/bin` };
-    prepareTriggerUserCliEnv(env, dir, SESSION, { enabled: true, tools: ['bytedcli'], fallback: 'none' }, () => {});
-    const run = () => execFileSync('/bin/bash', ['-lc', 'bytedcli'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    prepareTriggerUserCliEnv(env, dir, SESSION, { enabled: true, tools: ['bytedcli'] }, () => {});
+    const run = () => execFileSync('/bin/bash', ['-lc', 'bytedcli x'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     // No native/viewer CLI has been spawned. The model-owning process already
     // rejects absent identity rather than reaching the unwrapped binary.
     expect(run).toThrow();

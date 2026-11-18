@@ -39,6 +39,8 @@ import { canHandoffFinalOutput, type FinalOutputSnapshot } from './final-output-
 
 export interface BridgeTurnJournalEntry {
   turnId: string;
+  /** Exact native user record already attributed before a persistent reattach. */
+  nativeUserProof?: { uuid: string; hash: string; timestampMs: number; trajectoryOffset: number };
   /** Only newly admitted turns under the negotiated protocol opt in. */
   handoffVersion?: 1;
   pendingFinal?: FinalOutputSnapshot;

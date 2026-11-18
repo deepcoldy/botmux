@@ -23,7 +23,7 @@ import {
   prepareDirectSandbox,
   probeHostCredentialIsolationMechanism,
 } from '../src/adapters/backend/sandbox.js';
-import { relocateSymlinkedBaselineRules, type FsRule } from '../src/adapters/cli/fs-policy.js';
+import { accessForPath, compileToBwrap, relocateSymlinkedBaselineRules, type FsRule } from '../src/adapters/cli/fs-policy.js';
 import {
   __testOnly_resetBwrapWarnings,
   bwrapExecutable,
@@ -232,6 +232,73 @@ describe('symlinked baseline directories', () => {
     expect(out.rules).toEqual([ro('/srv', 'user')]);
     const untouched = relocateSymlinkedBaselineRules([ro('/etc')], io({}));
     expect(untouched).toEqual({ rules: [ro('/etc')], symlinks: [] });
+  });
+
+  // The stock devbox layout: /opt is a link to the root of a separate data
+  // disk that also holds projects, logs and other checkouts.
+  const diskRootPolicy = (extra: FsRule[] = []): FsRule[] => [
+    ro('/etc'), ro('/opt'), ro('/usr'),
+    { path: '/data00/proj', access: 'readWrite', source: 'internal' },
+    { path: '/data00/node/bin', access: 'readOnly', source: 'internal' },
+    ...extra,
+  ];
+  const compileRelocated = (rules: FsRule[], links: Record<string, string>) => {
+    const out = relocateSymlinkedBaselineRules(rules, io(links));
+    const { args } = compileToBwrap({ rules: out.rules, net: true, writeRegexes: [] }, {
+      symlinks: out.symlinks, emptyDir: '/sbx/empty', emptiesDir: '/sbx/empties', chdir: '/data00/proj',
+    });
+    return { out, args };
+  };
+  /** [source, dest] of every --bind / --ro-bind in the argv. */
+  const binds = (args: string[]) => args.flatMap((a, i) =>
+    a === '--bind' || a === '--ro-bind' ? [[args[i + 1], args[i + 2]]] : []);
+
+  it('recreates a system dir linked to a disk root as a link without granting the disk', () => {
+    const { out, args } = compileRelocated(diskRootPolicy(), { '/opt': '/data00' });
+    // Nothing mounts the disk itself, under either name; the granted subtrees still do.
+    expect(binds(args).filter(([src, dest]) => src === '/data00' || dest === '/data00' || dest === '/opt')).toEqual([]);
+    expect(binds(args)).toEqual(expect.arrayContaining([['/data00/proj', '/data00/proj'], ['/data00/node/bin', '/data00/node/bin']]));
+    expect(accessForPath(out.rules, '/data00/other-project').access).toBe('none');
+    expect(accessForPath(out.rules, '/data00/proj').access).toBe('readWrite');
+    // The link itself is still rebuilt, so /opt/<granted> resolves inside.
+    const symlinkAt = args.indexOf('--symlink');
+    expect(args.slice(symlinkAt, symlinkAt + 3)).toEqual(['--symlink', '/data00', '/opt']);
+    expect(out.symlinks).toEqual([{ path: '/opt', target: '/data00' }]);
+    expect(out.withheld).toEqual([{ path: '/opt', target: '/data00' }]);
+  });
+
+  it('keeps an explicit grant of the disk root and rules under the lexical link', () => {
+    // sandboxPaths `/opt` arrives canonicalized; a lexical rule below the link
+    // (e.g. a non-canonical install root) still moves to its real path.
+    const { out, args } = compileRelocated(diskRootPolicy([
+      { path: '/data00', access: 'readOnly', source: 'user' },
+      { path: '/opt/tool', access: 'readOnly', source: 'internal' },
+    ]), { '/opt': '/data00' });
+    expect(out.rules).toEqual(expect.arrayContaining([
+      { path: '/data00', access: 'readOnly', source: 'user' },
+      { path: '/data00/tool', access: 'readOnly', source: 'internal' },
+    ]));
+    expect(out.rules.some(r => r.path === '/opt' || r.path.startsWith('/opt/'))).toBe(false);
+    expect(binds(args)).toEqual(expect.arrayContaining([['/data00', '/data00'], ['/data00/tool', '/data00/tool']]));
+  });
+
+  it('withholds a system dir linked to the root itself', () => {
+    const out = relocateSymlinkedBaselineRules(
+      [ro('/etc'), ro('/opt'), { path: '/opt/tool', access: 'readOnly', source: 'internal' }, ro('/usr')],
+      io({ '/opt': '/' }),
+    );
+    expect(out.symlinks).toEqual([{ path: '/opt', target: '/' }]);
+    expect(out.rules.map(r => r.path)).toEqual(['/etc', '/tool', '/usr']);
+  });
+
+  it('keeps relocating a home-level link to a differently named directory', () => {
+    // Per-user cache/toolchain dirs are commonly moved to a data disk under
+    // another name; withholding a readWrite cache would break the CLI.
+    const cache: FsRule = { path: '/home/u/.cache', access: 'readWrite', source: 'baseline' };
+    const out = relocateSymlinkedBaselineRules([cache], io({ '/home/u/.cache': '/data00/cache' }));
+    expect(out.symlinks).toEqual([{ path: '/home/u/.cache', target: '/data00/cache' }]);
+    expect(out.rules).toEqual([{ ...cache, path: '/data00/cache' }]);
+    expect(out.withheld).toBeUndefined();
   });
 
   it('only rebuilds a link whose parent is already canonical', () => {

@@ -64,6 +64,7 @@ const TASK_PARAMS = {
   prompt: 'Run the build pipeline',
   workingDir: '/workspace/project',
   chatId: 'oc_test_chat',
+  owner: { kind: 'ownerless' as const },
 };
 
 /**
@@ -254,14 +255,14 @@ describe('schedule-store', () => {
 
       // ownerOpenId is part of create-or-return-identical input: same id with a
       // different owner is an idempotency conflict, not a silent no-op.
-      createTask({ ...TASK_PARAMS, id: 'wf_owner_hash', ownerOpenId: 'ou_a' });
-      expect(() => createTask({ ...TASK_PARAMS, id: 'wf_owner_hash', ownerOpenId: 'ou_b' }))
+      createTask({ ...TASK_PARAMS, id: 'wf_owner_hash', owner: { kind: 'human', openId: 'ou_a' } });
+      expect(() => createTask({ ...TASK_PARAMS, id: 'wf_owner_hash', owner: { kind: 'human', openId: 'ou_b' } }))
         .toThrow('IdempotencyConflict');
     });
 
     it('persists ownerOpenId across reloads', async () => {
       const store1 = await freshImport();
-      const task = store1.createTask({ ...TASK_PARAMS, ownerOpenId: 'ou_creator' });
+      const task = store1.createTask({ ...TASK_PARAMS, owner: { kind: 'human', openId: 'ou_creator' } });
       expect(task.ownerOpenId).toBe('ou_creator');
       const store2 = await freshImport();
       expect(store2.getTask(task.id)?.ownerOpenId).toBe('ou_creator');

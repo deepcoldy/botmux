@@ -1,3 +1,4 @@
+import type { TurnSpeaker } from './core/turn-speakers.js';
 import type { BackendType, HerdrBackendConfig, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 // The IPC carries the USER-facing MojoConfig. EffectiveMojoConfig exists only
@@ -543,6 +544,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Last settled fixed context for one TraeX native thread. */
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   nativeGoalStatusCard?: import('./core/goal-status-card.js').GoalStatusCardRecord;
   nativeGoalCardOrigin?: import('./core/goal-status-card.js').GoalStatusCardOrigin;
   sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
@@ -653,6 +656,8 @@ export interface Session {
   nativeSessionTitleUserDefined?: boolean;
   /** 首轮只有机器人 mention 时，等待第一条有效正文生成原生标题。 */
   nativeSessionTitleAwaitingContent?: boolean;
+  /** Fingerprint of the join bootstrap, retained across configuration changes. */
+  automaticTitleBootstrap?: { digest: string; length: number };
   /** Last explicit title update. Undefined means the title is the legacy initial fallback. */
   titleUpdatedAt?: string;
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
@@ -752,6 +757,10 @@ export interface Session {
     committedAt: string;
     dispatchAttempt?: number;
   }>;
+  /** Exact closed lifecycle displaced by a primary-mode /repo switch. Persisted
+   * before worker startup so a delayed or restored first checkpoint cannot
+   * claim a different successor's closed lane. Absent means no takeover proof. */
+  durablePrimaryPredecessor?: { sessionId: string; contractRevision: number };
   /** Confirmed settings for an exact durable Inbox task that may retry before
    * provider submission. Never itself authorizes a business-turn replay. */
   codexEffortTaskConfirmations?: import('./services/codex-effort-task-state.js').EffortTaskConfirmation[];
@@ -1248,6 +1257,8 @@ export interface Session {
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Last explicit preference edit, only recorded while terminal writeback is enabled. */
+  terminalEffortPreferenceEdit?: { atMs: number; source: 'explicit' | 'terminal'; requestedAtMs?: number; enableEpoch?: number; nativeSessionId?: string; nativeModel?: string; nativeEffort?: string; nativeSnapshotHash?: string };
   /** Codex service tier frozen at session creation; legacy missing means inherit. */
   serviceTier?: CodexServiceTierPreference;
   /** Per-session opt-in idle auto-compaction (core/idle-auto-compact.ts).
@@ -2090,6 +2101,9 @@ export interface CliTurnPayload {
   rerouteEnvelope?: CrossPrincipalInterruptionMessage;
 }
 
+/** Exact provider control text plus the host-authenticated caller; no CLI sidecars. */
+export type AcceptedCommandInput = Pick<CliTurnPayload, 'content' | 'trustedCaller'>;
+
 /** Exact ordered successor retained behind an adapter-ACKed activation. */
 export interface QueuedActivationTailEntry {
   id: string;
@@ -2105,6 +2119,7 @@ export interface QueuedActivationTailEntry {
  * this record after restart; the record is cleared only with the activation
  * journal's adapter-level ACK. */
 export interface PendingRepoSetup {
+  acceptedInput?: AcceptedCommandInput;
   mode: 'picker' | 'auto_worktree';
   linkRefMode?: import('./services/link-ref-types.js').LinkRefMode;
   prompt: string;
@@ -2135,6 +2150,8 @@ export interface CodexAppEffortResult {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
+  /** One small-model recap of `prompt`, answered by recap_result. */
+  | { type: 'recap_request'; requestId: string; prompt: string }
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
@@ -2148,8 +2165,10 @@ type DaemonToWorkerBase =
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
   | { type: 'codex_app_effort'; requestId: string; effort: string }
+  | { type: 'codex_app_interrupt'; requestId: string; generation: string; turnEpoch: number }
   | { type: 'worker_ipc_probe' }
   | { type: 'protected_mcp_secret_channel_result'; requestId: string; ok: boolean; error?: string }
+  | { type: 'traex_model_pool_prune_result'; requestId: string; result: import('./services/traex-model-pool-prune.js').TraexModelPoolPruneResult }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
@@ -2168,6 +2187,7 @@ type DaemonToWorkerBase =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
+  | { type: 'terminal_effort_writeback_ack'; nonce: string; preference: string }
   | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
@@ -2289,7 +2309,10 @@ type DaemonToWorkerBase =
     dispatchAttempt?: number;
   };
 
-export type DaemonToWorker = DaemonToWorkerTransport & { sessionCommand?: import('./services/session-contract.js').SessionCommandContext };
+export type DaemonToWorker = DaemonToWorkerTransport & {
+  sessionCommand?: import('./services/session-contract.js').SessionCommandContext;
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
+};
 
 type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
@@ -2420,6 +2443,8 @@ export interface WorkerFinalOutput {
   /** Redacted terminal diagnostic only, without partial model text. May
    * surface as auxiliary failure UI when a loud trigger hides its answer. */
   turnFailureNotice?: string;
+  /** A signed Codex App final whose native terminal was interrupted. */
+  codexAppCancelled?: true;
   /** True when `content` is the worker's "completed but no final text matched"
    *  diagnostic, not a model answer: it must not count as the turn's delivered
    *  final reply. Presentation is unchanged. */
@@ -2468,10 +2493,13 @@ export interface WorkerFinalOutput {
 export type WorkerToDaemon = WorkerToDaemonBase & { sessionContract?: import('./services/session-contract.js').SessionEventContext };
 
 export type WorkerToDaemonBase =
+  | { type: 'traex_model_pool_prune'; requestId: string; expectedPolicyKey: string; availableModels: string[]; turnId?: string; dispatchAttempt?: number }
   | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
+  | { type: 'codex_app_interrupt_target'; target?: { generation: string; turnEpoch: number; replyTurnId: string; dispatchAttempt?: number } }
+  | { type: 'codex_app_interrupt_result'; requestId: string; status: 'delivered' | 'stale_turn' | 'delivery_failed' }
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'runtime_binding_started'; bindingId: string; operationId?: string; continuation?: import('./services/session-contract.js').RuntimeExecutionContinuation }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
@@ -2538,6 +2566,7 @@ export type WorkerToDaemonBase =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
@@ -2613,6 +2642,10 @@ export type WorkerToDaemonBase =
       modelBackendVariant?: 'standard' | 'max' | null;
       traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
     }
+  /** Claude statusline effort.level, independent of the transcript's serving model.
+   * null means the current native session has no usable effort reading. */
+  | ({ type: 'claude_effort' } & import('./services/claude-effort-observer.js').ClaudeEffortObservation)
+  | ({ type: 'native_reasoning' } & import('./services/native-reasoning-observation.js').NativeReasoningObservation)
   /** OBSERVED FACTS about Claude Code's automatic model switching — never a
    * decision. `claudeSessionId` (always present) says WHICH Claude conversation
    * they are about; `fallback` is a `scope:"session"` switch record this worker
@@ -2639,6 +2672,8 @@ export type WorkerToDaemonBase =
     signal: string | null;
     logTail?: string;
     canParkDiagnostic?: boolean;
+    /** Presentation-only evidence that this TraeX generation never reached a prompt. */
+    traexStartupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
@@ -2687,6 +2722,19 @@ export type WorkerToDaemonBase =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number }
+  /** The CLI's own next-input suggestion on an idle screen (Claude Code's
+   *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
+   *  the turn that just ended; the daemon shows it on that turn's last card. */
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  /** The CLI's own recap of the session (Claude Code's transcript away
+   *  summary), written while idle after a turn; turnId is that turn. */
+  | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }
+  /** What a completed turn did (「本轮回顾」), sent just before its terminal:
+   *  facts and the latest activity, recorded apart from the capped CoT buffer. */
+  | { type: 'recap_input'; turnId: string; dispatchAttempt?: number } & import('./services/turn-recap.js').RecapTurnInput
+  /** Answer to a recap_request: the recap, or why none was made. */
+  | { type: 'recap_result'; requestId: string; text?: string; error?: string;
+      costUsd?: number; inputTokens?: number; outputTokens?: number }
   /** Redacted execution observation for the daemon notification clock only. */
   | { type: 'turn_progress'; turnId: string; dispatchAttempt?: number; stage: import('./services/cli-progress-notice.js').ProgressStage }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.
@@ -2760,11 +2808,23 @@ export type WorkerToDaemonBase =
         | 'structured_turn_not_collected'
         /** Claude's own permission dialog seen on screen (claudeActionPrompt). The
          *  daemon drops it while the PermissionRequest hook's card is pending. */
-        | 'claude_permission_prompt';
+        | 'claude_permission_prompt'
+        /** The CLI's resume was demoted to a fresh session. The worker reports
+         *  the FACT on every demotion; the daemon decides whether to speak
+         *  (per-session latch + history gate) and composes the copy. A worker
+         *  is reforked on every `/restart`, so it cannot own that latch. */
+        | 'resume_fallback';
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */
-      screenTail?: string }
+      screenTail?: string
+      /** `kind='resume_fallback'`: which tier demoted the launch. */
+      resumeTier?: import('./services/resume-fallback-notice.js').ResumeFallbackTier
+      /** `kind='resume_fallback'`: the worker's demotion reason (log only). */
+      resumeReason?: string
+      /** `kind='resume_fallback'`: false when nothing user-visible was lost
+       *  (claude-family first-turn launch recovery with no transcript ever). */
+      resumeLost?: boolean }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
@@ -2790,7 +2850,7 @@ export type WorkerToDaemonBase =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; linkRefMode?: 'observe' | 'enabled' }
   /** Worker→daemon single-source identity storage decision, sent right after
    *  the worker resolved the actual spawn (or RPC engine): the effective model
    *  plus the spawn facts it was derived from. The daemon publishes identity
@@ -2874,6 +2934,15 @@ export type WorkerToDaemonBase =
       /** Non-completed terminals only: the CLI screen's last rows when the
        *  turn ended, masked and clipped. */
       screenTail?: string;
+      /** Retryable failures only: epoch ms at which the provider's own error
+       *  text said the request may be retried (gateway "available at …",
+       *  Retry-After, "try again in 30s"). A scheduling hint for the daemon's
+       *  ordinary-turn recovery, which re-validates it. */
+      providerRetryAtMs?: number;
+      /** Non-completed terminals only: transcript time of the last request the
+       *  provider answered before this failure — when its prompt cache was last
+       *  refreshed. Bounds how long a recovery is worth waiting. */
+      providerLastSuccessAtMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

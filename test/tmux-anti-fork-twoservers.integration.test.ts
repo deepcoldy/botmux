@@ -19,6 +19,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { linuxListeningServerPids, resolveBootDirective, tmuxSocketPath } from '../src/core/tmux-server-guard.js';
+import { waitForListenerSetToSettle } from './helpers/tmux-listener-settle.js';
 
 const hasTmux = spawnSync('tmux', ['-V']).status === 0;
 function tmuxVersion(): { major: number; minor: number } | null {
@@ -84,8 +85,17 @@ describe.skipIf(process.platform !== 'linux' || !hasTmux || !TMPDIR)('tmux anti-
     expect(pidB).not.toBe(pidA);
 
     // Exactly two LISTENING servers, A (orphan) and B (reachable), same pathname.
-    expect((linuxListeningServerPids(socketPath) ?? []).sort((a, b) => a - b))
-      .toEqual([pidA, pidB].sort((a, b) => a - b));
+    // A forked child can still hold the listening socket fd for a few
+    // milliseconds while it exits, so require the census to SETTLE on the exact
+    // set rather than snapshot it once: a transient third pid converges and
+    // passes, while a real third server never settles and still fails the case.
+    const expected = [pidA, pidB].sort((a, b) => a - b);
+    const settlement = waitForListenerSetToSettle(expected, {
+      readPids: () => linuxListeningServerPids(socketPath),
+    });
+    // One object assertion: on failure it prints BOTH settled:false and the
+    // actual pid array (including any extra listener), not just the boolean.
+    expect(settlement).toEqual({ settled: true, pids: expected });
   });
 
   it('the guard RECREATES the socket via SIGUSR1 instead of forking (one bmx listener, ENOENT)', () => {

@@ -91,6 +91,7 @@ const sendWorkerInputMock = vi.fn(() => true);
 const closeSessionMock = vi.fn();
 const sessionStoreCloseMock = vi.fn();
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => {
     // Faithfully model the production queued-session transition. A loose
     // no-op mock would hide the exact regression this suite guards: forking a

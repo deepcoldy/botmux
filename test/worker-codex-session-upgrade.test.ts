@@ -72,6 +72,14 @@ function harness() {
     injectionFlushing: false,
     commandLineWritesPending: 0,
     initialInputOwnershipPending: false,
+    // The TraeX native startup first-input fence is traex-only and fresh-only;
+    // these Codex upgrade scenarios never arm it (see traex-startup-input).
+    traexNativeStartupInputPending: false,
+    traexFirstInputAdmissionPending: false,
+    traexNativeStartupInputIsPending: () => false,
+    // Captured unconditionally at every flush entry; unused while the fence
+    // above stays disarmed.
+    webTerminalInputGeneration: 0,
     remoteRunnerRecoveredTurnInFlight: false,
     pendingMessages: [], pendingRawInputs: [], pendingInjections: [], pendingAdoptMessages: [],
     sessionRenameInFlight: () => false,

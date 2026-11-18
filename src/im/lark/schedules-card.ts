@@ -20,6 +20,7 @@
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
+import { scheduleSupportLines } from '../../core/schedule-followup.js';
 import type {
   ScheduleCardTaskInput,
   ScheduleDetailDto,
@@ -476,15 +477,11 @@ export function buildSchedulesDetailCard(
       opts.locale,
     ),
   );
-  if (detail.lastStatus) {
-    infoLines.push(
-      t(
-        'card.dashboard.schedules.detail.status_label',
-        { status: escapeLarkMd(detail.lastStatus) },
-        opts.locale,
-      ),
-    );
-  }
+  // The shared support summary takes the place of the raw lastStatus row: for
+  // an until-done task `ok` only means a check was dispatched, so keeping both
+  // would print two contradictory "last result" rows. Its execution-position
+  // line is skipped because the card already has that row above.
+  infoLines.push(...scheduleSupportLines(detail.raw, opts.locale).slice(1).map(escapeLarkMd));
   if (detail.repeat) {
     const repeatStr =
       detail.repeat.times === null

@@ -42,6 +42,61 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 describe('Antigravity ACP transport', () => {
+  it('reports native currentValue after a successful settings update rather than the requested level', async () => {
+    const f = fixture('effort-override'); const values: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, effort: 'high', onReasoningEffort: level => values.push(level) }, new AbortController().signal);
+    expect(values).toEqual(['low', 'medium']);
+  });
+
+  it('does not report an unconfirmed selection when the native settings request is rejected', async () => {
+    const f = fixture('effort-denied'); const values: unknown[] = [];
+    await expect(runAntigravityAcp({ ...f.options, effort: 'medium', onReasoningEffort: level => values.push(level) }, new AbortController().signal)).rejects.toThrow();
+    expect(values).toEqual(['low']);
+    expect(f.calls().some(c => c.method === 'session/prompt')).toBe(false);
+  });
+
+  it('clears effort on a native config_option_update to default', async () => {
+    const f = fixture('effort-clear'); const values: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, effort: 'high', onReasoningEffort: level => values.push(level) }, new AbortController().signal);
+    expect(values).toEqual(['low', 'high', null]);
+  });
+
+  it('an optional display observer failure does not stop the native business turn', async () => {
+    const f = fixture();
+    expect(await runAntigravityAcp({ ...f.options, effort: 'high', onReasoningEffort: () => { throw new Error('observer unavailable'); } },
+      new AbortController().signal)).toBe('中文 complete answer');
+  });
+
+  it.each(['early-runtime', 'early-history-runtime'])('retains coalesced runtime updates without replaying load history: %s', async mode => {
+    const f = fixture(mode); const runtime: Array<{ model?: string }> = [];
+    expect(await runAntigravityAcp({ ...f.options, nativeSessionId: 'exact-native', onRuntime: value => runtime.push(value) }, new AbortController().signal))
+      .toBe('中文 complete answer');
+    expect(runtime.at(-1)?.model).toBe('early-model');
+  });
+  it('reports native default/restored models and subsequent configuration updates', async () => {
+    const f = fixture('runtime');
+    const runtime: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, nativeSessionId: 'exact-native', onRuntime: value => runtime.push(value) }, new AbortController().signal);
+    expect(runtime).toEqual([
+      { model: 'gemini-test', reasoningEffort: 'low' },
+      { model: 'gemini-runtime-updated', reasoningEffort: 'medium' },
+    ]);
+  });
+
+  it('uses the acknowledged native selection and keeps metadata callback failures cosmetic', async () => {
+    const f = fixture();
+    const runtime: unknown[] = [];
+    await expect(runAntigravityAcp({ ...f.options, model: 'gemini-test-high', effort: 'high', onRuntime: value => {
+      runtime.push(value); throw new Error('cosmetic failure');
+    } }, new AbortController().signal)).resolves.toBe('中文 complete answer');
+    expect(runtime.at(-1)).toEqual({ model: 'Gemini Test High', reasoningEffort: 'high' });
+  });
+  it('announces only the selection this turn runs on when set_model echoes base-only options later', async () => {
+    const f = fixture('agy-1.5.4');
+    const runtime: unknown[] = [];
+    await runAntigravityAcp({ ...f.options, model: 'gemini-test-high', onRuntime: value => runtime.push(value) }, new AbortController().signal);
+    expect(runtime).toEqual([{ model: 'Gemini Test High', reasoningEffort: 'high' }]);
+  });
   it('delivers long UTF-8 multi-line prompts intact and returns only the final answer', async () => {
     const f = fixture();
     const content = '<user_message>\n' + '中文 😀 line\n'.repeat(2_000) + '</user_message>';

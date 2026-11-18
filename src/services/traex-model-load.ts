@@ -4,6 +4,9 @@ import { isCodexReasoningEffort, type CodexReasoningEffort } from './codex-reaso
 export interface TraexModelLoadSnapshot {
   loads: Map<string, number>;
   reasoningEfforts: Map<string, readonly CodexReasoningEffort[]>;
+  /** Present only after a valid, nonempty catalog has been read to its end.
+   * Absence is inconclusive, never evidence that a model was removed. */
+  catalogModels?: ReadonlySet<string>;
 }
 
 function publicModelIdentities(entry: Record<string, any>): string[] {
@@ -63,7 +66,9 @@ export async function readTraexModelLoadSnapshot(input: {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<TraexModelLoadSnapshot | null> {
+  if (input.signal?.aborted) return Promise.resolve(null);
   return new Promise(resolve => {
     const child = spawn(input.cliBin, ['app-server', '--listen', 'stdio://'], {
       env: input.env, cwd: input.cwd, stdio: ['pipe', 'pipe', 'ignore'],
@@ -75,11 +80,13 @@ export async function readTraexModelLoadSnapshot(input: {
     const cursors = new Set<string>();
     let nextId = 2;
     const snapshot: TraexModelLoadSnapshot = { loads: new Map(), reasoningEfforts: new Map() };
+    const catalogModels = new Set<string>();
     const timeout = setTimeout(() => finish(null), input.timeoutMs ?? 8_000);
     function finish(result: TraexModelLoadSnapshot | null) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      input.signal?.removeEventListener('abort', onAbort);
       child.stdin.end();
       child.kill('SIGTERM');
       const reap = setTimeout(() => child.kill('SIGKILL'), 1_000);
@@ -87,6 +94,7 @@ export async function readTraexModelLoadSnapshot(input: {
       child.once('exit', () => clearTimeout(reap));
       resolve(result);
     }
+    function onAbort() { finish(null); }
     function send(value: object) {
       if (!settled) child.stdin.write(`${JSON.stringify(value)}\n`, error => {
         if (error) finish(null);
@@ -119,17 +127,31 @@ export async function readTraexModelLoadSnapshot(input: {
           page();
         } else if (message.id === nextId) {
           if (message.error) { finish(null); return; }
+          const data = message.result?.data;
+          if (!Array.isArray(data) || data.some((entry: unknown) =>
+            !entry || typeof entry !== 'object' || Array.isArray(entry)
+            || publicModelIdentities(entry as Record<string, any>).length === 0)) {
+            finish(null); return;
+          }
+          for (const entry of data) {
+            for (const identity of publicModelIdentities(entry)) catalogModels.add(identity);
+          }
           const pageSnapshot = parseTraexModelLoadSnapshot(message.result);
           for (const [key, value] of pageSnapshot.loads) snapshot.loads.set(key, value);
           for (const [key, value] of pageSnapshot.reasoningEfforts) snapshot.reasoningEfforts.set(key, value);
           const cursor = message.result?.nextCursor;
-          if (typeof cursor === 'string' && cursor && !cursors.has(cursor)) {
+          if (cursor !== undefined && cursor !== null
+            && (typeof cursor !== 'string' || !cursor || cursors.has(cursor) || pages >= 100)) {
+            finish(null); return;
+          }
+          if (typeof cursor === 'string' && cursor) {
             cursors.add(cursor); nextId += 1; page(cursor);
           }
-          else finish(snapshot.loads.size || snapshot.reasoningEfforts.size ? snapshot : null);
+          else finish(catalogModels.size > 0 ? { ...snapshot, catalogModels } : null);
         }
       }
     });
+    input.signal?.addEventListener('abort', onAbort, { once: true });
     send({ id: 1, method: 'initialize', params: {
       clientInfo: { name: 'botmux-model-load', version: '1' },
       capabilities: { experimentalApi: true },

@@ -988,6 +988,22 @@ export interface CliAdapter {
    *  hold, never a card. */
   readonly stuckPageFamily?: import('../../utils/stuck-detector.js').StuckPageFamily;
 
+  /** The CLI's own prediction of the user's next input, read from the
+   *  rendered input box of an idle screen (cells, so dim/inverse attributes
+   *  survive). Undefined = none on screen or not recognised; adapters without
+   *  it never offer a next-step suggestion. */
+  readonly promptSuggestion?: (rows: readonly import('../../utils/terminal-cells.js').ScreenRow[]) => string | undefined;
+
+  /** A one-off, tool-less, small-model call with this CLI's own credentials:
+   *  the optional「本轮回顾」model recap. The prompt is written to stdin;
+   *  stdout is the CLI's JSON result (`services/turn-recap.ts`
+   *  parseRecapModelOutput). Adapters without it never make that call. */
+  readonly recapModel?: {
+    args(systemPrompt: string): string[];
+    /** Added to the session's own CLI env for that call. */
+    readonly env: Readonly<Record<string, string>>;
+  };
+
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
    *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit

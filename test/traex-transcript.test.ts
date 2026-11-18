@@ -139,6 +139,17 @@ function historyAppend(items: unknown[], timestamp = '2000-01-01T00:00:02.000Z')
   };
 }
 
+function traexResponseItem(item: object, turnId?: string) {
+  return {
+    timestamp: '2000-01-01T00:00:02.000Z',
+    type: 'response_item',
+    payload: {
+      ...item,
+      ...(turnId ? { internal_chat_message_metadata_passthrough: { turn_id: turnId } } : {}),
+    },
+  };
+}
+
 function canonicalCompletion(item: unknown, timestamp = '2000-01-01T00:00:01.000Z') {
   return {
     ...historyAppend([], timestamp),
@@ -965,6 +976,86 @@ describe('drainTraexRollout', () => {
     expect(queue.drainEmittable()).toEqual([
       expect.objectContaining({ turnId: 'remote-tool', finalText: 'tool completed' }),
     ]);
+  });
+
+  it('routes TraeX 0.215 response items to the active turn as they are written', () => {
+    const turnId = taskComplete().payload.turn_id;
+    const input = itemCompleted({
+      type: 'UserMessage', id: 'input-1', content: [{ type: 'text', text: 'inspect it' }],
+    }, turnId);
+    const reasoning = {
+      type: 'reasoning', id: 'rs_1', summary: [],
+      content: [{ type: 'reasoning_text', text: 'Inspect the input' }],
+      encrypted_content: 'opaque-data',
+    };
+    const call = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'exec', arguments: '{"command":"pwd"}' };
+    const result = { type: 'function_call_output', call_id: 'call_1', output: 'ok' };
+    writeFileSync(path, [
+      line(input),
+      line(traexResponseItem(reasoning, turnId)),
+      line(traexResponseItem(call, turnId)),
+      line(traexResponseItem({ ...reasoning, id: 'unscoped' })),
+      line(assistantProgress('still running')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { probe: true }).events.map(event => event.kind)).toEqual(['user']);
+    const queue = new CodexBridgeQueue();
+    const observed: string[] = [];
+    queue.mark('current-turn', 'inspect it', Date.parse(input.timestamp));
+    queue.setCotObserver((entries, turn) => {
+      observed.push(...entries.map(entry => `${turn.turnId}:${entry.kind}`));
+    });
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user', 'cot', 'cot']);
+    expect(first.events[1]).toMatchObject({
+      sourceTurnId: turnId,
+      cotEntries: [{ kind: 'thinking', text: 'Inspect the input' }],
+    });
+    queue.ingest(first.events);
+    expect(observed).toEqual(['current-turn:thinking', 'current-turn:tool_call']);
+    expect(queue.drainEmittable()).toEqual([]);
+
+    appendFileSync(path, line({
+      ...input, payload: { ...input.payload, item: {
+        type: 'Reasoning', id: 'rs_1', raw_content: ['Inspect the input'], summary_text: [],
+      } },
+    }) + line(traexResponseItem(result, turnId)) + line(taskComplete('done')));
+    queue.ingest(drainTraexRollout(path, first.newOffset).events);
+    expect(observed).toEqual(['current-turn:thinking', 'current-turn:tool_call', 'current-turn:tool_result']);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'current-turn', finalText: 'done' }),
+    ]);
+  });
+
+  it('deduplicates both TraeX CoT formats across drains and preserves native turn ownership', () => {
+    const turnId = taskComplete().payload.turn_id;
+    const nextTurnId = '00000000-0000-7000-8000-000000000011';
+    const reasoning = {
+      type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'Inspect the input' }],
+    };
+    const call = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'exec', arguments: '{}' };
+    const result = { type: 'function_call_output', call_id: 'call_1', output: 'ok' };
+    writeFileSync(path, line(historyAppend([reasoning])) + line(traexResponseItem(call, turnId)));
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.flatMap(event => event.cotEntries ?? []).map(entry => entry.kind))
+      .toEqual(['thinking', 'tool_call']);
+
+    appendFileSync(path, [
+      line(traexResponseItem(reasoning, turnId)),
+      line(historyAppend([call, result])),
+      line(traexResponseItem(result, turnId)),
+      line(taskComplete('done')),
+      line(traexResponseItem(reasoning, nextTurnId)),
+      line(traexResponseItem(call, nextTurnId)),
+    ].join(''));
+    const next = drainTraexRollout(path, first.newOffset);
+    expect(next.events.map(event => [event.kind, event.sourceTurnId, event.cotEntries?.map(entry => entry.kind)]))
+      .toEqual([
+        ['cot', turnId, ['tool_result']],
+        ['assistant_final', turnId, undefined],
+        ['cot', nextTurnId, ['thinking']],
+        ['cot', nextTurnId, ['tool_call']],
+      ]);
   });
 
   it('emits TraeX reasoning and tool calls/results as ordered CoT events', () => {

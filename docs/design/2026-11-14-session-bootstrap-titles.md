@@ -1,0 +1,11 @@
+# Group bootstrap titles
+
+A group-join bootstrap is setup context rather than a user question. New sessions use the known group name while awaiting meaningful user content. Configured and localized bootstraps are removed only from title input; task content stays intact. A persisted normalized fingerprint identifies a replay even if configuration changes.
+
+The daemon persists the awaiting-content marker when it creates an ordinary join session, so naming does not depend on recognizing the opening text and resumes at the next accepted input even if the bootstrap title write fails. On the first meaningful continuation, the canonical list title is updated for both native-title and other CLI adapters; a question folded after the bootstrap into the opening counts as that content. An ordinary opening, including one that merely starts with the join prompt, keeps the title its entry point created (topic text, schedule, trigger); native-title CLIs still receive their launch title from it. Content-derived titles keep the `initial` source, so session-group naming in session-title mode, which renames a chat only once, still waits for the native semantic result. That result replaces the canonical title only when the current title is automatic (`initial` or `cli`). User, Dashboard and explicit agent renames remain protected by the existing manual flag and source metadata. Native and canonical changes are persisted as one session update at the accepted continuation path.
+
+Existing truncated oncall bootstrap titles can display the known group name without rewriting old rows. List/table views show real attention reasons and use known activity timestamps, falling back to last message time when necessary. Unknown flags do not become blockers.
+
+Validation should cover configuration changes and replay, manual intervention during title generation, failed persistence/restart, queued/rejected continuations, and late native results. UI output must use sample data in review screenshots.
+
+Legacy resumed sessions without a known native title keep the CLI's existing title. Empty title-generation prompts remain absent in the launch payload. Dashboard publication after an accepted input is best-effort: an observer error cannot turn accepted input into retryable activation failure; a failed metadata commit leaves the previous launch configuration intact.

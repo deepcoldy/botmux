@@ -210,6 +210,10 @@ setInterval(() => {
       type: 'message',
       content: 'first prompt',
       turnId: 'om_first',
+      // Ordinary TRAE drafts now retain attribution in master (#3506).
+      // The durable delivery path still retires its bounded warning/mark and
+      // needs this PR's separately owned late receipt observer.
+      dispatchAttempt: 1,
     } satisfies DaemonToWorker);
     await waitFor(
       child,
@@ -228,9 +232,15 @@ setInterval(() => {
       return output.includes('Structured bridge mark dropped after submit failure')
         || output.includes('expired 1 structured head(s) without transcript start (om_first)');
     }, logs, 'bounded cleanup retires the unconfirmed attribution mark', 60_000);
-    child.send({ type: 'message', content: 'successor after late completion', turnId: 'om_successor' } satisfies DaemonToWorker);
-    await waitFor(child, () => logs.join('').includes('Holding 1 pending message(s) behind unconfirmed input delivery'),
-      logs, 'successor held behind quarantine');
+    await new Promise<void>((resolveSend, rejectSend) => {
+      child.send({
+        type: 'message', content: 'successor after late completion',
+        turnId: 'om_successor', dispatchAttempt: 1,
+      } satisfies DaemonToWorker, error => error ? rejectSend(error) : resolveSend());
+    });
+    // A durable terminal can leave the worker logically busy: the successor
+    // then queues without calling flushPending and its old "Holding 1" log.
+    // Prove the hold below from actual CLI submissions, not that log branch.
     // A sibling's same-text receipt is NOT proof, even with a terminal and idle.
     appendFileSync(historyPath, rolloutLine({session_id: '00000000-0000-7000-8000-000000000999', text: firstSubmission.text, ts: Date.now()/1000}));
     appendFileSync(rolloutPath, rolloutTerminal('unrelated-native-turn'));

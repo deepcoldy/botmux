@@ -106,6 +106,55 @@ describe('buildReproduceCommand', () => {
     expect(cmd.startsWith('cd ')).toBe(false);
     expect(cmd).toContain("'/opt/claude'");
   });
+
+  // Regression: the Dashboard command used to be built from the PRE-scrub env,
+  // so a demoted/fresh dsh-tui session's "copy & run" still carried the
+  // launcher's resume markers and would resume another conversation. A bare
+  // `KEY=VAL` prefix cannot REMOVE an exported value either, so removals must
+  // be expressed through `env -u` — and the builder must not silently drop the
+  // `-u` tokens (its old `eq <= 0` loop did exactly that).
+  it('expresses unsetEnv as `env -u KEY` before the CLI', () => {
+    const cmd = buildReproduceCommand({
+      backendType: 'pty',
+      bin: '/opt/dsh-tui',
+      args: ['--patch=/tmp/p.json'],
+      cwd: '/repo',
+      env: baseEnv,
+      unsetEnv: ['DSH_TUI_RESUME_SESSION', 'DSH_TUI_RESUME_BACKEND', 'DSH_TUI_RESUME_RETRY'],
+    })!;
+    expect(cmd).toContain(
+      '/usr/bin/env -u DSH_TUI_RESUME_SESSION -u DSH_TUI_RESUME_BACKEND -u DSH_TUI_RESUME_RETRY',
+    );
+    // Removals are not assignments: no `KEY='value'` for any of them.
+    expect(cmd).not.toContain("DSH_TUI_RESUME_SESSION='");
+    // The CLI and its argv still follow the env prefix.
+    expect(cmd).toContain("'/opt/dsh-tui' '--patch=/tmp/p.json'");
+    // The authoritative botmux assignments are still present.
+    expect(cmd).toContain("BOTMUX_SESSION_ID='sess-1'");
+  });
+
+  it('keeps the session-env lock: reserved names are not emitted as removals', () => {
+    const cmd = buildReproduceCommand({
+      backendType: 'pty',
+      bin: '/opt/claude',
+      args: [],
+      env: baseEnv,
+      unsetEnv: ['PATH', 'BOTMUX_SESSION_ID', 'LEAKED_TOKEN'],
+    })!;
+    expect(cmd).toContain('/usr/bin/env -u LEAKED_TOKEN');
+    expect(cmd).not.toContain('-u PATH');
+    expect(cmd).not.toContain('-u BOTMUX_SESSION_ID');
+  });
+
+  it('no unsetEnv → no env(1) indirection at all (unchanged command shape)', () => {
+    const cmd = buildReproduceCommand({
+      backendType: 'pty',
+      bin: '/opt/claude',
+      args: [],
+      env: baseEnv,
+    })!;
+    expect(cmd).not.toContain('/usr/bin/env');
+  });
 });
 
 // selectReproduceLaunch：复现命令的 bin/args 决策——绝不含 sandbox wrapper（codex P1）。
