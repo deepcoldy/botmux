@@ -663,11 +663,8 @@ export class CodexBrowserBroker {
   private runtimeShim?: Json;
   private authenticatedFetch?: CodexBrowserAuthenticatedFetch;
   private pluginModules?: BrowserPluginModules;
-  /** The in-flight dead-runtime teardown for a rejected discovery init.
-   *  Concurrent callers failing the same init await the same promise instead
-   *  of returning early, so no caller can reuse the stale rejected init while
-   *  the shared close() is still running. */
-  private invalidation?: { init: Promise<unknown>; done: Promise<void> };
+  /** Shared teardown for the browser initialization being invalidated. */
+  private invalidation?: { init: Promise<BrowserBinding>; done: Promise<void> };
 
   constructor(private readonly opts: CodexBrowserBrokerOptions) {}
 
@@ -760,36 +757,27 @@ export class CodexBrowserBroker {
     return /^Browser Node runtime (?:exited|is unavailable)\b/i.test(message);
   }
 
-  /** Full teardown for a dead owner-scoped Node runtime. The next operation
-   *  rebuilds runtime and binding through initialize(); the failed operation is
-   *  never replayed.
-   *
-   *  Discovery failures pass the shared `init` promise: concurrent callers that
-   *  rejected the same init await one shared teardown, so by the time any of
-   *  them returns, `this.init` is cleared and the next operation rebuilds rather
-   *  than replaying the stale rejection. A runtime rebuilt while close() was in
-   *  flight is preserved by the modules identity check. The operation path
-   *  passes no init and keeps its original single-caller semantics. */
-  private async invalidateDeadRuntime(init?: Promise<unknown>): Promise<void> {
-    if (init !== undefined) {
-      if (this.invalidation?.init === init) return this.invalidation.done;
-      const done = this.invalidateDeadRuntime();
-      this.invalidation = { init, done };
-      return done;
-    }
+  /** Callers sharing a failed init await one cleanup. Retire the dead binding
+   * even if close rejects, so the next explicit operation can rebuild it. */
+  private async invalidateDeadRuntime(init = this.init): Promise<void> {
+    if (!init || this.init !== init) return;
+    if (this.invalidation?.init === init) return this.invalidation.done;
     const modules = this.pluginModules;
-    await modules?.close?.();
-    // While close() was pending, another path may already have rebuilt a newer
-    // runtime; leave that generation completely untouched.
-    if (modules !== undefined && this.pluginModules !== modules) return;
-    this.pluginModules = undefined;
-    this.agent = undefined;
-    this.turnEndedHandlers.clear();
-    this.browserGeneration++;
-    this.browser = undefined;
-    this.init = undefined;
-    this.claimedTabs.clear();
-    this.requiresFreshTabClaim = true;
+    const done = Promise.resolve().then(() => modules?.close?.()).finally(() => {
+      if (this.invalidation?.done === done) this.invalidation = undefined;
+      // A newer binding can take over while the old runtime is closing.
+      if (this.init !== init || this.pluginModules !== modules) return;
+      this.pluginModules = undefined;
+      this.agent = undefined;
+      this.turnEndedHandlers.clear();
+      this.browserGeneration++;
+      this.browser = undefined;
+      this.init = undefined;
+      this.claimedTabs.clear();
+      this.requiresFreshTabClaim = true;
+    });
+    this.invalidation = { init, done };
+    return done;
   }
 
   private async executeWithBrowser(

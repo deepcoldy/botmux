@@ -98,6 +98,34 @@ describe.sequential('browser connection recovery', () => {
     expect(close).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['discovery', 'operation'] as const)('rebuilds the runtime after teardown fails during %s', async phase => {
+    const stale = fakeModules();
+    const recovered = fakeModules();
+    const disconnected = new Error('Browser Node runtime exited');
+    const get = vi.fn(async () => stale.browser);
+    if (phase === 'discovery') get.mockRejectedValueOnce(disconnected);
+    else stale.browser.user.openTabs.mockRejectedValueOnce(disconnected);
+    const setupBrowserRuntime = recovered.modules.setupBrowserRuntime
+      .mockResolvedValueOnce({ browsers: { get } });
+    const close = vi.fn(async () => {}).mockRejectedValueOnce(new Error('temporary cleanup failure'));
+    broker = new CodexBrowserBroker({
+      sessionId: 'failed-invalidation',
+      family: 'chrome',
+      modules: { ...recovered.modules, setupBrowserRuntime, close },
+    });
+
+    const request = call({ operation: 'list_tabs' });
+    expect((await broker.handleToolCall(request)).success).toBe(false);
+    expect(setupBrowserRuntime).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(recovered.browser.user.openTabs).not.toHaveBeenCalled();
+
+    expect((await broker.handleToolCall(request)).success).toBe(true);
+    expect(recovered.browser.user.openTabs).toHaveBeenCalledOnce();
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it('shares one invalidation promise so concurrent callers wait for the same teardown', async () => {
     const closeDefers: Array<{ resolve: () => void }> = [];
     const close = vi.fn(async () => new Promise<void>(resolve => {
