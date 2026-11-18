@@ -83,7 +83,12 @@ const answered = (h: Harness) => events(h).some(e => e.kind === 'turn' && String
  *  for a persistent backend, and a new daemon session object and contract
  *  controller fork the next worker for the surviving pane. */
 function liveSession(opts: { turnMs: number; pidStateGated?: boolean; recordReadable?: boolean }) {
-  const h = setupFakeClaude({ turnMs: opts.turnMs, ...(opts.pidStateGated ? { pidStateGated: true } : {}) });
+  // These scenarios control identity availability through pidStateGated.
+  // An unrelated torn periodic rewrite during runtime registration must not
+  // turn a known-conversation handoff into the missing-identity scenario.
+  // In-place rewrite/re-read behavior remains covered by its own tests.
+  const h = setupFakeClaude({ turnMs: opts.turnMs, atomicPidState: true,
+    ...(opts.pidStateGated ? { pidStateGated: true } : {}) });
   if (opts.pidStateGated && opts.recordReadable !== false) writeFileSync(h.pidStateGate, '');
   const transcript = h.transcript(h.sessionId);
   const ago = (ms: number) => new Date(Date.now() - 3_600_000 + ms).toISOString();

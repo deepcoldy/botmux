@@ -287,7 +287,7 @@ import {
   ClaudeStopFailureTranscriptEvidence, drainClaudeStopFailureOutbox, handleClaudeStopFailureReport,
 } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
-import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence.js';
+import { InputDeliveryEvidenceTracker, inputDeliveryObservedSessionIdAtSpawn } from './services/input-delivery-evidence.js';
 import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
@@ -3200,6 +3200,12 @@ const adoptWriteQueue = new AsyncSerialQueue();
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
+/** Current native identity used by input-delivery recovery. Seeded from the
+ * spawn's ACTUAL effective target (undefined after fresh demotion or while a
+ * persistent reattach still lacks live proof), then moved forward by
+ * persistCliSessionId. Unlike lastInitConfig.cliSessionId, this cannot keep
+ * pointing at a resume target the live pane already abandoned. */
+let inputDeliveryObservedCliSessionId: string | undefined;
 let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
 let lastSpawnArgvDurableInitialPrompt = false;
@@ -17022,6 +17028,7 @@ async function writeAdoptMessage(
               submissionBackend,
               { turnId, dispatchAttempt },
               content,
+              result?.recheck,
             );
           }
           scheduleSubmitFailureNotify(
@@ -20551,6 +20558,7 @@ interface InputDeliveryQuarantine {
   draftContent: string;
   turnId?: string;
   dispatchAttempt?: number;
+  cancelReceipt?: () => void;
   draftRescueAttempted?: true;
   submitWarningSent?: true;
 }
@@ -20661,6 +20669,7 @@ function currentInputDeliveryQuarantine(): InputDeliveryQuarantine | null {
   if (quarantine.backend === backend && quarantine.generation === cliSpawnGeneration) {
     return quarantine;
   }
+  quarantine.cancelReceipt?.();
   inputDeliveryQuarantine = null;
   log('Cleared stale input-delivery quarantine after backend generation change');
   return null;
@@ -20670,6 +20679,7 @@ function armInputDeliveryQuarantine(
   target: SessionBackend,
   item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
   draftContent: string,
+  recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>,
 ): InputDeliveryQuarantine | null {
   if (cliAdapter?.quarantineUnconfirmedSubmits !== true || backend !== target) return null;
   // The native terminal may have been emitted while writeInput was still
@@ -20687,9 +20697,47 @@ function armInputDeliveryQuarantine(
       ? { dispatchAttempt: item.dispatchAttempt }
       : {}),
   };
+  inputDeliveryQuarantine?.cancelReceipt?.();
   inputDeliveryQuarantine = quarantine;
   if (lastInitConfig?.cliId === 'traex' && item.turnId && item.dispatchAttempt === undefined) {
     codexBridgeQueue.setInputDeliveryQuarantined(item.turnId, true);
+  }
+  if (recheck) {
+    // Notification/attribution leases are bounded, but an ambiguous submit can
+    // be accepted much later (e.g. a parked draft submitted in the terminal).
+    // Keep its read-only receipt closure, not a live bridge mark or replayable
+    // queue entry.
+    // The ordinary recheck may accept a sibling's same-text history line;
+    // recovery after attribution is gone requires positive pane ownership.
+    const nativeSessionId = inputDeliveryObservedCliSessionId;
+    const receipts = createQueuedActivationReceiptObserver(SUBMIT_DEFERRED_RECHECK_MS);
+    quarantine.cancelReceipt = () => receipts.clear();
+    receipts.watch('quarantined-input', {
+      isCurrent: () => inputDeliveryQuarantine === quarantine
+        && backend === target && cliSpawnGeneration === quarantine.generation
+        && !cliRestartInProgress
+        && (!nativeSessionId || inputDeliveryObservedCliSessionId === nativeSessionId),
+      recheck: async () => {
+        // While attribution is live, its existing confirmation/terminal path
+        // owns recovery. In particular, do not race its awaited recheck.
+        if (quarantine.turnId
+          && (codexBridgeQueue.hasPendingTurn(quarantine.turnId, quarantine.dispatchAttempt)
+            || codexBridgeQueue.hasTerminalTurn(quarantine.turnId, quarantine.dispatchAttempt))) return false;
+        const result = await recheck();
+        const expectedSessionId = nativeSessionId ?? inputDeliveryObservedCliSessionId;
+        return typeof result === 'object' && result && result.ownershipProven === true
+          && !!result.cliSessionId
+          && (!expectedSessionId || result.cliSessionId === expectedSessionId)
+          ? result : false;
+      },
+      onConfirmed: () => {
+        // The native terminal may already have passed without a bridge mark.
+        // Still require the ordinary composer fence before any successor;
+        // an owned receipt is not permission to type into a busy/stuck PTY.
+        armPostTerminalInputFence();
+        releaseInputDeliveryQuarantine(quarantine, 'owned late submit receipt', { redriveTerminal: true });
+      },
+    });
   }
   log(
     `Quarantined input delivery for backend generation ${quarantine.generation} `
@@ -20705,6 +20753,7 @@ function releaseInputDeliveryQuarantine(
   opts: { redriveTerminal?: boolean } = {},
 ): boolean {
   if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
+  quarantine.cancelReceipt?.();
   inputDeliveryQuarantine = null;
   if (quarantine.turnId) {
     codexBridgeQueue.setInputDeliveryQuarantined(quarantine.turnId, false, quarantine.dispatchAttempt);
@@ -22107,6 +22156,7 @@ function persistCliSessionId(cliSessionId: string): void {
   // During an interactive fork the CLI temporarily resumes the parent. Its
   // early PID/transcript observations must never acknowledge the pending fork.
   if (nativeSessionForkPending()) return;
+  inputDeliveryObservedCliSessionId = cliSessionId;
   const published = publishCliSessionIdToDaemon({
     cliSessionId,
     // Snapshot only worker-owned, durable local Codex roots. Never infer an
@@ -24505,7 +24555,7 @@ async function flushPending(): Promise<void> {
           codexAppLivenessHandle,
         );
         if (!result.failureReason && !recoveryFailureReason && submissionBackend) {
-          deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item, msg);
+          deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item, msg, result.recheck);
           if (deliveryQuarantine) inflightInputs.forget(item);
         }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
@@ -28243,6 +28293,7 @@ async function spawnCliBody(
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
   lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
+  inputDeliveryObservedCliSessionId = inputDeliveryObservedSessionIdAtSpawn(willReattachPersistent, effectiveCliSessionId);
   lastSpawnEffectiveAdapterSessionId = effectiveAdapterSessionId;
   // Inputs whose turn had already started when the previous CLI died: a
   // resumed conversation holds them (the restart note asks it to continue), so
@@ -32720,6 +32771,7 @@ function killCli(opts: {
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
   if (backend) previousCliEndedAtMs = Date.now();
+  inputDeliveryQuarantine?.cancelReceipt?.();
   inputDeliveryQuarantine = null;
   postTerminalInputFence = null;
   currentCliCredentialIsolated = false;
