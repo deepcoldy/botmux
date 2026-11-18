@@ -71,6 +71,39 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
     expect(h.recheck).not.toHaveBeenCalled();
   });
 
+  it('yields to a retained bridge mark while it is live, then takes over after the mark drops', async () => {
+    const h = harness();
+    // Stop the harness's own flush from arming the built-in 'delivery' turn, so
+    // this case drives the quarantine manually and isolates the observer yield.
+    h.scope.pendingMessages.splice(0);
+    // Ordinary traex input: the master-side retained-mark path keeps the exact
+    // bridge turn and the quarantine flag. The late-receipt observer must not
+    // race that live attribution, even when an owned receipt is already visible.
+    h.queue.mark('parked', 'original draft', 0);
+    const quarantine = h.scope.armInputDeliveryQuarantine(
+      h.scope.backend, { turnId: 'parked' }, 'original draft', h.recheck,
+    );
+    h.recheck.mockResolvedValue({ submitted: true, ownershipProven: true, cliSessionId: 'owned-session' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.queue.hasPendingTurn('parked', undefined)).toBe(true);
+    expect(h.scope.inputDeliveryQuarantine).toBe(quarantine);
+    // The yield guard short-circuits before the read-only recheck closure runs.
+    expect(h.recheck).not.toHaveBeenCalled();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+
+    // Durable path: the bounded failure terminal drops the mark, after which the
+    // same observer is the only remaining recovery path and may release.
+    h.queue.dropPendingTurn('parked', undefined);
+    expect(h.queue.hasPendingTurn('parked', undefined)).toBe(false);
+    await vi.advanceTimersByTimeAsync(20_000);
+    // Now the observer runs the read-only recheck and releases via the composer
+    // fence, without touching the original parked draft.
+    expect(h.recheck).toHaveBeenCalledTimes(1);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.armPostTerminalInputFence).toHaveBeenCalledTimes(1);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+
   it('also recovers when attribution expiry wins the race against the warning callback', async () => {
     const h = harness();
     await h.flush();
