@@ -16,6 +16,12 @@ describe('MiniMax reply file transport', () => {
     expect(changedBody.bytes.toString()).toBe('new body');
   });
 
+  it('reports the failing stage and exit status without including reply text', async () => {
+    const context = { workspaceRoots: [null as unknown as string] };
+    await expect(prepareReplyFile('private reply', context))
+      .rejects.toThrow(/^MiniMax reply file sanitizer failed \(stage=sanitize, code=1, signal=-\)$/);
+  });
+
   it('carries an exact 8 MB final_output from the worker over a real daemon IPC channel', async () => {
     const child = spawnTsEvalWithRepoImports(`
       import { loadWorkerFunction } from './test/helpers/worker-function-harness.ts';

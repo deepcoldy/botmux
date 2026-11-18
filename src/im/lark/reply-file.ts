@@ -23,13 +23,18 @@ function scrubInChild(source: string, policy: string): Promise<Buffer> {
       ] }
     : resolveEntrySpawn('reply-file-sanitizer', resolve(here, '../..'));
   return new Promise((done, reject) => {
+    let inputError: NodeJS.ErrnoException | undefined;
     const child = execFile(entry.command, [...entry.args, policy], {
-      encoding: 'buffer', maxBuffer: 64 * 1024 * 1024,
-    }, (error, stdout) => {
-      if (error) reject(new Error('MiniMax reply file sanitizer failed', { cause: error.code }));
-      else done(stdout);
+      encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, timeout: 120_000, killSignal: 'SIGKILL',
+    }, (error, stdout, stderr) => {
+      if (error || inputError) {
+        // stderr can contain source text from an exception. Only carry the
+        // helper's fixed stage name across the logging boundary.
+        const stage = /^reply-file-sanitizer (policy|input|sanitize|output)$/m.exec(stderr.toString())?.[1] ?? 'launch';
+        reject(new Error(`MiniMax reply file sanitizer failed (stage=${stage}, code=${error?.code ?? inputError?.code ?? '-'}, signal=${error?.signal ?? '-'})`));
+      } else done(stdout);
     });
-    child.stdin!.on('error', reject);
+    child.stdin!.on('error', (error: NodeJS.ErrnoException) => { inputError = error; });
     child.stdin!.end(source, 'utf8');
   });
 }

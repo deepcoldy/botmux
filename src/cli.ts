@@ -20138,7 +20138,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
   else if (__entrySubcommand === 'reply-file-sanitizer') {
     await import('./reply-file-sanitizer.js');
-    process.exit(0);
+    process.exit(process.exitCode ?? 0);
   }
   else if (__entrySubcommand === 'background-execution-runner') {
     await import('./background-execution-runner.js');
