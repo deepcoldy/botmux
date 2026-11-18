@@ -156,7 +156,7 @@ import { markProjectImportPending, noteProjectAssociationChanged } from './proje
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
-import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -4163,50 +4163,55 @@ export async function handleCommand(
               if (!await waitForTranscriptQuiet(rewindJsonl)) {
                 return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
               }
-              // Re-resolve the target by identity: the file may have gained a turn
-              // between preview and confirm, which shifts every index.
-              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50, rewindScope), pendingPreview.target);
-              // index must still match: a turn that landed after the preview would
-              // otherwise be removed silently along with the previewed ones.
-              if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
-                return { ok: false as const, code: 'moved' as const };
-              }
-              // Persist replay-state clearing BEFORE the cut: if this throws
-              // (sqlite busy, disk full), nothing has been truncated and the
-              // live session keeps its previous /retry state.
-              const savedReplay = {
-                lastUserPrompt: current.session.lastUserPrompt,
-                lastCliInput: current.session.lastCliInput,
-                lastCliInputTurnId: current.session.lastCliInputTurnId,
-                lastFailedTurn: current.session.lastFailedTurn,
-              };
-              current.session.lastUserPrompt = undefined;
-              current.session.lastCliInput = undefined;
-              current.session.lastCliInputTurnId = undefined;
-              current.session.lastFailedTurn = undefined;
-              try {
-                sessionStore.updateSession(current.session);
-              } catch (err) {
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                return asError(err, 'could not persist rewind state');
-              }
-              let result: RewindResult;
-              try {
-                // Cut the file the offset was read from, inside the same tree.
-                result = rewindClaudeTranscript(rewindJsonl, target.offset, Date.now(), { ...rewindScope, expectFile: target.file });
-              } catch (err) {
-                // Cut never happened — restore the replay fields so the failed
-                // attempt leaves the session as it was.
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
-                return asError(err);
-              }
+              // The re-scan and the cut go through ONE open descriptor: the
+              // offset is cut on exactly the file it was read from, never on
+              // whatever the path names by the time of the cut.
+              const cut = withOpenTranscript(rewindJsonl, rewindScope, transcript => {
+                // Re-resolve the target by identity: the file may have gained a turn
+                // between preview and confirm, which shifts every index.
+                const target = findCheckpoint(transcript.scan(50), pendingPreview.target);
+                // index must still match: a turn that landed after the preview would
+                // otherwise be removed silently along with the previewed ones.
+                if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
+                  return { ok: false as const, code: 'moved' as const };
+                }
+                // Persist replay-state clearing BEFORE the cut: if this throws
+                // (sqlite busy, disk full), nothing has been truncated and the
+                // live session keeps its previous /retry state.
+                const savedReplay = {
+                  lastUserPrompt: current.session.lastUserPrompt,
+                  lastCliInput: current.session.lastCliInput,
+                  lastCliInputTurnId: current.session.lastCliInputTurnId,
+                  lastFailedTurn: current.session.lastFailedTurn,
+                };
+                const restoreReplay = () => {
+                  current.session.lastUserPrompt = savedReplay.lastUserPrompt;
+                  current.session.lastCliInput = savedReplay.lastCliInput;
+                  current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
+                  current.session.lastFailedTurn = savedReplay.lastFailedTurn;
+                };
+                current.session.lastUserPrompt = undefined;
+                current.session.lastCliInput = undefined;
+                current.session.lastCliInputTurnId = undefined;
+                current.session.lastFailedTurn = undefined;
+                try {
+                  sessionStore.updateSession(current.session);
+                } catch (err) {
+                  restoreReplay();
+                  return asError(err, 'could not persist rewind state');
+                }
+                try {
+                  return { ok: true as const, result: transcript.cut(target.offset) };
+                } catch (err) {
+                  // Cut never happened — restore the replay fields so the failed
+                  // attempt leaves the session as it was.
+                  restoreReplay();
+                  try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
+                  return asError(err);
+                }
+              });
+              if (!cut.ok) return cut;
+              const result: RewindResult = cut.result;
               // The CLI will cold-resume from the truncated transcript under the SAME
               // native session id, so group-context coverage still marks the dropped
               // turn's background as delivered and it is not re-injected.

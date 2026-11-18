@@ -44,14 +44,6 @@ export interface RewindCheckpoint {
   resumable: boolean;
   /** 回退到这一轮会删掉的字节数，按本次扫描从同一个文件描述符读到的内容计。 */
   removedBytes: number;
-  /** 本次扫描读的那个文件。按它算出的偏移只能截在它身上。 */
-  file: FileIdentity;
-}
-
-/** 按设备号 + inode 钉住的文件：路径可以被换掉，inode 不会。 */
-export interface FileIdentity {
-  dev: number;
-  ino: number;
 }
 
 /** 会话记录所在的、会话里的 CLI 可写的那棵树（见 transcript-resolver 的
@@ -132,17 +124,16 @@ export function assertOpenedInsideTree(
 }
 
 /**
- * 打开 transcript 只读：不跟随链接、不在 FIFO 上阻塞，打开后从描述符确认是普通文件，
- * 路径经过 CLI 可写的树时再确认打开的就是树里那个文件。之后的读取和大小都只取自这个
- * 描述符，不再按路径另读。
+ * 打开 transcript：不跟随链接、不在 FIFO 上阻塞，打开后从描述符确认是普通文件，
+ * 路径经过 CLI 可写的树时再确认打开的就是树里那个文件。之后的读取、大小和截断都只
+ * 经这个描述符，不再按路径另开。
  */
-function openTranscriptForRead(path: string, scope: TranscriptTreeScope): { fd: number; file: FileIdentity } {
-  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+function openTranscript(path: string, scope: TranscriptTreeScope, access: number): number {
+  const fd = openSync(path, access | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
   try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) throw new Error(`refusing to read non-regular file ${path}`);
+    if (!fstatSync(fd).isFile()) throw new Error(`refusing to read non-regular file ${path}`);
     if (scope.writableTreeRoot) assertOpenedInsideTree(fd, path, scope.writableTreeRoot);
-    return { fd, file: { dev: st.dev, ino: st.ino } };
+    return fd;
   } catch (err) {
     closeSync(fd);
     throw err;
@@ -154,11 +145,45 @@ function openTranscriptForRead(path: string, scope: TranscriptTreeScope): { fd: 
  * 流式读取，不把整个文件读进内存。
  */
 export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope: TranscriptTreeScope = {}): RewindCheckpoint[] {
-  const { fd, file } = openTranscriptForRead(path, scope);
+  const fd = openTranscript(path, scope, fsConstants.O_RDONLY);
+  try {
+    return scanDescriptor(fd, limit);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** 一个打开着的 transcript：扫描和截断都经同一个描述符，截断的一定是扫描读的那个文件。 */
+export interface OpenTranscript {
+  scan(limit?: number): RewindCheckpoint[];
+  cut(offset: number, now?: number): RewindResult;
+}
+
+/** 打开 transcript（读写，规则同 {@link scanClaudeTranscriptCheckpoints}），在 `use`
+ *  返回前一直持有这个描述符。按扫描结果算出的偏移只在这个描述符上截断：路径在两步
+ *  之间被换成别的文件也碰不到它，inode 号也不会在持有期间被别的文件复用。 */
+export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, use: (transcript: OpenTranscript) => T): T {
+  const fd = openTranscript(path, scope, fsConstants.O_RDWR);
+  try {
+    return use({
+      scan: (limit = 20) => scanDescriptor(fd, limit),
+      cut: (offset, now = Date.now()) => {
+        // The backup is created next to the path: it must still name the
+        // file held here (held open, its inode cannot have been reused).
+        assertSameInode(lstatSync(path), fstatSync(fd), path);
+        return rewindOpenTranscript(fd, path, offset, now, scope);
+      },
+    });
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function scanDescriptor(fd: number, limit: number): RewindCheckpoint[] {
   const buf = Buffer.allocUnsafe(CHUNK_BYTES);
   let pending: Buffer = Buffer.alloc(0);
   let pendingStart = 0;
-  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction' | 'removedBytes' | 'file'>[] = [];
+  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction' | 'removedBytes'>[] = [];
   let lastCompactionOffset = -1;
   let sawConversation = false;
 
@@ -212,10 +237,13 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope:
     });
   };
 
-  try {
+  let readPos = 0;
+  {
     for (;;) {
-      const n = readSync(fd, buf, 0, CHUNK_BYTES, null);
+      // Positional: a descriptor shared with a later cut keeps no file offset.
+      const n = readSync(fd, buf, 0, CHUNK_BYTES, readPos);
       if (n <= 0) break;
+      readPos += n;
       const chunk = buf.subarray(0, n);
       const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
       const base = pendingStart;
@@ -230,8 +258,6 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope:
       pendingStart = base + pos;
     }
     // A trailing line without '\n' is a write in progress, not a checkpoint.
-  } finally {
-    closeSync(fd);
   }
 
   // Everything read, including a trailing partial line: that is what a cut at
@@ -244,7 +270,6 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope:
       index: tail.length - i,
       beforeCompaction: c.offset < lastCompactionOffset,
       removedBytes: scannedBytes - c.offset,
-      file,
     }))
     .reverse();
 }
@@ -300,9 +325,6 @@ export function rewindClaudeTranscript(
      *  but before the backup is read from it. Lets the symlink-swap regression
      *  replace the pathname deterministically mid-operation. */
     beforeBackup?: () => void;
-    /** The file the offset was computed on ({@link RewindCheckpoint.file}):
-     *  a different inode at the path now is refused. */
-    expectFile?: FileIdentity;
   } & TranscriptTreeScope = {},
 ): RewindResult {
   const pre = lstatSync(path);
@@ -312,7 +334,6 @@ export function rewindClaudeTranscript(
   try {
     // Pin the descriptor to the inode lstat inspected (regular-file swap TOCTOU).
     assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
-    if (opts.expectFile) assertSameInode(opts.expectFile, fstatSync(fd), path);
     if (opts.writableTreeRoot) assertOpenedInsideTree(fd, path, opts.writableTreeRoot);
     return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
@@ -326,7 +347,7 @@ export function rewindClaudeTranscript(
  *  between validation and use, and a path-based copy would then read whatever
  *  the link points at (host data the daemon can read but the sandbox cannot)
  *  into the agent-readable backup. */
-function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number): void {
+function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number, scope: TranscriptTreeScope = {}): void {
   const dstFd = openSync(
     backupPath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -336,6 +357,9 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
     if (!fstatSync(dstFd).isFile()) {
       throw new Error(`refusing to write rewind backup to non-regular file ${backupPath}`);
     }
+    // Created through the same path as the transcript: before a byte is
+    // written, it must be the file under the tree, not one a link put elsewhere.
+    if (scope.writableTreeRoot) assertOpenedInsideTree(dstFd, backupPath, scope.writableTreeRoot);
     const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
     let copied = 0;
     while (copied < size) {
@@ -361,7 +385,13 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
       throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${size} bytes)`);
     }
   } catch (err) {
-    try { unlinkSync(backupPath); } catch { /* may not have been created */ }
+    // Remove what this call created, and only that: the path may name another
+    // file by now. The open descriptor keeps the inode from being reused.
+    try {
+      const created = fstatSync(dstFd);
+      const atPath = lstatSync(backupPath);
+      if (atPath.dev === created.dev && atPath.ino === created.ino) unlinkSync(backupPath);
+    } catch { /* gone already */ }
     throw err;
   } finally {
     closeSync(dstFd);
@@ -373,7 +403,7 @@ function rewindOpenTranscript(
   path: string,
   offset: number,
   now: number,
-  opts: { beforeBackup?: () => void } = {},
+  opts: { beforeBackup?: () => void } & TranscriptTreeScope = {},
 ): RewindResult {
   const st = fstatSync(fd);
   if (!Number.isInteger(offset) || offset <= 0 || offset > st.size) {
@@ -387,7 +417,7 @@ function rewindOpenTranscript(
   const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
   const backupPath = `${path}.rewind-${stamp}.bak`;
   opts.beforeBackup?.();
-  copyBackupFromDescriptor(fd, backupPath, st.size);
+  copyBackupFromDescriptor(fd, backupPath, st.size, opts);
   ftruncateSync(fd, offset);
   return { backupPath, removedBytes: st.size - offset };
 }

@@ -223,10 +223,12 @@ function botHomeCliDataDir(
 
 /** The root of the CLI-writable tree `path` runs through, if any: for a
  *  scratch view, the view's own root (the session cannot replace the view it
- *  lives in); for a sandboxed bot's BOT_HOME, the `bots` directory holding it,
- *  so BOT_HOME itself is checked too (the resolver rejects a replaced app root
- *  for the same reason). */
-function claudeWritableTreeRoot(
+ *  lives in); for a path under a bot's BOT_HOME, the `bots` directory holding
+ *  it, so BOT_HOME itself is checked too (the resolver rejects a replaced app
+ *  root for the same reason). Decided from where the path lies, never from
+ *  the tree's current state: a check that fails here must not drop the root
+ *  and leave the path unguarded. */
+export function claudeWritableTreeRoot(
   path: string,
   scratch: ScratchPathMapping[] | undefined,
   larkAppId: string | undefined,
@@ -236,13 +238,26 @@ function claudeWritableTreeRoot(
     return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
   };
   if (scratch) {
-    // Longest view prefix first, like scratchViewPath's host-side lookup.
+    // Longest view prefix first, like scratchViewPath's host-side lookup. A
+    // scratch path outside every view is not one this resolver hands out;
+    // should it happen, the longest view is still the tree to check against.
     const views = scratch.map(m => m.to).sort((a, b) => b.length - a.length);
-    return views.find(within);
+    return views.find(within) ?? views[0];
   }
-  const botHomeClaude = botHomeCliDataDir(larkAppId, 'claude');
-  if (botHomeClaude && within(botHomeClaude)) return dirname(dirname(botHomeClaude));
-  return undefined;
+  const bots = botsDirOf(larkAppId);
+  return bots && within(bots) ? bots : undefined;
+}
+
+/** `<botmuxHome>/bots`, derived exactly like botHomeCliDataDir but without
+ *  looking at the disk. */
+function botsDirOf(larkAppId: string | undefined): string | undefined {
+  const sessionDataDir = process.env.SESSION_DATA_DIR;
+  if (!larkAppId || !sessionDataDir) return undefined;
+  try {
+    return dirname(botHomePath(dirname(sessionDataDir), larkAppId));
+  } catch {
+    return undefined; // unsafe app id: botHomeCliDataDir never builds a path from it either
+  }
 }
 
 function claudeJsonlWithBotHomeFallback(sid: string, q: TranscriptPathQuery, primaryDataDir: string): string | null {

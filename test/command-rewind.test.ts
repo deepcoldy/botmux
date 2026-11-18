@@ -296,10 +296,14 @@ vi.mock('../src/core/context-rewind.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/context-rewind.js')>();
   return {
     ...actual,
-    rewindClaudeTranscript: (...args: Parameters<typeof actual.rewindClaudeTranscript>) => {
-      if (rewindState.truncateError) throw new Error(rewindState.truncateError);
-      return actual.rewindClaudeTranscript(...args);
-    },
+    withOpenTranscript: <T,>(...[path, scope, use]: Parameters<typeof actual.withOpenTranscript<T>>) =>
+      actual.withOpenTranscript(path, scope, transcript => use({
+        scan: transcript.scan,
+        cut: (...cut: Parameters<typeof transcript.cut>) => {
+          if (rewindState.truncateError) throw new Error(rewindState.truncateError);
+          return transcript.cut(...cut);
+        },
+      })),
   };
 });
 vi.mock('../src/core/shared-adopt.js', () => ({ isSharedAdoptSession: vi.fn(() => false) }));
@@ -582,15 +586,14 @@ describe('/rewind command', () => {
 
   it.skipIf(process.platform === 'win32')('会话记录是命名管道：立即回复失败，不卡在管道上', async () => {
     rewindState.jsonl = transcript();
-    // The writer shows up after 10s; a blocking open would last that long. The
-    // bound leaves seconds of slack for a busy machine.
-    replaceWithFifo(rewindState.jsonl, 10);
+    // The late writer only keeps a blocking regression from hanging the run:
+    // it then reads an empty pipe and lists nothing. Blocking itself is pinned
+    // by the child-process test in context-rewind.test.ts.
+    replaceWithFifo(rewindState.jsonl, 15);
     const deps = makeDeps(makeDs());
-    const started = Date.now();
     await run(deps, '/rewind');
-    expect(Date.now() - started).toBeLessThan(7_000);
     expect(lastReply(deps)).toContain('回退失败');
-  }, 30_000);
+  }, 60_000);
 
   it.skipIf(process.platform === 'win32')('停 CLI 后会话记录被换成命名管道：确认时的重扫回复失败，不卡住', async () => {
     rewindState.jsonl = transcript();
@@ -598,32 +601,28 @@ describe('/rewind command', () => {
     await run(deps, '/rewind 1');
     suspendWorker.mockImplementation((d: any) => {
       d.worker = null;
-      replaceWithFifo(rewindState.jsonl, 10);
+      replaceWithFifo(rewindState.jsonl, 15);
       return true;
     });
-    const started = Date.now();
     await run(deps, '/rewind 1 confirm');
-    // The quiet wait alone takes ~0.6s; a blocking open would last until the
-    // writer shows up at 10s.
-    expect(Date.now() - started).toBeLessThan(7_000);
     expect(lastReply(deps)).toContain('回退失败');
-  }, 30_000);
+  }, 60_000);
 
-  it('锁内重扫之后、截断之前路径被换成另一个普通文件：按重扫时的文件拒绝截断，新文件不动', async () => {
+  it('锁内重扫之后、截断之前路径被删掉重建成同内容的文件：拒绝截断，新文件不动', async () => {
     rewindState.jsonl = transcript();
     const deps = makeDeps(makeDs());
     await run(deps, '/rewind 1');
-    // Same bytes, different inode: only the file identity tells them apart.
+    // Same bytes; deleting and recreating can hand the new file the old inode
+    // number, so only the descriptor held since the re-scan tells them apart.
     const replacement = readFileSync(rewindState.jsonl, 'utf8');
     (updateSession as any).mockImplementationOnce(() => {
-      // The scanned file stays alive under another name (a freed inode
-      // number could be handed straight to the new file).
-      renameSync(rewindState.jsonl, `${rewindState.jsonl}.scanned`);
+      rmSync(rewindState.jsonl);
       writeFileSync(rewindState.jsonl, replacement);
     });
     await run(deps, '/rewind 1 confirm');
     expect(lastReply(deps)).toContain('回退失败');
     expect(readFileSync(rewindState.jsonl, 'utf8')).toBe(replacement);
+    expect(readdirSync(dirname(rewindState.jsonl)).filter(n => n.endsWith('.bak'))).toEqual([]);
   });
 
   it('会话记录的项目目录在解析后被换成指向外部的链接：列表与确认都回复失败，外部内容不进回复、外部文件不被截断', async () => {
