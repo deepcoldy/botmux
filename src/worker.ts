@@ -22429,7 +22429,7 @@ function scheduleSubmitFailureNotify(
   let deferredRecheckAttempts = 0;
   let activeSilenceExtra = 0;
   let busySilenceExtra = 0;
-  let lateSessionStartEnterPressed = false;
+  let composerSubmitRescued = false;
   // With botmux's SessionStart hook armed, that signal and the transcript are
   // the only arbiters (see decideSessionStartGatedSubmitWarning).
   const sessionStartGated = readyGate.isArmed;
@@ -22633,6 +22633,38 @@ function scheduleSubmitFailureNotify(
     const nativeWorking = idleDetector?.programStatusHeldWorking() === true
       && submitDiagnosis.reason !== 'draft_parked'
       && (lastInitConfig?.cliId !== 'claude-code' || !claudeComposerHoldsInput(submitDiagnosisScreen, msg));
+    // The input's Enter can be swallowed (Claude still running its hooks after a
+    // late SessionStart, or paste-burst mode turning it into a newline); nothing
+    // presses it again, so the input would sit in the composer until the warning.
+    // Pressing submit on a draft parked during a running turn queues it. With an
+    // armed gate, keep the sole rescue until the real SessionStart has arrived:
+    // an earlier key send can be swallowed by the same still-running hooks.
+    if (
+      !composerSubmitRescued
+      && (!sessionStartGated || (sessionStartSignalAtMs !== undefined
+        && (sessionStartSignalAtMs <= activityBaselineMs
+          || Date.now() - sessionStartSignalAtMs >= SUBMIT_POST_SESSION_START_GRACE_MS)))
+      && lastInitConfig?.cliId === 'claude-code'
+      && claudeComposerHoldsInput(submitDiagnosisScreen, msg)
+    ) {
+      // Route through the adapter's submit-key resolution: with submit remapped
+      // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly = newline),
+      // a plain Enter would not submit and would edit the parked draft instead.
+      const rescueAdapter = cliAdapter;
+      const rescuePressed = !backend
+        ? false
+        : rescueAdapter?.pressComposerSubmit
+          ? rescueAdapter.pressComposerSubmit(backend)
+          : (pressBackendEnter(backend), true);
+      if (rescuePressed) {
+        composerSubmitRescued = true;
+        log(`Deferred recheck: the composer still holds the input — pressing submit once. preview="${preview}"`);
+        armDeferredRecheck();
+        return;
+      }
+      log(`Deferred recheck: composer holds the input but the configured submit key could not be sent — leaving it for the normal verdict. preview="${preview}"`);
+    }
+
     const busyNow = nativeWorking || (() => {
       if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
       try {
@@ -22652,36 +22684,6 @@ function scheduleSubmitFailureNotify(
       log(`Deferred recheck sees the CLI positively mid-turn (program status or busy footer) — waiting for the receipt. preview="${preview}"`);
       armDeferredRecheck();
       return;
-    }
-
-    // Written before a SessionStart that came after the ready gate's fallback, the
-    // input's Enter can be swallowed while Claude still runs its hooks; nothing
-    // presses it again, so the input would sit in the composer until the warning.
-    if (
-      sessionStartGated
-      && !lateSessionStartEnterPressed
-      && sessionStartSignalAtMs !== undefined
-      && sessionStartSignalAtMs > activityBaselineMs
-      && Date.now() - sessionStartSignalAtMs >= SUBMIT_POST_SESSION_START_GRACE_MS
-      && lastInitConfig?.cliId === 'claude-code'
-      && claudeComposerHoldsInput(submitDiagnosisScreen, msg)
-    ) {
-      // Route through the adapter's submit-key resolution: with submit remapped
-      // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly = newline),
-      // a plain Enter would not submit and would edit the parked draft instead.
-      const rescueAdapter = cliAdapter;
-      const rescuePressed = !backend
-        ? false
-        : rescueAdapter?.pressComposerSubmit
-          ? rescueAdapter.pressComposerSubmit(backend)
-          : (pressBackendEnter(backend), true);
-      if (rescuePressed) {
-        lateSessionStartEnterPressed = true;
-        log(`Deferred recheck: SessionStart arrived after the write and the composer still holds the input — pressing submit once. preview="${preview}"`);
-        armDeferredRecheck();
-        return;
-      }
-      log(`Deferred recheck: composer holds the input but the configured submit key could not be sent — leaving it for the normal verdict. preview="${preview}"`);
     }
 
     if (sessionStartGated) {
