@@ -22,6 +22,21 @@ describe('antigravity-discovery', () => {
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   });
 
+  it('resolves a brain directory without an open database and refuses two conversations', () => {
+    const procRoot = join(tmpDir, 'proc');
+    const cliHome = join(tmpDir, '.gemini', 'antigravity-cli');
+    const fd = join(procRoot, '4100', 'fd');
+    const first = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
+    const second = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
+    mkdirSync(fd, { recursive: true });
+    symlinkSync(join(cliHome, 'brain', first), join(fd, '3'));
+    symlinkSync(join(cliHome, 'brain', first, '.system_generated'), join(fd, '4'));
+    expect(findAntigravityConversationIdByPid(4100, join(cliHome, 'conversations'), procRoot)).toBe(first);
+
+    symlinkSync(join(cliHome, 'brain', second), join(fd, '5'));
+    expect(findAntigravityConversationIdByPid(4100, join(cliHome, 'conversations'), procRoot)).toBeNull();
+  });
+
   it('finds conversation ID matching cwd from summaries DB', () => {
     const db = openDatabaseSyncOrThrow(dbPath);
     db.exec(`

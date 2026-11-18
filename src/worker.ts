@@ -470,6 +470,7 @@ import { findAntigravityConversationIdByPid } from './services/antigravity-disco
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
+  isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
@@ -13324,17 +13325,16 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (structuredBridgeIs('antigravity')) {
-        // Antigravity has no /adopt bridge: this branch runs only for
-        // botmux-spawned zero-prompt sessions. writeInput's pid probe usually
-        // reports the conversation id through codexBridgeNotifyCliSessionId;
-        // the pid fallback here recovers a probe that lost the race.
-        //
-        // Resolve while UNBOUND or while a lazy-created conversation is still
-        // pending — the latter also covers a /new rotation or misbind
-        // correction: the notify path stored the new id while its brain file
-        // did not exist yet, and the previous path is still bound. Gating only
-        // on !codexBridgeRolloutPath would leave the new file unattached forever.
-        if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
+        if (lastInitConfig?.adoptMode) {
+          // A new pane can create its conversation and log on the first submit.
+          if (!codexBridgeRolloutPath && codexBridgeQueue.peek().length > 0) {
+            const pid = currentAntigravityObservedPid();
+            const path = pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
+            if (path) codexBridgeAttach(path, 'split-live');
+          }
+        } else if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
+          // A managed process can announce a new ID before its transcript
+          // exists, while the previous conversation remains bound.
           const action = decideAntigravityTickerAction({
             boundPath: codexBridgeRolloutPath,
             pendingSid: codexBridgePendingSessionId,
@@ -13579,7 +13579,10 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     // between adopt and rollout-discovery — that's the user-reported
     // "iTerm 手动输入飞书没收到" symptom under late-attach.
     const result = structuredBridgeIngestPath(rolloutPath, 0);
-    const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
+    const adoptStart = codexAdoptStartMs ?? Date.now();
+    const antigravity = structuredBridgeIs('antigravity');
+    // Native agy transcript timestamps have second precision.
+    const cutoff = antigravity ? Math.floor(adoptStart / 1_000) * 1_000 : adoptStart - 5_000;
     const journalPath = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
     const recover = journalPath && !codexAdoptRecoveryAttempted;
     const { history, live, restored } = recover
@@ -13594,6 +13597,10 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
+    if (antigravity && live.some(event => event.kind === 'user')) {
+      // The submit and its provisional final can both precede late binding.
+      structuredBridgeDriverState = result.state;
+    }
     if (restored > 0) log(`Codex adopt restored ${restored} pending turn(s) without re-submitting input`);
     pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
     // Late attach can discover an already-completed live turn in the same
@@ -13634,7 +13641,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       });
     }
     log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
-    maybeEmitCodexAdoptPreamble(history);
+    if (!antigravity) maybeEmitCodexAdoptPreamble(history);
   } else if (mode === 'split-live') {
     // split-live requested but file missing — degrade to fresh: the file
     // will appear later via fs.watch / poller, and ingest from offset 0
@@ -14177,6 +14184,27 @@ function currentAntigravityObservedPid(): number | undefined {
     ?? backend?.getChildPid?.()
     ?? codexAdoptPendingPid;
   return pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
+}
+
+function prepareAntigravityAdoptBridge(): void {
+  const pid = currentAntigravityObservedPid();
+  const conversationId = pid ? findAntigravityConversationIdByPid(pid) : null;
+  const path = conversationId ? resolveFileBridgePath('antigravity', { sessionId: conversationId }) : undefined;
+  // Recheck ownership at each Lark submit. A local /new or /resume may have
+  // switched the pane to a different conversation since the previous turn.
+  if (!isSameAntigravityConversation(path, codexBridgeRolloutPath)) {
+    if (codexBridgeRolloutPath) {
+      codexBridgeIngest();
+      emitReadyCodexTurns();
+      for (const turn of codexBridgeQueue.clearPending()) {
+        emitTurnTerminal(turn.turnId, 'ambiguous', 'antigravity_adopt_conversation_changed', turn.dispatchAttempt);
+      }
+      codexBridgeDetachFile();
+    }
+    if (path) codexBridgeAttach(path, 'baseline-existing');
+  }
+  codexAdoptStartMs = Date.now();
+  codexBridgeStartTimer();
 }
 
 /** Structured-bridge attach mode for a botmux-SPAWNED session: a fresh spawn
@@ -16813,6 +16841,7 @@ async function writeAdoptMessage(
         // only the new turn's reasoning/tool nodes render.
         armCursorCotForTurn();
       } else {
+        if (structuredBridgeIs('antigravity')) prepareAntigravityAdoptBridge();
         try { codexBridgeIngest(); } catch { /* best effort */ }
         adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(
           content, turnId, dispatchAttempt, Date.now(), linkRefMode,
@@ -16821,8 +16850,6 @@ async function writeAdoptMessage(
       if (adoptStructuredBridgeTurnId) {
         codexBridgeQueue.beginSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
       }
-    } else if (lastInitConfig?.cliId === 'antigravity') {
-      armAntigravityCotForTurn();
     }
   };
 
@@ -17007,6 +17034,7 @@ async function writeAdoptMessage(
         && !!err.recoveryFailureReason
         && !err.submissionStarted;
       log(`Adopt raw input error (${lastInitConfig?.cliId}): ${err.message}`);
+      if (structuredBridgeIs('antigravity')) dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt);
       if (turnId && dispatchAttempt !== undefined && blockedBeforeWrite) {
         emitTurnTerminal(turnId, 'failed', 'zmx_recovery_blocked_before_write', dispatchAttempt);
       } else if (turnId && dispatchAttempt !== undefined && !recoveryFailureReason) {
@@ -25084,7 +25112,11 @@ function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAd
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (isStructuredBridgeAdoptInputCli(cfg.cliId)) {
+  if (cfg.cliId === 'antigravity') {
+    // Use the native adapter's readiness patterns for final confirmation.
+    // Adopted input still uses the existing literal tmux write path.
+    cliAdapter = createCliAdapterSync('antigravity', cfg.cliPathOverride);
+  } else if (isStructuredBridgeAdoptInputCli(cfg.cliId)) {
     cliAdapter = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride);
   }
 }

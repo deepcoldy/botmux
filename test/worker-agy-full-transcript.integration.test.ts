@@ -1,4 +1,4 @@
-import { type ChildProcess } from 'node:child_process';
+import { execFileSync, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +17,7 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 const children = new Set<ChildProcess>();
 const cliPidFiles = new Set<string>();
 const roots = new Set<string>();
+const tmuxRoots = new Set<string>();
 
 function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -61,9 +62,18 @@ async function stopChildren(): Promise<void> {
 }
 
 afterEach(async () => {
-  await stopChildren();
-  for (const root of roots) rmSync(root, { recursive: true, force: true });
-  roots.clear();
+  try {
+    await stopChildren();
+  } finally {
+    for (const root of tmuxRoots) {
+      spawnSync('tmux', ['kill-server'], {
+        env: { ...process.env, TMUX: '', TMUX_TMPDIR: root }, stdio: 'ignore',
+      });
+    }
+    tmuxRoots.clear();
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+    roots.clear();
+  }
 });
 
 /** A second, different long reply for the follow-up turn (steps 26–27). */
@@ -74,7 +84,7 @@ function followupReply(): string {
   return lines.join('\n');
 }
 
-function startWorker(opts: { fullDelayMs: number }) {
+async function startWorker(opts: { fullDelayMs: number; adopt?: boolean; seedHistory?: boolean }) {
   const sessionId = `agy-full-${randomUUID()}`;
   const root = mkdtempSync(join(tmpdir(), 'botmux-agy-full-'));
   roots.add(root);
@@ -152,12 +162,25 @@ setInterval(() => { void convFd; }, 1_000);
 `);
   chmodSync(fakeCli, 0o755);
 
+  let adoptCliPid: number | undefined;
+  const tmuxEnv = { ...process.env, HOME: root, TMUX: '', TMUX_TMPDIR: root };
+  if (opts.adopt) {
+    if (opts.seedHistory) {
+      writeFileSync(join(logsDir, 'transcript_full.jsonl'), jsonl(logs.fullRecords));
+    }
+    tmuxRoots.add(root);
+    execFileSync('tmux', ['-f', '/dev/null', 'new-session', '-d', '-s', 'agy-adopt', '-x', '120', '-y', '30', fakeCli], { env: tmuxEnv });
+    await waitFor(() => existsSync(cliPidFile), ['Waiting for the tmux fixture process']);
+    adoptCliPid = Number(readFileSync(cliPidFile, 'utf8'));
+  }
+
   const messages: WorkerToDaemon[] = [];
   const output: string[] = [];
   const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,
+      ...(opts.adopt ? tmuxEnv : {}),
       HOME: root,
       SESSION_DATA_DIR: dataDir,
       BOTMUX_SESSION_ID: sessionId,
@@ -173,19 +196,23 @@ setInterval(() => { void convFd; }, 1_000);
   child.stderr?.on('data', chunk => output.push(chunk.toString()));
   child.send({
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: dataDir, cliId: 'antigravity', cliPathOverride: fakeCli, backendType: 'pty',
-    promptInjection: 'none',
-    prompt: 'ACTIVATION_UNIQUE_MARKER 请对比两种工具调用方式', turnId: 'om_initial',
+    workingDir: dataDir, cliId: 'antigravity', cliPathOverride: fakeCli,
+    ...(adoptCliPid !== undefined ? {
+      backendType: 'tmux', adoptMode: true, adoptTmuxTarget: 'agy-adopt:0.0', adoptCliPid, prompt: '',
+    } : {
+      backendType: 'pty', promptInjection: 'none',
+      prompt: 'ACTIVATION_UNIQUE_MARKER 请对比两种工具调用方式', turnId: 'om_initial',
+    }),
     larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
 
   const finals = () => messages.filter((m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output');
-  return { child, messages, output, finals, logs, second };
+  return { child, messages, output, finals, logs, second, adoptCliPid };
 }
 
 describe('worker harvests Antigravity replies from transcript_full.jsonl', () => {
   it('delivers the complete long reply when agy writes both logs', async () => {
-    const worker = startWorker({ fullDelayMs: 3 });
+    const worker = await startWorker({ fullDelayMs: 3 });
     await waitFor(() => worker.finals().length > 0, worker.output, 45_000);
     const [final] = worker.finals();
     expect(final.turnId).toBe('om_initial');
@@ -197,7 +224,7 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
   it('a compact bind made before the full log existed says the first reply was cut, then moves to the full log', async () => {
     // The full log appears seconds after the compact one: the bridge can only
     // bind the compact log for the first turn.
-    const worker = startWorker({ fullDelayMs: 3_000 });
+    const worker = await startWorker({ fullDelayMs: 3_000 });
     await waitFor(() => worker.finals().length > 0, worker.output, 45_000);
     const [first] = worker.finals();
     expect(first.content).toContain('<truncated ');
@@ -213,4 +240,19 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
     expect(second.content).not.toContain(ANTIGRAVITY_TRUNCATED_REPLY_NOTICE);
     expect(worker.output.join('')).toContain('Antigravity bridge moved to the full transcript');
   }, 120_000);
+
+  const hasTmux = spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0;
+  it.skipIf(!hasTmux).each([true, false])('posts the adopted pane reply once (existing transcript: %s)', async seedHistory => {
+    const worker = await startWorker({ fullDelayMs: 3, adopt: true, seedHistory });
+    await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.output, 15_000);
+    expect(worker.finals()).toHaveLength(0);
+    const content = 'First message from Lark';
+    worker.child.send({ type: 'message', content, turnId: 'om_adopted' } satisfies DaemonToWorker);
+    await waitFor(() => worker.finals().length > 0, worker.output, 20_000);
+    expect(worker.finals()).toEqual([expect.objectContaining({
+      turnId: 'om_adopted', content: expect.stringContaining(worker.logs.middleSentinel),
+    })]);
+    expect(worker.messages.some(m => m.type === 'adopt_preamble')).toBe(false);
+    expect(worker.adoptCliPid && processAlive(worker.adoptCliPid)).toBe(true);
+  }, 45_000);
 });

@@ -1,10 +1,11 @@
 import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const UUID_MATCH_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const CONVERSATION_DB_RE = /^([0-9a-f-]{36})\.db(?:-wal|-shm)?(?: \(deleted\))?$/i;
 
 export interface AntigravityDiscoveryOptions {
   pid?: number;
@@ -63,8 +64,9 @@ function getProcessChildPids(pid: number, procRoot = '/proc'): number[] {
 }
 
 /**
- * Scan /proc/<pid>/fd (and its child processes) for open SQLite handles
- * matching ~/.gemini/antigravity-cli/conversations/<uuid>.db.
+ * Scan for open conversation databases and brain directories. Linux uses
+ * procfs, including child processes. macOS uses lsof: agy can keep the brain
+ * directory open even when it has closed the conversation database.
  *
  * Fails closed (`null`) when zero or multiple distinct conversation UUIDs are
  * open across the process tree (for example during startup `ListConversations`
@@ -78,25 +80,22 @@ export function findAntigravityConversationIdByPid(
   procRoot = '/proc',
 ): string | null {
   if (!Number.isFinite(pid) || pid <= 0) return null;
-  const pidsToScan: number[] = [pid, ...getProcessChildPids(pid, procRoot)];
-  const marker = conversationsDir ?? join('.gemini', 'antigravity-cli', 'conversations');
-  const found = new Map<string, string>();
-
-  for (const p of pidsToScan) {
-    const links = getProcessFds(p, procRoot);
-    for (const link of links) {
-      if (!link.includes(marker)) continue;
-      const m = link.match(UUID_MATCH_RE);
-      if (m && UUID_RE.test(m[0])) {
-        const key = m[0].toLowerCase();
-        if (!found.has(key)) {
-          found.set(key, m[0]);
-          if (found.size > 1) return null;
-        }
-      }
-    }
+  const links = process.platform === 'linux' || procRoot !== '/proc'
+    ? [pid, ...getProcessChildPids(pid, procRoot)].flatMap(child => getProcessFds(child, procRoot))
+    : listProcessOpenFiles(pid) ?? [];
+  const databases = conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+  const databasePrefix = `${databases}/`;
+  const brainPrefix = `${join(dirname(databases), 'brain')}/`;
+  let found: string | null = null;
+  for (const link of links) {
+    const id = link.startsWith(brainPrefix)
+      ? link.slice(brainPrefix.length).split('/')[0]
+      : link.startsWith(databasePrefix) ? CONVERSATION_DB_RE.exec(link.slice(databasePrefix.length))?.[1] : undefined;
+    if (!id || !UUID_RE.test(id)) continue;
+    if (found && found.toLowerCase() !== id.toLowerCase()) return null;
+    found ??= id;
   }
-  return found.size === 1 ? (found.values().next().value ?? null) : null;
+  return found;
 }
 
 function uriToPath(uri: string): string {
