@@ -14,6 +14,7 @@ import {
   effectiveKanbanPosition,
   isOffBoardDormant,
   isOffBoardIdle,
+  isOffBoardKanbanRow,
 } from '../src/dashboard/web/kanban-model.js';
 import { deriveSessionBoardColumn } from '../src/dashboard/web/sessions.js';
 import { matchesStatusFilter, sessionTaskCardLine } from '../src/dashboard/web/session-task-view.js';
@@ -297,5 +298,24 @@ describe('idle sessions do not imply pending work', () => {
     for (const status of ['working', 'starting', 'limited', 'stalled', 'closed', 'dormant']) {
       expect(isOffBoardIdle({ status })).toBe(false);
     }
+  });
+});
+
+describe('kanban off-board composition follows the active status filter', () => {
+  const staleDormant = {
+    status: 'dormant',
+    lastTurn: { turnId: 'old', outcome: 'no_output', at: Date.now() - RECENT_TURN_ON_BOARD_MS - 1 },
+  };
+  it('hides plain idle rows by default and keeps them under the idle filter', () => {
+    expect(isOffBoardKanbanRow({ status: 'idle' }, '')).toBe(true);
+    expect(isOffBoardKanbanRow({ status: 'idle' }, 'working')).toBe(true);
+    expect(isOffBoardKanbanRow({ status: 'idle' }, 'idle')).toBe(false);
+  });
+  it('hides long-dormant rows under every filter and keeps rows that still imply work', () => {
+    expect(isOffBoardKanbanRow(staleDormant, '')).toBe(true);
+    expect(isOffBoardKanbanRow(staleDormant, 'idle')).toBe(true);
+    expect(isOffBoardKanbanRow({ status: 'working' }, '')).toBe(false);
+    expect(isOffBoardKanbanRow({ status: 'idle', queued: true }, '')).toBe(false);
+    expect(isOffBoardKanbanRow({ status: 'idle', lastTurn: delivered(T0) }, '')).toBe(false);
   });
 });

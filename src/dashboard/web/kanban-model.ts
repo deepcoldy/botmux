@@ -93,6 +93,12 @@ export function isOffBoardIdle(s: KanbanRowLike): boolean {
     && deriveSessionTaskStatus(s).kind === 'idle';
 }
 
+/** 看板默认收起的行：长期休眠会话，以及没有待办证据的普通空闲会话。
+ *  显式用「空闲」状态筛选时不收起空闲行，否则筛选结果会是一块空板。 */
+export function isOffBoardKanbanRow(s: KanbanRowLike, statusFilter: string): boolean {
+  return isOffBoardDormant(s) || (statusFilter !== 'idle' && isOffBoardIdle(s));
+}
+
 /** 未手动排过序的卡片的排序键基底：量级远大于任何手动位置，保证手动卡片
  *  永远排在自动卡片前面；减 lastMessageAt 让自动区按最近活跃倒序。 */
 const UNPINNED_BASE = 1e15;
