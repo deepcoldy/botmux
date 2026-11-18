@@ -888,6 +888,10 @@ export class TmuxPipeBackend implements SessionBackend {
    *  can land after kill()/teardown or after a restart of the watcher; an
    *  answer from an older epoch must not act. */
   private lifecycleEpoch = 0;
+  /** Monotonic evidence clock, bumped by a SYNCHRONOUS authoritative exists.
+   *  Async probes capture it before their first await: a newer live answer must
+   *  invalidate an older missing chain even when the watcher was not stopped. */
+  private livenessEvidenceGeneration = 0;
   /** The pane counts as active (fast probe cadence) until this time; pushed
    *  out by writes, the attach and output (see noteLifecycleActivity). */
   private activeUntil = 0;
@@ -1554,6 +1558,7 @@ export class TmuxPipeBackend implements SessionBackend {
       return true;
     }
     const verdict = classifyPaneProbeAnswer(answer);
+    if (verdict.state === 'exists') this.noteAuthoritativePaneExists();
     if (verdict.state === 'missing' && verdict.deathLine !== undefined) {
       process.stderr.write(`[tmux-pipe-backend] refusing write: pane ${this.paneTarget} is dead (remain-on-exit remnant); reporting the CLI exit\n`);
       this.capturePaneDeathSync(verdict.deathLine);
@@ -1717,6 +1722,22 @@ export class TmuxPipeBackend implements SessionBackend {
     return this.exited || epoch !== this.lifecycleEpoch;
   }
 
+  private lifecycleEvidenceStale(epoch: number, generation: number): boolean {
+    return this.lifecycleStale(epoch) || generation !== this.livenessEvidenceGeneration;
+  }
+
+  /** Record fresh live evidence from a synchronous probe. Do not call this from
+   *  an async answer: its ordering against newer synchronous evidence is not
+   *  authoritative. A live answer also proves the server reachable, so all
+   *  destructive clocks/streaks restart from this newer observation. */
+  private noteAuthoritativePaneExists(): void {
+    this.livenessEvidenceGeneration += 1;
+    this.livenessGate.reset();
+    this.probeSetbackStreak = 0;
+    this.lastProbeState = 'exists';
+    this.serverUnreachableSince = null;
+  }
+
   private armLifecycleTimer(delayMs: number): void {
     if (this.lifecycleTimer) clearTimeout(this.lifecycleTimer);
     const epoch = this.lifecycleEpoch;
@@ -1745,11 +1766,18 @@ export class TmuxPipeBackend implements SessionBackend {
       this.handleAdoptedCliPidExit();
       return;
     }
+    const evidenceGeneration = this.livenessEvidenceGeneration;
     const probe = await this.probePaneAddressabilityAsync(2000, epoch);
     if (this.lifecycleStale(epoch)) return;
+    if (evidenceGeneration !== this.livenessEvidenceGeneration) {
+      // A synchronous write-side probe saw the pane alive after this round
+      // started. Its answer is newer, so this round must not reapply old misses.
+      this.armLifecycleTimer(this.nextProbeDelayMs());
+      return;
+    }
     this.probeSetbackStreak = probe.state === 'exists' ? 0 : this.probeSetbackStreak + 1;
     this.lastProbeState = probe.state;
-    await this.recordPaneProbe(probe, epoch);
+    await this.recordPaneProbe(probe, epoch, evidenceGeneration);
     if (!this.lifecycleStale(epoch)) this.armLifecycleTimer(this.nextProbeDelayMs());
   }
 
@@ -1846,6 +1874,10 @@ export class TmuxPipeBackend implements SessionBackend {
       // A live pane only ever lives on the server that created it, so its
       // server pid (in the same answer) needs recording once.
       if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = verdict.serverPid;
+      // This synchronous answer can arrive while an older async final missing
+      // confirmation is awaiting its turn on the event loop. Make that older
+      // destructive sequence stale before returning the live verdict.
+      this.noteAuthoritativePaneExists();
       return { state: 'exists' };
     }
     if (verdict.deathLine !== undefined) this.capturePaneDeathSync(verdict.deathLine);
@@ -1877,8 +1909,8 @@ export class TmuxPipeBackend implements SessionBackend {
    * `missing` confirmation detach the observer. Any success resets.
    * (pid-death is handled decisively in the watcher — see startLifecycleWatcher.)
    */
-  private async recordPaneProbe(probe: PaneProbeResult, epoch: number): Promise<void> {
-    if (this.lifecycleStale(epoch)) return;
+  private async recordPaneProbe(probe: PaneProbeResult, epoch: number, evidenceGeneration: number): Promise<void> {
+    if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return;
     if (probe.state === 'unknown') {
       // Unknown is not evidence of death. Reset the destructive streak so a
       // timeout cannot combine with later unrelated misses, and rate-limit the
@@ -1929,7 +1961,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // timeout so a transiently overloaded tmux server gets a fair chance to
     // answer before we detach a pane that's actually still alive.
     const confirm = await this.probePaneAddressabilityAsync(3000, epoch);
-    if (this.lifecycleStale(epoch)) return;
+    if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return;
     if (confirm.state !== 'missing') {
       this.livenessGate.reset();
       process.stderr.write(
@@ -1952,7 +1984,7 @@ export class TmuxPipeBackend implements SessionBackend {
     //     serverUnreachableSince every probe, so the 60s escalation never
     //     accrued and this cross-check blocked teardown on every pass.
     const reach = await TmuxPipeBackend.tmuxServerReachability(3000, this.tmuxArgs);
-    if (this.lifecycleStale(epoch)) return;
+    if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return;
     if (reach === 'unreachable') {
       this.livenessGate.reset();
       if (this.serverUnreachableSince === null) this.serverUnreachableSince = Date.now();
@@ -1961,6 +1993,7 @@ export class TmuxPipeBackend implements SessionBackend {
       );
       return;
     }
+    if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return;
     process.stderr.write(
       `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );

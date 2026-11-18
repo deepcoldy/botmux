@@ -1995,6 +1995,90 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     expect(exits).toEqual([[77, null]]);
   });
 
+  /** With holdAsync enabled from the start, release exactly the three MAIN
+   *  missing rounds. The next held callback is then the final confirmation,
+   *  not the reachability command that follows it. */
+  async function advanceThreeMissesToHeldFinal(world: TmuxWorld): Promise<void> {
+    for (const delay of [INITIAL, 3_000, 9_000]) {
+      await vi.advanceTimersByTimeAsync(delay);
+      expect(world.held).toHaveLength(1);
+      for (const deliver of world.held.splice(0)) deliver();
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.held).toHaveLength(1);
+  }
+
+  it.each(['write precheck', 'guardedSend follow-up probe'] as const)(
+    'a newer exists from the %s invalidates an older in-flight final missing confirmation',
+    async (evidencePath) => {
+      const world = createTmuxWorld();
+      let releaseFinalMissing = false;
+      world.override = (args, via) => {
+        if (via === 'async' && isLivenessRead(args) && releaseFinalMissing) return '::::111\n';
+        if (evidencePath === 'guardedSend follow-up probe' && via === 'sync') {
+          // Keep the write precheck inconclusive, then fail the write itself:
+          // only guardedSend's follow-up sync probe supplies the live evidence.
+          if (isLivenessRead(args) && String(args.at(-1)).endsWith('#{pane_in_mode}')) return DEADLINE;
+          if (args[0] === 'send-keys') return { kind: 'exit', status: 1, stderr: 'transient write failure' };
+        }
+        return undefined;
+      };
+      const { be, exits } = watch(world);
+      world.pane = 'gone';
+      world.holdAsync = true;
+      await advanceThreeMissesToHeldFinal(world);
+      expect(world.asyncCalls.filter(isLivenessRead)).toHaveLength(4);
+      expect(world.asyncCalls.some(args => args[0] === 'list-sessions')).toBe(false);
+      expect(exits).toEqual([]);
+
+      // A NEWER synchronous server answer proves the pane alive. In the first
+      // case the write itself lands; in the second, guardedSend's post-failure
+      // probe is the authoritative exists (the write is dropped, not the session).
+      world.pane = 'alive';
+      expect(be.sendText('newer-live-proof')).toBe(evidencePath === 'write precheck');
+
+      // Release the OLDER final answer (missing), while the pane remains alive.
+      // The old synchronous watcher could not interleave a write here; the async
+      // watcher must explicitly invalidate this now-stale destructive sequence.
+      releaseFinalMissing = true;
+      world.holdAsync = false;
+      for (const deliver of world.held.splice(0)) deliver();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(exits).toEqual([]);
+
+      // The live evidence must also RESET the gate, not merely suppress this
+      // callback. One further miss is a new 1/3, not a fourth miss that goes
+      // straight to another final confirmation and tears the live pane down.
+      await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 10);
+      expect(exits).toEqual([]);
+    },
+  );
+
+  it('a newer live write invalidates an older missing chain while its server reachability check is in flight', async () => {
+    const world = createTmuxWorld();
+    const { be, exits } = watch(world);
+    world.pane = 'gone';
+    world.holdAsync = true;
+    await advanceThreeMissesToHeldFinal(world);
+    // Answer the final missing; the following reachability command stays held.
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.held).toHaveLength(1);
+    expect(world.asyncCalls.some(args => args[0] === 'list-sessions')).toBe(true);
+    expect(exits).toEqual([]);
+
+    world.pane = 'alive';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+
+    world.pane = 'gone';
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 10);
+    expect(exits).toEqual([]);
+  });
+
   // A refusal storm is intermittent: some connects are refused, some answered.
   // The 60s escalation must rest on a dense run of failures — on the idle
   // cadence 60s holds only ~3 samples, which "all fail" far more often than
