@@ -6648,6 +6648,22 @@ function closePostTerminalLiveWorkEpisode(ds: DaemonSession): void {
 }
 
 /**
+ * Open the post-terminal live-work episode from the worker's explicit
+ * `direct_submit_started` provenance signal. Unlike notePostTerminalLiveWork
+ * this does not depend on a screen frame (which may never arrive when
+ * prompt_ready is stuck), so it works in the exact failure mode that leaves a
+ * card stranded after a terminal. Also requests a working repaint against any
+ * delivered/in-flight idle correction; the actual card write still happens on
+ * the next frame or the settle callback, never from this signal alone.
+ */
+function markDirectSubmitEpisode(ds: DaemonSession): void {
+  if (ds.lastTurnTerminalStatus !== 'completed') return;
+  if (ds.postTerminalLiveWorkAt === undefined) ds.postTerminalLiveWorkAt = Date.now();
+  const receipt = postTerminalCardSettles.get(ds);
+  if (receipt && receipt.cardId === ds.streamCardId) receipt.repaintRequested = true;
+}
+
+/**
  * Whether an accepted (non-stale) live busy frame must force a visible card
  * re-render against a post-terminal idle correction.
  *
@@ -21085,6 +21101,20 @@ function setupWorkerHandlers(
         } catch (err) {
           logger.warn(`[${t}] prompt submission handler failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+        break;
+      }
+      case 'direct_submit_started': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored direct_submit_started from stale worker generation`);
+          break;
+        }
+        // Provenance-only: open the live-work episode even when no prompt_ready
+        // / working screen frame follows (stuck-after-terminal). No card write.
+        markDirectSubmitEpisode(ds);
         break;
       }
       case 'turn_progress': {

@@ -937,5 +937,51 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
   });
+
+  it('R6: direct_submit_started opens the episode with no prompt_ready, then a normal working frame repaints', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle'); // correction delivered
+    const revAfterIdle = ds.streamCardStatusRevision ?? 0;
+
+    // Stuck-after-terminal: prompt_ready never fires. The hook still signals a
+    // real direct-submit, but no working screen frame accompanies it yet.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined(); // episode opened without a frame
+
+    // The PTY stream later produces an ordinary working frame (still tagged with
+    // the old terminalized turn, no directSubmit marker). The open episode must
+    // let it through and repaint the card back to working.
+    staleTaggedFrame(ds, { content: 'late working from pty' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(revAfterIdle + 1);
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('R6: direct_submit_started is a no-op outside a completed terminal', async () => {
+    const ds = setupTerminalDs();
+    // No terminal yet: the signal must not open a spurious epoch.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+  });
+
+  it('R6: a stale-generation direct_submit_started is ignored', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    // The handler closure is bound to the original worker/generation; advance
+    // only the session's recorded generation so the bound worker is now stale.
+    const originalWorker = ds.worker;
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+    ds.session.workerGeneration = ds.workerGeneration;
+
+    (originalWorker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+  });
 });
 

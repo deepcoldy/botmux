@@ -169,4 +169,30 @@ describe('worker prompt_submitted handler', () => {
     await delay(300);
     expect(submittedFor()).toEqual([{ type: 'prompt_submitted_input', turnId }]);
   });
+
+  it('emits direct_submit_started even when prompt_ready never fired (stuck-after-terminal shape)', async () => {
+    const harness = startWorker();
+    await waitFor(
+      harness,
+      () => harness.messages.some(m => m.type === 'ready'),
+      'worker readiness',
+    );
+    // Deliberately do NOT send session_ready: the startup ready-gate stays held,
+    // so prompt_ready is never published and isPromptReady stays false — the
+    // exact shape of a worker stranded after a terminal.
+    const before = harness.messages.filter(m => m.type === 'direct_submit_started').length;
+    harness.child.send({ type: 'prompt_submitted' } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.messages.filter(m => m.type === 'direct_submit_started').length > before,
+      'direct_submit_started provenance without prompt_ready',
+    );
+    // Provenance is decoupled from the screen edge: no working screen_update is
+    // forced while not ready (the existing no-duplicate contract holds).
+    await delay(300);
+    const workingUpdates = harness.messages.filter(
+      m => m.type === 'screen_update' && m.status === 'working' && m.turnId === undefined,
+    );
+    expect(workingUpdates).toEqual([]);
+  });
 });

@@ -39248,6 +39248,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'prompt_submitted': {
       const wasPromptReady = isPromptReady;
       revokePromptReadiness();
+      // Provenance is independent of the ready→working screen edge: emit it
+      // unconditionally so a direct-submit after a terminal whose prompt_ready
+      // never fired still opens the daemon's live-work episode. A keep-alive
+      // never reaches this case (it uses prompt_cache_keepalive), so this cannot
+      // be spoofed. This signal carries no status and never repaints a card.
+      send({ type: 'direct_submit_started' });
       if (wasPromptReady) {
         idleDetector?.reset();
         log('User prompt submitted via hook — publishing working state');

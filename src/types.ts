@@ -2617,6 +2617,13 @@ export type WorkerToDaemonBase =
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
   | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
+  /** Provenance-only signal for a Web Terminal / sandbox hook direct-submit.
+   *  Sent unconditionally when the submit hook fires, even when the worker has
+   *  no prompt_ready (the exact stuck-after-terminal case this card fix
+   *  targets): it opens the daemon's live-work episode without depending on a
+   *  ready→working screen edge, so a later working frame is never mistaken for
+   *  stale residue. Carries no status and never repaints the card by itself. */
+  | { type: 'direct_submit_started' }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
