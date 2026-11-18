@@ -12,7 +12,7 @@
  * （groupContextEpoch），换新 id 会让整段群历史——包括想丢掉的那条——重新注入。
  */
 
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, readlinkSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, readlinkSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   extractTurnStartText,
@@ -24,6 +24,7 @@ import {
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
 import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
+import { rewindBackupSuffix } from './rewind-backup-retention.js';
 
 export interface RewindCheckpoint {
   /** 1 = 最近一轮；仅在一次扫描结果内稳定。 */
@@ -557,6 +558,9 @@ export function rewindClaudeTranscript(
      *  but before the backup is read from it. Lets the symlink-swap regression
      *  replace the pathname deterministically mid-operation. */
     beforeBackup?: () => void;
+    /** Test seam: runs after the backup was written, before the transcript is
+     *  cut. Lets a test take the backup away in that window. */
+    beforeCut?: () => void;
     /** `removed` keeps only the bytes being cut (`<path>.rewind-<stamp>.removed.bak`).
      *  An automatic rewind of one failed turn runs on every failure: copying a
      *  transcript of hundreds of MB each time is not affordable, and the part
@@ -583,13 +587,28 @@ export function rewindClaudeTranscript(
  *  agent-writable sandbox data dir the pathname can be swapped to a symlink
  *  between validation and use, and a path-based copy would then read whatever
  *  the link points at (host data the daemon can read but the sandbox cannot)
- *  into the agent-readable backup. */
-function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number, from = 0, keep = false): Buffer | undefined {
-  const dstFd = openSync(
+ *  into the agent-readable backup. The backup's descriptor is returned open:
+ *  the caller closes it once the cut is done, so its inode number cannot be
+ *  handed to another file meanwhile (see {@link cutWhileBackupHeld}). */
+function copyBackupFromDescriptor(
+  srcFd: number, backupPath: string, size: number, from = 0, keep = false, backupDir?: string,
+): { fd: number; removed?: Buffer } {
+  const create = () => openSync(
     backupPath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
     0o600,
   );
+  let dstFd: number;
+  try {
+    dstFd = create();
+  } catch (err) {
+    // The retention sweep removes an empty backup directory left unchanged
+    // for days (rewind-backup-retention.ts): it may have gone between the
+    // caller creating it and this. Made anew, its fresh mtime keeps it.
+    if (!backupDir || (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+    dstFd = create();
+  }
   try {
     if (!fstatSync(dstFd).isFile()) {
       throw new Error(`refusing to write rewind backup to non-regular file ${backupPath}`);
@@ -621,12 +640,32 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
     if (fstatSync(dstFd).size !== total) {
       throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${total} bytes)`);
     }
-    return keep ? Buffer.concat(kept, total) : undefined;
+    return { fd: dstFd, ...(keep ? { removed: Buffer.concat(kept, total) } : {}) };
   } catch (err) {
+    try { closeSync(dstFd); } catch { /* best effort */ }
     try { unlinkSync(backupPath); } catch { /* may not have been created */ }
     throw err;
+  }
+}
+
+/** Cut the transcript only while `backupPath` still names the backup just
+ *  written: backups are pruned now (rewind-backup-retention.ts), and a cut
+ *  must never land with its backup gone, or with another file under the name
+ *  the caller will report. Closes the backup's descriptor either way; a
+ *  backup found gone or replaced is left as it is. */
+function cutWhileBackupHeld(fd: number, offset: number, backupFd: number, backupPath: string, beforeCut?: () => void): void {
+  try {
+    beforeCut?.();
+    // Held open, the backup's inode number cannot have gone to another file.
+    const held = fstatSync(backupFd);
+    let named;
+    try { named = lstatSync(backupPath); } catch { named = undefined; }
+    if (!named?.isFile() || !sameFile(named, held)) {
+      throw new Error(`rewind backup ${backupPath} went away before the cut; transcript left as it was`);
+    }
+    ftruncateSync(fd, offset);
   } finally {
-    closeSync(dstFd);
+    closeSync(backupFd);
   }
 }
 
@@ -635,7 +674,7 @@ function rewindOpenTranscript(
   path: string,
   offset: number,
   now: number,
-  opts: { beforeBackup?: () => void; backup?: 'full' | 'removed' } & TranscriptTreeScope = {},
+  opts: { beforeBackup?: () => void; beforeCut?: () => void; backup?: 'full' | 'removed' } & TranscriptTreeScope = {},
 ): RewindResult {
   const st = fstatSync(fd);
   if (!Number.isInteger(offset) || offset <= 0 || offset > st.size) {
@@ -646,7 +685,6 @@ function rewindOpenTranscript(
     readSync(fd, byte, 0, 1, offset - 1);
     if (byte[0] !== 10) throw new Error(`rewind offset ${offset} is not at a line boundary`);
   }
-  const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
   // A tree the session's CLI can write to gets no file from here: neither a
   // check before creating it nor a cleanup after can keep a path in such a
   // tree pointing where it pointed.
@@ -654,11 +692,13 @@ function rewindOpenTranscript(
     throw new Error(`refusing to rewind ${path}: no backup directory outside the CLI-writable tree`);
   }
   const removedOnly = opts.backup === 'removed';
-  const backupSuffix = `.rewind-${stamp}${removedOnly ? '.removed' : ''}.bak`;
+  // Named so the retention sweep recognises it (rewind-backup-retention.ts).
+  const backupSuffix = rewindBackupSuffix(now, removedOnly ? 'removed' : 'full');
   const backupPath = opts.backupDir ? join(opts.backupDir, `${basename(path)}${backupSuffix}`) : `${path}${backupSuffix}`;
   opts.beforeBackup?.();
-  const removed = copyBackupFromDescriptor(fd, backupPath, st.size, removedOnly ? offset : 0, removedOnly);
-  ftruncateSync(fd, offset);
+  const backup = copyBackupFromDescriptor(fd, backupPath, st.size, removedOnly ? offset : 0, removedOnly, opts.backupDir);
+  cutWhileBackupHeld(fd, offset, backup.fd, backupPath, opts.beforeCut);
+  const removed = backup.removed;
   return {
     backupPath,
     removedBytes: st.size - offset,

@@ -32,6 +32,7 @@ import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-
 import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
 import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
+import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
@@ -149,6 +150,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
+    if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
+    if (key === 'rewindBackupDirForSession') return rewindBackupDirForSession;
+    if (key === 'registerRewindBackup') return registerRewindBackup;
     if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;
     if (key === 'traexAutoModelPolicyKey') return traexAutoModelPolicyKey;
     if (key === 'reconcileTraexModelCatalog') {

@@ -591,6 +591,7 @@ import {
   runFailedTurnRewindMaintenance,
   transcriptTurnFailedWithoutOutput,
 } from './core/failed-turn-rewind.js';
+import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './core/rewind-backup-retention.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
@@ -36931,11 +36932,17 @@ function startFailedTurnRewind(
   enqueueMessage: () => void,
 ): void {
   let reported = false;
+  // The backup of the cut, once it landed. Its directory is pruned only after
+  // the rewind settled (core/rewind-backup-retention.ts), this backup left
+  // alone, without holding anything up.
+  let landedBackup: string | undefined;
+  const dataDir = process.env.SESSION_DATA_DIR;
   const report = (outcome: 'rewound' | 'declined', reason: string): void => {
     if (reported) return;
     reported = true;
     log(`Failed-turn rewind ${outcome} for ${directive.failedTurnId.slice(0, 16)} → ${(turnId ?? '-').slice(0, 16)} (${directive.mode}): ${reason}`);
     send({ type: 'failed_turn_rewind', turnId: turnId ?? '', failedTurnId: directive.failedTurnId, outcome, reason });
+    if (landedBackup) void pruneRewindBackupsBeside(landedBackup, { dataDir, log });
   };
   const target = resolvePurgeResumeTarget(
     bridgeJsonlPath,
@@ -37007,6 +37014,10 @@ function startFailedTurnRewind(
         return;
       }
       const queued = state.queued!;
+      landedBackup = outcome.result.backupPath;
+      // Next to the transcript: registered at once, so the periodic sweep
+      // reaches its directory even if this worker never settles the rewind.
+      registerRewindBackup(landedBackup, dataDir, log);
       const cut: FailedTurnCut = {
         path: plan.target.jsonlPath,
         offset: plan.offset,
@@ -37066,7 +37077,7 @@ function failedTurnTranscriptScope(): TranscriptTreeScope {
     writableTreeRoot: claudeTranscriptTreeRoot,
     // No data dir, no backup directory: the cut is refused rather than made
     // with its backup in the tree.
-    ...(dataDir && sessionId ? { backupDir: join(dataDir, 'rewind-backups', sessionId) } : {}),
+    ...(dataDir && sessionId ? { backupDir: rewindBackupDirForSession(dataDir, sessionId) } : {}),
   };
 }
 
