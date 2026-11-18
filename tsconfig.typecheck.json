@@ -29,6 +29,7 @@
     "test/helpers/worker-test-modules.ts",
     "test/worker-test-modules.test.ts",
     "test/worker-module-snapshot-cache.test.ts",
+    "test/workflow-c0-isolation.test.ts",
     "test/ensure-herdr-integrations.test.ts",
     "test/hermes-transcript.test.ts",
     "test/mtr-transcript.test.ts",
