@@ -92,6 +92,9 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Durable replay identity. Runner adapters may forward this with turnId so
+   * late output from an older attempt cannot settle its successor. */
+  dispatchAttempt?: number;
   /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
    * An exact post-write history match then proves ownership even when the OS
    * sandbox prevents reading the CLI's open rollout file descriptors. */

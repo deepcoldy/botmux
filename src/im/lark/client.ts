@@ -1442,6 +1442,7 @@ export async function unpinMessage(larkAppId: string, messageId: string): Promis
  */
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
   cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
@@ -1453,6 +1454,7 @@ export async function sendEphemeralCard(
     } catch (err) {
       throw new Error(`Invalid ephemeral card JSON: ${err}`);
     }
+    if (options?.beforeWrite) await options.beforeWrite();
     const res: any = await (c as any).request({
       method: 'POST',
       url: '/open-apis/ephemeral/v1/send',
@@ -2101,14 +2103,14 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
   });
 }
 
-export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
+export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
   return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
     const c = getBotUploadClient(larkAppId);
-    const buf = readFileSync(filePath);
-    const ext = extname(filePath).toLowerCase();
+    const buf = typeof source === 'string' ? readFileSync(source) : source.bytes;
+    const fileName = basename(typeof source === 'string' ? source : source.name);
+    const ext = extname(fileName).toLowerCase();
     const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-    const fileName = basename(filePath);
     // `duration` (ms) only applies to opus voice uploads — it sets the length
     // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
     const duration = fileType === 'opus' && opts?.duration
@@ -2120,7 +2122,7 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
     });
     const fileKey = res?.file_key;
     if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded file ${filePath} → ${fileKey}`);
+    logger.info(`Uploaded file ${fileName} → ${fileKey}`);
     return fileKey;
   });
 }

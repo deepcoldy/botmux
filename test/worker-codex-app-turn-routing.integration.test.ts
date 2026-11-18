@@ -1465,8 +1465,11 @@ describe('Codex App worker native stop', () => {
     }));
     await waitFor(worker, logs, () => !!target('om_first'));
     stop('first', 'om_first');
+    // The interrupt reply and the terminal event arrive independently over IPC.
     await waitFor(worker, logs, () => messages.some(
       message => message.type === 'turn_terminal' && message.turnId === 'om_first' && message.status === 'cancelled',
+    ) && messages.some(
+      message => message.type === 'codex_app_interrupt_result' && message.requestId === 'first',
     ));
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'codex_app_interrupt_result', requestId: 'first', status: 'delivered',

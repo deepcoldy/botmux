@@ -42,7 +42,7 @@ import { noteNextStepCard, noteNextStepSuggestion } from './next-step-suggestion
 import { nextStepIo } from './next-step-io.js';
 import { noteCliRecap, noteRecapCard, noteRecapReported } from './turn-recap-state.js';
 import { noteRecapResult, recapInputFor, turnRecapIo } from './turn-recap-io.js';
-import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
+import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage, uploadFile } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
 import { sessionPromptInjection } from './prompt-injection.js';
@@ -182,6 +182,8 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { prepareReplyFile, type PreparedReplyFile } from '../im/lark/reply-file.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../im/lark/turn-reply-card-size.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
 import { localAddressContextForBot, replayVettedBody, sendableCardLink } from '../im/lark/local-address-context.js';
 import { isStuckPageType } from './stuck-page-catalog.js';
@@ -25632,6 +25634,7 @@ const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
 export interface DurableBridgeFinalOutputRequest {
+  replyFileDigest?: string;
   daemonSession: DaemonSession;
   turnId: string;
   content: string;
@@ -26194,7 +26197,7 @@ function deliverFinalOutput(
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
-  imageFallback: ReplyImageState = { omitImages: false },
+  imageFallback: ReplyImageState & { replyFile?: PreparedReplyFile } = { omitImages: false },
   handoff?: HandoffDeliveryContext,
   outputControl?: OutputDeliveryControl,
 ): void {
@@ -26489,6 +26492,7 @@ function deliverFinalOutput(
     ));
     return frozen ? replayVettedBody(frozen.content, frozen.msgType, reply) : reply();
   };
+  const ownsOpenSession = () => isStillOwned() && ds.session.status !== 'closed';
   setTimeout(async () => {
     if (!isStillOwned()) {
       logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
@@ -26503,6 +26507,7 @@ function deliverFinalOutput(
       onComplete?.(true);
       return;
     }
+    let sendReplyFile = false;
     try {
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
@@ -26686,7 +26691,12 @@ function deliverFinalOutput(
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
-      const renderedAssistantText = await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      // Ordinary MiniMax IM finals may be up to 8 MB. Avoid parsing a whole
+      // Markdown document into a card that can never fit the provider budget.
+      const canSendReplyFile = effectiveCliId === 'minimax' && !managedReceiver && !imOrigin
+        && !msg.turnFailed && (!msg.kind || msg.kind === 'bridge');
+      sendReplyFile = canSendReplyFile && Buffer.byteLength(safeAssistantText) > TURN_REPLY_CARD_MAX_BYTES;
+      const renderedAssistantText = sendReplyFile ? 'reply.md' : await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
       if (!isStillOwned()) { onComplete?.(false); return; }
       const zeroPromptDispatchRoot = frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
         : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
@@ -26839,7 +26849,9 @@ function deliverFinalOutput(
           locale: localeForBot(ds.larkAppId),
         }),
       ));
-      const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
+      sendReplyFile ||= canSendReplyFile && turnReplyCardRequestBytes(cardJson, ds.chatId) > TURN_REPLY_CARD_MAX_BYTES;
+      if (sendReplyFile) feedbackPolicy = undefined;
+      const baseFeedbackCard = feedback && !sendReplyFile ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
         targetChatId: ds.chatId,
@@ -26990,14 +27002,29 @@ function deliverFinalOutput(
             messageId: durableReplyTarget.rootMessageId,
             replyInThread: durableReplyTarget.mode === 'thread',
           };
+      let providerOutput = canonicalOutput;
+      if (sendReplyFile) {
+        if (!ownsOpenSession()) { onComplete?.(false); return; }
+        const fileState = await prepareReplyFile(safeAssistantText,
+          localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir), imageFallback.replyFile);
+        imageFallback.replyFile = fileState;
+        if (!ownsOpenSession()) { onComplete?.(false); return; }
+        fileState.key ??= await uploadFile(ds.larkAppId, { name: 'reply.md', bytes: fileState.bytes });
+        if (!ownsOpenSession()) { onComplete?.(false); return; }
+        const file = { msgType: 'file', content: JSON.stringify({ file_key: fileState.key }),
+          providerUuid: deliveryReplyOptions.uuid };
+        const frozen = outputControl?.freezeTransport('minimax-reply-file', file) ?? file;
+        providerOutput = { ...canonicalOutput, content: frozen.content, msgType: frozen.msgType };
+      }
       const durableDelivery = durableBridgeFinalOutputHandler
         && !managedReceiver
         && !preparedListenerReply
         ? await durableBridgeFinalOutputHandler({
             daemonSession: ds,
             turnId: msg.turnId,
-            content: canonicalOutput.content,
-            msgType: canonicalOutput.msgType,
+            ...(sendReplyFile ? { replyFileDigest: imageFallback.replyFile!.digest } : {}),
+            content: providerOutput.content,
+            msgType: providerOutput.msgType,
             providerUuid: deliveryReplyOptions.uuid,
             target: durableTarget,
           })
@@ -27008,7 +27035,7 @@ function deliverFinalOutput(
         onComplete?.(false);
         return;
       }
-      const unifiedReply = durableDelivery || handoff
+      const unifiedReply = sendReplyFile || durableDelivery || handoff
         ? undefined
         : !managedReceiver && (!msg.kind || msg.kind === 'bridge')
           ? await updateTurnReplyCard(ds, msg.turnId, {
@@ -27021,7 +27048,7 @@ function deliverFinalOutput(
           : undefined;
       const sendFinal = (content: string) => scopedReply(
         content,
-        canonicalOutput.msgType,
+        providerOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
         frozenReplyTarget && !managedReceiver
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
@@ -27030,8 +27057,8 @@ function deliverFinalOutput(
       // Unified cards persist their own image downgrade. Managed VC replies
       // retain their audited payload; only legacy replies use this fallback.
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
-        ? sendFinal(canonicalOutput.content)
-        : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
+        ? sendFinal(providerOutput.content)
+        : replyWithImageFallback(providerOutput.content, providerOutput.msgType, sendFinal, imageFallback));
       if (!isStillOwned()) {
         // The provider already returned its stable message id. Ownership loss
         // only suppresses later local bookkeeping; it cannot make that external
@@ -27055,7 +27082,7 @@ function deliverFinalOutput(
         // are eventually decoupled.
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
-          kind: 'standard_reply_card',
+          kind: sendReplyFile ? 'non_patchable' : 'standard_reply_card',
           responseKind: 'final',
         });
       }
@@ -27068,7 +27095,7 @@ function deliverFinalOutput(
           text: explicit?.finalText ?? safeAssistantText,
         });
       }
-      if (!managedReceiver) {
+      if (!managedReceiver && !sendReplyFile) {
         recordOncallGroupDelivery(config.session.dataDir, {
           appId: ds.larkAppId, chatId: ds.chatId, messageId, sessionId: ds.session.sessionId, rootId: sessionAnchorId(ds),
           questionId: msg.replyTurnId ?? msg.turnId,
@@ -27244,6 +27271,9 @@ function deliverFinalOutput(
         const partialMessages = partialResultMessages();
         observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'delivery_unknown' },
           resultReceipt(partialMessages.length ? 'partial' : 'unknown', partialMessages, 'delivery_unknown'));
+        if (sendReplyFile && raiseDaemonAttention(ds, 'blocked', 'MiniMax reply.md delivery failed', msg.turnId)) {
+          publishAttentionPatch(ds);
+        }
         logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewFailed(msg.turnId, {

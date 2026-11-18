@@ -285,7 +285,7 @@ import { deliverAuthLink, type AuthLinkDelivery } from './auth-link-delivery.js'
 import { AUTH_PROVIDERS, PROVIDER_LABEL, deliverProviderLink, platformAuthLink, requestProviderAuth, type AuthProvider, type ProviderAuthResult } from './provider-auth-request.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
-import { beginBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge } from '../services/bytedcli-auth.js';
+import { completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, startBytedcliLogin } from '../services/bytedcli-auth.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
 import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
@@ -4672,7 +4672,7 @@ async function handleProviderAuthRequest(
       const { state } = await describeBytedcliAuth(person);
       return state === 'unknown' ? 'unknown' : state === 'authorized';
     },
-    beginBytedcliLogin,
+    startBytedcliLogin,
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
       sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId,
       botConfig: cfg, senderOpenId: person,
