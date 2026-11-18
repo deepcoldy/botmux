@@ -162,6 +162,28 @@ function scriptIndex(args: readonly string[]): number {
   return index;
 }
 
+/** Emulate tmux executing the queued subscription after printing the new
+ * session's identity. Keep the existing pipe failure injections applicable to
+ * both the creating queue and later standalone subscription retries. */
+function emulateQueuedSubscription(): void {
+  const implementation = mockedExecFileSync.getMockImplementation()!;
+  mockedExecFileSync.mockImplementation(((...params: unknown[]) => {
+    const result = Reflect.apply(implementation, undefined, params);
+    const argv = params[1] as string[];
+    if (!Array.isArray(argv) || !argv.includes('new-session')) return result;
+    const subscription = argv.slice(argv.lastIndexOf(';') + 1);
+    if (!['if-shell', 'pipe-pane'].includes(subscription[0]!)) return result;
+    const command = subscription.map((arg, i) => i === 0 || arg.startsWith('-')
+      ? arg : `'${arg.replace(/'/g, "'\\''")}'`).join(' ');
+    const identity = String(result).trim() || '1234 $7 5678';
+    try {
+      return Buffer.from(`${identity}\n${String(mockedExecSync(`tmux ${command}`))}`);
+    } catch (err) {
+      throw Object.assign(err as Error, { stdout: Buffer.from(`${identity}\n`) });
+    }
+  }) as typeof execFileSync);
+}
+
 beforeEach(() => {
   mockedExecSync.mockReset();
   mockedExecFileSync.mockReset();
@@ -184,6 +206,17 @@ beforeEach(() => {
 });
 
 describe('TmuxPipeBackend.spawn', () => {
+  it('removes the FIFO and creates no session if opening its read end fails', () => {
+    mockedOpenSync.mockImplementationOnce(() => { throw new Error('EACCES: FIFO read denied'); });
+    const be = new TmuxPipeBackend('bmx-no-reader', { createSession: true, ownsSession: true });
+    const readersBefore = __testOnly_liveFifoReaderCount();
+    expect(() => be.spawn('/bin/sh', [], spawnOpts())).toThrow(/EACCES/);
+    expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo$/));
+    expect(__testOnly_liveFifoReaderCount()).toBe(readersBefore);
+    expect(mockedExecFileSync.mock.calls.some(([, args]) => (args as string[]).includes('new-session'))).toBe(false);
+    expect(be.retireSessionCreatedBySpawn()).toBe(false);
+  });
+
   it.each([
     { status: 1, stderr: Buffer.from('mkfifo: No space left on device') },
     { status: null, error: new Error('spawn mkfifo ENOENT') },
@@ -248,6 +281,7 @@ describe('TmuxPipeBackend.spawn', () => {
   });
 
   it('throws but does NOT fire an exit when pipe-pane keeps failing (startup failure, not a crash)', () => {
+    emulateQueuedSubscription();
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       let pipeAttempts = 0;
@@ -283,6 +317,7 @@ describe('TmuxPipeBackend.spawn', () => {
   // cached that a later onExit would replay — that used to mislabel a tmux
   // stall as a crashed CLI once fireExit became sticky (#2408).
   it('a failed spawn leaves no sticky exit for an onExit registered afterwards', () => {
+    emulateQueuedSubscription();
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       mockedExecSync.mockImplementation(((cmd: any) => {
@@ -361,6 +396,7 @@ describe('TmuxPipeBackend.spawn', () => {
   });
 
   it('fails pipe-pane FAST on a server-answered deterministic rejection (pane genuinely gone)', () => {
+    emulateQueuedSubscription();
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       let pipeAttempts = 0;
@@ -485,6 +521,7 @@ describe('TmuxPipeBackend.spawn', () => {
   it.each(['binding-a', 'binding-b', ''])('checks the actual identity before adopting a duplicate on startup retry: %s', actual => {
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const be = new TmuxPipeBackend('bmx-bound', { createSession: true, ownsSession: true });
+    const readersBefore = __testOnly_liveFifoReaderCount();
     let attempts = 0;
     mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
       if (args[0] === '-V') return 'tmux 3.3a';
@@ -503,7 +540,7 @@ describe('TmuxPipeBackend.spawn', () => {
       if (actual === 'binding-a') expect(() => be.spawn('sleep', ['60'], opts)).not.toThrow();
       else {
         expect(() => be.spawn('sleep', ['60'], opts)).toThrow(/preserved/);
-        expect(mockedOpenSync).not.toHaveBeenCalled();
+        expect(__testOnly_liveFifoReaderCount()).toBe(readersBefore);
         expect(mockedExecSync.mock.calls.some(([cmd]) => /set-option|pipe-pane/.test(String(cmd)))).toBe(false);
       }
       expect(attempts).toBe(2);
@@ -1465,7 +1502,7 @@ describe('TmuxPipeBackend managed session', () => {
       const launchClause = args.slice(cIdx - 2, cIdx + 3);
       // fish gets its post-script args as $argv: no POSIX `_` sentinel.
       expect(launchClause).toEqual([shell.path, '-i', '-c', 'source $argv[1]', args[cIdx + 2]]);
-      expect(args.slice(cIdx + 3)).toEqual([';', 'set-option', '-t', 'bmx-fish-pipe', 'remain-on-exit', 'failed']);
+      expect(args.slice(cIdx + 3, cIdx + 10)).toEqual([';', 'set-option', '-t', 'bmx-fish-pipe', 'remain-on-exit', 'failed', ';']);
       const { body } = takePaneLaunchFile(args);
       expect(body).toContain(`set argv '/tmp'`);
       expect(body).toContain('cd -- $argv[1]');
@@ -1490,7 +1527,7 @@ describe('TmuxPipeBackend managed session', () => {
     const args = newSessionArgs();
     const cIdx = scriptIndex(args);
     expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', '. "$1"', '_', args[cIdx + 3]]);
-    expect(args.slice(cIdx + 4)).toEqual([';', 'set-option', '-t', 'bmx-posix-pipe', 'remain-on-exit', 'failed']);
+    expect(args.slice(cIdx + 4, cIdx + 11)).toEqual([';', 'set-option', '-t', 'bmx-posix-pipe', 'remain-on-exit', 'failed', ';']);
     const { body } = takePaneLaunchFile(args);
     expect(body).toContain(`set -- '/tmp'`);
     expect(body).toContain('cd -- "$1" && shift');
@@ -2546,6 +2583,7 @@ describe('TmuxPipeBackend pipe-pane death evidence', () => {
 
       // FRESH create whose CLI died instantly: startup-failure message, no
       // process-exit event (it never came up).
+      emulateQueuedSubscription();
       const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
       const exits: unknown[] = [];
       be.onExit((code, signal) => exits.push([code, signal]));
@@ -2827,6 +2865,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
       }
       return Buffer.from('') as any;
     }) as typeof execSync);
+    emulateQueuedSubscription();
   }
 
   // The shell hands if-shell its arguments, then tmux parses the subscription
@@ -3016,6 +3055,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
       }
       return Buffer.from('') as any;
     }) as typeof execSync);
+    emulateQueuedSubscription();
   }
 
   it('a vanished target (else-branch "can\'t find pane") is a one-shot startup failure with no exit', () => {
@@ -3059,6 +3099,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
 
   it('tmux >= 3.2 subscribes with a bare pipe-pane and no if-shell guard', () => {
     // beforeEach default emulation is modern tmux; do not override it.
+    emulateQueuedSubscription();
     const be = new TmuxPipeBackend(target, { createSession: true, ownsSession: true });
     try {
       expect(() => be.spawn('', [], spawnOpts())).not.toThrow();

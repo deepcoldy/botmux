@@ -38,8 +38,9 @@ interface Scenario {
   onCommandClear?: string;
   /** Frame drawn on each signal() call, in order (labelled `signal-N`). */
   onSignal?: string[];
-  /** Delay tmux's output-pipe attach, as a loaded tmux server does. */
+  /** Deliberately miss the first paint to exercise the backend-screen fallback. */
   pipeAttachDelayS?: number;
+  legacyTmux?: boolean;
   init?: Partial<Extract<DaemonToWorker, { type: 'init' }>>;
 }
 
@@ -127,7 +128,32 @@ setInterval(() => {}, 1000);
     const realTmux = execFileSync('sh', ['-c', 'command -v tmux'], { encoding: 'utf8' }).trim();
     const shimDir = join(root, 'shim');
     mkdirSync(shimDir);
-    writeFileSync(join(shimDir, 'tmux'), `#!/bin/sh\ncase " $* " in *" pipe-pane "*) sleep ${scenario.pipeAttachDelayS} ;; esac\nexec ${realTmux} "$@"\n`, { mode: 0o755 });
+    // A fresh managed session now subscribes in its creating queue. Split only
+    // this fixture's pipe command out so its artificial delay still starts
+    // after the CLI, rather than delaying the entire atomic launch.
+    writeFileSync(join(shimDir, 'tmux'), `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (${!!scenario.legacyTmux}) {
+  if (args.includes('-V')) { console.log('tmux 3.1c'); process.exit(0); }
+  if (args.includes('display-message') && args.includes('#{version}')) { console.log('3.1c'); process.exit(0); }
+}
+const hasPipe = argv => argv.some(arg => arg === 'pipe-pane' || arg.startsWith('pipe-pane '));
+const create = args.indexOf('new-session');
+const boundary = args.lastIndexOf(';');
+const run = argv => {
+  const result = spawnSync(${JSON.stringify(realTmux)}, argv, { stdio: 'inherit' });
+  if (result.error || result.status !== 0) process.exit(result.status ?? 1);
+};
+if (hasPipe(args)) {
+  if (create >= 0 && boundary > create && hasPipe(args.slice(boundary + 1))) {
+    run(args.slice(0, boundary));
+    args.splice(create, boundary - create + 1);
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${scenario.pipeAttachDelayS * 1_000});
+}
+run(args);
+`, { mode: 0o755 });
     path = `${shimDir}:${path}`;
   }
   const messages: WorkerToDaemon[] = [];
@@ -237,8 +263,9 @@ it.skipIf(!tmuxAvailable)('keeps an opening that meets a draft queued, then deli
   });
 }, 60_000);
 
-it.skipIf(!tmuxAvailable)('delivers at the soft timeout when the input box was drawn before the output pipe attached', async () => {
-  await withWorker({ steps: [{ atMs: 0, frame: READY }], pipeAttachDelayS: 2 }, async h => {
+const tmuxVersions = [['modern tmux', false], ['legacy tmux', true]] as const;
+it.skipIf(!tmuxAvailable).each(tmuxVersions)('%s: delivers at the soft timeout when the input box was drawn before the output pipe attached', async (_label, legacyTmux) => {
+  await withWorker({ steps: [{ atMs: 0, frame: READY }], pipeAttachDelayS: 2, legacyTmux }, async h => {
     // Well before the hard cap: nothing on the output pipe ever matched the prompt.
     await h.waitFor(() => committed(h.messages, 'om_first'), 45_000);
     expect(pasted(h.input(), 'first-prompt')).toBe(1);
@@ -246,11 +273,12 @@ it.skipIf(!tmuxAvailable)('delivers at the soft timeout when the input box was d
   });
 }, 75_000);
 
-it.skipIf(!tmuxAvailable)('keeps checking the backend screen after the soft timeout and delivers once the box is ready', async () => {
+it.skipIf(!tmuxAvailable).each(tmuxVersions)('%s: keeps checking the backend screen after the soft timeout and delivers once the box is ready', async (_label, legacyTmux) => {
   await withWorker({
     steps: [{ atMs: 0, frame: PROVISIONAL }],
     onSignal: [FOOTER_ONLY],
     pipeAttachDelayS: 2,
+    legacyTmux,
   }, async h => {
     await h.waitFor(() => h.logs().includes('First prompt timeout'), 45_000);
     expect(h.input(), h.logs()).not.toContain('\x1b[200~');
