@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  file: vi.fn(async () => ({ file_key: 'file_reply' })),
+  file: vi.fn(async (_request: { data: { file_type: string; file_name: string; file: Buffer } }) => ({ file_key: 'file_reply' })),
   create: vi.fn(async () => ({ image_key: 'img_v3_uploaded' })),
 }));
 
@@ -25,7 +25,11 @@ describe('uploadImage with inspected bytes', () => {
 });
 
 it('uploads the full in-memory Markdown answer with its filename and stream type', async () => {
-  const bytes = Buffer.from('甲\0'.repeat(2_000_000));
+  const answer = '甲\0'.repeat(2_000_000);
+  const bytes = Buffer.from(answer);
   expect(await uploadFile('app', { name: 'reply.md', bytes })).toBe('file_reply');
-  expect(mocks.file).toHaveBeenCalledExactlyOnceWith({ data: { file_type: 'stream', file_name: 'reply.md', file: bytes } });
+  expect(mocks.file).toHaveBeenCalledTimes(1);
+  const { file, ...metadata } = mocks.file.mock.calls[0]![0].data;
+  expect(metadata).toEqual({ file_type: 'stream', file_name: 'reply.md' });
+  expect(file.equals(Buffer.from(answer))).toBe(true);
 });
