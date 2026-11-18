@@ -1,6 +1,7 @@
 /**
  * Session cost calculator — computes token usage from JSONL logs.
  */
+import { createHash } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -13,6 +14,7 @@ import {
   cachedTranscriptPathLookup,
   kimiEnvForBot,
   resolveSessionTranscriptPath,
+  resolveSessionTranscriptPaths,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
 import { estimateCostCny, type ResolvedModelPricing } from '../services/model-pricing.js';
@@ -50,6 +52,7 @@ export interface SessionTokenUsage extends SessionCost, SessionTokenUsageSnapsho
   out: number;
   /** Cumulative native execution-model attribution (when the CLI exposes it). */
   models?: ModelTokenUsage[];
+  nativeCheckpoint?: string;
 }
 
 /** Latest Context Usage reported by the Agent CLI. A missing window means the
@@ -291,6 +294,11 @@ type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'kimi' | 'generic
 
 interface UsageSourceRecord {
   offset: number;
+  checkpoint: string;
+}
+
+function checkpointHash(line: string): string {
+  return createHash('sha256').update(line).digest('hex');
 }
 
 const CODEX_USAGE_SOURCE_RECORD_MAX_BYTES = 64 * 1024;
@@ -300,6 +308,7 @@ function sourceRecordForLine(line: string, lineStart: number | undefined): Usage
   if (Buffer.byteLength(line, 'utf8') > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return null;
   return {
     offset: lineStart,
+    checkpoint: checkpointHash(line),
   };
 }
 
@@ -846,6 +855,7 @@ const warnedOversizedUsageFiles = new Set<string>();
 
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
+  usageRecoveryCursor.clear();
   warnedOversizedUsageFiles.clear();
   piModelsCache = null;
   __resetCodexCompactionCountForTest();
@@ -1572,9 +1582,97 @@ function withKimiContextWindow(read: UsageReadResult, env: NodeJS.ProcessEnv): U
   return { ...read, agg };
 }
 
-export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+// Cache the last verified checkpoint so ordinary turns only read the new tail.
+const usageRecoveryCursor = new Map<string, {
+  dev: number; ino: number; offset: number; line: string; model: string;
+}>();
+
+/** Recover only a complete, monotone interval anchored by an exact native checkpoint. */
+export function getSessionUsageRecovery(
+  q: SessionTokenUsageQuery, previous: SessionTokenUsage, current: SessionTokenUsage,
+): Array<{ at: Date; usage: SessionTokenUsage; reset?: true }> | null {
+  if (q.cliId !== 'codex' && q.cliId !== 'traex') return null;
+  const fields = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreateTokens'] as const;
+  const equal = (a: SessionTokenUsage, b: SessionTokenUsage) => fields.every(k => a[k] === b[k]);
+  const recover = (paths: string[], resume?: typeof cursor) => {
+    const aggregate = newTokenUsageAggregate();
+    const recovered: Array<{ at: Date; usage: SessionTokenUsage; reset?: true }> = [];
+    let last = previous;
+    let anchored = false;
+    let previousAt: number | null = null;
+    let checkpoint: typeof cursor;
+    let invalid = false;
+    for (const path of paths) {
+      const st = statSync(path);
+      if (resume && (st.dev !== resume.dev || st.ino !== resume.ino)) return null;
+      const priorSegmentEnd = anchored ? previousAt : null;
+      // Model context belongs to this segment. A prior segment cannot supply it.
+      aggregate.model = resume?.model ?? '';
+      const scan = scanJsonlFromOffset(path, resume?.offset ?? 0, { endOffset: st.size, onLine(line, offset) {
+        if (invalid || !line.trim()) return;
+        if (resume && offset === resume.offset && line !== resume.line) { invalid = true; return; }
+        let entry: any;
+        try { entry = JSON.parse(line); } catch { invalid = anchored; return; }
+        foldCodexLine(aggregate, entry, () => null);
+        const usage = extractCodexTokenCountUsage(entry);
+        if (!usage) return;
+        usage.nativeCheckpoint = checkpointHash(line);
+        usage.model = firstNonEmptyString(entry.payload.context?.model, aggregate.model) ?? '';
+        const ms = entryTimestampMs(entry);
+        if (!anchored) {
+          anchored = equal(usage, previous)
+            && (!previous.nativeCheckpoint || usage.nativeCheckpoint === previous.nativeCheckpoint);
+          if (anchored) previousAt = ms;
+          return;
+        }
+        if (ms !== null && priorSegmentEnd !== null && ms <= priorSegmentEnd
+          && fields.every(k => usage[k] <= last[k])) return;
+        if (equal(usage, last)) {
+          last = usage;
+          checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
+          return;
+        }
+        if (ms === null || !usage.model || (previousAt !== null && ms < previousAt)) {
+          invalid = true; return;
+        }
+        const reset = fields.some(k => usage[k] < last[k]);
+        if (reset && !previous.nativeCheckpoint) {
+          // Legacy totals alone cannot disambiguate the same checkpoint across resets.
+          invalid = true;
+          return;
+        }
+        recovered.push({ at: new Date(ms), usage, ...(reset ? { reset: true as const } : {}) });
+        checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
+        last = usage;
+        previousAt = ms;
+      } });
+      if (!scan || scan.pendingTail.trim() || invalid) return null;
+    }
+    if (!anchored || !equal(last, current)
+      || (current.nativeCheckpoint && last.nativeCheckpoint !== current.nativeCheckpoint)) return null;
+    return { recovered, checkpoint };
+  };
+  const path = resolveSessionTranscriptPath(q)?.path;
+  if (!path) return null;
+  const cursor = usageRecoveryCursor.get(path);
+  try {
+    const result = (cursor && recover([path], cursor)) || recover(resolveSessionTranscriptPaths(q));
+    if (!result) return null;
+    if (result.checkpoint) {
+      if (usageRecoveryCursor.size >= USAGE_FILE_CACHE_MAX_ENTRIES && !usageRecoveryCursor.has(path)) {
+        usageRecoveryCursor.delete(usageRecoveryCursor.keys().next().value!);
+      }
+      usageRecoveryCursor.set(path, result.checkpoint);
+    }
+    return result.recovered;
+  } catch { return null; }
+}
+
+export function getSessionTokenUsage(q: SessionTokenUsageQuery, includeCheckpoint = false): SessionTokenUsage | null {
   if (q.cliId === 'minimax' || q.cliId === 'cursor') return getSessionUsageSnapshot(q).tokens;
-  return readSessionUsage(q)?.result ?? null;
+  const read = readSessionUsage(q);
+  const checkpoint = includeCheckpoint ? read?.agg.latestCodexUsageSource?.checkpoint : undefined;
+  return read?.result && checkpoint ? { ...read.result, nativeCheckpoint: checkpoint } : read?.result ?? null;
 }
 
 /** Provenance of the latest context measurement for `botmux observe`: only the

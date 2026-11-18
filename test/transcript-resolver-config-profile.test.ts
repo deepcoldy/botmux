@@ -14,7 +14,32 @@ vi.mock('../src/services/session-store.js', () => ({
 import {
   __resetTranscriptResolverCacheForTest,
   resolveSessionTranscriptPath,
+  resolveSessionTranscriptPaths,
 } from '../src/services/transcript-resolver.js';
+
+it('excludes a falsely named continuation with a foreign native session header', () => {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-rollout-identity-'));
+  const sid = '11111111-1111-1111-1111-111111111111';
+  try {
+    vi.stubEnv('CODEX_HOME', root);
+    const day = join(root, 'sessions', '2026', '01', '01');
+    mkdirSync(day, { recursive: true });
+    const write = (hour: string, id: string) => {
+      const path = join(day, `rollout-2026-01-01T${hour}-00-00-${sid}.jsonl`);
+      writeFileSync(path, JSON.stringify({ type: 'session_meta', payload: { id } }) + '\n');
+      return path;
+    };
+    const first = write('10', sid);
+    write('11', '22222222-2222-2222-2222-222222222222');
+    const last = write('12', sid);
+    expect(resolveSessionTranscriptPaths({ cliId: 'codex', sessionId: 'recovery', cliSessionId: sid }))
+      .toEqual([first, last]);
+  } finally {
+    vi.unstubAllEnvs();
+    __resetTranscriptResolverCacheForTest();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe('resolveSessionTranscriptPath — Claude config profile', () => {
   let base: string;

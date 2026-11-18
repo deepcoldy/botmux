@@ -22,7 +22,7 @@ import { createHash } from 'node:crypto';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 import { logger } from '../utils/logger.js';
-import { getSessionTokenUsage, type SessionTokenUsage } from '../core/cost-calculator.js';
+import { getSessionUsageRecovery, getSessionTokenUsage, type SessionTokenUsage } from '../core/cost-calculator.js';
 import { estimateCostCny, type ResolvedModelPricing } from './model-pricing.js';
 import type { DaemonSession } from '../core/types.js';
 import { modelTokenDeltas, normalizeModelTokenUsage, type ModelTokenUsage } from './model-token-usage.js';
@@ -39,6 +39,7 @@ export interface UsageLedgerRecord {
   kind?: 'ownership';
   recordId: string;
   ts: string;
+  nativeCheckpoint?: string;
   /** Baseline reset epoch this delta was measured in — lets the ledger itself
    *  re-seed a lost baseline (crash recovery) without ambiguity. */
   epoch: number;
@@ -85,6 +86,8 @@ export interface RecordSessionUsageArgs {
   callerOpenId?: string;
   /** 定价覆盖（按 bot 解析后的结果）；缺省时走进程级 pricingResolver。 */
   pricing?: ResolvedModelPricing;
+  /** Native usage event time; persistence and retention still use now. */
+  occurredAt?: Date;
   /** Injectable for tests; defaults to wall clock. */
   now?: Date;
   /** Injectable for tests; defaults to ~/.botmux/usage (BOTMUX_USAGE_DIR overrides). */
@@ -100,6 +103,7 @@ interface SessionBaseline {
    *  baselines used includes_cache prompt input and must be migrated once. */
   inputTokenSemantics?: InputTokenSemantics;
   recordedAt: string;
+  nativeCheckpoint?: string;
   /** Bumped on every baseline reset (shrink, explicit anchor) so identical
    *  totals transitions in different epochs get distinct recordIds. */
   epoch?: number;
@@ -146,8 +150,8 @@ export function setUsageLedgerRecordSink(sink: UsageLedgerRecordSink | null): vo
 /** Ownership markers already written by this process (recordId-keyed). */
 const ownershipWritten = new Set<string>();
 
-function baselineMemoryKey(larkAppId: string | undefined, sessionId: string): string {
-  return `${larkAppId ?? ''}\u0000${sessionId}`;
+function baselineMemoryKey(dir: string, larkAppId: string | undefined, sessionId: string): string {
+  return `${dir}\u0000${larkAppId ?? ''}\u0000${sessionId}`;
 }
 
 function finiteNum(v: unknown): number {
@@ -192,10 +196,10 @@ function normalizeBaseline(
 }
 
 /** Reconstruct the newest baseline for a session from the ledger files
- *  themselves (newest file first; last matching line in a file is newest).
+ *  themselves. Event dates can precede the wall-clock baseline date.
  *  This is the crash-recovery source of truth: a record that reached the
  *  ledger but whose state advance was lost is still binding. */
-function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | null {
+function baselineFromLedger(dir: string, sessionId: string, cliId: string | undefined): SessionBaseline | null {
   let files: string[];
   try {
     files = readdirSync(dir)
@@ -205,6 +209,7 @@ function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | n
   } catch {
     return null;
   }
+  let best: SessionBaseline | undefined;
   for (const name of files) {
     let content: string;
     try {
@@ -212,34 +217,34 @@ function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | n
     } catch {
       continue;
     }
-    let latest: any = null;
+
     for (const line of content.split('\n')) {
       if (!line.includes(sessionId)) continue;
       try {
         const rec = JSON.parse(line);
         // Ownership markers are not accounting events — their zero totals
         // must never re-seed a baseline.
-        if (rec?.sessionId === sessionId && rec?.kind !== 'ownership') latest = rec;
+        if (rec?.sessionId !== sessionId || rec?.kind === 'ownership') continue;
+        const latest = rec;
+        const semanticsPresent = Object.prototype.hasOwnProperty.call(latest, 'inputTokenSemantics');
+        best = newerBaseline(best, normalizeBaseline({
+          inputTokens: finiteNum(latest.totalInputTokens),
+          outputTokens: finiteNum(latest.totalOutputTokens),
+          cacheReadTokens: finiteNum(latest.totalCacheReadTokens),
+          cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
+          ...(semanticsPresent ? { inputTokenSemantics: latest.inputTokenSemantics } : {}),
+          recordedAt: typeof latest.ts === 'string' ? latest.ts : new Date(0).toISOString(),
+          ...(typeof latest.nativeCheckpoint === 'string' ? { nativeCheckpoint: latest.nativeCheckpoint } : {}),
+          epoch: finiteNum(latest.epoch),
+          models: normalizeModelTokenUsage(latest.modelTotals, {
+            inputTokens: finiteNum(latest.totalInputTokens), outputTokens: finiteNum(latest.totalOutputTokens),
+            cacheReadTokens: finiteNum(latest.totalCacheReadTokens), cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
+          }),
+        }, cliId));
       } catch { /* skip malformed lines */ }
     }
-    if (latest) {
-      const semanticsPresent = Object.prototype.hasOwnProperty.call(latest, 'inputTokenSemantics');
-      return {
-        inputTokens: finiteNum(latest.totalInputTokens),
-        outputTokens: finiteNum(latest.totalOutputTokens),
-        cacheReadTokens: finiteNum(latest.totalCacheReadTokens),
-        cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
-        ...(semanticsPresent ? { inputTokenSemantics: latest.inputTokenSemantics } : {}),
-        recordedAt: typeof latest.ts === 'string' ? latest.ts : new Date(0).toISOString(),
-        epoch: finiteNum(latest.epoch),
-        models: normalizeModelTokenUsage(latest.modelTotals, {
-          inputTokens: finiteNum(latest.totalInputTokens), outputTokens: finiteNum(latest.totalOutputTokens),
-          cacheReadTokens: finiteNum(latest.totalCacheReadTokens), cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
-        }),
-      };
-    }
   }
-  return null;
+  return best ?? null;
 }
 
 /** Of two baseline candidates, pick the newer: higher epoch wins; within an
@@ -264,10 +269,10 @@ function resolveBaseline(
   cliId: string | undefined,
   stateBaseline: SessionBaseline | undefined,
 ): SessionBaseline | undefined {
-  const key = baselineMemoryKey(larkAppId, sessionId);
+  const key = baselineMemoryKey(dir, larkAppId, sessionId);
   let remembered = sessionBaselineMemory.get(key);
   if (remembered === undefined) {
-    remembered = normalizeBaseline(baselineFromLedger(dir, sessionId), cliId) ?? null;
+    remembered = normalizeBaseline(baselineFromLedger(dir, sessionId, cliId), cliId) ?? null;
     sessionBaselineMemory.set(key, remembered);
   }
   return newerBaseline(normalizeBaseline(stateBaseline, cliId), normalizeBaseline(remembered, cliId));
@@ -351,6 +356,8 @@ function ledgerFilePath(dir: string, now: Date): string {
 export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRecord | null {
   try {
     const now = args.now ?? new Date();
+    const occurredAt = args.occurredAt ?? now;
+    if (!Number.isFinite(occurredAt.getTime())) throw new Error('Invalid usage event time');
     const dir = args.ledgerDir ?? defaultLedgerDir();
     mkdirSync(dir, { recursive: true });
 
@@ -376,6 +383,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       cacheCreateTokens: cur.cacheCreateTokens,
       inputTokenSemantics: 'uncached',
       recordedAt: now.toISOString(),
+      ...(cur.nativeCheckpoint ? { nativeCheckpoint: cur.nativeCheckpoint } : {}),
       epoch: prevEpoch,
       ...(models ? { models } : {}),
     };
@@ -385,14 +393,14 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       // The epoch bump keeps a later identical totals transition from reusing
       // a pre-reset recordId.
       baseline.epoch = prevEpoch + 1;
-      sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
       state.sessions[args.sessionId] = baseline;
       saveState(dir, args.larkAppId, state, now);
+      sessionBaselineMemory.set(baselineMemoryKey(dir, args.larkAppId, args.sessionId), baseline);
       return null;
     }
     if (deltaInput === 0 && deltaOutput === 0 && deltaCacheRead === 0 && deltaCacheCreate === 0) {
       if (models && !previousModels) {
-        sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
+        sessionBaselineMemory.set(baselineMemoryKey(dir, args.larkAppId, args.sessionId), baseline);
         state.sessions[args.sessionId] = baseline;
         saveState(dir, args.larkAppId, state, now);
       }
@@ -422,7 +430,8 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       v: 2,
       inputTokenSemantics: 'uncached',
       recordId: deterministicRecordId(args.sessionId, prevEpoch, prev, cur),
-      ts: now.toISOString(),
+      ts: occurredAt.toISOString(),
+      ...(cur.nativeCheckpoint ? { nativeCheckpoint: cur.nativeCheckpoint } : {}),
       epoch: prevEpoch,
       ...(args.larkAppId ? { larkAppId: args.larkAppId } : {}),
       sessionId: args.sessionId,
@@ -451,10 +460,10 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
 
     // Append first, then advance the baseline: a crash in between replays the
     // same transition with the SAME recordId, which the consumer dedupes.
-    appendFileSync(ledgerFilePath(dir, now), JSON.stringify(record) + '\n');
+    appendFileSync(ledgerFilePath(dir, occurredAt), JSON.stringify(record) + '\n');
     // Memory advances immediately after the append: even if saveState throws
     // without killing the process, this process will not re-bill the interval.
-    sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
+    sessionBaselineMemory.set(baselineMemoryKey(dir, args.larkAppId, args.sessionId), baseline);
     state.sessions[args.sessionId] = baseline;
     saveState(dir, args.larkAppId, state, now);
     // 预算累加缝：仅正 delta 记录成功落盘后触发一次；ownership marker 与
@@ -496,12 +505,13 @@ export function anchorSessionUsage(args: RecordSessionUsageArgs): void {
       cacheCreateTokens: args.usage.cacheCreateTokens,
       inputTokenSemantics: 'uncached',
       recordedAt: now.toISOString(),
+      ...(args.usage.nativeCheckpoint ? { nativeCheckpoint: args.usage.nativeCheckpoint } : {}),
       // Anchors start a new epoch: transitions after a re-anchor must never
       // collide with recordIds from before it.
       epoch: (prev?.epoch ?? 0) + 1,
       models: normalizeModelTokenUsage(args.usage.models, args.usage),
     };
-    sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
+    sessionBaselineMemory.set(baselineMemoryKey(dir, args.larkAppId, args.sessionId), baseline);
     state.sessions[args.sessionId] = baseline;
     saveState(dir, args.larkAppId, state, now);
   } catch (err: any) {
@@ -540,7 +550,7 @@ function ledgerArgsForDaemonSession(ds: DaemonSession): Omit<RecordSessionUsageA
     cwd: workingDir,
     larkAppId: ds.larkAppId ?? s.larkAppId,
     fresh: true,
-  });
+  }, true);
   return {
     sessionId: s.sessionId,
     usage,
@@ -559,7 +569,12 @@ export function recordUsageForDaemonSession(ds: DaemonSession, opts?: DaemonSess
   try {
     const args = ledgerArgsForDaemonSession(ds);
     if (!args.usage) return null;
-    return recordSessionUsage({ ...args, usage: args.usage, ...opts });
+    const dir = opts?.ledgerDir ?? defaultLedgerDir();
+    const state = loadState(dir, args.larkAppId);
+    const baseline = resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId]);
+    return baseline
+      ? recordUsageSinceBaseline(ds, { ...args, usage: args.usage }, baseline, opts)
+      : recordSessionUsage({ ...args, usage: args.usage, ...opts });
   } catch (err: any) {
     logger.error(`usage-ledger: failed to record daemon session usage: ${err?.message ?? err}`);
     return null;
@@ -656,6 +671,38 @@ export function recordOwnershipForDaemonSession(ds: DaemonSession, opts?: Daemon
   }
 }
 
+function recordUsageSinceBaseline(
+  ds: DaemonSession, args: RecordSessionUsageArgs, baseline: SessionBaseline,
+  opts?: DaemonSessionLedgerOpts,
+): UsageLedgerRecord | null {
+  // Preserve native per-model snapshots where the CLI provides them.
+  if (args.usage.models || (args.cliId !== 'codex' && args.cliId !== 'traex')) {
+    return recordSessionUsage({ ...args, ...opts });
+  }
+  const previous = { ...args.usage, ...baseline, nativeCheckpoint: baseline.nativeCheckpoint };
+  const fields = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreateTokens'] as const;
+  if (fields.every(k => previous[k] === args.usage[k])
+      && (!baseline.nativeCheckpoint || baseline.nativeCheckpoint === args.usage.nativeCheckpoint)) return null;
+  const recovered = getSessionUsageRecovery({
+    cliId: ds.session.cliId ?? 'unknown', sessionId: args.sessionId,
+    cliSessionId: ds.session.cliSessionId, cwd: args.workingDir, larkAppId: args.larkAppId,
+  }, previous, args.usage);
+  if (recovered) {
+    let record: UsageLedgerRecord | null = null;
+    const key = baselineMemoryKey(opts?.ledgerDir ?? defaultLedgerDir(), args.larkAppId, args.sessionId);
+    for (const point of recovered) {
+      const before = sessionBaselineMemory.get(key);
+      record = recordSessionUsage({ ...args, ...opts, usage: point.usage, occurredAt: point.at });
+      if (!record && (!point.reset || sessionBaselineMemory.get(key) === before)) break;
+    }
+    return record;
+  }
+  if (fields.some(k => args.usage[k] < previous[k])) return recordSessionUsage({ ...args, ...opts });
+  // Preserve the checkpoint for retry; an unproven interval must not be billed as today's usage.
+  logger.warn(`usage-ledger: attribution pending for session ${args.sessionId}`);
+  return null;
+}
+
 /**
  * Daemon-restart restore: a turn that was in flight when the daemon died may
  * have finished inside tmux while we were away — that work was submitted by
@@ -669,8 +716,9 @@ export function reconcileUsageForDaemonSession(ds: DaemonSession, opts?: DaemonS
     if (!args.usage) return null;
     const dir = opts?.ledgerDir ?? defaultLedgerDir();
     const state = loadState(dir, args.larkAppId);
-    if (resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId])) {
-      return recordSessionUsage({ ...args, usage: args.usage, ...opts });
+    const baseline = resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId]);
+    if (baseline) {
+      return recordUsageSinceBaseline(ds, { ...args, usage: args.usage }, baseline, opts);
     }
     anchorSessionUsage({ ...args, usage: args.usage, ...opts });
     return null;

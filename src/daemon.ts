@@ -33370,7 +33370,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const bot = getBot(record.larkAppId);
       const budget = bot?.config?.budget;
       if (!budget) return;
-      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
+      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget, occurredAt: new Date(record.ts), recordId: record.recordId });
       if (alert) {
         const ownerOpenId = getConfiguredOwnerOpenId(record.larkAppId);
         if (ownerOpenId) {
