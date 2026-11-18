@@ -13,7 +13,7 @@
  */
 
 import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, readlinkSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   extractTurnStartText,
   isMeaningfulQueuedCommand,
@@ -50,6 +50,9 @@ export interface RewindCheckpoint {
  *  writableTreeRoot）。给出时，打开之后还要证明打开的就是树里那个文件。 */
 export interface TranscriptTreeScope {
   writableTreeRoot?: string;
+  /** 截断前的备份放在这里，而不是 transcript 旁边。给了 writableTreeRoot 时必填：
+   *  那棵树里不再创建任何文件，备份只进会话 CLI 写不到的目录。 */
+  backupDir?: string;
 }
 
 const CHUNK_BYTES = 1 << 20;
@@ -347,7 +350,7 @@ export function rewindClaudeTranscript(
  *  between validation and use, and a path-based copy would then read whatever
  *  the link points at (host data the daemon can read but the sandbox cannot)
  *  into the agent-readable backup. */
-function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number, scope: TranscriptTreeScope = {}): void {
+function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: number): void {
   const dstFd = openSync(
     backupPath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -357,9 +360,6 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
     if (!fstatSync(dstFd).isFile()) {
       throw new Error(`refusing to write rewind backup to non-regular file ${backupPath}`);
     }
-    // Created through the same path as the transcript: before a byte is
-    // written, it must be the file under the tree, not one a link put elsewhere.
-    if (scope.writableTreeRoot) assertOpenedInsideTree(dstFd, backupPath, scope.writableTreeRoot);
     const buf = Buffer.allocUnsafe(BACKUP_COPY_CHUNK_BYTES);
     let copied = 0;
     while (copied < size) {
@@ -385,13 +385,7 @@ function copyBackupFromDescriptor(srcFd: number, backupPath: string, size: numbe
       throw new Error(`rewind backup short write (${fstatSync(dstFd).size}/${size} bytes)`);
     }
   } catch (err) {
-    // Remove what this call created, and only that: the path may name another
-    // file by now. The open descriptor keeps the inode from being reused.
-    try {
-      const created = fstatSync(dstFd);
-      const atPath = lstatSync(backupPath);
-      if (atPath.dev === created.dev && atPath.ino === created.ino) unlinkSync(backupPath);
-    } catch { /* gone already */ }
+    try { unlinkSync(backupPath); } catch { /* may not have been created */ }
     throw err;
   } finally {
     closeSync(dstFd);
@@ -415,9 +409,16 @@ function rewindOpenTranscript(
     if (byte[0] !== 10) throw new Error(`rewind offset ${offset} is not at a line boundary`);
   }
   const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
-  const backupPath = `${path}.rewind-${stamp}.bak`;
+  // A tree the session's CLI can write to gets no file from here: neither a
+  // check before creating it nor a cleanup after can keep a path in such a
+  // tree pointing where it pointed.
+  if (opts.writableTreeRoot && !opts.backupDir) {
+    throw new Error(`refusing to rewind ${path}: no backup directory outside the CLI-writable tree`);
+  }
+  const backupName = `${basename(path)}.rewind-${stamp}.bak`;
+  const backupPath = opts.backupDir ? join(opts.backupDir, backupName) : `${path}.rewind-${stamp}.bak`;
   opts.beforeBackup?.();
-  copyBackupFromDescriptor(fd, backupPath, st.size, opts);
+  copyBackupFromDescriptor(fd, backupPath, st.size);
   ftruncateSync(fd, offset);
   return { backupPath, removedBytes: st.size - offset };
 }

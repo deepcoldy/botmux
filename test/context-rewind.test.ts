@@ -247,27 +247,44 @@ describe('会话记录路径经过 CLI 可写的树', () => {
     expect(readdirSync(join(outside, 'key'))).toEqual(['session.jsonl']);
   });
 
-  it('备份创建时祖先目录被换成链接：拒绝，树外不留备份，源文件不截断', () => {
-    const { root, projects, path, outside, swapForLink } = treeFixture();
+  it('树内的会话记录没给备份目录：拒绝截断，树里不创建任何文件', () => {
+    const { root, path } = treeFixture();
     const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
     const size = statSync(path).size;
-    expect(() => rewindClaudeTranscript(path, latest!.offset, Date.now(), {
+    expect(() => rewindClaudeTranscript(path, latest!.offset, Date.now(), { writableTreeRoot: root }))
+      .toThrow(/no backup directory/);
+    expect(statSync(path).size).toBe(size);
+    expect(readdirSync(dirname(path))).toEqual(['session.jsonl']);
+  });
+
+  it('树内的会话记录：备份写进给定目录；备份前祖先目录被换成链接也碰不到树外', () => {
+    const { root, projects, path, outside, swapForLink } = treeFixture();
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-'));
+    dirs.push(backupDir);
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    const result = rewindClaudeTranscript(path, latest!.offset, Date.UTC(2026, 10, 18), {
       writableTreeRoot: root,
-      // The source is open and checked by now; the backup is created by path.
+      backupDir,
       beforeBackup: () => swapForLink(join(projects, 'key'), join(outside, 'key')),
-    })).toThrow(/not the one under|not a directory/);
+    });
+    expect(dirname(result.backupPath)).toBe(backupDir);
+    expect(readFileSync(result.backupPath, 'utf8')).toContain('第二轮');
     expect(readdirSync(join(outside, 'key'))).toEqual(['session.jsonl']);
-    expect(statSync(join(projects, 'key.aside', 'session.jsonl')).size).toBe(size);
+    // The cut landed on the descriptor opened before the swap.
+    expect(statSync(join(projects, 'key.aside', 'session.jsonl')).size).toBe(latest!.offset);
   });
 
   it('withOpenTranscript：扫描与截断走同一个描述符，截在扫描读的那个文件上', () => {
     const { root, path } = treeFixture();
-    const result = withOpenTranscript(path, { writableTreeRoot: root }, transcript => {
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-'));
+    dirs.push(backupDir);
+    const result = withOpenTranscript(path, { writableTreeRoot: root, backupDir }, transcript => {
       const [latest] = transcript.scan(10);
       expect(latest!.preview).toBe('第二轮');
       return { cut: transcript.cut(latest!.offset, Date.UTC(2026, 10, 18)), offset: latest!.offset };
     });
     expect(statSync(path).size).toBe(result.offset);
+    expect(dirname(result.cut.backupPath)).toBe(backupDir);
     expect(readFileSync(result.cut.backupPath, 'utf8')).toContain('第二轮');
   });
 
@@ -283,7 +300,9 @@ describe('会话记录路径经过 CLI 可写的树', () => {
   it('withOpenTranscript：扫描之后路径被删掉重建（inode 号可能被复用）：拒绝截断，新文件不动', () => {
     const { root, path } = treeFixture();
     const replacement = readFileSync(path, 'utf8');
-    expect(() => withOpenTranscript(path, { writableTreeRoot: root }, transcript => {
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-'));
+    dirs.push(backupDir);
+    expect(() => withOpenTranscript(path, { writableTreeRoot: root, backupDir }, transcript => {
       const [latest] = transcript.scan(10);
       rmSync(path);
       writeFileSync(path, replacement);
@@ -291,6 +310,7 @@ describe('会话记录路径经过 CLI 可写的树', () => {
     })).toThrow(/replaced between validation and open/);
     expect(readFileSync(path, 'utf8')).toBe(replacement);
     expect(readdirSync(dirname(path))).toEqual(['session.jsonl']);
+    expect(readdirSync(backupDir)).toEqual([]);
   });
 
   it('withOpenTranscript：命名管道或链接一律拒绝打开', () => {

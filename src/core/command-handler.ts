@@ -12,7 +12,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
@@ -4014,9 +4014,13 @@ export async function handleCommand(
           : null;
         const rewindJsonl = rewindTranscript?.path ?? null;
         // Every read and the cut re-check the file they open against the tree
-        // the CLI can write to; the resolver's own check is from before.
+        // the CLI can write to; the resolver's own check is from before. The
+        // backup of such a transcript goes to a daemon-owned directory.
         const rewindScope = rewindTranscript?.writableTreeRoot
-          ? { writableTreeRoot: rewindTranscript.writableTreeRoot }
+          ? {
+              writableTreeRoot: rewindTranscript.writableTreeRoot,
+              backupDir: join(config.session.dataDir, 'rewind-backups', ds.session.sessionId),
+            }
           : {};
         if (!rewindJsonl) {
           await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
@@ -4201,6 +4205,7 @@ export async function handleCommand(
                   return asError(err, 'could not persist rewind state');
                 }
                 try {
+                  if (rewindScope.backupDir) mkdirSync(rewindScope.backupDir, { recursive: true, mode: 0o700 });
                   return { ok: true as const, result: transcript.cut(target.offset) };
                 } catch (err) {
                   // Cut never happened — restore the replay fields so the failed

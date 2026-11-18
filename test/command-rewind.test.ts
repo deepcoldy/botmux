@@ -625,6 +625,26 @@ describe('/rewind command', () => {
     expect(readdirSync(dirname(rewindState.jsonl)).filter(n => n.endsWith('.bak'))).toEqual([]);
   });
 
+  it('会话记录在 CLI 可写的树里：备份写进 daemon 数据目录，树里不留备份', async () => {
+    rewindState.jsonl = transcript();
+    rewindState.treeRoot = dirname(dirname(rewindState.jsonl));
+    const ds = makeDs();
+    const deps = makeDeps(ds);
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-data-'));
+    dirs.push(dataDir);
+    (config.session as any).dataDir = dataDir;
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('已回退');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B']);
+    const backupDir = join(dataDir, 'rewind-backups', ds.session.sessionId);
+    const backups = readdirSync(backupDir);
+    expect(backups).toHaveLength(1);
+    expect(lastReply(deps)).toContain(join(backupDir, backups[0]!));
+    expect(readFileSync(join(backupDir, backups[0]!), 'utf8')).toContain('"uC"');
+    expect(readdirSync(dirname(rewindState.jsonl)).filter(n => n.endsWith('.bak'))).toEqual([]);
+  });
+
   it('会话记录的项目目录在解析后被换成指向外部的链接：列表与确认都回复失败，外部内容不进回复、外部文件不被截断', async () => {
     rewindState.jsonl = transcript();
     const projectDir = dirname(rewindState.jsonl);
