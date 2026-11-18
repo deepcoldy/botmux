@@ -44,7 +44,9 @@ const RESUME_MARKERS = [
 const FAKE_CLI = `#!/bin/sh
 : > "$DUMP_DIR/args"
 for a in "$@"; do printf '%s\\n' "$a" >> "$DUMP_DIR/args"; done
-env > "$DUMP_DIR/env"
+# Publish only after env has finished writing: file existence is the reader's
+# completion signal, and worker ready IPC can arrive before the dump is complete.
+env > "$DUMP_DIR/env.tmp" && mv "$DUMP_DIR/env.tmp" "$DUMP_DIR/env"
 # The dsh-tui composer glyph: enough for the worker's idle detector to consider
 # the CLI ready, so the ready IPC (with its spawnCommand) is observable early.
 printf '\\342\\235\\257\\n'
