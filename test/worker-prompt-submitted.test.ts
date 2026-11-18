@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
-import { loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
+import { canStartInjectionFlush } from '../src/core/inject-queue-policy.js';
 
 interface Harness {
   child: ChildProcess;
@@ -203,13 +204,20 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
 
   function scopeWith(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     const sent: WorkerToDaemon[] = [];
+    const inFlightKeepaliveFingerprints = new Map<string, number>();
     return {
       isPromptReady: false,
       revokePromptReadiness: () => {},
       idleDetector: undefined,
       writtenInputs: { takeSubmitted: () => undefined },
-      inFlightKeepaliveFingerprints: new Map(),
+      inFlightKeepaliveFingerprints,
       KEEPALIVE_HOOK_CLAIM_MS: 30_000,
+      // Same semantics as the worker's module-level purge helper.
+      purgeExpiredKeepaliveFingerprints: (now: number = Date.now()) => {
+        for (const [fp, at] of inFlightKeepaliveFingerprints) {
+          if (now - at >= 30_000) inFlightKeepaliveFingerprints.delete(fp);
+        }
+      },
       send: (m: WorkerToDaemon) => { sent.push(m); },
       __sent: sent,
       ...overrides,
@@ -217,10 +225,16 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
   }
   const emitsProvenance = (scope: Record<string, unknown>) =>
     (scope.__sent as WorkerToDaemon[]).some(m => m.type === 'direct_submit_started');
+  // Seed the scope's own Map (the purge helper closes over this instance, so
+  // tests must mutate it rather than replace it).
+  const seedKeepalive = (scope: Record<string, unknown>, at: number = Date.now()) => {
+    (scope.inFlightKeepaliveFingerprints as Map<string, number>).set(keepaliveFingerprint, at);
+    return scope.inFlightKeepaliveFingerprints as Map<string, number>;
+  };
 
   it('suppresses direct_submit_started when the hook fingerprint matches an in-flight keep-alive', async () => {
-    const pending = new Map([[keepaliveFingerprint, Date.now()]]);
-    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
     await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
 
     expect(emitsProvenance(scope)).toBe(false);
@@ -228,8 +242,8 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
   });
 
   it('R8 reordering: a human hook arriving first still emits, and the late keep-alive hook is then suppressed', async () => {
-    const pending = new Map([[keepaliveFingerprint, Date.now()]]);
-    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
 
     await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: humanFingerprint });
     expect(emitsProvenance(scope)).toBe(true);
@@ -242,8 +256,8 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
   });
 
   it('R8 reordering: an expired keep-alive entry cannot suppress a later real submit with the same fingerprint', async () => {
-    const pending = new Map([[keepaliveFingerprint, Date.now() - 31_000]]);
-    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope, Date.now() - 31_000);
     await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
 
     expect(emitsProvenance(scope)).toBe(true);
@@ -251,8 +265,8 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
   });
 
   it('emits direct_submit_started when the hook carries no fingerprint (cannot be a matched keep-alive)', async () => {
-    const pending = new Map([[keepaliveFingerprint, Date.now()]]);
-    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
     await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
 
     expect(emitsProvenance(scope)).toBe(true);
@@ -263,5 +277,58 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
     const scope = scopeWith();
     await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: humanFingerprint });
     expect(emitsProvenance(scope)).toBe(true);
+  });
+
+  it('R9: a keep-alive entry survives an unrelated injection, so its late hook is still suppressed', async () => {
+    // The keep-alive was written and is awaiting its hook. An unrelated normal
+    // injection (e.g. /compact) writes in between; it must NOT clear the entry.
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
+
+    // The keep-alive's independent HTTP hook then arrives late.
+    await loadWorkerMessageHandler('prompt_submitted', scope)({
+      type: 'prompt_submitted', fingerprint: keepaliveFingerprint,
+    });
+
+    expect(emitsProvenance(scope)).toBe(false); // still recognized as keep-alive
+    expect(pending.has(keepaliveFingerprint)).toBe(false); // matched and consumed
+  });
+
+  it('R9 flush: writing a normal injection does not clear an unconfirmed keep-alive entry', async () => {
+    const keepaliveEntries = new Map([[keepaliveFingerprint, Date.now()]]);
+    const pendingInjections = [{ command: '/compact', barrier: false }];
+    const scope: Record<string, unknown> = {
+      nativeSessionForkPending: () => false,
+      codexModelMigrationCheckNeeded: () => false,
+      idleDetector: { isStartupPending: () => false, reset: () => {} },
+      cliRestartInProgress: false,
+      injectionFlushing: false,
+      userFlushing: false,
+      isFlushing: false,
+      commandLineWritesPending: 0,
+      pendingInjections,
+      pendingMessages: [],
+      pendingRawInputs: [],
+      pendingSessionRename: null,
+      backend: {},
+      isPromptReady: true,
+      bareShellLaunchBlocked: false,
+      sessionRenameInFlight: () => false,
+      bareShellChecked: true, // skip the bare-shell launch detector
+      canStartInjectionFlush,
+      revokePromptReadiness: () => {},
+      log: () => {},
+      sendRawCommandLineWithRecoveryFence: async () => {},
+      awaitPtyQuiescence: async () => {},
+      STARTUP_CMD_QUIET_MS: 1,
+      STARTUP_CMD_CAP_MS: 10,
+      inFlightKeepaliveFingerprints: keepaliveEntries,
+      KEEPALIVE_HOOK_CLAIM_MS: 30_000,
+    };
+
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', scope)();
+
+    expect(pendingInjections).toHaveLength(0); // the /compact was written
+    expect(keepaliveEntries.has(keepaliveFingerprint)).toBe(true); // entry retained
   });
 });

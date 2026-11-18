@@ -18296,6 +18296,16 @@ let injectionFlushing = false;
 const KEEPALIVE_HOOK_CLAIM_MS = 30_000;
 const inFlightKeepaliveFingerprints = new Map<string, number>();
 
+/** Drop keep-alive entries whose UserPromptSubmit hook never arrived within the
+ *  bounded claim window. Entries are otherwise retained until an exact
+ *  fingerprint match (or process teardown): an unrelated injection must not
+ *  clear a keep-alive whose independent HTTP hook is simply late. */
+function purgeExpiredKeepaliveFingerprints(now: number = Date.now()): void {
+  for (const [fp, at] of inFlightKeepaliveFingerprints) {
+    if (now - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
+  }
+}
+
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
   if (nativeSessionForkPending()) return;
@@ -18345,11 +18355,14 @@ async function flushPendingInjections(): Promise<void> {
       const cmd = item.command;
       // Record the keep-alive by its actual command fingerprint so the later
       // UserPromptSubmit hook can be matched by content regardless of HTTP
-      // arrival ordering. Other injections clear any stale entries.
+      // arrival ordering. A non-keepalive injection does NOT touch existing
+      // entries: its write is unrelated to a keep-alive whose hook may still be
+      // in flight, and clearing them would let a late keep-alive hook be
+      // misread as a human direct-submit. Entries leave only on exact match,
+      // expiry purge, or process teardown.
       if (item.kind === 'keepalive') {
+        purgeExpiredKeepaliveFingerprints();
         inFlightKeepaliveFingerprints.set(fingerprintPromptText(cmd), Date.now());
-      } else {
-        inFlightKeepaliveFingerprints.clear();
       }
       revokePromptReadiness();
       idleDetector?.reset();
@@ -39283,9 +39296,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // window are treated as abandoned (their hook was lost) and purged, so a
       // missing fingerprint or no match always falls through to a real submit.
       const now = Date.now();
-      for (const [fp, at] of inFlightKeepaliveFingerprints) {
-        if (now - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
-      }
+      purgeExpiredKeepaliveFingerprints(now);
       const fromKeepalive = typeof msg.fingerprint === 'string'
         && inFlightKeepaliveFingerprints.has(msg.fingerprint);
       if (fromKeepalive) inFlightKeepaliveFingerprints.delete(msg.fingerprint!);
