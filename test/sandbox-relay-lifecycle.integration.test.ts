@@ -184,13 +184,53 @@ setInterval(() => {}, 1 << 30);
   // exited unexpectedly`. Scoped to the pane so unrelated kills/probes
   // (diagnostic sessions, backend selection) neither arm nor count.
   const exitingServerFlag = join(dir, 'exiting-server-on-post-kill-probe');
+  // `failPipePane` creates THIS session first, then rejects its subscription,
+  // exercising a spawn failure after the pane exists.
+  const failPipePaneFlag = join(dir, 'fail-pipe-pane');
   // `cliDiesBeforePipePane` makes the fake CLI print one line and exit 3 the
-  // moment it starts, and holds the worker's pipe-pane of THIS pane until tmux
-  // reports the pane dead: the fresh launch then meets a pane whose CLI is
-  // already gone when pipe-pane attaches (`target pane has exited`) — the
-  // shape CI hit in #3470, made deterministic instead of a startup race.
+  // moment it starts. The shim splits the creating queue and holds only its
+  // pipe-pane suffix until tmux reports the pane dead, preserving the #3470
+  // diagnostic shape without delaying (and timing out) new-session itself.
   const holdPipePaneFlag = join(dir, 'hold-pipe-pane-until-dead');
   const paneMarker = isolationPaneMarkerPath(dataDir, sessionId);
+  const interruptPipePane = join(dir, 'interrupt-pipe-pane.cjs');
+  writeFileSync(interruptPipePane, `
+const { spawnSync } = require('node:child_process');
+const [mode, real, socketPath, pane, ...args] = process.argv.slice(2);
+const create = args.indexOf('new-session');
+const boundary = args.lastIndexOf(';');
+const queued = create >= 0 && boundary > create && args.slice(boundary + 1)
+  .some(arg => arg === 'pipe-pane' || arg.startsWith('pipe-pane '));
+const run = argv => {
+  const result = spawnSync(real, ['-S', socketPath, ...argv], { stdio: 'inherit' });
+  if (result.error) console.error(String(result.error));
+  return result.error ? 1 : (result.status ?? 1);
+};
+if (mode === 'fail' && !queued) {
+  console.error('pipe-pane refused by test');
+  process.exit(1);
+}
+// Execute new-session and remain-on-exit first. Their printed identity must
+// reach the caller exactly as it does when a real queued subscription fails.
+if (queued) {
+  const status = run(args.slice(0, boundary));
+  if (status !== 0) process.exit(status);
+}
+if (mode === 'hold') {
+  for (let i = 0; i < 400; i++) {
+    const reply = spawnSync(real, [
+      '-S', socketPath, 'display-message', '-p', '-t', pane, '#{pane_dead}',
+    ], { encoding: 'utf8' });
+    if (reply.stdout.trim() === '1') break;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+}
+if (mode === 'fail') {
+  console.error('pipe-pane refused by test');
+  process.exit(1);
+}
+process.exit(run(queued ? args.slice(boundary + 1) : args));
+`, { mode: 0o700 });
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
 if [ -e '${failNewSessionFlag}' ]; then
   creating=0; ours=0
@@ -230,18 +270,16 @@ if [ -e '${exitingServerFlag}' ]; then
     done
   fi
 fi
-if [ -e '${holdPipePaneFlag}' ]; then
+if [ -e '${failPipePaneFlag}' ] || [ -e '${holdPipePaneFlag}' ]; then
+  mode=fail
+  [ -e '${holdPipePaneFlag}' ] && mode=hold
   piping=0; ours=0
   for arg in "$@"; do
     case "$arg" in *pipe-pane*) piping=1 ;; esac
     case "$arg" in *'${paneTarget}'*) ours=1 ;; esac
   done
   if [ $piping = 1 ] && [ $ours = 1 ]; then
-    i=0
-    while [ $i -lt 400 ]; do
-      [ "$('${realTmux}' -S '${socket}' display-message -p -t '${paneTarget}' '#{pane_dead}' 2>/dev/null)" = 1 ] && break
-      sleep 0.05; i=$((i + 1))
-    done
+    exec node '${interruptPipePane}' "$mode" '${realTmux}' '${socket}' '${paneTarget}' "$@"
   fi
 fi
 if [ -e '${corruptProofFlag}' ]; then
@@ -298,6 +336,7 @@ exec '${realTmux}' -S '${socket}' "$@"
       try { process.kill(pid, 0); return true; } catch { return false; }
     },
     failNewSession: (): void => writeFileSync(failNewSessionFlag, ''),
+    failPipePane: (): void => writeFileSync(failPipePaneFlag, ''),
     corruptProofOnPipePane: (): void => writeFileSync(corruptProofFlag, ''),
     cliDiesBeforePipePane: (): void => {
       writeFileSync(join(workDir, DIE_ON_START_BASENAME), '');
@@ -548,15 +587,17 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
     }
   }, 120_000);
 
-  // tmux creates the detached pane first, then the FIFO / wake fd / pipe-pane.
-  // A failure after the pane exists must retire exactly that pane before the
-  // tree goes — and keep the tree when that cannot be proven.
+  // tmux prepares the FIFO/reader, then creates the pane and subscribes in one
+  // server queue. A subscription failure after the pane exists must retire
+  // exactly that pane before the tree goes — and keep the tree when that cannot
+  // be proven.
   it.skipIf(!realTmux || !runtime)('tmux × fresh launch failing after its pane exists: retires that pane, then rolls the tree back', async () => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
-      const first = lab.start('boot-1', { env: { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } });
+      lab.failPipePane();
+      const first = lab.start('boot-1');
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('EMFILE: injected by test');
+      expect(first.errors().join('\n'), first.logs()).toContain('pipe-pane refused by test');
       expect(first.logs()).toContain('retired the tmux session it had created');
       expect(lab.paneAlive()).toBe(false);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
@@ -600,9 +641,10 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
       lab.failKillSession(true);
-      const first = lab.start('boot-1', { env: { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } });
+      lab.failPipePane();
+      const first = lab.start('boot-1');
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('EMFILE: injected by test');
+      expect(first.errors().join('\n'), first.logs()).toContain('pipe-pane refused by test');
       expect(first.logs()).toContain('keeping the sandbox tree for the pane that may still run');
       expect(lab.paneAlive()).toBe(true);
       expect(existsSync(lab.outbox), first.logs()).toBe(true);
