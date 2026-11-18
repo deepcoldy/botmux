@@ -11,7 +11,8 @@ import { ProjectCoordinator } from './project-coordinator.js';
 /** One process-wide coordinator keeps projection updates serialized while the
  * durable ProjectStore remains the cross-restart source of truth. */
 export const projectCoordinator = new ProjectCoordinator({
-  sendCard: (larkAppId, chatId, cardJson) => sendMessage(larkAppId, chatId, cardJson, 'interactive'),
+  sendCard: (larkAppId, chatId, cardJson, publication) => sendMessage(larkAppId, chatId, cardJson, 'interactive', publication?.uuid, undefined,
+    publication ? {beforeWrite: publication.beforeSend} : undefined),
   updateCard: (larkAppId, messageId, cardJson) => updateMessage(larkAppId, messageId, cardJson),
   pinMessage: async (larkAppId, messageId) => !!(await pinMessage(larkAppId, messageId)),
   unpinMessage: async (larkAppId, messageId) => !!(await unpinMessage(larkAppId, messageId)),

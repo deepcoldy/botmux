@@ -43,7 +43,8 @@ export async function applyProjectProjection(context: ProjectCoordinatorContext,
       createdAt:current?.createdAt ?? now,updatedAt:now,
       projection:{providerId:input.providerId,sourceId:input.sourceId,revision:input.revision,hash,stateLabel}};
   }))!;
-  if(stale || project.projection?.appliedHash===hash)return project;
+  if(stale || project.projection?.appliedHash===hash && !project.cardReplacement && project.card?.pinned
+    && !project.retiredCards?.some(card=>card.pinned))return project;
   await deps.writeBoard(input,hash);
   await deps.publish(project);
   return (await deps.mutate(current=>{

@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import {applyProjectProjection, type ProjectProjection} from './project-projection.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
@@ -22,7 +23,7 @@ import {
 } from './group-collaboration-mode-store.js';
 
 export interface ProjectCoordinatorTransport {
-  sendCard(larkAppId: string, chatId: string, cardJson: string): Promise<string>;
+  sendCard(larkAppId: string, chatId: string, cardJson: string, publication?: {uuid: string; beforeSend: () => Promise<void>}): Promise<string>;
   updateCard(larkAppId: string, messageId: string, cardJson: string): Promise<void>;
   pinMessage(larkAppId: string, messageId: string): Promise<boolean>;
   unpinMessage(larkAppId: string, messageId: string): Promise<boolean>;
@@ -419,8 +420,87 @@ export class ProjectCoordinator {
     return next;
   }
 
+  private async replaceUneditableCard(context: ProjectCoordinatorContext, project: ProjectGroupState): Promise<ProjectGroupState> {
+    let pending = project.cardReplacement!;
+    if (!pending.messageId) {
+      const withinWindow = () => {
+        if (pending.startedAt !== undefined && (Date.now() < pending.startedAt || Date.now() - pending.startedAt >= 55 * 60 * 1000)) {
+          throw new Error('project_card_replacement_outcome_unknown');
+        }
+      };
+      withinWindow();
+      const messageId = await this.transport.sendCard(project.larkAppId, project.chatId, pending.content, {
+        uuid: pending.uuid,
+        beforeSend: async () => {
+          withinWindow();
+          project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+            if (!current || current.larkAppId !== context.larkAppId || current.card?.messageId !== pending.previous.messageId
+              || current.cardReplacement?.uuid !== pending.uuid) throw new Error('project_card_replacement_changed');
+            current.cardReplacement.startedAt ??= Date.now();
+            return current;
+          }))!;
+          pending = project.cardReplacement!;
+        },
+      });
+      project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+        if (!current || current.cardReplacement?.uuid !== pending.uuid) throw new Error('project_card_replacement_changed');
+        current.cardReplacement.messageId = messageId;
+        return current;
+      }))!;
+      pending = project.cardReplacement!;
+    }
+    const messageId = pending.messageId!;
+    const pinned = await this.transport.pinMessage(project.larkAppId, messageId);
+    return (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      if (!current || current.cardReplacement?.uuid !== pending.uuid || current.card?.messageId !== pending.previous.messageId) {
+        throw new Error('project_card_replacement_changed');
+      }
+      current.retiredCards ??= [];
+      current.retiredCards.push({...pending.previous, reason: pending.reason, replacedBy: messageId, retiredAt: nowIso()});
+      current.card = {messageId, pinned, updatedAt: current.updatedAt};
+      delete current.cardReplacement;
+      return current;
+    }))!;
+  }
+
+  private async publishReplacement(context: ProjectCoordinatorContext, project: ProjectGroupState): Promise<ProjectGroupState> {
+    const content = project.cardReplacement!.content;
+    project = await this.replaceUneditableCard(context, project);
+    const mode = readGroupCollaborationMode(context.dataDir, context.chatId);
+    const current = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), mode?.progressCard));
+    if (content !== current) return this.publish(context, project);
+    project = await this.retireSupersededPins(context, project);
+    await this.retireOnboardingCard(context);
+    return project;
+  }
+
+  private async retireSupersededPins(context: ProjectCoordinatorContext, project: ProjectGroupState): Promise<ProjectGroupState> {
+    if (!project.card?.pinned) return project;
+    for (const previous of project.retiredCards ?? []) {
+      if (!previous.pinned) continue;
+      try {
+        if (!await this.transport.unpinMessage(project.larkAppId, previous.messageId)) continue;
+      } catch (error) {
+        if (!this.transport.isMessageWithdrawn(error)) continue;
+      }
+      project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+        if (!current || current.card?.messageId !== project.card?.messageId || !current.card?.pinned) {
+          throw new Error('project_card_replacement_changed');
+        }
+        const retired = current.retiredCards?.find(card => card.messageId === previous.messageId);
+        if (retired) retired.pinned = false;
+        return current;
+      }))!;
+    }
+    return project;
+  }
+
   private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState): Promise<ProjectGroupState> {
     let project = initial;
+    if (project.cardReplacement) {
+      // Reuse the frozen send across a lost reply, then publish the latest snapshot.
+      return this.publishReplacement(context, project);
+    }
     const resolutions = await Promise.all(project.workstreams
       .filter(item => !item.threadId)
       .map(async item => ({ dispatchRoot: item.dispatchRoot, threadId: await this.transport.resolveThreadId(project.larkAppId, item.dispatchRoot) })));
@@ -447,12 +527,32 @@ export class ProjectCoordinator {
           current.card.updatedAt = current.updatedAt;
           return current;
         }))!;
+        if (!project.card?.pinned) {
+          const pinned = await this.transport.pinMessage(project.larkAppId, project.card!.messageId);
+          project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+            if (!current || current.card?.messageId !== project.card?.messageId) throw new Error('project_card_replacement_changed');
+            current.card!.pinned = pinned;
+            return current;
+          }))!;
+        }
+        project = await this.retireSupersededPins(context, project);
         // If a previous first-publish attempt persisted and pinned the active
         // card but failed to retire the guide, retry that cleanup on refresh.
         await this.retireOnboardingCard(context);
         return project;
       } catch (error) {
-        if (!this.transport.isMessageWithdrawn(error)) throw error;
+        const reason = this.transport.isMessageUpdateExpired(error) ? 'expired'
+          : this.transport.isMessageWithdrawn(error) ? 'withdrawn' : null;
+        if (!reason) throw error;
+        project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+          if (!current || current.larkAppId !== context.larkAppId || current.card?.messageId !== project.card?.messageId) {
+            throw new Error('project_card_replacement_changed');
+          }
+          current.cardReplacement ??= {previous: {...current.card!}, reason, content: cardJson,
+            uuid: 'project_' + createHash('sha256').update(current.larkAppId + ':' + current.chatId + ':' + current.card!.messageId).digest('hex').slice(0,40)};
+          return current;
+        }))!;
+        return this.publishReplacement(context, project);
       }
     }
     // Starting a project must be visible at the current point in the chat.

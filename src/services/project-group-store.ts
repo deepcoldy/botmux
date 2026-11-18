@@ -51,6 +51,17 @@ export interface ProjectGroupState {
     pinned: boolean;
     updatedAt: string;
   };
+  cardReplacement?: {
+    previous: NonNullable<ProjectGroupState['card']>;
+    reason: 'expired' | 'withdrawn';
+    uuid: string;
+    content: string;
+    startedAt?: number;
+    messageId?: string;
+  };
+  retiredCards?: Array<NonNullable<ProjectGroupState['card']> & {
+    reason: 'expired' | 'withdrawn'; replacedBy: string; retiredAt: string;
+  }>;
   createdAt: string;
   updatedAt: string;
 }
