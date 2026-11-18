@@ -459,4 +459,73 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(ds.asyncTriggerResults!.has('turn-feishu')).toBe(false);
     expect(recordCompletedMock).not.toHaveBeenCalled();
   });
+
+  it('settles a pending async result fail-closed on an unobserved transcript boundary', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['turn-unobserved', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([['turn-unobserved', {
+      ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1,
+    } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-unobserved', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('turn-unobserved')?.status).toBe('failed'));
+    expect(ds.asyncTriggerResults!.get('turn-unobserved')).toMatchObject({
+      status: 'failed',
+      errorCode: 'trigger_failed',
+      terminalErrorCode: 'turn_ended_unobserved',
+    });
+    // Durable persistence keeps the same fail-closed classification across restarts.
+    expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(
+      'sid-async-settle', 'turn-unobserved', expect.any(Number), 'app_test', 'turn_ended_unobserved',
+    );
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    // Late output may never fall through to IM for a turn settled here.
+    expect(ds.settledHttpTerminalTurns?.has('turn-unobserved')).toBe(true);
+    // Worker-exit convergence entry dropped (by triggerId).
+    expect(ds.idempotentAsyncTurns!.get('turn-unobserved')).toBeUndefined();
+  });
+
+  it('keeps a final_output completion stronger than an unobserved boundary', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([[
+      'turn-partial', { status: 'completed', content: 'partial answer' } as any,
+    ]]);
+    ds.idempotentAsyncTurns = new Map([['turn-partial', {
+      ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1,
+    } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-partial', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ds.asyncTriggerResults!.get('turn-partial')).toMatchObject({
+      status: 'completed',
+      content: 'partial answer',
+    });
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
+    // Known output wins, but the convergence entry is still released.
+    expect(ds.idempotentAsyncTurns!.get('turn-partial')).toBeUndefined();
+  });
+
+  it('settles a durable pending trigger after the in-memory projection is gone', async () => {
+    const ds = makeDs();
+    ds.chatId = 'http_async_fixture';             // daemon restarted: no in-memory entry
+    ds.asyncTriggerResults = new Map();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-restart', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await vi.waitFor(() => expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(
+      'sid-async-settle', 'turn-restart', expect.any(Number), 'app_test', 'turn_ended_unobserved',
+    ));
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
 });

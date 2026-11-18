@@ -1330,6 +1330,12 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
 }
 
 const TURN_EXPLICIT_MENTION_MAX = 64;
+/** terminalErrorCode used when the claude transcript bridge ends a turn at a
+ *  screen-idle boundary WITHOUT ever observing an explicit transcript terminal
+ *  (`turn_terminal outputDisposition:'boundary_unobserved'` from the worker) —
+ *  the killed-CLI-mid-turn shape. Surfaces to async pollers as
+ *  state=failed / errorCode=trigger_failed / terminalErrorCode=below. */
+const TURN_ENDED_UNOBSERVED = 'turn_ended_unobserved';
 /** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
  *  larger than any plausible replay window within one session's lifetime. */
 const SILENT_RECEIPT_DEDUPE_MAX = 64;
@@ -17370,6 +17376,83 @@ function setupWorkerHandlers(
             // concurrent sibling keyed turn's convergence entry is untouched.
             ds.idempotentAsyncTurns?.delete(msg.turnId);
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
+          }
+        }
+        // Async-HTTP settle-on-UNOBSERVED-boundary (headless residual-running):
+        // the claude transcript bridge pops a started turn at a screen-idle
+        // boundary when the CLI never produced an explicit transcript terminal.
+        // The dominant cause is the CLI dying mid-turn (killed/crashed) — the
+        // frozen pane still matches the idle detector, so the pop fires and
+        // `emitReadyTurns` emits `completed` with NO final_output. Neither the
+        // failure gate above (completed ≠ failed/ambiguous) nor the
+        // nothing_to_send arm (no disposition) settles it, so the durable
+        // async trigger stays `pending` while the session record stays `open`
+        // — `headless wait`/trigger-result then resolve `running` FOREVER (the
+        // session even auto-restarts into an idle REPL and leaks). The worker
+        // now labels that shape `outputDisposition: 'boundary_unobserved'` so
+        // the daemon can keep its positive-evidence policy and still converge:
+        // for the claude bridge, final_output is guaranteed to precede this
+        // terminal (same-worker IPC ordering), so a still-pending result can
+        // never receive an answer afterwards — settle it fail-closed. The
+        // RPC-hydration shape deliberately does NOT carry this label, and a
+        // bare `completed` still settles nothing (the guard above is untouched).
+        // Feishu turns have no asyncTriggerResults entry, so they are unaffected.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'boundary_unobserved'
+          && !ds.session.vcMeetingReceiver) {
+          const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+          const asyncSink = !!asyncResult
+            || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
+          if (asyncSink) {
+            if (asyncResult?.status === 'completed') {
+              // A partial answer was already published as final_output (killed
+              // mid-answer). Known output is stronger than the unobserved
+              // boundary — keep it, only release the convergence entry.
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Ignored unobserved terminal for completed async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else {
+              if (asyncResult?.status === 'pending') {
+                const failedAt = Date.now();
+                asyncResult.status = 'failed';
+                asyncResult.failedAt = failedAt;
+                asyncResult.errorCode = 'trigger_failed';
+                asyncResult.terminalErrorCode = TURN_ENDED_UNOBSERVED;
+              }
+              rememberHttpTerminal(ds, msg.turnId);
+              try {
+                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                  ds.session.sessionId,
+                  msg.turnId,
+                  Date.now(),
+                  ds.larkAppId,
+                  TURN_ENDED_UNOBSERVED,
+                );
+                if (outcome === 'already_completed') {
+                  // Durable completed proof (e.g. a racing final_output persist)
+                  // is stronger. Drop the stale in-memory projection so
+                  // trigger-result reads that proof instead.
+                  ds.asyncTriggerResults?.delete(msg.turnId);
+                }
+              } catch (err) {
+                // The live failed projection still terminates current-daemon
+                // polling. Keep it when durable persistence is unavailable and
+                // report the lost restart guarantee explicitly (mirrors the
+                // failure gate above).
+                logger.error(
+                  `[${t}] Failed to persist async unobserved-terminal for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
+                + `failed (${TURN_ENDED_UNOBSERVED})`,
+              );
+            }
           }
         }
         // Resolve the terminal-strip route once and share it with the legacy

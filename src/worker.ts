@@ -7659,12 +7659,29 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         + `(${outcome.status}${outcome.errorCode ? `/${outcome.errorCode}` : ''}) — no Lark turn to notify`);
       continue;
     }
+    // Output disposition, positive evidence only:
+    //  - genuine silence (bare nothing-to-send sentinel, no `botmux send`) →
+    //    'nothing_to_send'; a durable/async caller may settle completed-empty.
+    //  - NO explicit transcript terminal at all (`terminalOutcome` undefined:
+    //    no assistant stop_reason record, no API-error record) and not silence →
+    //    'boundary_unobserved'. The turn was popped at a screen-idle boundary
+    //    that proves nothing: the dominant cause is the CLI dying mid-turn
+    //    (killed/crashed — a frozen pane still matches the idle detector), so
+    //    claiming plain `completed` here would let the daemon leave a pending
+    //    async trigger `running` forever (residual headless state) while the
+    //    session auto-restarts into an idle REPL. The label lets the daemon
+    //    settle fail-closed instead. A turn with a real terminal outcome keeps
+    //    the label absent.
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
       outcome && outcome.status !== 'completed' ? outcome.errorCode : undefined,
       turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      nothingToSendTurns.has(turn)
+        ? 'nothing_to_send'
+        : !outcome
+          ? 'boundary_unobserved'
+          : undefined,
       outcome && outcome.status !== 'completed' ? outcome.retryable : undefined,
     );
   }
@@ -24257,7 +24274,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  outputDisposition?: 'nothing_to_send',
+  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved',
   retryable?: boolean,
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
