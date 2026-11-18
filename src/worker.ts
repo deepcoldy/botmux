@@ -6906,6 +6906,18 @@ function observeTraexAutoModelCapacity(screen: string): void {
         || currentBotmuxTurnId !== action.turnId || commandLineWritesPending > 0
         || isFlushing || traexQuotaPending || controller.recoveryStopped(action.turnId)
         || traexAutoModelTurnReplayForbidden) {
+        // Discarding is not a failed read: name what changed, or the ordered
+        // fallback that follows looks like an unexplained skip of the
+        // lowest-load choice.
+        const changed = Object.entries({
+          backend: backend !== target, generation: generation !== cliSpawnGeneration,
+          controller: controller !== traexAutoModelController, restarting: cliRestartInProgress,
+          turnNotStarted: !active?.started, turnChanged: !!active && active.turnId !== action.turnId,
+          durableAttempt: active?.dispatchAttempt !== undefined, promptReady: isPromptReady,
+          botmuxTurnChanged: currentBotmuxTurnId !== action.turnId, commandWritesPending: commandLineWritesPending > 0,
+          flushing: isFlushing, quotaPending: !!traexQuotaPending, replayForbidden: traexAutoModelTurnReplayForbidden,
+        }).filter(([, held]) => held).map(([name]) => name);
+        log(`TraeX model load reply discarded (${changed.join(', ') || 'recovery stopped'}; snapshot=${snapshot ? 'present' : 'none'})`);
         // A rejected reply must not strand the controller's pending check.
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
@@ -6968,6 +6980,7 @@ function currentTraexLoadSnapshot(timeoutMs: number, cfg = lastInitConfig): Prom
     cwd: config.workingDir,
     timeoutMs,
     signal: abort.signal,
+    onUnavailable: reason => log(`TraeX model load read unavailable: ${reason}`),
     env: {
       ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
       ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
