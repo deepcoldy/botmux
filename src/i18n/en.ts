@@ -20,6 +20,8 @@ export const messages: Record<string, string> = {
   'cmd.cli.unknown': 'Unknown CLI: {input}',
   'cmd.cli.ambiguous': '"{input}" matches several CLIs, so none was picked. Send one of: {choices}',
   'cmd.cli.choice': '/cli {cliId} ({name})',
+  'worker.memory_admission_unavailable': '⚠️ The service cannot run this request right now. Please retry later.',
+  'worker.memory_admission_owner_alert': '⚠️ {botName} worker startup blocked by host memory protection\nAffected sessions: {count}\nAvailable memory: {available}; reserve: {reserve}\nMemory full PSI avg10: {psi}%; limit: {psiLimit}%\nReason: {reason}\nCheck host process memory and concurrency, then retry after resources recover.',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
   'cmd.effort.task_not_submitted': 'The attached task was not submitted: the effort change was unconfirmed, the session changed, or input is unavailable. The task remains in the original message; retry the task. Task: {task}',
   'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',
