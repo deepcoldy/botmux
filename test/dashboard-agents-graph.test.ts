@@ -86,9 +86,9 @@ describe('syncAgentToBot', () => {
 
   it('refuses to sync into a CLI / backend / sandbox combination that breaks zero injection', async () => {
     const send = vi.fn();
-    // The agent only manages the backend; the bot keeps antigravity + zero injection.
+    // The agent only manages the backend; the bot keeps antigravity + scratch + zero injection.
     const result = await syncAgentToBot({ backend: { backendType: 'zmx' } }, {
-      ...bot, cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', promptInjection: 'none',
+      ...bot, cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', sandboxMode: 'scratch', promptInjection: 'none',
     }, send as any);
     expect(send).not.toHaveBeenCalled();
     expect(result.failures).toEqual([{ section: 'promptInjection', error: 'zero_prompt_unsupported' }]);
@@ -99,7 +99,7 @@ describe('syncAgentToBot', () => {
       ? { ok: false, status: 502, body: { ok: false, error: 'daemon_unreachable' } }
       : { ok: true, status: 200, body: { ok: true } }));
     const result = await syncAgentToBot({ promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' } }, {
-      ...bot, cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', promptInjection: 'none',
+      ...bot, cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', sandboxMode: 'scratch', promptInjection: 'none',
     }, send as any);
     expect(send.mock.calls.map(call => call[1])).toEqual(['/api/bots/cli_a/prompt-injection']);
     expect(result.failures).toEqual([
@@ -110,15 +110,15 @@ describe('syncAgentToBot', () => {
 
   it('defers a write whose intermediate combination breaks zero injection until it no longer does', async () => {
     const send = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
-    // claude-code + zmx + zero injection → antigravity + tmux: switching the CLI first
-    // would pass through antigravity + zmx, so the backend goes first.
+    // claude-code + tmux + scratch + zero injection → cursor + tmux + off:
+    // switching the CLI to cursor first would pass through cursor + scratch, so sandbox goes first.
     const result = await syncAgentToBot({
-      exec: { cliId: 'antigravity', model: '', reasoningEffort: '', configDir: '' },
-      backend: { backendType: 'tmux' },
-    }, { ...bot, backendType: 'zmx', promptInjection: 'none' }, send as any);
-    expect(send.mock.calls.map(call => call[1])).toEqual(['/api/bots/cli_a/backend-type', '/api/bots/cli_a/agent']);
+      exec: { cliId: 'cursor', model: '', reasoningEffort: '', configDir: '' },
+      sandbox: { mode: 'off', scratchStorage: 'tmpfs' },
+    }, { ...bot, backendType: 'tmux', sandboxMode: 'scratch', promptInjection: 'none' }, send as any);
+    expect(send.mock.calls.map(call => call[1])).toEqual(['/api/bots/cli_a/sandbox', '/api/bots/cli_a/agent']);
     expect(result.failures).toEqual([]);
-    expect(result.pushed).toEqual(['backend', 'exec']);
+    expect(result.pushed).toEqual(['sandbox', 'exec']);
   });
 
   it('pushes zero injection after the other drifted sections', async () => {

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { runAntigravityAcp, type AntigravityAcpOptions } from '../src/services/antigravity-acp.js';
 import { createAntigravityAcpAdapter } from '../src/adapters/cli/antigravity-acp.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
-import { antigravityTransport, verifyAntigravityTransport } from '../src/services/antigravity-transport.js';
+import { antigravityTransport, assertAntigravityTransportBackend, verifyAntigravityTransport } from '../src/services/antigravity-transport.js';
 import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
@@ -174,6 +174,12 @@ describe('Antigravity ACP transport', () => {
 });
 
 describe('Antigravity ACP opt-in', () => {
+  it('rejects ACP over zmx, where the runner completion frames are lost', () => {
+    expect(() => assertAntigravityTransportBackend('acp', 'zmx')).toThrow('control frames');
+    expect(() => assertAntigravityTransportBackend('acp', 'tmux')).not.toThrow();
+    expect(() => assertAntigravityTransportBackend('acp', 'pty')).not.toThrow();
+    expect(() => assertAntigravityTransportBackend('terminal', 'zmx')).not.toThrow();
+  });
   it('keeps native defaults and selects ACP only for the requested adapter', () => {
     expect(antigravityTransport(undefined)).toBe('terminal');
     expect(antigravityTransport({ AGY_BOTMUX_TRANSPORT: 'acp' })).toBe('acp');

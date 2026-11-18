@@ -467,10 +467,26 @@ import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './service
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
-import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
+import { antigravityTransport, assertAntigravityTransportBackend, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import {
+  annotateAntigravityUsageLimit,
+  finalizeAntigravityScratchSessionLog,
+  isAntigravityWorkingScreen,
+  resolveActiveAntigravityCliDir,
+  rewriteAntigravityMacScratchArgs,
+  supportsAntigravityTrustedWorkspaces,
+} from './adapters/cli/antigravity.js';
+import {
+  drainAntigravityForRestartScan,
+  evaluateAntigravityProvisionalFinalVerdict,
+  isAntigravityExecutionIdleAtOrAfterStep,
+  isAntigravitySqliteDbFile,
+  readAntigravityExecutionSnapshot,
+} from './services/antigravity-execution-state.js';
+import {
+  conversationIdFromAntigravityTranscriptPath,
   mapAntigravityCompactOffsetToFull,
+  readLatestAntigravityTranscriptStepIndex,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -668,7 +684,12 @@ import {
 } from './adapters/backend/scratch-sandbox-darwin.js';
 import { scratchFailureNotice } from './adapters/backend/scratch-capability.js';
 import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
-import { registerScratchView, scratchViewPath, scratchLinuxMappings } from './services/scratch-host-view.js';
+import {
+  enableWorkerScratchIsolation,
+  registerScratchView,
+  scratchLinuxMappings,
+  scratchViewPath,
+} from './services/scratch-host-view.js';
 import {
   reconcileSandboxTreeFlavour,
   recordedSandboxTreeFlavour,
@@ -2734,7 +2755,7 @@ function refreshCliPluginGeneration(
 ): void {
   if (cfg.promptInjection === 'none' && (!supportsZeroPromptInjection(cfg.cliId, cfg)
     || process.env[GOAL_ENV.V3_MARKER] === '1')) {
-    throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity/Doubao 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
+    throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Doubao 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），scratch 沙箱仅支持 pty/tmux 后端');
   }
   const bot = resolvePluginGenerationBot(cfg);
   // Operator/crash restarts of Auto also resume the same native conversation;
@@ -6042,6 +6063,13 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       onAccepted: () => {
         revokePromptReadiness();
         idleDetector?.reset({ inputCycle: true });
+        if (typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function'
+          && !backendScreenEvidenceIsAuthoritativeForMutation()
+          && typeof structuredBridgeIs === 'function'
+          && structuredBridgeIs('antigravity')
+          && typeof scheduleBusyPatternIdleProbe === 'function') {
+          scheduleBusyPatternIdleProbe('passthrough slash command');
+        }
         log(`Passthrough slash command: ${msg.content}`);
       },
       // Non-adopt follows the normal busy queue. Adopt keeps the complete
@@ -9549,7 +9577,16 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
       // for precisely these read-only rescans.
       const { events } = lastInitConfig?.cliId === 'traex'
         ? drainTraexRollout(path, from, { adoptMode: false, probe: true, includeHistoryCot: true })
-        : spec.drain(path, from, { adoptMode: false, state: undefined });
+        : (typeof structuredBridgeIs === 'function'
+          && structuredBridgeIs('antigravity')
+          && typeof drainAntigravityForRestartScan === 'function')
+          ? drainAntigravityForRestartScan(path, from, {
+              geminiCliDir: typeof resolveActiveAntigravityCliDir === 'function'
+                ? resolveActiveAntigravityCliDir()
+                : undefined,
+              beforeMs,
+            })
+          : spec.drain(path, from, { adoptMode: false, state: undefined });
       work = { turnOpen: structuredTurnOpen(events, beforeMs), tasks: [] };
     }
   } catch (err) {
@@ -9634,18 +9671,19 @@ function deliverRestartInterruptionNote(): void {
   pendingRestartInterruption = undefined;
   for (const task of work.tasks) reportedInterruptedTaskIds.add(task.taskId);
   const note = restartInterruptionNote(work);
+  const zeroPromptInjection = typeof lastInitConfig !== 'undefined' && lastInitConfig?.promptInjection === 'none';
   let delivered = false;
   let noticeTurnId: string | undefined;
   const head = pendingMessages[0];
   if (head) {
     noticeTurnId = head.turnId;
-    if (restartNoteMayPrefix(head)) {
+    if (!zeroPromptInjection && restartNoteMayPrefix(head)) {
       // In place: the queue item's identity is what replay / hold tracking
       // follows.
       Object.assign(head, prefixRestartNote(head, note));
       delivered = true;
     }
-  } else if (!spawnArgvNeedsWorkingSeed && !spawnArgvInitialPromptBusy && lastWrittenCliInput) {
+  } else if (!zeroPromptInjection && !spawnArgvNeedsWorkingSeed && !spawnArgvInitialPromptBusy && lastWrittenCliInput) {
     noticeTurnId = lastWrittenCliInput.turnId;
     const input = restartNoteInput(lastWrittenCliInput, note);
     if (input) {
@@ -13361,8 +13399,12 @@ function codexBridgeStartTimer(): void {
             codexAdoptPendingPid = undefined;
             if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
               try {
-                codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-                emitReadyCodexTurns();
+                if (typeof flushOrRetireAntigravityBeforeRotation === 'function') {
+                  flushOrRetireAntigravityBeforeRotation();
+                } else {
+                  codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+                  emitReadyCodexTurns();
+                }
               } catch (err: any) {
                 log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
               }
@@ -13384,6 +13426,9 @@ function codexBridgeStartTimer(): void {
         maybeUpgradeAntigravityBridgeToFull();
         codexBridgeIngest();
         maybeFlushAntigravityTrailingFinalOnQuietTick();
+        if (typeof maybeSettleAntigravityAbortedTurnOnNonScreenBackend === 'function') {
+          maybeSettleAntigravityAbortedTurnOnNonScreenBackend();
+        }
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -13963,8 +14008,14 @@ function armCursorCotForTurn(): void {
 let antigravityCotReaderSessionId: string | undefined;
 
 function ensureAntigravityCotReader(cliSessionId: string): void {
-  if (cliAdapter?.runnerFramedInput) return;
+  if (typeof cliAdapter !== 'undefined' && cliAdapter?.runnerFramedInput) return;
   if (!cliSessionId || antigravityCotReaderSessionId === cliSessionId) return;
+  const hasCliDirResolver = typeof resolveActiveAntigravityCliDir === 'function';
+  const cliDir = hasCliDirResolver ? resolveActiveAntigravityCliDir() : undefined;
+  if (hasCliDirResolver && !cliDir) {
+    log(`Antigravity CoT reader deferred for session ${cliSessionId}: isolated scratch view unavailable`);
+    return;
+  }
   const previousId = antigravityCotReaderSessionId;
   antigravityCotReaderSessionId = cliSessionId;
   if (previousId) {
@@ -13982,6 +14033,7 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
     if (!currentBotmuxTurnId) return;
     observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }, {
+    ...(cliDir ? { brainDir: `${cliDir.replace(/\/+$/, '')}/brain` } : {}),
     onRuntime: runtime => {
       if (antigravityCotReaderSessionId !== boundSessionId || lastInitConfig?.cliId !== 'antigravity') return;
       publishActiveRuntime(runtime);
@@ -14610,8 +14662,12 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         // existing bytes are ingested from byte 0.
         if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
           try {
-            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-            emitReadyCodexTurns();
+            if (typeof flushOrRetireAntigravityBeforeRotation === 'function') {
+              flushOrRetireAntigravityBeforeRotation();
+            } else {
+              codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+              emitReadyCodexTurns();
+            }
           } catch (err: any) {
             log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
           }
@@ -15041,8 +15097,9 @@ function maybeUpgradeAntigravityBridgeToFull(): void {
  * before it is flushed. */
 function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (!structuredBridgeIs('antigravity')) return;
-  const candidate = antigravityBridgeState().provisionalFinal;
-  if (!candidate || antigravityBridgeState().hasPendingTask) {
+  const state = antigravityBridgeState();
+  const candidate = state.provisionalFinal;
+  if (!candidate || state.hasPendingTask) {
     // No candidate, or the transcript itself proves a background task is still
     // outstanding (the TUI shows the ready composer during that wait — do not
     // arm the quiet latch on screen evidence the transcript contradicts).
@@ -15057,24 +15114,146 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
     antigravityQuietCandidateCompleteOffset = codexBridgeOffset;
     return;
   }
-  if (codexBridgePendingTail || !backend
-    || !backendScreenEvidenceIsAuthoritativeForMutation()
-    || !cliAdapter?.busyPattern || !cliAdapter.readyPattern) return;
-  try {
-    const screen = captureBackendScreen(backend);
-    if (!screen) return;
-    if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
-    if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
-  } catch (err: any) {
-    log(`Antigravity quiet-final viewport capture failed: ${err.message}`);
-    return;
+  if (codexBridgePendingTail || !backend) return;
+
+  if (backendScreenEvidenceIsAuthoritativeForMutation()) {
+    if (!cliAdapter?.busyPattern || !cliAdapter.readyPattern) return;
+    try {
+      const screen = captureBackendScreen(backend);
+      if (!screen) return;
+      if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
+      if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
+    } catch (err: any) {
+      log(`Antigravity quiet-final viewport capture failed: ${err.message}`);
+      return;
+    }
+  } else {
+    // Non-authoritative screen backend (`zmx`): NEVER consult `zmx history`.
+    // Require positive SQLite execution-store proof bound to this exact
+    // conversation and covering at least `provisionalFinalStepIndex`.
+    const boundCid = conversationIdFromAntigravityTranscriptPath(codexBridgeRolloutPath ?? undefined);
+    if (!boundCid || codexBridgePendingSessionId) return;
+    const activeCid = cliAdapter?.resolveActiveSessionId?.({
+      cliPid: currentAntigravityObservedPid(),
+      cliCwd: lastInitConfig?.workingDir,
+    }) ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+    if (activeCid && activeCid !== boundCid) return;
+    const verdict = evaluateAntigravityProvisionalFinalVerdict(
+      boundCid,
+      state.provisionalFinalStepIndex,
+      { geminiCliDir: resolveActiveAntigravityCliDir() },
+    );
+    if (verdict === 'discard_aborted') {
+      // Turn terminated via USER_CANCELED or ERROR after an interim step: drop
+      // the candidate so it is neither emitted now nor replayed on Turn N+1,
+      // and retire the open queue/journal turn as aborted.
+      const abortedStep = readAntigravityExecutionSnapshot(boundCid, {
+        geminiCliDir: resolveActiveAntigravityCliDir(),
+      })?.lastStepIdx ?? (state.provisionalFinalStepIndex ?? 0);
+      structuredBridgeDriverState = state.hasPendingTask ? { hasPendingTask: true } : {};
+      antigravityQuietCandidateKey = undefined;
+      antigravityQuietCandidateCompleteOffset = undefined;
+      retireAntigravityAbortedTurnFromSqlite(boundCid, abortedStep);
+      return;
+    }
+    if (verdict !== 'confirm') return;
   }
 
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
+    emitReadyCodexTurns();
+    const hasOpenStartedTurn = codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined);
+    if (!antigravityBridgeState().hasPendingTask && !hasOpenStartedTurn) {
+      idleDetector?.fireIdle();
+      if (!isPromptReady) {
+        scheduleBusyPatternIdleProbe('Antigravity confirmed final');
+      }
+    }
+  }
 }
 
+function flushOrRetireAntigravityBeforeRotation(): void {
+  codexBridgeIngest();
+  const state = antigravityBridgeState();
+  if (state.provisionalFinal && !state.hasPendingTask) {
+    const boundCid = conversationIdFromAntigravityTranscriptPath(codexBridgeRolloutPath ?? undefined) ?? undefined;
+    const cliDir = resolveActiveAntigravityCliDir();
+    const hasConvDb = cliDir === null || Boolean(boundCid && isAntigravitySqliteDbFile(join(cliDir, 'conversations', `${boundCid}.db`)));
+    if (!backendScreenEvidenceIsAuthoritativeForMutation() || hasConvDb) {
+      const verdict = evaluateAntigravityProvisionalFinalVerdict(boundCid, state.provisionalFinalStepIndex, {
+        geminiCliDir: cliDir,
+      });
+      if (verdict === 'confirm') {
+        codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+      } else if (verdict === 'discard_aborted' && boundCid) {
+        const abortedStep = readAntigravityExecutionSnapshot(boundCid, { geminiCliDir: cliDir })?.lastStepIdx
+          ?? (state.provisionalFinalStepIndex ?? 0);
+        structuredBridgeDriverState = state.hasPendingTask ? { hasPendingTask: true } : {};
+        antigravityQuietCandidateKey = undefined;
+        antigravityQuietCandidateCompleteOffset = undefined;
+        retireAntigravityAbortedTurnFromSqlite(boundCid, abortedStep);
+      }
+    } else {
+      codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+    }
+  } else if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
+    maybeSettleAntigravityAbortedTurnOnNonScreenBackend();
+  }
+  emitReadyCodexTurns();
+}
+
+function retireAntigravityAbortedTurnFromSqlite(boundCid: string, terminalStepIdx: number): void {
+  codexBridgeQueue.ingest([{
+    kind: 'turn_aborted',
+    uuid: `agy-abort:${boundCid}:${terminalStepIdx}`,
+    text: '',
+    timestampMs: Date.now(),
+  }]);
+  emitReadyCodexTurns();
+  const hasOpenStartedTurn = codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined);
+  if (!antigravityBridgeState().hasPendingTask && !hasOpenStartedTurn) {
+    idleDetector?.fireIdle();
+    if (!isPromptReady) {
+      scheduleBusyPatternIdleProbe('Antigravity aborted turn');
+    }
+  }
+}
+
+/**
+ * On non-authoritative screen backends (`zmx`), retire an open started turn
+ * when SQLite proves Antigravity terminated execution via `USER_CANCELED` or
+ * `ERROR` without leaving a trailing `provisionalFinal` (e.g. `/stop` during a
+ * tool call, or a warm-reattached worker recovering a cancelled turn from the
+ * persisted journal).
+ */
+function maybeSettleAntigravityAbortedTurnOnNonScreenBackend(): void {
+  if (!structuredBridgeIs('antigravity') || backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) return;
+  const state = antigravityBridgeState();
+  if (state.hasPendingTask || codexBridgePendingTail || !backend || codexBridgePendingSessionId) return;
+  const boundCid = conversationIdFromAntigravityTranscriptPath(codexBridgeRolloutPath ?? undefined);
+  if (!boundCid || !codexBridgeRolloutPath) return;
+  const activeCid = cliAdapter?.resolveActiveSessionId?.({
+    cliPid: currentAntigravityObservedPid(),
+    cliCwd: lastInitConfig?.workingDir,
+  }) ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (activeCid && activeCid !== boundCid) return;
+  const latestStep = readLatestAntigravityTranscriptStepIndex(codexBridgeRolloutPath);
+  if (latestStep === undefined) return;
+  const snap = readAntigravityExecutionSnapshot(boundCid, { geminiCliDir: resolveActiveAntigravityCliDir() });
+  if (!snap || !snap.authoritativelyIdle) return;
+  if (snap.terminationReason !== 1 && snap.terminationReason !== 2) return;
+  if (snap.lastStepIdx < latestStep || snap.maxStepIdx < latestStep) return;
+
+  if (state.provisionalFinal) {
+    structuredBridgeDriverState = state.hasPendingTask ? { hasPendingTask: true } : {};
+    antigravityQuietCandidateKey = undefined;
+    antigravityQuietCandidateCompleteOffset = undefined;
+  }
+  retireAntigravityAbortedTurnFromSqlite(boundCid, snap.lastStepIdx);
+}
 /** 将 Codex 的结构化 429 终态同步为既有的限流状态。 */
 function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]): void {
   for (const ev of events) {
@@ -17881,6 +18060,12 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (criticalInterrupt && requestedKey === 'ctrlc') {
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
     if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
+    if (typeof isPromptReady !== 'undefined' && !isPromptReady
+      && typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
+      && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function' && !backendScreenEvidenceIsAuthoritativeForMutation()
+      && typeof scheduleBusyPatternIdleProbe === 'function') {
+      scheduleBusyPatternIdleProbe('Antigravity term_action interrupt');
+    }
   }
   // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
   // flag here — without this, dismissing an AskUserQuestion dialog via the
@@ -17975,6 +18160,12 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     if (tuiPromptBlocking) {
       tuiPromptBlocking = false;
       void flushPending();
+    }
+    if (typeof isPromptReady !== 'undefined' && !isPromptReady
+      && typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
+      && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function' && !backendScreenEvidenceIsAuthoritativeForMutation()
+      && typeof scheduleBusyPatternIdleProbe === 'function') {
+      scheduleBusyPatternIdleProbe('Antigravity exact interrupt');
     }
     log(`Exact interrupt delivered for turn ${turnId.substring(0, 8)}`);
     scheduleOneShotAfterAction();
@@ -21973,7 +22164,10 @@ function persistCliSessionId(cliSessionId: string): void {
     dispatchAttempt: currentBotmuxDispatchAttempt,
     send,
   });
-  if (published) log(`Published CLI session id for daemon persistence: ${cliSessionId}`);
+  if (published) {
+    lastSpawnEffectiveCliSessionId = cliSessionId;
+    log(`Published CLI session id for daemon persistence: ${cliSessionId}`);
+  }
   if (lastInitConfig?.cliId === 'antigravity') {
     ensureAntigravityCotReader(cliSessionId);
   }
@@ -25328,11 +25522,25 @@ function checkStaleProgramStatus(): void {
     + '— treating the lost terminal report as idle');
 }
 
+function resolveCurrentWorkerCliSessionId(): string | undefined {
+  if (lastInitConfig?.cliId === 'antigravity') {
+    const liveSid = cliAdapter?.resolveActiveSessionId?.({
+      cliPid: currentAntigravityObservedPid(),
+      cliCwd: lastInitConfig.workingDir,
+    });
+    if (liveSid) return liveSid;
+    return lastInitConfig.cliSessionId ?? lastSpawnEffectiveCliSessionId;
+  }
+  return lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+}
+
 /** Screen fallback only: the authoritative viewport shows the CLI's idle
  *  prompt and none of its busy markers. */
 function viewportShowsIdlePrompt(be: SessionBackend): boolean {
   if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
-  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  const currentCliSid = typeof resolveCurrentWorkerCliSessionId === 'function'
+    ? resolveCurrentWorkerCliSessionId()
+    : (lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId);
   if (cliAdapter.isSessionBusy?.({ sessionId, cliSessionId: currentCliSid, getCurrentScreen: () => captureBackendScreen(be) })) {
     return false;
   }
@@ -25376,7 +25584,9 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
     scheduleBusyPatternIdleProbe(source);
     return true;
   }
-  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  const currentCliSid = typeof resolveCurrentWorkerCliSessionId === 'function'
+    ? resolveCurrentWorkerCliSessionId()
+    : (lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId);
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
     cliSessionId: currentCliSid,
@@ -25389,6 +25599,21 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
     idleDetector?.reset();
     scheduleBusyPatternIdleProbe(source);
     return true;
+  }
+  if (typeof structuredBridgeIs === 'function'
+    && structuredBridgeIs('antigravity')
+    && !backendScreenEvidenceIsAuthoritativeForMutation()) {
+    const freshBootBeforeFirstConversation = awaitingFirstPrompt
+      && !currentCliSid
+      && !codexBridgeRolloutPath
+      && codexBridgeQueue.peek().length === 0;
+    if (!freshBootBeforeFirstConversation && !antigravityNonScreenExecutionSettledIdle(currentCliSid)) {
+      deferBusyReady('db-busy', source);
+      log(`${source}: Antigravity SQLite/bridge state still active on non-authoritative screen; deferring prompt ready`);
+      idleDetector?.reset();
+      scheduleBusyPatternIdleProbe(source);
+      return true;
+    }
   }
   if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
   try {
@@ -25426,6 +25651,45 @@ function reattachedTurnStillOpen(source: string): boolean {
   return true;
 }
 
+function antigravityNonScreenExecutionSettledIdle(currentCliSid: string | undefined): boolean {
+  if (!structuredBridgeIs('antigravity') || backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  if (!currentCliSid) return false;
+  if (codexBridgeBaselineDone) {
+    try { codexBridgeIngest(); } catch { /* ignore */ }
+    maybeSettleAntigravityAbortedTurnOnNonScreenBackend();
+  }
+  if (codexBridgePendingSessionId && codexBridgePendingSessionId !== currentCliSid) return false;
+  const boundCid = conversationIdFromAntigravityTranscriptPath(codexBridgeRolloutPath ?? undefined);
+  if (!boundCid || boundCid === currentCliSid) {
+    const state = antigravityBridgeState();
+    if (state.provisionalFinal || state.hasPendingTask) return false;
+  } else if (codexBridgeQueue.peek().length > 0) {
+    // Active conversation already rotated (e.g. `/new` in `--log-file`) before
+    // the new brain transcript was created: settle/retire any queued turn from
+    // the previous conversation without blocking on its stale driver state.
+    flushOrRetireAntigravityBeforeRotation();
+  }
+  if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) return false;
+  const cliDir = resolveActiveAntigravityCliDir();
+  if (!cliDir) return false;
+  const transcriptPath = resolveFileBridgePath('antigravity', { sessionId: currentCliSid });
+  const convDbExists = existsSync(join(cliDir, 'conversations', `${currentCliSid}.db`));
+  if (!transcriptPath && !convDbExists) {
+    // Fresh `/new` or 0-turn conversation with no submitted turn yet: idle once composer booted.
+    return !awaitingFirstPrompt || idleDetector?.isStartupComplete() === true;
+  }
+  const snap = readAntigravityExecutionSnapshot(currentCliSid, { geminiCliDir: cliDir });
+  if (!snap || !snap.authoritativelyIdle) return false;
+  if (!transcriptPath) {
+    // SQLite exists before transcript was created: only an aborted turn without
+    // transcript output can settle idle without a transcript file.
+    return snap.terminationReason === 1 || snap.terminationReason === 2;
+  }
+  const latestStepIdx = readLatestAntigravityTranscriptStepIndex(transcriptPath);
+  if (latestStepIdx === undefined) return false;
+  return isAntigravityExecutionIdleAtOrAfterStep(currentCliSid, latestStepIdx, { geminiCliDir: cliDir });
+}
+
 /** Re-arm the busy probe when an async settle aborted *and* a real deferral is
  *  active. Adopt-idle / screen-idle probe callers never defer, so they gain no
  *  polling loop here. */
@@ -25456,7 +25720,9 @@ function probeBusyPatternIdle(
   const probeAttempt = currentBotmuxDispatchAttempt;
   const ownsProbe = () => backend === be && cliSpawnGeneration === probeGeneration
     && currentBotmuxTurnId === probeTurnId && currentBotmuxDispatchAttempt === probeAttempt;
-  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  const currentCliSid = typeof resolveCurrentWorkerCliSessionId === 'function'
+    ? resolveCurrentWorkerCliSessionId()
+    : (lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId);
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
     cliSessionId: currentCliSid,
@@ -25466,7 +25732,9 @@ function probeBusyPatternIdle(
   })) {
     return false;
   }
-  if (cliAdapter?.busyPattern) {
+  const nonScreenAgySettled = typeof antigravityNonScreenExecutionSettledIdle === 'function'
+    && antigravityNonScreenExecutionSettledIdle(currentCliSid);
+  if (cliAdapter?.busyPattern && !nonScreenAgySettled) {
     if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
       log(`${source} idle probe skipped: backend screen geometry is not authoritative`);
       return false;
@@ -25530,6 +25798,7 @@ function probeBusyPatternIdle(
       log(`${source} idle probe captureCurrentScreen failed: ${err.message}`);
     }
   } else if (cliAdapter?.isSessionBusy) {
+    if (reattachedTurnStillOpen(source)) return false;
     if (!be.settleCurrentScreen) {
       log(`${source} idle probe: session state store no longer busy, marking prompt ready`);
       markPromptReadyFromBusyProbe(be);
@@ -25552,6 +25821,12 @@ function probeBusyPatternIdle(
       if (backendScreenRevision !== revisionBeforeSettle) {
         log(`${source} idle probe: authoritative screen changed during settle; deferring completion`);
         handleBusyProbeSettleAbort(source, be, { settleProceeded: true, revisionChanged: true });
+        if (!busyPatternIdleProbeTimer
+          && !backendScreenEvidenceIsAuthoritativeForMutation()
+          && typeof structuredBridgeIs === 'function'
+          && structuredBridgeIs('antigravity')) {
+          scheduleBusyPatternIdleProbe(`${source} settle-retry`);
+        }
         return;
       }
       if (settle.degraded) {
@@ -25633,7 +25908,9 @@ function scheduleBusyPatternIdleProbe(source: string): void {
  * genuinely working CLI keeps deferring. */
 function maybeForceReadyOnStaleBusyMarker(source: string, be: SessionBackend): boolean {
   if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
-  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  const currentCliSid = typeof resolveCurrentWorkerCliSessionId === 'function'
+    ? resolveCurrentWorkerCliSessionId()
+    : (lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId);
   const sessionStateBusy = !!cliAdapter.isSessionBusy?.({
     sessionId,
     cliSessionId: currentCliSid,
@@ -26235,6 +26512,7 @@ async function spawnCliBody(
   // sessions; ZMX validates its version plus full-list control plane; Herdr
   // uses a non-destructive version check.
   let effectiveBackend = cfg.backendType;
+  assertAntigravityTransportBackend(agyTransport, effectiveBackend);
   const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId);
   if (backendCliError) {
     throw new Error(
@@ -26826,7 +27104,12 @@ async function spawnCliBody(
     readIsolation: cfg.readIsolation === true,
     codexRpcInput: cfg.codexRpcInput === true,
   })) {
-    throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity/Doubao 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
+    throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Doubao 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），scratch 沙箱仅支持 pty/tmux 后端');
+  }
+  if (sandboxMode === 'scratch' && config.session.dataDir) {
+    // Latch fail-closed scratch isolation BEFORE cliAdapter.buildArgs runs so
+    // adapters never create or read state under the real host $HOME.
+    enableWorkerScratchIsolation(cfg.sessionId, config.session.dataDir);
   }
   {
     // The auto-worktree gate's degrade verdict may only be strengthened here.
@@ -29938,26 +30221,38 @@ async function spawnCliBody(
     scratchNativeCodexHome = nativeCodexHome;
     scratchNativeTraeHome = nativeTraeHome;
 
+    let macAntigravityCliLogPath: string | undefined;
     if (willReattachPersistent) {
       // Live pane across a daemon restart: the overlay/clone + pane survive;
       // only re-wire the outbox watcher. Never remount/re-clone here.
       if (process.platform === 'darwin') {
         const att = attachMacScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
-        if (att) {
-          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-          sandboxCleanup = att.cleanup;
-          sandboxRelayOutbox = att.outbox;
-          scratchMappings = att.mappings;
-          scratchHostHome = att.clonedHome;
-          scratchChdirInSandbox = att.chdirInSandbox;
-          sandboxStopWatcher = startOutboxWatcher(
-            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend, allowRouting: true },
+        if (!att) {
+          throw new Error(
+            `[scratch-sandbox] refusing to reattach session ${cfg.sessionId}: `
+            + 'scratch clone or relay outbox disappeared before it could be re-served',
           );
-          publishSandboxRelayCapability();
-          log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
-        } else {
-          log(`Scratch(mac) REATTACH (${cfg.cliId}): no clone found — reattaching live pane as-is`);
         }
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        sandboxCleanup = att.cleanup;
+        sandboxRelayOutbox = att.outbox;
+        scratchMappings = att.mappings;
+        scratchHostHome = att.clonedHome;
+        scratchChdirInSandbox = att.chdirInSandbox;
+        if (cfg.cliId === 'antigravity' && !cliAdapter.runnerFramedInput) {
+          macAntigravityCliLogPath = join(
+            att.clonedHome,
+            '.gemini',
+            'antigravity-cli',
+            'botmux',
+            `${encodeURIComponent(effectiveAdapterSessionId)}.log`,
+          );
+        }
+        sandboxStopWatcher = startOutboxWatcher(
+          att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend, allowRouting: true },
+        );
+        publishSandboxRelayCapability();
+        log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
       } else {
         // Same contract as the oncall arm: the isolation gate cold-spawned a
         // pane whose tree is gone, so null here means it vanished in between.
@@ -29993,6 +30288,24 @@ async function spawnCliBody(
         home: scratchHome,
         cliBin: sandboxWrapperLaunch?.bin ?? cliAdapter.resolvedBin,
         cliArgs: sandboxWrapperLaunch?.args ?? args,
+        ...(sandboxWrapperLaunch
+          ? { cliNameLink: cliNameLink(sandboxWrapperLaunch.cliBin, defaultWrapperFsIo(() => undefined)) }
+          : {}),
+        ...(cfg.cliId === 'antigravity' && !cliAdapter.runnerFramedInput
+          ? {
+              resolveCliArgs: ({ clonedHome, chdirInSandbox }) => {
+                const rewritten = rewriteAntigravityMacScratchArgs(sandboxWrapperLaunch?.args ?? args, {
+                  sessionId: effectiveAdapterSessionId,
+                  clonedHome,
+                  chdirInSandbox,
+                  includeTrustedWorkspaces: cfg.disableCliBypass !== true
+                    && supportsAntigravityTrustedWorkspaces(cfg.cliVersion),
+                });
+                macAntigravityCliLogPath = rewritten.cliLogPath;
+                return rewritten.args;
+              },
+            }
+          : {}),
         denyPaths: scratchDeny,
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         net: spawnNetworkShape.netEnabled,
@@ -30074,6 +30387,14 @@ async function spawnCliBody(
     // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
     // products) resolve through the scratch mappings for this spawn.
     registerScratchView(cfg.sessionId, scratchMappings);
+    if (cfg.cliId === 'antigravity' && !cliAdapter.runnerFramedInput) {
+      if (!finalizeAntigravityScratchSessionLog(effectiveAdapterSessionId, macAntigravityCliLogPath)) {
+        throw new Error(
+          `[scratch-sandbox] refusing to start Antigravity session ${cfg.sessionId}: `
+          + 'isolated native log path could not be verified inside the scratch view',
+        );
+      }
+    }
     if (scratchMappings && scratchHostHome) {
       // The worker is a PER-SESSION process, so repointing these env vars here
       // only affects THIS session's transcript finders (codex/traex honor them
@@ -31688,6 +32009,9 @@ async function spawnCliBody(
         if (!settle.proceed || backend !== idleBackend) return;
         if (backendScreenRevision !== revisionBeforeSettle) {
           log('Authoritative screen changed during idle settle; deferring completion to the re-armed detector');
+          if (evidenceSource === 'external' && !backendScreenEvidenceIsAuthoritativeForMutation() && structuredBridgeIs('antigravity')) {
+            scheduleBusyPatternIdleProbe(`${cliName()} external-idle settle-retry`);
+          }
           return;
         }
         if (settle.degraded) {
@@ -31731,7 +32055,8 @@ async function spawnCliBody(
       // CLIs retain their established immediate terminal behavior.
       const busyGuardedIdle = evidenceSource === 'screen'
         || (evidenceSource === 'external'
-          && (structuredBridgeIs('pi') || structuredBridgeIs('oh-my-pi') || structuredBridgeIs('ebsd')));
+          && (structuredBridgeIs('pi') || structuredBridgeIs('oh-my-pi') || structuredBridgeIs('ebsd')
+            || (structuredBridgeIs('antigravity') && !backendScreenEvidenceIsAuthoritativeForMutation())));
       if (busyGuardedIdle && idleBackend
         && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       ptyIdleSettle.request(() => {

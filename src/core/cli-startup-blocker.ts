@@ -79,6 +79,12 @@ const RULES: readonly StartupBlockerRule[] = [
     all: [/Trust this folder\?/, dialogLine('Yes, I trust this folder')],
   },
   {
+    // Antigravity agy 1.5.x (captured on 1.5.10).
+    rule: 'antigravity-folder-trust-v15',
+    kind: 'folder_trust',
+    all: [dialogLine(String.raw`Trust this folder\b`), dialogLine(String.raw`No, exit\b`)],
+  },
+  {
     // Cursor Agent 2026.09 (binary strings; Botmux passes --trust).
     rule: 'cursor-workspace-trust',
     kind: 'folder_trust',

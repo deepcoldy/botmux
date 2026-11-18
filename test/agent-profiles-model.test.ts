@@ -225,36 +225,50 @@ describe('zero injection section', () => {
 
   it('judges zero injection on the combination the bot will have after syncing', () => {
     const antigravity = bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', promptInjection: 'none' });
-    // The agent only manages the backend; the bot keeps antigravity and zero injection.
-    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, antigravity)).toBe(true);
-    expect(agentZeroPromptConflict({ sandbox: { mode: 'scratch' } }, antigravity)).toBe(true);
+    // Antigravity supports zmx (outside scratch) and scratch (on pty/tmux), while rejecting zmx + scratch.
+    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict({ sandbox: { mode: 'scratch' } }, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' }, sandbox: { mode: 'scratch' } }, antigravity)).toBe(true);
+    expect(agentZeroPromptConflict({ sandbox: { mode: 'scratch' } }, bot({ cliId: 'cursor', agentSelectionKey: 'cursor', backendType: 'tmux', promptInjection: 'none' }))).toBe(true);
     expect(agentZeroPromptConflict({ backend: { backendType: 'herdr' } }, antigravity)).toBe(false);
-    // Switching the CLI away from antigravity makes zmx fine; to opencode it never is.
+    // Switching the CLI to claude-code keeps zmx fine; to opencode it never is.
     expect(agentZeroPromptConflict({ exec: { cliId: 'claude-code', model: '', reasoningEffort: '', configDir: '' }, backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
     expect(agentZeroPromptConflict({ exec: { cliId: 'opencode', model: '', reasoningEffort: '', configDir: '' } }, antigravity)).toBe(true);
     // The agent turns zero injection on/off itself.
-    expect(agentZeroPromptConflict({ promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' }, sandbox: { mode: 'scratch' } }, antigravity)).toBe(false);
     expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, bot({ cliId: 'opencode', agentSelectionKey: 'opencode' }))).toBe(true);
-    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', promptInjection: 'default' }))).toBe(false);
+    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' }, sandbox: { mode: 'scratch' } }, bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', promptInjection: 'default' }))).toBe(false);
   });
 
   it('resolves a cleared backend override to the daemon default', () => {
-    const antigravity = bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', defaultBackendType: 'zmx' });
-    // Clearing the tmux override lands on zmx, where antigravity zero injection cannot run.
-    expect(agentZeroPromptConflict({ backend: { backendType: '' }, promptInjection: { mode: 'none' } }, antigravity)).toBe(true);
-    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, antigravity)).toBe(false);
-    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, { ...antigravity, backendType: null })).toBe(true);
+    const antigravityScratch = bot({
+      cliId: 'antigravity',
+      agentSelectionKey: 'antigravity',
+      backendType: 'tmux',
+      sandboxMode: 'scratch',
+      defaultBackendType: 'zmx',
+    });
+    // Clearing the tmux override lands on zmx, where scratch zero injection cannot run.
+    expect(agentZeroPromptConflict({ backend: { backendType: '' }, promptInjection: { mode: 'none' } }, antigravityScratch)).toBe(true);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, antigravityScratch)).toBe(false);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, { ...antigravityScratch, backendType: null })).toBe(true);
     // A remote daemon default pairs back to pty for a local CLI, as spawning does.
-    expect(agentZeroPromptConflict({ backend: { backendType: '' }, promptInjection: { mode: 'none' } }, { ...antigravity, defaultBackendType: 'riff' })).toBe(false);
+    expect(agentZeroPromptConflict({ backend: { backendType: '' }, promptInjection: { mode: 'none' } }, { ...antigravityScratch, defaultBackendType: 'riff' })).toBe(false);
   });
 
   it('judges an intermediate combination from the sections already written', () => {
-    const antigravity = bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', promptInjection: 'none' });
+    const antigravityScratch = bot({
+      cliId: 'antigravity',
+      agentSelectionKey: 'antigravity',
+      backendType: 'tmux',
+      sandboxMode: 'scratch',
+      promptInjection: 'none',
+    });
     const agent: AgentSectionsConfig = { promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' } };
-    // Final state is fine (zero injection off), but zmx before the switch-off landed is not.
-    expect(agentZeroPromptConflict(agent, antigravity)).toBe(false);
-    expect(agentZeroPromptConflict(agent, antigravity, ['backend'])).toBe(true);
-    expect(agentZeroPromptConflict(agent, antigravity, ['promptInjection', 'backend'])).toBe(false);
+    // Final state is fine (zero injection off), but zmx + scratch before the switch-off landed is not.
+    expect(agentZeroPromptConflict(agent, antigravityScratch)).toBe(false);
+    expect(agentZeroPromptConflict(agent, antigravityScratch, ['backend'])).toBe(true);
+    expect(agentZeroPromptConflict(agent, antigravityScratch, ['promptInjection', 'backend'])).toBe(false);
   });
 
   it('turns zero injection off before switching to a combination that cannot support it', () => {

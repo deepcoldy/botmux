@@ -76,10 +76,14 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
   // rmwBotEntry、不过 applyConfigField，可落盘 antigravity × zmx（远端后端同形）；单看
   // entry 解析不出生效后端（daemon 默认 + CLI 配对），由 worker spawnCli 权威闸
   // fail-closed 拒启动。跟踪 issue #3064。
-  if (entry.promptInjection === 'none'
-      && entry.sandbox === 'scratch'
-      && zeroPromptInjectionUnsupportedReason(entry.cliId, { sandbox: 'scratch' }) === 'scratch_unsupported_for_cli') {
-    return 'zero_prompt_unsupported';
+  if (entry.promptInjection === 'none' && entry.sandbox === 'scratch') {
+    const reason = zeroPromptInjectionUnsupportedReason(entry.cliId, {
+      sandbox: 'scratch',
+      backendType: entry.backendType,
+    });
+    if (reason === 'scratch_unsupported_for_cli' || reason === 'scratch_unsupported_for_backend') {
+      return 'zero_prompt_unsupported';
+    }
   }
   return undefined;
 }

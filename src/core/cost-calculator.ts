@@ -12,6 +12,7 @@ import {
   __resetTranscriptResolverCacheForTest,
   cachedTranscriptPathLookup,
   kimiEnvForBot,
+  resolveSessionAntigravityDbPath,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
@@ -1495,7 +1496,9 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   }
   if (q.cliId === 'antigravity') {
     if (!q.cliSessionId) return null;
-    return readAntigravityTokenUsage(q.cliSessionId) as UsageReadResult | null;
+    const dbPath = resolveSessionAntigravityDbPath(q);
+    if (!dbPath) return null;
+    return readAntigravityTokenUsage(q.cliSessionId, { dbPath }) as UsageReadResult | null;
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;

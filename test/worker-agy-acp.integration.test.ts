@@ -1,7 +1,7 @@
 /** Full worker/runner regression without a real daemon, model account or shared terminal server. */
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,13 +24,14 @@ afterEach(async () => {
 });
 
 /** Launch an actual isolated worker against a protocol peer and collect its public IPC events. */
-function start(content: string, mode = '', backendType: 'pty' | 'tmux' = 'pty') {
+function start(content: string, mode = '', backendType: 'pty' | 'tmux' | 'zmx' = 'pty') {
   const sessionId = randomUUID();
   const root = mkdtempSync(join(tmpdir(), 'botmux-worker-agy-acp-')); roots.push(root);
   const dataDir = join(root, 'data'); mkdirSync(dataDir);
   const executable = join(root, 'agy');
   const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-  writeFileSync(executable, `#!/bin/sh\nexec ${[tsRunnerPrefix().command, resolve('test/fixtures/fake-antigravity-acp.mjs')].map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
+  const started = join(root, 'agy-started');
+  writeFileSync(executable, `#!/bin/sh\n: > ${quote(started)}\nexec ${[tsRunnerPrefix().command, resolve('test/fixtures/fake-antigravity-acp.mjs')].map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
   const log = join(root, 'calls.jsonl'); writeFileSync(log, '');
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
@@ -50,7 +51,7 @@ function start(content: string, mode = '', backendType: 'pty' | 'tmux' = 'pty') 
     prompt: content, turnId: 'om_initial', env: { AGY_BOTMUX_TRANSPORT: 'acp' },
     larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
-  return { child, root, messages, logs, sessionId, backendType,
+  return { child, root, messages, logs, sessionId, backendType, started,
     calls: () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) as Array<Record<string, unknown>> };
 }
 
@@ -72,6 +73,15 @@ async function waitFor(worker: ReturnType<typeof start>, check: () => boolean): 
 }
 
 describe('worker Antigravity ACP delivery', () => {
+  it('fails before launching ACP for zmx rather than losing its final', async () => {
+    const worker = start('must not execute', '', 'zmx');
+    await waitFor(worker, () => worker.messages.some(message => message.type === 'error'));
+    expect(worker.messages).toContainEqual(expect.objectContaining({
+      type: 'error', message: expect.stringContaining('zmx history does not preserve runner control frames'),
+    }));
+    expect(existsSync(worker.started)).toBe(false);
+    expect(worker.calls()).toHaveLength(0);
+  }, 30_000);
   it.each(['pty', 'tmux'] as const)('%s delivers full multi-line input once and attributes each final to its own turn', async backendType => {
     const content = '<user_message>\n' + '中文 😀 transmission\n'.repeat(1_000) + '</user_message>';
     const worker = start(content, '', backendType);

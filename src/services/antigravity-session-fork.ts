@@ -7,32 +7,78 @@ const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const STREAM = new RegExp(`\\bStreaming conversation (${UUID})\\s*$`, 'i');
 const FORK = new RegExp(`\\bForked conversation (${UUID}) -> (${UUID})\\s*$`, 'i');
 
+export interface AntigravitySessionLogOptions {
+  /** Dynamic host-side path resolver (e.g. fail-closed scratch view). Returning
+   *  `null` indicates the isolated view is unavailable and forces fail-closed reads. */
+  resolveReadPath?: () => string | null;
+  /** Skip constructor `mkdirSync` when `path` is a sandbox-internal path. */
+  ensureDir?: boolean;
+}
+
 /** Each managed agy gets its own native log. A global cli.log mixes sibling
  * processes, and agy keeps BOTH parent and child DBs open after /fork. */
 export class AntigravitySessionLog {
-  readonly path: string;
+  private cliPath: string;
+  private readonly resolveReadPath?: () => string | null;
   private offset = 0;
   private inode: string | undefined;
   private tail = '';
   private state: { currentId?: string; fork?: { parentId: string; childId: string } } = {};
 
-  constructor(sessionId: string, root = join(homedir(), '.gemini', 'antigravity-cli')) {
-    this.path = join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
-    mkdirSync(dirname(this.path), { recursive: true });
+  constructor(
+    sessionId: string,
+    root = join(homedir(), '.gemini', 'antigravity-cli'),
+    opts?: AntigravitySessionLogOptions,
+  ) {
+    this.cliPath = join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
+    this.resolveReadPath = opts?.resolveReadPath;
+    if (opts?.ensureDir !== false && !this.resolveReadPath) {
+      mkdirSync(dirname(this.cliPath), { recursive: true });
+    }
+  }
+
+  get path(): string {
+    return this.cliPath;
+  }
+
+  setCliPath(nextPath: string): void {
+    this.cliPath = nextPath;
+  }
+
+  private currentReadPath(): string | null {
+    return this.resolveReadPath ? this.resolveReadPath() : this.cliPath;
+  }
+
+  /** Ensure parent directory of the resolved host-readable log exists inside the active view. */
+  ensureReadableParentDir(): boolean {
+    const target = this.currentReadPath();
+    if (!target) return false;
+    mkdirSync(dirname(target), { recursive: true });
+    return true;
   }
 
   /** True once `agy --log-file` has created and written to this native log. */
   hasLogFile(): boolean {
+    const target = this.currentReadPath();
+    if (!target) return false;
     try {
-      return statSync(this.path).size > 0;
+      return statSync(target).size > 0;
     } catch {
       return false;
     }
   }
 
   read(): Readonly<typeof this.state> {
+    const target = this.currentReadPath();
+    if (!target) {
+      this.inode = undefined;
+      this.offset = 0;
+      this.tail = '';
+      this.state = {};
+      return this.state;
+    }
     try {
-      const stat = statSync(this.path);
+      const stat = statSync(target);
       const inode = `${stat.dev}:${stat.ino}`;
       if (inode !== this.inode || stat.size < this.offset) {
         this.inode = inode;
@@ -41,7 +87,7 @@ export class AntigravitySessionLog {
         this.state = {};
       }
       if (stat.size === this.offset) return this.state;
-      const fd = openSync(this.path, 'r');
+      const fd = openSync(target, 'r');
       try {
         const buf = Buffer.alloc(Math.min(stat.size - this.offset, 256 * 1024));
         const count = readSync(fd, buf, 0, buf.length, this.offset);

@@ -1,6 +1,6 @@
 import { detectModelsViaExec } from './model-catalog-json.js';
 import { parseAntigravityModels } from './antigravity-models.js';
-import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, fstatSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
@@ -8,14 +8,26 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
+import { detectCliStartupBlocker } from '../../core/cli-startup-blocker.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 import { findAntigravityConversationId, findAntigravityConversationIdByPid } from '../../services/antigravity-discovery.js';
+import {
+  classifyAntigravityProvisionalBeforeNextTurn,
+  isAntigravityExecutionIdleAtOrAfterStep,
+} from '../../services/antigravity-execution-state.js';
 import { AntigravitySessionLog, forkAntigravitySession } from '../../services/antigravity-session-fork.js';
 import {
+  isWorkerScratchIsolationActive,
+  resolveWorkerHomeSubpath,
+} from '../../services/scratch-host-view.js';
+import {
+  antigravityFullTranscriptPath,
+  conversationIdFromAntigravityTranscriptPath,
   drainAntigravityTranscript,
+  readLatestAntigravityTranscriptStepIndex,
   resolveAntigravityTranscriptPath,
   type AntigravityTranscriptState,
 } from '../../services/antigravity-transcript.js';
@@ -69,7 +81,48 @@ import {
  *  is injected via `systemHints` instead.
  */
 
-const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
+function hostHistoryPath(): string {
+  return join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
+}
+
+/** Active Antigravity CLI state root (`~/.gemini/antigravity-cli`, or the
+ *  fail-closed isolated scratch counterpart when scratch isolation is active). */
+export function resolveActiveAntigravityCliDir(): string | null {
+  return resolveWorkerHomeSubpath(join('.gemini', 'antigravity-cli'));
+}
+
+function resolveRuntimeHistoryPath(): string | null {
+  return resolveWorkerHomeSubpath(join('.gemini', 'antigravity-cli', 'history.jsonl'));
+}
+
+function resolveRuntimeTranscriptPath(conversationId: string | undefined): string | null {
+  if (!isWorkerScratchIsolationActive()) {
+    return resolveAntigravityTranscriptPath(conversationId);
+  }
+  // Validate conversationId charset/traversal before interpolating.
+  if (!antigravityFullTranscriptPath(conversationId, '/')) return null;
+  for (const name of ['transcript_full.jsonl', 'transcript.jsonl'] as const) {
+    const candidate = resolveWorkerHomeSubpath(
+      join('.gemini', 'antigravity-cli', 'brain', conversationId!, '.system_generated', 'logs', name),
+    );
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const activeScratchSessionLogs = new Map<string, AntigravitySessionLog>();
+
+/** Finalise a scratch session's `--log-file` directory inside the materialised
+ *  sandbox view (and update the CLI argv log path on macOS APFS clones). */
+export function finalizeAntigravityScratchSessionLog(
+  sessionId: string,
+  macCliLogPath?: string,
+): boolean {
+  const log = activeScratchSessionLogs.get(sessionId);
+  if (!log) return false;
+  if (macCliLogPath) log.setCliPath(macCliLogPath);
+  return log.ensureReadableParentDir();
+}
 
 
 function currentFileSize(path: string): number {
@@ -332,18 +385,30 @@ function antigravityTranscriptHasUserInput(transcriptPath: string): boolean {
  *  log only when no full log exists (the worker moves a compact bind over at a turn
  *  boundary once the full log appears). */
 export const antigravityBridgeSpec: StructuredBridgeSpec = {
-  drain: (path, offset, ctx) => drainAntigravityTranscript(
-    path,
-    offset,
-    (ctx.state as AntigravityTranscriptState | undefined) ?? {},
-    { flushTrailingFinal: ctx.flushTrailingFinal },
-  ),
+  drain: (path, offset, ctx) => {
+    const cid = conversationIdFromAntigravityTranscriptPath(path) ?? undefined;
+    return drainAntigravityTranscript(
+      path,
+      offset,
+      (ctx.state as AntigravityTranscriptState | undefined) ?? {},
+      {
+        flushTrailingFinal: ctx.flushTrailingFinal,
+        classifyProvisionalBeforeNextTurn: stepIdx =>
+          classifyAntigravityProvisionalBeforeNextTurn(cid, stepIdx, {
+            geminiCliDir: resolveActiveAntigravityCliDir(),
+          }),
+      },
+    );
+  },
   stateCommit: 'ingest',
   locate: {
-    bySessionId: sessionId => resolveAntigravityTranscriptPath(sessionId) ?? undefined,
+    bySessionId: sessionId => resolveRuntimeTranscriptPath(sessionId) ?? undefined,
     byPid: pid => {
+      if (isWorkerScratchIsolationActive() && !resolveActiveAntigravityCliDir()) {
+        return undefined;
+      }
       const conversationId = findAntigravityConversationIdByPid(pid);
-      return conversationId ? resolveAntigravityTranscriptPath(conversationId) ?? undefined : undefined;
+      return conversationId ? resolveRuntimeTranscriptPath(conversationId) ?? undefined : undefined;
     },
   },
   spawn: { sessionId: 'cli', baseline: 'birth-aware' },
@@ -355,6 +420,72 @@ function supportsAntigravityBracketedPaste(version: string | undefined): boolean
   if (!match) return false;
   const [major = 0, minor = 0, patch = 0] = match.slice(1, 4).map(Number);
   return major > 1 || (major === 1 && (minor > 5 || (minor === 5 && patch >= 4)));
+}
+
+/** Session-only `--settings {"trustedWorkspaces":[...]}` flag support (agy ≥ 1.5.0). */
+export function supportsAntigravityTrustedWorkspaces(version: string | undefined): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version?.trim() ?? '');
+  if (!match) return false;
+  const [major = 0, minor = 0] = match.slice(1, 3).map(Number);
+  return major > 1 || (major === 1 && minor >= 5);
+}
+
+function buildTrustedWorkspacesList(dirs: readonly (string | undefined)[]): string[] {
+  const out = new Set<string>();
+  for (const dir of dirs) {
+    if (!dir || typeof dir !== 'string' || !dir.trim()) continue;
+    out.add(dir);
+    try {
+      out.add(realpathSync(dir));
+    } catch { /* keep lexical when target does not exist yet */ }
+  }
+  return [...out];
+}
+
+/** Rewrite CLI argv for macOS APFS scratch clones so `--log-file` and
+ *  `--settings.trustedWorkspaces` point inside the clone rather than the host. */
+export function rewriteAntigravityMacScratchArgs(
+  rawArgs: readonly string[],
+  opts: {
+    sessionId: string;
+    clonedHome: string;
+    chdirInSandbox: string;
+    includeTrustedWorkspaces: boolean;
+  },
+): { args: string[]; cliLogPath: string } {
+  const cliLogPath = join(
+    opts.clonedHome,
+    '.gemini',
+    'antigravity-cli',
+    'botmux',
+    `${encodeURIComponent(opts.sessionId)}.log`,
+  );
+  const args = [...rawArgs];
+  const logIdx = args.indexOf('--log-file');
+  if (logIdx >= 0 && logIdx + 1 < args.length) {
+    args[logIdx + 1] = cliLogPath;
+  } else {
+    args.push('--log-file', cliLogPath);
+  }
+
+  if (opts.includeTrustedWorkspaces) {
+    const trusted = buildTrustedWorkspacesList([opts.chdirInSandbox]);
+    if (trusted.length > 0) {
+      const settingsIdx = args.indexOf('--settings');
+      if (settingsIdx >= 0 && settingsIdx + 1 < args.length) {
+        try {
+          const parsed = JSON.parse(args[settingsIdx + 1]!);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            parsed.trustedWorkspaces = trusted;
+            args[settingsIdx + 1] = JSON.stringify(parsed);
+          }
+        } catch { /* preserve non-JSON user setting untouched */ }
+      } else if (!args.some(a => a.startsWith('--settings='))) {
+        args.push('--settings', JSON.stringify({ trustedWorkspaces: trusted }));
+      }
+    }
+  }
+  return { args, cliLogPath };
 }
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
@@ -373,6 +504,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // writes there is post-submit (see transcriptCreatedAfterSubmit in writeInput).
   let submitTranscriptCreatedAfter = false;
   const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
+    const cliDir = resolveActiveAntigravityCliDir();
+    if (!cliDir) return undefined;
     const fromLog = sessionLog?.read().currentId;
     if (fromLog) return fromLog;
     // On a fresh launch (`!resume && !reattach`), agy creates no conversation
@@ -386,7 +519,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // historical conversation sharing the same working directory.
     const cwd = sessionLog ? undefined : pty.cliCwd;
     if (!pty.cliPid && !cwd) return undefined;
-    return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    return findAntigravityConversationId({
+      pid: pty.cliPid,
+      cwd,
+      summariesDbPath: join(cliDir, 'conversation_summaries.db'),
+    }) ?? undefined;
   };
   const recordConfirmedSubmit = (
     pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>,
@@ -417,12 +554,38 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       });
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, disableCliBypass, model, reasoningEffort, cliVersion, reattach, extraArgs }) {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
       awaitNativeStreamLog = !resume && !reattach;
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
-      sessionLog = new AntigravitySessionLog(sessionId);
+      if (isWorkerScratchIsolationActive()) {
+        let canonHome = homedir();
+        try { canonHome = realpathSync(canonHome); } catch { /* keep lexical */ }
+        const logSubpath = join('.gemini', 'antigravity-cli', 'botmux', `${encodeURIComponent(sessionId)}.log`);
+        sessionLog = new AntigravitySessionLog(
+          sessionId,
+          join(canonHome, '.gemini', 'antigravity-cli'),
+          {
+            ensureDir: false,
+            resolveReadPath: () => resolveWorkerHomeSubpath(logSubpath),
+          },
+        );
+        activeScratchSessionLogs.set(sessionId, sessionLog);
+      } else {
+        sessionLog = new AntigravitySessionLog(sessionId);
+      }
       args.push('--log-file', sessionLog.path);
+      if (
+        !disableCliBypass
+        && workingDir
+        && supportsAntigravityTrustedWorkspaces(cliVersion)
+        && !extraArgs?.some(a => a === '--settings' || a.startsWith('--settings='))
+      ) {
+        const trustedWorkspaces = buildTrustedWorkspacesList([workingDir]);
+        if (trustedWorkspaces.length > 0) {
+          args.push('--settings', JSON.stringify({ trustedWorkspaces }));
+        }
+      }
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
       // spawn time and ignores any value we'd pass — `--conversation`
@@ -460,12 +623,6 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildResumeCommand({ cliSessionId }) {
-      // Antigravity's conversation id is opaque and not derivable from
-      // botmux's sessionId. Without a captured cliSessionId we can't print
-      // a precise one-liner, so let the closed-session card fall back to
-      // its generic note. v1 does not capture cliSessionId — added in a
-      // later iteration once we wire conversation-id discovery against
-      // ~/.gemini/antigravity-cli/conversations/.
       if (!cliSessionId) return null;
       return `agy --conversation ${cliSessionId}`;
     },
@@ -474,7 +631,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
      *  records `{display, timestamp, workspace, conversationId}` per submit —
      *  enough to discover resumable conversations (deduped by conversationId). */
     listResumableSessions({ limit, exclude }) {
-      return discoverAntigravitySessions(HISTORY_PATH, limit, exclude);
+      return discoverAntigravitySessions(hostHistoryPath(), limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -483,14 +640,18 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         if (content.includes('\x1b')) return { submitted: false, failureReason: 'antigravity_paste_control_character' };
         content = content.replace(/\r\n?/g, '\n');
       }
+      const historyPath = resolveRuntimeHistoryPath();
+      if (!historyPath) {
+        return { submitted: false, failureReason: 'antigravity_isolated_view_unavailable' };
+      }
       // agy 1.5.4 accepts complete bracketed-paste frames. Older/unknown
       // versions retain the original M-Enter soft-newline contract. A write
       // acknowledgement is not submission evidence: both paths still use the
       // post-write history delta and never replay an unconfirmed input.
-      const baseByte = currentFileSize(HISTORY_PATH);
+      const baseByte = currentFileSize(historyPath);
       const marker = historyMarker(content);
       const initialCid = activeSessionId(pty) ?? knownCliSessionId;
-      const initialTranscriptPath = initialCid ? resolveAntigravityTranscriptPath(initialCid) : null;
+      const initialTranscriptPath = initialCid ? resolveRuntimeTranscriptPath(initialCid) : null;
       const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
       // No transcript exists yet for the conversation this input lands in: a
       // known id whose brain file agy creates lazily (e.g. right after /new),
@@ -558,14 +719,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         if (!trySendEnter()) return { submitted: false };
       }
 
-      // Single Enter only — do NOT retry it. agy's history.jsonl append can
-      // lag well past a short per-attempt window (cold start, large initial
-      // prompt, network-bound auth), and a retry Enter lands on the
-      // already-submitted composer: the same prompt then gets submitted
-      // multiple times. Poll history once for the full in-band budget; a
-      // genuinely dropped Enter is recovered by the worker's deferred
-      // recheck, not by a second Enter (same pattern as the grok adapter).
-      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
+      if (await waitForHistoryAppend(historyPath, baseByte, marker, 3_200)) {
         const cliSessionId = recordConfirmedSubmit(pty, preSize, transcriptCreatedAfterSubmit);
         return cliSessionId ? { submitted: true, cliSessionId } : undefined;
       }
@@ -574,7 +728,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // slow agy (cold start, large initial prompt, network-bound auth)
       // can still resolve the warning before user-facing Lark notify.
       const recheck = (): SubmitRecheckResult => {
-        if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
+        const currentHistoryPath = resolveRuntimeHistoryPath();
+        if (!currentHistoryPath || !historyDeltaContains(currentHistoryPath, baseByte, marker)) return false;
         const cliSessionId = recordConfirmedSubmit(pty, preSize, transcriptCreatedAfterSubmit);
         return cliSessionId ? { submitted: true, cliSessionId } : true;
       };
@@ -584,31 +739,22 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: new RegExp(`\\? for shortcuts|${ERROR_COMPOSER_PATTERN.source}`),
     busyPattern: /esc to cancel/,
-    // agy records Enter in history.jsonl immediately while a turn is running:
-    // Queue mode parks the message until turn end (Auto-flush), while
-    // Queued Messages = send-immediately forwards it into the active
-    // conversation without cancelling the in-flight tool. Without
-    // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
-    // a permission dialog where Enter approves and digit keys jump options, so
-    // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
-    // Known issue (unified screen-hold follow-up): busy `raw_input` passthrough
-    // commands (/effort, /compact, /model, /btw, /clear) bypass
-    // runtimePtyInputPolicy, and interactive selection menus that still appear
-    // with bypass enabled (`ask_question`, Plan artifact review) also capture
-    // digit keys + Enter; both belong in one unified screen-based hold
-    // alongside hookReviewInputHold.
+    startupReadyFromHistory(history) {
+      if (!history || detectCliStartupBlocker(history)) return false;
+      return isAntigravityIdleComposerScreen(history);
+    },
     supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
-      if (cliSessionId) knownCliSessionId = cliSessionId;
+      const cliDir = resolveActiveAntigravityCliDir();
+      if (!cliDir) return true;
+      const liveSid = activeSessionId({});
+      const targetSid = liveSid ?? cliSessionId;
+      if (targetSid) knownCliSessionId = targetSid;
       if (lastConfirmedSubmitAtMs > 0) {
         const elapsed = Date.now() - lastConfirmedSubmitAtMs;
-        const effectiveCid = cliSessionId ?? knownCliSessionId;
-        const graceTranscriptPath = effectiveCid ? resolveAntigravityTranscriptPath(effectiveCid) : null;
+        const effectiveCid = targetSid ?? knownCliSessionId;
+        const graceTranscriptPath = effectiveCid ? resolveRuntimeTranscriptPath(effectiveCid) : null;
         if (graceTranscriptPath && preSubmitTranscriptSize === null) {
-          // A transcript created after the submit holds only this input's
-          // records. Its USER_INPUT — even of a turn that already finished
-          // before this first probe — proves agy took the input, so it must
-          // not become the "pre-submit" baseline and hold a finished turn busy.
           if (isAntigravityTranscriptBusy(graceTranscriptPath)
             || (submitTranscriptCreatedAfter && antigravityTranscriptHasUserInput(graceTranscriptPath))) {
             lastConfirmedSubmitAtMs = 0;
@@ -636,23 +782,28 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           }
         }
       }
-      if (!cliSessionId) return false;
-      const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
+      if (!targetSid) return false;
+      const transcriptPath = resolveRuntimeTranscriptPath(targetSid);
       if (!transcriptPath || !isAntigravityTranscriptBusy(transcriptPath)) return false;
-      try {
-        // The transcript lags reality when a turn was killed (e.g. /close
-        // mid tool call, worker crash) and the conversation is later resumed:
-        // its dangling last record reads "busy" forever while the live TUI is
-        // parked at an empty composer. Trust the viewport when it proves the
-        // CLI is waiting for input; stay conservative when no authoritative
-        // screen is available (no getter → non-authoritative backend).
-        const screen = getCurrentScreen?.();
-        if (screen
-          && (isAntigravityIdleComposerScreen(screen)
-            || isAntigravityInterruptedScreen(screen))) {
-          return false;
-        }
-      } catch { /* Missing viewport is not evidence of cancellation. */ }
+      if (getCurrentScreen) {
+        try {
+          const screen = getCurrentScreen();
+          if (screen
+            && (isAntigravityIdleComposerScreen(screen)
+              || isAntigravityInterruptedScreen(screen))) {
+            return false;
+          }
+        } catch { /* Missing viewport is not evidence of cancellation. */ }
+        return true;
+      }
+      // Non-authoritative screen backend (`zmx`): never consult `zmx history`.
+      // Release a dangling cancelled/resumed transcript only when Antigravity's
+      // SQLite execution store proves an execution covering at least the latest
+      // transcript step has terminated and the conversation is completely idle.
+      const latestStepIdx = readLatestAntigravityTranscriptStepIndex(transcriptPath);
+      if (isAntigravityExecutionIdleAtOrAfterStep(targetSid, latestStepIdx, { geminiCliDir: cliDir })) {
+        return false;
+      }
       return true;
     },
     systemHints: BOTMUX_SHELL_HINTS,

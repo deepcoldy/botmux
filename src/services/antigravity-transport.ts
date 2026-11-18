@@ -10,6 +10,14 @@ export function antigravityTransport(env: Readonly<Record<string, string>> | und
   throw new Error('AGY_BOTMUX_TRANSPORT must be terminal or acp');
 }
 
+/** ZMX history removes the OSC frames used by the ACP runner for terminal
+ * outcomes. Reject before starting a session rather than losing its reply. */
+export function assertAntigravityTransportBackend(transport: 'terminal' | 'acp' | undefined, backend: string): void {
+  if (transport === 'acp' && backend === 'zmx') {
+    throw new Error('Antigravity ACP cannot use the zmx backend: zmx history does not preserve runner control frames. Use pty or tmux.');
+  }
+}
+
 /** Freeze the actual fresh process transport; a warm pane cannot change protocols in place. */
 export function verifyAntigravityTransport(opts: {
   dataDir: string;
