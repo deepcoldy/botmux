@@ -15113,6 +15113,9 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+  // A surviving pane can already be idle when a replacement worker attaches.
+  // The viewport just confirmed completion, even without a new ready edge.
+  if (lastInitConfig?.adoptMode) emitReadyCodexTurns();
 }
 
 /** 将 Codex 的结构化 429 终态同步为既有的限流状态。 */

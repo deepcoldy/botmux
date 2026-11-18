@@ -237,12 +237,15 @@ setInterval(() => { void convFd; }, 1_000);
   const typeInPane = (command: string) => {
     execFileSync('tmux', ['send-keys', '-t', 'agy-adopt:0.0', command, 'Enter'], { env: tmuxEnv });
   };
+  const paneIsReady = () => execFileSync('tmux', ['capture-pane', '-p', '-t', 'agy-adopt:0.0'], {
+    env: tmuxEnv, encoding: 'utf8',
+  }).includes(ready);
   const switchConversation = async () => {
     typeInPane('/new');
     await waitFor(() => existsSync(switchReceipt), worker.output);
   };
   return {
-    ...worker, logs, second, adoptCliPid, switchConversation, spawnWorker, typeInPane, history,
+    ...worker, logs, second, adoptCliPid, switchConversation, spawnWorker, typeInPane, paneIsReady, history,
     transcript: join(logsDir, 'transcript_full.jsonl'),
     journal: join(dataDir, 'turn-marks', `${sessionId}.json.structured`),
   };
@@ -318,9 +321,9 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
     worker.child.kill('SIGKILL');
     await exited;
 
-    const replacement = worker.spawnWorker(true);
-    await waitFor(() => replacement.messages.some(m => m.type === 'ready'), replacement.output, 15_000);
     worker.typeInPane('/fixture-ready');
+    await waitFor(worker.paneIsReady, worker.output);
+    const replacement = worker.spawnWorker(true);
     await waitFor(() => replacement.finals().length > 0, replacement.output, 15_000);
     expect(replacement.finals()).toEqual([expect.objectContaining({
       turnId: 'om_before_restart', content: expect.stringContaining(worker.logs.middleSentinel), replyModel: 'gemini-4-carbon-high',
