@@ -11,7 +11,7 @@ import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { isLinuxZombie } from '../src/utils/process-identity.js';
 import { createServer, type ServerResponse } from 'node:http';
 import { RunnerControlDecoder } from '../src/adapters/cli/runner-control-channel.js';
-import { createMinimaxFinalAssembler } from '../src/services/minimax-final-control.js';
+import { MinimaxFinalReceiver } from '../src/services/minimax-final-control.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -358,11 +358,23 @@ describe('mcode ACP wire client', () => {
       expect((await runMinimaxAcp({ ...f.options, content }, bounded())).content).toBe(expected);
       await stopped(f.calls()[0].pid);
     });
+  it('stops on the first invalid ACP frame even when a final follows in the same read', () => {
+    const delivered = vi.fn();
+    const read = createMinimaxFrameReader(line => delivered(JSON.parse(line)));
+    expect(() => read(Buffer.from('invalid JSON\n{"id":1,"result":{"stopReason":"end_turn"}}\n'))).toThrow();
+    expect(delivered).not.toHaveBeenCalled();
+  });
+  it('stops within a read when the consumer terminates the turn', () => {
+    const delivered = vi.fn(() => false);
+    createMinimaxFrameReader(delivered)(Buffer.from('first\nlate final\n'));
+    expect(delivered.mock.calls).toHaveLength(1);
+    expect(delivered).toHaveBeenCalledWith('first');
+  });
   it('decodes every byte split inside a multibyte ACP frame, including before a second frame', () => {
     const frame = Buffer.from('{"text":"你好🌍"}\n');
     for (let split = 1; split < frame.length; split++) {
       const lines: string[] = [];
-      const read = createMinimaxFrameReader(line => lines.push(JSON.parse(line).text));
+      const read = createMinimaxFrameReader(line => { lines.push(JSON.parse(line).text); });
       read(frame.subarray(0, split));
       expect(lines).toEqual([]);
       read(Buffer.concat([frame.subarray(split), frame]));
@@ -431,14 +443,13 @@ it('settles only the second large ACP answer across the real runner control chan
   const finals: Array<Record<string, unknown>> = [];
   let nextTurnSettled!: () => void;
   const settled = new Promise<void>(resolve => { nextTurnSettled = resolve; });
-  const scope = { lastInitConfig: { cliId: 'minimax' }, minimaxFinalAssembler: createMinimaxFinalAssembler(),
+  const scope = { lastInitConfig: { cliId: 'minimax' }, currentBotmuxTurnId: 'large',
     decodeCodexAppPayload: loadWorkerFunction('decodeCodexAppPayload', {}),
-    handleTrustedCodexAppMarker(kind: string, payload: Record<string, unknown>) {
-      if (kind === 'final') {
-        finals.push(payload);
-        if (payload.turnId === 'next') nextTurnSettled();
-      }
-    }, log: () => {} };
+    handleTrustedCodexAppMarker: () => {}, minimaxFinalReceiver: new MinimaxFinalReceiver(payload => {
+      finals.push(payload);
+      if (payload.turnId === 'next') nextTurnSettled();
+      scope.currentBotmuxTurnId = 'next';
+    }) };
   const handle = loadWorkerFunction<(body: string) => void>('handleAppRunnerOscMarker', scope);
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => decoder.push(chunk, true, handle));

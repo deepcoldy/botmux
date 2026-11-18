@@ -35,6 +35,7 @@ import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
+const uploadReplyFile = vi.fn(async (_appId: string, _file: { name: string; bytes: Buffer }) => 'file_reply');
 const uploadImageMock = vi.fn(async (_appId: string, _image: string | Buffer) => 'img_v3_uploaded_preview');
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
@@ -48,6 +49,7 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
 vi.mock('../src/im/lark/client.js', () => ({
   getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
+  uploadFile: (appId: string, file: { name: string; bytes: Buffer }) => uploadReplyFile(appId, file),
   uploadImage: (appId: string, image: string | Buffer) => uploadImageMock(appId, image),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
@@ -317,6 +319,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    uploadReplyFile.mockReset().mockResolvedValue('file_reply');
     uploadImageMock.mockReset().mockResolvedValue('img_v3_uploaded_preview');
     resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
       resolved: entries,
@@ -352,6 +355,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     clearMessageListenerRunPreviewStore();
     linkRefRuntime.current = undefined;
     vi.useRealTimers();
+  });
+
+  it.each([3_000_000, 8_000_000])('delivers a %i-byte MiniMax final as one Markdown file after a transient send failure', async size => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'minimax';
+    getBot('app_test').config.cliId = 'minimax';
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('temporary send failure')).mockResolvedValue('om_file');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const msg = { ...finalOutputMsg(), content: size === 3_000_000
+      ? 'a'.repeat(size - 21) + ' https://example.org/' : '甲\0'.repeat(size / 4) };
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(complete).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_file'));
+    expect(uploadReplyFile).toHaveBeenCalledTimes(1);
+    const [app, file] = uploadReplyFile.mock.calls[0];
+    expect([app, file.name, file.bytes.length]).toEqual(['app_test', 'reply.md', size]);
+    expect(file.bytes.equals(Buffer.from(msg.content))).toBe(true);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(JSON.parse(call[1])).toEqual({ file_key: 'file_reply' });
+      expect(call[2]).toBe('file');
+      expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+    }
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('reports failed MiniMax attachment publication after upload retries are exhausted', async () => {
+    const ds = makeDs(); ds.adoptedFrom = undefined; ds.session.cliId = 'minimax';
+    getBot('app_test').config.cliId = 'minimax';
+    uploadReplyFile.mockRejectedValue(new Error('upload unavailable'));
+    const sessionReply = vi.fn(); const complete = vi.fn();
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: '文'.repeat(1_000_000) }, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadReplyFile).toHaveBeenCalledTimes(3);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'MiniMax reply.md delivery failed' });
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
   it('expands LinkRefs before markdown card rendering and keeps the worker IPC immutable', async () => {

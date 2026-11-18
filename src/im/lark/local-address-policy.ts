@@ -269,7 +269,11 @@ function scrubText(input: string, ctx: Context): string {
   const spans = extractHttpUrlSpans(linked);
   // The link ledger excludes credentials. Locality checks must still inspect
   // such URLs, and protocol-relative web links must be protected too.
-  for (const match of linked.matchAll(/[a-z][a-z0-9+.-]*:[^\s<>"'\x60，。、；！？]+|(?<![:/])\/\/(?=[a-z0-9[])[^\s<>"'\x60，。、；！？]+/giu)) {
+  // A large Markdown attachment can contain long unbroken words. Consume a
+  // whole candidate even without a colon instead of rescanning its suffixes.
+  const urlCandidates = linked.includes(':') || linked.includes('//') ? linked : '';
+  for (const match of urlCandidates.matchAll(/[a-z][a-z0-9+.-]*(?::[^\s<>"'\x60，。、；！？]+)?|(?<![:/])\/\/(?=[a-z0-9[])[^\s<>"'\x60，。、；！？]+/giu)) {
+    if (!match[0].includes(':') && !match[0].startsWith('//')) continue;
     if (spans.some(span => span.start === match.index)) continue;
     const value = match[0].replace(/[)\].,;]+$/, '');
     try {

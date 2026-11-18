@@ -1,7 +1,7 @@
 import type { SendMessageFn, ReplyMessageFn } from '../cli/send-dispatch.js';
 import { describeSendFailure } from '../cli/send-dispatch.js';
 import type { ManagedHookOrigin } from './hook-runner.js';
-import type { DurableJson, DurableOutboxMessage, DurableOutboxRecord } from './durable-coordination.js';
+import type { DurableJson, DurableOutboxMessage, DurableOutboxRecord, DurableOutboxStore } from './durable-coordination.js';
 import type {
   DurableOutboxDeliveryContext,
   DurableOutboxDeliveryResult,
@@ -195,6 +195,19 @@ export function parseDurableLarkOutboxRecord(record: DurableOutboxRecord): Durab
     throw new Error('durable Lark outbox message identity does not match its row');
   }
   return parsed;
+}
+
+/** Re-uploading identical bytes can issue a new Lark file key. Present the
+ * first key to normal fenced enqueue so retries after daemon takeover join
+ * the same publication. All other envelope fields still undergo conflict checks. */
+export async function durableReplyFileContent(
+  store: Pick<DurableOutboxStore, 'readOutbox'>, messageId: string, digest: string, proposed: string,
+): Promise<string> {
+  const prior = await store.readOutbox(messageId);
+  if (!prior) return proposed;
+  const envelope = parseDurableLarkOutboxRecord(prior);
+  return envelope.msgType === 'file' && envelope.hookContext?.replyFileDigest === digest
+    ? envelope.content : proposed;
 }
 
 function retryAt(

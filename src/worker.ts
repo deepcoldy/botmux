@@ -807,7 +807,7 @@ import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { runnerFinalOutcome } from './services/runner-final-outcome.js';
-import { createMinimaxFinalAssembler } from './services/minimax-final-control.js';
+import { MinimaxFinalReceiver } from './services/minimax-final-control.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
@@ -6202,6 +6202,7 @@ function setCaptureIdentity(
   forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
@@ -18972,7 +18973,7 @@ function handleVisibleStartupInteraction(data: string): boolean {
 // in the terminal-OSC decode set.
 const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
-const minimaxFinalAssembler = createMinimaxFinalAssembler();
+const minimaxFinalReceiver = new MinimaxFinalReceiver(payload => { void handleTrustedCodexAppMarker('final', payload); });
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
 /** ANSI-stripped PTY tail scanned for Pi's "updated while this session was
@@ -19818,18 +19819,10 @@ function handleAppRunnerOscMarker(body: string): void {
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
+      payload && typeof payload === 'object' ? payload : undefined,
+      { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
   if (!payload || typeof payload !== 'object') return;
-  if (lastInitConfig?.cliId === 'minimax') {
-    if (kind === 'final-start' || kind === 'final-chunk' || kind === 'final-end') {
-      // A new writer/turn may follow a partial transaction left on the PTY.
-      if (kind === 'final-start') minimaxFinalAssembler.clear();
-      const result = minimaxFinalAssembler.accept(kind, payload);
-      if (result.status === 'complete') void handleTrustedCodexAppMarker('final', result.payload);
-      else if (result.status === 'reject') log(`MiniMax rejected final record: ${result.reason}`);
-      return;
-    }
-    minimaxFinalAssembler.clear();
-  }
   // PR #597 routes every runner marker (thread/state/diagnostic/activity/final
   // and master's lifecycle/steer) through the single trusted handler; codex-app
   // reaches it over the signed socket, mira/mir over this terminal-OSC path.
@@ -31531,6 +31524,7 @@ async function spawnCliBody(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
     lastCliExitServerReplaced = exitMarksServerReplaced({
       intentionalRestart,
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
@@ -32063,6 +32057,7 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
+  if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   // Invalidate an in-flight async spawn before any other teardown hook runs. The
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
@@ -32207,7 +32202,6 @@ function killCli(opts: {
   disarmSwitchConfirm();
   disarmBtwCapture();
   appRunnerControlDecoder.reset();
-  minimaxFinalAssembler.clear();
 }
 
 function stopOwnedSessionScope(reason: string): void {

@@ -21,7 +21,7 @@ const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array
 // turn. The caller's deadline and owned-process cancellation still bound work.
 const MAX_FRAME_BYTES = 8_000_000;
 /** A frame can span reads, including the bytes of a single UTF-8 character. */
-export function createMinimaxFrameReader(onLine: (line: string) => void) {
+export function createMinimaxFrameReader(onLine: (line: string) => void | boolean) {
   let frameBytes = 0;
   let fragments: Buffer[] = [];
   return (chunk: Buffer): void => {
@@ -34,7 +34,7 @@ export function createMinimaxFrameReader(onLine: (line: string) => void) {
       if (end < 0) return;
       const line = Buffer.concat(fragments, frameBytes).toString('utf8');
       fragments = []; frameBytes = 0; start = end + 1;
-      if (line.trim()) onLine(line);
+      if (line.trim() && onLine(line) === false) return;
     }
   };
 }
@@ -159,7 +159,11 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
     else if (object(message.result)) p.resolve(message.result);
     else p.reject(new Error('mcode_acp_result_invalid'));
   };
-  const readFrames = createMinimaxFrameReader(line => handle(JSON.parse(line)));
+  const readFrames = createMinimaxFrameReader(line => {
+    handle(JSON.parse(line));
+    // An update callback may synchronously abort the turn.
+    return !failure && !closing;
+  });
   child.stdout.on('data', (chunk: Buffer) => {
     if (failure || closing) return;
     try { readFrames(chunk); } catch (error) { fail(error instanceof Error ? error : new Error('mcode_acp_protocol_invalid')); }
