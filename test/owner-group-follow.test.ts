@@ -255,8 +255,9 @@ describe('owner follow policy validation', () => {
     expect(normalizeOwnerGroupFollowConfig({ enabled: true, excludeChatIds: ['oc_a', 'oc_a'] }))
       .toEqual({ enabled: true, excludeChatIds: ['oc_a'] });
   });
-  it.each([true, [], { enabled: 'true' }, { owner: 'ou_other' }, { excludeChatIds: ['ou_user'] }, { pollIntervalSeconds: 0 }])
-    ('rejects invalid settings rather than accidentally enabling: %j', value => {
+  it.each([true, [], { enabled: 'true' }, { owner: 'ou_other' }, { excludeChatIds: ['ou_user'] }, { pollIntervalSeconds: 0 }]
+    .map(value => ({ value })))
+    ('rejects invalid settings rather than accidentally enabling: $value', ({ value }) => {
       expect(() => normalizeOwnerGroupFollowConfig(value)).toThrow();
     });
 });
