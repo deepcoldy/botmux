@@ -61,7 +61,7 @@ describe('owner follow with the real platform resolver and authorization request
     mocks.request.mockResolvedValue({ ok: false, reason: 'not_deployed' }); await start();
     expect(mocks.request).toHaveBeenCalledTimes(1);
     const text = mocks.notify.mock.calls[0][2];
-    const link = /\]\(([^)]+)\)/.exec(text)![1];
+    const link = /(https:\/\/\S+)/.exec(text)![1];
     expect(new URL(link).origin).toBe('https://platform.example');
     expect(new URL(link).searchParams.get('scope')?.split(' ')).toEqual(['im:chat:read', 'im:chat.members:write_only', 'offline_access']);
   });

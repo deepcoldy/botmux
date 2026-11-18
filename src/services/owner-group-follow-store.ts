@@ -84,8 +84,9 @@ export class OwnerGroupFollowStore {
       return true;
     });
   }
-  observe(epoch: string, chats: readonly string[], botChats: ReadonlySet<string>, excluded: ReadonlySet<string>, snapshotRevision?: number): boolean {
-    return this.update(epoch, state => {
+  observe(epoch: string, chats: readonly string[], botChats: ReadonlySet<string>, excluded: ReadonlySet<string>, snapshotRevision?: number): number | undefined {
+    let revision: number | undefined;
+    const updated = this.update(epoch, state => {
       // A second daemon can settle an invitation while these snapshots await.
       // Its newer state wins; an old absence must not manufacture a removal.
       if (snapshotRevision !== undefined && state.revision !== snapshotRevision) return false;
@@ -108,36 +109,40 @@ export class OwnerGroupFollowStore {
       // Only a complete successful listing may become a baseline.
       state.knownChatIds = [...chats];
       state.initialized = true;
+      revision = state.revision + 1;
     });
+    return updated ? revision : undefined;
   }
-  claim(epoch: string, chatId: string, now: number): string | undefined {
-    let attemptId: string | undefined;
-    this.update(epoch, state => {
+  claim(epoch: string, chatId: string, now: number, expectedRevision?: number): { attemptId: string; revision: number } | undefined {
+    let result: { attemptId: string; revision: number } | undefined;
+    const updated = this.update(epoch, state => {
+      if (expectedRevision !== undefined && state.revision !== expectedRevision) return false;
       const entry = state.entries[chatId];
-      if (!entry || entry.attempts >= 3) return;
+      if (!entry || entry.attempts >= 3) return false;
       const ready = entry.status === 'pending' && (entry.retryAt ?? 0) <= now;
       const stale = entry.status === 'inviting' && now - (entry.startedAt ?? now) >= 120_000;
-      if (!ready && !stale) return;
-      attemptId = randomUUID();
+      if (!ready && !stale) return false;
+      const attemptId = randomUUID();
       state.entries[chatId] = { status: 'inviting', attempts: entry.attempts + 1, attemptId, startedAt: now };
+      result = { attemptId, revision: state.revision + 1 };
     });
-    return attemptId;
+    return updated ? result : undefined;
   }
-  finish(epoch: string, chatId: string, attemptId: string, result: 'joined' | 'approval' | 'failed' | 'retry' | 'authorization', now: number): boolean {
-    let changed = false;
-    this.update(epoch, state => {
+  finish(epoch: string, chatId: string, attemptId: string, result: 'joined' | 'approval' | 'failed' | 'retry' | 'authorization', now: number): number | undefined {
+    let revision: number | undefined;
+    const updated = this.update(epoch, state => {
       const entry = state.entries[chatId];
       // A removal event or config edit while the request was in flight wins.
-      if (entry?.status !== 'inviting' || entry.attemptId !== attemptId) return;
+      if (entry?.status !== 'inviting' || entry.attemptId !== attemptId) return false;
       state.entries[chatId] = {
         status: result === 'authorization' || result === 'retry' && entry.attempts < 3 ? 'pending' : result === 'joined' || result === 'approval' ? result : 'failed',
         attempts: result === 'authorization' ? entry.attempts - 1 : entry.attempts,
         ...(result === 'authorization' ? { retryAt: now + 300_000 } : {}),
         ...(result === 'retry' && entry.attempts < 3 ? { retryAt: now + 60_000 * 2 ** (entry.attempts - 1) } : {}),
       };
-      changed = true;
+      revision = state.revision + 1;
     });
-    return changed;
+    return updated ? revision : undefined;
   }
   removed(chatId: string): void {
     if (!validChatId(chatId) || !existsSync(this.path)) return;

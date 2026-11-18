@@ -70,6 +70,13 @@ describe('owner group follow', () => {
     expect(h.token).toHaveBeenCalledTimes(3);
     await h.scan(); expect(h.invite).toHaveBeenCalledTimes(1);
   });
+  it('invites every eligible new chat while advancing the round revision through its own writes', async () => {
+    const h = harness(); await h.scan();
+    h.chats(['oc_old', 'oc_new_a', 'oc_new_b']); await h.scan();
+    expect(h.invite.mock.calls.map(call => call[0])).toEqual(['oc_new_a', 'oc_new_b']);
+    expect(h.store.read()?.entries.oc_new_a.status).toBe('joined');
+    expect(h.store.read()?.entries.oc_new_b.status).toBe('joined');
+  });
   it('does not turn a failed listing into a baseline or invite from it', async () => {
     const h = harness(); await h.scan();
     h.chats(['oc_old', 'oc_new']); h.listChats.mockRejectedValueOnce(new Error('page failed'));
@@ -143,6 +150,18 @@ describe('owner group follow', () => {
     expect(h.invite).toHaveBeenCalledTimes(3); expect(h.notify).toHaveBeenCalledTimes(1);
     expect(h.store.read()?.entries.oc_new.status).toBe('failed');
   });
+  it('keeps an uncertain invitation claimed until the 120-second reconciliation window', async () => {
+    const h = harness(); await h.scan(); h.chats(['oc_old', 'oc_new']);
+    h.invite.mockRejectedValueOnce(new TypeError('fetch failed'));
+    await h.scan();
+    expect(h.store.read()?.entries.oc_new).toMatchObject({ status: 'inviting', attempts: 1 });
+    await h.scan();
+    expect(h.invite).toHaveBeenCalledTimes(1);
+    expect(h.store.read()?.entries.oc_new.status).toBe('inviting');
+    await h.scan();
+    expect(h.invite).toHaveBeenCalledTimes(2);
+    expect(h.store.read()?.entries.oc_new.status).toBe('joined');
+  });
   it('stops retrying permanent permission failures', async () => {
     const h = harness(); await h.scan(); h.chats(['oc_old', 'oc_new']);
     h.invite.mockRejectedValue(new OwnerGroupFollowError(false));
@@ -189,6 +208,41 @@ describe('owner group follow', () => {
     h.chats(['oc_old', 'oc_while_off', 'oc_new']); await h.scan();
     expect(h.invite.mock.calls.map(call => call[0])).toEqual(['oc_new']);
   });
+  it('preserves the scoped journal while the owner is temporarily unresolved during tick', async () => {
+    const h = harness(); await h.scan(); h.store.removed('oc_old');
+    h.setContext({ brand: 'feishu', config: { enabled: true } });
+    await h.scan();
+    expect(h.store.read()).toMatchObject({
+      scope: 'feishu:ou_owner', active: true, initialized: true, knownChatIds: ['oc_old'],
+      entries: { oc_old: { status: 'removed' } },
+    });
+    h.setContext({ ownerOpenId: 'ou_owner', brand: 'feishu', config: { enabled: true } });
+    await h.scan();
+    h.chats([]); await h.scan();
+    h.chats(['oc_old']); await h.scan();
+    expect(h.invite).not.toHaveBeenCalled();
+    expect(h.store.read()?.entries.oc_old.status).toBe('removed');
+  });
+  it('changed() aborts an in-flight scan without replacing the journal when owner resolution is temporarily empty', async () => {
+    const h = harness(); await h.scan(); h.store.removed('oc_old');
+    const epoch = h.store.read()!.epoch;
+    const gate = deferred<string[]>(), started = deferred<void>();
+    h.listChats.mockImplementationOnce(async () => { started.resolve(); return gate.promise; });
+    const scan = h.scan(); await started.promise;
+    h.setContext({ brand: 'feishu', config: { enabled: true } }, true);
+    gate.resolve(['oc_old', 'oc_new']); await scan;
+    expect(h.invite).not.toHaveBeenCalled();
+    expect(h.store.read()).toMatchObject({
+      scope: 'feishu:ou_owner', active: true, initialized: true,
+      entries: { oc_old: { status: 'removed' } },
+    });
+    expect(h.store.read()?.epoch).not.toBe(epoch);
+  });
+  it('still resets the journal when the owner changes to a different resolved identity', async () => {
+    const h = harness(); await h.scan(); h.store.removed('oc_old');
+    h.setContext({ ownerOpenId: 'ou_new_owner', brand: 'feishu', config: { enabled: true } }, true);
+    expect(h.store.read()).toMatchObject({ scope: 'feishu:ou_new_owner', initialized: false, entries: {} });
+  });
   it('does not use credentials from a previous owner after ownership changes during a wait', async () => {
     const h = harness(); const gate = deferred<string | null>(), started = deferred<void>();
     h.token.mockImplementationOnce(async () => { started.resolve(); return gate.promise; });
@@ -232,6 +286,24 @@ describe('owner group follow', () => {
     gate.resolve([]); await olderScan;
     expect(h.store.read()?.entries.oc_new.status).toBe('joined');
     expect(h.invite).toHaveBeenCalledTimes(1);
+  });
+  it('does not claim from a round after another daemon advances its observed revision', async () => {
+    const h = harness(); await h.scan(); h.chats(['oc_old', 'oc_new']);
+    const fresh = deferred<string>(), freshStarted = deferred<void>();
+    h.token.mockImplementationOnce(async () => 'scan-token')
+      .mockImplementationOnce(async () => { freshStarted.resolve(); return fresh.promise; });
+    const olderScan = h.scan(); await freshStarted.promise;
+    expect(h.store.read()?.entries.oc_new.status).toBe('pending');
+    const second = createOwnerGroupFollower({
+      ...h.deps,
+      listChats: vi.fn(async () => ['oc_old']),
+    });
+    followers.push(second);
+    await second.tick();
+    expect(h.store.read()?.knownChatIds).toEqual(['oc_old']);
+    fresh.resolve('fresh-token'); await olderScan;
+    expect(h.invite).not.toHaveBeenCalled();
+    expect(h.store.read()?.entries.oc_new.status).toBe('pending');
   });
   it('cancels a pending invitation when its group is excluded, without reviving it later', async () => {
     const h = harness(); await h.scan(); h.chats(['oc_old', 'oc_new']);

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const mocks = vi.hoisted(() => ({ config: { larkAppId: 'cli_runtime_probe', larkAppSecret: 'secret', brand: 'feishu', ownerGroupFollow: { enabled: true } }, owner: 'ou_owner', token: vi.fn(async (_app: string, _secret: string, _brand: string, _owner: string, _signal?: AbortSignal) => 'owner-token'), bound: vi.fn(), ask: vi.fn(async (_args: unknown): Promise<any> => ({ kind: 'sent', deduped: false })), botList: vi.fn(), notify: vi.fn(async (_app: string, _owner: string, _content: string) => {}) }));
+const mocks = vi.hoisted(() => ({ config: { larkAppId: 'cli_runtime_probe', larkAppSecret: 'secret', brand: 'feishu', ownerGroupFollow: { enabled: true } }, owner: 'ou_owner', token: vi.fn(async (_app: string, _secret: string, _brand: string, _owner: string, _signal?: AbortSignal) => 'owner-token'), bound: vi.fn(), ask: vi.fn(async (_args: unknown): Promise<any> => ({ kind: 'sent', deduped: false })), botList: vi.fn(), notify: vi.fn(async (..._args: any[]) => {}) }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: mocks.config }), getOwnerOpenId: () => mocks.owner, getBotClient: () => ({}) }));
 vi.mock('../src/utils/user-token.js', () => ({ resolveUserToken: mocks.token }));
 vi.mock('../src/core/lark-tool-platform-credential.js', () => ({ resolveBoundLarkUserCredential: mocks.bound, platformIncrementalAuthorizeUrl: (page: string) => page }));
@@ -12,10 +12,12 @@ vi.mock('../src/im/lark/lark-get.js', () => ({ larkGet: mocks.botList }));
 vi.mock('../src/im/lark/client.js', () => ({ sendUserMessage: mocks.notify }));
 import { startOwnerGroupFollow, callOwnerFollowApi } from '../src/services/owner-group-follow-runtime.js';
 import { OwnerGroupFollowStore } from '../src/services/owner-group-follow-store.js';
+import { notifyOwnerGroupFollowChanged } from '../src/services/owner-group-follow-policy.js';
 let dir: string, stop: (() => void) | undefined, owners: string[], inviteBody: any;
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z')); dir = mkdtempSync(join(tmpdir(), 'follow-runtime-test-'));
   mocks.config.ownerGroupFollow = { enabled: true };
+  mocks.owner = 'ou_owner';
   owners = ['oc_old']; inviteBody = { code: 0, data: {} }; mocks.bound.mockReset(); mocks.ask.mockReset().mockResolvedValue({ kind: 'sent', deduped: false }); mocks.notify.mockClear(); mocks.token.mockClear();
   mocks.bound.mockImplementation(async input => ({ ok: true, credential: await input.botAppToken(input.openId), appId: input.bot.larkAppId }));
   mocks.botList.mockReset();
@@ -53,9 +55,11 @@ describe('owner follow runtime API boundaries', () => {
     expect(mocks.token.mock.calls.every(call => call[3] === 'ou_owner' && call[0] === 'cli_runtime_probe')).toBe(true);
     expect(store().read()?.entries.oc_new.status).toBe('joined');
   });
-  it('does not request user authorization to repair a bot application permission failure', async () => {
+  it.each(['envelope', 'sdk-exception'] as const)('does not request user authorization to repair a bot application permission failure (%s)', async shape => {
     mocks.bound.mockResolvedValue({ ok: true, credential: 'owner-token', appId: 'cli_platform', issuer: 'platform' });
-    mocks.botList.mockResolvedValue({ code: 99991672 }); await start();
+    if (shape === 'envelope') mocks.botList.mockResolvedValue({ code: 99991672 });
+    else mocks.botList.mockRejectedValue(Object.assign(new Error('HTTP 403'), { response: { status: 403, data: { code: 99991672 } } }));
+    await start();
     expect(mocks.ask).not.toHaveBeenCalled(); expect(mocks.notify).toHaveBeenCalledTimes(1);
     expect(store().read()?.initialized).toBe(false);
   });
@@ -69,6 +73,8 @@ describe('owner follow runtime API boundaries', () => {
     await start(); owners.push('oc_new'); await scan(); await scan();
     expect(store().read()?.entries.oc_new.status).toBe('approval');
     expect(mocks.notify).toHaveBeenCalledTimes(1);
+    expect(mocks.notify.mock.calls[0]?.[2]).toContain('https://');
+    expect(mocks.notify.mock.calls[0]?.[2]).not.toContain('](');
     const posts = vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST');
     expect(posts).toHaveLength(1);
     mocks.botList.mockResolvedValue({ code: 0, data: { items: [{ chat_id: 'oc_new' }], has_more: false } });
@@ -79,6 +85,35 @@ describe('owner follow runtime API boundaries', () => {
     await start(); await scan(); expect(mocks.notify).toHaveBeenCalledTimes(1);
     expect(mocks.ask).toHaveBeenCalledTimes(1);
     expect(mocks.notify.mock.calls[0]?.[2]).not.toContain('https://platform.example/credentials');
+  });
+  it('revalidates the owner through beforeWrite after a queued notification wait', async () => {
+    mocks.bound.mockResolvedValue({ ok: false, reason: 'bot_app_missing' });
+    let release!: () => void, started!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const delivered = vi.fn();
+    mocks.notify.mockImplementationOnce(async (...args: any[]) => {
+      started(); await gate;
+      await args[6]?.beforeWrite?.();
+      delivered(args[1]);
+    });
+    await start(); await entered;
+    mocks.owner = 'ou_new_owner';
+    notifyOwnerGroupFollowChanged(mocks.config.larkAppId);
+    release(); await settle();
+    expect(delivered).not.toHaveBeenCalled();
+  });
+  it.each([{ name: 'null', body: null }, { name: 'object without code', body: {} }])('keeps a malformed 2xx $name invitation response in the unknown-outcome claim window', async ({ body }) => {
+    inviteBody = body;
+    await start(); owners.push('oc_new'); await scan();
+    expect(store().read()?.entries.oc_new).toMatchObject({ status: 'inviting', attempts: 1 });
+    expect(mocks.notify).not.toHaveBeenCalled();
+    await scan();
+    expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    await scan();
+    expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(2);
+    expect(store().read()?.entries.oc_new).toMatchObject({ status: 'inviting', attempts: 2 });
+    expect(mocks.notify).not.toHaveBeenCalled();
   });
   it('documented same-chat concurrency error remains retryable', async () => {
     inviteBody = { code: 232019, data: {} };

@@ -44,14 +44,23 @@ export function createOwnerGroupFollower(deps: OwnerGroupFollowDependencies) {
     controller?.abort();
     nextPollAt = 0;
     const context = deps.context();
-    store.configure(scopeOf(context), context.config?.enabled === true && !!context.ownerOpenId, true);
+    // A temporarily unresolved owner is not a new identity scope. Keep the
+    // previous journal so a healed owner resumes its baseline and removals,
+    // but still advance its epoch to fence other daemons' old responses.
+    if (!context.ownerOpenId) {
+      const previous = store.read();
+      if (previous) store.configure(previous.scope, context.config?.enabled === true, true);
+      return;
+    }
+    store.configure(scopeOf(context), context.config?.enabled === true, true);
   }
   const unregister = registerOwnerGroupFollowChangeHandler(deps.appId, changed);
 
   async function tick(): Promise<void> {
     if (stopped || running) return;
     const context = deps.context();
-    const enabled = context.config?.enabled === true && !!context.ownerOpenId;
+    if (!context.ownerOpenId) return;
+    const enabled = context.config?.enabled === true;
     const state = store.configure(scopeOf(context), enabled);
     if (!enabled || !state || now() < nextPollAt) return;
     running = true;
@@ -89,7 +98,9 @@ export function createOwnerGroupFollower(deps: OwnerGroupFollowDependencies) {
       const botChats = new Set(await deps.listBotChats(signal));
       if (!current()) return;
       const excluded = new Set(deps.context().config?.excludeChatIds ?? []);
-      if (!store.observe(epoch, chats, botChats, excluded, snapshotRevision)) return;
+      const observedRevision = store.observe(epoch, chats, botChats, excluded, snapshotRevision);
+      if (observedRevision === undefined) return;
+      let roundRevision = observedRevision;
       const joinedByOwner = new Set(chats);
       const entries = store.read()?.entries ?? {};
       for (const [chatId, entry] of Object.entries(entries)) {
@@ -102,22 +113,44 @@ export function createOwnerGroupFollower(deps: OwnerGroupFollowDependencies) {
         if (!freshToken) { await notice(); return; }
         if (deps.context().config?.excludeChatIds?.includes(chatId)) continue;
         if (entry.status === 'inviting' && entry.attempts >= 3 && now() - (entry.startedAt ?? now()) >= 120_000) {
-          if (entry.attemptId && store.finish(epoch, chatId, entry.attemptId, 'failed', now())) await notice(chatId);
+          if (entry.attemptId) {
+            const settledRevision = store.finish(epoch, chatId, entry.attemptId, 'failed', now());
+            if (settledRevision !== undefined) {
+              roundRevision = settledRevision;
+              await notice(chatId);
+            }
+          }
           continue;
         }
-        const attemptId = store.claim(epoch, chatId, now());
-        if (!attemptId || !current()) continue;
+        const claim = store.claim(epoch, chatId, now(), roundRevision);
+        if (!claim) {
+          // Another daemon committed a newer snapshot after our observe. Do not
+          // let this stale round manufacture any further invitations.
+          if (store.read()?.revision !== roundRevision) return;
+          continue;
+        }
+        roundRevision = claim.revision;
+        if (!current()) return;
         try {
           await deps.invite(chatId, freshToken, signal);
-          store.finish(epoch, chatId, attemptId, 'joined', now());
+          const settledRevision = store.finish(epoch, chatId, claim.attemptId, 'joined', now());
+          if (settledRevision !== undefined) roundRevision = settledRevision;
         } catch (error) {
           if (!current()) return;
-          const retryable = !(error instanceof OwnerGroupFollowError) || error.retryable;
-          const authorization = error instanceof OwnerGroupFollowError && error.authorization;
-          const issue = error instanceof OwnerGroupFollowError ? error.issue : undefined;
-          const changedEntry = store.finish(epoch, chatId, attemptId, authorization ? 'authorization' : issue?.pendingApproval ? 'approval' : retryable ? 'retry' : 'failed', now());
+          if (!(error instanceof OwnerGroupFollowError)) {
+            // A transport/parse failure leaves the POST outcome unknown. Keep
+            // its durable claim for membership reconciliation and the 120s
+            // stale-claim window instead of retrying on the ordinary 60s path.
+            deps.log('owner group follow invitation outcome unknown');
+            continue;
+          }
+          const retryable = error.retryable;
+          const authorization = error.authorization;
+          const issue = error.issue;
+          const settledRevision = store.finish(epoch, chatId, claim.attemptId, authorization ? 'authorization' : issue?.pendingApproval ? 'approval' : retryable ? 'retry' : 'failed', now());
+          if (settledRevision !== undefined) roundRevision = settledRevision;
           if (authorization) { await notice(undefined, issue); return; }
-          if (changedEntry && ['failed', 'approval'].includes(store.read()?.entries[chatId]?.status ?? '')) await notice(chatId, issue);
+          if (settledRevision !== undefined && ['failed', 'approval'].includes(store.read()?.entries[chatId]?.status ?? '')) await notice(chatId, issue);
         }
       }
     } catch (error) {
