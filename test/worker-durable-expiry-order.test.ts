@@ -17,6 +17,7 @@ import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evi
 import { ClaudeEffortObserver } from '../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../src/services/terminal-effort-choice.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from '../src/core/restart-fresh-budget.js';
+import { nativeResumeTargetFailure } from '../src/services/native-resume-target.js';
 import { join } from 'node:path';
 
 type RespawnResult = 'spawned' | 'failed' | 'superseded';
@@ -33,7 +34,7 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
   const timers: Array<() => unknown> = [];
   const observed: Record<string, unknown> = {};
   const scope: Record<string, any> = {
-    codexAutoUpgrade: undefined,
+    codexAutoUpgrade: undefined, nativeResumeTargetFailure,
     lastInitConfig: { cliId: 'claude-code', sessionId: 'sid', workingDir: '/project', resume: false },
     cliSpawnGeneration: 1,
     submitFailureChains: { clear: vi.fn() },

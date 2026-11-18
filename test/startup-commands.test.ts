@@ -66,6 +66,11 @@ describe('shouldRunStartupCommandsOnSpawn', () => {
     expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: false })).toBe(true);
     expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: true })).toBe(false);
   });
+  it('native-history replacement suppresses replay only for that exact spawn', () => {
+    expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: false, suppressStartupCommands: true })).toBe(false);
+    expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: true, suppressStartupCommands: true })).toBe(false);
+    expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: false, suppressStartupCommands: false })).toBe(true);
+  });
 });
 
 describe('shouldDeferInitialPromptForStartup', () => {

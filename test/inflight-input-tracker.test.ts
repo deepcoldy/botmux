@@ -221,6 +221,16 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([]);
   });
 
+  it('started native input stays unresolved until the terminal/idle boundary', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('already started', 'started'));
+    t.onTurnStarted('started');
+    expect(t.hasUnacked()).toBe(false);
+    expect(t.hasUnresolved()).toBe(true);
+    t.onTurnComplete();
+    expect(t.hasUnresolved()).toBe(false);
+  });
+
   it('a turn whose user record reached the transcript is kept apart: resumed CLIs do not get it again', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('review PR 1650', 'started'));

@@ -431,6 +431,16 @@ describe('native HTTP review: intervention, partial failure and late calls', () 
     expect(state).toMatchObject({ nativeSessionId: input.targetId, workerReady: true, cliReady: true, busy: true });
   });
 
+  it('an accepted input without its exact terminal keeps readback busy even on an idle screen', async () => {
+    ds.session.cliSessionId = input.targetId;
+    ds.acceptedInputTurns = new Map([['open-turn', {
+      workerGeneration: ds.workerGeneration, turnId: 'open-turn', phase: 'native-submit', at: Date.now(),
+    }]]);
+    expect(pool.hasUnsettledAcceptedInput(ds)).toBe(true);
+    const state = await (await call('GET')).json();
+    expect(state).toMatchObject({ nativeSessionId: input.targetId, workerReady: true, cliReady: true, busy: true });
+  });
+
   it('an exception before startFailure normalization is redacted at the HTTP boundary', async () => {
     vi.spyOn(pool, 'requestSessionRestart').mockImplementation(() => { throw new Error(privateText); });
     await startDashboard();

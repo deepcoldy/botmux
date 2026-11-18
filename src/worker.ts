@@ -25711,6 +25711,9 @@ async function spawnCli(
   opts: {
     pluginGenerationPrepared?: boolean;
     exactResumeSessionId?: string;
+    /** Explicit native-history replacement must not inject startup commands
+     * into the prepared target. Ordinary restarts keep their existing replay. */
+    suppressStartupCommands?: boolean;
     restartCause?: CliRestartCause;
     /** First CLI start only; see SpawnOpts.retryPaneAgentStart. */
     retryPaneAgentStart?: boolean;
@@ -25752,6 +25755,10 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      if (outcome === 'refused' && !superseded
+        && pendingNativeResumeTarget?.attemptId === activeRestartAttemptId) {
+        throw new Error('native_resume_target_in_use');
+      }
       if (outcome === 'refused' && continuation && !superseded) {
         abandonTraexAutoModelContinuation(continuation, binding.bindingId, 'rejected');
         return spawnCli(cfg, opts);
@@ -27834,8 +27841,9 @@ async function spawnCliBody(
   // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
-  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })
-    || codexAutoUpgrade?.stage === 'restoring';
+  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({
+    willReattachPersistent, suppressStartupCommands: opts.suppressStartupCommands,
+  }) || codexAutoUpgrade?.stage === 'restoring';
   startupCommandCursor = 0;
   startupCommandsInProgress = false;
   clearStartupCommandAckHold();
@@ -32708,6 +32716,9 @@ async function restartCliProcess(
     preservePending?: boolean;
     skipRestartBudget?: boolean;
     exactResumeSessionId?: string;
+    /** Explicit native-history replacement must not inject startup commands
+     * into the prepared target. Ordinary restarts keep their existing replay. */
+    suppressStartupCommands?: boolean;
     restartCause?: CliRestartCause;
     /** Runs after the old CLI is killed and before the respawn. Normally a
      * rejection is logged and the original history resumes. Explicit history
@@ -32732,6 +32743,12 @@ async function restartCliProcess(
     } catch (err) {
       log(`onRespawnSettled failed (${reason}): ${err instanceof Error ? err.message : String(err)}`);
     }
+  };
+  const fatalRestartError = async (err: unknown): Promise<void> => {
+    if (!opts.beforeRespawnMustSucceed) return sendFatalWorkerErrorAndExit(err);
+    const raw = err instanceof Error ? err.message : String(err);
+    log(`Native resume restart failed (local only): ${raw}`);
+    await sendFatalWorkerErrorAndExit(new Error(nativeResumeTargetFailure(err)));
   };
   if (codexAutoUpgrade) {
     // This restart is abandoned; the server-loss marker must not survive to be
@@ -32807,6 +32824,11 @@ async function restartCliProcess(
           retiringProcessScope.push(current);
           pending.push(...childrenOf(current));
         }
+        // The strict native-history proof may not silently discard a live
+        // writer. Optional legacy maintenance keeps its old bounded snapshot.
+        if (pending.length > 0 && opts.beforeRespawnMustSucceed) {
+          throw new Error('native_resume_process_scope_overflow');
+        }
       }
       if (restartingBackend) {
         intentionalRestartBackend = restartingBackend;
@@ -32851,7 +32873,7 @@ async function restartCliProcess(
         // cliRestartInProgress / rawInputRestartGate deliberately stay armed so no
         // input is accepted while the outcome is unknown.
         settleRespawn('failed');
-        await sendFatalWorkerErrorAndExit(new Error(
+        await fatalRestartError(new Error(
           `restart teardown not proven: ${teardownVerdict.reason ?? 'unknown'}`,
         ));
         return;
@@ -32872,7 +32894,7 @@ async function restartCliProcess(
         } catch (err) {
           if (opts.beforeRespawnMustSucceed) {
             settleRespawn('failed');
-            await sendFatalWorkerErrorAndExit(err instanceof Error ? err : new Error(String(err)));
+            await fatalRestartError(err);
             return;
           }
           log(`beforeRespawn failed (${reason}), respawning anyway: ${err instanceof Error ? err.message : String(err)}`);
@@ -32911,6 +32933,7 @@ async function restartCliProcess(
             await spawnCli(restartCfg, {
               pluginGenerationPrepared: rpcPluginGenerationPrepared,
               exactResumeSessionId: opts.exactResumeSessionId,
+              suppressStartupCommands: opts.suppressStartupCommands,
               restartCause: opts.restartCause,
               reuseExistingScratchTree: opts.preserveScratchTreeForRespawn,
             });
@@ -32924,7 +32947,7 @@ async function restartCliProcess(
             cliRestartInProgress = false;
             settleRespawn(err instanceof CliSpawnSupersededError ? 'superseded' : 'failed');
             if (err instanceof CliSpawnSupersededError) return;
-            await sendFatalWorkerErrorAndExit(err);
+            await fatalRestartError(err);
             return;
           }
         } else {
@@ -32963,6 +32986,14 @@ async function restartCliProcess(
           requestedLaunch: pendingLaunchConvergence?.requested,
         });
         if (followup.kind !== 'none') {
+          if (opts.beforeRespawnMustSucceed) {
+            // A target that exited before proof may already have changed the
+            // prepared bytes. Never fall back to the source or retry it through
+            // the ordinary recovery path with startup commands re-enabled.
+            log(`Native resume replacement recovery refused (${followup.kind})`);
+            await fatalRestartError(new Error('native_resume_target_superseded'));
+            return;
+          }
           const reason = followup.kind === 'cwd-move'
             ? `cwd-move follow-up respawn → ${lastInitConfig?.workingDir}`
             : followup.kind === 'launch-config'
@@ -33002,7 +33033,7 @@ async function restartCliProcess(
       cliRestartInProgress = false;
       settleRespawn('failed');
       try {
-        await sendFatalWorkerErrorAndExit(err);
+        await fatalRestartError(err);
       } catch { /* sendFatalWorkerErrorAndExit is already best-effort */ }
     }
   };
@@ -38195,7 +38226,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ready: isPromptReady && traexRestoredComposerReady(captureBackendScreen(backend), { resumedSession: true }),
             busy: !!cliRestartInProgress || !!tmuxRestartTimer || !!isFlushing || !!injectionFlushing
               || !!commandLineWritesPending || !!pendingMessages.length || !!pendingRawInputs.length
-              || durableTurnInFlight || backgroundWaitTasks > 0,
+              || durableTurnInFlight || inflightInputs.hasUnresolved() || backgroundWaitTasks > 0,
             isolated: sandboxEnabled(), nativeSessionId: observed?.cliSessionId,
           })) throw new Error('native_resume_target_not_idle');
           verifyNativeResumeTarget(msg.nativeResumeTarget, {
@@ -38337,6 +38368,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const restartOptions: NonNullable<Parameters<typeof restartCliProcess>[1]> = {
           immediate: true, preservePending: true, skipRestartBudget: true,
           exactResumeSessionId: requested.sourceId, beforeRespawnMustSucceed: true,
+          suppressStartupCommands: true,
           beforeRespawn: async retiring => {
             await waitForProcessQuiescence(retiring.pid, {
               now: () => Date.now(), wait: ms => delay(ms), provablyGone: pid => !pidNotProvablyGone(pid),

@@ -53,6 +53,12 @@ export class InflightInputTracker {
   private carryOver: InflightItem[] = [];
   private startedCarryOver: InflightItem[] = [];
 
+  /** Something written has not reached a terminal/idle boundary yet. Unlike
+   * hasUnacked(), this retains inputs whose native start was already observed. */
+  hasUnresolved(): boolean {
+    return this.unacked.length > 0 || this.started.length > 0;
+  }
+
   /** Something written to the PTY has not been consumed yet (no idle since). */
   hasUnacked(): boolean {
     return this.unacked.length > 0;

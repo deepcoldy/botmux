@@ -275,7 +275,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, hasUnsettledAcceptedInput, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -3164,7 +3164,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/resume-target', (req, res, params) => 
     retiring: !!ds.worker?.killed,
       cliReady: ds.cliReady === true,
       busy: !sessionAcceptsDirectCommand(ds) || ds.lastScreenStatus !== 'idle' || isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)
-        || hasPendingOrdinaryImDelivery(ds) || (ds.backgroundTaskCount ?? 0) > 0 });
+        || hasPendingOrdinaryImDelivery(ds) || hasUnsettledAcceptedInput(ds) || (ds.backgroundTaskCount ?? 0) > 0 });
   } catch {
     return jsonRes(res, 500, { ok: false, error: 'native_resume_target_readback_failed' });
   }
@@ -3264,7 +3264,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume-target/park', async (req, res,
         && ds.worker === worker && ds.workerGeneration === generation
         && ds.lastScreenStatus === 'idle' && (operationId ? true : ds.cliReady === true && !isSessionLifecycleInFlight(ds))
         && sessionAcceptsDirectCommand(ds, operationId && runtime ? { operationId, runtime } : undefined)
-        && !hasPendingOrdinaryImDelivery(ds) && (ds.backgroundTaskCount ?? 0) === 0;
+        && !hasPendingOrdinaryImDelivery(ds) && !hasUnsettledAcceptedInput(ds) && (ds.backgroundTaskCount ?? 0) === 0;
       if (!owned()) return jsonRes(res, 409, { ok: false, error: 'native_runtime_refresh_not_idle' });
       const suspended = await suspendWorkerAsync(ds, 'native_runtime_refresh', owned);
       if (!res.destroyed) return jsonRes(res, suspended ? 200 : 409,

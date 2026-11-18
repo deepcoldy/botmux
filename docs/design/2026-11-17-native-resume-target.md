@@ -55,16 +55,16 @@ HTTP parked 只证明已休眠，不表示新运行环境已经启动；调用�
 
 ## 证明与失败
 
-1. daemon 有界获取 Bot mutation gate，并在物理接纳前复核 HTTP 连接仍有效；超时的 waiter 被移除，代理断连后不得迟到执行。gate 内检查当前身份和未完成输入，拒绝重叠生命周期操作；异步 primary flush 后重新核对 worker 代次。
-2. Worker 在物理操作前重新验证当前 PID 只打开预期 source、空 composer、无输入积压、无在途回合。
-3. 路径由 Worker 按自己的原生数据根解析，不采纳调用者路径；校验边界、文件大小、完整行、源/副本 hash、header ID、fork 血缘与原生终态。
-4. 用已有的受管重启停下源进程，确认其进程树静止后再次验证。此时若出现不确定性或文件变化，停止，不在可能仍存活的源上叠加新进程。
-5. 恢复只允许精确 targetId，禁止不存在时降级成空白新会话。
+1. daemon 有界获取 Bot mutation gate，并在物理接纳前复核 HTTP 连接仍有效；超时的 waiter 被移除，代理断连后不得迟到执行。gate 内检查当前身份、其它活跃会话未占用 targetId，以及包括 accepted-but-unsettled 在内的未完成输入，拒绝重叠生命周期操作；异步 primary flush 后重新核对 worker 代次、target 占用与输入状态。接纳时登记 target claim，当前操作与其它会话的普通 native runtime bind 都在进程创建前复核，成功回执再查一次；dispatch 前失败、已证明成功或 untouched refusal 才释放，dispatch 后的超时与不确定结果保留 claim。
+2. Worker 在物理操作前重新验证当前 PID 只打开预期 source、空 composer、无输入积压、无在途回合；daemon 的 accepted-input 终态账本是权威门，worker 的 unresolved-input 信号作为独立加固。
+3. 路径由 Worker 按自己的原生数据根解析，不采纳调用者路径；校验边界、文件大小、完整行、源/副本 hash、header ID、fork 血缘与原生终态。终态必须跟踪全部嵌套/并行 turn ID，任一未结束即拒绝。
+4. 用已有的受管重启停下源进程，确认其进程树静止后再次验证。严格进程枚举达到 256 PID 上限且仍有未遍历项时 fail-closed；此时若出现不确定性或文件变化，停止，不在可能仍存活的源上叠加新进程。
+5. 恢复只允许精确 targetId，禁止不存在时降级成空白新会话。显式 native replacement 的该次新进程抑制 startupCommands，不向副本重放 `/compact` 等命令；普通 restart 的启动命令合同不变。目标进程在证明前退出时 fail-closed，不走普通 replacement-recovery 回退 source，也不自动重试可能已改写的 target。
 6. 成功回执必须有新进程真实打开目标 rollout 的证据，先发布原生 ID 再确认 restart。argv、HTTP 202、进程存活均不是成功证明。
 
 宿主不修改原稿或副本，也不注入“继续”提示或重放工具。副本的消息/工具内容、模型/provider 兼容和非可移植状态处理，由调用方在显式授权下负责验证。调用方应持久化副本来源及操作记录，daemon 重启后按精确 targetId 与 readiness 对账，不能看到超时就重复建副本或重放原请求。
 
-HTTP 读回的 busy 同时检查待处理人工输入、后继输入、受保护操作、生命周期、消息投递与后台任务，不只依赖屏幕 idle。接纳、读回和代理异常均返回有限错误码，不反射内部路径或异常原文。若副作用已接纳但响应丢失，调用方只能读回对账，不能把网络失败解释为已回滚。
+HTTP 读回的 busy 同时检查待处理人工输入、后继输入、accepted-but-unsettled 输入、受保护操作、生命周期、消息投递与后台任务，不只依赖屏幕 idle。接纳、读回和代理异常均返回有限错误码；strict native replacement 的任何 worker-bound fatal 也都在本机日志之外投影为白名单码，不反射内部路径、JSON 原文或异常原文。若副作用已接纳但响应丢失，调用方只能读回对账，不能把网络失败解释为已回滚。
 
 ### 控制器与物理身份
 

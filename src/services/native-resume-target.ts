@@ -21,6 +21,7 @@ const publicFailures = new Set([
   'native_resume_history_changed', 'native_resume_history_incomplete', 'native_resume_history_encoding',
   'native_resume_history_identity', 'native_resume_history_format', 'native_resume_history_not_terminal',
   'native_resume_history_lineage', 'native_resume_source_changed', 'native_resume_target_superseded',
+  'native_resume_process_scope_overflow', 'native_resume_target_in_use',
 ]);
 
 /** Never return filesystem paths, JSON excerpts or arbitrary exception text. */
@@ -71,7 +72,8 @@ function inspect(bytes: Buffer, id: string): { sourceId?: string; visible: boole
   const header = rows[0];
   if (header?.type !== 'session_meta' || header.payload?.id !== id
     || header.payload.history_format !== 'canonical_v1') throw new Error('native_resume_history_identity');
-  let mutation = -1, terminal = -1, visible = false, activeTurn: string | undefined;
+  let mutation = -1, terminal = -1, visible = false;
+  const activeTurns = new Set<string>();
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i]!;
     if (['response_item', 'compacted'].includes(row.type ?? '')) throw new Error('native_resume_history_format');
@@ -88,11 +90,11 @@ function inspect(bytes: Buffer, id: string): { sourceId?: string; visible: boole
       if (typeof turnId !== 'string' || !turnId.trim() || !Number.isFinite(Date.parse(row.timestamp ?? ''))) {
         throw new Error('native_resume_history_not_terminal');
       }
-      if (row.payload?.type === 'task_started') { activeTurn = turnId; terminal = -1; }
-      else if (!activeTurn || activeTurn === turnId) { terminal = i; activeTurn = undefined; }
+      if (row.payload?.type === 'task_started') { activeTurns.add(turnId); terminal = -1; }
+      else if (activeTurns.size === 0 || activeTurns.delete(turnId)) { terminal = i; }
     }
   }
-  if (!visible || mutation < 0 || activeTurn || terminal <= mutation) throw new Error('native_resume_history_not_terminal');
+  if (!visible || mutation < 0 || activeTurns.size > 0 || terminal <= mutation) throw new Error('native_resume_history_not_terminal');
   return { sourceId: typeof header.payload.forked_from_id === 'string' ? header.payload.forked_from_id : undefined, visible };
 }
 

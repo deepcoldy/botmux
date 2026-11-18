@@ -45,6 +45,7 @@ if (mutation) {
     isSessionLifecycleInFlight: (...args: any[]) => (pool.isSessionLifecycleInFlight as any)(...args),
     sessionAcceptsDirectCommand: (...args: any[]) => (pool.sessionAcceptsDirectCommand as any)(...args),
     hasPendingOrdinaryImDelivery: (...args: any[]) => (pool.hasPendingOrdinaryImDelivery as any)(...args),
+    hasUnsettledAcceptedInput: (...args: any[]) => (pool.hasUnsettledAcceptedInput as any)(...args),
     suspendWorkerAsync: (...args: any[]) => (pool.suspendWorkerAsync as any)(...args) };
   const compiled = ts.transpileModule(`const handler = ${broken};`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
@@ -136,6 +137,17 @@ describe('same-ID Codex runtime refresh', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ state: 'parked', sourceId: request.sourceId });
     expect(suspend).toHaveBeenCalledOnce();
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+  it('refuses to erase an accepted input whose exact terminal is still missing', async () => {
+    const f = idle();
+    f.ds.acceptedInputTurns = new Map([['open-turn', {
+      workerGeneration: f.ds.workerGeneration, turnId: 'open-turn', phase: 'native-submit', at: Date.now(),
+    }]]);
+    const suspend = vi.spyOn(pool, 'suspendWorkerAsync').mockResolvedValue(true);
+    const response = await call({ sourceId: request.sourceId }, true, 'POST', parkPath);
+    expect(response.status).toBe(409);
+    expect(suspend).not.toHaveBeenCalled();
     expect(f.restart).not.toHaveBeenCalled();
   });
   it('rechecks source, generation and human input at the asynchronous suspension boundary', async () => {

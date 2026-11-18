@@ -328,6 +328,32 @@ export function nativeResumeTargetReadback(ds: DaemonSession): ReturnType<typeof
   const value = nativeResumeOutcomes.get(ds);
   return value ? { ...value } : undefined;
 }
+const nativeResumeTargetClaims = new Map<string, { attemptId: string; owner: DaemonSession }>();
+function releaseNativeResumeTargetClaim(ds: DaemonSession, attemptId: string): void {
+  for (const [targetId, claim] of nativeResumeTargetClaims) {
+    if (claim.owner === ds && claim.attemptId === attemptId) nativeResumeTargetClaims.delete(targetId);
+  }
+}
+function nativeResumeTargetConflict(ds: DaemonSession, targetId: string, attemptId?: string): boolean {
+  const claim = nativeResumeTargetClaims.get(targetId);
+  if (claim && (claim.owner !== ds || claim.attemptId !== attemptId)) return true;
+  return [...new Set(activeSessionsRegistry?.values() ?? [])]
+    .some(candidate => candidate !== ds && candidate.session.status === 'active'
+      && candidate.session.cliSessionId === targetId);
+}
+function nativeResumeTargetMayStart(ds: DaemonSession, operationId: string | undefined): boolean {
+  const readiness = nativeResumeRestartReadiness.get(ds.session.sessionId);
+  if (readiness && readiness.attemptId === operationId) {
+    return !nativeResumeTargetConflict(ds, readiness.requested.targetId, operationId);
+  }
+  // Ordinary resume/adopt paths have no per-attempt readiness entry, but their
+  // persisted native ID still names the process they are about to recreate.
+  // Honor another session's claim before a competing writer can exist.
+  const nativeId = ds.session.cliSessionId;
+  if (!nativeId) return true;
+  const claim = nativeResumeTargetClaims.get(nativeId);
+  return !claim || claim.owner === ds;
+}
 const nativeResumeRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../services/native-resume-target.js').NativeResumeTarget }>();
 const topicEffortRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../utils/traex-session-effort.js').TraexTopicEffortRestart }>();
 const hostPressureWarningsLogged = new Set<string>();
@@ -8648,10 +8674,11 @@ export function requestSessionRestart(
   if (opts.topicEffort && (isSessionRestartInFlight(ds) || !ds.worker || ds.worker.killed)) return undefined;
   if (opts.nativeResumeTarget && (!ds.initConfig || !ds.worker || ds.worker.killed
     || isSessionRestartInFlight(ds) || opts.topicEffort || ds.adoptedFrom || ds.session.adoptedFrom
+    || nativeResumeTargetConflict(ds, opts.nativeResumeTarget.targetId)
     || !nativeResumeTargetAllowed({ ...ds.initConfig, cliSessionId: ds.session.cliSessionId }, opts.nativeResumeTarget, {
       ready: ds.workerReady === true && ds.cliReady === true && ds.lastScreenStatus === 'idle',
       busy: !sessionAcceptsDirectCommand(ds) || hasPendingOrdinaryImInput(ds) || hasPendingOrdinaryImDelivery(ds)
-        || (ds.backgroundTaskCount ?? 0) > 0,
+        || hasUnsettledAcceptedInput(ds) || (ds.backgroundTaskCount ?? 0) > 0,
       isolated: sandboxEnabled(), nativeSessionId: ds.session.cliSessionId,
     }))) return undefined;
   const nativeSourceWorker = opts.nativeResumeTarget ? ds.worker : undefined;
@@ -8664,6 +8691,7 @@ export function requestSessionRestart(
   const start: { failure?: { error: unknown } } = {};
   const cwdMove = opts.updateWorkingDir ? { updateWorkingDir: opts.updateWorkingDir } : {};
   let settingAttempt: string | undefined;
+  let nativeDispatched = false;
   const restartObserver: RestartObserver = opts.topicEffort || opts.nativeResumeTarget ? {
     source: observer.source,
     notify: async (status, attemptId) => {
@@ -8684,17 +8712,24 @@ export function requestSessionRestart(
   } : observer;
   const result = restartCoordinator.request(ds.session.sessionId, restartObserver, attemptId => {
     settingAttempt = attemptId;
-    if (opts.nativeResumeTarget) nativeResumeOutcomes.set(ds, { attemptId, state: 'in_progress',
-      sourceId: opts.nativeResumeTarget.sourceId, targetId: opts.nativeResumeTarget.targetId });
+    if (opts.nativeResumeTarget) {
+      nativeResumeTargetClaims.set(opts.nativeResumeTarget.targetId, { attemptId, owner: ds });
+      nativeResumeOutcomes.set(ds, { attemptId, state: 'in_progress',
+        sourceId: opts.nativeResumeTarget.sourceId, targetId: opts.nativeResumeTarget.targetId });
+    }
     const execute = (): void => {
     const controller = controllerForSession(ds);
-    if (controller && controller.operation()?.operationId !== attemptId) return;
+    if (controller && controller.operation()?.operationId !== attemptId) {
+      if (opts.nativeResumeTarget) releaseNativeResumeTargetClaim(ds, attemptId);
+      return;
+    }
     try {
       if (opts.nativeResumeTarget && (ds.worker !== nativeSourceWorker || ds.workerGeneration !== nativeSourceGeneration
         || ds.session.cliSessionId !== opts.nativeResumeTarget.sourceId || ds.lastScreenStatus !== 'idle'
+        || nativeResumeTargetConflict(ds, opts.nativeResumeTarget.targetId, attemptId)
         || !sessionAcceptsDirectCommand(ds, nativeSourceRuntime ? { operationId: attemptId, runtime: nativeSourceRuntime } : undefined)
         || hasPendingOrdinaryImInput(ds) || hasPendingOrdinaryImDelivery(ds)
-        || (ds.backgroundTaskCount ?? 0) > 0)) {
+        || hasUnsettledAcceptedInput(ds) || (ds.backgroundTaskCount ?? 0) > 0)) {
         throw new Error('native_resume_source_changed');
       }
       if (ds.worker && !ds.worker.killed) {
@@ -8714,6 +8749,7 @@ export function requestSessionRestart(
           ...(opts.topicEffort || opts.nativeResumeTarget ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
             larkToolBinding: latestLarkToolBindingForRespawn(ds),
             ...latestLaunchCommandsForRespawn(ds) }) } as DaemonToWorker);
+        nativeDispatched = true;
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -8740,7 +8776,8 @@ export function requestSessionRestart(
           sameNativeId: ds.session.cliSessionId === opts.nativeResumeTarget.sourceId,
           idleScreen: ds.lastScreenStatus === 'idle', workerReady: ds.workerReady, cliReady: ds.cliReady,
           acceptsDirect: sessionAcceptsDirectCommand(ds), pendingInput: hasPendingOrdinaryImInput(ds),
-          pendingDelivery: hasPendingOrdinaryImDelivery(ds), background: ds.backgroundTaskCount ?? 0,
+          pendingDelivery: hasPendingOrdinaryImDelivery(ds), unsettledInput: hasUnsettledAcceptedInput(ds),
+          targetOccupied: nativeResumeTargetConflict(ds, opts.nativeResumeTarget.targetId, attemptId), background: ds.backgroundTaskCount ?? 0,
         })}`);
       }
       if (isSessionLaunchModelBlockedError(error) && callbacks && observer.source !== 'cli_crash') {
@@ -8753,6 +8790,7 @@ export function requestSessionRestart(
           });
       }
       const nativeBefore = opts.nativeResumeTarget ? nativeResumeRestartReadiness.get(ds.session.sessionId) : undefined;
+      if (opts.nativeResumeTarget && !nativeDispatched) releaseNativeResumeTargetClaim(ds, attemptId);
       if (opts.nativeResumeTarget && nativeBefore?.attemptId === attemptId && nativeBefore.worker === ds.worker
         && nativeBefore.workerGeneration === ds.workerGeneration) {
         ds.workerReady = nativeBefore.workerReady; ds.cliReady = nativeBefore.cliReady;
@@ -8779,6 +8817,7 @@ export function requestSessionRestart(
 export function __testOnly_resetRestartCoordinator(): void {
   topicEffortRestartReadiness.clear();
   nativeResumeRestartReadiness.clear();
+  nativeResumeTargetClaims.clear();
   restartCoordinator.reset();
 }
 
@@ -21660,7 +21699,8 @@ function setupWorkerHandlers(
         const validNativeReceipt = !currentNativeAttempt || msg.status !== 'succeeded'
           || (msg.nativeResumeTarget?.sourceId === nativeReadiness.requested.sourceId
             && msg.nativeResumeTarget?.targetId === nativeReadiness.requested.targetId
-            && ds.session.cliSessionId === nativeReadiness.requested.targetId);
+            && ds.session.cliSessionId === nativeReadiness.requested.targetId
+            && !nativeResumeTargetConflict(ds, nativeReadiness.requested.targetId, msg.attemptId));
         const validSettingReceipt = validNativeReceipt && (!currentSettingsAttempt || msg.status !== 'succeeded'
           || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
             && msg.topicEffort.effort === savedReadiness.requested.effort));
@@ -21678,6 +21718,9 @@ function setupWorkerHandlers(
         // blocked as `worker_busy`.
         if (restartSettled && validSettingReceipt && msg.status === 'succeeded') {
           ds.workerReady = true;
+        }
+        if (currentNativeAttempt && ((validNativeReceipt && msg.status === 'succeeded') || msg.untouched)) {
+          releaseNativeResumeTargetClaim(ds, msg.attemptId);
         }
         if (restartSettled && currentNativeAttempt) {
           const prior = nativeResumeOutcomes.get(ds);
@@ -25211,7 +25254,8 @@ function setupWorkerHandlers(
             runtime: sessionController.store.binding(sessionController.ref, msg.bindingId)?.ref,
             mayStart: sessionController.bindingMayStart(msg.bindingId)
               && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
-              && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
+              && (!state.activeOperationId || state.activeOperationId === msg.operationId)
+              && nativeResumeTargetMayStart(ds, msg.operationId) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
           // A refused reservation (e.g. a TraeX continuation the contract could

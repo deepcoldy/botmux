@@ -65,9 +65,11 @@ export function normalizeStartupCommandList(arr: unknown): string[] {
  * daemon restart recovering an existing session — is the SAME CLI with its
  * effort/model/context already established, so re-typing `/effort` (idempotent)
  * or `/clear`,`/compact` (NOT idempotent) would corrupt it. Skip on reattach.
+ * Explicit native-history replacement also opts out for exactly that spawn:
+ * resuming a prepared copy must not replay commands into the new history.
  */
-export function shouldRunStartupCommandsOnSpawn(opts: { willReattachPersistent: boolean }): boolean {
-  return !opts.willReattachPersistent;
+export function shouldRunStartupCommandsOnSpawn(opts: { willReattachPersistent: boolean; suppressStartupCommands?: boolean }): boolean {
+  return !opts.willReattachPersistent && opts.suppressStartupCommands !== true;
 }
 
 /**

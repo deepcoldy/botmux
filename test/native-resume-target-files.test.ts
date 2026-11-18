@@ -56,6 +56,16 @@ describe('prepared native history copy validation',()=>{
       {type:'event_msg',timestamp,payload:{type:'task_complete',turn_id:'previous'}}]);
     expect(f.verify).toThrow('native_resume_history_not_terminal');
   });
+  it('a parallel nested start cannot erase an earlier unfinished turn',()=>{
+    const f=fixture();
+    const [header,start,mutation,complete]=f.rows as any[];
+    const nested=(type:string,turnId:string)=>({type:'event_msg',timestamp,
+      payload:{type,turn_id:turnId,root_turn_id:'turn'}});
+    f.sourceRows([header,start,mutation,
+      nested('task_started','child-still-open'),nested('task_started','child-finished'),
+      nested('task_complete','child-finished'),complete]);
+    expect(f.verify).toThrow('native_resume_history_not_terminal');
+  });
   it('terminal records require an actual turn identity and timestamp',()=>{
     for(const patch of [{timestamp:undefined},{payload:{type:'task_complete'}}]){
       const f=fixture();const rows=structuredClone(f.rows);Object.assign(rows.at(-1)!,patch);
