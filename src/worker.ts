@@ -38188,7 +38188,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           const pid = bridgeCliPid ?? backend.getChildPid?.();
           const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
           const observed = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
-          if (!nativeResumeTargetAllowed(lastInitConfig, msg.nativeResumeTarget, {
+          // A freshly started CLI acquires its native ID AFTER init. The PID's
+          // single currently-owned rollout is authoritative, not that empty
+          // (or pre-native-fork) launch-time ID.
+          if (!nativeResumeTargetAllowed({ ...lastInitConfig, cliSessionId: observed?.cliSessionId }, msg.nativeResumeTarget, {
             ready: isPromptReady && traexRestoredComposerReady(captureBackendScreen(backend), { resumedSession: true }),
             busy: !!cliRestartInProgress || !!tmuxRestartTimer || !!isFlushing || !!injectionFlushing
               || !!commandLineWritesPending || !!pendingMessages.length || !!pendingRawInputs.length

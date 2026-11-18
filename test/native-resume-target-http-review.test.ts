@@ -6,6 +6,7 @@ import { startIpcServer, setIpcAuthSecret, setLarkAppId, type IpcServerHandle } 
 import { daemonIpcAuthHeaders, fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { withBotTurnMutation, __testOnly_resetBotTurnMutationGates } from '../src/core/bot-turn-mutation-gate.js';
 import * as pool from '../src/core/worker-pool.js';
+import * as sessionManager from '../src/core/session-manager.js';
 import { registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { resolveDashboardIdentity, resolveDashboardRequestGate } from '../src/dashboard/request-identity.js';
 import { parseCookie, signCliAuth } from '../src/dashboard/auth.js';
@@ -491,5 +492,61 @@ describe('native HTTP review: intervention, partial failure and late calls', () 
     const after = await (await call('GET')).json();
     expect(after).toMatchObject({ nativeSessionId: input.sourceId, workerReady: true, cliReady: true,
       transition: null });
+  });
+});
+
+describe('native resume preparation uses the same management boundary', () => {
+  const preparePath = `${PATH}/prepare`;
+  it('requires signed management and permits only the recorded active source', async () => {
+    ds.worker = null;
+    ds.initConfig.backendType = 'tmux';
+    const wake = vi.spyOn(sessionManager, 'ensureTerminalWorkerPort').mockResolvedValue(5000);
+    expect((await call('POST', { sourceId: input.sourceId }, {}, preparePath)).status).toBe(401);
+    expect(wake).not.toHaveBeenCalled();
+    const result = await call('POST', { sourceId: input.sourceId }, undefined, preparePath);
+    expect(result.status).toBe(202);
+    expect(await result.json()).toMatchObject({ state: 'warming', sourceId: input.sourceId });
+    expect(wake).toHaveBeenCalledWith(ds);
+    expect(send).not.toHaveBeenCalled();
+    expect((await call('POST', { sourceId: input.targetId }, undefined, preparePath)).status).toBe(409);
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+  it.each(['closed', 'queued', 'manual', 'adopt', 'remote', 'pty-cold'])('%s is never revived or bypassed', async kind => {
+    ds.worker = null;
+    ds.initConfig.backendType = 'tmux';
+    if (kind === 'closed') ds.session.status = 'closed';
+    if (kind === 'queued') ds.session.queued = true;
+    if (kind === 'manual') ds.pendingRawInput = { text: 'manual intervention' };
+    if (kind === 'adopt') ds.session.adoptedFrom = 'external';
+    if (kind === 'remote') ds.initConfig.backendType = 'remote-runner';
+    if (kind === 'pty-cold') ds.initConfig.backendType = 'pty';
+    const wake = vi.spyOn(sessionManager, 'ensureTerminalWorkerPort').mockResolvedValue(5000);
+    expect((await call('POST', { sourceId: input.sourceId }, undefined, preparePath)).status).toBe(409);
+    expect(wake).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('extra fields cannot turn preparation into prompt injection or arbitrary resume', async () => {
+    ds.worker = null;
+    ds.initConfig.backendType = 'tmux';
+    const wake = vi.spyOn(sessionManager, 'ensureTerminalWorkerPort').mockResolvedValue(5000);
+    for (const extra of [{ prompt: 'replay' }, { targetId: input.targetId }, { sourcePath: '/outside' }]) {
+      expect((await call('POST', { sourceId: input.sourceId, ...extra }, undefined, preparePath)).status).toBe(400);
+    }
+    expect(wake).not.toHaveBeenCalled();
+  });
+  it('Dashboard preparation requires CSRF and proxies the prepare endpoint rather than replacement', async () => {
+    ds.worker = null;
+    ds.initConfig.backendType = 'tmux';
+    const wake = vi.spyOn(sessionManager, 'ensureTerminalWorkerPort').mockResolvedValue(5000);
+    await startDashboard();
+    const denied = await fetch(`${base}${preparePath}`, { method: 'POST', headers: { cookie, origin: base },
+      body: JSON.stringify({ sourceId: input.sourceId }) });
+    expect(denied.status).toBe(403);
+    expect(wake).not.toHaveBeenCalled();
+    const result = await fetch(`${base}${preparePath}`, { method: 'POST', headers: browserHeaders(),
+      body: JSON.stringify({ sourceId: input.sourceId }) });
+    expect(result.status).toBe(202);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
   });
 });

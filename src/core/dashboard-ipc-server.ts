@@ -1,6 +1,10 @@
 import { nativeResumeTargetReadback } from './worker-pool.js';
 import { parseNativeResumeTarget } from '../services/native-resume-target.js';
 import { sessionAcceptsDirectCommand } from './worker-pool.js';
+import { nativeResumeTargetSupported, sameIdRuntimeRestartSupported } from '../utils/native-resume-target-plan.js';
+import { controllerForSession } from './session-controller.js';
+import { ensureTerminalWorkerPort } from './session-manager.js';
+import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
@@ -52,7 +56,7 @@ import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
@@ -3139,22 +3143,137 @@ ipcRoute('DELETE', '/api/sessions/:sessionId/model-pin', async (req, res, params
  * copy. Ordinary restart/resume semantics are unchanged. HTTP202 is admission,
  * never proof of the new native identity; read the session after the correlated
  * restart and require ready + the exact target ID. */
+const nativeResumePreparations = new WeakMap<import('./types.js').DaemonSession, {
+  attemptId: string; sourceId: string; state: 'warming' | 'worker_started' | 'failed'; errorCode?: string;
+}>();
+
 ipcRoute('GET', '/api/sessions/:sessionId/resume-target', (req, res, params) => {
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
   try {
     const ds = findActiveBySessionId(params.sessionId);
     if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
     return jsonRes(res, 200, { ok: true, protocol: 1, supportedCli: 'traex',
+      sameIdRuntimeRestartSupported: !ds.adoptedFrom && !ds.session.adoptedFrom
+        && sameIdRuntimeRestartSupported(ds.initConfig ?? { cliId: ds.session.cliId, backendType: ds.session.backendType }, sandboxEnabled()),
       transition: nativeResumeTargetReadback(ds) ?? null,
+      preparation: nativeResumePreparations.get(ds) ?? null,
       nativeSessionId: ds.session.cliSessionId ?? null,
       workerGeneration: ds.workerGeneration ?? null,
       workerReady: !!ds.worker && !ds.worker.killed && ds.workerReady === true,
+    cold: !ds.worker || !!ds.worker.killed,
+    retiring: !!ds.worker?.killed,
       cliReady: ds.cliReady === true,
       busy: !sessionAcceptsDirectCommand(ds) || ds.lastScreenStatus !== 'idle' || isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)
         || hasPendingOrdinaryImDelivery(ds) || (ds.backgroundTaskCount ?? 0) > 0 });
   } catch {
     return jsonRes(res, 500, { ok: false, error: 'native_resume_target_readback_failed' });
   }
+});
+
+/** Prepare an already-active dormant session using the same message-less wake
+ * as an authenticated terminal open. This does not reactivate closed topics,
+ * replace history, inject an input, or claim the migration completed. */
+ipcRoute('POST', '/api/sessions/:sessionId/resume-target/prepare', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  let sourceId: string;
+  try {
+    const body = await readJsonBody<Record<string, unknown>>(req, 1024);
+    if (!body || Array.isArray(body) || Object.keys(body).length !== 1
+      || typeof body.sourceId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(body.sourceId)) {
+      throw new Error('invalid');
+    }
+    sourceId = body.sourceId;
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_native_resume_target' }); }
+  let disconnected = req.aborted || res.destroyed;
+  const onClose = () => { disconnected = true; };
+  res.once('close', onClose);
+  try {
+    const initial = findActiveBySessionId(params.sessionId);
+    if (!initial || initial.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    const acquired = await tryWithBotTurnMutation(initial.larkAppId, 5_000, () => {
+      if (disconnected || res.destroyed || req.aborted) return;
+      const ds = findActiveBySessionId(params.sessionId);
+      if (ds !== initial || ds.session.status !== 'active' || ds.session.cliSessionId !== sourceId) {
+        return jsonRes(res, 409, { ok: false, error: 'session_changed' });
+      }
+      const scope = ds.initConfig ?? { cliId: ds.session.cliId, backendType: ds.session.backendType };
+      if (!(nativeResumeTargetSupported(scope, sandboxEnabled()) || sameIdRuntimeRestartSupported(scope, sandboxEnabled()))
+        || ds.adoptedFrom || ds.session.adoptedFrom
+        || !sessionAcceptsDirectCommand(ds) || isSessionLifecycleInFlight(ds)
+        || hasPendingOrdinaryImDelivery(ds) || (ds.backgroundTaskCount ?? 0) > 0) {
+        return jsonRes(res, 409, { ok: false, error: 'native_resume_target_unavailable' });
+      }
+      if (ds.worker?.killed) return jsonRes(res, 409, { ok: false, error: 'native_resume_prepare_retiring' });
+      if (ds.worker && !ds.worker.killed) return jsonRes(res, 200, { ok: true, state: 'already_started', sourceId });
+      if (scope.backendType !== 'tmux') return jsonRes(res, 409, { ok: false, error: 'native_resume_prepare_unsupported' });
+      const existing = nativeResumePreparations.get(ds);
+      if (existing?.state === 'warming' && existing.sourceId === sourceId) {
+        return jsonRes(res, 202, { ok: true, state: 'warming', sourceId, attemptId: existing.attemptId });
+      }
+      const preparation = { attemptId: randomUUID(), sourceId, state: 'warming' as const };
+      nativeResumePreparations.set(ds, preparation);
+      // Reuse terminal wake (including its backing/admission fences). A port
+      // only proves a worker started, never native readiness or migration.
+      // Both undefined and rejection are terminal observable failures.
+      const settle = (started: boolean) => {
+        if (nativeResumePreparations.get(ds)?.attemptId !== preparation.attemptId) return;
+        const current = findActiveBySessionId(params.sessionId);
+        const same = current === ds && ds.session.status === 'active' && ds.session.cliSessionId === sourceId;
+        nativeResumePreparations.set(ds, { ...preparation,
+          state: started && same ? 'worker_started' : 'failed',
+          ...(!started || !same ? { errorCode: same ? 'native_resume_prepare_failed' : 'session_changed' } : {}) });
+      };
+      void ensureTerminalWorkerPort(ds).then(port => settle(!!port), () => settle(false));
+      return jsonRes(res, 202, { ok: true, state: 'warming', sourceId, attemptId: preparation.attemptId });
+    });
+    if (!acquired.acquired && !res.destroyed && !disconnected) return jsonRes(res, 409, { ok: false, error: 'native_resume_target_gate_busy' });
+  } catch {
+    if (!res.destroyed && !res.writableEnded) return jsonRes(res, 502, { ok: false, error: 'native_resume_target_start_failed' });
+  } finally { res.off('close', onClose); }
+});
+
+/** Same-ID runtime refresh uses the existing verified idle-suspend primitive,
+ * not an interrupting restart. Only a matching, locally owned idle generation
+ * may be parked; a separate message-less prepare resumes its original ID. */
+ipcRoute('POST', '/api/sessions/:sessionId/resume-target/park', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
+  let sourceId: string;
+  try {
+    const body = await readJsonBody<Record<string, unknown>>(req, 1024);
+    if (!body || Array.isArray(body) || Object.keys(body).length !== 1
+      || typeof body.sourceId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(body.sourceId)) throw new Error('invalid');
+    sourceId = body.sourceId;
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_native_resume_target' }); }
+  let disconnected = req.aborted || res.destroyed;
+  const onClose = () => { disconnected = true; };
+  res.once('close', onClose);
+  try {
+    const initial = findActiveBySessionId(params.sessionId);
+    if (!initial || initial.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    const acquired = await tryWithBotTurnMutation(initial.larkAppId, 5_000, async () => {
+      if (disconnected || res.destroyed || req.aborted) return;
+      const ds = findActiveBySessionId(params.sessionId);
+      if (ds !== initial || !ds.initConfig || !sameIdRuntimeRestartSupported(ds.initConfig, sandboxEnabled())
+        || ds.adoptedFrom || ds.session.adoptedFrom) return jsonRes(res, 409, { ok: false, error: 'native_runtime_refresh_unsupported' });
+      const worker = ds.worker, generation = ds.workerGeneration;
+      const runtime = controllerForSession(ds)?.currentRuntime();
+      const owned = (operationId?: string) => !disconnected && !res.destroyed && !req.aborted
+        && findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
+        && !ds.session.queued
+        && ds.session.cliSessionId === sourceId && !!worker && !worker.killed
+        && ds.worker === worker && ds.workerGeneration === generation
+        && ds.lastScreenStatus === 'idle' && (operationId ? true : ds.cliReady === true && !isSessionLifecycleInFlight(ds))
+        && sessionAcceptsDirectCommand(ds, operationId && runtime ? { operationId, runtime } : undefined)
+        && !hasPendingOrdinaryImDelivery(ds) && (ds.backgroundTaskCount ?? 0) === 0;
+      if (!owned()) return jsonRes(res, 409, { ok: false, error: 'native_runtime_refresh_not_idle' });
+      const suspended = await suspendWorkerAsync(ds, 'native_runtime_refresh', owned);
+      if (!res.destroyed) return jsonRes(res, suspended ? 200 : 409,
+        { ok: suspended, state: suspended ? 'parked' : 'refused', sourceId });
+    });
+    if (!acquired.acquired && !res.destroyed && !disconnected) return jsonRes(res, 409, { ok: false, error: 'native_resume_target_gate_busy' });
+  } catch {
+    if (!res.destroyed && !res.writableEnded) return jsonRes(res, 502, { ok: false, error: 'native_runtime_refresh_failed' });
+  } finally { res.off('close', onClose); }
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/resume-target', async (req, res, params) => {

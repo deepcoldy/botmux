@@ -8656,6 +8656,11 @@ export function requestSessionRestart(
     }))) return undefined;
   const nativeSourceWorker = opts.nativeResumeTarget ? ds.worker : undefined;
   const nativeSourceGeneration = ds.workerGeneration;
+  const nativeSourceController = opts.nativeResumeTarget ? controllerForSession(ds) : undefined;
+  const nativeSourceRuntime = nativeSourceController?.currentRuntime();
+  const nativeSourceReadiness = opts.nativeResumeTarget ? {
+    workerReady: ds.workerReady === true, cliReady: ds.cliReady === true,
+  } : undefined;
   const start: { failure?: { error: unknown } } = {};
   const cwdMove = opts.updateWorkingDir ? { updateWorkingDir: opts.updateWorkingDir } : {};
   let settingAttempt: string | undefined;
@@ -8687,7 +8692,8 @@ export function requestSessionRestart(
     try {
       if (opts.nativeResumeTarget && (ds.worker !== nativeSourceWorker || ds.workerGeneration !== nativeSourceGeneration
         || ds.session.cliSessionId !== opts.nativeResumeTarget.sourceId || ds.lastScreenStatus !== 'idle'
-        || !sessionAcceptsDirectCommand(ds) || hasPendingOrdinaryImInput(ds) || hasPendingOrdinaryImDelivery(ds)
+        || !sessionAcceptsDirectCommand(ds, nativeSourceRuntime ? { operationId: attemptId, runtime: nativeSourceRuntime } : undefined)
+        || hasPendingOrdinaryImInput(ds) || hasPendingOrdinaryImDelivery(ds)
         || (ds.backgroundTaskCount ?? 0) > 0)) {
         throw new Error('native_resume_source_changed');
       }
@@ -8695,8 +8701,8 @@ export function requestSessionRestart(
         const model = opts.nativeResumeTarget ? ds.initConfig?.model : opts.topicEffort?.model ?? latestModelForRespawn(ds);
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         if (opts.nativeResumeTarget) nativeResumeRestartReadiness.set(ds.session.sessionId, { attemptId,
-          worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady,
-          cliReady: !!ds.cliReady, requested: opts.nativeResumeTarget });
+          worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: nativeSourceReadiness!.workerReady,
+          cliReady: nativeSourceReadiness!.cliReady, requested: opts.nativeResumeTarget });
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
@@ -8724,6 +8730,19 @@ export function requestSessionRestart(
       });
     } catch (error) {
       start.failure = { error };
+      if (opts.nativeResumeTarget) {
+        const prior = nativeResumeOutcomes.get(ds);
+        if (prior?.attemptId === attemptId) nativeResumeOutcomes.set(ds, {
+          ...prior, state: 'failed', errorCode: nativeResumeTargetFailure(error),
+        });
+        logger.warn(`Native resume dispatch refused: ${nativeResumeTargetFailure(error)} ${JSON.stringify({
+          sameWorker: ds.worker === nativeSourceWorker, sameGeneration: ds.workerGeneration === nativeSourceGeneration,
+          sameNativeId: ds.session.cliSessionId === opts.nativeResumeTarget.sourceId,
+          idleScreen: ds.lastScreenStatus === 'idle', workerReady: ds.workerReady, cliReady: ds.cliReady,
+          acceptsDirect: sessionAcceptsDirectCommand(ds), pendingInput: hasPendingOrdinaryImInput(ds),
+          pendingDelivery: hasPendingOrdinaryImDelivery(ds), background: ds.backgroundTaskCount ?? 0,
+        })}`);
+      }
       if (isSessionLaunchModelBlockedError(error) && callbacks && observer.source !== 'cli_crash') {
         const content = tr('worker.traex_auto_model.catalog_empty', {}, botLocale(getBot(ds.larkAppId).config));
         // The coordinator settles the restart observer as failed; this notice
@@ -11380,11 +11399,25 @@ export function __testOnly_resetTurnTerminalReportingClis(): void {
  * right now: same idle-boundary guarantees as reasoning-effort CAS minus the
  * codex transcript turn-boundary probe. Cold/suspended sessions and non-live
  * backends are accepted (the command queues until the worker consumes it). */
-export function sessionAcceptsDirectCommand(ds: DaemonSession): boolean {
+export function sessionAcceptsDirectCommand(ds: DaemonSession, ownOperation?: {
+  operationId: string; runtime: import('../services/session-contract.js').RuntimeRef;
+}): boolean {
   if (ds.session.status !== 'active' || isSessionTransferring(ds)
     || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
     || hasPendingOrdinaryImInput(ds)) return false;
-  if (ds.worker && !ds.worker.killed && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return false;
+  let ready = ds.workerReady;
+  if (ownOperation) {
+    // beginControl intentionally makes legacy readiness getters false. That
+    // is our OWN admission fence, not evidence the old CLI started working.
+    // Recheck the exact captured physical runtime instead; all input/ownership
+    // guards above still apply, and the worker proves idle again before stop.
+    const controller = controllerForSession(ds);
+    const runtime = controller?.store.runtime(controller.ref);
+    ready = controller?.operation()?.operationId === ownOperation.operationId
+      && sameRuntime(runtime?.ref, ownOperation.runtime)
+      && runtime?.phase === 'ready' && runtime.promptReady === true;
+  }
+  if (ds.worker && !ds.worker.killed && (ds.lastScreenStatus !== 'idle' || !ready)) return false;
   return true;
 }
 

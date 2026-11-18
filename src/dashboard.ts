@@ -6575,26 +6575,33 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(owner, url.pathname, { method: req.method, signal: AbortSignal.timeout(15_000) });
       res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
     }
-    if (['GET', 'POST'].includes(req.method ?? '') && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/resume-target$/))) {
+    if (['GET', 'POST'].includes(req.method ?? '') && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/resume-target(?:\/(prepare|park))?$/))) {
       if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
       if (req.method === 'POST' && !sessionWriteOriginAllowed(req, url.pathname)) return jsonRes(res, 403, { ok: false, error: 'invalid_origin' });
       if (req.method === 'POST' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
       const sid = decodeURIComponent(m[1]);
+      const preparationAction = m[2];
+      if (preparationAction && req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       let body: unknown;
       try { if (req.method === 'POST') body = await readJsonBody(req, 4096); }
       catch { return jsonRes(res, 400, { ok: false, error: 'invalid_native_resume_target' }); }
+      const disconnected = new AbortController();
+      const onClose = () => disconnected.abort();
+      res.once('close', onClose);
+      if (res.destroyed) disconnected.abort();
       try {
-        const upstream = await proxyToDaemon(owner, `/api/sessions/${encodeURIComponent(sid)}/resume-target`, {
+        const upstream = await proxyToDaemon(owner, `/api/sessions/${encodeURIComponent(sid)}/resume-target${preparationAction ? `/${preparationAction}` : ''}`, {
           method: req.method, ...(req.method === 'POST'
             ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
-          signal: AbortSignal.timeout(15_000),
+          signal: AbortSignal.any([AbortSignal.timeout(15_000), disconnected.signal]),
         });
+        if (res.destroyed) return;
         res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
       } catch {
-        return jsonRes(res, 502, { ok: false, error: 'native_resume_target_proxy_failed' });
-      }
+        if (!res.destroyed && !res.writableEnded) return jsonRes(res, 502, { ok: false, error: 'native_resume_target_proxy_failed' });
+      } finally { res.off('close', onClose); }
     }
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;

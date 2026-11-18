@@ -5,6 +5,13 @@ import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-har
 import { nativeResumeTargetFailure } from '../src/services/native-resume-target.js';
 import { nativeResumeTargetAllowed } from '../src/utils/native-resume-target-plan.js';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
+import { SessionController } from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { sameRuntime } from '../src/services/session-contract.js';
+import { hasProtectedSessionMutationOwnership } from '../src/core/session-mutation-guard.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const sourceId = '00000000-0000-4000-8000-000000000001';
 const targetId = '00000000-0000-4000-8000-000000000002';
@@ -40,6 +47,13 @@ function workerScope() {
 }
 
 describe('real worker native resume-target branch', () => {
+  it('accepts a proven current native ID acquired after fresh worker initialization', async () => {
+    const f = workerScope();
+    f.scope.lastInitConfig.cliSessionId = undefined;
+    await f.run({ type: 'restart', attemptId: 'attempt', nativeResumeTarget: requested });
+    expect(f.retirements).toHaveLength(1);
+    expect(f.retirements[0].exactResumeSessionId).toBe(targetId);
+  });
   it('validates twice, proves quiescence, then selects the exact target with fresh fallback forbidden', async () => {
     const f = workerScope();
     await f.run({ type: 'restart', attemptId: 'attempt', nativeResumeTarget: requested });
@@ -110,12 +124,12 @@ describe('real daemon correlated restart sender', () => {
     let release!:()=>void;
     const flushed=new Promise<void>(resolve=>{release=resolve});
     const coordinator=new RestartCoordinator({createAttemptId:()=> 'attempt'});
-    const scope:any={nativeResumeTargetAllowed,sandboxEnabled:()=>false,isSessionTransferring:()=>false,
+    const scope:any={nativeResumeTargetAllowed,nativeResumeTargetFailure,sandboxEnabled:()=>false,isSessionTransferring:()=>false,
       isSessionRestartInFlight:()=>false,sessionAcceptsDirectCommand:()=>true,
       hasPendingOrdinaryImInput:()=>false,hasPendingOrdinaryImDelivery:()=>false,
       topicEffortRestartReadiness:new Map(),nativeResumeRestartReadiness:new Map(),nativeResumeOutcomes:new WeakMap(),
       restartCoordinator:coordinator,restartIpcReason:()=>({reason:'operator'}),
-      controllerForSession:()=> primary ? {operation:()=>({operationId:'attempt'}),flushPrimary:()=>flushed} : undefined,
+      controllerForSession:()=> primary ? {currentRuntime:()=>undefined,operation:()=>({operationId:'attempt'}),flushPrimary:()=>flushed} : undefined,
       sessionContractPrimary:()=>primary,logger:{warn:vi.fn()},tag:()=> 'test'};
     return {ds,worker,scope,release,coordinator,
       run:loadWorkerPoolFunction('requestSessionRestart',scope)};
@@ -164,5 +178,64 @@ describe('real daemon correlated restart sender', () => {
       expect(f.ds.workerReady).toBe(false);
       expect(f.scope.nativeResumeOutcomes.get(f.ds).state).toBe('failed');
     }finally{f.coordinator.reset();}
+  });
+});
+
+describe('native replacement with real canonical readiness getters', () => {
+  it.each([false, true])('does not confuse its own operation fence with activity (new input=%s)', async intervene => {
+    const dir = mkdtempSync(join(tmpdir(), 'native-canonical-ready-'));
+    const store = new SessionContractStore(dir, 'cli_native_ready');
+    let coordinator: RestartCoordinator | undefined;
+    try {
+      const worker = { killed: false, send: vi.fn() };
+      const ds: any = { larkAppId: 'cli_native_ready', worker, workerGeneration: 1, lastScreenStatus: 'idle',
+        initConfig: cfg(), session: { sessionId: 'canonical-ready', status: 'active', cliSessionId: sourceId } };
+      const controller = new SessionController(ds, store);
+      const producer = controller.bindWorker(1).worker;
+      const runtime = controller.reserveBinding('owned-binding', producer);
+      controller.bindRuntime('owned-binding', producer, { backend: 'tmux', physicalId: '123:owned-start',
+        nativeSessionId: sourceId, proof: 'process_start' });
+      const context = (sequence: number, scope: any) => ({ version: 2 as const, session: controller.ref,
+        producer, sequence, eventId: `${producer.workerId}:${sequence}`, scope });
+      controller.ingest({ type: 'ready', sessionContract: context(1, {}) }, producer);
+      controller.ingest({ type: 'prompt_ready', sessionContract: context(2, { runtime }) }, producer);
+      expect(ds.workerReady).toBe(true);
+      expect(ds.cliReady).toBe(true);
+      let flush!: () => void;
+      const flushing = new Promise<void>(resolve => { flush = resolve; });
+      vi.spyOn(controller, 'flushPrimary').mockReturnValue(flushing);
+      coordinator = new RestartCoordinator({ createAttemptId: () => 'owned-operation', persistence: {
+        restore: () => undefined,
+        record: (_sid, id, phase) => {
+          if (phase === 'requested') controller.beginControl('restart', id);
+          else if (phase === 'started') { controller.controlStarted(id); return 'started'; }
+          else { controller.controlResult(id, phase === 'succeeded' ? 'confirmed' : 'rejected', controller.currentRuntime()); return 'terminal'; }
+        },
+      } });
+      const scope: any = { nativeResumeTargetAllowed, nativeResumeTargetFailure, sameRuntime,
+        sandboxEnabled: () => false, isSessionTransferring: () => false, hasProtectedSessionMutationOwnership,
+        hasPendingOrdinaryImInput: () => false, hasPendingOrdinaryImDelivery: () => false,
+        controllerForSession: () => controller, sessionContractPrimary: () => true,
+        isSessionRestartInFlight: () => !!coordinator!.activeAttemptId(ds.session.sessionId),
+        restartCoordinator: coordinator, nativeResumeRestartReadiness: new Map(), nativeResumeOutcomes: new WeakMap(),
+        topicEffortRestartReadiness: new Map(), restartIpcReason: () => ({ reason: 'operator' }),
+        logger: { warn: vi.fn() }, tag: () => 'owned', isSessionLaunchModelBlockedError: () => false };
+      scope.sessionAcceptsDirectCommand = loadWorkerPoolFunction('sessionAcceptsDirectCommand', scope);
+      if (process.env.NATIVE_CANONICAL_MUTATION === 'drop-own-operation') {
+        const accepts = scope.sessionAcceptsDirectCommand;
+        scope.sessionAcceptsDirectCommand = (session: any) => accepts(session);
+      }
+      const requestRestart = loadWorkerPoolFunction('requestSessionRestart', scope);
+      requestRestart(ds, { source: 'dashboard', notify: () => {} }, { nativeResumeTarget: requested });
+      expect(ds.workerReady).toBe(false, 'real beginControl masks readiness even though the physical CLI is idle');
+      if (intervene) ds.pendingRawInput = { text: 'new human input' };
+      flush();
+      for (let n = 0; n < 12; n++) await Promise.resolve();
+      expect(worker.send).toHaveBeenCalledTimes(intervene ? 0 : 1);
+      if (!intervene) {
+        expect(worker.send.mock.calls[0][0].nativeResumeTarget).toEqual(requested);
+        expect(scope.nativeResumeRestartReadiness.get(ds.session.sessionId)).toMatchObject({ workerReady: true, cliReady: true });
+      }
+    } finally { coordinator?.reset(); store.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
