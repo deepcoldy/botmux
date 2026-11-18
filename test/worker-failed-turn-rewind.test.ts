@@ -14,10 +14,12 @@ import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { resolvePurgeResumeTarget } from '../src/services/transcript-image-purge.js';
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
 import { pinClaudeProjectsRoot } from '../src/services/claude-projects-root.js';
-import { restoreRewoundTranscript, rewindClaudeTranscript } from '../src/core/context-rewind.js';
+import { restoreRewoundTranscript } from '../src/core/context-rewind.js';
 import {
+  assertTranscriptInProjectsRoot,
   inspectLastTurnInProjectsRoot,
   planFailedTurnRewindRequest,
+  withFailedTurnTranscript,
   rewindableErrorCode,
   rewoundContent,
   runFailedTurnRewindMaintenance,
@@ -61,7 +63,7 @@ type RestartOpts = {
   onRespawnSettled?: (result: 'spawned' | 'failed' | 'superseded') => void;
 };
 
-function setup(transcript: string, overrides: Record<string, unknown> = {}, d = directive()) {
+function setup(transcript: string, overrides: Record<string, unknown> = {}, d = directive(), { tree = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-worker-rewind-'));
   roots.push(root);
   const jsonl = join(root, 'claude', 'projects', 'cwd-key', `${SID}.jsonl`);
@@ -77,6 +79,8 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     bridgeJsonlPath: jsonl,
     // Pinned when the CLI was launched, from its config dir.
     claudeProjectsRoot: pinClaudeProjectsRoot(join(root, 'claude')),
+    // A sandboxed session's config dir is a tree its CLI can write.
+    claudeTranscriptTreeRoot: tree ? join(root, 'claude') : undefined,
     backend: { getChildPid: () => 4242 },
     lastInitConfig: { cliId: 'claude-code' },
     isRemoteBackendType: () => false,
@@ -98,10 +102,14 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     delay: async () => {},
     pidNotProvablyGone: () => false,
     dirname,
+    join,
     resolvePurgeResumeTarget,
     waitForProcessQuiescence,
     inspectLastTurnInProjectsRoot,
-    rewindClaudeTranscript,
+    withFailedTurnTranscript,
+    assertTranscriptInProjectsRoot,
+    mkdirSync,
+    sessionId: 'sess-rewind',
     restoreRewoundTranscript,
     planFailedTurnRewindRequest,
     runFailedTurnRewindMaintenance,
@@ -489,17 +497,57 @@ describe('startFailedTurnRewind', () => {
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/changed/) })]);
   });
 
-  it('does not cut a file other than the one the last-turn read pinned', async () => {
+  it('does not cut a file put at the path between the last-turn read and the cut', async () => {
     const original = failedTranscript();
     const { jsonl, cutAfterExit, reports } = setup(original, {
-      // As if another file had been put at the path between the read and the cut.
-      inspectLastTurnInProjectsRoot: (path: string, root: Parameters<typeof inspectLastTurnInProjectsRoot>[1]) => ({
-        ...inspectLastTurnInProjectsRoot(path, root), file: { dev: -1, ino: -1 },
-      }),
+      withFailedTurnTranscript: (path: string, root: Parameters<typeof withFailedTurnTranscript>[1], scope: object, use: Parameters<typeof withFailedTurnTranscript>[3]) =>
+        withFailedTurnTranscript(path, root, scope, transcript => use({
+          lastTurn: () => {
+            const turn = transcript.lastTurn();
+            renameSync(path, `${path}.held`);
+            writeFileSync(path, original);
+            return turn;
+          },
+          cut: offset => transcript.cut(offset),
+        })),
     });
     await cutAfterExit();
     expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(readFileSync(`${jsonl}.held`, 'utf8')).toBe(original);
     expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut failed/) })]);
+  });
+
+  describe('a transcript in a tree its CLI can write', () => {
+    let previousDataDir: string | undefined;
+    afterEach(() => {
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+    });
+
+    it('is backed up into the daemon\'s rewind-backups directory, not next to the transcript', async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-worker-rewind-data-'));
+      roots.push(dataDir);
+      previousDataDir = process.env.SESSION_DATA_DIR;
+      process.env.SESSION_DATA_DIR = dataDir;
+      const { jsonl, cutAfterExit, reports } = setup(failedTranscript(), {}, directive(), { tree: true });
+      await cutAfterExit();
+      expect(readFileSync(jsonl, 'utf8')).toBe(HISTORY);
+      expect(readdirSync(dirname(jsonl))).toEqual([`${SID}.jsonl`]);
+      const backups = readdirSync(join(dataDir, 'rewind-backups', 'sess-rewind'));
+      expect(backups).toEqual([expect.stringMatching(/\.removed\.bak$/)]);
+      expect(reports()).toEqual([]);
+    });
+
+    it('is not cut when there is no backup directory outside the tree', async () => {
+      previousDataDir = process.env.SESSION_DATA_DIR;
+      delete process.env.SESSION_DATA_DIR;
+      const original = failedTranscript();
+      const { jsonl, cutAfterExit, reports } = setup(original, {}, directive(), { tree: true });
+      await cutAfterExit();
+      expect(readFileSync(jsonl, 'utf8')).toBe(original);
+      expect(readdirSync(dirname(jsonl))).toEqual([`${SID}.jsonl`]);
+      expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/no backup directory/) })]);
+    });
   });
 
   it('does not cut a transcript whose project directory became a link to somewhere else', async () => {

@@ -577,11 +577,14 @@ import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { claudeProjectsRootForLaunch, type ClaudeProjectsRoot } from './services/claude-projects-root.js';
+import { claudeWritableTreeRoot } from './services/transcript-resolver.js';
 import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
-import { restoreRewoundTranscript, rewindClaudeTranscript, type RewindResult } from './core/context-rewind.js';
+import { restoreRewoundTranscript, type RewindResult, type TranscriptTreeScope } from './core/context-rewind.js';
 import {
   planFailedTurnRewindRequest,
   inspectLastTurnInProjectsRoot,
+  withFailedTurnTranscript,
+  assertTranscriptInProjectsRoot,
   rewindableErrorCode,
   rewoundContent,
   runFailedTurnRewindMaintenance,
@@ -9367,6 +9370,11 @@ let bridgeDataDir: string = DEFAULT_CLAUDE_DATA_DIR;
  *  resolved at launch: the only root an in-place transcript rewrite (the image
  *  purge) trusts. Never derived from the transcript path itself. */
 let claudeProjectsRoot: ClaudeProjectsRoot | undefined;
+/** The CLI-writable tree (sandbox bot home, scratch view) the transcripts of
+ *  this launch sit in, resolved with the projects root: a failed-turn rewind
+ *  re-checks every transcript it opens against it and keeps its backup out
+ *  of it, as /rewind does (core/context-rewind TranscriptTreeScope). */
+let claudeTranscriptTreeRoot: string | undefined;
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
@@ -31471,6 +31479,7 @@ async function spawnCliBody(
     claudeProjectsRoot = claudeProjectsRootForLaunch(bridgeClaudeDataDir, claudeProjectsRoot, {
       noFollow: isolationBotHome !== undefined,
     });
+    claudeTranscriptTreeRoot = claudeWritableTreeRoot(join(bridgeClaudeDataDir, 'projects'), scratchMappings, cfg.larkAppId);
     // On macOS the clone cwd is a different path and Claude keys its project
     // dir by the realpath of ITS cwd; Linux keeps the identical path. Resolve
     // via the glob-aware helper so a long (>200-char) truncated+hashed project
@@ -36804,6 +36813,9 @@ interface FailedTurnCut {
    *  removed: putting them back writes only that file, from memory. */
   transcript: RewindResult['transcript'];
   removed: Buffer;
+  /** As for the cut: the pinned projects root and the CLI-writable tree. */
+  projectsRoot: ClaudeProjectsRoot | undefined;
+  scope: TranscriptTreeScope;
   sessionId: string;
   preserveScratchTree: boolean;
   plainContent: string;
@@ -36850,8 +36862,11 @@ function startFailedTurnRewind(
       : undefined,
   );
   // The projects root this worker pinned when it launched the CLI: both reads
-  // that can lead to a cut trust only a transcript inside it.
+  // that can lead to a cut trust only a transcript inside it. In a
+  // CLI-writable tree every open is re-checked against that tree, and the
+  // backup goes to a directory of the daemon's, as with /rewind.
   const projectsRoot = claudeProjectsRoot;
+  const transcriptScope = failedTurnTranscriptScope();
   const plan = planFailedTurnRewindRequest({
     cliId: lastInitConfig?.cliId,
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
@@ -36869,7 +36884,7 @@ function startFailedTurnRewind(
               : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
                 ? 'a turn is running' : undefined,
     directive,
-    inspect: path => inspectLastTurnInProjectsRoot(path, projectsRoot),
+    inspect: path => inspectLastTurnInProjectsRoot(path, projectsRoot, transcriptScope),
   });
   if (plan.kind === 'decline') {
     report('declined', plan.reason);
@@ -36889,10 +36904,10 @@ function startFailedTurnRewind(
     beforeRespawn: async retiring => {
       const outcome = await runFailedTurnRewindMaintenance({
         waitForQuiescence: () => waitForRetiringCliQuiescence(retiring),
-        inspect: () => inspectLastTurnInProjectsRoot(plan.target.jsonlPath, projectsRoot),
-        rewind: (offset, file) => rewindClaudeTranscript(plan.target.jsonlPath, offset, Date.now(), {
-          backup: 'removed', ...(file ? { expectFile: file } : {}),
-        }),
+        withTranscript: use => {
+          if (transcriptScope.backupDir) mkdirSync(transcriptScope.backupDir, { recursive: true, mode: 0o700 });
+          return withFailedTurnTranscript(plan.target.jsonlPath, projectsRoot, transcriptScope, use);
+        },
         planned: { offset: plan.offset, ...(plan.uuid ? { uuid: plan.uuid } : {}) },
         failedInput: directive.failedInput,
         // Held behind the restart fence, so nothing can have written it yet —
@@ -36911,6 +36926,8 @@ function startFailedTurnRewind(
         backupPath: outcome.result.backupPath,
         transcript: outcome.result.transcript,
         removed: outcome.result.removed ?? Buffer.alloc(0),
+        projectsRoot,
+        scope: transcriptScope,
         sessionId: plan.target.sessionId,
         preserveScratchTree: plan.preserveScratchTree,
         plainContent: queued.content,
@@ -36951,6 +36968,21 @@ function startFailedTurnRewind(
   state.queued = pendingMessages.length > before && last?.turnId === turnId ? last : undefined;
 }
 
+/** Where a failed-turn rewind's transcript opens are checked and its backup
+ *  goes: nothing for a transcript outside any CLI-writable tree (the backup
+ *  sits next to it); for one inside, that tree and a backup directory of the
+ *  daemon's — the same layout /rewind uses. */
+function failedTurnTranscriptScope(): TranscriptTreeScope {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!claudeTranscriptTreeRoot) return {};
+  return {
+    writableTreeRoot: claudeTranscriptTreeRoot,
+    // No data dir, no backup directory: the cut is refused rather than made
+    // with its backup in the tree.
+    ...(dataDir && sessionId ? { backupDir: join(dataDir, 'rewind-backups', sessionId) } : {}),
+  };
+}
+
 /** The CLI a restart retired has stopped, its children included — before
  *  anything rewrites the transcript it wrote. */
 function waitForRetiringCliQuiescence(retiring: { pid?: number; processScope: number[] }): Promise<void> {
@@ -36964,7 +36996,8 @@ function waitForRetiringCliQuiescence(retiring: { pid?: number; processScope: nu
 /** Put a failed-turn cut back while no CLI is running on the transcript. */
 function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
   try {
-    return restoreRewoundTranscript(cut.path, cut);
+    assertTranscriptInProjectsRoot(cut.path, cut.projectsRoot);
+    return restoreRewoundTranscript(cut.path, cut, cut.scope);
   } catch (err) {
     log(`Restoring the cut failed turn failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;

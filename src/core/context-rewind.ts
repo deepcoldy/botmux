@@ -165,7 +165,9 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope:
 /** 一个打开着的 transcript：扫描和截断都经同一个描述符，截断的一定是扫描读的那个文件。 */
 export interface OpenTranscript {
   scan(limit?: number): RewindCheckpoint[];
-  cut(offset: number, now?: number): RewindResult;
+  /** The last turn, read from the held descriptor (see {@link inspectLastClaudeTurn}). */
+  lastTurn(limit?: number): LastTurnInspection;
+  cut(offset: number, now?: number, opts?: { backup?: 'full' | 'removed' }): RewindResult;
 }
 
 /** 打开 transcript（读写，规则同 {@link scanClaudeTranscriptCheckpoints}），在 `use`
@@ -176,11 +178,12 @@ export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, 
   try {
     return use({
       scan: (limit = 20) => scanDescriptor(fd, limit),
-      cut: (offset, now = Date.now()) => {
+      lastTurn: (limit = LAST_TURN_SCAN_LIMIT_BYTES) => lastTurnOfDescriptor(fd, limit),
+      cut: (offset, now = Date.now(), opts = {}) => {
         // The backup is created next to the path: it must still name the
         // file held here (held open, its inode cannot have been reused).
         assertSameInode(lstatSync(path), fstatSync(fd), path);
-        return rewindOpenTranscript(fd, path, offset, now, scope);
+        return rewindOpenTranscript(fd, path, offset, now, { ...scope, ...opts });
       },
     });
   } finally {
@@ -318,12 +321,9 @@ export interface LastTurnInspection {
   /** A user/assistant record precedes the turn, so the cut file still
    *  resumes (see {@link RewindCheckpoint.resumable}). */
   resumable?: boolean;
-  /** The file this was read from: a cut planned on it must land on it. */
-  file?: FileIdentity;
 }
 
-/** A file pinned by device and inode: a pathname under an agent-writable
- *  directory can be swapped between two steps, an inode cannot. */
+/** A file named by device and inode (the transcript a cut cut). */
 export interface FileIdentity {
   dev: number;
   ino: number;
@@ -406,102 +406,108 @@ function isTopLevelConversationLine(line: Buffer): boolean {
  * Fail-closed: every record this does not positively recognise as error-only
  * bookkeeping makes the outcome `progress` or `other`, never `error_only`.
  */
-export function inspectLastClaudeTurn(path: string, limit = LAST_TURN_SCAN_LIMIT_BYTES): LastTurnInspection {
+export function inspectLastClaudeTurn(
+  path: string,
+  limit = LAST_TURN_SCAN_LIMIT_BYTES,
+  scope: TranscriptTreeScope = {},
+): LastTurnInspection {
   // What is read here can reach the CLI (the cut turn's write-edge blocks):
-  // never through a link, and never block on a FIFO planted at the path.
-  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  // opened like every transcript read here (no link, no FIFO, inside the
+  // CLI-writable tree when there is one).
+  const fd = openTranscript(path, scope, fsConstants.O_RDONLY);
   try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) throw new Error(`refusing to inspect non-regular file ${path}`);
-    const size = st.size;
-    if (size === 0) return { outcome: 'no_turn' };
-    const last = Buffer.alloc(1);
-    readSync(fd, last, 0, 1, size - 1);
-    // A trailing line without '\n' is a write in progress.
-    if (last[0] !== 10) return { outcome: 'other' };
-    let errors = 0;
-    let start: { ev: TranscriptEvent; offset: number } | undefined;
-    let readToFileStart = false;
-    const lines = linesFromEnd(fd, size, limit);
-    for (let next = lines.next(); ; next = lines.next()) {
-      if (next.done) {
-        readToFileStart = next.value;
-        break;
-      }
-      const { line, offset } = next.value;
-      let ev: TranscriptEvent;
-      try {
-        const parsed: unknown = JSON.parse(line.toString('utf8'));
-        if (!parsed || typeof parsed !== 'object') return { outcome: 'other' };
-        ev = parsed as TranscriptEvent;
-      } catch {
-        return { outcome: 'other' };
-      }
-      if (isCompactBoundary(ev)) return { outcome: 'other' };
-      if (isTurnStart(ev)) {
-        start = { ev, offset };
-        break;
-      }
-      // A subagent's record belongs to a Task tool call of this turn.
-      if ((ev as any).isSidechain === true) return { outcome: 'progress' };
-      if (ev.type === 'assistant') {
-        if (ev.isApiErrorMessage === true) {
-          // Rate limits have their own handling; a cancelled request is a stop.
-          if (isTranscriptRateLimitEvent(ev) || String(ev.error ?? '').toLowerCase().includes('cancel')) {
-            return { outcome: 'other' };
-          }
-          errors += 1;
-          continue;
-        }
-        if (isSyntheticNoModelReplyEvent(ev)) {
-          errors += 1;
-          continue;
-        }
-        if (assistantMadeProgress(ev.message?.content)) return { outcome: 'progress' };
-        continue;
-      }
-      if (ev.type === 'user') {
-        // The nudge Claude Code writes when it resumes a turn cut mid-flight
-        // (before its no-model-reply placeholder) belongs to the turn. Any
-        // other meta record carries something of its own — a peer session's
-        // message, a subagent's hand-back — that a cut would lose.
-        if ((ev as any).isMeta === true && extractTurnStartText(ev).trim() === RESUME_NUDGE) continue;
-        const content = ev.message?.content;
-        if (Array.isArray(content) && content.some((block: any) => block?.type === 'tool_result')) {
-          return { outcome: 'progress' };
-        }
-        // An interrupt, a slash command's records, a compaction summary.
-        return { outcome: 'other' };
-      }
-      // An input folded into this turn has no record of its own, and a note
-      // that the user edited a file is not written again: cutting the turn
-      // would lose them. The other attachments are context Claude Code
-      // derives afresh for the next turn (hook context, date, skill listing…).
-      if (ev.type === 'attachment' && CONTENT_ATTACHMENT_RE.test(String((ev as any).attachment?.type ?? ''))) {
-        return { outcome: 'other' };
-      }
-      // system (turn_duration, retry notices), attachments, snapshots, request
-      // metadata: bookkeeping, not output.
-    }
-    if (!start) return { outcome: readToFileStart && errors === 0 ? 'no_turn' : 'other' };
-    let resumable = false;
-    for (let next = lines.next(); !next.done; next = lines.next()) {
-      if (isTopLevelConversationLine(next.value.line)) {
-        resumable = true;
-        break;
-      }
-    }
-    return {
-      outcome: errors > 0 ? 'error_only' : 'other',
-      offset: start.offset,
-      ...(typeof start.ev.uuid === 'string' ? { uuid: start.ev.uuid } : {}),
-      text: extractTurnStartText(start.ev),
-      resumable,
-      file: { dev: st.dev, ino: st.ino },
-    };
+    return lastTurnOfDescriptor(fd, limit);
   } finally {
     closeSync(fd);
   }
+}
+
+function lastTurnOfDescriptor(fd: number, limit: number): LastTurnInspection {
+  const size = fstatSync(fd).size;
+  if (size === 0) return { outcome: 'no_turn' };
+  const last = Buffer.alloc(1);
+  readSync(fd, last, 0, 1, size - 1);
+  // A trailing line without '\n' is a write in progress.
+  if (last[0] !== 10) return { outcome: 'other' };
+  let errors = 0;
+  let start: { ev: TranscriptEvent; offset: number } | undefined;
+  let readToFileStart = false;
+  const lines = linesFromEnd(fd, size, limit);
+  for (let next = lines.next(); ; next = lines.next()) {
+    if (next.done) {
+      readToFileStart = next.value;
+      break;
+    }
+    const { line, offset } = next.value;
+    let ev: TranscriptEvent;
+    try {
+      const parsed: unknown = JSON.parse(line.toString('utf8'));
+      if (!parsed || typeof parsed !== 'object') return { outcome: 'other' };
+      ev = parsed as TranscriptEvent;
+    } catch {
+      return { outcome: 'other' };
+    }
+    if (isCompactBoundary(ev)) return { outcome: 'other' };
+    if (isTurnStart(ev)) {
+      start = { ev, offset };
+      break;
+    }
+    // A subagent's record belongs to a Task tool call of this turn.
+    if ((ev as any).isSidechain === true) return { outcome: 'progress' };
+    if (ev.type === 'assistant') {
+      if (ev.isApiErrorMessage === true) {
+        // Rate limits have their own handling; a cancelled request is a stop.
+        if (isTranscriptRateLimitEvent(ev) || String(ev.error ?? '').toLowerCase().includes('cancel')) {
+          return { outcome: 'other' };
+        }
+        errors += 1;
+        continue;
+      }
+      if (isSyntheticNoModelReplyEvent(ev)) {
+        errors += 1;
+        continue;
+      }
+      if (assistantMadeProgress(ev.message?.content)) return { outcome: 'progress' };
+      continue;
+    }
+    if (ev.type === 'user') {
+      // The nudge Claude Code writes when it resumes a turn cut mid-flight
+      // (before its no-model-reply placeholder) belongs to the turn. Any
+      // other meta record carries something of its own — a peer session's
+      // message, a subagent's hand-back — that a cut would lose.
+      if ((ev as any).isMeta === true && extractTurnStartText(ev).trim() === RESUME_NUDGE) continue;
+      const content = ev.message?.content;
+      if (Array.isArray(content) && content.some((block: any) => block?.type === 'tool_result')) {
+        return { outcome: 'progress' };
+      }
+      // An interrupt, a slash command's records, a compaction summary.
+      return { outcome: 'other' };
+    }
+    // An input folded into this turn has no record of its own, and a note
+    // that the user edited a file is not written again: cutting the turn
+    // would lose them. The other attachments are context Claude Code
+    // derives afresh for the next turn (hook context, date, skill listing…).
+    if (ev.type === 'attachment' && CONTENT_ATTACHMENT_RE.test(String((ev as any).attachment?.type ?? ''))) {
+      return { outcome: 'other' };
+    }
+    // system (turn_duration, retry notices), attachments, snapshots, request
+    // metadata: bookkeeping, not output.
+  }
+  if (!start) return { outcome: readToFileStart && errors === 0 ? 'no_turn' : 'other' };
+  let resumable = false;
+  for (let next = lines.next(); !next.done; next = lines.next()) {
+    if (isTopLevelConversationLine(next.value.line)) {
+      resumable = true;
+      break;
+    }
+  }
+  return {
+    outcome: errors > 0 ? 'error_only' : 'other',
+    offset: start.offset,
+    ...(typeof start.ev.uuid === 'string' ? { uuid: start.ev.uuid } : {}),
+    text: extractTurnStartText(start.ev),
+    resumable,
+  };
 }
 
 export interface RewindResult {
@@ -556,9 +562,6 @@ export function rewindClaudeTranscript(
      *  transcript of hundreds of MB each time is not affordable, and the part
      *  that stays needs no backup. Default `full` (the /rewind command). */
     backup?: 'full' | 'removed';
-    /** The file the cut was planned on ({@link LastTurnInspection.file}): a
-     *  different inode at the path now is refused. */
-    expectFile?: FileIdentity;
   } & TranscriptTreeScope = {},
 ): RewindResult {
   const pre = lstatSync(path);
@@ -568,7 +571,6 @@ export function rewindClaudeTranscript(
   try {
     // Pin the descriptor to the inode lstat inspected (regular-file swap TOCTOU).
     assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
-    if (opts.expectFile) assertSameInode(opts.expectFile, fstatSync(fd), path);
     if (opts.writableTreeRoot) assertOpenedInsideTree(fd, path, opts.writableTreeRoot);
     return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
@@ -728,18 +730,19 @@ function mayFollowRestoredTurn(line: string): boolean {
 export function restoreRewoundTranscript(
   path: string,
   cut: { offset: number; transcript: FileIdentity; removed: Buffer },
+  scope: TranscriptTreeScope = {},
 ): boolean {
-  // The transcript sits in a directory the sandboxed CLI can write: opened
-  // without following a link, it must be the very inode the cut cut — never
-  // a file planted at the path since. The bytes come from the cut itself; a
-  // cut always removes some (it starts at a turn).
+  // The transcript sits in a directory the sandboxed CLI can write: opened the
+  // way every transcript read here is (no link, no FIFO, inside that tree),
+  // it must still be the inode the cut cut. The bytes come from the cut
+  // itself; a cut always removes some (it starts at a turn).
   if (cut.removed.length === 0) return false;
   const pre = lstatSync(path);
   if (!pre.isFile()) return false;
-  const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+  const fd = openTranscript(path, scope, fsConstants.O_RDWR);
   try {
     const st = fstatSync(fd);
-    if (!st.isFile() || !sameFile(pre, st) || !sameFile(cut.transcript, st)) return false;
+    if (!sameFile(pre, st) || !sameFile(cut.transcript, st)) return false;
     const size = st.size;
     if (size < cut.offset || size - cut.offset > RESTORE_TAIL_LIMIT_BYTES) return false;
     const tail = Buffer.alloc(size - cut.offset);

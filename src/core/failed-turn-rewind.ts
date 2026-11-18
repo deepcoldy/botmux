@@ -29,7 +29,7 @@ import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { normaliseForFingerprint } from '../services/claude-transcript.js';
 import type { PurgeResumeTarget } from '../services/transcript-image-purge.js';
 import { isInClaudeProjectsRoot, type ClaudeProjectsRoot } from '../services/claude-projects-root.js';
-import { inspectLastClaudeTurn, type FileIdentity, type LastTurnInspection, type RewindResult } from './context-rewind.js';
+import { inspectLastClaudeTurn, withOpenTranscript, type LastTurnInspection, type RewindResult, type TranscriptTreeScope } from './context-rewind.js';
 
 /** The failed input, then the newer one, as one turn. A newer input identical
  *  to how the failed input already ends (a connector re-sending its bare
@@ -166,11 +166,46 @@ export function transcriptTurnFailedWithoutOutput(jsonlPath: string, writtenInpu
  *  which a link at or above `projects` would move along. No pinned root:
  *  nothing is trusted. The file itself is never followed either, see
  *  {@link inspectLastClaudeTurn}. */
-export function inspectLastTurnInProjectsRoot(jsonlPath: string, root: ClaudeProjectsRoot | undefined): LastTurnInspection {
+export function inspectLastTurnInProjectsRoot(
+  jsonlPath: string,
+  root: ClaudeProjectsRoot | undefined,
+  scope: TranscriptTreeScope = {},
+): LastTurnInspection {
+  assertTranscriptInProjectsRoot(jsonlPath, root);
+  return inspectLastClaudeTurn(jsonlPath, undefined, scope);
+}
+
+/** The last-turn read and the cut of a failed-turn rewind, on one held
+ *  descriptor (context-rewind's withOpenTranscript): the cut lands on the
+ *  file read. A transcript in the CLI-writable tree is checked against that
+ *  tree on open, and its backup goes to `scope.backupDir`. */
+export interface FailedTurnTranscript {
+  lastTurn(): LastTurnInspection;
+  cut(offset: number): RewindResult;
+}
+
+/** Open the transcript for {@link runFailedTurnRewindMaintenance}: inside the
+ *  projects root pinned at launch, through withOpenTranscript; the cut keeps
+ *  only the bytes it removes. */
+export function withFailedTurnTranscript<T>(
+  jsonlPath: string,
+  root: ClaudeProjectsRoot | undefined,
+  scope: TranscriptTreeScope,
+  use: (transcript: FailedTurnTranscript) => T,
+): T {
+  assertTranscriptInProjectsRoot(jsonlPath, root);
+  return withOpenTranscript(jsonlPath, scope, transcript => use({
+    lastTurn: () => transcript.lastTurn(),
+    cut: offset => transcript.cut(offset, Date.now(), { backup: 'removed' }),
+  }));
+}
+
+/** Throws unless the transcript lies inside the projects root pinned at
+ *  launch (no pinned root: nothing is trusted). */
+export function assertTranscriptInProjectsRoot(jsonlPath: string, root: ClaudeProjectsRoot | undefined): void {
   if (!root || !isInClaudeProjectsRoot(jsonlPath, root)) {
     throw new Error('transcript outside its projects directory');
   }
-  return inspectLastClaudeTurn(jsonlPath);
 }
 
 /** What the CLI gets once the turn is cut: the directive's content, then the
@@ -248,9 +283,9 @@ export function planFailedTurnRewindRequest(input: {
  *  it must still be the one planned, at the same place. */
 export async function runFailedTurnRewindMaintenance(deps: {
   waitForQuiescence: () => Promise<void>;
-  inspect: () => LastTurnInspection;
-  /** Cuts the file `inspect` read (`file`), not whatever is at the path. */
-  rewind: (offset: number, file: FileIdentity | undefined) => RewindResult;
+  /** Opens the transcript once: the last-turn read and the cut both go
+   *  through that one held descriptor, so the cut lands on the file read. */
+  withTranscript: <T>(use: (transcript: FailedTurnTranscript) => T) => T;
   planned: { offset: number; uuid?: string };
   failedInput: string;
   /** Checked right before the cut, with nothing awaited in between: the
@@ -264,21 +299,27 @@ export async function runFailedTurnRewindMaintenance(deps: {
   } catch (err) {
     return { kind: 'declined', reason: `CLI exit unproven: ${text(err)}` };
   }
-  let turn: LastTurnInspection;
   try {
-    turn = deps.inspect();
+    return deps.withTranscript((transcript): FailedTurnRewindOutcome => {
+      let turn: LastTurnInspection;
+      try {
+        turn = transcript.lastTurn();
+      } catch (err) {
+        return { kind: 'declined', reason: `transcript unreadable: ${text(err)}` };
+      }
+      if (!lastTurnIsFailedInput(turn, deps.failedInput)
+        || turn.offset !== deps.planned.offset || turn.uuid !== deps.planned.uuid) {
+        return { kind: 'declined', reason: `the transcript changed before the cut (${turn.outcome})` };
+      }
+      if (!deps.messageStillQueued()) return { kind: 'declined', reason: 'the message is no longer waiting for the CLI' };
+      const suffix = matchRecordedInput(turn.text!, deps.failedInput)!.suffix;
+      try {
+        return { kind: 'rewound', result: transcript.cut(turn.offset!), suffix };
+      } catch (err) {
+        return { kind: 'declined', reason: `cut failed: ${text(err)}` };
+      }
+    });
   } catch (err) {
     return { kind: 'declined', reason: `transcript unreadable: ${text(err)}` };
-  }
-  if (!lastTurnIsFailedInput(turn, deps.failedInput)
-    || turn.offset !== deps.planned.offset || turn.uuid !== deps.planned.uuid) {
-    return { kind: 'declined', reason: `the transcript changed before the cut (${turn.outcome})` };
-  }
-  if (!deps.messageStillQueued()) return { kind: 'declined', reason: 'the message is no longer waiting for the CLI' };
-  const suffix = matchRecordedInput(turn.text!, deps.failedInput)!.suffix;
-  try {
-    return { kind: 'rewound', result: deps.rewind(turn.offset!, turn.file), suffix };
-  } catch (err) {
-    return { kind: 'declined', reason: `cut failed: ${text(err)}` };
   }
 }

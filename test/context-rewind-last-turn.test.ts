@@ -6,11 +6,11 @@
  * the API-error record and turn_duration.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, type RewindResult } from '../src/core/context-rewind.js';
+import { inspectLastClaudeTurn, restoreRewoundTranscript, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, withOpenTranscript, type RewindResult } from '../src/core/context-rewind.js';
 
 /** What a restore takes from a `removed` cut. */
 const pinned = (result: RewindResult, offset: number) => ({ ...result, offset, removed: result.removed! });
@@ -320,15 +320,47 @@ describe('the last-turn read and the cut stay on the file they planned on', () =
     expect(() => inspectLastClaudeTurn(fifo)).toThrow(/non-regular/);
   });
 
-  it('a cut planned on one file refuses another file at the path', () => {
+  it('the last-turn read and the cut share one descriptor: a file swapped in between is not cut', () => {
     const path = fixture([...history, prompt('继续', 'u1'), apiError(), turnDuration]);
-    const { offset, file } = inspectLastClaudeTurn(path);
-    const copy = `${path}.copy`;
-    copyFileSync(path, copy);
-    renameSync(copy, path);
-    const swapped = readFileSync(path);
-    expect(() => rewindClaudeTranscript(path, offset!, Date.UTC(2026, 10, 16, 15, 7), { backup: 'removed', expectFile: file })).toThrow(/replaced/);
-    expect(readFileSync(path).equals(swapped)).toBe(true);
+    const original = readFileSync(path);
+    const held = `${path}.held`;
+    expect(() => withOpenTranscript(path, {}, transcript => {
+      const { offset } = transcript.lastTurn();
+      // Another file at the path between the read and the cut.
+      renameSync(path, held);
+      copyFileSync(held, path);
+      return transcript.cut(offset!, Date.UTC(2026, 10, 16, 15, 7), { backup: 'removed' });
+    })).toThrow(/replaced/);
+    expect(readFileSync(path).equals(original)).toBe(true);
+    expect(readFileSync(held).equals(original)).toBe(true);
+  });
+
+  it('in a CLI-writable tree, the cut keeps its backup out of the tree and the restore re-checks the tree', () => {
+    const tree = mkdtempSync(join(tmpdir(), 'botmux-tree-'));
+    dirs.push(tree);
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-backups-'));
+    dirs.push(backupDir);
+    const projectDir = join(tree, 'projects', 'cwd-key');
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, 'session.jsonl');
+    writeFileSync(path, [...history, prompt('继续', 'u1'), apiError(), turnDuration].map(line => `${JSON.stringify(line)}\n`).join(''));
+    const before = readFileSync(path);
+    const scope = { writableTreeRoot: tree, backupDir };
+    const result = withOpenTranscript(path, scope, transcript => transcript.cut(transcript.lastTurn().offset!, Date.UTC(2026, 10, 16, 15, 8), { backup: 'removed' }));
+    expect(dirname(result.backupPath)).toBe(backupDir);
+    expect(readdirSync(projectDir)).toEqual(['session.jsonl']);
+    const cut = pinned(result, before.length - result.removedBytes);
+    // The project directory became a link to a copy elsewhere: refused.
+    const elsewhere = mkdtempSync(join(tmpdir(), 'botmux-elsewhere-'));
+    dirs.push(elsewhere);
+    renameSync(projectDir, join(elsewhere, 'cwd-key'));
+    symlinkSync(join(elsewhere, 'cwd-key'), projectDir);
+    expect(() => restoreRewoundTranscript(path, cut, scope)).toThrow();
+    // Back in place: restored.
+    unlinkSync(projectDir);
+    renameSync(join(elsewhere, 'cwd-key'), projectDir);
+    expect(restoreRewoundTranscript(path, cut, scope)).toBe(true);
+    expect(readFileSync(path).equals(before)).toBe(true);
   });
 });
 
