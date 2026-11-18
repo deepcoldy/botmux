@@ -6633,6 +6633,21 @@ function notePostTerminalLiveWork(
 }
 
 /**
+ * Close the post-terminal live-work episode. Called when the live work ends
+ * through a path that does NOT emit a managed completed terminal:
+ *  - a real idle/limited screen frame (the CLI returned to its prompt — the
+ *    natural end of a direct-submit episode whose local failure terminal the
+ *    worker deliberately suppresses);
+ *  - any local-* terminal (completed/failed/cancelled).
+ * Without these exits the epoch would stay open forever and a later keep-alive
+ * busy frame would be misread as episode continuation, flipping an idle card
+ * back to working and disabling the stuck-working self-heal.
+ */
+function closePostTerminalLiveWorkEpisode(ds: DaemonSession): void {
+  ds.postTerminalLiveWorkAt = undefined;
+}
+
+/**
  * Whether an accepted (non-stale) live busy frame must force a visible card
  * re-render against a post-terminal idle correction.
  *
@@ -22414,6 +22429,13 @@ function setupWorkerHandlers(
             directSubmit: msg.directSubmit,
           });
         }
+        // A real idle/limited frame is the natural end of a live-work episode
+        // (e.g. a direct-submit whose local failure terminal is suppressed):
+        // close it so a later keep-alive busy frame cannot be mistaken for
+        // continuation and re-open a settled idle card.
+        if (!POST_TERMINAL_BUSY_STATUSES.has(projectedScreenStatus)) {
+          closePostTerminalLiveWorkEpisode(ds);
+        }
         // A non-stale live busy frame arriving against a display-only idle
         // correction must repaint the card back to busy even though the
         // execution status value itself does not change (it stayed 'working').
@@ -22981,6 +23003,11 @@ function setupWorkerHandlers(
         // no direct-submit marker; untagged ones are keepalive and stay stale).
         if (!stalePostTerminalShot && POST_TERMINAL_BUSY_STATUSES.has(ds.lastScreenStatus)) {
           notePostTerminalLiveWork(ds, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt });
+        }
+        // Symmetric to screen_update: an idle/limited screenshot closes the
+        // live-work episode so a later keep-alive cannot re-open the card.
+        if (!POST_TERMINAL_BUSY_STATUSES.has(ds.lastScreenStatus)) {
+          closePostTerminalLiveWorkEpisode(ds);
         }
         if (!stalePostTerminalShot) bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
@@ -24418,11 +24445,13 @@ function setupWorkerHandlers(
           schedulePostTerminalStatusSettle(ds, msg);
         }
         // A Web Terminal typed turn (`local-*`) never moves currentTurnId, so the
-        // managed-turn gate above does not run for it. Its completed terminal
-        // still ends the live-work episode it opened: clear the epoch so a later
-        // stuck-working self-heal is not permanently suppressed by stale liveness.
-        if (isTerminalTypedTurnId(msg.turnId) && msg.status === 'completed') {
-          ds.postTerminalLiveWorkAt = undefined;
+        // managed-turn gate above does not run for it. Any of its terminals
+        // (completed/failed/cancelled) ends the live-work episode it opened —
+        // including the failure path whose terminal the worker suppresses down
+        // to a notice: clear the epoch so a later stuck-working self-heal is not
+        // permanently suppressed by stale liveness.
+        if (isTerminalTypedTurnId(msg.turnId)) {
+          closePostTerminalLiveWorkEpisode(ds);
         }
         const terminalCliId = workerCliId(ds);
         if (terminalCliId !== undefined) turnTerminalReportingCliIds.add(terminalCliId);

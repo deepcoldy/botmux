@@ -891,5 +891,51 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
     expect(ds.currentImageKey).toBe('img-episode');
   });
+
+  it('R5: a real idle frame closes the episode so a later keepalive cannot re-open the card', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds); // opens the live-work episode
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // The direct-submit work ends with a real idle frame (no local terminal).
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'composer', status: 'idle' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined(); // episode closed
+
+    // A keepalive busy frame must now be treated as stale, not episode continuation.
+    const rev = ds.streamCardStatusRevision ?? 0;
+    const calls = updateMessageMock.mock.calls.length;
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+    expect(updateMessageMock.mock.calls.length).toBe(calls);
+    expect(lastPatchedStatus()).not.toBe('working');
+  });
+
+  it('R5: a local-* failed/cancelled terminal closes the episode even without a completed one', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // Local failure: the worker suppresses the failure terminal to a notice, but
+    // when it does arrive (any non-completed status) the epoch must still close.
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: SESSION, turnId: 'local-typed-fail', status: 'failed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+
+    // Self-heal is live again: a residual busy frame is gated.
+    const rev = ds.streamCardStatusRevision ?? 0;
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+  });
 });
 
