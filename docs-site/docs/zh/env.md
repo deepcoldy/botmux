@@ -84,10 +84,13 @@
 | `BOTMUX_RECOVERY_FORK_BATCH` | `5` | botmux 重启后恢复会话时，每批重新拉起几个，避免一下子全起来把机器压满。最小 `1` |
 | `BOTMUX_RECOVERY_FORK_DELAY_MS` | `250` | 恢复会话时两批之间隔多久（毫秒）。最小 `0` |
 | `BOTMUX_WORKTREE_SLUG_AI_ENABLED` | 关 | 设 `true` 后，用 AI 给新 worktree 起分支名，见下方「用 AI 给 worktree 起名」 |
+| `BOTMUX_WORKTREE_CREATE_TIMEOUT_MS` | `60000` | 每次 `git worktree add` 的超时（毫秒），包含 checkout 和 `post-checkout` hook；必须是 `1`～`2147483647` 的整数，非法值回退默认值 |
 | `BOTMUX_ALLOW_UNKNOWN_SCOPES` | 不设 | 设 `1` 后，可以申请 botmux 权限清单里还没收录的飞书权限（只检查格式）。飞书新出权限、botmux 还没发版时临时用 |
 | `BOTMUX_CODEX_NODE_REPL_PATH` | 不设 | 显式启用浏览器相关功能、但没配好 MCP 运行时时，指定已安装的 Codex `node_repl` 可执行文件的绝对路径 |
 
 `BOTMUX_ASK_TIMEOUT_MS` 和 `BOTMUX_PERMISSION_TIMEOUT_MS` 由会话里的 CLI 读取，默认继承 `~/.botmux/.env` 里的值。它们以 `BOTMUX` 开头，属于 botmux 保留变量，不能在会话环境变量里按 Bot 单独设置；Bot 开了[严格进程环境继承](/bots-json#strict-env)时，这两项传不进会话，按默认值生效。
+
+在 `~/.botmux/.env` 中设置 `BOTMUX_WORKTREE_CREATE_TIMEOUT_MS=180000` 并重启 botmux，可给耗时的 checkout hook 留出 3 分钟预算。此项适用于自动会话 worktree、仓库选择卡、`/repo wt`、`/tw`、多仓库 worktree、独立成员 worktree 和已删除 worktree 的恢复等共用创建流程；只调整每次 `git worktree add`，不调整 fetch、push、清理或目标锁等待，也不是整个创建流程的总超时。既有 worktree 复用规则保持不变；创建抛错时，普通自动创建回退默认目录，本地 `oncall` 沙盒拒绝启动，显式请求向调用方报错。
 
 ### 用 AI 给 worktree 起名（可选）
 
