@@ -87,7 +87,15 @@ export function workerSubmitHarness() {
     buildSubmitMessagePreview,
     cliName: () => 'TraeX',
     // Any unrelated failure path is observable instead of silently swallowed.
-    SubmissionWriteError: class extends Error {},
+    SubmissionWriteError: class extends Error {
+      constructor(
+        message: string,
+        readonly recoveryFailureReason?: string,
+        readonly submissionStarted = true,
+        readonly runnerGenerationUnsafe = false,
+        readonly traexCatalogAdmissionRequired = false,
+      ) { super(message); }
+    },
     emitTurnTerminal: vi.fn(),
     shouldStopPendingBatch: () => true,
   };

@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 import { classifyFailure, RETRY_DELAYS_MS, runWithRetry } from '../scripts/ci-net-retry.mjs';
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -11,7 +12,9 @@ const SCRIPT = join(ROOT, 'scripts/ci-net-retry.mjs');
 // 样本是真实输出：两条来自 #3193 的 CI 现场日志，其余是 bun 1.4.4 / npm 11 / pnpm 9.5.0 /
 // electron install.js / curl 对着本地故障注入 registry（504、断开连接、404）时的报错原文。
 const APT_DNS = "E: Failed to fetch mirror+file:/etc/apt/apt-mirrors.txt/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb Temporary failure resolving 'azure.archive.ubuntu.com'";
+const DOCKER_CDN_RESET = 'docker: failed to copy: httpReadSeeker: failed open: failed to do request: Get "https://cdn01.quay.io/quayio-production-s3/layer": read tcp 10.1.0.101:49806->23.67.33.92:443: read: connection reset by peer';
 const TRANSIENT: Record<string, string> = {
+  'Docker 镜像 CDN 重置连接（#3500 CI 原始日志）': DOCKER_CDN_RESET,
   'apt 临时 DNS 失败（#3348 CI 原始日志）': APT_DNS,
   'electron postinstall 504（#3193 现场一）':
     'bun install v1.4.3 (c6da4a4d3)\nHTTPError: Response code 504 (Gateway Time-out)\n    at Request._onResponseBase (/home/runner/work/botmux/botmux/node_modules/got/dist/source/core/index.js:913:31)\nerror: postinstall script from "electron" exited with 1',
@@ -29,6 +32,8 @@ const TRANSIENT: Record<string, string> = {
 };
 
 const DETERMINISTIC: Record<string, string> = {
+  'Docker 镜像不存在优先于连接重置': 'manifest unknown: manifest unknown\n' + DOCKER_CDN_RESET,
+  'Docker 无权限优先于连接重置': 'pull access denied: requested access to the resource is denied\n' + DOCKER_CDN_RESET,
   'bun lockfile 漂移':
     'bun install v1.4.4 (38afee6c8)\nerror: lockfile had changes, but lockfile is frozen\nnote: dependencies in package.json changed since bun.lock was saved: fake-dep was removed',
   'pnpm lockfile 漂移': ' ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with "frozen-lockfile" because pnpm-lock.yaml is not up to date with package.json',
@@ -63,6 +68,23 @@ describe('classifyFailure', () => {
   });
 });
 
+// 源码结构护栏(K4)：预拉镜像必须与构建脚本一致，重试下载不能重跑编译验收。
+describe('glibc CI image download retries', () => {
+  it('pulls the actual builder image with retries before running the build once', () => {
+    const ci = parse(readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8'));
+    const steps = ci.jobs['bun-binary'].steps as Array<{ run?: string }>;
+    const pullAt = steps.findIndex(step => step.run?.startsWith('node scripts/ci-net-retry.mjs docker pull '));
+    const buildAt = steps.findIndex(step => step.run?.includes('scripts/build-linux-glibc-baseline.sh'));
+    expect(pullAt).toBeGreaterThanOrEqual(0);
+    expect(buildAt).toBeGreaterThan(pullAt);
+    const builder = readFileSync(join(ROOT, 'scripts/build-linux-glibc-baseline.sh'), 'utf8');
+    const image = /^\s*bun-linux-x64\)[\s\S]*?image="([^"]+)"/m.exec(builder)?.[1];
+    expect(image).toBeTruthy();
+    expect(steps[pullAt]!.run!.trim().split(/\s+/)).toEqual(['node', 'scripts/ci-net-retry.mjs', 'docker', 'pull', image]);
+    expect(steps[buildAt]!.run).not.toContain('ci-net-retry.mjs');
+  });
+});
+
 type Attempt = { code: number; output: string; interrupted?: boolean };
 
 function harness(results: Attempt[]) {
@@ -84,6 +106,14 @@ function harness(results: Attempt[]) {
 const GATEWAY_504 = { code: 1, output: TRANSIENT['bun tarball 504'] };
 
 describe('runWithRetry', () => {
+  it.each([true, false])('Docker 镜像连接重置有界重试，恢复=%s', async (recovers) => {
+    const h = harness(recovers ? [{ code: 1, output: DOCKER_CDN_RESET }, { code: 0, output: '' }] : [{ code: 1, output: DOCKER_CDN_RESET }]);
+    const args = ['pull', 'quay.io/pypa/manylinux_2_28_x86_64:latest'];
+    await expect(runWithRetry('docker', args, h.deps)).resolves.toBe(recovers ? 0 : 1);
+    expect(h.calls).toEqual(Array.from({ length: recovers ? 2 : 5 }, () => ['docker', ...args]));
+    expect(h.sleeps).toEqual(recovers ? [10_000] : [...RETRY_DELAYS_MS]);
+  });
+
   it.each([true, false])('apt 临时解析失败有界重试，恢复=%s', async (recovers) => {
     const failed = { code: 100, output: APT_DNS };
     const h = harness(recovers ? [failed, { code: 0, output: '' }] : [failed]);

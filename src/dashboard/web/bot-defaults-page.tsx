@@ -6,6 +6,8 @@ import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
 import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
+import { afterNextPaint } from './deferred-task.js';
+import { LazyTabPanel } from './lazy-tab-panel.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -1141,13 +1143,7 @@ function BotDefaultsCard(props: {
         </div>
       ) : null}
       <div className="bd-body bd-tab-panels">
-        <div
-          id="bd-panel-common"
-          role="tabpanel"
-          aria-labelledby="bd-tab-common"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'common'}
-        >
+        <LazyTabPanel id="common" active={props.activeTab === 'common'}>
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('agent')}>
               <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} lock={props.linkedAgent} />
@@ -1157,14 +1153,8 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile" id={botDefaultsSectionDomId('role')}><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-sessions"
-          role="tabpanel"
-          aria-labelledby="bd-tab-sessions"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'sessions'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="sessions" active={props.activeTab === 'sessions'}>
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
@@ -1189,14 +1179,8 @@ function BotDefaultsCard(props: {
             <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-security"
-          role="tabpanel"
-          aria-labelledby="bd-tab-security"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'security'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="security" active={props.activeTab === 'security'}>
           <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
@@ -1214,14 +1198,8 @@ function BotDefaultsCard(props: {
             <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-cards"
-          role="tabpanel"
-          aria-labelledby="bd-tab-cards"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'cards'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="cards" active={props.activeTab === 'cards'}>
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('card-behavior')}><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('long-task-reminder')}><LongTaskReminderSection bot={bot} patchBot={patchBot} /></section>
@@ -1232,14 +1210,8 @@ function BotDefaultsCard(props: {
             <section className="bd-tile" id={botDefaultsSectionDomId('ask-option-layout')}><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('brand')}><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
           </BdTabGrid>
-        </div>
-        <div
-          id="bd-panel-advanced"
-          role="tabpanel"
-          aria-labelledby="bd-tab-advanced"
-          className="bd-tab-panel"
-          hidden={props.activeTab !== 'advanced'}
-        >
+        </LazyTabPanel>
+        <LazyTabPanel id="advanced" active={props.activeTab === 'advanced'}>
           <BdTabGrid>
             {/* 远端 CLI（riff/mojo）：backendType 与 CLI 选择 1:1 绑定 ——
                 reconcileRiffBackendType 在 spawn 层按 isRemoteBackendId(cliId)
@@ -1273,7 +1245,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
-        </div>
+        </LazyTabPanel>
       </div>
     </article>
   );
@@ -2456,19 +2428,21 @@ function botDescriptionErrorText(
   return responseErrorText(res);
 }
 
-function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
+export function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const { bot } = props;
   const [snapshot, setSnapshot] = useState<BotDescriptionSnapshot | null>(null);
   const [drafts, setDrafts] = useState<BotDescriptionDrafts>({});
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const busy = loading || saving;
   const [status, setStatus] = useState<StatusMessage>(null);
   const [loginVisible, setLoginVisible] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
 
   const loadDescriptions = useCallback(async (previousDrafts?: BotDescriptionDrafts) => {
-    setBusy(true);
+    setLoading(true);
     setStatus({ text: `⏳ ${tr('botDefaults.descriptionLoading')}`, ok: true });
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`);
@@ -2498,18 +2472,17 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     } catch (e: any) {
       setStatus({ text: `✗ ${tr('botDefaults.descriptionLoadFailed', { error: caughtErrorText(e) })}` });
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
     return null;
   }, [bot.larkAppId, tr]);
 
-  useEffect(() => {
-    void loadDescriptions();
-  }, [loadDescriptions]);
-
   const openEditor = useCallback(() => {
     setOpen(true);
-  }, []);
+    // Reading descriptions bootstraps a remote Open Platform Web session. It
+    // is not needed to display or edit the rest of the Bot configuration.
+    if (!snapshot && !busy) void loadDescriptions();
+  }, [snapshot, busy, loadDescriptions]);
 
   const save = useCallback(async () => {
     const normalized = normalizeBotDescriptions(drafts);
@@ -2522,7 +2495,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
       setStatus({ text: `✗ ${tr(key, { lang: normalized.lang ?? '' })}` });
       return;
     }
-    setBusy(true);
+    setSaving(true);
     setStatus({ text: `⏳ ${tr('botDefaults.descriptionPublishing')}`, ok: true });
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`, {
@@ -2555,7 +2528,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     } catch (e: any) {
       setStatus({ text: `✗ ${tr('botDefaults.descriptionFailed', { error: caughtErrorText(e) })}` });
     } finally {
-      setBusy(false);
+      setSaving(false);
     }
   }, [bot.larkAppId, drafts, loadDescriptions, snapshot?.primaryLang, tr]);
 
@@ -2594,13 +2567,13 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
         <div
           className="bot-defaults-page bd-description-overlay"
           onClick={event => {
-            if (event.currentTarget === event.target && !busy) setOpen(false);
+            if (event.currentTarget === event.target && !saving) setOpen(false);
           }}
         >
           <div className="bd-description-modal" role="dialog" aria-modal="true" aria-labelledby="bd-description-title">
             <div className="bd-description-modal-head">
               <h3 id="bd-description-title">{tr('botDefaults.descriptionTitle')}</h3>
-              <button type="button" className="feishu-login-close" aria-label={tr('feishuLogin.close')} disabled={busy} onClick={() => setOpen(false)}>x</button>
+              <button type="button" className="feishu-login-close" data-action="close-bot-description" aria-label={tr('feishuLogin.close')} disabled={saving} onClick={() => setOpen(false)}>x</button>
             </div>
             {status ? (
               <small className={statusClass(status, 'bd-description-modal-status')} data-description-modal-status>
@@ -2645,7 +2618,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
               })}
             </div>
             <div className="bd-description-actions">
-              <button type="button" disabled={busy} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
+              <button type="button" data-action="cancel-bot-description" disabled={saving} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
               <button type="button" className="primary" disabled={busy || rows.length === 0} onClick={() => void save()}>{tr('botDefaults.descriptionSave')}</button>
             </div>
           </div>
@@ -3044,10 +3017,12 @@ export function BotAgentSection(props: {
     let stale = false;
     setDetectedModels(null);
     setDetectingModels(true);
-    fetchDetectedModels(cliKey, bot.larkAppId)
-      .then(result => { if (!stale) setDetectedModels(result); })
-      .finally(() => { if (!stale) setDetectingModels(false); });
-    return () => { stale = true; };
+    const cancel = afterNextPaint(() => {
+      void fetchDetectedModels(cliKey, bot.larkAppId)
+        .then(result => { if (!stale) setDetectedModels(result); })
+        .finally(() => { if (!stale) setDetectingModels(false); });
+    });
+    return () => { stale = true; cancel(); };
     // Runtime/path/env-policy/env edits save into the bot row first. A new row
     // identity is the probe revision; env values themselves stay write-only.
   }, [cliKey, bot]);

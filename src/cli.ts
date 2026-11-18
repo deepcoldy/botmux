@@ -3221,7 +3221,7 @@ async function cmdRestart(): Promise<void> {
 
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      const { restartFleet, resolveFleetMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
         const r = restartFleet({
@@ -3236,8 +3236,8 @@ async function cmdRestart(): Promise<void> {
         }
         // Health-gate on every supervised member (bot daemons + dashboard), so a
         // restart that leaves the dashboard down is reported unhealthy, not "ok".
-        const names = fleetMemberNames();
-        health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
+        const members = resolveFleetMembers();
+        health = waitFleetOnline(members, pm2StartVerifyTimeoutMs(members.length));
         if (!health.healthy) {
           throw new Error(
             `[restart] fleet 未在超时时间内全部上线 (${health.online}/${health.expected})；`

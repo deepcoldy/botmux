@@ -8,6 +8,7 @@ import {
   isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
+  globalTerminalEffortWritebackConfigLive,
 } from './global-config.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
@@ -411,6 +412,10 @@ export const config = {
   // so a Dashboard change gates the next session upgrade without restarting
   // daemons or changing the current turn.
   get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions === true; },
+  /** Default OFF; only confirmed user terminal choices affect durable session effort. */
+  get terminalEffortWriteback(): boolean { return globalTerminalEffortWritebackConfigLive().enabled; },
+  get terminalEffortWritebackEpoch(): number { return globalTerminalEffortWritebackConfigLive().epoch; },
+  get terminalEffortWritebackEnabledAtMs(): number { return globalTerminalEffortWritebackConfigLive().enabledAtMs; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without

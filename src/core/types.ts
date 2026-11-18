@@ -588,6 +588,15 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Wall-clock of the most recent `turn_terminal` observed for this session,
+   *  and the turn it named. The terminal edge is the daemon's authority that a
+   *  turn is over, so these drive the post-terminal display settle (see
+   *  schedulePostTerminalStatusSettle) and the periodic stale-card self-heal.
+   *  In-memory only. */
+  lastTurnTerminalAt?: number;
+  lastTurnTerminalTurnId?: string;
+  lastTurnTerminalDispatchAttempt?: number;
+  lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -738,6 +747,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */

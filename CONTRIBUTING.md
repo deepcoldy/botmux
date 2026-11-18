@@ -231,6 +231,11 @@ bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.
 bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
 
+CI also runs the eligible unit files on Bun in four independent shards, retaining
+one process per file. The stable `bun-test` check verifies complete coverage and
+publishes per-file wall times. See [Bun CI shards and timing artifacts](docs/bun-ci-shards.md)
+for local reproduction and refreshing the separate Bun duration table.
+
 > **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
 > submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by
 > `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every

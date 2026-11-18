@@ -202,12 +202,12 @@ setInterval(() => {
   let workerScript = join(root, 'worker-bootstrap.ts');
   const preload = `
 await import(${JSON.stringify(resolve('src/worker-ipc-preload.ts'))});
-process.send?.({ type: 'worker_ipc_ready' });
 `;
   writeFileSync(workerScript, `
 (async () => {
 ${preload}
 await import(${JSON.stringify(resolve('src/worker.ts'))});
+process.send?.({ type: 'worker_ipc_ready' });
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `);
   if (nativeViewport || heldIdle || provisionalThread) {
@@ -293,6 +293,7 @@ TmuxPipeBackend.prototype.captureViewportAsync = async function () {
   return screen;
 };
 await import(${JSON.stringify(resolve('src/worker.ts'))});
+process.send?.({ type: 'worker_ipc_ready' });
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `);
   }
@@ -312,13 +313,15 @@ await import(${JSON.stringify(resolve('src/worker.ts'))});
     child.on('message', message => messages.push(message as WorkerToDaemon));
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-    // Source mode mirrors production's explicit IPC preload, with a fixture
-    // ACK before importing the full worker. Standalone mode uses its real ACK.
-    // Only harmless bootstrap probes repeat; the business init is sent once.
+    // Source fixtures ACK after the full handler is installed, so cold tsx
+    // imports do not consume the CLI's first-frame window. Standalone mode
+    // uses its real preload ACK; only its harmless bootstrap probes repeat.
     const bootstrapDeadline = Date.now() + 30_000;
     while (!messages.some(message => message.type === 'worker_ipc_ready')) {
       if (Date.now() >= bootstrapDeadline || child.exitCode != null) throw new Error(`worker IPC bootstrap\n${logs.join('')}`);
-      child.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
+      if (process.env.BOTMUX_TEST_WORKER_BINARY) {
+        child.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
+      }
       await new Promise(resolveWait => setTimeout(resolveWait, 50));
     }
     child.send({
