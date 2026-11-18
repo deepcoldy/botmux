@@ -1512,9 +1512,9 @@ export class TmuxPipeBackend implements SessionBackend {
    *  the waits between them do not block the event loop. Once the watcher is
    *  stopped (kill/teardown) the remaining rounds run dry — no more tmux
    *  commands for a backend nobody watches. */
-  private async capturePaneDeathAsync(deathLine: string, epoch: number): Promise<void> {
+  private async capturePaneDeathAsync(deathLine: string, epoch: number, evidenceGeneration: number): Promise<void> {
     const readLine = async (): Promise<string> => {
-      if (this.lifecycleStale(epoch)) return '';
+      if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return '';
       const r = await runTmuxAsync(
         [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, PANE_DEATH_FORMAT],
         PANE_DEATH_PROBE_TIMEOUT_MS,
@@ -1522,10 +1522,14 @@ export class TmuxPipeBackend implements SessionBackend {
       return r.ok ? r.stdout.trim() : '';
     };
     const sleep = (ms: number) => new Promise<void>((resolve) => {
-      if (this.lifecycleStale(epoch)) resolve();
+      if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) resolve();
       else setTimeout(resolve, ms);
     });
-    this.latchObservedDeath(await resolvePaneDeathAsync(deathLine, readLine, sleep, undefined, readUnreapedPaneExit));
+    const verdict = await resolvePaneDeathAsync(deathLine, readLine, sleep, undefined, readUnreapedPaneExit);
+    // A newer synchronous exists both cleared the old death latch and advanced
+    // the generation. Do not let this older capture repopulate it afterwards.
+    if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return;
+    this.latchObservedDeath(verdict);
   }
 
   /**
@@ -1558,7 +1562,7 @@ export class TmuxPipeBackend implements SessionBackend {
       return true;
     }
     const verdict = classifyPaneProbeAnswer(answer);
-    if (verdict.state === 'exists') this.noteAuthoritativePaneExists();
+    if (verdict.state === 'exists') this.noteAuthoritativePaneExists(verdict.serverPid);
     if (verdict.state === 'missing' && verdict.deathLine !== undefined) {
       process.stderr.write(`[tmux-pipe-backend] refusing write: pane ${this.paneTarget} is dead (remain-on-exit remnant); reporting the CLI exit\n`);
       this.capturePaneDeathSync(verdict.deathLine);
@@ -1730,8 +1734,14 @@ export class TmuxPipeBackend implements SessionBackend {
    *  an async answer: its ordering against newer synchronous evidence is not
    *  authoritative. A live answer also proves the server reachable, so all
    *  destructive clocks/streaks restart from this newer observation. */
-  private noteAuthoritativePaneExists(): void {
+  private noteAuthoritativePaneExists(serverPid: number | undefined): void {
+    // A live pane only ever lives on the server that created it, so its server
+    // pid needs recording once. Do this before any older async answer can act.
+    if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = serverPid;
     this.livenessEvidenceGeneration += 1;
+    // A death observed by the invalidated chain belongs to the old lifecycle;
+    // its exit code must not win over the next real death's code.
+    this.observedDeathStatus = undefined;
     this.livenessGate.reset();
     this.probeSetbackStreak = 0;
     this.lastProbeState = 'exists';
@@ -1767,7 +1777,7 @@ export class TmuxPipeBackend implements SessionBackend {
       return;
     }
     const evidenceGeneration = this.livenessEvidenceGeneration;
-    const probe = await this.probePaneAddressabilityAsync(2000, epoch);
+    const probe = await this.probePaneAddressabilityAsync(2000, epoch, evidenceGeneration);
     if (this.lifecycleStale(epoch)) return;
     if (evidenceGeneration !== this.livenessEvidenceGeneration) {
       // A synchronous write-side probe saw the pane alive after this round
@@ -1871,13 +1881,10 @@ export class TmuxPipeBackend implements SessionBackend {
     }
     const verdict = classifyPaneProbeAnswer(raw);
     if (verdict.state === 'exists') {
-      // A live pane only ever lives on the server that created it, so its
-      // server pid (in the same answer) needs recording once.
-      if (this.lastLiveServerPid === undefined) this.lastLiveServerPid = verdict.serverPid;
       // This synchronous answer can arrive while an older async final missing
       // confirmation is awaiting its turn on the event loop. Make that older
       // destructive sequence stale before returning the live verdict.
-      this.noteAuthoritativePaneExists();
+      this.noteAuthoritativePaneExists(verdict.serverPid);
       return { state: 'exists' };
     }
     if (verdict.deathLine !== undefined) this.capturePaneDeathSync(verdict.deathLine);
@@ -1885,7 +1892,7 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   /** {@link probePaneAddressability} without blocking the event loop. */
-  private async probePaneAddressabilityAsync(timeoutMs: number, epoch: number): Promise<PaneProbeResult> {
+  private async probePaneAddressabilityAsync(timeoutMs: number, epoch: number, evidenceGeneration: number): Promise<PaneProbeResult> {
     const r = await runTmuxAsync(
       [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, PANE_PROBE_FORMAT],
       timeoutMs,
@@ -1893,10 +1900,16 @@ export class TmuxPipeBackend implements SessionBackend {
     if (!r.ok) return classifyPaneProbeFailure(r.error, `${this.tmuxCmd} display-message`);
     const verdict = classifyPaneProbeAnswer(r.stdout);
     if (verdict.state === 'exists') {
-      if (this.lastLiveServerPid === undefined && !this.exited) this.lastLiveServerPid = verdict.serverPid;
+      // Even a read-only side effect must not come from an answer older than a
+      // synchronous exists: this anchor drives server-replacement classification.
+      if (this.lastLiveServerPid === undefined && !this.lifecycleEvidenceStale(epoch, evidenceGeneration)) {
+        this.lastLiveServerPid = verdict.serverPid;
+      }
       return { state: 'exists' };
     }
-    if (verdict.deathLine !== undefined && !this.lifecycleStale(epoch)) await this.capturePaneDeathAsync(verdict.deathLine, epoch);
+    if (verdict.deathLine !== undefined && !this.lifecycleEvidenceStale(epoch, evidenceGeneration)) {
+      await this.capturePaneDeathAsync(verdict.deathLine, epoch, evidenceGeneration);
+    }
     return { state: 'missing', reason: verdict.reason };
   }
 
@@ -1960,7 +1973,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // Threshold reached — one final authoritative probe with a more lenient
     // timeout so a transiently overloaded tmux server gets a fair chance to
     // answer before we detach a pane that's actually still alive.
-    const confirm = await this.probePaneAddressabilityAsync(3000, epoch);
+    const confirm = await this.probePaneAddressabilityAsync(3000, epoch, evidenceGeneration);
     if (this.lifecycleEvidenceStale(epoch, evidenceGeneration)) return;
     if (confirm.state !== 'missing') {
       this.livenessGate.reset();

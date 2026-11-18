@@ -2008,6 +2008,16 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     expect(world.held).toHaveLength(1);
   }
 
+  async function advanceToDeathCode(
+    world: TmuxWorld,
+    exits: Array<[number | null, string | null]>,
+    code: number,
+  ): Promise<void> {
+    world.pane = { dead: String(code) };
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 12_000 + 100);
+    expect(exits).toEqual([[code, null]]);
+  }
+
   it.each(['write precheck', 'guardedSend follow-up probe'] as const)(
     'a newer exists from the %s invalidates an older in-flight final missing confirmation',
     async (evidencePath) => {
@@ -2077,6 +2087,111 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     world.pane = 'gone';
     await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 10);
     expect(exits).toEqual([]);
+  });
+
+  it('a newer exists drops the exit code latched by an invalidated death chain', async () => {
+    const world = createTmuxWorld({ pane: { dead: '77' } });
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await advanceThreeMissesToHeldFinal(world); // the old chain has latched 77
+
+    world.pane = 'alive';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    world.override = (args, via) => (via === 'async' && isLivenessRead(args) ? '::::111\n' : undefined);
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+
+    world.override = undefined;
+    await advanceToDeathCode(world, exits, 9);
+  });
+
+  it('a death-status capture from before a newer exists cannot relatch its old exit code', async () => {
+    const world = createTmuxWorld({ pane: { dead: '' } });
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    for (const deliver of world.held.splice(0)) deliver(); // main probe: dead, status not published
+    await vi.advanceTimersByTimeAsync(60); // cross the 50ms status poll sleep
+    expect(world.held).toHaveLength(1); // the PANE_DEATH_FORMAT re-read is held
+    expect(String(world.asyncCalls.at(-1)!.at(-1)).startsWith('#{pane_dead}')).toBe(true);
+
+    world.pane = 'alive';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    world.override = (args, via) => (
+      via === 'async' && String(args.at(-1)).startsWith('#{pane_dead}') ? '1:77:4242:111\n' : undefined
+    );
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver(); // late 77 belongs to the old chain
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+
+    world.override = undefined;
+    await advanceToDeathCode(world, exits, 9);
+  });
+
+  it.each([
+    ['222', false],
+    ['333', true],
+  ] as const)('a newer write-side exists anchors server 222 before an old async exists returns (answering at death=%s)', async (answeringServerPid, expectedReplacement) => {
+    const world = createTmuxWorld();
+    world.override = (args, via) => (
+      via === 'sync' && args.at(-1) === '#{pane_id} #{pid}' ? DEADLINE : undefined
+    );
+    const { be, exits } = watch(world); // attach-time server-pid anchor is unavailable
+    world.override = undefined;
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    expect(world.held).toHaveLength(1); // old async exists on server 111
+
+    let releaseOldExists = false;
+    world.override = (args, via) => (
+      releaseOldExists && via === 'async' && isLivenessRead(args) ? '%1:0::4242:111\n' : undefined
+    );
+    world.serverPid = '222';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    releaseOldExists = true;
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+
+    world.override = undefined;
+    world.serverPid = answeringServerPid;
+    await advanceToDeathCode(world, exits, 9);
+    expect(be.exitedBecauseServerReplaced()).toBe(expectedReplacement);
+  });
+
+  it('an old async exists cannot backfill its server pid after a newer write-side exists', async () => {
+    const world = createTmuxWorld();
+    world.override = (args, via) => (
+      via === 'sync' && args.at(-1) === '#{pane_id} #{pid}' ? DEADLINE : undefined
+    );
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    expect(world.held).toHaveLength(1); // old async exists on server 111
+
+    let releaseOldExists = false;
+    world.override = (args, via) => {
+      if (releaseOldExists && via === 'async' && isLivenessRead(args)) return '%1:0::4242:111\n';
+      // The newer sync exists carries no server pid, so the anchor stays empty;
+      // only the generation guard can prevent the older async 111 backfill.
+      if (via === 'sync' && isLivenessRead(args) && String(args.at(-1)).endsWith('#{pane_in_mode}')) {
+        return '%1:0::4242::0\n';
+      }
+      return undefined;
+    };
+    world.serverPid = '222';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    releaseOldExists = true;
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+
+    world.override = undefined;
+    await advanceToDeathCode(world, exits, 9);
+    expect(be.exitedBecauseServerReplaced()).toBe(false);
   });
 
   // A refusal storm is intermittent: some connects are refused, some answered.
