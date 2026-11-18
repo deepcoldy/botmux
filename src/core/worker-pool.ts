@@ -18085,8 +18085,9 @@ function forkWorkerPrepared(
       // A blank re-attach has no current request. Never borrow its previous
       // reply target, even if a persisted queued turn is being recovered.
       if (opts.memoryNoticeAudience === 'owner-only') return;
-      const blockedTurnId = initTurnId;
-      if (blockedTurnId === undefined && !opts.onAdmissionBlocked) return;
+      // A missing turn id does not prove a background fork: voice-card actions
+      // and terminal/dashboard wakes rely on the session's current reply target.
+      const blockedTurnId = fallbackTurnId(ds, initTurnId);
       const retry = tr('worker.memory_admission_unavailable', undefined, botLocale(botCfg));
       if (opts.onAdmissionBlocked) {
         opts.onAdmissionBlocked({

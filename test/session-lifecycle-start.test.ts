@@ -2046,7 +2046,7 @@ describe('host memory pressure worker admission', () => {
     expect(admissions).toEqual(['rejected']);
   });
 
-  it('does not borrow an old reply target for an unattributed blank fork', () => {
+  it('does not borrow an old reply target for an owner-only blank fork', () => {
     const sessionReply = vi.fn(async () => 'om_pressure');
     const onMemoryAdmissionBlocked = vi.fn();
     initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
@@ -2055,9 +2055,43 @@ describe('host memory pressure worker admission', () => {
       pressure: { warnings: [] }, policy: {} } as any);
     const ds = makeDs({ hasHistory: true });
     ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
-    forkWorker(ds, '', true);
+    forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
     expect(onMemoryAdmissionBlocked).toHaveBeenCalledTimes(1);
     expect(sessionReply).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('reports a rejected voice-shaped request through the current reply target', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    const onMemoryAdmissionBlocked = vi.fn();
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
+    forkWorker(ds, 'voice summary request', true);
+    expect(onMemoryAdmissionBlocked).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root', expect.any(String), 'text', 'app_test', 'om_old',
+      { sourceSessionId: 'sid-start-test' },
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('reports a rejected blank user wake through the current reply target', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
+    forkWorker(ds, '', true);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root', expect.any(String), 'text', 'app_test', 'om_old',
+      { sourceSessionId: 'sid-start-test' },
+    );
     expect(forkMock).not.toHaveBeenCalled();
   });
 
