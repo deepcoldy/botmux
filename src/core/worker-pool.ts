@@ -279,7 +279,7 @@ import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, onFinalOutputDeliverySettled, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
-import { isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
+import { holdLastTurnThroughExcludedTerminal, isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
 import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
 import { FinalOutputHandoffStore, type StoredFinalOutput } from '../services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError, type FinalOutputDeliveryControl } from '../services/final-output-handoff-host.js';
@@ -22043,6 +22043,9 @@ function setupWorkerHandlers(
                 // Leaving working clears the previous turn's activity; entering it
                 // carries the new turn's (null survives JSON, undefined would not).
                 executionActivity: dashboardRow.executionActivity ?? null,
+                // Live background work is also a kanban keep-on-board fact.
+                // Null clears an earlier count when the worker stops reporting it.
+                backgroundTaskCount: ds.backgroundTaskCount ?? null,
               },
             },
           });
@@ -22078,6 +22081,17 @@ function setupWorkerHandlers(
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
           }
+        // Background work can start or finish while the coarse status stays
+        // idle/working. Publish only that fact here; usage, reactions and the
+        // other side effects above remain exclusive to real status edges.
+        } else if (prevBackgroundTaskCount !== ds.backgroundTaskCount) {
+          dashboardEventBus.publish({
+            type: 'session.update',
+            body: {
+              sessionId: ds.session.sessionId,
+              patch: { backgroundTaskCount: ds.backgroundTaskCount ?? null },
+            },
+          });
         }
 
         // A hidden run retains its identity after the worker retires its capture
@@ -23956,6 +23970,12 @@ function setupWorkerHandlers(
         }
         // Read before the code below settles the auto-compact and HTTP-wait markers.
         const outcomeExcluded = isTurnOutcomeExcluded(ds, msg.turnId);
+        // Excluded rounds deliberately keep the previous visible turn result.
+        // Once such a round ends, close only its own activity window. The helper
+        // reads the turn's exact ledger timestamp, never the session-global
+        // lastMessageAt, so a newer human round stays pending even when its
+        // activity was published before currentTurnId changed.
+        if (outcomeExcluded) holdLastTurnThroughExcludedTerminal(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
           if (noteIdleAutoCompactRefused(ds, msg.turnId)) {

@@ -902,7 +902,7 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; createdAt?: number }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads

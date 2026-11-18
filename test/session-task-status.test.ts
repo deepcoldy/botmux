@@ -288,6 +288,30 @@ describe('idle sessions do not imply pending work', () => {
     expect(isOffBoardIdle({ status: 'idle', lastTurn: { turnId: 'silent', outcome: 'no_output', at: T0 } })).toBe(true);
     expect(deriveSessionTaskStatus({ status: 'idle' }).kind).toBe('idle');
   });
+  it('keeps a newer input on-board until its own outcome arrives', () => {
+    const settled = { status: 'idle', lastTurn: delivered(T0), lastMessageAt: T0 };
+    expect(isOffBoardIdle(settled)).toBe(false);
+    const pending = { ...settled, lastMessageAt: T0 + 1 };
+    expect(deriveSessionTaskStatus(pending).kind).toBe('idle');
+    expect(isOffBoardIdle(pending)).toBe(false);
+    expect(isOffBoardIdle({
+      ...pending,
+      lastTurn: { turnId: 't2', outcome: 'no_output', at: T0 + 2 },
+    })).toBe(true);
+  });
+  it('does not turn legacy rows or held-through maintenance into pending input', () => {
+    expect(isOffBoardIdle({ status: 'idle', lastMessageAt: T0 + 1 })).toBe(true);
+    expect(isOffBoardIdle({
+      status: 'idle',
+      lastMessageAt: T0 + 5,
+      lastTurn: { turnId: 'silent', outcome: 'no_output', at: T0, heldThrough: T0 + 5 },
+    })).toBe(true);
+  });
+  it('keeps live background work on-board even after a no-output round', () => {
+    const lastTurn = { turnId: 'silent', outcome: 'no_output', at: T0 };
+    expect(isOffBoardIdle({ status: 'idle', lastTurn, backgroundTaskCount: 1 })).toBe(false);
+    expect(isOffBoardIdle({ status: 'idle', lastTurn, backgroundTaskCount: 0 })).toBe(true);
+  });
   it('keeps unfinished work, explicit placement, queued input, results and blockers', () => {
     for (const facts of [
       { openTodos: { remaining: 1 } }, { kanbanColumn: 'todo' }, { queued: true },

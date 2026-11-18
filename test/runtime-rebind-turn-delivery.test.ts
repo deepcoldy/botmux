@@ -54,8 +54,10 @@ afterEach(() => {
 
 async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean } = {}) {
   const sessionReply = vi.fn(async () => 'om_reply');
+  const screenStatuses: Array<{ prevStatus?: string; status: string; turnId?: string }> = [];
   workerPool.initWorkerPool({
     sessionReply, getSessionWorkingDir: () => dir, getActiveCount: () => 1, closeSession: vi.fn(),
+    onScreenStatus: (_ds: DaemonSession, context: { prevStatus?: string; status: string; turnId?: string }) => { screenStatuses.push(context); },
   } as any);
   const worker = new EventEmitter() as any;
   worker.killed = false; worker.connected = true; worker.pid = process.pid;
@@ -211,7 +213,7 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
     await observer({ type: 'prompt_ready' });
   };
   const replies = () => sessionReply.mock.calls.map(([, content]) => String(content));
-  return { controller, ds, ws, scope, binding, bridge, toWorker, workerLog, replies, spawnCli,
+  return { controller, ds, ws, scope, binding, bridge, toWorker, workerLog, replies, screenStatuses, spawnCli,
     writeOpeningTurn: () => scope.run(binding, async () => { const c = writeTurn(TURNS[0]); await drain(); return c; }, openingExecution),
     deliver, answer,
     // The relay timer rewires the ownership PID and re-attests it at once; the
@@ -245,6 +247,22 @@ describe('turns around a semantic runtime rebind', () => {
     await s.bridge({ type: 'screen_update', content: 'prompt', status: 'idle', turnId: undefined });
     expect(s.ds.lastScreenStatus).toBe('idle');
     await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[1])));
+  });
+
+  it('preserves display attribution for a turn that started before the semantic rebind', async () => {
+    const s = await startWorker();
+    const capability = await s.writeOpeningTurn();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+
+    await s.bridge({ type: 'screen_update', content: 'running', status: 'working', turnId: TURNS[0] });
+    expect(s.ds.lastScreenStatus).toBe('working');
+    expect(s.screenStatuses.at(-1)).toMatchObject({ status: 'working', turnId: TURNS[0] });
+
+    await s.answer(TURNS[0], capability);
+    await s.bridge({ type: 'screen_update', content: 'prompt', status: 'idle', turnId: TURNS[0] });
+    expect(s.screenStatuses.at(-1)).toMatchObject({ status: 'idle', turnId: TURNS[0] });
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
   });
 
   it('delivers both turns of a cold resume whose relay resolves the real CLI mid-turn', async () => {
