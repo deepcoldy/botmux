@@ -371,19 +371,13 @@ const foundWrap = (found: string | null | undefined, v: (p: string) => string): 
 function resolveSessionScratchState(
   sessionId: string,
 ): { scratch: false; mappings?: undefined } | { scratch: true; mappings: ScratchPathMapping[] | undefined } {
-  let persisted: ScratchPathMapping[] | undefined;
-  try {
-    persisted = persistedScratchMappings(config.session.dataDir, sessionId);
-  } catch {
-    persisted = undefined;
-  }
   let session;
   try { session = getSession(sessionId); } catch { session = undefined; }
+  const readPersisted = (): ScratchPathMapping[] | undefined => {
+    try { return persistedScratchMappings(config.session.dataDir, sessionId); } catch { return undefined; }
+  };
   if (session?.sandbox === 'scratch') {
-    return { scratch: true, mappings: persisted };
-  }
-  if (persisted && persisted.length > 0) {
-    return { scratch: true, mappings: persisted };
+    return { scratch: true, mappings: readPersisted() };
   }
   if (session && session.backendType !== 'riff' && session.backendType !== 'remote-runner') {
     try {
@@ -392,11 +386,24 @@ function resolveSessionScratchState(
         envValue: process.env.BOTMUX_SANDBOX,
       });
       if (effectiveMode === 'scratch') {
-        return { scratch: true, mappings: undefined };
+        return { scratch: true, mappings: readPersisted() };
       }
     } catch {
       // Invalid BOTMUX_SANDBOX → fail closed rather than exposing host transcripts.
       return { scratch: true, mappings: undefined };
+    }
+  }
+  if (
+    !session
+    && config.session.dataDir
+    && /^[A-Za-z0-9._-]+$/.test(sessionId)
+    && sessionId !== '.'
+    && sessionId !== '..'
+    && existsSync(join(config.session.dataDir, 'sandboxes', sessionId, 'scratch.json'))
+  ) {
+    const persisted = readPersisted();
+    if (persisted && persisted.length > 0) {
+      return { scratch: true, mappings: persisted };
     }
   }
   return { scratch: false };

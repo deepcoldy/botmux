@@ -497,7 +497,7 @@ function defaultClassifyProvisionalFromSiblingConvDb(
     return 'confirm';
   }
   const db = openDatabaseSyncNow(convDbPath, { readOnly: true });
-  if (!db) return 'discard_aborted';
+  if (!db) return 'confirm';
   try {
     try { db.exec('PRAGMA busy_timeout = 2000;'); } catch { /* ignore */ }
     const rows = db.prepare('SELECT data FROM executor_metadata ORDER BY idx ASC').all() as Array<{ data?: unknown }>;
@@ -507,17 +507,17 @@ function defaultClassifyProvisionalFromSiblingConvDb(
         : row?.data instanceof Uint8Array
           ? row.data
           : null;
-      if (!bytes) return 'discard_aborted';
+      if (!bytes) continue;
       const parsed = parseExecRunBlob(bytes);
-      if (!parsed) return 'discard_aborted';
+      if (!parsed) continue;
       if (parsed.lastStepIdx >= candidateStepIndex) {
         if (parsed.proceededWithAutoContinue) return 'discard_aborted';
         return COMPLETION_EXEC_REASONS.has(parsed.terminationReason) ? 'confirm' : 'discard_aborted';
       }
     }
-    return 'discard_aborted';
+    return 'confirm';
   } catch {
-    return 'discard_aborted';
+    return 'confirm';
   } finally {
     try { db.close(); } catch { /* ignore */ }
   }

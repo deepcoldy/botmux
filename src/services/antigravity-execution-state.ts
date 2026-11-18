@@ -31,7 +31,7 @@
  * Every missing file, unreadable/locked DB, unknown enum, or lagging `step_count`
  * fails closed (`hold` / `false`).
  */
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
@@ -41,6 +41,28 @@ import {
   readLatestAntigravityTranscriptStepIndex,
 } from './antigravity-transcript.js';
 import { openDatabaseSyncNow, type DatabaseSyncLike } from './sqlite-compat.js';
+
+const SQLITE_HEADER_MAGIC = 'SQLite format 3\0';
+
+/** True only when `filePath` is an existing regular file with SQLite's 16-byte magic header
+ *  (excludes 0-byte fd placeholders or non-SQLite sentinel files). */
+export function isAntigravitySqliteDbFile(filePath: string): boolean {
+  if (!existsSync(filePath)) return false;
+  try {
+    const fd = openSync(filePath, 'r');
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size < 16) return false;
+      const header = Buffer.alloc(16);
+      if (readSync(fd, header, 0, 16, 0) !== 16) return false;
+      return header.toString('latin1') === SQLITE_HEADER_MAGIC;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
 
 function openReadOnlyAntigravityDb(dbPath: string): DatabaseSyncLike | null {
   const db = openDatabaseSyncNow(dbPath, { readOnly: true });
@@ -357,10 +379,10 @@ export function classifyAntigravityProvisionalBeforeNextTurn(
   }
   const geminiCliDir = opts?.geminiCliDir ?? join(homedir(), '.gemini', 'antigravity-cli');
   const convDbPath = join(geminiCliDir, 'conversations', `${conversationId}.db`);
-  if (!existsSync(convDbPath)) return 'confirm';
+  if (!isAntigravitySqliteDbFile(convDbPath)) return 'confirm';
 
   const convDb = openReadOnlyAntigravityDb(convDbPath);
-  if (!convDb) return 'discard_aborted';
+  if (!convDb) return 'confirm';
   try {
     const execRows = convDb.prepare('SELECT idx, data FROM executor_metadata ORDER BY idx ASC').all() as Array<{
       idx?: unknown;
@@ -368,18 +390,18 @@ export function classifyAntigravityProvisionalBeforeNextTurn(
     }>;
     for (const row of execRows) {
       const execBytes = toBytes(row?.data);
-      if (!execBytes) return 'discard_aborted';
+      if (!execBytes) continue;
       const parsed = parseExecutorMetadataBlob(execBytes);
-      if (!parsed) return 'discard_aborted';
+      if (!parsed) continue;
       if (parsed.lastStepIdx >= candidateStepIndex) {
         if (parsed.proceededWithAutoContinue) return 'discard_aborted';
         if (COMPLETION_TERMINATION_REASONS.has(parsed.terminationReason)) return 'confirm';
         return 'discard_aborted';
       }
     }
-    return 'discard_aborted';
+    return 'confirm';
   } catch {
-    return 'discard_aborted';
+    return 'confirm';
   } finally {
     try { convDb.close(); } catch { /* ignore */ }
   }
@@ -471,8 +493,8 @@ export function drainAntigravityForRestartScan(
     : (opts?.geminiCliDir ?? join(homedir(), '.gemini', 'antigravity-cli'));
   const hasExecutionStore = resolvedCliDir === null || Boolean(
     cid && (
-      existsSync(join(resolvedCliDir, 'conversations', `${cid}.db`))
-      || existsSync(join(resolvedCliDir, 'conversation_summaries.db'))
+      isAntigravitySqliteDbFile(join(resolvedCliDir, 'conversations', `${cid}.db`))
+      || isAntigravitySqliteDbFile(join(resolvedCliDir, 'conversation_summaries.db'))
     ),
   );
   const snap = readAntigravityExecutionSnapshot(cid, { geminiCliDir: opts.geminiCliDir });

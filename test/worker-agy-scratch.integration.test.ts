@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -15,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { probeScratchCapability } from '../src/adapters/backend/scratch-capability.js';
+import { prepareScratchSandboxDetailed, teardownScratchSession } from '../src/adapters/backend/scratch-sandbox.js';
 import { preferredManagedTmuxSocket } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -22,8 +24,56 @@ import { killProcessTree } from './helpers/process-tree.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { resolveNodeExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
 
-const scratchCap = probeScratchCapability();
-const scratchAvailable = scratchCap.summary !== 'none';
+function makeScratchTestRoot(prefix: string): string {
+  // On Linux, scratch masks `/tmp` and `/var/tmp` with container-private tmpfs,
+  // so test workspaces/HOMEs must reside outside `/tmp` and `/var/tmp`.
+  // On macOS, `/tmp` keeps Unix domain socket paths under the 104-byte limit.
+  const parent = process.platform === 'linux' ? resolve('.') : '/tmp';
+  const safePrefix = process.platform === 'linux' ? `.${prefix}` : prefix;
+  return realpathSync(mkdtempSync(join(parent, safePrefix)));
+}
+
+function probeScratchMountUsable(): boolean {
+  const cap = probeScratchCapability();
+  if (cap.summary === 'none') return false;
+  if (process.platform === 'darwin') return true;
+  if (process.platform !== 'linux') return false;
+  // Unprivileged Linux CI runners (e.g. GitHub Actions) may have `bwrap` +
+  // `fuse-overlayfs` installed while `/` contains unreadable root-only mounts
+  // (`/boot/efi`), causing full-root `lowerdir=/` mounts to fail closed.
+  let probeRoot: string | undefined;
+  try {
+    probeRoot = makeScratchTestRoot('bmx-scr-probe-');
+    const work = join(probeRoot, 'work');
+    const home = join(probeRoot, 'home');
+    const dataDir = join(probeRoot, 'data');
+    mkdirSync(work, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const res = prepareScratchSandboxDetailed({
+      sessionId: 'scr-cap-probe',
+      dataDir,
+      storage: 'disk',
+      chdir: work,
+      home,
+      cliBin: '/bin/true',
+      cliArgs: [],
+    });
+    if (res.ok) {
+      teardownScratchSession('scr-cap-probe', dataDir);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (probeRoot) {
+      try { rmSync(probeRoot, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
+}
+
+const scratchAvailable = probeScratchMountUsable();
 const tmuxAvailable = probeTmuxFunctional().ok;
 
 const roots = new Set<string>();
@@ -63,6 +113,14 @@ afterEach(async () => {
   }
   tmuxCleanupDirs.clear();
   for (const dir of roots) {
+    if (process.platform === 'linux') {
+      const sbDir = join(dir, 'botmux-data', 'sandboxes');
+      if (existsSync(sbDir)) {
+        for (const sid of readdirSync(sbDir)) {
+          try { teardownScratchSession(sid, join(dir, 'botmux-data')); } catch { /* ignore */ }
+        }
+      }
+    }
     try { execFileSync('/bin/chmod', ['-R', 'u+w', dir], { stdio: 'ignore' }); } catch { /* ignore */ }
     rmSync(dir, { recursive: true, force: true });
   }
@@ -215,7 +273,7 @@ setInterval(() => {}, 1_000);
 
 describe.skipIf(!scratchAvailable)('worker Antigravity + scratch zero-injection integration', () => {
   it('delivers multi-turn replies + CoT on PTY scratch with symlinked HOME without touching host ~/.gemini (even when absent)', async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'bmx-agy-scr-pty-')));
+    const root = makeScratchTestRoot('bmx-agy-scr-pty-');
     roots.add(root);
     const realHome = join(root, 'data00', 'home', 'devuser');
     const symlinkParent = join(root, 'home');
@@ -300,7 +358,7 @@ describe.skipIf(!scratchAvailable)('worker Antigravity + scratch zero-injection 
 
   it.skipIf(!tmuxAvailable)('isolates concurrent tmux + scratch sessions in the same workingDir, supports warm reattach + cold suspend/resume, and leaves pre-existing host ~/.gemini untouched', async () => {
     // Keep path short so macOS 104-byte sockaddr_un limit accommodates tmux's probe socket.
-    const root = realpathSync(mkdtempSync('/tmp/bmx-scrt-'));
+    const root = makeScratchTestRoot('bmx-scrt-');
     roots.add(root);
     tmuxCleanupDirs.add(root);
     const hostHome = join(root, 'host-home');
@@ -443,7 +501,7 @@ describe.skipIf(!scratchAvailable)('worker Antigravity + scratch zero-injection 
   }, 60_000);
 
   it('rewrites --log-file and trustedWorkspaces into the isolated view when wrapperCli wraps Antigravity under scratch', async () => {
-    const root = realpathSync(mkdtempSync('/tmp/bmx-scrw-'));
+    const root = makeScratchTestRoot('bmx-scrw-');
     roots.add(root);
     const hostHome = join(root, 'host-home');
     const dataDir = join(root, 'botmux-data');

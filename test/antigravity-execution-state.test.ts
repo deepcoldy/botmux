@@ -304,5 +304,23 @@ describe('antigravity execution state & non-screen zmx turn verdicts', () => {
     // 2. Transcript lagging behind a completed SQLite step (`minStepIndex: 3 < lastStepIdx: 4`) stays NOT idle!
     expect(isAntigravityExecutionIdleAtOrAfterStep(cid, 3, { geminiCliDir })).toBe(false);
     expect(isAntigravityExecutionIdleAtOrAfterStep(cid, 4, { geminiCliDir })).toBe(true);
+
+    // 3. A 0-byte `<cid>.db` fd placeholder (e.g. native `/fork` before SQLite writes) does NOT
+    //    discard a completed turn on the next `USER_INPUT` or mark restart scan as `turnOpen: true`.
+    const placeholderCid = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    mkdirSync(join(geminiCliDir, 'conversations'), { recursive: true });
+    writeFileSync(join(geminiCliDir, 'conversations', `${placeholderCid}.db`), '');
+    const placeholderTranscript = join(geminiCliDir, 'brain', placeholderCid, '.system_generated', 'logs', 'transcript_full.jsonl');
+    mkdirSync(join(placeholderTranscript, '..'), { recursive: true });
+    writeFileSync(placeholderTranscript, [
+      { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: new Date(fakeNow).toISOString(), content: '<USER_REQUEST>\nCHILD_FIRST\n</USER_REQUEST>' },
+      { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date(fakeNow + 10).toISOString(), content: 'CHILD_REPLY_1' },
+      { step_index: 2, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: new Date(fakeNow + 20).toISOString(), content: '<USER_REQUEST>\nCHILD_QUEUED\n</USER_REQUEST>' },
+      { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: new Date(fakeNow + 30).toISOString(), content: 'CHILD_REPLY_2' },
+    ].map(r => JSON.stringify(r) + '\n').join(''));
+    const forkDrain = drainAntigravityTranscript(placeholderTranscript, 0, {}, { flushTrailingFinal: true });
+    expect(forkDrain.events.filter(e => e.kind === 'assistant_final').map(e => e.text)).toEqual(['CHILD_REPLY_1', 'CHILD_REPLY_2']);
+    rmSync(join(geminiCliDir, 'conversation_summaries.db'), { force: true });
+    expect(structuredTurnOpen(drainAntigravityForRestartScan(placeholderTranscript, 0, { geminiCliDir, beforeMs: fakeNow + 100 }).events, fakeNow + 100)).toBe(false);
   });
 });

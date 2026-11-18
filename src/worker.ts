@@ -480,6 +480,7 @@ import {
   drainAntigravityForRestartScan,
   evaluateAntigravityProvisionalFinalVerdict,
   isAntigravityExecutionIdleAtOrAfterStep,
+  isAntigravitySqliteDbFile,
   readAntigravityExecutionSnapshot,
 } from './services/antigravity-execution-state.js';
 import {
@@ -6062,7 +6063,11 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       onAccepted: () => {
         revokePromptReadiness();
         idleDetector?.reset({ inputCycle: true });
-        if (!backendScreenEvidenceIsAuthoritativeForMutation() && structuredBridgeIs('antigravity')) {
+        if (typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function'
+          && !backendScreenEvidenceIsAuthoritativeForMutation()
+          && typeof structuredBridgeIs === 'function'
+          && structuredBridgeIs('antigravity')
+          && typeof scheduleBusyPatternIdleProbe === 'function') {
           scheduleBusyPatternIdleProbe('passthrough slash command');
         }
         log(`Passthrough slash command: ${msg.content}`);
@@ -9572,9 +9577,13 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
       // for precisely these read-only rescans.
       const { events } = lastInitConfig?.cliId === 'traex'
         ? drainTraexRollout(path, from, { adoptMode: false, probe: true, includeHistoryCot: true })
-        : structuredBridgeIs('antigravity')
+        : (typeof structuredBridgeIs === 'function'
+          && structuredBridgeIs('antigravity')
+          && typeof drainAntigravityForRestartScan === 'function')
           ? drainAntigravityForRestartScan(path, from, {
-              geminiCliDir: resolveActiveAntigravityCliDir(),
+              geminiCliDir: typeof resolveActiveAntigravityCliDir === 'function'
+                ? resolveActiveAntigravityCliDir()
+                : undefined,
               beforeMs,
             })
           : spec.drain(path, from, { adoptMode: false, state: undefined });
@@ -13390,7 +13399,12 @@ function codexBridgeStartTimer(): void {
             codexAdoptPendingPid = undefined;
             if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
               try {
-                flushOrRetireAntigravityBeforeRotation();
+                if (typeof flushOrRetireAntigravityBeforeRotation === 'function') {
+                  flushOrRetireAntigravityBeforeRotation();
+                } else {
+                  codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+                  emitReadyCodexTurns();
+                }
               } catch (err: any) {
                 log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
               }
@@ -13412,7 +13426,9 @@ function codexBridgeStartTimer(): void {
         maybeUpgradeAntigravityBridgeToFull();
         codexBridgeIngest();
         maybeFlushAntigravityTrailingFinalOnQuietTick();
-        maybeSettleAntigravityAbortedTurnOnNonScreenBackend();
+        if (typeof maybeSettleAntigravityAbortedTurnOnNonScreenBackend === 'function') {
+          maybeSettleAntigravityAbortedTurnOnNonScreenBackend();
+        }
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -14646,7 +14662,12 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         // existing bytes are ingested from byte 0.
         if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
           try {
-            flushOrRetireAntigravityBeforeRotation();
+            if (typeof flushOrRetireAntigravityBeforeRotation === 'function') {
+              flushOrRetireAntigravityBeforeRotation();
+            } else {
+              codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+              emitReadyCodexTurns();
+            }
           } catch (err: any) {
             log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
           }
@@ -15159,7 +15180,7 @@ function flushOrRetireAntigravityBeforeRotation(): void {
   if (state.provisionalFinal && !state.hasPendingTask) {
     const boundCid = conversationIdFromAntigravityTranscriptPath(codexBridgeRolloutPath ?? undefined) ?? undefined;
     const cliDir = resolveActiveAntigravityCliDir();
-    const hasConvDb = cliDir === null || Boolean(boundCid && existsSync(join(cliDir, 'conversations', `${boundCid}.db`)));
+    const hasConvDb = cliDir === null || Boolean(boundCid && isAntigravitySqliteDbFile(join(cliDir, 'conversations', `${boundCid}.db`)));
     if (!backendScreenEvidenceIsAuthoritativeForMutation() || hasConvDb) {
       const verdict = evaluateAntigravityProvisionalFinalVerdict(boundCid, state.provisionalFinalStepIndex, {
         geminiCliDir: cliDir,
@@ -18039,7 +18060,10 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (criticalInterrupt && requestedKey === 'ctrlc') {
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
     if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
-    if (!isPromptReady && structuredBridgeIs('antigravity') && !backendScreenEvidenceIsAuthoritativeForMutation()) {
+    if (typeof isPromptReady !== 'undefined' && !isPromptReady
+      && typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
+      && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function' && !backendScreenEvidenceIsAuthoritativeForMutation()
+      && typeof scheduleBusyPatternIdleProbe === 'function') {
       scheduleBusyPatternIdleProbe('Antigravity term_action interrupt');
     }
   }
@@ -18137,7 +18161,10 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
       tuiPromptBlocking = false;
       void flushPending();
     }
-    if (!isPromptReady && structuredBridgeIs('antigravity') && !backendScreenEvidenceIsAuthoritativeForMutation()) {
+    if (typeof isPromptReady !== 'undefined' && !isPromptReady
+      && typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
+      && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function' && !backendScreenEvidenceIsAuthoritativeForMutation()
+      && typeof scheduleBusyPatternIdleProbe === 'function') {
       scheduleBusyPatternIdleProbe('Antigravity exact interrupt');
     }
     log(`Exact interrupt delivered for turn ${turnId.substring(0, 8)}`);
