@@ -51,7 +51,29 @@ export type LaunchModelBotConfig = {
 export type SessionLaunchModelChoice = {
   model?: string;
   traexAutoModel?: TraexAutoModelConfig;
+  /** A durable pool state that forbids launching any out-of-pool default. */
+  blocked?: 'catalog_empty';
 };
+
+export class SessionLaunchModelBlockedError extends Error {
+  readonly blocked = 'catalog_empty' as const;
+  constructor() {
+    super('catalog_empty');
+    this.name = 'SessionLaunchModelBlockedError';
+  }
+}
+
+export function isSessionLaunchModelBlockedError(error: unknown): error is SessionLaunchModelBlockedError {
+  return error instanceof SessionLaunchModelBlockedError
+    || (error instanceof Error && (error as SessionLaunchModelBlockedError).blocked === 'catalog_empty');
+}
+
+/** Launch callers must opt into the blocked state explicitly instead of
+ * interpreting an empty pool as an absent model/policy. */
+export function assertSessionLaunchModelChoiceAllowed(choice: SessionLaunchModelChoice): SessionLaunchModelChoice {
+  if (choice.blocked) throw new SessionLaunchModelBlockedError();
+  return choice;
+}
 
 /**
  * Resolve both the concrete launch model and the optional virtual-auto policy.
@@ -95,7 +117,8 @@ export function resolveSessionLaunchModelChoice(
     return { model: logicalModel };
   }
   const auto = botCfg?.traexAutoModel;
-  if (!auto?.enabled || auto.models.length === 0) return {};
+  if (!auto?.enabled) return {};
+  if (auto.models.length === 0) return { traexAutoModel: auto, blocked: 'catalog_empty' };
   const runtime = ds.session.traexAutoModelRuntime;
   return {
     model: validTraexAutoModelRuntime(auto, runtime, ds.session.cliSessionId) ? runtime.model : auto.models[0],

@@ -147,6 +147,8 @@ export interface SessionRow extends SessionMessagePreview {
   agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
   /** 最近一轮的结果（core/session-task-status.ts）。缺失 = 读不到，前端归空闲。 */
   lastTurn?: SessionLastTurn;
+  /** Main turn ended but this many background tasks are still running (live rows only). */
+  backgroundTaskCount?: number;
   /** 当前忙碌段的起点（进入 starting/working/analyzing 的边沿），只在活跃会话上有。 */
   busySinceAt?: number;
   /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
@@ -457,6 +459,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
         }
       : undefined,
     ...(ds.session.lastTurn ? { lastTurn: ds.session.lastTurn } : {}),
+    ...(ds.backgroundTaskCount !== undefined ? { backgroundTaskCount: ds.backgroundTaskCount } : {}),
     ...(ds.busySinceAt !== undefined ? { busySinceAt: ds.busySinceAt } : {}),
     ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),

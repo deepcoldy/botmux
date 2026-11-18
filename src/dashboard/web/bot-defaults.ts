@@ -236,7 +236,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionRuntimeEnv',
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
-  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval', 'botDefaults.ownerReminderQuietHours', 'botDefaults.ownerReminderQuietHoursStart', 'botDefaults.ownerReminderQuietHoursEnd'] },
   { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
@@ -564,12 +564,7 @@ export type BotDefaultsRow = {
   dormantSessionCount?: number;
   /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
   longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
-  sessionOwnerReminder?: {
-    enabled: boolean;
-    intervalMinutes: number;
-    text: string;
-    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
-  } | null;
+  sessionOwnerReminder?: import('../../core/session-owner-reminder.js').SessionOwnerReminderConfig | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   defaultPassthroughCommands?: string[];

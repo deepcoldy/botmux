@@ -2964,6 +2964,9 @@ const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9
 export class CodexAppControlFinalAssembler {
   private active: CodexAppFinalAssemblyState | undefined;
 
+  constructor(private readonly maxBytes = CODEX_APP_CONTROL_FINAL_MAX_BYTES,
+    private readonly chunkBytes = CODEX_APP_CONTROL_FINAL_CHUNK_BYTES) {}
+
   accept(kind: string, payload: Record<string, unknown>): CodexAppFinalAssemblyResult {
     const isTransactionKind = kind === 'final-start' || kind === 'final-chunk' || kind === 'final-end';
     if (!isTransactionKind) {
@@ -3002,15 +3005,16 @@ export class CodexAppControlFinalAssembler {
         ? payload.index
         : -1;
       if (index !== assembly.chunks.length || index >= assembly.total
-          || typeof payload.data !== 'string' || !STRICT_BASE64_RE.test(payload.data)) {
+          || typeof payload.data !== 'string' || payload.data.length > 4 * Math.ceil(this.chunkBytes / 3)
+          || !STRICT_BASE64_RE.test(payload.data)) {
         return this.reject('invalid, duplicate, or out-of-order final chunk');
       }
       const chunk = Buffer.from(payload.data, 'base64');
-      if (chunk.length === 0 || chunk.length > CODEX_APP_CONTROL_FINAL_CHUNK_BYTES) {
+      if (chunk.length === 0 || chunk.length > this.chunkBytes) {
         return this.reject('final chunk size is invalid');
       }
       assembly.bytes += chunk.length;
-      if (assembly.bytes > CODEX_APP_CONTROL_FINAL_MAX_BYTES) {
+      if (assembly.bytes > this.maxBytes) {
         return this.reject('final transaction exceeds the byte limit');
       }
       assembly.chunks.push(chunk);

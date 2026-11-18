@@ -1,4 +1,5 @@
 import type { OncallForwardMode } from './oncall-group-policy.js';
+import type { OncallGroupCreation } from './oncall-group-client.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -36,6 +37,8 @@ export interface OncallGroupRequest {
   forwardMode?: OncallForwardMode;
   forwardedMessageIds?: Record<string, string>;
   attemptId?: string;
+  creation?: OncallGroupCreation;
+  formClosePending?: boolean;
   messageIdsSnapshot?: string[];
   forwarding?: { messageId: string; messageIds?: string[]; startedAtMs: number };
   forwardingBlocked?: boolean;
@@ -174,10 +177,13 @@ export class OncallGroupStore {
     return [...sources].filter(([key, source]) => {
       const request = read<OncallGroupRequest>(key)
         ?? ([...legacyFiles.get(key) ?? []].some(file => requests.has(file)) ? this.legacyRequest(source) : undefined);
+      if (request?.creation && request.attemptId && ['pending', 'unknown'].includes(request.status)) {
+        return Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000;
+      }
       return request?.status === 'succeeded'
         && (((!request.inviteLink || request.cardRefreshPending) && !!request.openChatId)
           || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
-            && (!!request.cardRefreshPending || oncallForwardingPending(request))));
+            && (!!request.formClosePending || !!request.cardRefreshPending || oncallForwardingPending(request))));
     }).map(([, source]) => source);
   }
 
@@ -315,16 +321,37 @@ export class OncallGroupStore {
       conversationScopePending: chosen.status === 'succeeded' && forwardMode !== 'none' };
   }
 
-  claim(source: OncallGroupSource, operatorOpenId?: string, snapshot?: { messageIds: string[]; cutoffMs: number; forwardMode?: OncallForwardMode }): boolean {
+  claim(source: OncallGroupSource, operatorOpenId?: string, snapshot?: { messageIds: string[]; cutoffMs: number; forwardMode?: OncallForwardMode },
+    creation?: OncallGroupCreation): boolean {
     const file = this.requestPath(source);
     mkdirSync(join(this.dataDir, 'oncall-groups', source.sessionId ? 'session-requests' : 'requests'), { recursive: true, mode: 0o700 });
     return withFileLockSync(file, () => {
       const previous = read<OncallGroupRequest>(file) ?? this.legacyRequest(source);
       // A crashed or timed-out request may already have created a group.
       if (previous && previous.status !== 'failed') return false;
-      this.write(file, { status: 'pending', questionId: source.questionId, sourceMessageId: source.messageId, ...(source.sessionId ? {
-        attemptId: randomUUID(), submittedAtMs: snapshot?.cutoffMs ?? Date.now(), messageIdsSnapshot: snapshot?.forwardMode === 'none' ? [] : snapshot?.messageIds ?? this.messageIds(source), forwardMode: snapshot?.forwardMode ?? 'individual',
-      } : {}), ...(operatorOpenId ? { operatorOpenId, submittedAtMs: snapshot?.cutoffMs ?? Date.now() } : {}) });
+      this.write(file, { status: 'pending', questionId: source.questionId, sourceMessageId: source.messageId,
+        ...(creation ? { creation } : {}),
+        ...(source.sessionId || creation ? { attemptId: randomUUID(), submittedAtMs: snapshot?.cutoffMs ?? Date.now() } : {}),
+        ...(source.sessionId ? { messageIdsSnapshot: snapshot?.forwardMode === 'none' ? [] : snapshot?.messageIds ?? this.messageIds(source),
+          forwardMode: snapshot?.forwardMode ?? 'individual' } : {}),
+        ...(operatorOpenId ? { operatorOpenId, submittedAtMs: snapshot?.cutoffMs ?? Date.now() } : {}) });
+      return true;
+    });
+  }
+
+  /** Adopt a proven platform-created group in one durable write, without a new ticket. */
+  adoptNativeGroup(source: OncallGroupSource, operatorOpenId: string, result: { flowId: string; openChatId: string },
+    snapshot: { messageIds: string[]; cutoffMs: number; forwardMode: OncallForwardMode }): boolean {
+    const file = this.requestPath(source);
+    mkdirSync(join(this.dataDir, 'oncall-groups', source.sessionId ? 'session-requests' : 'requests'), { recursive: true, mode: 0o700 });
+    return withFileLockSync(file, () => {
+      const previous = read<OncallGroupRequest>(file) ?? this.legacyRequest(source);
+      if (previous && previous.status !== 'failed') return previous.status === 'succeeded'
+        && previous.flowId === result.flowId && previous.openChatId === result.openChatId;
+      this.write(file, { status: 'succeeded', questionId: source.questionId, sourceMessageId: source.messageId,
+        attemptId: randomUUID(), operatorOpenId, submittedAtMs: snapshot.cutoffMs,
+        messageIdsSnapshot: snapshot.forwardMode === 'none' ? [] : snapshot.messageIds, forwardMode: snapshot.forwardMode,
+        ...result, cardRefreshPending: true });
       return true;
     });
   }
@@ -334,7 +361,7 @@ export class OncallGroupStore {
     mkdirSync(join(this.dataDir, 'oncall-groups', source.sessionId ? 'session-requests' : 'requests'), { recursive: true, mode: 0o700 });
     withFileLockSync(file, () => {
       const previous = read<OncallGroupRequest>(file) ?? this.legacyRequest(source);
-      if (source.sessionId && (!attemptId || previous?.attemptId !== attemptId)) throw new Error('Oncall request ownership changed');
+      if ((source.sessionId || previous?.creation) && (!attemptId || previous?.attemptId !== attemptId)) throw new Error('Oncall request ownership changed');
       if (previous?.status === 'succeeded' && result.status !== 'succeeded') return;
       if (previous?.status === 'unknown' && result.status === 'failed') return;
       if (previous?.openChatId && result.openChatId && previous.openChatId !== result.openChatId) throw new Error('Oncall session is already bound to a different group');

@@ -16,8 +16,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { SOURCE_WORKER_LOAD_TIMEOUT_MS, spawnLoadedSourceWorker } from './helpers/source-worker-boot.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const ENV = {
@@ -58,33 +59,44 @@ setInterval(() => {}, 1_000);
 }
 
 interface Generation {
-  child: ReturnType<typeof spawnNodeTsScript>;
+  child: ChildProcess;
   messages: WorkerToDaemon[];
   logs: string[];
 }
 
-function startWorker(fakeCli: string, root: string, dataDir: string): Generation {
+const roots: string[] = [];
+const children: ChildProcess[] = [];
+
+/** A real source worker that has finished loading its modules. Every deadline
+ *  below starts after this, at `init`: a cold tsx compile of the worker (each
+ *  Bun-leg file gets a fresh TMPDIR) took 12s of the old 20s budget on CI. */
+async function startLoadedWorker(root: string, dataDir: string, sessionId: string): Promise<Generation> {
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
-  const sessionId = `busy-fallback-${randomUUID()}`;
-  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+  const { child, loaded } = spawnLoadedSourceWorker({
     cwd: resolve('.'),
     env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, ...ENV },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
+  children.push(child);
   child.on('message', m => messages.push(m as WorkerToDaemon));
   child.stdout?.on('data', c => logs.push(c.toString()));
   child.stderr?.on('data', c => logs.push(c.toString()));
-  child.send({
+  await loaded.catch((error: Error) => { throw new Error(`${error.message}\n${logs.join('')}`); });
+  return { child, messages, logs };
+}
+
+async function startWorker(fakeCli: string, root: string, dataDir: string): Promise<Generation> {
+  const sessionId = `busy-fallback-${randomUUID()}`;
+  const g = await startLoadedWorker(root, dataDir, sessionId);
+  g.child.send({
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId: 'claude-code', cliPathOverride: fakeCli, backendType: 'pty',
     prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
-  return { child, messages, logs };
+  return g;
 }
 
-const roots: string[] = [];
-const children: Generation['child'][] = [];
 afterEach(async () => {
   await Promise.all(children.map(c => new Promise<void>(done => {
     if (c.exitCode !== null) return done();
@@ -105,8 +117,7 @@ describe('bounded busy-marker prompt-ready fallback', () => {
     mkdirSync(dataDir, { recursive: true });
     const fakeCli = join(root, 'fake-claude');
     writeFakeCli(fakeCli, 'stale');
-    const g = startWorker(fakeCli, root, dataDir);
-    children.push(g.child);
+    const g = await startWorker(fakeCli, root, dataDir);
 
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline && !g.messages.some(m => m.type === 'prompt_ready')) {
@@ -116,7 +127,7 @@ describe('bounded busy-marker prompt-ready fallback', () => {
     expect(g.messages.some(m => m.type === 'prompt_ready'), `expected bounded prompt_ready\n${g.logs.join('')}`).toBe(true);
     // The release must come from the bounded fallback, not the ordinary probe.
     expect(g.logs.join('')).toMatch(/bounded fallback window/);
-  }, 25_000);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 25_000);
 
   it('does not force readiness while the screen is still streaming (real active work)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'bmx-busy-active-'));
@@ -125,8 +136,7 @@ describe('bounded busy-marker prompt-ready fallback', () => {
     mkdirSync(dataDir, { recursive: true });
     const fakeCli = join(root, 'fake-claude');
     writeFakeCli(fakeCli, 'active');
-    const g = startWorker(fakeCli, root, dataDir);
-    children.push(g.child);
+    const g = await startWorker(fakeCli, root, dataDir);
 
     // Wait well past fallbackMs (2s) and several 3.5s probe intervals: a forced
     // release would have fired by now if the stability gate were not holding.
@@ -134,7 +144,7 @@ describe('bounded busy-marker prompt-ready fallback', () => {
     expect(g.child.exitCode === null).toBe(true);
     expect(g.messages.filter(m => m.type === 'prompt_ready')).toHaveLength(0);
     expect(g.logs.join('')).not.toMatch(/bounded fallback window/);
-  }, 18_000);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 18_000);
 
   it('does not release mid-turn while the Claude transcript still holds the turn open', async () => {
     // Claude Code with prefersReducedMotion draws a static spinner: a real turn
@@ -190,17 +200,9 @@ setInterval(() => {}, 1_000);
     chmodSync(fakeCli, 0o755);
 
     const messages: { at: number; msg: WorkerToDaemon }[] = [];
-    const logs: string[] = [];
     const sid = `busy-fallback-turn-${randomUUID()}`;
-    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
-      cwd: resolve('.'),
-      env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sid, ...ENV },
-      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    });
-    children.push(child);
+    const { child, logs } = await startLoadedWorker(root, dataDir, sid);
     child.on('message', m => messages.push({ at: Date.now(), msg: m as WorkerToDaemon }));
-    child.stdout?.on('data', c => logs.push(c.toString()));
-    child.stderr?.on('data', c => logs.push(c.toString()));
     child.send({
       type: 'init', sessionId: sid, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: workDir, cliId: 'claude-code', cliPathOverride: fakeCli, cliSessionId, resume: true,
@@ -227,5 +229,5 @@ setInterval(() => {}, 1_000);
     expect(readyAt.filter(at => at < workEnd()), `prompt_ready published mid-turn\n${logs.join('')}`).toHaveLength(0);
     expect(readyAt.length, `expected prompt_ready once the turn closed\n${logs.join('')}`).toBeGreaterThan(0);
     expect(logs.join('')).not.toMatch(/bounded fallback window/);
-  }, 70_000);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 70_000);
 });

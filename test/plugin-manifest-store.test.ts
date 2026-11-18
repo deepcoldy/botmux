@@ -149,6 +149,28 @@ describe('plugin manifest and registry basics', () => {
     });
   });
 
+  it('accepts the prerequisites opt-in only as the boolean literal true', () => {
+    const base = {
+      name: '@botmux/plugin-prepared',
+      version: '1.0.0',
+      keywords: ['botmux-plugin'],
+    };
+    expect(parsePluginPackageManifest({
+      ...base,
+      botmux: { schemaVersion: 1, id: 'prepared', prerequisites: true },
+    }).botmux.prerequisites).toBe(true);
+    expect(parsePluginPackageManifest({
+      ...base,
+      botmux: { schemaVersion: 1, id: 'prepared' },
+    }).botmux).not.toHaveProperty('prerequisites');
+    for (const prerequisites of ['true', 1, false, {}, [], null]) {
+      expect(() => parsePluginPackageManifest({
+        ...base,
+        botmux: { schemaVersion: 1, id: 'prepared', prerequisites },
+      })).toThrow(/invalid_plugin_prerequisites/);
+    }
+  });
+
   it('requires package versions to use standard semver metadata', () => {
     expect(() => parsePluginPackageManifest({
       name: '@botmux/plugin-bad',

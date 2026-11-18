@@ -747,6 +747,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */
@@ -911,7 +913,7 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; createdAt?: number }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads

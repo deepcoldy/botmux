@@ -282,6 +282,225 @@ describe('login — device code, in two steps', () => {
   });
 });
 
+// bytedcli 0.186 started checking for a login before `--begin` creates a
+// challenge (and finishing its own still-pending one): it then answers with
+// that login and no link. botmux read that as "could not start a login" and
+// told an authorized person "❌ 无法发起 ByteCloud 授权".
+describe('starting a login that bytedcli already holds (0.186+)', () => {
+  /** `--begin` on a HOME that already holds a login, as 0.186+ prints it. */
+  const ALREADY = {
+    site: 'cn', status: 'ready', initialized: true, authType: 'user',
+    message: 'Already authenticated', login_mode: 'device_code', login_status: 'success', already_authenticated: true,
+  };
+  /** `--begin` that finished bytedcli's own pending challenge instead. */
+  const FINISHED_PENDING = { site: 'cn', status: 'ready', login_status: 'success', already_completed: true };
+
+  it.each([
+    ['an existing login', ALREADY],
+    ['its own pending challenge, finished', FINISHED_PENDING],
+    ['its own pending challenge, finished just now', { ...FINISHED_PENDING, already_completed: false }],
+    ['an existing login, flag only', { message: 'Already authenticated', already_authenticated: true }],
+    ['its own pending challenge, flag only', { already_completed: true }],
+  ])('%s: authorized once the personal status confirms it, no link and nothing left pending', async (_name, data) => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [{ code: 0, stdout: envelope(data) }];
+    expect(await mod.startBytedcliLogin(ALICE)).toEqual({ state: 'authorized' });
+    expect(calls.map(c => c.args)).toEqual([['auth', 'login', '--begin', '--json']]);
+    expect(statusCalls).toHaveLength(1);
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+  });
+
+  it('gives link-only callers no link', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [{ code: 0, stdout: envelope(ALREADY) }];
+    expect(await mod.beginBytedcliLogin(ALICE)).toBeNull();
+  });
+
+  it('drops a leftover challenge that had no link once the login is confirmed', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    writeFileSync(join(mod.bytedcliHomeFor(ALICE), '.botmux-login-challenge'),
+      JSON.stringify({ token: 'old-token', createdAt: Date.now() }));
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBe('old-token');
+    replies = [{ code: 0, stdout: envelope(ALREADY) }];
+    expect(await mod.startBytedcliLogin(ALICE)).toEqual({ state: 'authorized' });
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+  });
+
+  // The CLI's word is not authority; the personal status read is, as on every turn.
+  it.each([
+    ['says logged out', { code: 0, stdout: envelope({ authenticated: false }) }],
+    ['cannot be read', { code: 1, stderr: 'provider offline' }],
+    ['names an app identity', { code: 0, stdout: envelope({ authenticated: true, auth_as: 'app' }) }],
+  ])('is not authorized when the personal status %s', async (_name, status) => {
+    const mod = await fresh();
+    mkdirSync(mod.bytedcliHomeFor(ALICE), { recursive: true });
+    statuses.set(mod.bytedcliHomeFor(ALICE), status);
+    replies = [{ code: 0, stdout: envelope(ALREADY) }];
+    expect(await mod.startBytedcliLogin(ALICE)).toMatchObject({ state: 'failed' });
+  });
+
+  // An app identity does not go away by waiting; it is not reported as an outage.
+  it('names an app identity as such, not as a status to retry', async () => {
+    const mod = await fresh();
+    mkdirSync(mod.bytedcliHomeFor(ALICE), { recursive: true });
+    statuses.set(mod.bytedcliHomeFor(ALICE), { code: 0, stdout: envelope({ authenticated: true, auth_as: 'app' }) });
+    replies = [{ code: 0, stdout: envelope(ALREADY) }];
+    const started = await mod.startBytedcliLogin(ALICE) as { detail: string };
+    expect(started.detail).toMatch(/app identity/);
+    expect(started.detail).not.toMatch(/retry/);
+  });
+
+  // A revoke can land while the status read that confirms the login is still
+  // running: /logout in this daemon (epoch bump, then local cleanup) or in
+  // another daemon (only the durable epoch moves). The confirmed login
+  // belongs to the revoked generation and must not be reported.
+  it.each([
+    ['in this daemon', true],
+    ['in another daemon', false],
+  ])('is not authorized when a revoke lands %s during the confirming status read', async (_name, local) => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    const { bumpCliAuthEpoch } = await import('../src/services/cli-auth-epoch.js');
+    const { spawn } = await import('node:child_process');
+    const child = (reply: { code: number; stdout?: string }, gate?: Promise<void>) => {
+      const c = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), kill: () => {} });
+      void (gate ?? Promise.resolve()).then(() => setImmediate(() => {
+        if (reply.stdout) c.stdout.emit('data', reply.stdout);
+        c.emit('close', reply.code);
+      }));
+      return c as unknown as ReturnType<typeof spawn>;
+    };
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let statusStarted!: () => void;
+    const statusRunning = new Promise<void>(r => { statusStarted = r; });
+    vi.mocked(spawn)
+      .mockImplementationOnce(() => child({ code: 0, stdout: envelope(ALREADY) }))
+      .mockImplementationOnce(() => { statusStarted(); return child({ code: 0, stdout: envelope({ authenticated: true }) }, gate); });
+
+    const started = mod.startBytedcliLogin(ALICE);
+    await statusRunning;
+    bumpCliAuthEpoch(ALICE);
+    if (local) mod.clearBytedcliAuth(ALICE);
+    release();
+    expect(await started).toMatchObject({ state: 'failed' });
+  });
+
+  it('keeps an earlier link on progress events that carry a status of their own', async () => {
+    const mod = await fresh();
+    replies = [{
+      code: 0,
+      stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 't' })
+        + `${JSON.stringify({ event: 'login_progress', status: 'done' })}\n`,
+    }];
+    expect(await mod.beginBytedcliLogin(ALICE)).toEqual({ authUrl: 'https://x/y', completeToken: 't' });
+  });
+});
+
+describe('a login that cannot start says why', () => {
+  const errorEnvelope = (code: string, message: string) =>
+    `${JSON.stringify({ status: 'error', data: null, error: { message, code, hint: 'Retry with `--debug`.' } })}\n`;
+  const detailFor = async (reply: { code: number; stdout?: string; stderr?: string }) => {
+    const mod = await fresh();
+    replies = [reply];
+    const started = await mod.startBytedcliLogin(ALICE);
+    expect(started.state).toBe('failed');
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+    return (started as { detail: string }).detail;
+  };
+
+  it('reports bytedcli\'s own error code and message from the JSON result', async () => {
+    expect(await detailFor({
+      code: 1,
+      stdout: errorEnvelope('BYTECLOUD_AUTH_RUNTIME_ERROR', 'ByteCloud Auth runtime error.: login challenge not found'),
+      stderr: `${JSON.stringify({ event: 'action_required', data: { message: 'Retry with `--debug`.', code: 'BYTECLOUD_AUTH_RUNTIME_ERROR' } })}\n`,
+    })).toBe('BYTECLOUD_AUTH_RUNTIME_ERROR: ByteCloud Auth runtime error.: login challenge not found');
+  });
+
+  it('falls back to an action_required event when no result came', async () => {
+    expect(await detailFor({
+      code: 1,
+      stderr: `${JSON.stringify({ event: 'action_required', data: { message: 'Not authenticated', code: 'AUTH_REQUIRED' } })}\n`,
+    })).toBe('AUTH_REQUIRED: Not authenticated');
+  });
+
+  it('falls back to the first lines of plain output, without a stack trace', async () => {
+    const detail = await detailFor({
+      code: 1,
+      stderr: 'Error: getaddrinfo ENOTFOUND sso.example.com\n    at GetAddrInfoReqWrap.onlookup (node:dns:1:1)\n',
+    });
+    expect(detail).toBe('Error: getaddrinfo ENOTFOUND sso.example.com');
+  });
+
+  it('says a run that printed nothing printed nothing', async () => {
+    // bytedcli in its ByteClaw mode exits 0 on `--begin` without any output.
+    expect(await detailFor({ code: 0, stdout: '' })).toMatch(/no JSON result/);
+  });
+
+  it('does not hand out a link from a run that failed', async () => {
+    expect(await detailFor({ code: 1, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 't', login_status: 'pending' }) }))
+      .not.toContain('https://x/y');
+  });
+
+  it('names the error line of a crash, not the source line or Node\'s warnings', async () => {
+    const detail = await detailFor({
+      code: 1,
+      stderr: [
+        '(node:12345) ExperimentalWarning: something is experimental',
+        '(Use `node --trace-warnings ...` to show where the warning was created)',
+        '/opt/tool/dist/cli.js:1234',
+        'var a=function(){return b()}',
+        '        ^',
+        '',
+        'TypeError: b is not a function',
+        '    at a (/opt/tool/dist/cli.js:1234:9)',
+      ].join('\n'),
+    });
+    expect(detail).toBe('TypeError: b is not a function');
+  });
+
+  it('names what an unrecognized successful result said', async () => {
+    expect(await detailFor({ code: 0, stdout: envelope({ login_status: 'expired', message: 'Login device code expired' }) }))
+      .toContain('Login device code expired');
+  });
+
+  // The reply can land in a group. A device-code link, a resume token or a JWT
+  // must not reach it, nor what the chat's content audit refuses.
+  it.each([
+    ['a link\'s query', 'see https://sso.example.com/device?user_code=ABCD-1234&state=s', ['user_code', 'ABCD-1234'], 'https://sso.example.com/…'],
+    ['an e-mail address', 'login failed for alice@example.com', ['alice@example.com'], 'login failed for'],
+    ['a phone number', 'bound to 13812345678', ['13812345678'], 'bound to'],
+    ['a hex token', 'resume 0123456789abcdef0123456789abcdef', ['0123456789abcdef'], 'resume'],
+    ['an opaque token', 'resume Gk3sP9xQ2mV7bN4zL8wR1tY6uI0oA5eD', ['Gk3sP9xQ2mV7bN4zL8wR1tY6uI0oA5eD'], 'resume'],
+    ['a JWT', 'rejected eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl', ['eyJhbGci', 'c2lnbmF0dXJl'], 'rejected'],
+    ['a local path', "EACCES: permission denied, mkdir '/root/.botmux/data/bytedcli-home/ou_alice'", ['/root', 'ou_alice'], 'EACCES: permission denied'],
+    ['a device code shown on its own', 'Enter code WXYZ-1234 at https://sso.example.com/device', ['WXYZ-1234'], 'Enter code'],
+    ['a user_code value', 'pending user_code=WXYZ-1234', ['WXYZ-1234'], 'pending user_code='],
+    ['the query of a link without a scheme', 'open sso.example.com/device?user_code=QRST-5678&state=s', ['QRST-5678', 'state=s'], 'sso.example.com/device'],
+    ['an upper-case UUID', 'request 6F1C2D3E-4A5B-4C6D-8E9F-0A1B2C3D4E5F failed', ['6F1C2D3E'], 'request'],
+    ['a phone number with separators', 'bound to +86 138 1234 5678 and 138-1234-5678', ['1234 5678', '1234-5678'], 'bound to'],
+  ])('hides %s', async (_name, message, hidden, kept) => {
+    const detail = await detailFor({ code: 1, stdout: errorEnvelope('LOGIN_FAILED', message) });
+    expect(detail).toContain('LOGIN_FAILED');
+    expect(detail).toContain(kept);
+    for (const value of hidden) expect(detail).not.toContain(value);
+  });
+
+  // Only a bounded prefix is examined: the patterns backtrack on long unbroken
+  // runs (seconds on tens of KB), which would stall the daemon's event loop.
+  it('handles a huge unbroken output quickly', async () => {
+    const started = Date.now();
+    const detail = await detailFor({ code: 1, stdout: errorEnvelope('LOGIN_FAILED', 'a1'.repeat(100_000)) });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(detail.length).toBeLessThanOrEqual(200);
+  });
+
+  it('stays one short line', async () => {
+    const detail = await detailFor({ code: 1, stdout: errorEnvelope('LOGIN_FAILED', `line one\nline two ${'x '.repeat(400)}`) });
+    expect(detail).not.toContain('\n');
+    expect(detail.length).toBeLessThanOrEqual(200);
+  });
+});
+
 describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('mints both JWTs for an authorized person', async () => {
     const mod = await fresh();
@@ -701,9 +920,12 @@ describe('provider timeout', () => {
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     vi.useFakeTimers();
     try {
-      const first = mod.beginBytedcliLogin(ALICE);
+      const first = mod.startBytedcliLogin(ALICE);
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(await first).toBeNull();
+      const timedOut = await first as { state: string; detail: string };
+      expect(timedOut.state).toBe('failed');
+      expect(timedOut.detail).toContain('timed out');
+      expect(timedOut.detail).not.toContain('[bytedcli-auth]');
       expect(child.kill).toHaveBeenCalledWith('SIGKILL');
       expect(child.stdout.destroyed).toBe(true);
       expect(child.stderr.destroyed).toBe(true);

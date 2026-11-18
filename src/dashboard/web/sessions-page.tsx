@@ -102,7 +102,7 @@ import {
   t,
   ui,
 } from './ui.js';
-import { isOffBoardDormant, type SessionKanbanColumn } from './kanban-model.js';
+import { isOffBoardKanbanRow, type SessionKanbanColumn } from './kanban-model.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { sessionTaskStatusText, statusFilterLabel, taskTone } from './session-task-view.js';
 import {
@@ -2070,7 +2070,7 @@ function SessionsPage(): React.JSX.Element {
     const onBoard: SessionRow[] = [];
     let off = 0;
     for (const row of rows) {
-      if (isOffBoardDormant(row)) off += 1;
+      if (isOffBoardKanbanRow(row, filters.status)) off += 1;
       else onBoard.push(row);
     }
     return { kanbanRows: onBoard, dormantOffBoard: off };
@@ -2572,7 +2572,7 @@ function SessionsPage(): React.JSX.Element {
     }
   }, [sortKey]);
   const showDormantInTable = useCallback(() => {
-    setFilters(prev => ({ ...prev, status: 'dormant' }));
+    setFilters(prev => ({ ...prev, status: '' }));
     setViewMode('table');
     writeStoredSessionsViewMode(windowStorage(), 'table');
   }, []);

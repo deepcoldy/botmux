@@ -16,6 +16,7 @@ import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.j
 import { createHostPluginMarket, PluginMarketError } from './dashboard/plugin-market.js';
 import { pluginRecordHash } from './core/plugins/mutation-guard.js';
 import { withPluginServiceLock } from './core/plugins/service-manager.js';
+import { assertPluginPrerequisitesReady } from './core/plugins/prerequisites.js';
 import { createConfigApi } from './core/plugins/runtime.js';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
@@ -1255,6 +1256,7 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   /** Experimental, default OFF: reap tmux servers orphaned by a previous
    *  daemon generation at daemon startup (automatic process kill). */
   reapOrphanTmuxServers: boolean;
@@ -1943,6 +1945,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    terminalEffortWriteback: dashboard.terminalEffortWriteback === true,
     reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     tmuxOrphanSessionSweep: dashboard.tmuxOrphanSessionSweep !== false, // default ON report-only; explicit false disables
     tmuxOrphanSessionBareWrapperKill: dashboard.tmuxOrphanSessionBareWrapperKill === true, // default OFF narrow kill
@@ -2985,6 +2988,9 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
 }
 
 async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  // The live check runs plugin code for up to 20s. Keep it outside the config
+  // lease: the caller's plugin service lock already pins the registry record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
@@ -3005,6 +3011,9 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
   if (defaults.includes(pluginId)) throw new Error('请先关闭全局启用，再按 Bot 配置');
+  // Never hold bots.json's cross-process lock (5s waiter budget) across the
+  // plugin's live check (up to 20s); the service lock still pins the record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   return runDurableConfigMutation({
     scope: 'bots',
     path,

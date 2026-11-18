@@ -562,6 +562,11 @@ import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid,
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
+import { ClaudeEffortObserver } from './services/claude-effort-observer.js';
+import { TerminalEffortChoiceTracker, terminalEffortPreferenceKey, readClaudeEffortCommandReceipt, type TerminalEffortBinding, type TerminalEffortChoice } from './services/terminal-effort-choice.js';
+import { isNativeReasoningEffort, type NativeReasoningObservation, type AppliedReasoningSelection } from './services/native-reasoning-observation.js';
+import { readGrokRuntimeObservation } from './services/grok-runtime-observer.js';
+import { readNativeReasoningFooter } from './utils/native-reasoning-footer.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
 import { readySignalLogDir, readySignalLogPath } from './services/ready-signal-log.js';
@@ -571,6 +576,7 @@ import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.j
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
+import { claudeProjectsRootForLaunch, type ClaudeProjectsRoot } from './services/claude-projects-root.js';
 import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
 import { restoreRewoundTranscript, rewindClaudeTranscript, type RewindResult } from './core/context-rewind.js';
 import {
@@ -811,12 +817,16 @@ import {
   readTraexModelLoadSnapshot,
   type TraexModelLoadSnapshot,
 } from './services/traex-model-load.js';
+import { readTraexCatalogWithRetry } from './services/traex-model-catalog-retry.js';
+import { traexAutoModelPolicyKey } from './services/traex-auto-model.js';
+import type { TraexModelPoolPruneResult } from './services/traex-model-pool-prune.js';
 import { readTraexModelQuotas, TRAEX_QUOTA_ERROR_CODE } from './services/traex-quota.js';
 import { TRAEX_MODEL_ACCESS_ERROR_CODE } from './services/traex-model-access.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { runnerFinalOutcome } from './services/runner-final-outcome.js';
+import { MinimaxFinalReceiver } from './services/minimax-final-control.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
@@ -2131,6 +2141,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     delete context.scope.execution;
     return { ...msg, sessionContract: context };
   }
+  // turnId on a screen is presentation context, not execution authority.
+  // The sampler can outlive both the turn and an in-process identity rebind.
+  if (msg.type === 'screen_update') {
+    const context = workerSessionEventScope.envelope(origin ?? workerSessionEventScope.screenObservationOrigin());
+    delete context.scope.execution;
+    return { ...msg, sessionContract: context };
+  }
   const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
@@ -2142,12 +2159,6 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
-    if (execution) context.scope.execution = execution;
-  }
-  if (msg.type === 'screen_update' && context.scope.execution
-    && (msg.turnId !== context.scope.execution.turnId || msg.dispatchAttempt !== context.scope.execution.dispatchAttempt)) {
-    delete context.scope.execution;
-    const execution = workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
     if (execution) context.scope.execution = execution;
   }
   // Physical process proof is available before an opening attempt is bound.
@@ -5169,6 +5180,9 @@ class SubmissionWriteError extends Error {
      *  half-frame and be dropped while the backend still reports success.
      *  Callers must fence/exit the generation, never continue typing. */
     readonly runnerGenerationUnsafe = false,
+    /** The catalog changed before any byte was written; requeue and rotate
+     * instead of classifying this proven pre-write refusal as ambiguous. */
+    readonly traexCatalogAdmissionRequired = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
@@ -6218,6 +6232,7 @@ function setCaptureIdentity(
   forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
@@ -6290,6 +6305,97 @@ const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => 
 function rememberTraexModelLoadSnapshot(snapshot: TraexModelLoadSnapshot | null): void {
   if (!snapshot) return;
   traexAutoModelReasoningEfforts = new Map(snapshot.reasoningEfforts);
+}
+
+const pendingTraexModelPoolPrunes = new Map<string, {
+  resolve: (result: TraexModelPoolPruneResult) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}>();
+let traexCatalogReadInFlight: { generation: number; abort: AbortController; promise: Promise<TraexModelLoadSnapshot | null> } | undefined;
+let traexCatalogRetryPending: { controller: TraexAutoModelController; generation: number; turnId?: string } | undefined;
+const traexCatalogEmptyNoticeTurns = new WeakMap<TraexAutoModelController, Set<string>>();
+
+function notifyTraexCatalogEmpty(
+  controller: TraexAutoModelController,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  const key = `${turnId ?? ''}:${dispatchAttempt ?? ''}`;
+  const seen = traexCatalogEmptyNoticeTurns.get(controller) ?? new Set<string>();
+  if (seen.has(key)) return;
+  seen.add(key);
+  traexCatalogEmptyNoticeTurns.set(controller, seen);
+  send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    message: t('worker.traex_auto_model.catalog_empty') });
+}
+
+async function reconcileTraexModelCatalog(
+  snapshot: TraexModelLoadSnapshot | null,
+  controller: TraexAutoModelController,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  isCurrent: () => boolean,
+  turnId?: string,
+  dispatchAttempt?: number,
+): Promise<boolean> {
+  const available = snapshot?.catalogModels;
+  if (!isCurrent()) return false;
+  if (!available?.size) return true;
+  if (controller.config.models.every(model => available.has(model.toLowerCase()))) {
+    controller.observeModelCatalog(available);
+    return true;
+  }
+  const requestId = randomUUID();
+  const result = await new Promise<TraexModelPoolPruneResult>(resolve => {
+    const timeout = setTimeout(() => {
+      pendingTraexModelPoolPrunes.delete(requestId);
+      resolve({ status: 'timed_out', removedModels: [] });
+    }, 20_000);
+    pendingTraexModelPoolPrunes.set(requestId, { resolve, timeout });
+    process.send?.({
+      type: 'traex_model_pool_prune', requestId,
+      expectedPolicyKey: traexAutoModelPolicyKey(cfg.traexAutoModel ?? controller.config),
+      availableModels: [...available], ...(turnId ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    } satisfies WorkerToDaemon);
+  });
+  if (!isCurrent()) return false;
+  // A sibling may have committed the same directory cleanup first. Its returned
+  // current config is safe to adopt only as a strict, directory-confirmed subset
+  // of this controller's pool; arbitrary manual replacements stay superseded.
+  const siblingSubset = result.status === 'superseded' && result.config
+    && result.config.models.length < controller.config.models.length
+    && result.config.models.every(model =>
+      controller.config.models.some(current => current.toLowerCase() === model.toLowerCase())
+      && available.has(model.toLowerCase()));
+  if (result.status === 'superseded' && !siblingSubset) return false;
+  if (result.config && result.status !== 'failed' && result.status !== 'timed_out') {
+    controller.observeModelCatalog(available);
+    const removed = controller.config.models.filter(model =>
+      !result.config!.models.some(next => next.toLowerCase() === model.toLowerCase()));
+    controller.markCatalogPruned(removed, result.config);
+    cfg.traexAutoModel = result.config;
+    if (lastInitConfig) lastInitConfig.traexAutoModel = result.config;
+    if (result.config.models.length === 0) {
+      if (turnId) {
+        controller.requestRecoveryStop(turnId);
+        controller.catalogQueryFailed(turnId);
+      }
+      notifyTraexCatalogEmpty(controller, turnId, dispatchAttempt);
+      return false;
+    }
+  }
+  if (result.status === 'failed' || result.status === 'timed_out') {
+    // The catalog READ succeeded; only persistence is failed/unconfirmed. Keep
+    // the pre-catalog ordered fallback live instead of latching catalogReadFailed.
+    send({ type: 'user_notify', ...(turnId ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      message: t(result.status === 'timed_out'
+        ? 'worker.traex_auto_model.catalog_persist_timeout'
+        : 'worker.traex_auto_model.catalog_persist_failed') });
+    return false;
+  }
+  return true;
 }
 
 function applyTraexAutoModelSettings(
@@ -6394,6 +6500,9 @@ function configureTraexAutoModel(
     && !cfg.existingAppServerEndpoint
     && !cfg.wrapperCli
     && !cfg.cliLaunchMode;
+  if (managedAuto && cfg.traexAutoModel?.models.length === 0) {
+    throw new Error(t('worker.traex_auto_model.catalog_empty'));
+  }
   // Older daemons may send the stored RPC preference rather than the launch
   // mode. Auto owns this managed terminal; normalize before any RPC startup.
   if (managedAuto) {
@@ -6432,30 +6541,70 @@ async function preflightTraexAutoModelBeforeSpawn(
 ): Promise<void> {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()
-    || !traexAutoModelPreflightEnabled(controller.config)
-    || !cfg.prompt || !cfg.turnId
     || options.willReattachPersistent
-    || options.restartCause === 'traex-auto-model'
     || !cliAdapter) return;
 
   const startedAtMs = Date.now();
   let snapshot: TraexModelLoadSnapshot | null = null;
+  const ownerTurnId = cfg.turnId ?? controller.currentTurnId();
+  const current = () => options.spawnGeneration === cliSpawnGeneration && controller === traexAutoModelController
+    && (!ownerTurnId || !controller.recoveryStopped(ownerTurnId))
+    && (controller.currentTurnId() === ownerTurnId || (ownerTurnId !== undefined && controller.currentTurnId() === undefined));
+  const read = () => currentTraexLoadSnapshot(
+    controller.config.preflightTimeoutMs ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS, cfg,
+  );
   try {
-    snapshot = await readTraexModelLoadSnapshot({
-      cliBin: cliAdapter.resolvedBin,
-      cwd: cfg.workingDir,
-      timeoutMs: controller.config.preflightTimeoutMs
-        ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
-      env: {
-        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
-        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
-      },
-    });
+    snapshot = await read();
   } catch (error) {
     log(`TraeX preflight load query failed before spawn: ${String(error)}`);
   }
   if (options.spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+  if (!snapshot) {
+    // Catalog IO is not permission to delete or replace the selected model.
+    // Preserve the existing fail-open launch; retry only while startup/input
+    // is still unresolved, and never interrupt a model that began working.
+    const stillNeeded = () => current()
+      && (!backend || traexNativeStartupInputIsPending()
+        || controller.awaitingModelActivity() || controller.capacityCurrentlyBlocking());
+    const token = { controller, generation: options.spawnGeneration, turnId: ownerTurnId };
+    traexCatalogRetryPending = token;
+    send({ type: 'user_notify', ...(cfg.turnId ? { turnId: cfg.turnId } : {}),
+      message: t('worker.traex_auto_model.catalog_query_retry') });
+    void readTraexCatalogWithRetry({ read, isCurrent: stillNeeded, firstReadFailed: true })
+      .then(async result => {
+        if (!stillNeeded()) return;
+        if (result) {
+          if (!await reconcileTraexModelCatalog(result, controller, cfg, stillNeeded, ownerTurnId, cfg.dispatchAttempt)) return;
+          rememberTraexModelLoadSnapshot(result);
+          if (ownerTurnId && controller.capacityCurrentlyBlocking()) {
+            const choice = controller.resolveModelLoads(ownerTurnId, result.loads);
+            if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
+          }
+        } else {
+          if (ownerTurnId) controller.catalogQueryFailed(ownerTurnId);
+          send({ type: 'user_notify', ...(ownerTurnId ? { turnId: ownerTurnId } : {}),
+            message: t('worker.traex_auto_model.catalog_query_failed') });
+        }
+      }).catch(error => log(`TraeX deferred catalog cleanup failed: ${String(error)}`))
+      .finally(() => {
+        if (traexCatalogRetryPending === token) traexCatalogRetryPending = undefined;
+        if (ownerTurnId && controller === traexAutoModelController) controller.resolveModelLoads(ownerTurnId, null);
+      });
+    return;
+  }
+  if (!await reconcileTraexModelCatalog(snapshot, controller, cfg, current, cfg.turnId, cfg.dispatchAttempt)) {
+    if (cfg.traexAutoModel?.catalogUnavailable) throw new Error(t('worker.traex_auto_model.catalog_empty'));
+    throw new CliSpawnSupersededError();
+  }
   rememberTraexModelLoadSnapshot(snapshot);
+  const catalogChoice = controller.catalogAdmissionDecision(cfg.turnId ?? `catalog-${options.spawnGeneration}`);
+  if (catalogChoice.kind === 'exhausted') throw new Error(t('worker.traex_auto_model.catalog_empty'));
+  if (catalogChoice.kind === 'switch') {
+    controller.commitSwitch(catalogChoice);
+    applyTraexAutoModelSettings(cfg, controller, controller.currentModel());
+  }
+  if (!cfg.prompt || !cfg.turnId || !traexAutoModelPreflightEnabled(controller.config)
+    || options.restartCause === 'traex-auto-model') return;
   const decision = controller.preflightDecision(cfg.turnId, snapshot?.loads ?? null, {
     preferFirstModel: controller.config.reselectPerTurn === true,
   });
@@ -6629,6 +6778,8 @@ function executeTraexAutoModelSwitch(
     message: t(
       action.reason === 'quota_exhausted'
         ? 'worker.traex_auto_model.quota_switch'
+        : action.reason === 'catalog_unavailable'
+          ? 'worker.traex_auto_model.catalog_switch'
         : action.reason === 'new_turn' && traexAutoModelController.config.trigger === 'quota'
           ? 'worker.traex_auto_model.quota_preference'
         : action.reason === 'preflight_available'
@@ -6681,6 +6832,39 @@ function executeTraexAutoModelSwitch(
   return true;
 }
 
+/** Directory admission is shared by preflight, the pre-dequeue gate and the
+ * final write-edge safety net. A catalog switch never replays the original
+ * task: the replacement resumes the exact native session with pending input
+ * preserved. If called inside flush, defer the physical restart until the
+ * flush mutex has been released; the input remains queued throughout. */
+function admitTraexCatalogModelBeforeInput(turnId: string, dispatchAttempt?: number): boolean {
+  const controller = traexAutoModelController;
+  if (!controller || !traexAutoModelRuntimeEligible()) return false;
+  const action = controller.catalogAdmissionDecision?.(turnId);
+  if (!action || action.kind === 'none') return false;
+  if (action.kind === 'exhausted') {
+    controller.requestRecoveryStop(turnId);
+    controller.catalogQueryFailed(turnId);
+    notifyTraexCatalogEmpty(controller, turnId, dispatchAttempt);
+    return true;
+  }
+  if (action.kind !== 'switch') {
+    log(`TraeX catalog admission returned ${action.kind}; keeping input queued`);
+    return true;
+  }
+  const execute = (): void => {
+    if (controller !== traexAutoModelController) return;
+    const switched = executeTraexAutoModelSwitch(action, {
+      resumeCurrentTurn: false,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    });
+    if (!switched) log(`TraeX catalog admission switch refused; keeping input queued for ${turnId}`);
+  };
+  if (isFlushing) queueMicrotask(execute);
+  else execute();
+  return true;
+}
+
 function observeTraexAutoModelCapacity(screen: string): void {
   const controller = traexAutoModelController;
   if (!controller || !traexAutoModelRuntimeEligible()) return;
@@ -6712,17 +6896,20 @@ function observeTraexAutoModelCapacity(screen: string): void {
     void flushPending();
   }
   if (action.kind === 'load_check') {
+    if (traexCatalogRetryPending?.controller === controller
+      && traexCatalogRetryPending.generation === cliSpawnGeneration
+      && traexCatalogRetryPending.turnId === action.turnId) return;
     const target = backend;
     const generation = cliSpawnGeneration;
     const config = lastInitConfig;
-    void readTraexModelLoadSnapshot({
-      cliBin: cliAdapter!.resolvedBin,
-      cwd: config.workingDir,
-      env: {
-        ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
-        ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
-      },
-    }).then(snapshot => {
+    const current = () => backend === target && generation === cliSpawnGeneration
+      && controller === traexAutoModelController && !cliRestartInProgress
+      && activeTurnAuthority.snapshot()?.turnId === action.turnId
+      && !controller.recoveryStopped(action.turnId) && controller.capacityCurrentlyBlocking();
+    void readTraexCatalogWithRetry({
+      isCurrent: current,
+      read: () => currentTraexLoadSnapshot(TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS, config),
+    }).then(async snapshot => {
       const active = activeTurnAuthority.snapshot();
       if (backend !== target || generation !== cliSpawnGeneration
         || controller !== traexAutoModelController || cliRestartInProgress
@@ -6733,6 +6920,16 @@ function observeTraexAutoModelCapacity(screen: string): void {
         || traexAutoModelTurnReplayForbidden) {
         // A rejected reply must not strand the controller's pending check.
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
+        return;
+      }
+      if (!snapshot) {
+        controller.catalogQueryFailed(action.turnId);
+        send({ type: 'user_notify', turnId: action.turnId,
+          message: t('worker.traex_auto_model.catalog_query_failed') });
+        return;
+      }
+      if (!await reconcileTraexModelCatalog(snapshot, controller, config, current, action.turnId)) {
+        controller.resolveModelLoads(action.turnId, null);
         return;
       }
       rememberTraexModelLoadSnapshot(snapshot);
@@ -6772,18 +6969,27 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
 }
 
-function currentTraexLoadSnapshot(timeoutMs: number): Promise<TraexModelLoadSnapshot | null> {
+function currentTraexLoadSnapshot(timeoutMs: number, cfg = lastInitConfig): Promise<TraexModelLoadSnapshot | null> {
   if (!cliAdapter || !lastInitConfig) return Promise.resolve(null);
-  const config = lastInitConfig;
-  return readTraexModelLoadSnapshot({
+  if (traexCatalogReadInFlight?.generation === cliSpawnGeneration) return traexCatalogReadInFlight.promise;
+  traexCatalogReadInFlight?.abort.abort();
+  const config = cfg!;
+  const abort = new AbortController();
+  const token = { generation: cliSpawnGeneration, abort, promise: readTraexModelLoadSnapshot({
     cliBin: cliAdapter.resolvedBin,
     cwd: config.workingDir,
     timeoutMs,
+    signal: abort.signal,
     env: {
       ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
       ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
     },
-  });
+  }) };
+  traexCatalogReadInFlight = token;
+  void token.promise.finally(() => {
+    if (traexCatalogReadInFlight === token) traexCatalogReadInFlight = undefined;
+  }).catch(() => {});
+  return token.promise;
 }
 
 function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
@@ -6797,18 +7003,36 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
       log(`TraeX preflight load query failed before idle turn: ${String(error)}`);
       return null;
     })
-    .then(snapshot => {
+    .then(async snapshot => {
       if (traexAutoModelPreflightPending !== token) return;
-      traexAutoModelPreflightPending = undefined;
       if (controller !== traexAutoModelController
         || token.generation !== cliSpawnGeneration
         || pendingMessages[0] !== head
         || !isPromptReady
         || cliRestartInProgress
         || activeTurnAuthority.snapshot()?.started) {
+        traexAutoModelPreflightPending = undefined;
         void flushPending();
         return;
       }
+      const current = () => traexAutoModelPreflightPending === token
+        && controller === traexAutoModelController && token.generation === cliSpawnGeneration
+        && pendingMessages[0] === head && isPromptReady && !cliRestartInProgress
+        && !activeTurnAuthority.snapshot()?.started;
+      if (!await reconcileTraexModelCatalog(snapshot, controller, lastInitConfig!, current, head.turnId, head.dispatchAttempt)) {
+        if (traexAutoModelPreflightPending === token) {
+          traexAutoModelPreflightPending = undefined;
+          head.traexAutoModelPreflightDone = true;
+          void flushPending();
+        }
+        return;
+      }
+      if (!current()) {
+        if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
+        void flushPending();
+        return;
+      }
+      traexAutoModelPreflightPending = undefined;
       rememberTraexModelLoadSnapshot(snapshot);
       const decision = controller.preflightDecision(head.turnId!, snapshot?.loads ?? null, {
         preferFirstModel: controller.config.reselectPerTurn === true,
@@ -6822,11 +7046,15 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
           resumeCurrentTurn: false,
           ...(head.dispatchAttempt !== undefined ? { dispatchAttempt: head.dispatchAttempt } : {}),
         })) return;
+      if (admitTraexCatalogModelBeforeInput(head.turnId!, head.dispatchAttempt)) return;
       controller.beginTurn(head.turnId!, { retainCurrentModel: true });
       if (lastInitConfig) applyTraexAutoModelSettings(lastInitConfig, controller, controller.currentModel());
       // A switch decision reaching here was refused; the model did not change.
       if (decision.kind !== 'switch') notifyTraexPreflightDecision(decision, head.turnId, head.dispatchAttempt);
       void flushPending();
+    }).catch(error => {
+      if (traexAutoModelPreflightPending === token) traexAutoModelPreflightPending = undefined;
+      log(`TraeX idle catalog reconciliation failed: ${String(error)}`);
     });
   return true;
 }
@@ -6836,6 +7064,13 @@ function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
 function resetTraexAutoModelBeforePendingTurn(): boolean {
   const controller = traexAutoModelController;
   const head = pendingMessages[0];
+  if (head && lastInitConfig?.traexAutoModel?.catalogUnavailable) {
+    if (controller) notifyTraexCatalogEmpty(controller, head.turnId, head.dispatchAttempt);
+    else if (!head.traexAutoModelPreflightDone) send({ type: 'user_notify', turnId: head.turnId,
+      message: t('worker.traex_auto_model.catalog_empty') });
+    head.traexAutoModelPreflightDone = true;
+    return true;
+  }
   if (!controller || !traexAutoModelRuntimeEligible() || !head?.turnId
     || head.traexAutoModelRecovery || head.noReplay === true
     || controller.currentTurnId() === head.turnId) return false;
@@ -6853,6 +7088,7 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
     && !activeTurnAuthority.snapshot()
     && queuedTypeAheadTurns.length === 0) return true;
   if (!isPromptReady) return traexAutoModelInputHold();
+  if (admitTraexCatalogModelBeforeInput(head.turnId, head.dispatchAttempt)) return true;
   if (controller.config.trigger === 'quota') return selectTraexQuotaModelBeforeTurn(head);
   if (traexAutoModelPreflightEnabled(controller.config)) {
     if (!head.traexAutoModelPreflightDone) return selectTraexCapacityModelBeforeTurn(head);
@@ -9127,6 +9363,10 @@ let bridgeCliCwd: string | undefined;
  *  bridge start (from the adapter's claudeDataDir); defaults to `~/.claude` so
  *  the adopt path and any non-seed caller behave exactly as before. */
 let bridgeDataDir: string = DEFAULT_CLAUDE_DATA_DIR;
+/** Projects root of the Claude config dir this worker launches its CLI with,
+ *  resolved at launch: the only root an in-place transcript rewrite (the image
+ *  purge) trusts. Never derived from the transcript path itself. */
+let claudeProjectsRoot: ClaudeProjectsRoot | undefined;
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
@@ -9518,6 +9758,171 @@ const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
  *  reaches it through observeModelFallbackEvents. The worker reports
  *  observations only — the daemon owns the state and decides. */
 const modelFallbackTracker = new ClaudeModelFallbackTracker();
+const claudeEffortObserver = new ClaudeEffortObserver();
+const terminalEffortTracker = new TerminalEffortChoiceTracker();
+let terminalEffortPendingChoice: TerminalEffortChoice | undefined;
+let terminalEffortAwaitingClaudeChoice: TerminalEffortChoice | undefined;
+let terminalEffortSavedNonce: string | undefined;
+let terminalEffortEnabledSinceMs: number | undefined;
+let terminalEffortEnableEpoch: number | undefined;
+function readTerminalEffortPreference(notAfter?: number): string | undefined {
+  if (!lastInitConfig?.sessionId || !lastInitConfig.larkAppId) return;
+  const row = sessionStore.readSessionRowFromDisk(lastInitConfig.sessionId, lastInitConfig.larkAppId);
+  if (!row || notAfter !== undefined && (row.terminalEffortPreferenceEdit?.atMs ?? 0) >= notAfter) return;
+  return terminalEffortPreferenceKey(row);
+}
+function terminalEffortWritebackEnabled(): boolean {
+  if (!config.terminalEffortWriteback) {
+    terminalEffortEnabledSinceMs = undefined;
+    terminalEffortEnableEpoch = undefined;
+    terminalEffortPendingChoice = undefined;
+    terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.reset();
+    return false;
+  }
+  if (terminalEffortEnableEpoch !== config.terminalEffortWritebackEpoch) {
+    terminalEffortEnabledSinceMs = config.terminalEffortWritebackEnabledAtMs || Date.now();
+    terminalEffortPendingChoice = undefined;
+    terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.reset();
+    terminalEffortEnableEpoch = config.terminalEffortWritebackEpoch;
+  }
+  terminalEffortEnabledSinceMs ??= Date.now();
+  return true;
+}
+
+function noteTerminalEffortInput(client: object, data: string): void {
+  // Observation only: a failing preference read or tracker must never swallow
+  // the authenticated keystroke that runs immediately after this hook.
+  try {
+    const cliId = lastInitConfig?.cliId;
+    const nativeSessionId = cliId === 'claude-code'
+      ? (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined) ?? bridgeObservedCliSessionId ?? lastInitConfig?.cliSessionId
+      : lastInitConfig?.cliSessionId;
+    if (!cliId || !nativeSessionId) return;
+    if (data.includes('\x03') || data === '\x1b') terminalEffortAwaitingClaudeChoice = undefined;
+    terminalEffortTracker.input(client, data, { cliId, nativeSessionId, cliSpawnGeneration }, {
+      enabled: terminalEffortWritebackEnabled(), ready: isPromptReady && !cliRestartInProgress,
+      screen: lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
+      enableEpoch: config.terminalEffortWritebackEpoch, readPreference: readTerminalEffortPreference,
+    });
+  } catch { /* observer failure must not block input delivery */ }
+}
+function confirmedTerminalEffortChoice(binding: TerminalEffortBinding, effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null,
+  atMs: number | undefined, evidence: 'native-settings' | 'native-footer' | 'native-summary' | 'statusline', model?: string,
+): TerminalEffortChoice | undefined {
+  const enabled = terminalEffortWritebackEnabled();
+  const environmentOverride = binding.cliId === 'claude-code'
+    && (lastInitConfig?.env?.CLAUDE_CODE_EFFORT_LEVEL || process.env.CLAUDE_CODE_EFFORT_LEVEL);
+  if (environmentOverride) { terminalEffortPendingChoice = undefined; terminalEffortAwaitingClaudeChoice = undefined; terminalEffortTracker.reset(); return; }
+  if (atMs === undefined) return;
+  model ??= terminalEffortTracker.model(binding) ?? lastInitConfig?.model;
+  const confirmed = terminalEffortTracker.observe({ binding, effort, model, atMs }, enabled, evidence, config.terminalEffortWritebackEpoch);
+  if (!enabled) return;
+  if (confirmed && binding.cliId === 'claude-code') terminalEffortAwaitingClaudeChoice = confirmed;
+  if (confirmed && binding.cliId !== 'claude-code') terminalEffortPendingChoice = { ...confirmed, nonce: `${cliLifetimeNonce}:${confirmed.nonce}` };
+  const pending = terminalEffortPendingChoice;
+  if (pending && pending.nativeSessionId === binding.nativeSessionId && pending.cliId === binding.cliId
+    && pending.cliSpawnGeneration === binding.cliSpawnGeneration && pending.requestedEffort === effort
+    && atMs >= pending.confirmedAtMs && Date.now() - pending.requestedAtMs <= 60_000) {
+    terminalEffortPendingChoice = { ...pending, confirmedAtMs: atMs };
+    return terminalEffortPendingChoice;
+  }
+  if (pending) terminalEffortPendingChoice = undefined;
+  if (binding.cliId !== 'claude-code' || !bridgeJsonlPath || effort === null
+    || lastInitConfig?.env?.CLAUDE_CODE_EFFORT_LEVEL || process.env.CLAUDE_CODE_EFFORT_LEVEL) return;
+  const receipt = readClaudeEffortCommandReceipt(bridgeJsonlPath, binding.nativeSessionId,
+    Math.max(claudeEffortNotBeforeMs, terminalEffortEnabledSinceMs ?? Date.now()));
+  const nonce = receipt ? `${cliLifetimeNonce}:${receipt.nonce}` : undefined;
+  if (!receipt || nonce === terminalEffortSavedNonce || receipt.effort !== effort || receipt.atMs > atMs || Date.now() - receipt.atMs > 60_000) return;
+  if (terminalEffortAwaitingClaudeChoice && (terminalEffortAwaitingClaudeChoice.nativeSessionId !== binding.nativeSessionId
+    || terminalEffortAwaitingClaudeChoice.cliSpawnGeneration !== binding.cliSpawnGeneration
+    || terminalEffortAwaitingClaudeChoice.enableEpoch !== config.terminalEffortWritebackEpoch
+    || terminalEffortAwaitingClaudeChoice.requestedEffort !== effort
+    || Date.now() - terminalEffortAwaitingClaudeChoice.requestedAtMs > 60_000)) terminalEffortAwaitingClaudeChoice = undefined;
+  const awaiting = terminalEffortAwaitingClaudeChoice;
+  const expectedPreference = confirmed?.expectedPreference ?? awaiting?.expectedPreference ?? readTerminalEffortPreference(receipt.atMs);
+  if (!expectedPreference) return;
+  terminalEffortPendingChoice = { nonce: nonce!, ...binding, cliId: 'claude-code', requestedEffort: effort,
+    requestedAtMs: confirmed?.requestedAtMs ?? awaiting?.requestedAtMs ?? receipt.atMs, confirmedAtMs: atMs, ...(model ? { model } : {}), source: 'claude-command',
+    enableEpoch: config.terminalEffortWritebackEpoch, expectedPreference };
+  return terminalEffortPendingChoice;
+}
+
+let claudeEffortNotBeforeMs = 0;
+let nativeReasoningNotBeforeMs = 0;
+let lastNativeReasoningKey: string | undefined;
+let nativeReasoningClock: { owner: string; atMs: number } | undefined;
+
+function publishNativeReasoningObservation(observed: NativeReasoningObservation): void {
+  if (closeRequested || !backend || observed.cliId !== lastInitConfig?.cliId) return;
+  const binding = workerSessionEventScope?.currentBinding();
+  const owner = JSON.stringify([cliLifetimeNonce, binding?.runtime?.runtimeId, observed.cliId, observed.nativeSessionId]);
+  if (observed.observedAtMs !== undefined) {
+    if (nativeReasoningClock?.owner === owner && observed.observedAtMs < nativeReasoningClock.atMs) return;
+    nativeReasoningClock = { owner, atMs: observed.observedAtMs };
+  }
+  const userSelection = confirmedTerminalEffortChoice({ cliId: observed.cliId, nativeSessionId: observed.nativeSessionId, cliSpawnGeneration },
+    observed.reasoningEffort, observed.observedAtMs, observed.source as 'native-settings' | 'native-footer' | 'native-summary', observed.model);
+  if (userSelection) observed = { ...observed, userSelection };
+  const { observedAtMs: _time, ...value } = observed;
+  const key = JSON.stringify([owner, value]);
+  if (key === lastNativeReasoningKey && !observed.userSelection) return;
+  lastNativeReasoningKey = key;
+  const publish = () => send({ type: 'native_reasoning', ...observed,
+    ...(typeof cliSpawnGeneration === 'number' ? { cliSpawnGeneration } : {}) });
+  if (workerSessionEventScope && binding) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
+
+function publishAppliedReasoningSelection(path: string, selected?: AppliedReasoningSelection): void {
+  const cliId = lastInitConfig?.cliId;
+  if (!selected || path !== codexBridgeRolloutPath || (cliId !== 'codex' && cliId !== 'traex')
+    || selected.atMs < nativeReasoningNotBeforeMs || selected.atMs > Date.now()) return;
+  const nativeSessionId = cliId === 'codex' ? codexGenerationSessionIdFromRolloutPath(path) : traexSessionIdFromRolloutPath(path);
+  if (!nativeSessionId || (selected.nativeSessionId && selected.nativeSessionId !== nativeSessionId)) return;
+  publishNativeReasoningObservation({ cliId, nativeSessionId, reasoningEffort: selected.reasoningEffort,
+    source: 'native-settings', observedAtMs: selected.atMs, ...(selected.model ? { model: selected.model } : {}) });
+}
+
+function publishNativeReasoningFooter(screen: string, observedAtMs = Date.now()): void {
+  const cliId = lastInitConfig?.cliId;
+  const nativeSessionId = lastInitConfig?.cliSessionId;
+  if ((cliId !== 'codex' && cliId !== 'traex') || !nativeSessionId) return;
+  const reasoningEffort = readNativeReasoningFooter(cliId, screen);
+  if (reasoningEffort !== undefined && (reasoningEffort === null || isNativeReasoningEffort(reasoningEffort))) {
+    publishNativeReasoningObservation({ cliId, nativeSessionId, reasoningEffort, source: 'native-footer', observedAtMs });
+  }
+}
+
+function publishGrokRuntimeObservation(): void {
+  if (!backend || closeRequested || lastInitConfig?.cliId !== 'grok' || !codexBridgeRolloutPath) return;
+  const sessionDir = dirname(codexBridgeRolloutPath);
+  const nativeSessionId = lastInitConfig.cliSessionId;
+  if (!nativeSessionId) return;
+  publishNativeReasoningObservation(readGrokRuntimeObservation(sessionDir, nativeSessionId, Date.now(), nativeReasoningNotBeforeMs));
+}
+
+/** Statusline is emitted on native effort changes (Claude 2.1.322's effortValue
+ * dependency), even without an assistant turn. Do not infer from argv/settings. */
+function publishClaudeEffortObservation(): void {
+  if (!backend || closeRequested || lastInitConfig?.cliId !== 'claude-code') return;
+  // The primary transcript follows in-pane /clear and /resume; pid-state can
+  // continue naming the session that existed when the process was launched.
+  const claudeSessionId = (bridgeJsonlPath ? sessionIdFromJsonlPath(bridgeJsonlPath) : undefined)
+    ?? bridgeObservedCliSessionId
+    ?? lastInitConfig.cliSessionId ?? lastInitConfig.sessionId;
+  const observed = claudeEffortObserver.observe(config.session.dataDir, lastInitConfig.sessionId, {
+    claudeSessionId, notBefore: claudeEffortNotBeforeMs,
+  }) ?? (terminalEffortPendingChoice || terminalEffortAwaitingClaudeChoice ? claudeEffortObserver.lastObservation : undefined);
+  if (!observed) return;
+  const userSelection = confirmedTerminalEffortChoice({ cliId: 'claude-code', nativeSessionId: claudeSessionId, cliSpawnGeneration },
+    observed.reasoningEffort, claudeEffortObserver.lastObservedAtMs, 'statusline', claudeEffortObserver.lastModel);
+  const publish = () => send({ type: 'claude_effort', ...observed, ...(userSelection ? { userSelection } : {}) });
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && binding) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -12818,6 +13223,9 @@ function structuredBridgeIngestPath(
       publishNativeGoal(result.latestGoal);
     }
     if (nativeGoalSourcePath === path) observeNativeGoal();
+    if ((result as CodexDrainResult).latestReasoningSelection) {
+      publishAppliedReasoningSelection(path, (result as CodexDrainResult).latestReasoningSelection);
+    }
     if (structuredBridgeIs('codex')) {
       // Codex resume can copy the whole conversation into a new generation
       // file; content-addressed ids let the queue dedup copied history across
@@ -18990,6 +19398,10 @@ function handleVisibleStartupInteraction(data: string): boolean {
 // in the terminal-OSC decode set.
 const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
+const minimaxFinalReceiver = new MinimaxFinalReceiver(
+  payload => { void handleTrustedCodexAppMarker('final', payload); },
+  message => log(`${cliName()} ${message}`),
+);
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
 /** ANSI-stripped PTY tail scanned for Pi's "updated while this session was
@@ -19144,6 +19556,13 @@ async function handleTrustedCodexAppMarker(
   payload: Record<string, unknown>,
   control?: { generation: string; seq: number; socket?: Socket; channelId?: number; epoch?: string },
 ): Promise<boolean> {
+  if (kind === 'reasoning_observed' && lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) {
+    if (typeof payload.nativeSessionId !== 'string'
+      || (payload.reasoningEffort !== null && !isNativeReasoningEffort(payload.reasoningEffort))) return false;
+    publishNativeReasoningObservation({ cliId: 'antigravity', nativeSessionId: payload.nativeSessionId,
+      reasoningEffort: payload.reasoningEffort, source: 'acp-config' });
+    return true;
+  }
   if (kind === 'interrupt_target' && control && isCodexAppCliId(lastInitConfig?.cliId)) {
     const reservation = typeof payload.replyTurnId === 'string'
       ? codexAppTurnDispatchQueue.findByTurnId(payload.replyTurnId) : undefined;
@@ -19835,6 +20254,9 @@ function handleAppRunnerOscMarker(body: string): void {
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
+      payload && typeof payload === 'object' ? payload : undefined,
+      { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
   if (!payload || typeof payload !== 'object') return;
   // PR #597 routes every runner marker (thread/state/diagnostic/activity/final
   // and master's lifecycle/steer) through the single trusted handler; codex-app
@@ -20275,6 +20697,7 @@ async function runAmbiguousSubmissionTransaction<T>(
       rewrapped.recoveryFailureReason,
       rewrapped.submissionStarted,
       rewrapped.runnerGenerationUnsafe,
+      rewrapped.traexCatalogAdmissionRequired,
     );
   } finally {
     release();
@@ -23098,6 +23521,9 @@ async function flushPending(): Promise<void> {
         holdFirstAdmissionAfterWebInput();
         break;
       }
+      const catalogAdmissionHead = pendingMessages[0];
+      if (catalogAdmissionHead?.turnId
+        && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -23197,6 +23623,18 @@ async function flushPending(): Promise<void> {
             && itemsWrittenInThisFlush === 0 && !isTypeAhead;
         }
 
+        if (item.turnId && traexAutoModelRuntimeEligible()) {
+          // Independent of beginTurn: same-turn retries return none there, and
+          // durable attempts bypass that block entirely. Directory proof must
+          // still fence every attempt at the final pre-write boundary.
+          const catalogAction = traexAutoModelController?.catalogAdmissionDecision?.(item.turnId);
+          if (catalogAction?.kind === 'switch' || catalogAction?.kind === 'exhausted') {
+            throw new SubmissionWriteError(
+              `TraeX catalog admission ${catalogAction.kind} before the native write`,
+              undefined, false, false, true,
+            );
+          }
+        }
         if (item.turnId && item.dispatchAttempt === undefined) {
           // A live correction belongs to the running model, even when idle
           // turns opt into reselection. Once multiple native inputs coexist,
@@ -23209,10 +23647,21 @@ async function flushPending(): Promise<void> {
               traexAutoModelTurnReplayForbidden = item.noReplay === true;
             }
             const action = traexAutoModelController?.beginTurn(item.turnId);
-            // A fallback-to-core transition must be handled before dequeueing.
-            // Reaching it here means a future input path bypassed the shared
-            // pre-flush gate. The input is already dequeued: keep this turn on
-            // the running pool model rather than throwing into a retry loop.
+            if (action?.kind === 'switch' && action.reason === 'catalog_unavailable') {
+              throw new SubmissionWriteError(
+                'TraeX catalog admission changed before the native write',
+                undefined, false, false, true,
+              );
+            }
+            if (action?.kind === 'exhausted'
+              && traexAutoModelController?.catalogAdmissionDecision?.(item.turnId)?.kind === 'exhausted') {
+              throw new SubmissionWriteError(
+                'TraeX catalog is empty before the native write',
+                undefined, false, false, true,
+              );
+            }
+            // A preferred-model reset is still safe to retain at this late edge.
+            // Catalog admission above is not: it must requeue and rotate instead.
             if (action?.kind === 'switch') {
               log(
                 `TraeX auto-model skipped preferred-model reset at the write edge `
@@ -23589,6 +24038,7 @@ async function flushPending(): Promise<void> {
               msg,
               {
                 turnId: item.turnId,
+                dispatchAttempt: item.dispatchAttempt,
                 ...(lastInitConfig?.cliId === 'codex'
                   && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
                   ? { correlateTranscript: true as const } : {}),
@@ -23621,6 +24071,19 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {
+          // prepareNormalWrite threw before invoking the adapter. This is a
+          // proven pre-write refusal, never an ambiguous submission: restore
+          // the exact head and rotate after the flush mutex has been released.
+          pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          if (item.turnId) queueMicrotask(() => {
+            if (pendingMessages[0] !== item || !item.turnId) return;
+            if (!admitTraexCatalogModelBeforeInput(item.turnId, item.dispatchAttempt)) void flushPending();
+          });
+          break;
+        }
         recoveryFailureReason = err instanceof SubmissionWriteError
           ? err.recoveryFailureReason
           : recoveryFailureReason;
@@ -24352,6 +24815,9 @@ function startScreenUpdates(): void {
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {
         let content = lastContent;
         let changed = false;
+        let refreshed = false;
+        let nativeScreen: string | undefined;
+        const observedAtMs = Date.now();
 
         // Capture only when the pane has emitted output since our last snapshot.
         // During idle (the steady state for a parked session) this skips a tmux
@@ -24367,6 +24833,7 @@ function startScreenUpdates(): void {
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
         })) {
+          refreshed = true;
           lastSnapshotPtyActivity = ptyActivity;
           lastSnapshotGridRevision = gridRevision;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
@@ -24388,10 +24855,12 @@ function startScreenUpdates(): void {
               const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
               if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
             }
+            nativeScreen = lastAnalyzerSnapshot;
           } else if (renderer) {
             const snap = renderer.snapshot();
             content = snap.content;
             changed = snap.changed;
+            nativeScreen = renderer.rawSnapshot();
             if (suggestionReader) promptSuggestions.observe(suggestionReader(renderer.viewportCells()), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
           } else {
             return null;
@@ -24399,7 +24868,7 @@ function startScreenUpdates(): void {
           lastContent = content;
         }
 
-        return { content, changed };
+        return { content, changed, refreshed, nativeScreen, observedAtMs };
       }, projectedRuntimeScreenStatus);
       if (!snapshot) return;
       // TRAE's question page sits still once drawn: the tick's screen catches
@@ -24412,6 +24881,9 @@ function startScreenUpdates(): void {
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        if (snapshot.refreshed && status === 'idle' && snapshot.nativeScreen) {
+          publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+        }
       }
       // Kimi paints its cache-expiry menu once and then sits still: the
       // per-chunk hold check can miss it while the renderer is still parsing
@@ -25397,6 +25869,17 @@ async function spawnCliBody(
   const spawnGeneration = ++cliSpawnGeneration;
   localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
+  claudeEffortNotBeforeMs = spawnStartedAtMs;
+  claudeEffortObserver.reset();
+  terminalEffortTracker.reset();
+  terminalEffortPendingChoice = undefined;
+  terminalEffortAwaitingClaudeChoice = undefined;
+  terminalEffortSavedNonce = undefined;
+  terminalEffortEnabledSinceMs = config.terminalEffortWriteback ? spawnStartedAtMs : undefined;
+  terminalEffortEnableEpoch = config.terminalEffortWriteback ? config.terminalEffortWritebackEpoch : undefined;
+  nativeReasoningNotBeforeMs = spawnStartedAtMs;
+  lastNativeReasoningKey = undefined;
+  nativeReasoningClock = undefined;
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -30984,6 +31467,10 @@ async function spawnCliBody(
     const bridgeClaudeDataDir = scratchMappings
       ? scratchViewPath(scratchMappings, claudeDataDir)
       : claudeDataDir;
+    // A per-bot config dir lives in the sandbox's writable bot home.
+    claudeProjectsRoot = claudeProjectsRootForLaunch(bridgeClaudeDataDir, claudeProjectsRoot, {
+      noFollow: isolationBotHome !== undefined,
+    });
     // On macOS the clone cwd is a different path and Claude keys its project
     // dir by the realpath of ITS cwd; Linux keeps the identical path. Resolve
     // via the glob-aware helper so a long (>200-char) truncated+hashed project
@@ -31555,6 +32042,7 @@ async function spawnCliBody(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
     lastCliExitServerReplaced = exitMarksServerReplaced({
       intentionalRestart,
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
@@ -32089,10 +32577,15 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
+  if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   // Invalidate an in-flight async spawn before any other teardown hook runs. The
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  claudeEffortObserver.reset();
+  terminalEffortTracker.reset();
+  lastNativeReasoningKey = undefined;
+  nativeReasoningClock = undefined;
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
   if (backend) previousCliEndedAtMs = Date.now();
@@ -32885,6 +33378,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
+              noteTerminalEffortInput(ws, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -32973,6 +33467,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
+              noteTerminalEffortInput(ws, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -33087,6 +33582,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
+              noteTerminalEffortInput(ws, msg.data);
               noteWebTerminalInput(msg.data);
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
@@ -36232,9 +36728,11 @@ function startTranscriptImagePurge(
       ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend).claudeJsonlPath
       : undefined,
   );
-  // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl. Pin the independently known
-  // projects root so an ancestor alias in the path cannot redefine containment.
-  const purgeOptions = (jsonlPath: string) => ({ trustedProjectsRoot: dirname(dirname(jsonlPath)) });
+  // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl, checked against the root
+  // resolved when the CLI was launched — not one derived from the path itself,
+  // which a link at or above `projects` would move along. Without a pinned
+  // root (null) nothing is trusted and the purge declines.
+  const purgeOptions = { trustedProjectsRoot: claudeProjectsRoot ?? null };
   const plan = planPurgeRequest({
     cliId: lastInitConfig?.cliId,
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
@@ -36244,7 +36742,7 @@ function startTranscriptImagePurge(
     childPid: backend?.getChildPid?.(),
     sandboxMode: lastResolvedSandboxMode,
     platform: process.platform,
-    scan: scanTarget => purgeUndersizedImages(scanTarget.jsonlPath, { ...purgeOptions(scanTarget.jsonlPath), dryRun: true }),
+    scan: scanTarget => purgeUndersizedImages(scanTarget.jsonlPath, { ...purgeOptions, dryRun: true }),
   });
   if (plan.kind === 'decline') {
     log(`Transcript image purge declined (${plan.logReason})`);
@@ -36271,7 +36769,7 @@ function startTranscriptImagePurge(
           wait: ms => delay(ms),
           provablyGone: pid => !pidNotProvablyGone(pid),
         }, { ownedPids: retiring.processScope }),
-        purge: () => purgeUndersizedImages(plan.target.jsonlPath, purgeOptions(plan.target.jsonlPath)),
+        purge: () => purgeUndersizedImages(plan.target.jsonlPath, purgeOptions),
       });
       log(`Transcript image purge ${outcome.kind}: ${'report' in outcome ? describePurgeReport(outcome.report) : outcome.detail}`);
     },
@@ -36747,8 +37245,14 @@ async function sendFatalWorkerErrorAndExit(
   }
   const rawMessage = err instanceof Error ? err.message : String(err);
   const message = chatSafeFatalErrorMessage(err);
-  // The daemon posts `message` into the chat; the full text stays in this log.
-  if (message !== rawMessage) log(`Fatal worker error (full text, local log only): ${rawMessage}`);
+  // The daemon posts `message` into the chat; the full text always lands in
+  // this log as well. Only logging it when the chat copy differed left a
+  // startup failure whose message was already chat-safe (a pane that died
+  // before pipe-pane: exit status + last screen) with no reason at all in the
+  // worker's own log — just "Failed fresh launch: retired …" (#3470).
+  log(message !== rawMessage
+    ? `Fatal worker error (full text, local log only): ${rawMessage}`
+    : `Fatal worker error: ${rawMessage}`);
   const sandboxNamespace = sandboxNamespaceDiagnosis(rawMessage);
   await sendAndFlush({
     type: 'error',
@@ -36845,6 +37349,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'traex_model_pool_prune_result': {
+      const pending = pendingTraexModelPoolPrunes.get(msg.requestId);
+      if (!pending) break;
+      pendingTraexModelPoolPrunes.delete(msg.requestId);
+      clearTimeout(pending.timeout);
+      pending.resolve(msg.result);
+      break;
+    }
     case 'protected_mcp_secret_channel_result': {
       const pending = pendingProtectedSecretChannels.get(msg.requestId);
       if (!pending) {
@@ -37903,6 +38415,15 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       } catch {
         send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'error' });
+      }
+      break;
+    }
+
+    case 'terminal_effort_writeback_ack': {
+      if (terminalEffortPendingChoice?.nonce === msg.nonce) {
+        terminalEffortSavedNonce = msg.nonce;
+        terminalEffortPendingChoice = undefined;
+        terminalEffortAwaitingClaudeChoice = undefined;
       }
       break;
     }
@@ -39136,12 +39657,19 @@ process.on('message', (raw: unknown, handle: unknown) => {
 // The daemon starts every worker with an empty backlog.
 publishedCliInputBacklog = cliInputBacklogKey({ pending: false });
 setInterval(publishCliInputBacklog, 1_000).unref?.();
+// Runtime effort reporting cannot depend on a PTY redraw or a new model turn.
+const claudeEffortPollTimer = setInterval(publishClaudeEffortObservation, 1_000);
+claudeEffortPollTimer.unref?.();
+const grokRuntimePollTimer = setInterval(publishGrokRuntimeObservation, 1_000);
+grokRuntimePollTimer.unref?.();
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。
 (process as NodeJS.EventEmitter).emit(WORKER_IPC_HANDLER_READY_EVENT);
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  clearInterval(claudeEffortPollTimer);
+  clearInterval(grokRuntimePollTimer);
   workerFinalOutputHandoff?.stop();
   if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
   codexUpgradeTimer = undefined;

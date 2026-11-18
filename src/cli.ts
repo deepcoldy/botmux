@@ -3221,7 +3221,7 @@ async function cmdRestart(): Promise<void> {
 
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      const { restartFleet, resolveFleetMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
         const r = restartFleet({
@@ -3236,8 +3236,8 @@ async function cmdRestart(): Promise<void> {
         }
         // Health-gate on every supervised member (bot daemons + dashboard), so a
         // restart that leaves the dashboard down is reported unhealthy, not "ok".
-        const names = fleetMemberNames();
-        health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
+        const members = resolveFleetMembers();
+        health = waitFleetOnline(members, pm2StartVerifyTimeoutMs(members.length));
         if (!health.healthy) {
           throw new Error(
             `[restart] fleet 未在超时时间内全部上线 (${health.online}/${health.expected})；`
@@ -20136,6 +20136,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
   else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
+  else if (__entrySubcommand === 'reply-file-sanitizer') {
+    await import('./reply-file-sanitizer.js');
+    process.exit(process.exitCode ?? 0);
+  }
   else if (__entrySubcommand === 'background-execution-runner') {
     await import('./background-execution-runner.js');
     process.exit(process.exitCode ?? 0);
@@ -21048,6 +21052,8 @@ async function cmdPlugin(args: string[]): Promise<void> {
       if (!pluginRegistryCache.plugins[pluginId]) throw new Error(`plugin_not_installed:${pluginId}`);
       const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
       if (enable) {
+        const { assertPluginPrerequisitesReady } = await import('./core/plugins/prerequisites.js');
+        await assertPluginPrerequisitesReady(pluginId);
         if (botSelector) {
           updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
         } else {

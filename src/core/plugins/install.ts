@@ -25,6 +25,7 @@ import {
 import type { PluginMcpServer } from './types.js';
 import { createHash } from 'node:crypto';
 import { assertPluginMutationGuard, type PluginMutationGuard } from './mutation-guard.js';
+import { prepareInstalledPlugin } from './prerequisites.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
@@ -160,6 +161,7 @@ function commitPluginInstall(staged: StagedPluginRecord, stagedDir: string): Ins
     else removePluginMcpDescriptor(pluginId);
     const record = upsertInstalledPlugin(staged.record);
     replacement.commit();
+    prepareInstalledPlugin(record);
     return { record, runtimeDir: replacement.runtimeDir };
   } catch (error) {
     try { restorePluginMcpPrivateSnapshot(pluginId, privateSnapshot); } catch { /* preserve the original error */ }
