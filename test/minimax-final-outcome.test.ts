@@ -107,6 +107,32 @@ describe('MiniMax fragmented final settlement', () => {
     expect(deliver).toHaveBeenCalledExactlyOnceWith({ ...owner, content: 'ok' });
   });
 
+  it.each(['single-final', 'final-end', 'transaction'])(
+    'rejects a stale %s with the same turnId before accepting the current attempt', scenario => {
+      const deliver = vi.fn(), log = vi.fn();
+      const receiver = new MinimaxFinalReceiver(deliver, log);
+      const stale = { turnId: 'om_current', dispatchAttempt: 1 };
+      const current = { turnId: 'om_current', dispatchAttempt: 2 };
+      const id = 'tx-stale';
+      if (scenario === 'single-final') {
+        receiver.accept('final', { ...stale, content: 'old answer' }, current);
+      } else if (scenario === 'final-end') {
+        receiver.accept('final-end', { ...stale, id, total: 1 }, current);
+      } else {
+        receiver.accept('final-start', { ...stale, id, total: 1 }, current);
+        receiver.accept('final-chunk', { id, index: 0, data: Buffer.from('old answer').toString('base64') }, current);
+        receiver.accept('final-end', { ...stale, id, total: 1 }, current);
+      }
+      expect(deliver).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledTimes(scenario === 'transaction' ? 2 : 1);
+      for (const [message] of log.mock.calls) {
+        expect(message).toContain('mismatched dispatch attempt (marker=1, current=2)');
+      }
+
+      receiver.accept('final', { ...current, content: 'current answer' }, current);
+      expect(deliver).toHaveBeenCalledExactlyOnceWith({ ...current, content: 'current answer' });
+    });
+
   it.each(['gap', 'timeout', 'exit', 'interleaved', 'invalid-start', 'missing-start'])(
     'settles the identified turn exactly once on %s and preserves the next turn', scenario => {
       vi.useFakeTimers();

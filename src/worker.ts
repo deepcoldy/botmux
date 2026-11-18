@@ -23568,6 +23568,7 @@ async function flushPending(): Promise<void> {
               msg,
               {
                 turnId: item.turnId,
+                dispatchAttempt: item.dispatchAttempt,
                 ...(lastInitConfig?.cliId === 'codex'
                   && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
                   ? { correlateTranscript: true as const } : {}),

@@ -43,7 +43,7 @@ let active: AbortController | undefined;
 let closing = false;
 let processing = false;
 let buffer = '';
-const queue: Array<{ content: string; turnId?: string }> = [];
+const queue: Array<{ content: string; turnId?: string; dispatchAttempt?: number }> = [];
 const prompt = () => output.line('›');
 let displayLineStart = true;
 // Keep model text distinct from the standalone ready prompt, even across
@@ -125,7 +125,8 @@ async function drain(): Promise<void> {
           },
         }, controller.signal);
         if (!closing) writeMinimaxFinal(output, { content: result.content, usage: result.usage,
-          ...(turn.turnId ? { turnId: turn.turnId } : {}), startedAtMs, completedAtMs: Date.now() });
+          ...(turn.turnId ? { turnId: turn.turnId } : {}),
+          ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}), startedAtMs, completedAtMs: Date.now() });
       } catch (error) {
         if (!closing) {
           const errorCode = controller.signal.reason === 'turn_budget_exhausted' ? 'turn_budget_exhausted'
@@ -136,6 +137,7 @@ async function drain(): Promise<void> {
             : `MiniMax Code 执行失败：${(error instanceof Error ? error.message : String(error)).slice(0, 16_384)}`;
           finishDisplay(); displayText(message); finishDisplay();
           writeMinimaxFinal(output, { content: message, errorCode, ...(turn.turnId ? { turnId: turn.turnId } : {}),
+            ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
             startedAtMs, completedAtMs: Date.now() });
         }
       } finally {
@@ -156,7 +158,9 @@ function receiveLine(line: string): void {
   try {
     const value = JSON.parse(Buffer.from(line.slice('::botmux-minimax:'.length), 'base64').toString('utf8'));
     if (value?.type !== 'message' || typeof value.content !== 'string') throw new Error('invalid frame');
-    queue.push({ content: value.content, ...(typeof value.replyTurnId === 'string' ? { turnId: value.replyTurnId } : {}) });
+    queue.push({ content: value.content,
+      ...(typeof value.replyTurnId === 'string' ? { turnId: value.replyTurnId } : {}),
+      ...(typeof value.replyDispatchAttempt === 'number' ? { dispatchAttempt: value.replyDispatchAttempt } : {}) });
     void drain();
   } catch { output.line('[MiniMax Code] invalid input frame'); }
 }

@@ -115,5 +115,6 @@ export function writeMinimaxFinal(writer: RunnerControlWriter, payload: { conten
     const data = bytes.subarray(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES).toString('base64');
     writer.marker('final-chunk', { id, index: i, data });
   }
-  writer.marker('final-end', { id, total, turnId: payload.turnId });
+  writer.marker('final-end', { id, total, turnId: payload.turnId,
+    ...(payload.dispatchAttempt !== undefined ? { dispatchAttempt: payload.dispatchAttempt } : {}) });
 }

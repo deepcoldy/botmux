@@ -441,28 +441,45 @@ it('settles only the second large ACP answer across the real runner control chan
   const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
   const decoder = new RunnerControlDecoder();
   const finals: Array<Record<string, unknown>> = [];
+  const frames: Array<{ kind: string; payload: Record<string, unknown> }> = [];
   let nextTurnSettled!: () => void;
   const settled = new Promise<void>(resolve => { nextTurnSettled = resolve; });
-  const scope = { lastInitConfig: { cliId: 'minimax' }, currentBotmuxTurnId: 'large',
+  const scope = { lastInitConfig: { cliId: 'minimax' }, currentBotmuxTurnId: 'large', currentBotmuxDispatchAttempt: 0,
     decodeCodexAppPayload: loadWorkerFunction('decodeCodexAppPayload', {}),
     handleTrustedCodexAppMarker: () => {}, minimaxFinalReceiver: new MinimaxFinalReceiver(payload => {
       finals.push(payload);
-      if (payload.turnId === 'next') nextTurnSettled();
-      scope.currentBotmuxTurnId = 'next';
+      if (payload.turnId === 'large') {
+        scope.currentBotmuxTurnId = 'next';
+        scope.currentBotmuxDispatchAttempt = 1;
+      } else if (payload.turnId === 'next') nextTurnSettled();
     }) };
-  const handle = loadWorkerFunction<(body: string) => void>('handleAppRunnerOscMarker', scope);
+  const handleMarker = loadWorkerFunction<(body: string) => void>('handleAppRunnerOscMarker', scope);
+  const handle = (body: string) => {
+    const separator = body.indexOf(':');
+    frames.push({ kind: body.slice(0, separator),
+      payload: JSON.parse(Buffer.from(body.slice(separator + 1), 'base64').toString('utf8')) });
+    handleMarker(body);
+  };
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => decoder.push(chunk, true, handle));
   try {
-    for (const [content, replyTurnId] of [['two-large-answers', 'large'], ['hello', 'next']]) {
-      child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId })).toString('base64')}\n`);
+    for (const [content, replyTurnId, replyDispatchAttempt] of [['two-large-answers', 'large', 0], ['hello', 'next', 1]] as const) {
+      child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId, replyDispatchAttempt })).toString('base64')}\n`);
     }
     // The following turn is a deterministic completion barrier even when the large final is lost.
     await Promise.race([settled, closed.then(() => { throw new Error('runner exited before next final'); })]);
     expect(finals.map(final => final.turnId)).toEqual(['large', 'next']);
+    expect(finals.map(final => final.dispatchAttempt)).toEqual([0, 1]);
     expect(finals[0].errorCode).toBeUndefined();
     expect(finals[0].content === '乙\0'.repeat(2_000_000)).toBe(true);
     expect(finals[1].content).toBe('answer:hello');
+    expect(frames.find(frame => frame.kind === 'final-start')?.payload)
+      .toMatchObject({ turnId: 'large', dispatchAttempt: 0 });
+    expect(frames.find(frame => frame.kind === 'final-end')?.payload)
+      .toMatchObject({ turnId: 'large', dispatchAttempt: 0 });
+    expect(frames.filter(frame => frame.kind === 'final')).toHaveLength(1);
+    expect(frames[frames.length - 1]).toMatchObject({ kind: 'final',
+      payload: { turnId: 'next', dispatchAttempt: 1, content: 'answer:hello' } });
   } finally { child.kill('SIGTERM'); await closed; }
 });
 
