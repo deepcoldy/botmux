@@ -384,6 +384,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'traex',
     pressComposerSubmit: pressSubmit,
+    // buildArgs has no --continue fallback. The worker resolves the same
+    // exact native mapping first and reports/fences a missing-ID fresh launch.
+    resumeRequiresCliSessionId: true,
     // Native /goal starts work and can cold-start an empty topic.
     defaultPassthroughCommands: ['/goal'],
     // codex_core-based TUI: hook-review flow + legacy-data migration picker.

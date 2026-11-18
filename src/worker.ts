@@ -416,6 +416,7 @@ import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestored
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import { BridgeBlindTurnWatch, blindTurnNeedsNotice, type BridgeReadPosition } from './services/claude-bridge-blind-turn.js';
 import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
+import { WebTerminalInputController, WebTerminalInputWireState } from './core/web-terminal-input-controller.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -439,7 +440,7 @@ import {
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
-import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexSessionIdByBotmuxSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
@@ -4411,11 +4412,11 @@ let webTerminalInputGenerationAtSpawn = 0;
 let lastWebTerminalSubmitAtMs = 0;
 let webTerminalSubmitGeneration = 0;
 
-function noteWebTerminalInput(data: string): void {
+function noteWebTerminalInput(data: string, submits = terminalInputSubmits(data)): void {
   lastWebTerminalInputAtMs = Date.now();
   webTerminalInputGeneration++;
   webTerminalInputBackendScreenRevision = backendScreenRevision;
-  if (terminalInputSubmits(data)) {
+  if (submits) {
     lastWebTerminalSubmitAtMs = lastWebTerminalInputAtMs;
     webTerminalSubmitGeneration++;
   }
@@ -16317,12 +16318,36 @@ function observeRestoredStartupHistoryOnScreen(): boolean {
   return true;
 }
 
+/** Initialize admission only from the resolved launch, not a requested resume
+ * that an adapter or restart budget can later demote to fresh. */
+function applyTraexStartupLaunchMode(
+  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'adoptMode'>,
+  launch: { resume: boolean; nativeSessionId?: string; persistentReattach: boolean },
+): void {
+  traexNativeStartupInputPending = shouldFenceTraexStartupInput({
+    cliId: cfg.cliId,
+    programStatusEnabled: programStatusStream !== null,
+    resume: launch.resume,
+    adoptMode: cfg.adoptMode,
+    remoteViewer: !!remoteWsUrl,
+    persistentReattach: launch.persistentReattach,
+  });
+  traexFirstInputAdmissionPending = traexNativeStartupInputPending;
+  if (cfg.cliId === 'traex' && launch.resume && launch.nativeSessionId && !cfg.adoptMode && cliAdapter) {
+    cliAdapter = {
+      ...cliAdapter,
+      startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
+    };
+  }
+}
+
 function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
   if (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending) return false;
   // Snapshot/read-only backends and RPC engines retain their existing input
   // contracts. This fence is for a local terminal this worker launched.
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
   if (!backend || (cliRestartInProgress && !replacementSpawnInProgress)) return true;
+  if (pendingWebTerminalInput()) return true;
   const webInputUnchanged = webTerminalInputGeneration === webTerminalInputGenerationAtSpawn;
   if (!webInputUnchanged) {
     // An old empty footer is not proof about the composer after human input.
@@ -16360,6 +16385,8 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         const generation = cliSpawnGeneration;
         const revision = backendScreenRevision;
         const inputGeneration = webTerminalInputGeneration;
+        const retryDeadline = lastWebTerminalInputAtMs + FIRST_PROMPT_HARD_TIMEOUT_MS;
+        let accepted = false;
         traexStartupRendererDrain = token;
         void observedRenderer.writeAndFlush('').then(() => {
           if (traexStartupRendererDrain !== token || backend !== target || renderer !== observedRenderer
@@ -16368,10 +16395,28 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           traexStartupRendererWebInputGeneration = inputGeneration;
           traexStartupRendererScreenRevision = revision;
+          accepted = true;
           markPromptReady();
           void flushPending();
         }).catch(() => {}).finally(() => {
-          if (traexStartupRendererDrain === token) traexStartupRendererDrain = undefined;
+          if (traexStartupRendererDrain !== token) return;
+          traexStartupRendererDrain = undefined;
+          // Rejecting stale evidence is not the end of the admission check.
+          // Retry only this renderer/runtime, at a bounded rate and within the
+          // original Web-input recovery window; never force an Enter.
+          if (accepted || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
+            || backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
+            || (cliRestartInProgress && !replacementSpawnInProgress)
+            || Date.now() >= retryDeadline || traexStartupWebRecheck) return;
+          traexStartupWebRecheck = setTimeout(() => {
+            traexStartupWebRecheck = undefined;
+            if (backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
+              || (cliRestartInProgress && !replacementSpawnInProgress)
+              || Date.now() >= retryDeadline) return;
+            markPromptReady();
+            void flushPending();
+          }, 1_000);
+          traexStartupWebRecheck.unref?.();
         });
       }
       return true;
@@ -16410,22 +16455,27 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
   const adapter = cliAdapter;
   const generation = cliSpawnGeneration;
   const startedAt = Date.now();
-  const webInputGeneration = webTerminalInputGeneration;
+  const initialRenderer = renderer;
   const stillWaiting = (): boolean => awaitingFirstPrompt
     && backend === observedBackend && idleDetector === detector && cliSpawnGeneration === generation
-    && webTerminalInputGeneration === webInputGeneration
+    && renderer === initialRenderer
+    && !(cliRestartInProgress && !replacementSpawnInProgress)
     && Date.now() - startedAt < FIRST_PROMPT_HARD_TIMEOUT_MS;
   const check = async (): Promise<void> => {
     try {
       if (!stillWaiting() || !renderer || inflightInputs.hasUnacked()
         || Date.now() - lastPtyOutputAtMs < 2_000) return;
+      // A human input change invalidates this sample, not the whole poller.
+      // The next tick takes new evidence without resetting the total deadline.
+      const webInputGeneration = webTerminalInputGeneration;
       const observedRenderer = renderer;
       const revision = backendScreenRevision;
       const outputGeneration = ptyOutputGeneration.snapshot();
       // xterm writes asynchronously. Read only after its queue drains, and
       // reject a concurrent redraw, resync, restart or web-terminal input.
       await observedRenderer.writeAndFlush('');
-      if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
+      if (!stillWaiting() || webTerminalInputGeneration !== webInputGeneration
+        || renderer !== observedRenderer || backendScreenRevision !== revision
         || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
         || Date.now() - lastPtyOutputAtMs < 2_000) return;
       let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
@@ -16438,7 +16488,8 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
         // the exact generation/output/web-input fence across that await.
         if (!(observedBackend instanceof TmuxPipeBackend)) return;
         screen = await observedBackend.captureViewportAsync();
-        if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
+        if (!stillWaiting() || webTerminalInputGeneration !== webInputGeneration
+          || renderer !== observedRenderer || backendScreenRevision !== revision
           || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
           || Date.now() - lastPtyOutputAtMs < 2_000) return;
         if (!screen || !adapter?.startupReadyFromHistory?.(screen)
@@ -23024,6 +23075,7 @@ function promotePendingHumanInterruption(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  if (webTerminalInputWireDirty()) return;
   const guardTraexFirstAdmission = traexFirstInputAdmissionPending || traexNativeStartupInputPending;
   const firstAdmissionWebInputGeneration = webTerminalInputGeneration;
   const firstAdmissionBackend = backend;
@@ -26209,15 +26261,6 @@ async function spawnCliBody(
     cliAdapter = launchAdapter.adapter;
     waitedForMissingCli = launchAdapter.waited;
   }
-  if (effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true) {
-    // The native resume target is host-owned. A resumed transcript can occupy
-    // the entire viewport while a nonblocking repository notice hides both
-    // footer rows, so cold-start banner cells need not remain visible.
-    cliAdapter = {
-      ...cliAdapter,
-      startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
-    };
-  }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
   // A version-gated adapter (codex / traex) is decided per launch either way.
   if (cliAdapter.programStatusMinVersion !== undefined) {
@@ -27885,6 +27928,11 @@ async function spawnCliBody(
   let effectiveResume = cfg.resume ?? false;
   let effectiveCliSessionId = cfg.cliSessionId;
   let effectiveAdapterSessionId = adapterSessionId;
+  if (effectiveCliId === 'traex' && effectiveResume && !willReattachPersistent && !effectiveCliSessionId) {
+    // Preserve the adapter's existing exact Botmux-to-native lookup, but make
+    // its result authoritative BEFORE deciding whether this launch is fresh.
+    effectiveCliSessionId = findTraexSessionIdByBotmuxSessionId(effectiveAdapterSessionId);
+  }
   // Claude-family transcripts are scoped by cwd. `/cd` keeps the same Botmux /
   // CLI session id, so mirror the newest native transcript into the new cwd's
   // project directory before the adapter probes or launches `--resume`.
@@ -28081,6 +28129,14 @@ async function spawnCliBody(
   lastSpawnEffectiveResume = effectiveResume;
   lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
   lastSpawnEffectiveAdapterSessionId = effectiveAdapterSessionId;
+  // The adapter must not silently turn a requested resume into a fresh launch
+  // after startup admission was initialized. Resolve the native identity with
+  // the same exact Botmux mapping used by buildArgs, then fence the ACTUAL mode.
+  applyTraexStartupLaunchMode(cfg, {
+    resume: effectiveResume,
+    nativeSessionId: effectiveCliSessionId,
+    persistentReattach: willReattachPersistent,
+  });
   // Inputs whose turn had already started when the previous CLI died: a
   // resumed conversation holds them (the restart note asks it to continue), so
   // they wait in the tracker until this CLI reaches its prompt and are dropped
@@ -33014,6 +33070,146 @@ async function restartCliProcess(
   }
 }
 
+interface WebTerminalInputTarget {
+  backend: SessionBackend | null;
+  lifetime: typeof cliLifetimeNonce;
+  generation: number;
+  scope: typeof workerSessionEventScope;
+  binding: ReturnType<WorkerSessionEventScope['currentBinding']>;
+}
+const webTerminalInputControllers = new Set<WebTerminalInputController<WebTerminalInputTarget>>();
+let webTerminalDirtyTarget: WebTerminalInputTarget | undefined;
+let webTerminalWire: { target: WebTerminalInputTarget; state: WebTerminalInputWireState } | undefined;
+function webTerminalInputWireState(target: WebTerminalInputTarget): WebTerminalInputWireState {
+  if (!webTerminalWire || webTerminalWire.target.backend !== target.backend
+    || webTerminalWire.target.lifetime !== target.lifetime
+    || webTerminalWire.target.generation !== target.generation) {
+    webTerminalWire = { target, state: new WebTerminalInputWireState() };
+  }
+  return webTerminalWire.state;
+}
+function webTerminalInputWireDirty(): boolean {
+  const target = webTerminalDirtyTarget;
+  return !!target && backend === target.backend && cliLifetimeNonce === target.lifetime
+    && cliSpawnGeneration === target.generation;
+}
+type WebAttachInput = { ws: WebSocket; target: WebTerminalInputTarget; data: string; owner?: symbol };
+const webTerminalAttachInputs = new Set<WebAttachInput[]>();
+function webTerminalInputTargetCurrent(ws: WebSocket, target: WebTerminalInputTarget): boolean {
+  return !closeRequested && !webTerminalInputWireDirty()
+    && ws.readyState === WebSocket.OPEN && authedClients.has(ws) && !nativeSessionForkPending()
+    && backend === target.backend && cliLifetimeNonce === target.lifetime && cliSpawnGeneration === target.generation
+    && workerSessionEventScope === target.scope && target.scope?.currentBinding() === target.binding;
+}
+function pendingWebTerminalInput(): boolean {
+  if (webTerminalInputWireDirty()) return true;
+  for (const input of webTerminalInputControllers) if (input.pending) return true;
+  for (const queue of webTerminalAttachInputs) {
+    if (queue.some(input => webTerminalInputTargetCurrent(input.ws, input.target))) return true;
+  }
+  return webTerminalInputWireDirty();
+}
+function recheckAfterWebInput(target: WebTerminalInputTarget, ws: WebSocket): void {
+  if (!target.backend || !webTerminalInputTargetCurrent(ws, target)
+    || lastInitConfig?.cliId !== 'traex' || !backendScreenEvidenceIsAuthoritativeForMutation()
+    || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
+    || (cliRestartInProgress && !replacementSpawnInProgress)) return;
+  try {
+    // The generation already owns a bounded startup poller. A cleared parser
+    // hold must not create a second poller or reset its total deadline.
+    const check = () => {
+      if (!webTerminalInputTargetCurrent(ws, target)) return;
+      markPromptReady();
+      void flushPending();
+    };
+    if (target.scope && target.binding) target.scope.run(target.binding, check);
+    else check();
+  } catch { /* Observation cannot swallow authenticated input. */ }
+}
+function queueWebTerminalAttachInput(ws: WebSocket, queue: WebAttachInput[],
+  target: WebTerminalInputTarget, data: string, owner?: symbol): false | 'queued' {
+  const bytes = queue.reduce((sum, input) => sum + Buffer.byteLength(input.data, 'utf8'), 0);
+  if (queue.length >= 128 || bytes + Buffer.byteLength(data, 'utf8') > 256 * 1024) {
+    queue.length = 0; webTerminalAttachInputs.delete(queue);
+    ws.close(1009, 'terminal input backlog exceeded'); return false;
+  }
+  queue.push({ ws, target, data, owner }); webTerminalAttachInputs.add(queue); return 'queued';
+}
+function markWebTerminalInputWireUncertain(ws: WebSocket, target: WebTerminalInputTarget): void {
+  if (backend !== target.backend || cliLifetimeNonce !== target.lifetime
+    || cliSpawnGeneration !== target.generation) {
+    ws.close(1011, 'terminal input target changed'); return;
+  }
+  webTerminalDirtyTarget = target;
+  webTerminalInputWireState(target).fail();
+  log('Web terminal paste completion is unproven; this CLI generation is held');
+  send({ type: 'user_notify', message: '网页粘贴只完成了一部分，当前 CLI 输入状态尚未确认；已暂停后续网页输入和自动投递，请检查原生终端并明确重建 CLI 后再继续。' });
+  ws.close(1011, 'terminal input state uncertain');
+}
+function replayWebTerminalAttachInput(ws: WebSocket, queue: WebAttachInput[], cp: pty.IPty): void {
+  const inputs = queue.splice(0);
+  webTerminalAttachInputs.delete(queue);
+  for (const input of inputs) {
+    const wire = webTerminalInputWireState(input.target);
+    if (!webTerminalInputTargetCurrent(ws, input.target)) {
+      if (wire.writer.inPaste) markWebTerminalInputWireUncertain(ws, input.target);
+      break;
+    }
+    const write = () => {
+      if (!webTerminalInputTargetCurrent(ws, input.target)) return;
+      try {
+        cp.write(input.data);
+        wire.written(input.data, input.owner ?? Symbol('attach-writer'));
+      } catch {
+        if (wire.writer.pending || /\x1b\[20[01]~|\x9b20[01]~/.test(input.data)) {
+          markWebTerminalInputWireUncertain(ws, input.target);
+        }
+        throw new Error('web_terminal_attach_write_failed');
+      }
+    };
+    try {
+      if (input.target.scope && input.target.binding) input.target.scope.run(input.target.binding, write);
+      else write();
+    } catch { break; }
+  }
+  const latest = inputs.at(-1);
+  if (latest) recheckAfterWebInput(latest.target, ws);
+}
+function makeWebTerminalInputController(ws: WebSocket, auditUser: string | undefined,
+  write: (target: WebTerminalInputTarget, data: string, owner: symbol) => void | boolean | 'queued', countHuman = false
+): WebTerminalInputController<WebTerminalInputTarget> {
+  const input = new WebTerminalInputController<WebTerminalInputTarget>({
+    capture: () => {
+      if (!authedClients.has(ws) || ws.readyState !== WebSocket.OPEN || nativeSessionForkPending()) return;
+      const scope = workerSessionEventScope, binding = scope?.currentBinding();
+      if (scope && !binding?.runtime) return;
+      return { backend, lifetime: cliLifetimeNonce, generation: cliSpawnGeneration, scope, binding };
+    },
+    isCurrent: target => webTerminalInputTargetCurrent(ws, target),
+    wireState: webTerminalInputWireState,
+    runInTarget: (target, run) => target.scope && target.binding ? target.scope.run(target.binding, run) : run(),
+    beforeUserInput: () => cancelDeploymentForTerminalInput(),
+    cancelEffort: async () => { if (codexCliEffortOperation) await cancelCodexCliEffort(); },
+    write,
+    audit: (_target, classified) => auditTerminalInput(auditUser, classified.data),
+    onUserInput: (_target, data, submits) => {
+      noteTerminalEffortInput(ws, data);
+      if (!countHuman) return;
+      noteWebTerminalInput(data, submits);
+      if (usesHerdrSnapshotWebHistory()) {
+        if (data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
+        else if (data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
+      }
+    },
+    onPendingChange: (target, pending) => { if (!pending) recheckAfterWebInput(target, ws); },
+    onOverflow: () => ws.close(1009, 'terminal input backlog exceeded'),
+    onTransportUncertain: target => markWebTerminalInputWireUncertain(ws, target),
+  });
+  webTerminalInputControllers.add(input);
+  ws.once('close', () => { input.dispose(); webTerminalInputControllers.delete(input); });
+  return input;
+}
+
 // ─── HTTP + WebSocket Server ─────────────────────────────────────────────────
 
 function startWebServer(host: string, preferredPort?: number): Promise<number> {
@@ -33271,7 +33467,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               ? lastInitConfig.persistentBackendTarget.socketName
               : undefined);
         let cp: pty.IPty | null = null;
-        const pendingInput: string[] = [];
+        const pendingInput: WebAttachInput[] = [];
+        const inputController = makeWebTerminalInputController(ws, auditUser, (target, data, owner) => {
+          if (cp) { cp.write(data); return true; }
+          return queueWebTerminalAttachInput(ws, pendingInput, target, data, owner);
+        });
+        ws.once('close', () => { pendingInput.length = 0; webTerminalAttachInputs.delete(pendingInput); });
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
@@ -33307,8 +33508,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           });
 
           // Replay any input that arrived during the spawn window.
-          if (!nativeSessionForkPending()) for (const data of pendingInput) cp.write(data);
-          pendingInput.length = 0;
+          replayWebTerminalAttachInput(ws, pendingInput, cp);
         };
 
         // Safety net: if no resize arrives (very old client?), start the
@@ -33326,26 +33526,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 cp.resize(msg.cols, msg.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              // Mouse protocols carry clicks, releases, drags and wheel input;
-              // a mouse-aware TUI may bind any of them to approvals/actions.
-              // A view capability therefore forwards no input bytes at all.
-              if (!authedClients.has(ws)) return;
-              const inputBackend = backend;
-              const inputLifetime = cliLifetimeNonce;
-              const inputRuntimeBinding = workerSessionEventScope?.currentBinding();
-              if (workerSessionEventScope && !inputRuntimeBinding?.runtime) return;
-              if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || workerSessionEventScope?.currentBinding() !== inputRuntimeBinding || !authedClients.has(ws) || nativeSessionForkPending()) return;
-              if (codexCliEffortOperation) {
-                const target = backend;
-                const lifetime = cliLifetimeNonce;
-                await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
-              }
-              auditTerminalInput(auditUser, msg.data);
-              noteTerminalEffortInput(ws, msg.data);
-              if (cp) cp.write(msg.data);
-              else pendingInput.push(msg.data);
+              await inputController.accept(msg.data, { forceUser: msg.forceUser });
             }
           } catch { /* ignore non-JSON or bad messages */ }
         }));
@@ -33374,7 +33555,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         const zSession = lastInitConfig.adoptZellijSession ?? '';
         const cfgPath = ensureZellijAttachConfig();
         let cp: pty.IPty | null = null;
-        const pendingInput: string[] = [];
+        const pendingInput: WebAttachInput[] = [];
+        const inputController = makeWebTerminalInputController(ws, auditUser, (target, data, owner) => {
+          if (cp) { cp.write(data); return true; }
+          return queueWebTerminalAttachInput(ws, pendingInput, target, data, owner);
+        });
+        ws.once('close', () => { pendingInput.length = 0; webTerminalAttachInputs.delete(pendingInput); });
         // While this attach client is live, silence the ObserveBackend's
         // dump-screen/list-panes pollers: each `zellij action` they run makes the
         // server repaint every attached client, which flickers this client's
@@ -33405,8 +33591,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             clientPtys.delete(ws);
             if (ws.readyState === WebSocket.OPEN) ws.close();
           });
-          if (!nativeSessionForkPending()) for (const data of pendingInput) cp.write(data);
-          pendingInput.length = 0;
+          replayWebTerminalAttachInput(ws, pendingInput, cp);
         };
 
         const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
@@ -33418,23 +33603,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!cp) { clearTimeout(spawnTimer); startAttach(msg.cols, msg.rows); }
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              if (!authedClients.has(ws)) return;
-              const inputBackend = backend;
-              const inputLifetime = cliLifetimeNonce;
-              const inputRuntimeBinding = workerSessionEventScope?.currentBinding();
-              if (workerSessionEventScope && !inputRuntimeBinding?.runtime) return;
-              if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || workerSessionEventScope?.currentBinding() !== inputRuntimeBinding || !authedClients.has(ws) || nativeSessionForkPending()) return;
-              if (codexCliEffortOperation) {
-                const target = backend;
-                const lifetime = cliLifetimeNonce;
-                await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
-              }
-              auditTerminalInput(auditUser, msg.data);
-              noteTerminalEffortInput(ws, msg.data);
-              if (cp) cp.write(msg.data);
-              else pendingInput.push(msg.data);
+              await inputController.accept(msg.data, { forceUser: msg.forceUser });
             }
           } catch { /* ignore non-JSON or bad messages */ }
         }));
@@ -33520,6 +33689,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           ws.send(seed + modeSeed + herdrWebCursorSequence());
         }
 
+        const inputController = makeWebTerminalInputController(ws, auditUser, (target, data) => {
+          if (!target.backend) return false;
+          return target.backend.write(data);
+        }, true);
         ws.on('message', bindSessionInputCallback(async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
@@ -33531,29 +33704,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              // Mouse protocols can encode approvals/actions as well as wheel input.
-              // A read-only view capability must never forward bytes to the backend.
-              if (!authedClients.has(ws)) return;
-              const inputBackend = backend;
-              const inputLifetime = cliLifetimeNonce;
-              const inputRuntimeBinding = workerSessionEventScope?.currentBinding();
-              if (workerSessionEventScope && !inputRuntimeBinding?.runtime) return;
-              if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || workerSessionEventScope?.currentBinding() !== inputRuntimeBinding || !authedClients.has(ws) || nativeSessionForkPending()) return;
-              if (codexCliEffortOperation) {
-                const target = backend;
-                const lifetime = cliLifetimeNonce;
-                await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
-              }
-              auditTerminalInput(auditUser, msg.data);
-              noteTerminalEffortInput(ws, msg.data);
-              noteWebTerminalInput(msg.data);
-              if (usesHerdrSnapshotWebHistory()) {
-                if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
-                else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
-              }
-              backend?.write(msg.data);
+              await inputController.accept(msg.data, { forceUser: msg.forceUser });
             } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
               if (!allowReadOnlyRemoteScroll || authedClients.has(ws) || nativeSessionForkPending()) return;
               const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
@@ -34553,7 +34704,7 @@ function _wbRecordOutput(data){
 // 本页发给 CLI 的输入行里大概还有几个没提交的字（估计方法见 unsubmittedLineLength）。
 var _wbLineLen=0;
 function _wbNoteInput(d){_wbLineLen=_wbLineAfter(_wbLineLen,d);}
-function _sendInput(d){if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type:'input',data:d}));_wbNoteInput(d);}}
+function _sendInput(d,forceUser){if(ws_&&ws_.readyState===1&&wsHasWrite===true){ws_.send(JSON.stringify({type:'input',data:d,forceUser:forceUser!==false}));_wbNoteInput(d);}}
 // Pure pointer-motion reports (SGR button code 35 + shift/alt/ctrl modifier
 // bits). Emitted by xterm once the seed re-asserts DECSET 1003 (grok build) —
 // one per cell crossed. Each forwarded report costs a synchronous tmux
@@ -34561,7 +34712,11 @@ function _sendInput(d){if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type
 // would stall the relay for every viewer. Clicks/drags/wheel stay immediate.
 var _MOTION_RE=/^(?:\\x1b\\[<(?:35|39|43|47|51|55|59|63);\\d+;\\d+[Mm])+$/;
 var _motionPend=null,_motionT=0;
+var _wbKeyData=null,_wbPasteEvent=false;
+term.onKey(function(e){_wbKeyData=e.key;});
+if(term.element)term.element.addEventListener('paste',function(){_wbPasteEvent=true;queueMicrotask(function(){_wbPasteEvent=false;});},true);
 term.onData(function(d){
+  var _wbForceUser=_wbKeyData===d||_wbPasteEvent;_wbKeyData=null;
   // 只有已建立的 WS 明确回报「可写」(wsHasWrite===true) 才放行输入。null（还没确认，
   // 含重连中）和 false（这条连接判成只读）一律不发——桌面也要等首帧。照抄 hasToken
   // （这一次 HTTP GET 的判定）会在 WS 不带 Cookie 的 iOS WebView 上让人对着一个不收字
@@ -34587,7 +34742,7 @@ term.onData(function(d){
   // coordinates); dropping it preserves event ordering for the TUI.
   if(_motionT){clearTimeout(_motionT);_motionT=0}
   _motionPend=null;
-  _sendInput(d);
+  _sendInput(d,_wbForceUser);
 });
 var fixedSize=false,_lastC=0,_lastR=0,_rzT=0;
 function _setFixedGrid(enabled){
@@ -34679,6 +34834,7 @@ if(typeof ResizeObserver!=='undefined'){
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  if(_motionT){clearTimeout(_motionT);_motionT=0;}_motionPend=null;_wbKeyData=null;_wbPasteEvent=false;
   // 新连接：字节计数归零、收起上一条连接遗留的字节角标。
   _wbResetBytes();
   // Guard against a hung CONNECTING state (proxy/network black hole): if the
