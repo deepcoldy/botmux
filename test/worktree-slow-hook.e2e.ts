@@ -18,6 +18,10 @@ it('creates an automatic session worktree when the hook exceeds the default but 
   tempRoot = realpathSync(mkdtempSync(join(tmpdir(), 'worktree-slow-hook-')));
   const repo = join(tempRoot, 'repo');
   mkdirSync(repo);
+  // The e2e project keeps the real HOME, so a developer/host-level global
+  // core.hooksPath would make Git ignore this repo's .git/hooks and the slow
+  // hook would never run (silent false green). Ignore global git config.
+  vi.stubEnv('GIT_CONFIG_GLOBAL', '/dev/null');
   const git = (...args: string[]) => execFileSync('git', args, {
     cwd: repo, encoding: 'utf8', env: {
       ...process.env,
