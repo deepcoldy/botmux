@@ -13,6 +13,8 @@ import {
   deriveKanbanColumn,
   effectiveKanbanPosition,
   isOffBoardDormant,
+  isOffBoardIdle,
+  isOffBoardKanbanRow,
 } from '../src/dashboard/web/kanban-model.js';
 import { deriveSessionBoardColumn } from '../src/dashboard/web/sessions.js';
 import { matchesStatusFilter, sessionTaskCardLine } from '../src/dashboard/web/session-task-view.js';
@@ -276,5 +278,68 @@ describe('table and card views share the derivation', () => {
     expect(working).toMatchObject({ tone: 'work' });
     expect(`${working!.label} ${working!.detail ?? ''}`).toMatch(/3/);
     expect(sessionTaskCardLine({ kind: 'idle' }, T0)).toBeNull();
+  });
+});
+
+
+describe('idle sessions do not imply pending work', () => {
+  it('hides idle and silent completed rounds without inventing completion', () => {
+    expect(isOffBoardIdle({ status: 'idle' })).toBe(true);
+    expect(isOffBoardIdle({ status: 'idle', lastTurn: { turnId: 'silent', outcome: 'no_output', at: T0 } })).toBe(true);
+    expect(deriveSessionTaskStatus({ status: 'idle' }).kind).toBe('idle');
+  });
+  it('keeps a newer input on-board until its own outcome arrives', () => {
+    const settled = { status: 'idle', lastTurn: delivered(T0), lastMessageAt: T0 };
+    expect(isOffBoardIdle(settled)).toBe(false);
+    const pending = { ...settled, lastMessageAt: T0 + 1 };
+    expect(deriveSessionTaskStatus(pending).kind).toBe('idle');
+    expect(isOffBoardIdle(pending)).toBe(false);
+    expect(isOffBoardIdle({
+      ...pending,
+      lastTurn: { turnId: 't2', outcome: 'no_output', at: T0 + 2 },
+    })).toBe(true);
+  });
+  it('does not turn legacy rows or held-through maintenance into pending input', () => {
+    expect(isOffBoardIdle({ status: 'idle', lastMessageAt: T0 + 1 })).toBe(true);
+    expect(isOffBoardIdle({
+      status: 'idle',
+      lastMessageAt: T0 + 5,
+      lastTurn: { turnId: 'silent', outcome: 'no_output', at: T0, heldThrough: T0 + 5 },
+    })).toBe(true);
+  });
+  it('keeps live background work on-board even after a no-output round', () => {
+    const lastTurn = { turnId: 'silent', outcome: 'no_output', at: T0 };
+    expect(isOffBoardIdle({ status: 'idle', lastTurn, backgroundTaskCount: 1 })).toBe(false);
+    expect(isOffBoardIdle({ status: 'idle', lastTurn, backgroundTaskCount: 0 })).toBe(true);
+  });
+  it('keeps unfinished work, explicit placement, queued input, results and blockers', () => {
+    for (const facts of [
+      { openTodos: { remaining: 1 } }, { kanbanColumn: 'todo' }, { queued: true },
+      { lastTurn: delivered(T0) }, { pendingRepo: true }, { tuiPromptActive: true },
+      { lastTurn: { turnId: 'failed', outcome: 'interrupted', at: T0 } },
+      { agentAttention: { source: 'agent', reason: 'decision', at: T0 } },
+    ]) expect(isOffBoardIdle({ status: 'idle', ...facts })).toBe(false);
+    for (const status of ['working', 'starting', 'limited', 'stalled', 'closed', 'dormant']) {
+      expect(isOffBoardIdle({ status })).toBe(false);
+    }
+  });
+});
+
+describe('kanban off-board composition follows the active status filter', () => {
+  const staleDormant = {
+    status: 'dormant',
+    lastTurn: { turnId: 'old', outcome: 'no_output', at: Date.now() - RECENT_TURN_ON_BOARD_MS - 1 },
+  };
+  it('hides plain idle rows by default and keeps them under the idle filter', () => {
+    expect(isOffBoardKanbanRow({ status: 'idle' }, '')).toBe(true);
+    expect(isOffBoardKanbanRow({ status: 'idle' }, 'working')).toBe(true);
+    expect(isOffBoardKanbanRow({ status: 'idle' }, 'idle')).toBe(false);
+  });
+  it('hides long-dormant rows under every filter and keeps rows that still imply work', () => {
+    expect(isOffBoardKanbanRow(staleDormant, '')).toBe(true);
+    expect(isOffBoardKanbanRow(staleDormant, 'idle')).toBe(true);
+    expect(isOffBoardKanbanRow({ status: 'working' }, '')).toBe(false);
+    expect(isOffBoardKanbanRow({ status: 'idle', queued: true }, '')).toBe(false);
+    expect(isOffBoardKanbanRow({ status: 'idle', lastTurn: delivered(T0) }, '')).toBe(false);
   });
 });

@@ -406,11 +406,14 @@ export class SessionController {
       if (existing.length === 1) context.scope.execution = existing[0].ref;
       else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
-    // Physical screen status is a runtime observation, not an execution claim:
-    // keep proven runtime-bound attribution, but drop unproven/unbound turn
-    // scopes instead of rejecting the current runtime's idle/working frame.
+    // Physical screen status is a runtime observation, not an execution claim.
+    // A turn that was already running when its physical CLI continued into a
+    // new runtime keeps its display attribution: the execution remains on the
+    // submitted runtime, while the frame observes the continued live runtime.
+    // Unrelated/replaced-process executions still lose scope and are fenced by
+    // the gateway below; no execution is minted from an unknown turnId.
     if (message.type === 'screen_update' && context.scope.runtime && context.scope.execution
-      && !sameRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime)) {
+      && !this.sameOrContinuedRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime, channel)) {
       delete context.scope.execution;
     }
     const continuationFailure = message.continuationFailure as RuntimeExecutionContinuationFailure | undefined;

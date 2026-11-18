@@ -9,6 +9,7 @@ import {
 import {
   BUSY_RUNTIME_STATUSES,
   RECENT_TURN_WINDOW_MS,
+  currentLastTurn,
   deriveSessionTaskStatus,
   normalizeLastTurn,
   taskStatusChangedAt,
@@ -21,6 +22,7 @@ export { KANBAN_COLUMN_IDS, normalizeKanbanColumn, type SessionKanbanColumn };
 interface KanbanRowLike extends SessionTaskFacts {
   status?: string;
   queued?: unknown;
+  backgroundTaskCount?: unknown;
   kanbanColumn?: unknown;
   kanbanColumnAt?: unknown;
   kanbanPosition?: unknown;
@@ -84,6 +86,25 @@ export function isOffBoardDormant(s: KanbanRowLike, now: number = Date.now()): b
   if (s.status !== 'dormant' || activeManualColumn(s)) return false;
   const turnAt = normalizeLastTurn(s.lastTurn)?.at;
   return turnAt === undefined || now - turnAt >= RECENT_TURN_ON_BOARD_MS;
+}
+
+/** No work is implied by a resident CLI waiting at its prompt. Keep explicit
+ * placement, queued/background work and a newer input whose result is still
+ * pending; completed replies and blockers remain on-board. */
+export function isOffBoardIdle(s: KanbanRowLike): boolean {
+  // A valid previous result invalidated by newer input proves a new round has
+  // started but has no outcome yet. Legacy rows without lastTurn do not use
+  // this exception; heldThrough still excludes maintenance activity.
+  const awaitingTurnOutcome = normalizeLastTurn(s.lastTurn) !== undefined && currentLastTurn(s) === undefined;
+  return s.status === 'idle' && !s.queued && !awaitingTurnOutcome
+    && finiteOrZero(s.backgroundTaskCount) <= 0
+    && !activeManualColumn(s) && deriveSessionTaskStatus(s).kind === 'idle';
+}
+
+/** 看板默认收起的行：长期休眠会话，以及没有待办证据的普通空闲会话。
+ *  显式用「空闲」状态筛选时不收起空闲行，否则筛选结果会是一块空板。 */
+export function isOffBoardKanbanRow(s: KanbanRowLike, statusFilter: string): boolean {
+  return isOffBoardDormant(s) || (statusFilter !== 'idle' && isOffBoardIdle(s));
 }
 
 /** 未手动排过序的卡片的排序键基底：量级远大于任何手动位置，保证手动卡片
