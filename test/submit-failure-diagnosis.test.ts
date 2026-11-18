@@ -401,6 +401,22 @@ describe('claudeComposerHoldsInput', () => {
     });
   });
 
+  it('does not let a shared tail override a different visible head in an unscrolled composer', () => {
+    const sharedTail = ' common instruction suffix: keep the implementation unchanged and report test results.';
+    const wrap = (body: string) => `<botmux_formatting>fmt</botmux_formatting>\n<user_message>\n${body}\n</user_message>\n<sender id="ou_1" />`;
+    const input = wrap(`Handle the alpha file first.${sharedTail}`);
+    const otherDraft = wrap(`Handle a completely different bravo file.${sharedTail}`);
+    const screen = [
+      RULE,
+      ...otherDraft.split('\n').map((row, index) => `${index === 0 ? '❯ ' : '  '}${row}\\`),
+      RULE,
+      '  ? for shortcuts',
+    ].join('\n');
+
+    expect(claudeComposerHoldsInput(screen, otherDraft)).toBe(true);
+    expect(claudeComposerHoldsInput(screen, input)).toBe(false);
+  });
+
   it('does not match once the input left the composer for the transcript', () => {
     const screen = [`> ${input}`, '', '● Working on it', RULE, '❯ ', RULE].join('\n');
     expect(claudeComposerHoldsInput(screen, input)).toBe(false);

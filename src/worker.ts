@@ -22523,12 +22523,14 @@ function scheduleSubmitFailureNotify(
     // The input's Enter can be swallowed (Claude still running its hooks after a
     // late SessionStart, or paste-burst mode turning it into a newline); nothing
     // presses it again, so the input would sit in the composer until the warning.
-    // Pressing submit on a draft parked during a running turn queues it.
+    // Pressing submit on a draft parked during a running turn queues it. With an
+    // armed gate, keep the sole rescue until the real SessionStart has arrived:
+    // an earlier key send can be swallowed by the same still-running hooks.
     if (
       !composerSubmitRescued
-      && (sessionStartSignalAtMs === undefined
-        || sessionStartSignalAtMs <= activityBaselineMs
-        || Date.now() - sessionStartSignalAtMs >= SUBMIT_POST_SESSION_START_GRACE_MS)
+      && (!sessionStartGated || (sessionStartSignalAtMs !== undefined
+        && (sessionStartSignalAtMs <= activityBaselineMs
+          || Date.now() - sessionStartSignalAtMs >= SUBMIT_POST_SESSION_START_GRACE_MS)))
       && lastInitConfig?.cliId === 'claude-code'
       && claudeComposerHoldsInput(submitDiagnosisScreen, msg)
     ) {

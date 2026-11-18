@@ -99,7 +99,7 @@ const CLAUDE_PASTED_TEXT_CHIP = /\[\s*pasted text\s+#\d+(?:\s*\+\d+\s+lines?)?\s
 const CLAUDE_COMPOSER_SCROLL_RULE = /^\s*[─━═╌-]{3,}\s*[↑↓]\s*\d+\s+more\s*[─━═╌-]*\s*$/;
 
 /** Bodies of the ❯ input boxes on screen, bottom-most first. */
-function* claudeComposerBodies(screen: string): Generator<string> {
+function* claudeComposerBodies(screen: string): Generator<{ body: string; scrolled: boolean }> {
   const rows = screen.split(/\r?\n/);
   const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line) || CLAUDE_COMPOSER_SCROLL_RULE.test(line);
   for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
@@ -108,17 +108,18 @@ function* claudeComposerBodies(screen: string): Generator<string> {
     while (top >= 0 && !separator(rows[top])) top--;
     if (top < 0) continue;
     const body = rows.slice(top + 1, bottom);
-    if (!/^\s*❯/.test(body[0] ?? '') && !CLAUDE_COMPOSER_SCROLL_RULE.test(rows[top])) continue;
-    yield body.join('\n');
+    const scrolled = CLAUDE_COMPOSER_SCROLL_RULE.test(rows[top]);
+    if (!/^\s*❯/.test(body[0] ?? '') && !scrolled) continue;
+    yield { body: body.join('\n'), scrolled };
   }
 }
 
 function claudeComposerDraftMatch(screen: string): string | undefined {
   // Only the last input box, bounded by two full-width rules, is evidence.
   // Assistant transcript text or an idle suggestion outside it is not a draft.
-  for (const bodyText of claudeComposerBodies(screen)) {
-    if (/<\/?user_message>/.test(bodyText)) return 'draft_parked:claude_composer';
-    if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
+  for (const { body } of claudeComposerBodies(screen)) {
+    if (/<\/?user_message>/.test(body)) return 'draft_parked:claude_composer';
+    if (CLAUDE_PASTED_TEXT_CHIP.test(body)) return 'draft_parked:claude_pasted_chip';
     return undefined;
   }
   return undefined;
@@ -134,10 +135,13 @@ export function claudeComposerHoldsInput(screenText: string, input: string): boo
   const compactInput = compact(open >= 0 && close > open ? input.slice(open + '<user_message>'.length, close) : input);
   const head = compactInput.slice(0, 40);
   const tail = compactInput.slice(-40);
-  for (const bodyText of claudeComposerBodies(stripAnsiScreenText(screenText))) {
+  for (const { body: bodyText, scrolled } of claudeComposerBodies(stripAnsiScreenText(screenText))) {
     if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return true;
     const body = compact(bodyText.replace(/^\s*❯/, ''));
-    return head.length > 0 && (body.includes(head) || body.includes(tail));
+    // Tail evidence is meaningful only when the head has scrolled out. In an
+    // unscrolled composer a different draft can share a fixed suffix; its visible
+    // head must disprove the match instead of being overridden by that suffix.
+    return head.length > 0 && (body.includes(head) || (scrolled && body.includes(tail)));
   }
   return false;
 }
