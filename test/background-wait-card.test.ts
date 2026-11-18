@@ -22,7 +22,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
 } }));
 import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry, streamCardLabel,
-  usageRefreshShouldRun, syncUsageRefreshTimer,
+  usageRefreshShouldRun, syncUsageRefreshTimer, USAGE_REFRESH_INTERVAL_MS,
   __testOnly_setupWorkerHandlers as setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
@@ -126,6 +126,13 @@ async function beginActivity(cliId: 'traex' | 'codex', usageDisplay: 'streaming'
   await worker.listeners('message')[0]({ type: 'turn_execution_started', ...input, startedAtMs: Date.now() - 1000 });
 }
 
+async function activityScreen(content: string): Promise<void> {
+  await worker.listeners('message')[0]({
+    type: 'screen_update', content, status: 'working', turnId: 'om_turn', dispatchAttempt: 1,
+  });
+  await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+}
+
 describe('activity-triggered refresh boundaries', () => {
   it('reads queue notification live while keeping the shared queue observation', async () => {
     await beginActivity('traex', 'streaming');
@@ -136,6 +143,46 @@ describe('activity-triggered refresh boundaries', () => {
     expect(composeRowFromActive(ds, { includeTokenUsage: false }).executionActivity).toMatchObject({ phase: 'model_queue' });
     mergeDashboardConfig({ modelQueueNotify: true });
     expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+  });
+
+  it('repaints a queue label enabled mid-queue through the periodic refresh', async () => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', 'off');
+      mergeDashboardConfig({ modelQueueNotify: false });
+      await activityScreen('◆ Queued for capacity (3s • esc to interrupt)');
+      expect(mocks.patch).not.toHaveBeenCalled();
+
+      mergeDashboardConfig({ modelQueueNotify: true });
+      await activityScreen('⠋ Queued for capacity (4s • esc to interrupt)');
+      // Config-only changes need no immediate PATCH, but must have a refresh
+      // timer even when this working card did not have one before the frame.
+      expect(mocks.patch).not.toHaveBeenCalled();
+      expect(ds.usageRefreshTimer).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(USAGE_REFRESH_INTERVAL_MS);
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(patchedHeaders()[0]).toContain(t('card.status.model_queue', undefined, 'zh'));
+    });
+  });
+
+  it('restores the working header through the periodic refresh when queue notification is disabled', async () => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', 'off');
+      await activityScreen('◆ Queued for capacity (3s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(patchedHeaders()[0]).toContain(t('card.status.model_queue', undefined, 'zh'));
+      expect(ds.usageRefreshTimer).toBeDefined();
+
+      mergeDashboardConfig({ modelQueueNotify: false });
+      await activityScreen('⠋ Queued for capacity (4s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(USAGE_REFRESH_INTERVAL_MS);
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(2);
+      expect(patchedHeaders()[1]).toContain(t('card.status.working', undefined, 'zh'));
+    });
   });
 
   it('binds initial topic activity to the exact root before a follow-up assigns currentTurnId', async () => {

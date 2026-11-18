@@ -22401,6 +22401,9 @@ function setupWorkerHandlers(
           const activity = typeof label === 'object' && 'activity' in label ? label.activity : undefined;
           // Capacity entry/exit keeps status=working but changes the card header.
           // Spinner frames and elapsed time alone do not trigger a PATCH.
+          // A config-only label change has no activity edge; keep the periodic
+          // repaint available even when this frame itself needs no PATCH.
+          syncUsageRefreshTimer(ds);
           if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount && prevActivity === activity) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
