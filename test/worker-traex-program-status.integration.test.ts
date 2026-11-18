@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { SOURCE_WORKER_LOAD_TIMEOUT_MS, spawnLoadedSourceWorker, type LoadingSourceWorker } from './helpers/source-worker-boot.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
@@ -47,7 +47,7 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} cliVersion=${JSON.stringify(c.cliVersion.split('\n')[0])} reports=${c.reports}: unknown footer ${c.released ? 'released by the startup idle report' : 'stays held'}`,
       () => runScenario(backendType, c),
-      45_000,
+      SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000,
     );
   }
   // The idle report says no turn is running, not that the composer is on
@@ -57,7 +57,7 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
     `TraeX ${backendType} 0.214.1: the idle reported with the session-lock page does not make the session ready`,
     () => runLockPage(backendType),
-    45_000,
+    SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000,
   );
 }
 
@@ -126,12 +126,20 @@ async function withTraexWorker(
   };
   try {
     const options = { cwd: resolve('.'), env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any };
-    child = process.env.BOTMUX_TEST_WORKER_BINARY
-      ? spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], options)
-      : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
+    // A source worker's deadlines start once its modules are loaded: the first
+    // worker of a Bun-leg file compiles cold (fresh TMPDIR), which took 7–8s of
+    // the 10s first-input budget on CI. The compiled worker has no such phase.
+    let source: LoadingSourceWorker | undefined;
+    if (process.env.BOTMUX_TEST_WORKER_BINARY) {
+      child = spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], options);
+    } else {
+      source = spawnLoadedSourceWorker(options);
+      child = source.child;
+    }
     child.on('message', message => messages.push(message as WorkerToDaemon));
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    await source?.loaded.catch((error: Error) => { throw new Error(`${error.message}\n${logs.join('')}`); });
     const send = (message: DaemonToWorker) => { child!.send(message); };
     send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
