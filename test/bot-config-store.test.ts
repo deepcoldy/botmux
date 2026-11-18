@@ -1658,6 +1658,7 @@ describe('bot-config store', () => {
       intervalMinutes: 30,
       text: '请继续处理。',
       states: ['idle', 'tui_prompt'],
+      quietHours: { enabled: true, start: '23:00', end: '08:30' },
     };
     const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
     expect(saved).toEqual({ ok: true, config: value });

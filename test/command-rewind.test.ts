@@ -127,7 +127,7 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState, backendState } = vi.hoisted(() => ({
   suspendWorker: vi.fn<(ds: any, reason?: string) => boolean>(),
   killWorker: vi.fn<(ds: any) => void>(),
-  rewindState: { jsonl: '' as string, truncateError: '' as string },
+  rewindState: { jsonl: '' as string, truncateError: '' as string, treeRoot: '' as string },
   backendState: { backingType: undefined as string | undefined, probe: 'missing' as string, killThrows: false },
   sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
   forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
@@ -284,7 +284,9 @@ vi.mock('../src/core/cli-runtime-display.js', () => ({
 vi.mock('../src/services/session-groups-store.js', () => ({ isSessionGroup: vi.fn(() => false) }));
 
 vi.mock('../src/services/transcript-resolver.js', () => ({
-  resolveSessionTranscriptPath: vi.fn(() => (rewindState.jsonl ? { path: rewindState.jsonl, kind: 'claude' } : null)),
+  resolveSessionTranscriptPath: vi.fn(() => (rewindState.jsonl
+    ? { path: rewindState.jsonl, kind: 'claude', ...(rewindState.treeRoot ? { writableTreeRoot: rewindState.treeRoot } : {}) }
+    : null)),
 }));
 
 // Default-delegate to the real module; a test can arm rewindState.truncateError
@@ -294,17 +296,22 @@ vi.mock('../src/core/context-rewind.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/context-rewind.js')>();
   return {
     ...actual,
-    rewindClaudeTranscript: (...args: Parameters<typeof actual.rewindClaudeTranscript>) => {
-      if (rewindState.truncateError) throw new Error(rewindState.truncateError);
-      return actual.rewindClaudeTranscript(...args);
-    },
+    withOpenTranscript: <T,>(...[path, scope, use]: Parameters<typeof actual.withOpenTranscript<T>>) =>
+      actual.withOpenTranscript(path, scope, transcript => use({
+        scan: transcript.scan,
+        cut: (...cut: Parameters<typeof transcript.cut>) => {
+          if (rewindState.truncateError) throw new Error(rewindState.truncateError);
+          return transcript.cut(...cut);
+        },
+      })),
   };
 });
 vi.mock('../src/core/shared-adopt.js', () => ({ isSharedAdoptSession: vi.fn(() => false) }));
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -339,6 +346,18 @@ function transcript(): string {
     userTurn('C', 'uC'), assistant('c'),
   ].map(line).join(''));
   return path;
+}
+
+/** Replace `path` with a FIFO and start a writer that opens it after `delaySec`.
+ *  A blocking open on the read side then returns once the writer shows up
+ *  instead of freezing the test process forever, so a regression fails on the
+ *  elapsed-time / reply assertions rather than hanging the run. */
+const fifoWriters: ChildProcess[] = [];
+function replaceWithFifo(path: string, delaySec: number): void {
+  rmSync(path, { force: true });
+  const mk = spawnSync('mkfifo', [path]);
+  if (mk.status !== 0) throw new Error(`mkfifo failed: ${mk.stderr}`);
+  fifoWriters.push(spawn('sh', ['-c', `sleep ${delaySec}; exec 3>"$1"`, 'sh', path], { stdio: 'ignore' }));
 }
 
 /** Fake worker: exits (async) only when told to; while "alive" it can still append. */
@@ -390,9 +409,12 @@ beforeEach(() => {
   suspendWorker.mockImplementation((ds: any) => { ds.worker = null; return true; });
 });
 afterEach(() => {
+  // Only the writers this file spawned; one still blocked in open() is killed.
+  for (const w of fifoWriters.splice(0)) if (w.exitCode === null && w.signalCode === null) w.kill('SIGKILL');
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   rewindState.jsonl = '';
   rewindState.truncateError = '';
+  rewindState.treeRoot = '';
 });
 
 describe('/rewind command', () => {
@@ -544,6 +566,112 @@ describe('/rewind command', () => {
     const deps = makeDeps(makeDs());
     await run(deps, '/rewind');
     expect(lastReply(deps)).toContain('找不到当前会话的 transcript');
+  });
+
+  it('会话记录是软链：列表和预览都回复失败，链接目标的内容不进回复', async () => {
+    const target = transcript();
+    writeFileSync(target, line(userTurn('LINK_TARGET_TEXT', 'uT')) + line(assistant('t')) + line(userTurn('LINK_TARGET_2', 'uT2')));
+    rewindState.jsonl = join(dirname(target), 'link.jsonl');
+    symlinkSync(target, rewindState.jsonl);
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind');
+    await run(deps, '/rewind 1');
+    const replies = deps.sessionReply.mock.calls.map(c => String((c as unknown[])[1]));
+    expect(replies).toHaveLength(2);
+    for (const reply of replies) {
+      expect(reply).toContain('回退失败');
+      expect(reply).not.toContain('LINK_TARGET');
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('会话记录是命名管道：立即回复失败，不卡在管道上', async () => {
+    rewindState.jsonl = transcript();
+    // The late writer only keeps a blocking regression from hanging the run:
+    // it then reads an empty pipe and lists nothing. Blocking itself is pinned
+    // by the child-process test in context-rewind.test.ts.
+    replaceWithFifo(rewindState.jsonl, 15);
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind');
+    expect(lastReply(deps)).toContain('回退失败');
+  }, 60_000);
+
+  it.skipIf(process.platform === 'win32')('停 CLI 后会话记录被换成命名管道：确认时的重扫回复失败，不卡住', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation((d: any) => {
+      d.worker = null;
+      replaceWithFifo(rewindState.jsonl, 15);
+      return true;
+    });
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+  }, 60_000);
+
+  it('锁内重扫之后、截断之前路径被删掉重建成同内容的文件：拒绝截断，新文件不动', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    // Same bytes; deleting and recreating can hand the new file the old inode
+    // number, so only the descriptor held since the re-scan tells them apart.
+    const replacement = readFileSync(rewindState.jsonl, 'utf8');
+    (updateSession as any).mockImplementationOnce(() => {
+      rmSync(rewindState.jsonl);
+      writeFileSync(rewindState.jsonl, replacement);
+    });
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(readFileSync(rewindState.jsonl, 'utf8')).toBe(replacement);
+    expect(readdirSync(dirname(rewindState.jsonl)).filter(n => n.endsWith('.bak'))).toEqual([]);
+  });
+
+  it('会话记录在 CLI 可写的树里：备份写进 daemon 数据目录，树里不留备份', async () => {
+    rewindState.jsonl = transcript();
+    rewindState.treeRoot = dirname(dirname(rewindState.jsonl));
+    const ds = makeDs();
+    const deps = makeDeps(ds);
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-data-'));
+    dirs.push(dataDir);
+    (config.session as any).dataDir = dataDir;
+    await run(deps, '/rewind 1');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('已回退');
+    expect(remainingUserTexts(rewindState.jsonl)).toEqual(['A', 'B']);
+    const backupDir = join(dataDir, 'rewind-backups', ds.session.sessionId);
+    const backups = readdirSync(backupDir);
+    expect(backups).toHaveLength(1);
+    expect(lastReply(deps)).toContain(join(backupDir, backups[0]!));
+    expect(readFileSync(join(backupDir, backups[0]!), 'utf8')).toContain('"uC"');
+    expect(readdirSync(dirname(rewindState.jsonl)).filter(n => n.endsWith('.bak'))).toEqual([]);
+  });
+
+  it('会话记录的项目目录在解析后被换成指向外部的链接：列表与确认都回复失败，外部内容不进回复、外部文件不被截断', async () => {
+    rewindState.jsonl = transcript();
+    const projectDir = dirname(rewindState.jsonl);
+    rewindState.treeRoot = dirname(projectDir);
+    const outside = mkdtempSync(join(tmpdir(), 'botmux-rewind-outside-'));
+    dirs.push(outside);
+    const outsideFile = join(outside, 'native.jsonl');
+    writeFileSync(outsideFile, line(userTurn('OUTSIDE_TEXT', 'uA')) + line(assistant('x')) + line(userTurn('OUTSIDE_B', 'uB'))
+      + line(assistant('y')) + line(userTurn('OUTSIDE_C', 'uC')) + line(assistant('z')));
+    const swapProjectDir = () => {
+      rmSync(`${projectDir}.aside`, { recursive: true, force: true });
+      renameSync(projectDir, `${projectDir}.aside`);
+      symlinkSync(outside, projectDir);
+    };
+    const deps = makeDeps(makeDs());
+    // Preview on the real tree, then the swap while the CLI is being stopped.
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation((d: any) => { d.worker = null; swapProjectDir(); return true; });
+    const outsideBefore = readFileSync(outsideFile, 'utf8');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(readFileSync(outsideFile, 'utf8')).toBe(outsideBefore);
+    expect(readdirSync(outside)).toEqual(['native.jsonl']);
+    // A fresh listing through the swapped tree fails the same way.
+    await run(deps, '/rewind');
+    expect(lastReply(deps)).toContain('回退失败');
+    for (const call of deps.sessionReply.mock.calls) expect(String((call as unknown[])[1])).not.toContain('OUTSIDE');
   });
 
   it('截断前持久化 replay 状态失败：拒绝回退且文件不动', async () => {

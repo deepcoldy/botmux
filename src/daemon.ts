@@ -36135,6 +36135,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
+    getQuietHours: () => getBot(cfg.larkAppId).config.sessionOwnerReminder?.quietHours,
     canSend: ds => larkTransportEnabled({
       chatId: ds.chatId,
       apiOnly: getBot(ds.larkAppId).config.apiOnly,
