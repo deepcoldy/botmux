@@ -39310,9 +39310,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         log('User prompt submitted via hook — publishing working state');
         // Web 终端/沙箱 hook 直提路径无 managed turn；显式 clearTurnId 避免携带
         // 遗留的上一轮已终态 turnId，防止边沿更新误归因到历史 turn。directSubmit
-        // 标记这是真实新工作（区别于同样 clearTurnId 的 prompt-cache keep-alive），
-        // daemon 据此把卡片重新开回 working。
-        publishScreenStatus('working', { force: true, clearTurnId: true, directSubmit: true });
+        // 必须跟随 keepalive 归属：keepalive 也向 ready 的 CLI 注入并走同一 ready
+        // 分支，若固定 true 会让它的 working 帧在 daemon 侧误开 live-work episode、
+        // 把已 idle 的卡片翻回 working。仅真实直提（!fromKeepalive）才置位。
+        publishScreenStatus('working', {
+          force: true,
+          clearTurnId: true,
+          ...(fromKeepalive ? {} : { directSubmit: true }),
+        });
       }
       const submittedTurnId = writtenInputs.takeSubmitted(msg);
       if (submittedTurnId) send({ type: 'prompt_submitted_input', turnId: submittedTurnId });

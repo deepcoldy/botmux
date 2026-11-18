@@ -209,6 +209,7 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
       isPromptReady: false,
       revokePromptReadiness: () => {},
       idleDetector: undefined,
+      log: () => {},
       writtenInputs: { takeSubmitted: () => undefined },
       inFlightKeepaliveFingerprints,
       KEEPALIVE_HOOK_CLAIM_MS: 30_000,
@@ -330,5 +331,43 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
 
     expect(pendingInjections).toHaveLength(0); // the /compact was written
     expect(keepaliveEntries.has(keepaliveFingerprint)).toBe(true); // entry retained
+  });
+
+  it('R10 ready keep-alive: the working frame does NOT carry directSubmit', async () => {
+    const publishCalls: Array<{ status: string; opts: Record<string, unknown> }> = [];
+    const scope = scopeWith({
+      isPromptReady: true,
+      idleDetector: { isStartupPending: () => false, reset: () => {} },
+      publishScreenStatus: (status: string, opts: Record<string, unknown>) => publishCalls.push({ status, opts }),
+    });
+    seedKeepalive(scope); // the keep-alive fingerprint is awaiting its hook
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({
+      type: 'prompt_submitted', fingerprint: keepaliveFingerprint,
+    });
+
+    // One ready→working frame, but it must not be tagged as a direct-submit.
+    expect(publishCalls).toHaveLength(1);
+    expect(publishCalls[0].status).toBe('working');
+    expect(publishCalls[0].opts.directSubmit).toBeUndefined();
+    expect(publishCalls[0].opts.clearTurnId).toBe(true);
+    expect(emitsProvenance(scope)).toBe(false);
+  });
+
+  it('R10 ready human submit: the working frame DOES carry directSubmit', async () => {
+    const publishCalls: Array<{ status: string; opts: Record<string, unknown> }> = [];
+    const scope = scopeWith({
+      isPromptReady: true,
+      idleDetector: { isStartupPending: () => false, reset: () => {} },
+      publishScreenStatus: (status: string, opts: Record<string, unknown>) => publishCalls.push({ status, opts }),
+    });
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({
+      type: 'prompt_submitted', fingerprint: humanFingerprint,
+    });
+
+    expect(publishCalls).toHaveLength(1);
+    expect(publishCalls[0].opts.directSubmit).toBe(true);
+    expect(emitsProvenance(scope)).toBe(true);
   });
 });
