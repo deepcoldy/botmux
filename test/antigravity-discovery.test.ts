@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
@@ -54,6 +54,38 @@ describe('antigravity-discovery', () => {
     unlinkSync(join(fd, '4'));
     symlinkSync(join(cliHome, 'brain', newId), join(fd, '6'));
     expect(findAntigravityConversationIdByPid(4100, convDir, procRoot)).toBe(newId);
+  });
+
+  it('matches kernel-canonicalized fds when the CLI home is reached through a symlink', () => {
+    // /proc/<pid>/fd readlink and lsof return the canonical path, while the
+    // worker passes the logical $HOME prefix when $HOME is symlinked (the test
+    // fence puts HOME under a symlinked tmpdir). Presence, database and brain
+    // descriptors must all resolve through the symlink.
+    const realRoot = join(tmpDir, 'real-home');
+    const linkRoot = join(tmpDir, 'linked-home');
+    const realCliHome = join(realRoot, '.gemini', 'antigravity-cli');
+    const convDir = join(realCliHome, 'conversations');
+    const presenceDir = join(realCliHome, 'presence');
+    const brainConvDir = join(realCliHome, 'brain');
+    const id = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
+    mkdirSync(convDir, { recursive: true });
+    mkdirSync(presenceDir, { recursive: true });
+    mkdirSync(join(brainConvDir, id), { recursive: true });
+    writeFileSync(join(convDir, `${id}.db`), '');
+    writeFileSync(join(presenceDir, `${id}.lock`), '');
+    symlinkSync(realRoot, linkRoot);
+    const logicalConvDir = join(linkRoot, '.gemini', 'antigravity-cli', 'conversations');
+
+    const procRoot = join(tmpDir, 'proc-symlink');
+    const fd = join(procRoot, '4200', 'fd');
+    mkdirSync(fd, { recursive: true });
+    // A kernel fd readlink carries the fully canonicalized target, exactly as
+    // realpath would report it — not the logical symlinked prefix.
+    symlinkSync(join(realpathSync(convDir), `${id}.db`), join(fd, '3'));
+    symlinkSync(join(realpathSync(brainConvDir), id), join(fd, '4'));
+    symlinkSync(join(realpathSync(presenceDir), `${id}.lock`), join(fd, '5'));
+
+    expect(findAntigravityConversationIdByPid(4200, logicalConvDir, procRoot)).toBe(id);
   });
 
   it('finds conversation ID matching cwd from summaries DB', () => {

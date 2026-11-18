@@ -306,6 +306,11 @@ describe('worker harvests Antigravity replies from transcript_full.jsonl', () =>
       turnId: 'om_adopted_followup', content: expect.stringContaining('SECOND-MIDDLE-ONLY'), replyModel: 'gemini-4-carbon-low',
     })]);
     expect(worker.messages.some(m => m.type === 'adopt_preamble')).toBe(false);
+    // The adopt write path must still start the session-long thinking reader.
+    await waitFor(
+      () => worker.messages.some(m => m.type === 'thinking_update'),
+      worker.output, 10_000,
+    );
     expect(worker.adoptCliPid && processAlive(worker.adoptCliPid)).toBe(true);
   }, 45_000);
 

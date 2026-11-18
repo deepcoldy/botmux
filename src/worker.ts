@@ -14214,6 +14214,10 @@ function prepareAntigravityAdoptBridge(): void {
     }
     if (path) codexBridgeAttach(path, 'baseline-existing');
   }
+  // The adopt write path cannot reach the spawn-only observation arm, so keep
+  // the session-long thinking-timeline reader starting here (it also publishes
+  // the observed conversation id), as the pre-bridge adopt arm did.
+  if (conversationId) persistCliSessionId(conversationId);
   codexAdoptStartMs = Date.now();
   codexBridgeStartTimer();
 }

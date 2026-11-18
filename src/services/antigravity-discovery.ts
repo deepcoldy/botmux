@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
@@ -63,12 +63,34 @@ function getProcessChildPids(pid: number, procRoot = '/proc'): number[] {
   return children;
 }
 
+/** Logical and canonical trailing-slash prefixes for a directory. A directory
+ *  that does not exist yet (the conversation or its presence lock is created
+ *  lazily on the first submit) simply keeps its logical prefix. */
+function directoryPrefixVariants(directory: string): string[] {
+  const logical = `${directory}/`;
+  try {
+    const canonical = `${realpathSync(directory)}/`;
+    return canonical === logical ? [logical] : [logical, canonical];
+  } catch {
+    return [logical];
+  }
+}
+
+function matchingPrefix(link: string, prefixes: readonly string[]): string | undefined {
+  return prefixes.find(prefix => link.startsWith(prefix));
+}
+
 /**
  * Agy holds a presence lock on the active conversation in the TUI process.
  * Prefer that descriptor because old brain directories and databases can
  * remain open after a conversation switch. Older builds without presence
  * descriptors fall back to a unique brain or database identity across the
  * process tree (procfs on Linux, lsof on macOS).
+ *
+ * `/proc/<pid>/fd` and lsof report the kernel-resolved path, so an fd opened
+ * under a symlinked `$HOME` (or a symlinked parent) carries the canonical
+ * prefix while callers resolve the logical one from `homedir()`; every prefix
+ * is matched in both variants.
  */
 export function findAntigravityConversationIdByPid(
   pid: number,
@@ -81,10 +103,11 @@ export function findAntigravityConversationIdByPid(
     ? getProcessFds(pid, procRoot)
     : listProcessOpenFiles(pid) ?? [];
   const databases = conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
-  const presencePrefix = `${join(dirname(databases), 'presence')}/`;
+  const presencePrefixes = directoryPrefixVariants(join(dirname(databases), 'presence'));
   const active = new Set<string>();
   for (const link of links) {
-    if (!link.startsWith(presencePrefix) || !link.endsWith('.lock')) continue;
+    const presencePrefix = matchingPrefix(link, presencePrefixes);
+    if (!presencePrefix || !link.endsWith('.lock')) continue;
     const id = link.slice(presencePrefix.length, -'.lock'.length);
     if (UUID_RE.test(id)) active.add(id.toLowerCase());
   }
@@ -93,13 +116,20 @@ export function findAntigravityConversationIdByPid(
   if (useProcfs) {
     for (const child of getProcessChildPids(pid, procRoot)) links.push(...getProcessFds(child, procRoot));
   }
-  const databasePrefix = `${databases}/`;
-  const brainPrefix = `${join(dirname(databases), 'brain')}/`;
+  const databasePrefixes = directoryPrefixVariants(databases);
+  const brainPrefixes = directoryPrefixVariants(join(dirname(databases), 'brain'));
   let found: string | null = null;
   for (const link of links) {
-    const id = link.startsWith(brainPrefix)
-      ? link.slice(brainPrefix.length).split('/')[0]
-      : link.startsWith(databasePrefix) ? CONVERSATION_DB_RE.exec(link.slice(databasePrefix.length))?.[1] : undefined;
+    let id: string | undefined;
+    const brainPrefix = matchingPrefix(link, brainPrefixes);
+    if (brainPrefix) {
+      id = link.slice(brainPrefix.length).split('/')[0];
+    } else {
+      const databasePrefix = matchingPrefix(link, databasePrefixes);
+      if (databasePrefix) {
+        id = CONVERSATION_DB_RE.exec(link.slice(databasePrefix.length))?.[1];
+      }
+    }
     if (!id || !UUID_RE.test(id)) continue;
     if (found && found.toLowerCase() !== id.toLowerCase()) return null;
     found ??= id;
