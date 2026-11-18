@@ -6532,26 +6532,41 @@ function sessionHasLiveTurn(ds: DaemonSession): boolean {
 }
 
 /**
- * Whether a screen_update frame is STALE busy evidence from a turn that already
- * reported a completed terminal. After `turn_terminal(completed)` the CLI's
- * viewport can keep painting a busy marker for a while — the worker keeps
- * emitting working frames until its own idle detection catches up. With no
- * newer turn admitted, those frames must not drive the streaming card: they
- * would repaint it back to a busy state AND bump `streamCardStatusRevision`,
- * which invalidates the post-terminal idle correction's write fence and leaves
- * the card stuck on "working" forever (the 60s self-heal then retries forever).
+ * Whether a screen/screenshot frame is STALE busy evidence left over by a turn
+ * that already reported a completed terminal. The decision is taken per-FRAME
+ * on its (turnId, dispatchAttempt) attribution rather than from the session's
+ * current turn pointer, because real new work can arrive without moving that
+ * pointer:
  *
- * The caller still updates non-card state (screen content, usage limit,
- * background-task count, the in-memory execution status read by usage
- * settlement); only card-facing writes and the revision bump are suppressed.
- * A real idle/limited frame is never stale (those edges own usage settlement)
- * and a new turn immediately re-enables live card driving via
- * sessionHasLiveTurn(). A failed/cancelled terminal does not engage this gate.
+ *  - Web Terminal / sandbox hook direct-submit has no managed turn: the worker
+ *    publishes the frame with `clearTurnId` (turnId/dispatchAttempt undefined).
+ *    It is new work attributable to no terminalized turn, so it is never stale.
+ *  - A frame naming a different turn is a newer turn (e.g. a proven successor)
+ *    even before beginNewTurn advances currentTurnId.
+ *  - A newer dispatch attempt of the SAME turn (a retry) is live work; the
+ *    settle gate's high-water check independently refuses to idle-correct it.
+ *
+ * Only a busy frame attributed to exactly the terminalized (turn, attempt) is
+ * residual viewport evidence. The caller still updates non-card execution
+ * state (screen content, usage limit, background count, in-memory status);
+ * only card-facing writes and the revision bump are suppressed.
  */
-function isStalePostTerminalBusyFrame(ds: DaemonSession, projectedStatus: StreamStatus): boolean {
-  return ds.lastTurnTerminalStatus === 'completed'
-    && !sessionHasLiveTurn(ds)
-    && POST_TERMINAL_BUSY_STATUSES.has(projectedStatus);
+function isStalePostTerminalBusyFrame(
+  ds: DaemonSession,
+  projectedStatus: StreamStatus,
+  frame: { turnId?: string; dispatchAttempt?: number },
+): boolean {
+  if (ds.lastTurnTerminalStatus !== 'completed') return false;
+  if (!POST_TERMINAL_BUSY_STATUSES.has(projectedStatus)) return false;
+  // Untagged busy frame = direct-submit work outside the managed-turn system.
+  if (!frame.turnId) return false;
+  // A frame owned by a different (newer) turn.
+  if (frame.turnId !== ds.lastTurnTerminalTurnId) return false;
+  // A newer attempt of the same terminalized turn is a live retry.
+  if (frame.dispatchAttempt !== undefined
+    && ds.lastTurnTerminalDispatchAttempt !== undefined
+    && frame.dispatchAttempt > ds.lastTurnTerminalDispatchAttempt) return false;
+  return true;
 }
 
 function ownsSettleTarget(
@@ -22258,7 +22273,10 @@ function setupWorkerHandlers(
         // (with no newer turn admitted) is stale viewport evidence. It must not
         // cancel the post-terminal correction or drive the card/revision; the
         // caller still refreshes non-card state further down.
-        const stalePostTerminalBusy = isStalePostTerminalBusyFrame(ds, projectedScreenStatus);
+        const stalePostTerminalBusy = isStalePostTerminalBusyFrame(ds, projectedScreenStatus, {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+        });
         if (!stalePostTerminalBusy) cancelPostTerminalStatusSettle(ds);
         // Wait for worker init, independently of Web Terminal availability.
         // ZMX intentionally reports ready with port=0, but its plain-history
@@ -22824,7 +22842,15 @@ function setupWorkerHandlers(
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
-        bumpStreamCardStatusRevision(ds);
+        // Same per-frame stale gate as screen_update: a residual busy screenshot
+        // from the terminalized (turn, attempt) must not bump the card revision
+        // (which would invalidate the post-terminal idle correction's fence) or
+        // repaint the card below. Non-card execution state above still updates.
+        const stalePostTerminalShot = isStalePostTerminalBusyFrame(ds, ds.lastScreenStatus, {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+        });
+        if (!stalePostTerminalShot) bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already
@@ -22861,6 +22887,10 @@ function setupWorkerHandlers(
           persistStreamCardState(ds);
           break;
         }
+        // A stale post-terminal screenshot keeps the execution status updated
+        // above but must not overwrite the card image/cache or schedule a busy
+        // PATCH — the post-terminal idle correction owns the visible card now.
+        if (stalePostTerminalShot) break;
         noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.currentImageKey = msg.imageKey;
         ds.currentImageSource = { imageKey: msg.imageKey, ...frameVerdict.source };

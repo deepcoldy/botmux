@@ -287,7 +287,7 @@ describe('turn_terminal status settle (daemon turn_terminal handler)', () => {
     // A busy frame from the just-completed turn (no newer turn admitted) is
     // stale viewport evidence: it must not cancel the post-terminal correction.
     (ds.worker as any).emit('message', {
-      type: 'screen_update', content: 'still drawing', status: 'working',
+      type: 'screen_update', content: 'still drawing', status: 'working', turnId: TURN,
     });
 
     await vi.advanceTimersByTimeAsync(2_000);
@@ -391,7 +391,7 @@ describe('turn_terminal status settle (daemon turn_terminal handler)', () => {
     expect(idlePatchCount()).toBe(1); // first correction delivered
     // The post-terminal busy frame no longer bumps the revision, so the
     // delivered receipt keeps matching and the self-heal sweep never repaints.
-    (ds.worker as any).emit('message', { type: 'screen_update', content: 'stale busy footer', status: 'working' });
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'stale busy footer', status: 'working', turnId: TURN });
     await vi.advanceTimersByTimeAsync(180_000);
     expect(idlePatchCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(180_000);
@@ -563,24 +563,34 @@ describe('sweepStaleLiveCardStatuses (runtime self-heal)', () => {
 });
 
 describe('stale post-terminal busy frame gate (screen_update)', () => {
-  function setupTerminalDs() {
-    const ds = makeDs();
+  function setupTerminalDs(overrides?: Partial<DaemonSession>) {
+    const ds = makeDs(overrides);
     activate(ds);
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
     return ds;
   }
-  function busyFrame(ds: DaemonSession, content = 'stale busy') {
-    return (ds.worker as any).emit('message', { type: 'screen_update', content, status: 'working' });
+  // A residual frame from the terminalized turn: the worker tags normal
+  // screen_update frames with the current turn id (only direct-submit frames
+  // are untagged), so a stale frame carries the SAME turn id as the terminal.
+  function staleTaggedFrame(ds: DaemonSession, extra: Record<string, unknown> = {}) {
+    return (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'stale busy', status: 'working', turnId: TURN, ...extra,
+    });
+  }
+  // Web Terminal / sandbox direct-submit: worker publishes with clearTurnId,
+  // i.e. no managed turn attribution at all.
+  function untaggedFrame(ds: DaemonSession) {
+    return (ds.worker as any).emit('message', { type: 'screen_update', content: 'direct work', status: 'working' });
   }
 
-  it('does not bump revision or patch the card for a stale busy frame, but keeps non-card state', async () => {
+  it('does not bump revision or patch the card for a stale tagged busy frame, but keeps non-card state', async () => {
     const ds = setupTerminalDs();
     (ds.worker as any).emit('message', terminalMsg(TURN));
     await vi.advanceTimersByTimeAsync(2_000); // settle idle PATCH queued
     const revAfterSettle = ds.streamCardStatusRevision ?? 0;
     const callsAfterSettle = updateMessageMock.mock.calls.length;
 
-    busyFrame(ds);
+    staleTaggedFrame(ds);
     await vi.advanceTimersByTimeAsync(0);
 
     expect(ds.streamCardStatusRevision ?? 0).toBe(revAfterSettle);
@@ -596,7 +606,7 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     const rev = ds.streamCardStatusRevision ?? 0;
 
-    (ds.worker as any).emit('message', { type: 'screen_update', content: 'composer', status: 'idle' });
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'composer', status: 'idle', turnId: TURN });
     await vi.advanceTimersByTimeAsync(0);
 
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
@@ -610,7 +620,7 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     const rev = ds.streamCardStatusRevision ?? 0;
 
     ds.currentTurnId = 'turn-live-0002'; // beginNewTurn: newer turn admitted
-    busyFrame(ds, 'new turn work');
+    staleTaggedFrame(ds, { turnId: 'turn-live-0002', content: 'new turn work' });
     await vi.advanceTimersByTimeAsync(0);
 
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
@@ -622,7 +632,7 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     await vi.advanceTimersByTimeAsync(0);
     const rev = ds.streamCardStatusRevision ?? 0;
 
-    busyFrame(ds);
+    staleTaggedFrame(ds);
     await vi.advanceTimersByTimeAsync(0);
 
     expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
@@ -641,7 +651,7 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     await vi.advanceTimersByTimeAsync(2_000); // settle idle PATCH held in flight
 
     for (let i = 0; i < 3; i++) {
-      busyFrame(ds, `busy ${i}`);
+      staleTaggedFrame(ds, {}, );
       await vi.advanceTimersByTimeAsync(0);
     }
     expect(ds.streamCardStatusRevision ?? 0).toBe(0); // stale frames never bumped it
@@ -650,5 +660,67 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(lastPatchedStatus()).toBe('idle'); // fence passed, correction delivered
+  });
+
+  it('P1: an untagged direct-submit busy frame is live work and still bumps the revision', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    untaggedFrame(ds); // clearTurnId frame: no managed turn, real new work
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('P3: a newer dispatch attempt of the same terminalized turn is live work, not stale', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', { ...terminalMsg(TURN), dispatchAttempt: 1 });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(ds.lastTurnTerminalDispatchAttempt).toBe(1);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    // The turn is retried: a fresh attempt is admitted and starts working.
+    noteTurnDispatchAttempt(ds, TURN, 2);
+    staleTaggedFrame(ds, { dispatchAttempt: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+  });
+
+  it('P2: a stale tagged screenshot_uploaded frame neither bumps revision nor touches the card image', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+    const calls = updateMessageMock.mock.calls.length;
+
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-stale', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+    expect(ds.currentImageKey).not.toBe('img-stale');
+    expect(updateMessageMock.mock.calls.length).toBe(calls);
+    // Non-card execution state still moves.
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('P2 control: an untagged screenshot_uploaded direct-work frame is not gated', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-direct', status: 'working',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.currentImageKey).toBe('img-direct');
   });
 });
