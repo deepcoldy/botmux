@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { fingerprintPromptText } from './services/prompt-context-store.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
@@ -18284,17 +18285,16 @@ const pendingInjections: PendingInjection[] = [];
 let injectionFlushing = false;
 
 /**
- * Timestamp of the most recent keep-alive command written to the PTY. The
- * UserPromptSubmit hook it triggers arrives as a generic `prompt_submitted`
- * message indistinguishable from a human Web Terminal submit, so we remember
- * the in-flight keep-alive and suppress the direct-submit provenance signal for
- * a hook claimed inside this bounded window. Injection writes are serialized by
- * injectionFlushing/commandLineWritesPending, so the first hook in the window
- * is deterministically the keep-alive's. The bound prevents a missed hook from
- * leaking the marker and suppressing a later genuine direct-submit forever.
+ * Fingerprints of keep-alive commands written to the PTY but not yet confirmed
+ * by a UserPromptSubmit hook. The UserPromptSubmit hook arrives over an
+ * independent HTTP request whose ordering relative to other submits is not
+ * guaranteed, so attribution must use the prompt's content fingerprint rather
+ * than a time window: a hook whose fingerprint matches one of these is the
+ * keep-alive's echo and must not open a direct-submit episode. The timestamp
+ * only bounds cleanup if a hook never arrives; it never drives attribution.
  */
 const KEEPALIVE_HOOK_CLAIM_MS = 30_000;
-let inFlightKeepaliveAt: number | null = null;
+const inFlightKeepaliveFingerprints = new Map<string, number>();
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
@@ -18343,10 +18343,14 @@ async function flushPendingInjections(): Promise<void> {
       if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
-      // Track injection provenance before writing: a keep-alive's later
-      // UserPromptSubmit hook must not open a direct-submit episode; any other
-      // injection clears a stale keep-alive marker.
-      inFlightKeepaliveAt = item.kind === 'keepalive' ? Date.now() : null;
+      // Record the keep-alive by its actual command fingerprint so the later
+      // UserPromptSubmit hook can be matched by content regardless of HTTP
+      // arrival ordering. Other injections clear any stale entries.
+      if (item.kind === 'keepalive') {
+        inFlightKeepaliveFingerprints.set(fingerprintPromptText(cmd), Date.now());
+      } else {
+        inFlightKeepaliveFingerprints.clear();
+      }
       revokePromptReadiness();
       idleDetector?.reset();
       try {
@@ -32826,8 +32830,8 @@ function killCli(opts: {
   if (!opts.preserveInjections) {
     pendingInjections.length = 0;
     // A teardown that drops queued injections also invalidates any in-flight
-    // keep-alive marker so it cannot mislabel the next process's first submit.
-    inFlightKeepaliveAt = null;
+    // keep-alive fingerprints so they cannot mislabel the next process's submit.
+    inFlightKeepaliveFingerprints.clear();
   }
   scrollback = '';
   herdrWebHistory = null;
@@ -39270,20 +39274,25 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'prompt_submitted': {
       const wasPromptReady = isPromptReady;
       revokePromptReadiness();
-      // A keep-alive injection submits through this same generic UserPromptSubmit
-      // hook. If a keep-alive write is in flight, this hook is its echo, not a
-      // human direct-submit: consume the marker and do not open a live-work
-      // episode. The bounded window means a missed hook cannot suppress a later
-      // genuine direct-submit indefinitely.
-      const fromKeepalive = inFlightKeepaliveAt !== null
-        && Date.now() - inFlightKeepaliveAt < KEEPALIVE_HOOK_CLAIM_MS;
-      if (fromKeepalive) inFlightKeepaliveAt = null;
-      // Provenance is independent of the ready→working screen edge: emit it
-      // unconditionally (for real direct-submits) so a direct-submit after a
-      // terminal whose prompt_ready never fired still opens the daemon's
-      // live-work episode. A keep-alive never reaches this branch as a
-      // direct-submit (suppressed above), so this cannot be spoofed. This signal
-      // carries no status and never repaints a card.
+      // Attribution by content fingerprint, not arrival time: a keep-alive
+      // injection submits through this same generic UserPromptSubmit hook, and
+      // its hook can arrive before or after a human submit (independent HTTP
+      // requests). If the hook's fingerprint matches a keep-alive command still
+      // awaiting confirmation, this is the keep-alive echo: consume that entry
+      // and do not open a direct-submit episode. Entries past the bounded claim
+      // window are treated as abandoned (their hook was lost) and purged, so a
+      // missing fingerprint or no match always falls through to a real submit.
+      const now = Date.now();
+      for (const [fp, at] of inFlightKeepaliveFingerprints) {
+        if (now - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
+      }
+      const fromKeepalive = typeof msg.fingerprint === 'string'
+        && inFlightKeepaliveFingerprints.has(msg.fingerprint);
+      if (fromKeepalive) inFlightKeepaliveFingerprints.delete(msg.fingerprint!);
+      // Provenance is independent of the ready→working screen edge: emit it for
+      // real direct-submits so a direct-submit after a terminal whose
+      // prompt_ready never fired still opens the daemon's live-work episode.
+      // This signal carries no status and never repaints a card.
       if (!fromKeepalive) send({ type: 'direct_submit_started' });
       if (wasPromptReady) {
         idleDetector?.reset();

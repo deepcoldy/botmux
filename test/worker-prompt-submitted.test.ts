@@ -197,8 +197,10 @@ describe('worker prompt_submitted handler', () => {
     expect(workingUpdates).toEqual([]);
   });
 });
-
 describe('keep-alive vs direct-submit provenance (worker message handler)', () => {
+  const keepaliveFingerprint = fingerprintPromptText('the keepalive command text');
+  const humanFingerprint = fingerprintPromptText('a real human task');
+
   function scopeWith(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     const sent: WorkerToDaemon[] = [];
     return {
@@ -206,38 +208,60 @@ describe('keep-alive vs direct-submit provenance (worker message handler)', () =
       revokePromptReadiness: () => {},
       idleDetector: undefined,
       writtenInputs: { takeSubmitted: () => undefined },
-      inFlightKeepaliveAt: null,
+      inFlightKeepaliveFingerprints: new Map(),
       KEEPALIVE_HOOK_CLAIM_MS: 30_000,
       send: (m: WorkerToDaemon) => { sent.push(m); },
       __sent: sent,
       ...overrides,
     } as Record<string, unknown>;
   }
+  const emitsProvenance = (scope: Record<string, unknown>) =>
+    (scope.__sent as WorkerToDaemon[]).some(m => m.type === 'direct_submit_started');
 
-  it('suppresses direct_submit_started when the hook belongs to an in-flight keep-alive', async () => {
-    const scope = scopeWith({ inFlightKeepaliveAt: Date.now() });
-    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+  it('suppresses direct_submit_started when the hook fingerprint matches an in-flight keep-alive', async () => {
+    const pending = new Map([[keepaliveFingerprint, Date.now()]]);
+    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
 
-    const sent = (scope.__sent as WorkerToDaemon[]);
-    expect(sent.some(m => m.type === 'direct_submit_started')).toBe(false);
-    // The marker is consumed so it cannot taint the next (real) submit.
-    expect(scope.inFlightKeepaliveAt).toBeNull();
+    expect(emitsProvenance(scope)).toBe(false);
+    expect(pending.has(keepaliveFingerprint)).toBe(false); // consumed
   });
 
-  it('still emits direct_submit_started for a real submit after the keep-alive window expires', async () => {
-    // Stale marker: a keep-alive whose hook never came back. It must not leak.
-    const scope = scopeWith({ inFlightKeepaliveAt: Date.now() - 31_000 });
-    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+  it('R8 reordering: a human hook arriving first still emits, and the late keep-alive hook is then suppressed', async () => {
+    const pending = new Map([[keepaliveFingerprint, Date.now()]]);
+    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
 
-    const sent = (scope.__sent as WorkerToDaemon[]);
-    expect(sent.some(m => m.type === 'direct_submit_started')).toBe(true);
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: humanFingerprint });
+    expect(emitsProvenance(scope)).toBe(true);
+    expect(pending.has(keepaliveFingerprint)).toBe(true); // survives the human hook
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
+    const signals = (scope.__sent as WorkerToDaemon[]).filter(m => m.type === 'direct_submit_started');
+    expect(signals).toHaveLength(1); // still just the human one
+    expect(pending.has(keepaliveFingerprint)).toBe(false);
   });
 
-  it('emits direct_submit_started on a normal prompt_submit with no keep-alive in flight', async () => {
+  it('R8 reordering: an expired keep-alive entry cannot suppress a later real submit with the same fingerprint', async () => {
+    const pending = new Map([[keepaliveFingerprint, Date.now() - 31_000]]);
+    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
+
+    expect(emitsProvenance(scope)).toBe(true);
+    expect(pending.size).toBe(0); // purged as abandoned
+  });
+
+  it('emits direct_submit_started when the hook carries no fingerprint (cannot be a matched keep-alive)', async () => {
+    const pending = new Map([[keepaliveFingerprint, Date.now()]]);
+    const scope = scopeWith({ inFlightKeepaliveFingerprints: pending });
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+
+    expect(emitsProvenance(scope)).toBe(true);
+    expect(pending.size).toBe(1); // untouched
+  });
+
+  it('emits direct_submit_started on a normal prompt_submitted with no keep-alive in flight', async () => {
     const scope = scopeWith();
-    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
-
-    const sent = (scope.__sent as WorkerToDaemon[]);
-    expect(sent.some(m => m.type === 'direct_submit_started')).toBe(true);
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: humanFingerprint });
+    expect(emitsProvenance(scope)).toBe(true);
   });
 });
