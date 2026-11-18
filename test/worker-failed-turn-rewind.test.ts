@@ -4,9 +4,9 @@
  * inspection and rewind modules and a real transcript, with the worker's
  * restart machinery stubbed (same harness as the image purge).
  */
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from '../src/services/unsent-input-journal.js';
@@ -15,6 +15,7 @@ import { resolvePurgeResumeTarget } from '../src/services/transcript-image-purge
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
 import { pinClaudeProjectsRoot } from '../src/services/claude-projects-root.js';
 import { restoreRewoundTranscript } from '../src/core/context-rewind.js';
+import { pruneRewindBackupsBeside, rewindBackupDirForSession, rewindBackupSuffix, sweepRewindBackups } from '../src/core/rewind-backup-retention.js';
 import {
   assertTranscriptInProjectsRoot,
   inspectLastTurnInProjectsRoot,
@@ -608,6 +609,127 @@ describe('startFailedTurnRewind', () => {
     const { pendingMessages, cutAfterExit } = setup(failedTranscript(), {}, directive({ mode: 'resend', content: FAILED_INPUT }));
     await cutAfterExit();
     expect(pendingMessages).toEqual([{ content: FAILED_INPUT, turnId: 'trg_new' }]);
+  });
+
+  describe('the backups cuts leave behind (#3572)', () => {
+    const DAY = 24 * 60 * 60_000;
+    let previousDataDir: string | undefined;
+    afterEach(() => {
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+      previousDataDir = undefined;
+    });
+
+    /** The real pruning, each run collected so a test can await it. */
+    function collectPrunes() {
+      const runs: Promise<void>[] = [];
+      const prune = (...args: Parameters<typeof pruneRewindBackupsBeside>) => {
+        const pruning = pruneRewindBackupsBeside(...args);
+        runs.push(pruning);
+        return pruning;
+      };
+      return { runs, prune };
+    }
+    /** A backup an earlier cut made `ageMs` ago, last written then. */
+    const seedBackup = (dir: string, ageMs: number, kind: 'full' | 'removed' = 'removed') => {
+      const at = Date.now() - ageMs;
+      const path = join(dir, `${SID}.jsonl${rewindBackupSuffix(at, kind)}`);
+      writeFileSync(path, 'old backup');
+      utimesSync(path, at / 1000, at / 1000);
+      return path;
+    };
+
+    it('next to the transcript: pruned once the rewind settled, not before; the new backup and the young ones stay', async () => {
+      const { runs, prune } = collectPrunes();
+      const { jsonl, cutAfterExit, settle, reachWriteEdge, reports } = setup(failedTranscript(), { pruneRewindBackupsBeside: prune });
+      const dir = dirname(jsonl);
+      const expired = seedBackup(dir, 30 * DAY);
+      const expiredFull = seedBackup(dir, 8 * DAY, 'full');
+      const young = seedBackup(dir, 2 * DAY);
+      const purgeBackup = join(dir, `${SID}.jsonl.botmux-purge-bak-2026-01-01T00-00-00-000Z`);
+      writeFileSync(purgeBackup, 'image purge backup');
+      utimesSync(purgeBackup, (Date.now() - 30 * DAY) / 1000, (Date.now() - 30 * DAY) / 1000);
+
+      await cutAfterExit();
+      settle('spawned');
+      // Cut, and the CLI is back, but the message has not reached it: the
+      // rewind is not settled yet.
+      expect(runs).toHaveLength(0);
+      expect(existsSync(expired)).toBe(true);
+      expect(reachWriteEdge()).toBe('write');
+      expect(reports()).toEqual([expect.objectContaining({ outcome: 'rewound' })]);
+      expect(runs).toHaveLength(1);
+      await Promise.all(runs);
+
+      expect(existsSync(expired)).toBe(false);
+      expect(existsSync(expiredFull)).toBe(false);
+      expect(existsSync(young)).toBe(true);
+      expect(existsSync(purgeBackup)).toBe(true);
+      const fresh = readdirSync(dir).filter(name => name.endsWith('.removed.bak') && name !== basename(young));
+      expect(fresh).toHaveLength(1);
+      expect(readFileSync(join(dir, fresh[0]!), 'utf8')).toBe(prompt(FAILED_INPUT, 'u1') + apiError + duration);
+    });
+
+    it('a cut put back after a failed restart: pruned as it settles, its own backup kept', async () => {
+      const { runs, prune } = collectPrunes();
+      const original = failedTranscript();
+      const { jsonl, cutAfterExit, settle, reports } = setup(original, { pruneRewindBackupsBeside: prune });
+      const expired = seedBackup(dirname(jsonl), 30 * DAY);
+      await cutAfterExit();
+      settle('failed');
+      expect(readFileSync(jsonl, 'utf8')).toBe(original);
+      expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
+      await Promise.all(runs);
+      expect(existsSync(expired)).toBe(false);
+      expect(readdirSync(dirname(jsonl)).filter(name => name.endsWith('.bak'))).toEqual([expect.stringMatching(/\.removed\.bak$/)]);
+    });
+
+    it('next to the transcript: registered as soon as the cut lands, so the periodic sweep reaches it even if the rewind never settles', async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-worker-rewind-data-'));
+      roots.push(dataDir);
+      previousDataDir = process.env.SESSION_DATA_DIR;
+      process.env.SESSION_DATA_DIR = dataDir;
+      const { runs, prune } = collectPrunes();
+      const { jsonl, cutAfterExit, reports } = setup(failedTranscript(), { pruneRewindBackupsBeside: prune });
+      await cutAfterExit();
+      // The worker goes away here: nothing settles, nothing is pruned.
+      expect(reports()).toEqual([]);
+      expect(runs).toHaveLength(0);
+      const backup = readdirSync(dirname(jsonl)).find(name => name.endsWith('.removed.bak'))!;
+      expect(await sweepRewindBackups(dataDir)).toEqual([]);
+      expect(await sweepRewindBackups(dataDir, { now: Date.now() + 30 * DAY })).toEqual([join(dirname(jsonl), backup)]);
+      expect(readdirSync(dirname(jsonl))).toEqual([`${SID}.jsonl`]);
+    });
+
+    it('nothing cut, nothing pruned', async () => {
+      const { runs, prune } = collectPrunes();
+      const { jsonl, pendingMessages, cutAfterExit, reports } = setup(failedTranscript(), { pruneRewindBackupsBeside: prune });
+      const expired = seedBackup(dirname(jsonl), 30 * DAY);
+      pendingMessages.length = 0;
+      await cutAfterExit();
+      expect(reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
+      expect(runs).toHaveLength(0);
+      expect(existsSync(expired)).toBe(true);
+    });
+
+    it('in a tree its CLI can write: this session\'s directory in the daemon data dir is pruned', async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-worker-rewind-data-'));
+      roots.push(dataDir);
+      previousDataDir = process.env.SESSION_DATA_DIR;
+      process.env.SESSION_DATA_DIR = dataDir;
+      const backupDir = rewindBackupDirForSession(dataDir, 'sess-rewind');
+      mkdirSync(backupDir, { recursive: true });
+      const expired = seedBackup(backupDir, 30 * DAY);
+      const { runs, prune } = collectPrunes();
+      const { jsonl, cutAfterExit, settle, reachWriteEdge } = setup(failedTranscript(), { pruneRewindBackupsBeside: prune }, directive(), { tree: true });
+      await cutAfterExit();
+      settle('spawned');
+      expect(reachWriteEdge()).toBe('write');
+      await Promise.all(runs);
+      expect(existsSync(expired)).toBe(false);
+      expect(readdirSync(backupDir)).toEqual([expect.stringMatching(/\.removed\.bak$/)]);
+      expect(readdirSync(dirname(jsonl))).toEqual([`${SID}.jsonl`]);
+    });
   });
 });
 
