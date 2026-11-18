@@ -39,6 +39,7 @@ import {
   type CliLaunchMode,
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
+import { isLocalBotId } from './setup/local-bot.js';
 import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, setHideLocalAddressesResolver } from './im/lark/local-address-switch.js';
@@ -1484,8 +1485,15 @@ export interface BotConfig {
    * `local_<slug>`，非 `cli_` 前缀）作为 daemon 标识 + dashboard 路由 key +
    * `/api/trigger` 的 cachedLarkAppId gate；`larkAppSecret` 在此模式下可缺省。
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
+   * `botmux setup add --local` 与 Dashboard 本地模式会把这种 bot 写入 bots.json，
+   * 供 `botmux start` 加载；那不是 `serve --api-only` 的一次性内存身份。
    */
   apiOnly?: boolean;
+  /**
+   * 持久化本地机器人标记。为 true 时 `larkAppId` 只是稳定本地身份（`local_<slug>`），
+   * 不是飞书应用 ID，并且必须同时 `apiOnly: true`。缺省的飞书 bot 不写这个字段。
+   */
+  localIdentity?: boolean;
   /** Internal, opt-in target policy for dispatch launch IPC. Absent/disabled fails closed. */
   dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
@@ -3810,6 +3818,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // requirement — a missing secret there is a misconfig, not a headless bot.
     // The rule for apiOnly is "may be omitted; if present it must still be a
     // string" — a number/object/array/false must NOT slip into a string field.
+    if (entry.localIdentity !== undefined && typeof entry.localIdentity !== 'boolean') {
+      throw new Error(`Bot config [${i}]: localIdentity must be a boolean`);
+    }
+    if (entry.localIdentity === true) {
+      if (entry.apiOnly !== true) {
+        throw new Error(`Bot config [${i}]: localIdentity requires apiOnly: true (this id is not a Feishu app)`);
+      }
+      if (!isLocalBotId(entry.larkAppId)) {
+        throw new Error(`Bot config [${i}]: localIdentity larkAppId must be a local_<slug> identity, not a Feishu app id`);
+      }
+    }
     if (entry.apiOnly === true) {
       if (entry.larkAppSecret !== undefined && typeof entry.larkAppSecret !== 'string') {
         throw new Error(`Bot config [${i}]: larkAppSecret must be a string when provided (apiOnly bots may omit it)`);
@@ -4329,6 +4348,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       botActorOwnerBindings,
       linkRefs: normalizeLinkRefConfig(entry.linkRefs),
       apiOnly: entry.apiOnly === true || undefined,
+      localIdentity: entry.localIdentity === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
       inviteConfig: entry.inviteConfig === undefined ? undefined : parseInviteConfig(entry.inviteConfig),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),

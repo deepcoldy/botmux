@@ -143,6 +143,22 @@ describe('parseSetupCommand', () => {
     expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/add --create-app 或 configure/);
   });
 
+  it('parses local bot creation and rejects Feishu-only flags', () => {
+    expect(parseSetupCommand([
+      'add', '--local', '--name', '研究室', '--cli', 'codex', '--default-working-dir', '~', '--json',
+    ])).toMatchObject({
+      action: 'add',
+      local: true,
+      createApp: false,
+      openPlatformAuto: false,
+      json: true,
+      flags: { name: '研究室', cli: 'codex', defaultWorkingDir: '~' },
+    });
+    expect(() => parseSetupCommand(['add', '--local', '--app-id', 'cli_x'])).toThrow(/--local/);
+    expect(() => parseSetupCommand(['add', '--local', '--create-app'])).toThrow(/--local/);
+    expect(() => parseSetupCommand(['add', '--local', '--allowed-users', 'a@b.com'])).toThrow(/--local/);
+  });
+
   it('rejects ambiguous create-app credential combinations and app-name without creation', () => {
     expect(() => parseSetupCommand(['add', '--create-app', '--app-id', 'cli_x'])).toThrow(/不能与 --app-id/);
     expect(() => parseSetupCommand(['add', '--app-name', 'Bot'])).toThrow(/必须与 add --create-app/);

@@ -35,6 +35,8 @@ import {
 import type { CliId } from '../adapters/cli/types.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
+import { buildLocalBotRecord } from '../setup/local-bot.js';
+import { invalidWorkingDirs } from '../utils/working-dir.js';
 
 // Static default-imports of qrcode-terminal's vendored QRCode class (its public
 // API only prints to a terminal; we need the low-level class to render a QR into
@@ -106,7 +108,7 @@ export interface BotOnboardingSnapshot {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'web' | 'compat' | 'local';
   /** Existing onboarding job whose exact App permission setup is being resumed. */
   recoveryOfJobId?: string;
   /** Monotonic permission-recovery attempt within the same immutable target lineage. */
@@ -159,8 +161,8 @@ export interface BotOnboardingInput {
   /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
   cloneSourceAppId?: string;
-  /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
-  registrationMode?: 'web' | 'compat';
+  /** 默认 Feishu 单码主路径；compat 是 SDK 兼容模式；local 不创建飞书应用。 */
+  registrationMode?: 'web' | 'compat' | 'local';
   /**
    * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
    * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
@@ -1649,7 +1651,74 @@ export class BotOnboardingManager {
     this.patch(id, { platformQrScanConfirmedAt: confirmedAt });
   }
 
+  /** Persist a local bot. Does not call Feishu, scan a QR, or create an app. */
+  private async runLocal(id: string, input: BotOnboardingInput): Promise<void> {
+    this.patch(id, { registrationMode: 'local' });
+    if (input.cloneSourceAppId) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'local_clone_unsupported',
+        message: '克隆会新建飞书应用。本地模式只创建不关联飞书的机器人。',
+      });
+      return;
+    }
+    const workingDir = input.workingDir?.trim() || '~';
+    const bad = invalidWorkingDirs({ workingDir });
+    if (bad.length > 0) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_working_dir',
+        message: `目录不存在或不是目录: ${bad.join(', ')}`,
+      });
+      return;
+    }
+    const displayName = input.appName?.trim();
+    const cliId: CliId = input.cliId ?? 'claude-code';
+    const record = buildLocalBotRecord({
+      displayName,
+      cliId,
+      wrapperCli: input.wrapperCli,
+      cliLaunchMode: input.cliLaunchMode,
+      ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
+      model: input.model,
+      existingIds: readBotsJsonOrEmpty(this.opts.botsJsonPath)
+        .map((bot: { larkAppId?: string }) => bot?.larkAppId)
+        .filter((appId: string | undefined): appId is string => typeof appId === 'string' && appId.length > 0),
+    });
+    try {
+      validateCliLaunchModeConfig({
+        cliId: record.cliId,
+        cliLaunchMode: record.cliLaunchMode,
+        wrapperCli: record.wrapperCli,
+        cliRuntime: record.cliRuntime,
+        cliPathOverride: record.cliPathOverride,
+      }, 'Dashboard local bot');
+    } catch (error) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_launch_mode_config',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    const addedBotIndex = await this.persistBot(record);
+    await this.runLiveStart(id, String(record.larkAppId));
+    this.patch(id, {
+      status: 'completed',
+      appId: String(record.larkAppId),
+      appName: displayName || String(record.larkAppId),
+      cliId,
+      workingDir,
+      addedBotIndex,
+      message: 'larkAppId 是稳定的本地身份，不是飞书 App ID。',
+    });
+  }
+
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    if (input.registrationMode === 'local') {
+      await this.runLocal(id, input);
+      return;
+    }
     const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
     const cloneSource = input.cloneSourceAppId
       ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)

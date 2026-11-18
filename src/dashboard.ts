@@ -6388,11 +6388,24 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web、compat 或 local' });
       }
-      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const registrationMode = registrationModeRaw === 'compat'
+        ? 'compat' as const
+        : registrationModeRaw === 'local'
+          ? 'local' as const
+          : 'web' as const;
+      if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
+      }
+      if (registrationMode === 'local' && parsed.requireCriticalScopesBeforeActivation === true) {
+        return jsonRes(res, 400, { ok: false, error: 'local_scope_gate_unsupported', message: '本地机器人没有飞书权限可校验。' });
+      }
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
+      if (registrationMode !== 'web' && sessionModeRaw) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 只用于飞书 Web 登录' });
+      }
       if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });
       }
