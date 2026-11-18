@@ -40,6 +40,9 @@ export interface TeamAgent {
   owner: { unionId?: string; name?: string };
   machineId?: string;
   machineName?: string;
+  /** 外部机器人（不跑在 botmux 上，团队成员在平台登记）：没有机器，`online` 不是心跳判定，
+   *  owner 是登记人。可以被 @、被拉进团队群。 */
+  external?: boolean;
 }
 
 export interface TeamAgentsResult {
@@ -216,8 +219,9 @@ function normalizeAgent(raw: unknown): TeamAgent | null {
       unionId: typeof ownerRaw.unionId === 'string' ? ownerRaw.unionId : undefined,
       name: typeof ownerRaw.name === 'string' ? ownerRaw.name : undefined,
     },
-    machineId: typeof a.machineId === 'string' ? a.machineId : undefined,
-    machineName: typeof a.machineName === 'string' ? a.machineName : undefined,
+    machineId: typeof a.machineId === 'string' && a.machineId ? a.machineId : undefined,
+    machineName: typeof a.machineName === 'string' && a.machineName ? a.machineName : undefined,
+    ...(a.external === true ? { external: true } : {}),
   };
 }
 

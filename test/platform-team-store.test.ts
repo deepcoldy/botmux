@@ -27,7 +27,7 @@ const payload = (rev: string, teams: unknown[]) => ({ rev, teams });
 const team = (
   teamId: string,
   chatIds: string[],
-  bots: Array<{ appId: string; unionId?: string }>,
+  bots: Array<{ appId: string; unionId?: string; external?: unknown }>,
   memberUnionIds: string[] = [],
 ) => ({ teamId, teamName: teamId, groupChatIds: chatIds, bots, memberUnionIds });
 
@@ -129,4 +129,31 @@ describe('applyPlatformTeamSync', () => {
     expect(applied?.teams[0].bots).toEqual([{ appId: 'cli_a', unionId: 'on_a', name: undefined }]);
   });
 
+});
+
+describe('external roster entries', () => {
+  it('keeps external: true, drops any other value, and still counts the bot as non-human', () => {
+    applyPlatformTeamSync(dataDir, payload('rev-ext', [
+      team('t1', ['oc_hall'], [
+        { appId: 'cli_ext', unionId: 'on_ext', external: true },
+        { appId: 'cli_odd', unionId: 'on_odd', external: 'yes' },
+        { appId: 'cli_a', unionId: 'on_a' },
+      ]),
+    ]));
+    const bots = listPlatformTeams(dataDir)[0].bots;
+    expect(bots).toEqual([
+      { appId: 'cli_ext', unionId: 'on_ext', name: undefined, external: true },
+      { appId: 'cli_odd', unionId: 'on_odd', name: undefined },
+      { appId: 'cli_a', unionId: 'on_a', name: undefined },
+    ]);
+    // 「这个 union_id 是不是 bot」的身份证据：外部机器人同样不是真人。
+    expect(isPlatformTeamBot(dataDir, 'on_ext')).toBe(true);
+  });
+
+  it('an external entry never makes a bot a team member for the human talk leg', () => {
+    applyPlatformTeamSync(dataDir, payload('rev-ext2', [
+      team('t1', [], [{ appId: 'cli_x', unionId: 'on_x', external: true }], ['on_member']),
+    ]));
+    expect(isPlatformTeamMember(dataDir, 'cli_x', 'on_member')).toBe(false);
+  });
 });

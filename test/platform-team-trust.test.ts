@@ -211,3 +211,45 @@ describe('platform roster trust is scoped to the RECEIVING bot (same team or sam
     expect(evaluateTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
   });
 });
+
+// 外部机器人：不跑在 botmux 上、由团队成员在平台登记的飞书机器人（名册条目 external: true）。
+// 它作为发送方按 union_id 享受同队信任；但它的 appId 是成员手填的，绝不能让本机 bot
+// 被当成该队成员，也不能触发同机信任腿。
+describe('external bots in the platform roster', () => {
+  it('an external bot on the receiver\'s team is trusted by union_id, like a roster bot', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext1',
+      teams: [{ teamId: 't1', teamName: 'T1', groupChatIds: ['oc_t1_hall'], bots: [{ appId: 'pf1', unionId: 'on_pf1' }, { appId: 'cli_ext', unionId: 'on_ext', name: 'Ext', external: true }], memberUnionIds: [] }],
+    });
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext')).toMatchObject({ allowed: true, reason: 'teamBot' });
+    expect(canOperate('pf1', 'oc_public', 'ou_ext', 'on_ext')).toBe(true);
+  });
+
+  it('an external entry carrying a LOCAL bot\'s appId does not open the same-machine leg', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext2',
+      teams: [{ teamId: 't2', teamName: 'T2', groupChatIds: [], bots: [{ appId: 'cli_local', unionId: 'on_chosen', external: true }], memberUnionIds: [] }],
+    });
+    writeLocalBots(['pf1', 'cli_local']);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_chosen', 'on_chosen').allowed).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_chosen', 'on_chosen')).toBe(false);
+  });
+
+  it('an external entry carrying the RECEIVER\'s appId does not make the receiver a team member', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext3',
+      teams: [{
+        teamId: 't3', teamName: 'T3', groupChatIds: ['oc_t3_hall'],
+        bots: [{ appId: 'pf1', unionId: 'on_pf1_claimed', external: true }, { appId: 'cli_remote', unionId: 'on_remote' }],
+        memberUnionIds: ['on_t3_member'],
+      }],
+    });
+    // 同队腿：pf1 并不真在 T3
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_remote', 'on_remote')).toBe(false);
+    // 团队群首次接触腿
+    expect(evaluateBotTalk('pf1', 'oc_t3_hall', 'ou_fresh', 'on_fresh').allowed).toBe(false);
+    // 真人成员腿
+    expect(evaluateTalk('pf1', 'oc_public', 'ou_m', undefined, 'on_t3_member').allowed).toBe(false);
+  });
+});

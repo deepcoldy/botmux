@@ -40,6 +40,11 @@ export interface PlatformTeamBot {
   appId: string;
   unionId?: string;
   name?: string;
+  /** 外部机器人：不跑在 botmux 上的飞书机器人，由团队成员在平台登记担保（平台下发
+   *  `external: true`，旧平台没有该字段）。它只作为「发送方」按 union_id 被同队 bot 信任；
+   *  它的 appId 永远不能让本机 bot 被当成该团队的成员，也不触发同机信任腿——
+   *  否则登记一个与本机 bot 同 appId 的外部条目，就能借本机身份拿到信任。 */
+  external?: boolean;
 }
 
 export interface PlatformTeamSyncTeam {
@@ -97,10 +102,12 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
+      const external = (b as Record<string, unknown>).external === true;
       bots.push({
         appId,
         unionId: unionId || undefined,
         name,
+        ...(external ? { external: true } : {}),
       });
     }
   }
@@ -163,7 +170,8 @@ export function isPlatformHallChat(dataDir: string, chatId: string | undefined):
 
 /** Is `unionId` a bot in ANY platform team this machine belongs to?
  *
- *  Identity evidence only ("this union_id is a botmux bot"), NOT authorization:
+ *  Identity evidence only ("this union_id is a bot", botmux or external — both
+ *  are non-human), NOT authorization:
  *  the roster is per MACHINE (every team the machine's owner is in), so a hit
  *  says nothing about whether the RECEIVING bot shares a team with the sender.
  *  Auth gates must use {@link isPlatformTeamBotTrustedBy}. */
@@ -212,10 +220,17 @@ export function isPlatformTeamBotTrustedBy(
   for (const t of data.teams) {
     const sender = t.bots.find((b) => b.unionId === id);
     if (!sender) continue;
-    if (receiver && t.bots.some((b) => b.appId === receiver)) return true;
-    (senderAppIds ??= []).push(sender.appId);
+    if (receiver && hasTeamBotmuxBot(t, receiver)) return true;
+    // 外部机器人不跑在任何机器上：同机腿只认 botmux bot 条目。
+    if (!sender.external) (senderAppIds ??= []).push(sender.appId);
   }
   return !!senderAppIds && senderAppIds.some((appId) => isLocalApp(appId));
+}
+
+/** `appId` 作为 botmux bot（非外部条目）在团队 `t` 的 roster 里。判定「接收 bot 是否
+ *  在这个团队」只能看这类条目：外部条目的 appId 是成员手填的。 */
+function hasTeamBotmuxBot(t: PlatformTeamSyncTeam, appId: string): boolean {
+  return t.bots.some((b) => b.appId === appId && !b.external);
 }
 
 /**
@@ -240,7 +255,7 @@ export function isTeamGroupChatFor(
   if (!receiver) return false;
   const data = readFile(dataDir);
   if (!data) return false;
-  return data.teams.some((t) => t.groupChatIds.includes(id) && t.bots.some((b) => b.appId === receiver));
+  return data.teams.some((t) => t.groupChatIds.includes(id) && hasTeamBotmuxBot(t, receiver));
 }
 
 /**
@@ -280,7 +295,7 @@ export function isPlatformTeamMember(
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    if (t.memberUnionIds.includes(uid) && t.bots.some((b) => b.appId === appId)) return true;
+    if (t.memberUnionIds.includes(uid) && hasTeamBotmuxBot(t, appId)) return true;
   }
   return false;
 }
