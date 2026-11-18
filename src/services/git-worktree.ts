@@ -18,6 +18,7 @@ import { logger } from '../utils/logger.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { readGlobalConfig } from '../global-config.js';
+import { resolveWorktreeCreateTimeoutMs } from '../config.js';
 
 const execFileP = promisify(execFile);
 
@@ -236,7 +237,7 @@ async function addWorktreeOrReuseAfterRace(
   reuseExisting: boolean,
 ): Promise<WorktreeCreation | null> {
   try {
-    await git(args, repo, 60_000);
+    await git(args, repo, resolveWorktreeCreateTimeoutMs());
     return null;
   } catch (error) {
     if (reuseExisting) {
