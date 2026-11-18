@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { workerTestModules, useWorkerTestModulesCleanup } from './helpers/worker-test-modules.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
@@ -28,6 +28,7 @@ function redraw(rows: string[]): string {
 // has none), so the submit receipt is only visible if the worker follows it.
 type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'provisional-thread-start';
 
+useWorkerTestModulesCleanup();
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
   for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'provisional-thread-start'] as const) {
@@ -41,6 +42,7 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
 }
 
 async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise<void> {
+  const modules = workerTestModules({ forceSource: !!process.env.BOTMUX_TEST_WORKER_BINARY });
   const root = mkdtempSync('/tmp/bmx-traex-startup-');
   const sessionId = randomUUID();
   const nativeId = randomUUID();
@@ -199,23 +201,23 @@ setInterval(() => {
   env.BOTMUX_WRAPPER_BIN = join(root, 'wrapper-bin');
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
-  let workerScript = join(root, 'worker-bootstrap.ts');
+  let workerScript = join(root, `worker-bootstrap.${modules.scriptExtension}`);
   const preload = `
-await import(${JSON.stringify(resolve('src/worker-ipc-preload.ts'))});
+await import(${JSON.stringify(modules.path('worker-ipc-preload.ts'))});
 `;
   writeFileSync(workerScript, `
 (async () => {
 ${preload}
-await import(${JSON.stringify(resolve('src/worker.ts'))});
+await import(${JSON.stringify(modules.path('worker.ts'))});
 process.send?.({ type: 'worker_ipc_ready' });
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `);
   if (nativeViewport || heldIdle || provisionalThread) {
-    workerScript = join(root, 'worker-native-viewport.ts');
+    workerScript = join(root, `worker-native-viewport.${modules.scriptExtension}`);
     writeFileSync(workerScript, `
 (async () => {
 ${preload}
-const { TmuxPipeBackend } = await import(${JSON.stringify(resolve('src/adapters/backend/tmux-pipe-backend.ts'))});
+const { TmuxPipeBackend } = await import(${JSON.stringify(modules.path('adapters/backend/tmux-pipe-backend.ts'))});
 const originalOnData = TmuxPipeBackend.prototype.onData;
 TmuxPipeBackend.prototype.onData = function (callback) {
   let pending = '', dropping = false;
@@ -242,7 +244,7 @@ TmuxPipeBackend.prototype.onData = function (callback) {
 };
 const fs = await import('node:fs');
 if (${JSON.stringify(provisionalThread)}) {
-  const { IdleDetector } = await import(${JSON.stringify(resolve('src/utils/idle-detector.ts'))});
+  const { IdleDetector } = await import(${JSON.stringify(modules.path('utils/idle-detector.ts'))});
   const originalOnIdle = IdleDetector.prototype.onIdle;
   const originalReset = IdleDetector.prototype.reset;
   let idleEdgeObserved = false;
@@ -261,7 +263,7 @@ if (${JSON.stringify(provisionalThread)}) {
   };
 }
 if (${JSON.stringify(heldIdle)}) {
-  const { IdleDetector } = await import(${JSON.stringify(resolve('src/utils/idle-detector.ts'))});
+  const { IdleDetector } = await import(${JSON.stringify(modules.path('utils/idle-detector.ts'))});
   const originalOnIdle = IdleDetector.prototype.onIdle;
   IdleDetector.prototype.onIdle = function (callback) {
     let held = false;
@@ -292,7 +294,7 @@ TmuxPipeBackend.prototype.captureViewportAsync = async function () {
   }
   return screen;
 };
-await import(${JSON.stringify(resolve('src/worker.ts'))});
+await import(${JSON.stringify(modules.path('worker.ts'))});
 process.send?.({ type: 'worker_ipc_ready' });
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `);
@@ -309,7 +311,7 @@ process.send?.({ type: 'worker_ipc_ready' });
     const options = { cwd: resolve('.'), env, serialization: 'json' as const, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
       ? spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], options)
-      : spawnNodeTsScript(workerScript, [], options);
+      : modules.spawn(workerScript, [], options);
     child.on('message', message => messages.push(message as WorkerToDaemon));
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
