@@ -292,6 +292,7 @@ function dashboardCall(custom = headers(), signal?: AbortSignal) {
   });
 }
 
+// 非文本断言：提取并执行真实 Dashboard 路由闭包，以真实 HTTP/CSRF 结果为 oracle，不断言源码字符串。
 describe('prepare review: authority across retries', () => {
   it('HMAC is one-shot and bound to method/path/port; rejection never queues a wake', async () => {
     await holdGate();
@@ -360,6 +361,7 @@ describe('prepare review: gate-time interventions', () => {
     });
 });
 
+// 非文本断言：执行真实 Dashboard/IPC 闭包及网络取消，断言接纳/唤醒行为，不比较源码文本。
 describe('prepare review: deadlines and disconnect', () => {
   it('bounded gate timeout removes its waiter, late release does not wake, fresh retry can proceed', async () => {
     await holdGate();
