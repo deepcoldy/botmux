@@ -21188,7 +21188,7 @@ function markPromptReadyFromPty(observedBackend: SessionBackend): void {
 }
 
 /** Push a coarse screen status without waiting for the periodic sampler. */
-function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolean; clearTurnId?: boolean }): void {
+function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolean; clearTurnId?: boolean; directSubmit?: boolean }): void {
   if (workerSessionEventScope && !hasCurrentSessionRuntime()) return;
   if (!renderer) return;
   const { content } = renderer.snapshot();
@@ -21200,6 +21200,10 @@ function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolea
     ...backgroundWaitPayload(),
     turnId: opts?.clearTurnId ? undefined : currentBotmuxTurnId,
     dispatchAttempt: opts?.clearTurnId ? undefined : currentBotmuxDispatchAttempt,
+    // Explicit direct-submit provenance: only the clearTurnId caller that
+    // represents real new work (prompt_submitted hook) sets this. Keep-alive
+    // clears the turn id without this flag, so the daemon can tell them apart.
+    ...(opts?.directSubmit ? { directSubmit: true } : {}),
   });
 }
 
@@ -39248,8 +39252,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         idleDetector?.reset();
         log('User prompt submitted via hook — publishing working state');
         // Web 终端/沙箱 hook 直提路径无 managed turn；显式 clearTurnId 避免携带
-        // 遗留的上一轮已终态 turnId，防止边沿更新误归因到历史 turn。
-        publishScreenStatus('working', { force: true, clearTurnId: true });
+        // 遗留的上一轮已终态 turnId，防止边沿更新误归因到历史 turn。directSubmit
+        // 标记这是真实新工作（区别于同样 clearTurnId 的 prompt-cache keep-alive），
+        // daemon 据此把卡片重新开回 working。
+        publishScreenStatus('working', { force: true, clearTurnId: true, directSubmit: true });
       }
       const submittedTurnId = writtenInputs.takeSubmitted(msg);
       if (submittedTurnId) send({ type: 'prompt_submitted_input', turnId: submittedTurnId });

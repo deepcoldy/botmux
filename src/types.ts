@@ -2763,6 +2763,13 @@ export type WorkerToDaemonBase =
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'goal_update'; goal: import('./services/native-goal-state.js').NativeGoalState | null; turnId?: string; dispatchAttempt?: number; signature?: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      /** Set ONLY on the working frame a Web Terminal / sandbox hook
+       *  direct-submit publishes via the worker's clearTurnId path: real new
+       *  work that belongs to no managed turn. It explicitly reopens the card
+       *  to working after a post-terminal idle correction. A prompt-cache
+       *  keep-alive also clears the turn id but never sets this, so it cannot
+       *  flip a settled card back to working. Omitted everywhere else. */
+      directSubmit?: boolean;
       /** The main turn has ended but this many background tasks it launched are
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
        *  otherwise. Never changes the reported status; the card shows it and the
