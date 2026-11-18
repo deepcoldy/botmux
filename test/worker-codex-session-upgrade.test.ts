@@ -167,6 +167,10 @@ function harness() {
     expect(state.cliRestartInProgress).toBe(false);
     expect(state.rawInputRestartGate).toBe(false);
   });
+  // Failed-turn rewind wiring flushPending calls into, real: none in flight here.
+  state.failedTurnRewindInFlight = null;
+  state.settleFailedTurnRewindOffQueue = evaluate<() => void>('settleFailedTurnRewindOffQueue', state);
+  state.putBackStoppedRewindCutBeforeWrites = evaluate<() => boolean>('putBackStoppedRewindCutBeforeWrites', state);
   const realFlush = evaluate<() => Promise<void>>('flushPending', state);
   state.flushPending = vi.fn(async () => {
     steps.push('flush requested');

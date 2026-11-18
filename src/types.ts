@@ -305,6 +305,15 @@ export interface FailedTurnRecord {
   /** Provisional native quota observation, not a failed terminal. Unclaimed
    * snapshots expire when the CLI leaves limited or completes this turn. */
   limitedSnapshot?: true;
+  /** The worker saw this turn end on API errors alone (turn_terminal
+   *  `directFailure`): the next input may cut it out and re-send its input. */
+  directFailure?: true;
+  /** The terminal's `retryable`, kept for the rewind decision. */
+  retryable?: boolean;
+  /** Frozen at the failure: this turn's answer was meant for the chat (not an
+   *  HTTP wait/async result, a suppressed or silent run, a document comment).
+   *  Only such a failed input may be folded into another chat turn. */
+  answersInChat?: true;
   recovery?: {
     requestId: string;
     mode: 'retry' | 'fresh';
@@ -312,6 +321,23 @@ export interface FailedTurnRecord {
     sessionId: string;
     state: 'attempting' | 'accepted' | 'cancelled' | 'dispatch_unknown';
   };
+}
+
+/** Daemon → worker, on a `message`: the transcript's last turn is a turn that
+ *  failed without any output (see services/failed-turn-rewind.ts). Cut it out
+ *  first — the way /rewind does — and write {@link content} instead of the
+ *  message's own content, so failures do not pile up as turns. When the worker
+ *  cannot cut it (busy, the transcript shows something else, a restart is
+ *  running…) the message goes in unchanged, exactly as without a directive. */
+export interface FailedTurnRewindDirective {
+  failedTurnId: string;
+  /** The failed turn's exact input: the transcript's last turn must be it. */
+  failedInput: string;
+  /** `resend`: the failed input again (retry button / automatic continuation).
+   *  `merge`: the failed input followed by this message's input. */
+  mode: 'resend' | 'merge';
+  /** What the CLI gets once the turn is cut. */
+  content: string;
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -1143,6 +1169,23 @@ export interface Session {
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
   lastFailedTurn?: FailedTurnRecord;
+  /** The latest failure card posted to the chat, and the turn it reports.
+   *  A turn that re-sends that failed input reuses the card when it fails
+   *  the same way (services/failed-turn-rewind.ts). */
+  lastFailureCard?: { turnId: string; messageId: string };
+  /** A failed input that was cut from the transcript and re-sent (alone or
+   *  ahead of a newer input) as `turnId`. While that turn keeps failing
+   *  without output, the chain's one card is updated in place with the count
+   *  instead of a new card per failure. */
+  failedTurnRewindChain?: {
+    turnId: string;
+    /** The failed turn the chain started from: a retry or continuation aimed
+     *  at it may re-send what the chain carries now. */
+    originTurnId: string;
+    /** Consecutive failures of this input before `turnId` (the first is 1). */
+    failures: number;
+    cardMessageId?: string;
+  };
   /** Exact automatic recovery turn and its original, daemon-authenticated principal. */
   failedTurnRecovery?: {
     originalTurnId: string;
@@ -2180,7 +2223,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -2943,6 +2986,22 @@ export type WorkerToDaemonBase =
        *  provider answered before this failure — when its prompt cache was last
        *  refreshed. Bounds how long a recovery is worth waiting. */
       providerLastSuccessAtMs?: number;
+      /** `failed` Claude Code terminals only: the transcript's last turn is this
+       *  turn's input answered by API errors alone — no tool call, no text. The
+       *  next input may cut it out instead of stacking on top (see
+       *  services/failed-turn-rewind.ts). */
+      directFailure?: true;
+    }
+  | {
+      /** Outcome of a message's {@link FailedTurnRewindDirective}, sent before
+       *  the message reaches the CLI: `rewound` = the failed turn was cut and
+       *  the directive's content is what the CLI gets; `declined` = nothing
+       *  was cut and the message's own content goes in as usual. */
+      type: 'failed_turn_rewind';
+      turnId: string;
+      failedTurnId: string;
+      outcome: 'rewound' | 'declined';
+      reason: string;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

@@ -21,7 +21,9 @@ const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_o
 // handler re-checks generation, session and structural possibility.
 // cli_input_backlog reports the worker's own input queue, which outlives runtime
 // re-bindings; the worker sends it without a runtime (see sessionEventMetadata).
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'session_identity_decision', 'cli_input_backlog']);
+// failed_turn_rewind likewise: it is sent from inside the CLI restart that cuts
+// a failed turn, before the queued message runs.
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'session_identity_decision', 'cli_input_backlog', 'failed_turn_rewind']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {

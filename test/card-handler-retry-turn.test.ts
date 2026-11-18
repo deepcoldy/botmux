@@ -310,7 +310,23 @@ describe('retry_turn — happy path', () => {
     expect(sendWorkerInputMock.mock.calls[0][1]).toMatchObject({
       content: 'wrapped: do the thing',
     });
+    // A cut of a turn that failed without output re-sends this card's turn.
+    expect(sendWorkerInputMock.mock.calls[0][3]).toMatchObject({ failedTurnResendOf: TURN });
     expect(res?.toast?.type).toBe('success');
+  });
+
+  // The failed input is already being re-sent by an input whose CLI restart
+  // (cutting the failed turn out first) is still running: a retry now would
+  // run it twice.
+  it('refuses while another input is already re-sending this failed turn', async () => {
+    const ds = makeDs();
+    ds.pendingFailedTurnRewinds = new Map([['trg_carrier', {
+      failedTurnId: TURN, mode: 'merge', content: 'x', failedUserPrompt: 'x', worker: ds.worker,
+    }]]);
+    const res = await handleCardAction(actionData(TURN, 'resend'), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(res?.toast).toMatchObject({ type: 'warning' });
+    expect(res?.toast?.content).toMatch(/正在重新发送/);
   });
 
   it('submits a short continue instruction in continue mode', async () => {

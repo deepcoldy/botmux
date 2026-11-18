@@ -872,6 +872,17 @@ export interface DaemonSession {
   lastCliInput?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
+  /** Inputs sent with a failed-turn rewind directive, until the worker says
+   *  whether it cut the failed turn (`failed_turn_rewind`). Keyed by the
+   *  input's turn id; bounded, in-memory (a dead worker never reports). */
+  pendingFailedTurnRewinds?: Map<string, {
+    failedTurnId: string;
+    mode: 'merge' | 'resend';
+    content: string;
+    failedUserPrompt: string;
+    /** The worker process that was asked; another one never answers. */
+    worker: DaemonSession['worker'];
+  }>;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };

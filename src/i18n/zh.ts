@@ -1804,10 +1804,12 @@ export const messages: Record<string, string> = {
   'card.turn_failed.field_error': '**错误码**：{errorCode}',
   'card.turn_failed.field_when': '**失败时刻**：{when}',
   'card.turn_failed.field_task': '**任务**：{task}',
+  'card.turn_failed.field_repeat': '**连续失败**：同一条输入已连续第 {count} 次失败，除了报错没有任何输出；会话里只保留最近一次失败，这张卡显示的是最近一次的错误',
   'card.turn_failed.field_continuations': '**已自动续跑**：{count} 次（仍未恢复）',
   'card.turn_failed.provider_eta': '**上游预计恢复**：{eta}（之后再继续更稳）',
   'card.turn_failed.reason': '**原因**：{reason}',
   // 「没跑就挂了」——重发无副作用风险，可以放心点。
+  'card.turn_failed.retry_direct': '这一轮除了报错**没有任何输出**（没有调用工具，也没有回复）。点「重试」会先把这次失败从会话里拿掉，再原样重发这条输入；之后再发来的消息也会和它合成一轮发出，不会在会话里一轮轮叠上去。',
   'card.turn_failed.retry_safe': '这一轮的输入没有送达 CLI，**没有任何已执行的操作**，可以安全重试。',
   // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
   'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
@@ -1824,6 +1826,7 @@ export const messages: Record<string, string> = {
   'card.action.purge_images_started': '正在清理会话小图并重启续跑…',
   'card.action.retry_turn_missing': '⚠️ 找不到这一轮的输入记录，无法重试。请直接发送新的消息。',
   'card.action.retry_turn_stale': '⚠️ 这张卡片已过期（会话后来又失败过或已重试）。请用最新那张卡片，或直接发送新的消息。',
+  'card.action.retry_turn_in_flight': '这条输入正在重新发送（会先把失败那一轮从会话里拿掉），无需再点重试。',
   'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
   'card.action.retry_turn_submit_failed': '⚠️ 重试提交失败：worker 当前不接受输入，请稍后再试。',
   'card.action.retry_turn_success': '🔁 已重新提交这一轮任务，请等待执行。',

@@ -36,6 +36,8 @@ describe('Codex effort menu input ownership', () => {
         codexCliEffortOperation: {}, cancelCodexCliEffort: vi.fn(() => cancelled),
         effectiveBackendType: 'pty', isRemoteBackendType: () => false,
         isCriticalInterruptKey, traexQuotaPending: undefined, traexAutoModelController: null,
+        // No failed-turn rewind holds a message here.
+        stopHeldFailedTurnRewind: () => false,
       };
       const handler = evaluate<(...args: any[]) => Promise<unknown>>(name, state);
       const result = handler(...args);
