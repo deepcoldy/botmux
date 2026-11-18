@@ -15,6 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CODEX_REASONING_EFFORTS,
   cliModelMayKeepReasoningEffort,
+  codexAppResumeRestoresReasoningEffort,
+  codexReasoningEffortDroppedNotice,
   codexReasoningEffortsForModel,
   reasoningEffortsForCliModel,
   resolveCodexLaunchReasoningEffort,
@@ -178,6 +180,23 @@ describe('paths without a catalogue keep what the table cannot refute', () => {
 });
 
 describe('launch-time gate', () => {
+  it('skips only an effective Codex App thread resume, never a demoted fresh start', () => {
+    expect(codexAppResumeRestoresReasoningEffort({
+      cliId: 'codex-app', resume: true, cliSessionId: 'thread-1',
+    })).toBe(true);
+    // init asked to resume, but the worker's probe/tier-2 demotion made the
+    // actual launch fresh: the worker must still gate this thread/start.
+    expect(codexAppResumeRestoresReasoningEffort({
+      cliId: 'codex-app', resume: false, cliSessionId: 'thread-1',
+    })).toBe(false);
+    expect(codexAppResumeRestoresReasoningEffort({
+      cliId: 'codex-app', resume: true, cliSessionId: undefined,
+    })).toBe(false);
+    expect(codexAppResumeRestoresReasoningEffort({
+      cliId: 'codex', resume: true, cliSessionId: 'thread-1',
+    })).toBe(false);
+  });
+
   it('passes the common four through without asking the catalogue', async () => {
     const loadCatalog = vi.fn(async () => officialCatalog);
     for (const effort of FOUR) {
@@ -207,7 +226,7 @@ describe('launch-time gate', () => {
     const send = vi.fn();
     const gate = loadWorkerFunction<(cfg: any, cliBin: string, env: NodeJS.ProcessEnv) => Promise<string | undefined>>(
       'codexLaunchReasoningEffort',
-      { resolveCodexLaunchReasoningEffort, loadCodexServiceTierCatalog, isRemoteBackendType, log, send, currentBotmuxTurnId: 'om_turn' },
+      { resolveCodexLaunchReasoningEffort, codexReasoningEffortDroppedNotice, loadCodexServiceTierCatalog, isRemoteBackendType, log, send, currentBotmuxTurnId: 'om_turn' },
     );
     const cfg = { cliId: 'codex', model: FUTURE, reasoningEffort: 'max', backendType: 'tmux' };
     const env = { CODEX_HOME: '/fixture/codex-home' };

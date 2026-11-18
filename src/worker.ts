@@ -276,7 +276,7 @@ import { DSH_TUI_RESUME_ENV_KEYS, dshTuiResumeScope } from './core/dsh-tui-env.j
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { writeSessionEnvStamp } from './services/session-env-stamp.js';
 import { resumeFallbackNotice } from './services/resume-fallback-notice.js';
-import { cliModelSupportsReasoningEffort, resolveCodexLaunchReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, codexAppResumeRestoresReasoningEffort, codexReasoningEffortDroppedNotice, isCodexReasoningEffort, resolveCodexLaunchReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
@@ -1693,9 +1693,7 @@ async function codexLaunchReasoningEffort(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
-      message: `本次启动未使用思考强度 ${decision.dropped.effort}：${decision.dropped.catalog
-        ? `codex 模型目录显示 ${model} 不支持该档位`
-        : `拿不到可用于 ${model} 的 codex 模型目录，按内置档位表该档位不受支持`}，已按 CLI 默认强度启动；设置未改动。`,
+      message: codexReasoningEffortDroppedNotice(cfg.model, decision.dropped),
     });
   }
   return decision.effort;
@@ -19784,6 +19782,26 @@ async function handleTrustedCodexAppMarker(
     });
     return true;
   }
+  if (kind === 'launch_reasoning_dropped' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    const supported = payload.supported;
+    if (typeof payload.model !== 'string' || payload.model.length > 256
+      || !isCodexReasoningEffort(payload.effort)
+      || !Array.isArray(supported) || supported.length > 6 || !supported.every(isCodexReasoningEffort)
+      || typeof payload.catalog !== 'boolean') return false;
+    const dropped = { effort: payload.effort, supported, catalog: payload.catalog };
+    const model = payload.model.trim() || '(CLI default)';
+    log(`Codex App fresh fallback reasoning effort ${dropped.effort} is not supported by model=${model}`
+      + ` per the ${dropped.catalog ? 'live catalog' : 'static table'}`
+      + ` (supported: ${dropped.supported.join('/') || 'none'}); launching without it`);
+    // This marker is emitted only AFTER a missing-thread resume has committed
+    // to a real fresh thread/start. A successful resume never produces it.
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      message: codexReasoningEffortDroppedNotice(payload.model, dropped),
+    });
+    return true;
+  }
   if (kind === 'thread' && typeof payload.threadId === 'string') {
     persistCliSessionId(payload.threadId);
     return true;
@@ -28553,9 +28571,16 @@ async function spawnCliBody(
 
   // Codex: judge the level against the catalogue of this exact launch (the
   // binary and env the service-tier check below also uses). A remote viewer
-  // carries no level, and a reattach or adopted pane launches nothing.
+  // carries no level, and a reattach or adopted pane launches nothing. A
+  // codex-app resume with a native thread id restores that thread's persisted
+  // effort and does not consume this argv level: skip the probe here. Its
+  // runner applies the same gate only if a missing thread forces a REAL fresh
+  // thread/start fallback.
+  const codexAppResume = codexAppResumeRestoresReasoningEffort({
+    cliId: cfg.cliId, resume: effectiveResume, cliSessionId: effectiveCliSessionId,
+  });
   const launchReasoningEffort = isCodexFamilyCliId(cfg.cliId) && cfg.reasoningEffort && !remoteWsUrl
-      && !cfg.adoptMode && !willReattachPersistent
+      && !cfg.adoptMode && !willReattachPersistent && !codexAppResume
     ? await codexLaunchReasoningEffort(
       cfg,
       cfg.cliId === 'codex' ? cliAdapter.resolvedBin : resolveCommandReal(cfg.cliPathOverride ?? 'codex'),
@@ -28675,6 +28700,12 @@ async function spawnCliBody(
     // dsh runner only; other adapters ignore the field.
     dshProfile: cfg.dshProfile,
     reasoningEffort: launchReasoningEffort,
+    ...(cfg.cliId === 'codex-app' ? {
+      // The runner needs this only for a missing-thread fresh fallback. Match
+      // codexLaunchReasoningEffort: a wrapper/profile/remote provider cannot
+      // be attested by the bare local catalogue.
+      allowCodexReasoningCatalog: !cfg.wrapperCli?.trim() && !cfg.codexProfile && !isRemoteBackendType(cfg.backendType),
+    } : {}),
     codexProfile: cfg.codexProfile,
     serviceTier: cfg.serviceTier,
     disableCliBypass: cfg.disableCliBypass === true,

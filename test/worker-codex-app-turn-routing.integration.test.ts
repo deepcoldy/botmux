@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -1545,5 +1546,90 @@ describe('Codex App worker live effort', () => {
     expect(requests.filter(r => r.method === 'turn/settings/update').map(r => r.params)).toEqual([
       { threadId: 'thread-fake', turnId: 'turn-fake-1', effort: 'high' },
     ]);
+  }, 35_000);
+});
+
+describe('Codex App resume reasoning gate', () => {
+  function prepareUnavailableCatalog(root: string) {
+    const fixture = join(root, 'fake-codex-fixture.mjs');
+    const fakeCodex = join(root, 'fake-codex.mjs');
+    const requestLog = join(root, 'requests.jsonl');
+    const probeLog = join(root, 'debug-models.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fixture);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+if (process.argv[2] === 'debug' && process.argv[3] === 'models') {
+  appendFileSync(${JSON.stringify(probeLog)}, JSON.stringify({ pid: process.pid }) + '\\n');
+  process.exit(1);
+}
+const child = spawn(process.execPath, [${JSON.stringify(fixture)}, ...process.argv.slice(2)], {
+  stdio: 'inherit', env: process.env,
+});
+child.on('error', error => { console.error(error); process.exit(1); });
+child.on('exit', code => process.exit(code ?? 1));
+`);
+    chmodSync(fakeCodex, 0o755);
+    return { fakeCodex, requestLog, probeLog };
+  }
+
+  function resumeInit(sessionId: string, fakeCodex: string, requestLog: string, behavior: string) {
+    return replacementInit(sessionId, fakeCodex, '', {
+      backendType: 'pty',
+      model: 'gpt-6.3-sol',
+      reasoningEffort: 'max',
+      resume: true,
+      cliSessionId: 'thread-existing-1',
+      turnId: 'om_resume_gate',
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: behavior },
+    });
+  }
+
+  it('successful thread resume neither probes nor claims a default-effort launch', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-resume-gate-'));
+    tempDirs.add(root);
+    const { fakeCodex, requestLog, probeLog } = prepareUnavailableCatalog(root);
+    const sessionId = replacementSessionId('resume-gate-success');
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs, messages);
+    worker.send(resumeInit(sessionId, fakeCodex, requestLog, 'success'));
+    await waitFor(worker, logs, () => readRequests(requestLog).some(r => r.method === 'thread/resume')
+      && messages.some(message => message.type === 'prompt_ready'));
+
+    const resume = readRequests(requestLog).find(r => r.method === 'thread/resume');
+    expect(resume.params.config?.model_reasoning_effort).toBeUndefined();
+    expect(resume.params.model).toBeUndefined();
+    expect(existsSync(probeLog)).toBe(false);
+    expect(messages.filter(message => message.type === 'user_notify'
+      && message.message.includes('本次启动未使用思考强度'))).toEqual([]);
+  }, 35_000);
+
+  it('missing-thread fallback still gates the real fresh thread/start and notifies once', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-resume-fallback-gate-'));
+    tempDirs.add(root);
+    const { fakeCodex, requestLog, probeLog } = prepareUnavailableCatalog(root);
+    const sessionId = replacementSessionId('resume-gate-fallback');
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'resume-not-found', logs, messages);
+    worker.send(resumeInit(sessionId, fakeCodex, requestLog, 'resume-not-found'));
+    await waitFor(worker, logs, () => readRequests(requestLog).some(r => r.method === 'thread/start')
+      && messages.some(message => message.type === 'user_notify'
+        && message.message.includes('本次启动未使用思考强度 max')));
+
+    const requests = readRequests(requestLog);
+    expect(requests.filter(r => r.method === 'thread/resume')).toHaveLength(1);
+    const start = requests.find(r => r.method === 'thread/start');
+    expect(start.params.model).toBe('gpt-6.3-sol');
+    expect(start.params.config?.model_reasoning_effort).toBeUndefined();
+    expect(readFileSync(probeLog, 'utf8').trim().split('\n')).toHaveLength(1);
+    const notices = messages.filter(message => message.type === 'user_notify'
+      && message.message.includes('本次启动未使用思考强度'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      turnId: 'om_resume_gate',
+      message: expect.stringContaining('已按 CLI 默认强度启动；设置未改动'),
+    });
   }, 35_000);
 });

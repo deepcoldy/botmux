@@ -98,6 +98,17 @@ export function isCodexReasoningCliId(cliId: string | undefined): boolean {
   return cliId === 'codex' || cliId === 'codex-app';
 }
 
+/** Codex App restores a thread's persisted effort only when the EFFECTIVE
+ * launch still resumes that thread. Worker resume-demotion probes may turn an
+ * init-time resume into a fresh start; those must go through the launch gate. */
+export function codexAppResumeRestoresReasoningEffort(input: {
+  cliId: string | undefined;
+  resume: boolean;
+  cliSessionId: string | undefined;
+}): boolean {
+  return input.cliId === 'codex-app' && input.resume && !!input.cliSessionId;
+}
+
 /** Backend variants are a TraeX launch capability, either local or delegated
  * through the provider-neutral Remote Runner start/resume contract. */
 export function isBackendVariantCliId(cliId: string | undefined): boolean {
@@ -223,9 +234,28 @@ export function cliLaunchAcceptsReasoningEffort(
     : cliModelSupportsReasoningEffort(cliId, model, effort);
 }
 
+export interface CodexReasoningEffortDrop {
+  effort: CodexReasoningEffort;
+  supported: readonly CodexReasoningEffort[];
+  catalog: boolean;
+}
+
 export type CodexLaunchReasoningEffort =
   | { effort?: CodexReasoningEffort; dropped?: undefined }
-  | { effort?: undefined; dropped: { effort: CodexReasoningEffort; supported: readonly CodexReasoningEffort[]; catalog: boolean } };
+  | { effort?: undefined; dropped: CodexReasoningEffortDrop };
+
+/** User-facing explanation shared by the worker's direct-launch gate and the
+ * Codex App runner's signed fresh-fallback marker. The saved setting is
+ * deliberately untouched in both paths. */
+export function codexReasoningEffortDroppedNotice(
+  model: string | undefined,
+  dropped: CodexReasoningEffortDrop,
+): string {
+  const name = model?.trim() || '(CLI default)';
+  return `本次启动未使用思考强度 ${dropped.effort}：${dropped.catalog
+    ? `codex 模型目录显示 ${name} 不支持该档位`
+    : `拿不到可用于 ${name} 的 codex 模型目录，按内置档位表该档位不受支持`}，已按 CLI 默认强度启动；设置未改动。`;
+}
 
 /**
  * Launch-time gate for a Codex reasoning level, run by the worker with the
