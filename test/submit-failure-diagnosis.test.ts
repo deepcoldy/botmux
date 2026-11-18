@@ -364,6 +364,31 @@ describe('claudeComposerHoldsInput', () => {
     expect(claudeComposerHoldsInput(screen, 'line one\nline two')).toBe(true);
   });
 
+  describe('a long draft scrolled inside the composer', () => {
+    const lines = Array.from({ length: 25 }, (_, i) => `line ${i + 1} of the forwarded message`);
+    const longInput = lines.join('\n');
+    const scrolledScreen = [
+      '✻ Cogitated for 10m 6s · done 9:26 PM · 1 shell still running',
+      '─── ↑ 18 more ───────────────────────────────────────────',
+      ...lines.slice(-6).map(line => `  ${line}\\`),
+      RULE,
+      '  ⏵⏵ bypass permissions on · 1 shell',
+    ].join('\n');
+
+    it('matches the input by its tail when the head scrolled out', () => {
+      expect(claudeComposerHoldsInput(scrolledScreen, longInput)).toBe(true);
+    });
+
+    it('is diagnosed as a parked draft', () => {
+      const screen = scrolledScreen.replace('line 25 of the forwarded message', '</user_message>');
+      expect(diagnoseSubmitFailure({ screenText: screen, cliId: 'claude-code', nowMs: NOW }).reason).toBe('draft_parked');
+    });
+
+    it('does not match a different scrolled draft', () => {
+      expect(claudeComposerHoldsInput(scrolledScreen, 'something else entirely, long enough to compare against')).toBe(false);
+    });
+  });
+
   it('does not match once the input left the composer for the transcript', () => {
     const screen = [`> ${input}`, '', '● Working on it', RULE, '❯ ', RULE].join('\n');
     expect(claudeComposerHoldsInput(screen, input)).toBe(false);

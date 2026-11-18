@@ -94,17 +94,21 @@ function matchScreenRule(rules: readonly ScreenRule[], screen: string): string |
 // on-screen evidence the payload is stuck unsubmitted.
 const CLAUDE_PASTED_TEXT_CHIP = /\[\s*pasted text\s+#\d+(?:\s*\+\d+\s+lines?)?\s*\]/i;
 
+// A long draft scrolls inside the composer: its border becomes "─── ↑ 18 more ───"
+// and the ❯ row with the head of the draft is no longer visible.
+const CLAUDE_COMPOSER_SCROLL_RULE = /^\s*[─━═╌-]{3,}\s*[↑↓]\s*\d+\s+more\s*[─━═╌-]*\s*$/;
+
 /** Bodies of the ❯ input boxes on screen, bottom-most first. */
 function* claudeComposerBodies(screen: string): Generator<string> {
   const rows = screen.split(/\r?\n/);
-  const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line);
+  const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line) || CLAUDE_COMPOSER_SCROLL_RULE.test(line);
   for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
     if (!separator(rows[bottom])) continue;
     let top = bottom - 1;
     while (top >= 0 && !separator(rows[top])) top--;
     if (top < 0) continue;
     const body = rows.slice(top + 1, bottom);
-    if (!/^\s*❯/.test(body[0] ?? '')) continue;
+    if (!/^\s*❯/.test(body[0] ?? '') && !CLAUDE_COMPOSER_SCROLL_RULE.test(rows[top])) continue;
     yield body.join('\n');
   }
 }
@@ -113,7 +117,7 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
   // Only the last input box, bounded by two full-width rules, is evidence.
   // Assistant transcript text or an idle suggestion outside it is not a draft.
   for (const bodyText of claudeComposerBodies(screen)) {
-    if (bodyText.includes('<user_message>')) return 'draft_parked:claude_composer';
+    if (/<\/?user_message>/.test(bodyText)) return 'draft_parked:claude_composer';
     if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
     return undefined;
   }
@@ -121,14 +125,17 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
 }
 
 /** Whether Claude's last input box still holds `input`: the chip of a multi-line
- *  paste, or its opening text (compared without whitespace and the `\` of typed
+ *  paste, or its opening or closing text (compared without whitespace and the `\` of typed
  *  soft newlines, so wrapped or multi-line drafts still match). */
 export function claudeComposerHoldsInput(screenText: string, input: string): boolean {
   const compact = (text: string) => text.replace(/[\s\\]+/g, '');
-  const head = compact(input).slice(0, 40);
+  const compactInput = compact(input);
+  const head = compactInput.slice(0, 40);
+  const tail = compactInput.slice(-40);
   for (const bodyText of claudeComposerBodies(stripAnsiScreenText(screenText))) {
     if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return true;
-    return head.length > 0 && compact(bodyText.replace(/^\s*❯/, '')).includes(head);
+    const body = compact(bodyText.replace(/^\s*❯/, ''));
+    return head.length > 0 && (body.includes(head) || body.includes(tail));
   }
   return false;
 }

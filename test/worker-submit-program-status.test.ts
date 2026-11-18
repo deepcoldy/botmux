@@ -127,7 +127,7 @@ describe('worker submit confirmation with native program status', () => {
     expect(h.chain.size()).toBe(0);
     expect(h.backend.write).not.toHaveBeenCalled();
     expect(h.backend.sendText).not.toHaveBeenCalled();
-    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.backend.sendSpecialKeys).toHaveBeenCalledTimes(1);
   });
 
   it('lets the generic parked-draft screen gate override held working for another CLI', async () => {
