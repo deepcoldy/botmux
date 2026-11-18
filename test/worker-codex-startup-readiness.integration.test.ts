@@ -17,7 +17,7 @@ for (const mode of ['banner', 'resume', 'resumed-context', 'slow-resume', 'tmux-
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
     `holds input during loading, submits once after ${mode}, and commits only after confirmation`,
     () => runStartupScenario(mode, backendType),
-    115_000,
+    mode === 'slow-resume' ? 145_000 : 115_000,
   );
 }
 
