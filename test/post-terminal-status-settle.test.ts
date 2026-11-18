@@ -831,5 +831,65 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
 
     expect(lastPatchedStatus()).toBe('working'); // handoff applied after settle
   });
+
+  it('R4-P1: a local-* completed terminal clears the direct-submit live-work epoch', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // The Web Terminal typed turn completes with a local-* id; currentTurnId
+    // still points at the IM turn, so the managed gate would skip it.
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: SESSION, turnId: 'local-typed-abc', status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+    // With the epoch closed, a later stale busy frame is gated again (self-heal live).
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    const rev = ds.streamCardStatusRevision ?? 0;
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+  });
+
+  it('R4-P2: a newer-turn working frame opens liveness before beginNewTurn, so sweep does not idle it', async () => {
+    const ds = setupTerminalDs(); // currentTurnId stays TURN (no beginNewTurn yet)
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    ds.lastTurnTerminalAt = Date.now() - 121_000; // past the sweep age
+
+    // First frame of a newer turn arrives while currentTurnId still equals TURN.
+    staleTaggedFrame(ds, { turnId: 'turn-live-0002', content: 'new turn first frame' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // The self-heal must recognize the open episode and not idle-correct it.
+    expect(sweepStaleLiveCardStatuses(APP)).toBe(0);
+  });
+
+  it('R4-P3: follow-up screenshots inherit the open direct-submit episode despite an old capture tag', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds); // opens the live-work episode
+    await vi.advanceTimersByTimeAsync(0);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    // A later screenshot still carries the old terminalized turn/attempt tag.
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-episode', status: 'working',
+      turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // It belongs to the open episode, so it is not treated as stale residue.
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.currentImageKey).toBe('img-episode');
+  });
 });
 

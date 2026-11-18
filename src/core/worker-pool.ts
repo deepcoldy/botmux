@@ -6584,8 +6584,13 @@ function sessionHasLiveWorkAfterTerminal(ds: DaemonSession): boolean {
  * turn that already reported a completed terminal, with no live-work episode
  * opened since. Suppressed frames include both viewport residue tagged with the
  * terminalized (turn, attempt) AND untagged prompt-cache keep-alive frames:
- * neither may drive the card. Direct-submit / newer-turn / newer-attempt frames
- * are recognized as live work by isLiveWorkFrameAfterTerminal and never stale.
+ * neither may drive the card.
+ *
+ * Once a live-work episode is open (direct-submit, newer turn, or retry — see
+ * sessionHasLiveWorkAfterTerminal), ALL subsequent busy frames belong to that
+ * live work until the next terminal closes it, even if a screenshot still
+ * carries the previous capture identity: checking the persistent epoch here
+ * (not just the current frame's tag) lets follow-up frames inherit the episode.
  *
  * The caller still updates non-card execution state (screen content, usage
  * limit, background count, in-memory status); only card-facing writes and the
@@ -6598,17 +6603,21 @@ function isStalePostTerminalBusyFrame(
 ): boolean {
   if (ds.lastTurnTerminalStatus !== 'completed') return false;
   if (!POST_TERMINAL_BUSY_STATUSES.has(projectedStatus)) return false;
+  // A live-work episode is already open: this frame (screen or screenshot,
+  // whatever its tag) is part of it, not residual evidence.
+  if (sessionHasLiveWorkAfterTerminal(ds)) return false;
   if (isLiveWorkFrameAfterTerminal(ds, frame)) return false;
   return true;
 }
 
 /**
  * Record that genuine live work reopened the session after a completed terminal.
- * Opens the direct-submit liveness epoch (managed turns / retries are recognized
- * structurally via currentTurnId and the high-water, so they don't need this)
- * and, when a post-terminal idle correction exists, requests a working repaint —
- * covering both the already-delivered case and an in-flight PATCH whose callback
- * will honor the request once the idle write settles.
+ * Every live-work form opens the liveness epoch (direct-submit, a newer managed
+ * turn whose beginNewTurn has not landed yet, or a retry attempt) so the settle
+ * and self-heal recognize it even before the structural pointers catch up; the
+ * first frame wins and later frames do not refresh the timestamp, so the sweep
+ * ages against the true episode start. Also requests a working repaint against
+ * any post-terminal idle correction (delivered or in-flight).
  */
 function notePostTerminalLiveWork(
   ds: DaemonSession,
@@ -6616,9 +6625,9 @@ function notePostTerminalLiveWork(
 ): void {
   if (ds.lastTurnTerminalStatus !== 'completed') return;
   if (!isLiveWorkFrameAfterTerminal(ds, frame)) return;
-  // Direct-submit episodes have no managed turn/high-water of their own; stamp
-  // the epoch so the settle and self-heal recognize their liveness.
-  if (frame.directSubmit === true) ds.postTerminalLiveWorkAt = Date.now();
+  // Stamp the episode start once. Any of the three live-work forms opens it;
+  // subsequent frames of the same episode must not move the sweep age baseline.
+  if (ds.postTerminalLiveWorkAt === undefined) ds.postTerminalLiveWorkAt = Date.now();
   const receipt = postTerminalCardSettles.get(ds);
   if (receipt && receipt.cardId === ds.streamCardId) receipt.repaintRequested = true;
 }
@@ -24407,6 +24416,13 @@ function setupWorkerHandlers(
           // direct-submit live-work episode belongs to the previous window.
           ds.postTerminalLiveWorkAt = undefined;
           schedulePostTerminalStatusSettle(ds, msg);
+        }
+        // A Web Terminal typed turn (`local-*`) never moves currentTurnId, so the
+        // managed-turn gate above does not run for it. Its completed terminal
+        // still ends the live-work episode it opened: clear the epoch so a later
+        // stuck-working self-heal is not permanently suppressed by stale liveness.
+        if (isTerminalTypedTurnId(msg.turnId) && msg.status === 'completed') {
+          ds.postTerminalLiveWorkAt = undefined;
         }
         const terminalCliId = workerCliId(ds);
         if (terminalCliId !== undefined) turnTerminalReportingCliIds.add(terminalCliId);
