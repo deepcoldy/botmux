@@ -162,7 +162,7 @@ export async function inspectFeedbackMaintenance(dataDir: string, migrationId: s
     catch { throw new Error('feedback_fleet_state_invalid'); }
     if (!Array.isArray(fleet.procs)) throw new Error('feedback_fleet_state_invalid');
     for (const processState of fleet.procs) {
-      if (processState.name === 'botmux-dashboard' || processState.entry === 'dashboard' || processState.external || !processState.pid) continue;
+      if (processState.name === 'botmux-dashboard' || processState.name === 'topic-index' || processState.entry === 'dashboard' || processState.external || !processState.pid) continue;
       const identity = readDurableProcessIdentity(processState.pid);
       if (!identity) continue;
       if (!participants.some(participant => participant.processId === processState.pid && participant.processStartId === identity)) {

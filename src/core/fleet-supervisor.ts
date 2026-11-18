@@ -227,9 +227,12 @@ export class FleetSupervisor {
       const configured = this.specForProc(p);
       // A bot removed while its supervisor was down may still be online or
       // partway through retirement. With no configured member, allow only a fresh
-      // built-in daemon command match; never infer plugin/dashboard ownership.
+      // built-in command match: the daemon's, or the topic indexer's for the
+      // reserved topic-index row. Never infer plugin/dashboard ownership.
       const retireOnly = !configured && (p.status === 'online' || p.status === 'launching') && p.pid > 1;
-      const spec = configured ?? (retireOnly ? { name: p.name, appId: p.appId, botIndex: -1 } : undefined);
+      const spec = configured ?? (retireOnly
+        ? { name: p.name, appId: p.appId, botIndex: -1, ...(p.name === 'topic-index' ? { entry: 'topic-indexer' as const } : {}) }
+        : undefined);
       if (spec && (p.status === 'online' || (p.status === 'launching' && p.pid > 1)) && !this.children.has(p.name)) {
         // Include every alias of a configured App ID, not only its chosen name.
         // stopUnowned records failures; preserve the row and continue with peers.
@@ -295,8 +298,8 @@ export class FleetSupervisor {
     const inspection = inspectFleetProcess(proc.pid, proc.processStart, undefined,
       command => expected
         ? command.includes(expected.command) && (expected.args ?? []).every(arg => command.includes(arg))
-        : builtinFleetEntryMatches(spec.entry === 'dashboard' ? 'dashboard' : 'daemon', command),
-      runtime, /* removed members must re-prove their daemon command */ retireOnly);
+        : builtinFleetEntryMatches(spec.entry ?? 'daemon', command),
+      runtime, /* removed members must re-prove their built-in command */ retireOnly);
     if (inspection.status === 'unverifiable') throw new Error(`cannot verify unowned ${proc.name} (pid ${proc.pid})`);
     if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)) {
       throw new Error(`cannot prove removed ${proc.name} (pid ${proc.pid}) is a botmux daemon`);

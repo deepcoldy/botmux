@@ -792,6 +792,8 @@ describe('process-boundary env scrub call sites', () => {
       'index-daemon.ts': ['stripDashboardH5Env', 'stripCompanionStartupEnv', 'scrubSessionTurnMarkerEnv',
         'scrubSessionCliHomeEnv', 'scrubClaudeSessionMarkerEnv', 'scrubWorkflowWorkerEnv'],
       'index-dashboard.ts': ['scrubSessionTurnMarkerEnv'],
+      'index-topic-indexer.ts': ['stripDashboardH5Env', 'scrubSessionTurnMarkerEnv', 'scrubSessionCliHomeEnv',
+        'scrubClaudeSessionMarkerEnv', 'scrubWorkflowWorkerEnv'],
       'dashboard.ts': ['scrubWorkflowWorkerEnv'],
       'worker.ts': ['scrubSessionCliHomeEnv', 'scrubClaudeSessionMarkerEnv'],
       'index-plugin-supervisor.ts': ['scrubExternalMemberEnv'],

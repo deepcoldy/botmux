@@ -29,7 +29,7 @@ import { pathToFileURL } from 'node:url';
  */
 
 export type BotmuxEntry =
-  | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
+  | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard' | 'topic-indexer'
   | 'plugin-supervisor' | 'sandbox-network-runner' | 'program-status-relay' | 'background-execution-runner'
   | 'zellij-socket-probe' | 'reply-file-sanitizer'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
@@ -46,6 +46,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'worker': '__worker',
   'supervisor': '__supervisor',
   'dashboard': '__dashboard',
+  'topic-indexer': '__topic-indexer',
   'plugin-supervisor': '__plugin-supervisor',
   'sandbox-network-runner': '__sandbox-network-runner',
   'program-status-relay': '__program-status-relay',
@@ -69,6 +70,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'worker': 'worker.js',
   'supervisor': 'index-supervisor.js',
   'dashboard': 'index-dashboard.js',
+  'topic-indexer': 'index-topic-indexer.js',
   'plugin-supervisor': 'index-plugin-supervisor.js',
   'sandbox-network-runner': 'sandbox-network-runner.js',
   'program-status-relay': 'program-status-relay.js',

@@ -255,6 +255,16 @@ export function resolveDashboardSpec(): FleetBotSpec {
   };
 }
 
+export function resolveTopicIndexSpec(): FleetBotSpec {
+  return {
+    name: 'topic-index',
+    appId: '',
+    botIndex: -1,
+    entry: 'topic-indexer',
+    logBaseName: 'topic-index',
+  };
+}
+
 /**
  * Every process the supervisor manages: the bot daemons from bots.json PLUS the
  * dashboard. This is the list the supervisor `start()` reconciles and the set
@@ -263,7 +273,7 @@ export function resolveDashboardSpec(): FleetBotSpec {
  * rows) is unaffected.
  */
 export function resolveFleetMembers(): FleetBotSpec[] {
-  return [...resolveFleetBots(), resolveDashboardSpec()];
+  return [...resolveFleetBots(), resolveDashboardSpec(), ...(process.env.BOTMUX_TOPIC_SEARCH === '0' ? [] : [resolveTopicIndexSpec()])];
 }
 
 export function liveSupervisorTarget(
@@ -513,6 +523,12 @@ export function waitFleetOnline(
     if (Date.now() >= deadline) return { healthy: false, online: expected - pending.length, expected, pending };
     sleepSyncMs(250);
   }
+}
+
+/** Members `botmux restart` health-gates on: the bot daemons plus the
+ *  dashboard. The topic indexer is excluded so a restart never waits on it. */
+export function fleetHealthMembers(): FleetBotSpec[] {
+  return resolveFleetMembers().filter((m) => m.entry !== 'topic-indexer');
 }
 
 /** Resolve one bot's fleet spec by larkAppId (null if not in bots.json). */

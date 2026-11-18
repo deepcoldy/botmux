@@ -9,6 +9,7 @@
 
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { lstatSync, rmSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import {
   scrubClaudeSessionMarkerEnv,
@@ -19,6 +20,7 @@ import {
   stripDashboardH5Env,
 } from './utils/child-env.js';
 import { scrubDetachedRestartEnvRefresh } from './core/restart-env-refresh.js';
+import { resolveBotmuxDataDir } from './core/data-dir.js';
 
 installStdioEpipeGuard();
 
@@ -123,12 +125,23 @@ async function main(): Promise<void> {
   else if (scope.action === 'failed') logger.warn(`[supervisor] staying in ${scope.unit}: could not create an own systemd scope (${scope.reason})`);
   else if (scope.action === 'unsupported' && process.platform === 'linux') logger.info(`[supervisor] no own systemd scope: ${scope.reason}`);
 
-  logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard`);
+  logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard${process.env.BOTMUX_TOPIC_SEARCH === '0' ? '' : ' + topic-index'}`);
   if (!supervisor.start(members)) {
     // Another live supervisor already owns the fleet (two `botmux start`s
     // overlapped, e.g. the autostart watchdog and a slow first start). It keeps
     // supervising; this duplicate has spawned nothing and simply leaves.
     process.exit(0);
+  }
+  if (process.env.BOTMUX_TOPIC_SEARCH === '0') {
+    const directory = join(resolveBotmuxDataDir(), 'topic-search');
+    try {
+      const stat = lstatSync(directory);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) logger.warn(`[supervisor] topic-index cleanup failed: ${String(error)}`);
+    }
   }
   // Keep the process alive supervising; children + timers hold the event loop.
 }

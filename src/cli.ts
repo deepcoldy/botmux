@@ -505,7 +505,7 @@ import {
 // re-enables logging end-to-end for CLI troubleshooting.
 // Set fleet sinks before Bun can evaluate the bundled entry imports; restoring
 // them only at dispatch is too late for the dashboard's startup log.
-logger.setSilent(!['__core-only', '__daemon', '__worker', '__supervisor', '__dashboard', '__plugin-supervisor']
+logger.setSilent(!['__core-only', '__daemon', '__worker', '__supervisor', '__dashboard', '__topic-indexer', '__plugin-supervisor']
   .includes(process.argv[2] ?? ''));
 
 const __filename = fileURLToPath(import.meta.url);
@@ -3221,7 +3221,7 @@ async function cmdRestart(): Promise<void> {
 
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, resolveFleetMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      const { restartFleet, fleetHealthMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
         const r = restartFleet({
@@ -3236,7 +3236,7 @@ async function cmdRestart(): Promise<void> {
         }
         // Health-gate on every supervised member (bot daemons + dashboard), so a
         // restart that leaves the dashboard down is reported unhealthy, not "ok".
-        const members = resolveFleetMembers();
+        const members = fleetHealthMembers();
         health = waitFleetOnline(members, pm2StartVerifyTimeoutMs(members.length));
         if (!health.healthy) {
           throw new Error(
@@ -8183,6 +8183,10 @@ ${SEND_HELP_BODY}
   quoted <message_id> [<id> ...] [--raw] [--no-download]
                                        按消息 id 定向读取（最多 20 条）；默认下载附件，--no-download 只取文本和资源信息；
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
+  topic search <词...> [--limit N] [--hits N] [--since 时间] [--until 时间] [--bot name|appId] [--format json|text]
+  topic show <anchor|messageId> [--limit N] [--format json|text]
+  topic status                       查看话题索引状态
+  topic reindex [--rebuild]           同步或重建话题索引
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
@@ -20124,7 +20128,7 @@ const __entrySubcommand = command && ENTRY_SUBCOMMANDS.has(command) ? entryForSu
 if (__entrySubcommand) {
   // Compiled fleet entries share this logger module with CLI dispatch.
   // Protocol helpers/runners retain quiet stdout; fleet logs use normal sinks.
-  if (['core-only', 'daemon', 'worker', 'supervisor', 'dashboard', 'plugin-supervisor'].includes(__entrySubcommand)) {
+  if (['core-only', 'daemon', 'worker', 'supervisor', 'dashboard', 'topic-indexer', 'plugin-supervisor'].includes(__entrySubcommand)) {
     logger.setSilent(false);
   }
   // Bun's --compile can't bundle a fully-dynamic import specifier, so switch on
@@ -20134,6 +20138,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  else if (__entrySubcommand === 'topic-indexer') await import('./index-topic-indexer.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
   else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
   else if (__entrySubcommand === 'reply-file-sanitizer') {
@@ -21889,6 +21894,11 @@ switch (command) {
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
+  case 'topic': {
+    const { topicSearchCommand } = await import('./cli/topic-search.js');
+    process.exitCode = await topicSearchCommand(process.argv.slice(3));
+    break;
+  }
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;

@@ -10,16 +10,36 @@ import {
   resolveFleetDaemonEnv,
   inspectSupervisorState,
   liveSupervisorTarget,
+  resolveFleetMembers,
+  resolveTopicIndexSpec,
+  fleetHealthMembers,
 } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
 import { sessionTempDir } from '../src/core/session-temp.js';
+import { resolveEntrySpawn, entryForSubcommand } from '../src/core/self-spawn.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-runtime-')); dirs.push(d); return d; }
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
 const online = (name: string, pid: number): ReturnType<typeof freshProc> => freshProc(name, `cli_${name}`, pid, 'T');
+
+describe('topic index fleet member', () => {
+  it('has both runtime entry forms and is excluded from restart health gates', () => {
+    try {
+      vi.stubEnv('BOTMUX_TOPIC_SEARCH', '1');
+      expect(resolveFleetMembers()).toContainEqual(resolveTopicIndexSpec());
+      expect(fleetHealthMembers().map(m => m.name)).not.toContain('topic-index');
+      expect(entryForSubcommand('__topic-indexer')).toBe('topic-indexer');
+      expect(resolveEntrySpawn('topic-indexer', '/private/dist').args.at(-1)).toBe('/private/dist/index-topic-indexer.js');
+      vi.stubEnv('BOTMUX_TOPIC_SEARCH', '0');
+      expect(resolveFleetMembers().some(member => member.name === 'topic-index')).toBe(false);
+      vi.stubEnv('BOTMUX_TOPIC_SEARCH', 'false');
+      expect(resolveFleetMembers().some(member => member.name === 'topic-index')).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
 
 describe('projectFleetStatus', () => {
   it('reports supervisor + rows, cross-checking liveness with the injected probe', () => {

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { startBotViaSupervisor, stopBotViaSupervisor, fleetStatePath, fleetCommandPath, resolveFleetMembers, waitFleetOnline } from '../src/core/fleet-runtime.js';
+import { startBotViaSupervisor, stopBotViaSupervisor, fleetStatePath, fleetCommandPath, fleetHealthMembers, waitFleetOnline } from '../src/core/fleet-runtime.js';
 import { readFleetCommands } from '../src/core/fleet-command-queue.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
@@ -28,27 +28,27 @@ beforeEach(() => {
 
 describe('single-bot control follows App ID across names', () => {
   it('accepts renamed fleet members but still requires the dashboard', () => {
-    expect(waitFleetOnline(resolveFleetMembers(), 0)).toMatchObject({ healthy: false, online: 1, pending: ['botmux-dashboard'] });
+    expect(waitFleetOnline(fleetHealthMembers(), 0)).toMatchObject({ healthy: false, online: 1, pending: ['botmux-dashboard'] });
     state.procs.push(freshProc('botmux-dashboard', '', process.ppid, 'T'));
     writeFleetState(fleetStatePath(), state);
-    expect(waitFleetOnline(resolveFleetMembers(), 0)).toEqual({ healthy: true, online: 2, expected: 2, pending: [] });
+    expect(waitFleetOnline(fleetHealthMembers(), 0)).toEqual({ healthy: true, online: 2, expected: 2, pending: [] });
   });
 
   it('does not mistake a reused name for the configured App ID', () => {
     state.procs[0] = freshProc('botmux-renamed', 'cli_peer', process.pid, 'T');
     state.procs.push(freshProc('botmux-dashboard', '', process.ppid, 'T'));
     writeFleetState(fleetStatePath(), state);
-    expect(waitFleetOnline(resolveFleetMembers(), 0)).toMatchObject({ healthy: false, online: 1, pending: ['botmux-renamed'] });
+    expect(waitFleetOnline(fleetHealthMembers(), 0)).toMatchObject({ healthy: false, online: 1, pending: ['botmux-renamed'] });
   });
 
   it('waits for the supervisor to finish retiring a still-live orphan', () => {
     state.procs[0].status = 'launching';
     state.procs.push(freshProc('botmux-dashboard', '', process.ppid, 'T'));
     writeFleetState(fleetStatePath(), state);
-    expect(waitFleetOnline(resolveFleetMembers(), 0)).toMatchObject({ healthy: false, online: 1, pending: ['botmux-renamed'] });
+    expect(waitFleetOnline(fleetHealthMembers(), 0)).toMatchObject({ healthy: false, online: 1, pending: ['botmux-renamed'] });
     state.procs[0].status = 'online';
     writeFleetState(fleetStatePath(), state);
-    expect(waitFleetOnline(resolveFleetMembers(), 0).healthy).toBe(true);
+    expect(waitFleetOnline(fleetHealthMembers(), 0).healthy).toBe(true);
   });
 
   it('does not match a bot with an empty App ID to the dashboard', () => {

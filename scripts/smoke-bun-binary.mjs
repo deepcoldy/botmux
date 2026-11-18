@@ -90,6 +90,7 @@ const inheritedEnv = Object.fromEntries(
 );
 const childEnv = {
   ...inheritedEnv,
+  BOTMUX_TOPIC_SEARCH: '1',
   HOME: home,
   BOTMUX_DAEMON_IPC_BASE_PORT: String(PORTS.ipc),
   BOTMUX_WEB_PROXY_BASE_PORT: String(PORTS.proxy),
@@ -444,6 +445,23 @@ if ((row.restarts ?? 0) > 0) {
   fail('dashboard', `dashboard came online but had already restarted ${row.restarts}× (crashloop before settling)`);
 }
 console.log('smoke: ✅ dashboard — booted clean (0 restarts), embedded modules resolve');
+
+const topicDeadline = Date.now() + DASHBOARD_ONLINE_TIMEOUT_MS;
+let topicRow;
+let topicReady = false;
+while (Date.now() < topicDeadline) {
+  try { topicRow = JSON.parse(readFileSync(statePath,'utf8')).procs.find(p => p.name === 'topic-index'); } catch {}
+  try {
+    const status = JSON.parse(execFileSync(binary,['topic','status'],{ cwd: home,env: childEnv,encoding: 'utf8',timeout: 5000,stdio: ['ignore','pipe','pipe'] }));
+    topicReady = status.available && status.index.lastSyncAt !== null && status.engine.fts5Trigram;
+  } catch {}
+  if (topicReady && topicRow?.status === 'online' && topicRow.pid > 0 && alive(topicRow.pid)) break;
+  await delay(250);
+}
+if (!topicReady || topicRow?.status !== 'online' || !alive(topicRow.pid) || topicRow.restarts !== 0) {
+  fail('topic-index',`expected online with zero restarts: ${JSON.stringify(topicRow)}`);
+}
+console.log('smoke: ✅ topic-index — online, 0 restarts');
 
 // ── 4. the dashboard actually serves ────────────────────────────────────────
 // ANY HTTP status proves the listener bound (an unauthenticated `/` legitimately
