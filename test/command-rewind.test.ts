@@ -127,7 +127,7 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState, backendState } = vi.hoisted(() => ({
   suspendWorker: vi.fn<(ds: any, reason?: string) => boolean>(),
   killWorker: vi.fn<(ds: any) => void>(),
-  rewindState: { jsonl: '' as string, truncateError: '' as string },
+  rewindState: { jsonl: '' as string, truncateError: '' as string, treeRoot: '' as string },
   backendState: { backingType: undefined as string | undefined, probe: 'missing' as string, killThrows: false },
   sendWorkerInput: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
   forkWorker: vi.fn<(ds: any, payload: any, hasHistory?: any) => boolean>(),
@@ -284,7 +284,9 @@ vi.mock('../src/core/cli-runtime-display.js', () => ({
 vi.mock('../src/services/session-groups-store.js', () => ({ isSessionGroup: vi.fn(() => false) }));
 
 vi.mock('../src/services/transcript-resolver.js', () => ({
-  resolveSessionTranscriptPath: vi.fn(() => (rewindState.jsonl ? { path: rewindState.jsonl, kind: 'claude' } : null)),
+  resolveSessionTranscriptPath: vi.fn(() => (rewindState.jsonl
+    ? { path: rewindState.jsonl, kind: 'claude', ...(rewindState.treeRoot ? { writableTreeRoot: rewindState.treeRoot } : {}) }
+    : null)),
 }));
 
 // Default-delegate to the real module; a test can arm rewindState.truncateError
@@ -304,7 +306,7 @@ vi.mock('../src/core/shared-adopt.js', () => ({ isSharedAdoptSession: vi.fn(() =
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -408,6 +410,7 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   rewindState.jsonl = '';
   rewindState.truncateError = '';
+  rewindState.treeRoot = '';
 });
 
 describe('/rewind command', () => {
@@ -579,13 +582,15 @@ describe('/rewind command', () => {
 
   it.skipIf(process.platform === 'win32')('会话记录是命名管道：立即回复失败，不卡在管道上', async () => {
     rewindState.jsonl = transcript();
-    replaceWithFifo(rewindState.jsonl, 3);
+    // The writer shows up after 10s; a blocking open would last that long. The
+    // bound leaves seconds of slack for a busy machine.
+    replaceWithFifo(rewindState.jsonl, 10);
     const deps = makeDeps(makeDs());
     const started = Date.now();
     await run(deps, '/rewind');
-    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(Date.now() - started).toBeLessThan(7_000);
     expect(lastReply(deps)).toContain('回退失败');
-  }, 20_000);
+  }, 30_000);
 
   it.skipIf(process.platform === 'win32')('停 CLI 后会话记录被换成命名管道：确认时的重扫回复失败，不卡住', async () => {
     rewindState.jsonl = transcript();
@@ -593,16 +598,62 @@ describe('/rewind command', () => {
     await run(deps, '/rewind 1');
     suspendWorker.mockImplementation((d: any) => {
       d.worker = null;
-      replaceWithFifo(rewindState.jsonl, 4);
+      replaceWithFifo(rewindState.jsonl, 10);
       return true;
     });
     const started = Date.now();
     await run(deps, '/rewind 1 confirm');
     // The quiet wait alone takes ~0.6s; a blocking open would last until the
-    // writer shows up at 4s.
-    expect(Date.now() - started).toBeLessThan(3_000);
+    // writer shows up at 10s.
+    expect(Date.now() - started).toBeLessThan(7_000);
     expect(lastReply(deps)).toContain('回退失败');
-  }, 20_000);
+  }, 30_000);
+
+  it('锁内重扫之后、截断之前路径被换成另一个普通文件：按重扫时的文件拒绝截断，新文件不动', async () => {
+    rewindState.jsonl = transcript();
+    const deps = makeDeps(makeDs());
+    await run(deps, '/rewind 1');
+    // Same bytes, different inode: only the file identity tells them apart.
+    const replacement = readFileSync(rewindState.jsonl, 'utf8');
+    (updateSession as any).mockImplementationOnce(() => {
+      // The scanned file stays alive under another name (a freed inode
+      // number could be handed straight to the new file).
+      renameSync(rewindState.jsonl, `${rewindState.jsonl}.scanned`);
+      writeFileSync(rewindState.jsonl, replacement);
+    });
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(readFileSync(rewindState.jsonl, 'utf8')).toBe(replacement);
+  });
+
+  it('会话记录的项目目录在解析后被换成指向外部的链接：列表与确认都回复失败，外部内容不进回复、外部文件不被截断', async () => {
+    rewindState.jsonl = transcript();
+    const projectDir = dirname(rewindState.jsonl);
+    rewindState.treeRoot = dirname(projectDir);
+    const outside = mkdtempSync(join(tmpdir(), 'botmux-rewind-outside-'));
+    dirs.push(outside);
+    const outsideFile = join(outside, 'native.jsonl');
+    writeFileSync(outsideFile, line(userTurn('OUTSIDE_TEXT', 'uA')) + line(assistant('x')) + line(userTurn('OUTSIDE_B', 'uB'))
+      + line(assistant('y')) + line(userTurn('OUTSIDE_C', 'uC')) + line(assistant('z')));
+    const swapProjectDir = () => {
+      rmSync(`${projectDir}.aside`, { recursive: true, force: true });
+      renameSync(projectDir, `${projectDir}.aside`);
+      symlinkSync(outside, projectDir);
+    };
+    const deps = makeDeps(makeDs());
+    // Preview on the real tree, then the swap while the CLI is being stopped.
+    await run(deps, '/rewind 1');
+    suspendWorker.mockImplementation((d: any) => { d.worker = null; swapProjectDir(); return true; });
+    const outsideBefore = readFileSync(outsideFile, 'utf8');
+    await run(deps, '/rewind 1 confirm');
+    expect(lastReply(deps)).toContain('回退失败');
+    expect(readFileSync(outsideFile, 'utf8')).toBe(outsideBefore);
+    expect(readdirSync(outside)).toEqual(['native.jsonl']);
+    // A fresh listing through the swapped tree fails the same way.
+    await run(deps, '/rewind');
+    expect(lastReply(deps)).toContain('回退失败');
+    for (const call of deps.sessionReply.mock.calls) expect(String((call as unknown[])[1])).not.toContain('OUTSIDE');
+  });
 
   it('截断前持久化 replay 状态失败：拒绝回退且文件不动', async () => {
     rewindState.jsonl = transcript();

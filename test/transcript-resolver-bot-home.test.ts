@@ -148,7 +148,8 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
     const resolved = resolveSessionTranscriptPath({
       cliId: 'claude-code', sessionId: 'sb-1', cwd, larkAppId: APP_ID,
     });
-    expect(resolved).toEqual({ path: expected, kind: 'claude' });
+    // The bots dir holding BOT_HOME: readers re-check everything below it.
+    expect(resolved).toEqual({ path: expected, kind: 'claude', writableTreeRoot: join(base, '.botmux', 'bots') });
   });
 
   it('resolves the global dir when only it has the transcript (non-redirected bot)', () => {
@@ -156,7 +157,7 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
     const resolved = resolveSessionTranscriptPath({
       cliId: 'claude-code', sessionId: 'sb-2', cwd, larkAppId: APP_ID,
     });
-    expect(resolved?.path).toBe(global);
+    expect(resolved).toEqual({ path: global, kind: 'claude' });
   });
 
   // A persistent session that straddles a sandbox flip keeps its session id but

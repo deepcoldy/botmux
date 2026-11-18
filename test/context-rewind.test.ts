@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  assertOpenedInsideTree,
   assertSameInode,
   findCheckpoint,
   rewindClaudeTranscript,
@@ -149,6 +150,117 @@ describe('scanClaudeTranscriptCheckpoints 只读普通文件', () => {
     expect(out.returned).toBeUndefined();
     expect(out.error).toMatch(/non-regular/);
   }, 90_000);
+});
+
+/** `<root>/bots/app/claude/projects/key/session.jsonl` plus the same relative
+ *  layout under an outside directory, for swapping an ancestor for a link. */
+function treeFixture() {
+  const base = mkdtempSync(join(tmpdir(), 'botmux-rewind-tree-'));
+  dirs.push(base);
+  const root = join(base, 'bots');
+  const projects = join(root, 'app', 'claude', 'projects');
+  const path = join(projects, 'key', 'session.jsonl');
+  mkdirSync(join(projects, 'key'), { recursive: true });
+  writeFileSync(path, [userTurn('树里的会话', 'u1'), assistant, userTurn('第二轮', 'u2')].map(l => `${JSON.stringify(l)}\n`).join(''));
+  const outside = join(base, 'outside');
+  mkdirSync(join(outside, 'key'), { recursive: true });
+  const outsideFile = join(outside, 'key', 'session.jsonl');
+  // Same byte layout as the tree's file (same-length texts and uuids), so an
+  // offset computed on one lands on a line boundary in the other.
+  writeFileSync(outsideFile, [userTurn('OUTSIDE_TEXT___', 'u1'), assistant, userTurn('OUT_TWO__', 'u2')].map(l => `${JSON.stringify(l)}\n`).join(''));
+  /** Replace `dir` (inside the tree) with a link to `target`. */
+  const swapForLink = (dir: string, target: string) => {
+    renameSync(dir, `${dir}.aside`);
+    symlinkSync(target, dir);
+  };
+  return { root, projects, path, outside, outsideFile, swapForLink };
+}
+
+const noProc = () => { throw new Error('no /proc'); };
+
+describe('会话记录路径经过 CLI 可写的树', () => {
+  it('树里的普通文件照常扫描，检查点带上读的那个文件', () => {
+    const { root, path } = treeFixture();
+    const cps = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    expect(cps.map(cp => cp.preview)).toEqual(['第二轮', '树里的会话']);
+    const st = statSync(path);
+    expect(cps[0]!.file).toEqual({ dev: st.dev, ino: st.ino });
+  });
+
+  it('项目目录被换成指向外部的链接：拒绝扫描，外部内容不进预览', () => {
+    const { root, projects, path, outside, swapForLink } = treeFixture();
+    swapForLink(join(projects, 'key'), join(outside, 'key'));
+    let cps: unknown;
+    expect(() => { cps = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root }); }).toThrow(/not the one under|not a directory/);
+    expect(JSON.stringify(cps ?? null)).not.toContain('OUTSIDE');
+  });
+
+  it('projects 被换成链接：同样拒绝', () => {
+    const { root, projects, path, outside, swapForLink } = treeFixture();
+    swapForLink(projects, outside);
+    expect(() => scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root })).toThrow();
+  });
+
+  for (const [label, openedPath] of [['/proc', undefined], ['逐级 lstat', noProc]] as const) {
+    it(`经链接打开后又换回真目录：仍认出打开的不是树里的文件（${label}）`, () => {
+      const { root, projects, path, outside, swapForLink } = treeFixture();
+      const key = join(projects, 'key');
+      swapForLink(key, join(outside, 'key'));
+      const fd = openSync(path, 'r');
+      try {
+        // Put the real directory back before the check runs.
+        rmSync(key);
+        renameSync(`${key}.aside`, key);
+        expect(() => assertOpenedInsideTree(fd, path, root, openedPath)).toThrow(/not the one under|replaced between validation and open/);
+      } finally {
+        closeSync(fd);
+      }
+    });
+
+    it(`树里一路是真目录时放行（${label}）`, () => {
+      const { root, path } = treeFixture();
+      const fd = openSync(path, 'r');
+      try {
+        expect(() => assertOpenedInsideTree(fd, path, root, openedPath)).not.toThrow();
+      } finally {
+        closeSync(fd);
+      }
+    });
+  }
+
+  it('路径不在给出的树下：拒绝', () => {
+    const { root, outsideFile } = treeFixture();
+    const fd = openSync(outsideFile, 'r');
+    try {
+      expect(() => assertOpenedInsideTree(fd, outsideFile, root)).toThrow(/not under/);
+    } finally {
+      closeSync(fd);
+    }
+  });
+
+  it('截断时项目目录被换成链接：拒绝，外部文件不被截断、不在外部留备份', () => {
+    const { root, projects, path, outside, outsideFile, swapForLink } = treeFixture();
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    swapForLink(join(projects, 'key'), join(outside, 'key'));
+    const before = readFileSync(outsideFile, 'utf8');
+    expect(() => rewindClaudeTranscript(path, latest!.offset, Date.now(), { writableTreeRoot: root })).toThrow();
+    expect(readFileSync(outsideFile, 'utf8')).toBe(before);
+    expect(readdirSync(join(outside, 'key'))).toEqual(['session.jsonl']);
+  });
+
+  it('扫描之后路径被换成另一个普通文件：按扫描时的文件身份拒绝截断', () => {
+    const { root, path } = treeFixture();
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    // Another regular file, long enough and with a line break right before the offset.
+    const other = `${path}.other`;
+    writeFileSync(other, readFileSync(path, 'utf8').replace('树里的会话', '另一个文件'));
+    renameSync(path, `${path}.scanned`);
+    renameSync(other, path);
+    const before = readFileSync(path, 'utf8');
+    expect(() => rewindClaudeTranscript(path, latest!.offset, Date.now(), { writableTreeRoot: root, expectFile: latest!.file }))
+      .toThrow(/replaced between validation and open/);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
 });
 
 describe('resumable', () => {

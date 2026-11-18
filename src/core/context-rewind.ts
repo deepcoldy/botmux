@@ -12,7 +12,8 @@
  * （groupContextEpoch），换新 id 会让整段群历史——包括想丢掉的那条——重新注入。
  */
 
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, readlinkSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   extractTurnStartText,
   isMeaningfulQueuedCommand,
@@ -43,6 +44,20 @@ export interface RewindCheckpoint {
   resumable: boolean;
   /** 回退到这一轮会删掉的字节数，按本次扫描从同一个文件描述符读到的内容计。 */
   removedBytes: number;
+  /** 本次扫描读的那个文件。按它算出的偏移只能截在它身上。 */
+  file: FileIdentity;
+}
+
+/** 按设备号 + inode 钉住的文件：路径可以被换掉，inode 不会。 */
+export interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+/** 会话记录所在的、会话里的 CLI 可写的那棵树（见 transcript-resolver 的
+ *  writableTreeRoot）。给出时，打开之后还要证明打开的就是树里那个文件。 */
+export interface TranscriptTreeScope {
+  writableTreeRoot?: string;
 }
 
 const CHUNK_BYTES = 1 << 20;
@@ -80,31 +95,70 @@ function isCompactBoundary(ev: TranscriptEvent): boolean {
 }
 
 /**
- * 打开 transcript 只读：不跟随链接、不在 FIFO 上阻塞，打开后从描述符确认是普通文件。
- * 沙盒会话的 transcript 在 agent 可写的 BOT_HOME 下，路径在解析之后、打开之前可以被
- * 换掉；之后的读取和大小都只取自这个描述符，不再按路径另读。
+ * 证明描述符 `fd` 就是 `path` 在 `root` 之下、一路没有经过链接所指的那个文件。
+ * O_NOFOLLOW 只管路径最后一段，所以要在打开之后、读写之前核对实际打开的对象：
+ * 有 /proc 时由内核给出它的位置，必须正好是「root 的真实位置 + 路径的后缀」；
+ * 没有时逐级 lstat，root 之下每一级都得是目录本身、末级是普通文件且与 fd 同 inode。
  */
-function openTranscriptForRead(path: string): number {
+export function assertOpenedInsideTree(
+  fd: number,
+  path: string,
+  root: string,
+  openedPath: (fd: number) => string = descriptor => readlinkSync(`/proc/self/fd/${descriptor}`),
+): void {
+  const rel = relative(resolve(root), resolve(path));
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`refusing to use ${path}: not under ${root}`);
+  }
+  let opened: string | undefined;
+  try { opened = openedPath(fd); } catch { opened = undefined; }
+  if (opened !== undefined) {
+    if (opened !== join(realpathSync(root), rel)) {
+      throw new Error(`refusing to use ${path}: the opened file is not the one under ${root}`);
+    }
+    return;
+  }
+  const parts = rel.split(sep);
+  let current = resolve(root);
+  for (let i = 0; i < parts.length; i++) {
+    current = join(current, parts[i]!);
+    const st = lstatSync(current);
+    const leaf = i === parts.length - 1;
+    if (leaf ? !st.isFile() : !st.isDirectory()) {
+      throw new Error(`refusing to use ${path}: ${current} is not a ${leaf ? 'regular file' : 'directory'}`);
+    }
+    if (leaf) assertSameInode(st, fstatSync(fd), path);
+  }
+}
+
+/**
+ * 打开 transcript 只读：不跟随链接、不在 FIFO 上阻塞，打开后从描述符确认是普通文件，
+ * 路径经过 CLI 可写的树时再确认打开的就是树里那个文件。之后的读取和大小都只取自这个
+ * 描述符，不再按路径另读。
+ */
+function openTranscriptForRead(path: string, scope: TranscriptTreeScope): { fd: number; file: FileIdentity } {
   const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
   try {
-    if (!fstatSync(fd).isFile()) throw new Error(`refusing to read non-regular file ${path}`);
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`refusing to read non-regular file ${path}`);
+    if (scope.writableTreeRoot) assertOpenedInsideTree(fd, path, scope.writableTreeRoot);
+    return { fd, file: { dev: st.dev, ino: st.ino } };
   } catch (err) {
     closeSync(fd);
     throw err;
   }
-  return fd;
 }
 
 /**
  * 扫描 transcript，返回最近 `limit` 个检查点（新的在前，index=1 为最近一轮）。
  * 流式读取，不把整个文件读进内存。
  */
-export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): RewindCheckpoint[] {
-  const fd = openTranscriptForRead(path);
+export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope: TranscriptTreeScope = {}): RewindCheckpoint[] {
+  const { fd, file } = openTranscriptForRead(path, scope);
   const buf = Buffer.allocUnsafe(CHUNK_BYTES);
   let pending: Buffer = Buffer.alloc(0);
   let pendingStart = 0;
-  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction' | 'removedBytes'>[] = [];
+  const found: Omit<RewindCheckpoint, 'index' | 'beforeCompaction' | 'removedBytes' | 'file'>[] = [];
   let lastCompactionOffset = -1;
   let sawConversation = false;
 
@@ -190,6 +244,7 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20): Rewin
       index: tail.length - i,
       beforeCompaction: c.offset < lastCompactionOffset,
       removedBytes: scannedBytes - c.offset,
+      file,
     }))
     .reverse();
 }
@@ -245,7 +300,10 @@ export function rewindClaudeTranscript(
      *  but before the backup is read from it. Lets the symlink-swap regression
      *  replace the pathname deterministically mid-operation. */
     beforeBackup?: () => void;
-  } = {},
+    /** The file the offset was computed on ({@link RewindCheckpoint.file}):
+     *  a different inode at the path now is refused. */
+    expectFile?: FileIdentity;
+  } & TranscriptTreeScope = {},
 ): RewindResult {
   const pre = lstatSync(path);
   if (!pre.isFile()) throw new Error(`refusing to rewind non-regular file ${path}`);
@@ -254,6 +312,8 @@ export function rewindClaudeTranscript(
   try {
     // Pin the descriptor to the inode lstat inspected (regular-file swap TOCTOU).
     assertSameInode({ dev: pre.dev, ino: pre.ino }, fstatSync(fd), path);
+    if (opts.expectFile) assertSameInode(opts.expectFile, fstatSync(fd), path);
+    if (opts.writableTreeRoot) assertOpenedInsideTree(fd, path, opts.writableTreeRoot);
     return rewindOpenTranscript(fd, path, offset, now, opts);
   } finally {
     closeSync(fd);

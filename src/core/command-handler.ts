@@ -4002,7 +4002,7 @@ export async function handleCommand(
         }
         // The canonical resolver follows the frozen config profile and the sandbox
         // BOT_HOME redirect — the paths the CLI actually wrote.
-        const rewindJsonl = ds.session.cliSessionId
+        const rewindTranscript = ds.session.cliSessionId
           ? resolveSessionTranscriptPath({
               cliId: 'claude-code',
               sessionId: ds.session.sessionId,
@@ -4010,8 +4010,14 @@ export async function handleCommand(
               cwd: getSessionWorkingDir(ds),
               larkAppId: ds.larkAppId,
               fresh: true,
-            })?.path ?? null
+            })
           : null;
+        const rewindJsonl = rewindTranscript?.path ?? null;
+        // Every read and the cut re-check the file they open against the tree
+        // the CLI can write to; the resolver's own check is from before.
+        const rewindScope = rewindTranscript?.writableTreeRoot
+          ? { writableTreeRoot: rewindTranscript.writableTreeRoot }
+          : {};
         if (!rewindJsonl) {
           await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
           break;
@@ -4022,7 +4028,7 @@ export async function handleCommand(
         // top-level catch only logs, so without this local catch the user gets
         // NO reply while the CLI may already have been stopped.
         try {
-          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT);
+          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT, rewindScope);
           const formatCheckpointAt = (iso?: string): string => {
             if (!iso) return '-';
             const d = new Date(iso);
@@ -4159,7 +4165,7 @@ export async function handleCommand(
               }
               // Re-resolve the target by identity: the file may have gained a turn
               // between preview and confirm, which shifts every index.
-              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
+              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50, rewindScope), pendingPreview.target);
               // index must still match: a turn that landed after the preview would
               // otherwise be removed silently along with the previewed ones.
               if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
@@ -4189,7 +4195,8 @@ export async function handleCommand(
               }
               let result: RewindResult;
               try {
-                result = rewindClaudeTranscript(rewindJsonl, target.offset);
+                // Cut the file the offset was read from, inside the same tree.
+                result = rewindClaudeTranscript(rewindJsonl, target.offset, Date.now(), { ...rewindScope, expectFile: target.file });
               } catch (err) {
                 // Cut never happened — restore the replay fields so the failed
                 // attempt leaves the session as it was.
