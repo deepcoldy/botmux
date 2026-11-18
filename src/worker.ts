@@ -18283,6 +18283,19 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
 const pendingInjections: PendingInjection[] = [];
 let injectionFlushing = false;
 
+/**
+ * Timestamp of the most recent keep-alive command written to the PTY. The
+ * UserPromptSubmit hook it triggers arrives as a generic `prompt_submitted`
+ * message indistinguishable from a human Web Terminal submit, so we remember
+ * the in-flight keep-alive and suppress the direct-submit provenance signal for
+ * a hook claimed inside this bounded window. Injection writes are serialized by
+ * injectionFlushing/commandLineWritesPending, so the first hook in the window
+ * is deterministically the keep-alive's. The bound prevents a missed hook from
+ * leaking the marker and suppressing a later genuine direct-submit forever.
+ */
+const KEEPALIVE_HOOK_CLAIM_MS = 30_000;
+let inFlightKeepaliveAt: number | null = null;
+
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
   if (nativeSessionForkPending()) return;
@@ -18330,6 +18343,10 @@ async function flushPendingInjections(): Promise<void> {
       if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
+      // Track injection provenance before writing: a keep-alive's later
+      // UserPromptSubmit hook must not open a direct-submit episode; any other
+      // injection clears a stale keep-alive marker.
+      inFlightKeepaliveAt = item.kind === 'keepalive' ? Date.now() : null;
       revokePromptReadiness();
       idleDetector?.reset();
       try {
@@ -32806,7 +32823,12 @@ function killCli(opts: {
   // 目录变更已固化进 lastInitConfig.workingDir 与 daemon 记录，respawn 本身就落在
   // 新目录，重放 /cd 反而多余；非 barrier 注入（如 /compact）是 best-effort，
   // 不跨进程重放。自动升级保留换代窗口内尚未写入的注入。
-  if (!opts.preserveInjections) pendingInjections.length = 0;
+  if (!opts.preserveInjections) {
+    pendingInjections.length = 0;
+    // A teardown that drops queued injections also invalidates any in-flight
+    // keep-alive marker so it cannot mislabel the next process's first submit.
+    inFlightKeepaliveAt = null;
+  }
   scrollback = '';
   herdrWebHistory = null;
   herdrWebScrollDirection = null;
@@ -39073,7 +39095,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // identity so its screen updates cannot flip that turn's reply card back
       // to "working" or be attributed to it in any way.
       setCaptureIdentity(undefined, undefined);
-      pendingInjections.push({ command: msg.text, barrier: false });
+      pendingInjections.push({ command: msg.text, barrier: false, kind: 'keepalive' });
       send({ type: 'prompt_cache_keepalive_result', injected: true });
       log('Prompt-cache keep-alive queued');
       void flushPendingInjections();
@@ -39248,12 +39270,21 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'prompt_submitted': {
       const wasPromptReady = isPromptReady;
       revokePromptReadiness();
+      // A keep-alive injection submits through this same generic UserPromptSubmit
+      // hook. If a keep-alive write is in flight, this hook is its echo, not a
+      // human direct-submit: consume the marker and do not open a live-work
+      // episode. The bounded window means a missed hook cannot suppress a later
+      // genuine direct-submit indefinitely.
+      const fromKeepalive = inFlightKeepaliveAt !== null
+        && Date.now() - inFlightKeepaliveAt < KEEPALIVE_HOOK_CLAIM_MS;
+      if (fromKeepalive) inFlightKeepaliveAt = null;
       // Provenance is independent of the ready→working screen edge: emit it
-      // unconditionally so a direct-submit after a terminal whose prompt_ready
-      // never fired still opens the daemon's live-work episode. A keep-alive
-      // never reaches this case (it uses prompt_cache_keepalive), so this cannot
-      // be spoofed. This signal carries no status and never repaints a card.
-      send({ type: 'direct_submit_started' });
+      // unconditionally (for real direct-submits) so a direct-submit after a
+      // terminal whose prompt_ready never fired still opens the daemon's
+      // live-work episode. A keep-alive never reaches this branch as a
+      // direct-submit (suppressed above), so this cannot be spoofed. This signal
+      // carries no status and never repaints a card.
+      if (!fromKeepalive) send({ type: 'direct_submit_started' });
       if (wasPromptReady) {
         idleDetector?.reset();
         log('User prompt submitted via hook — publishing working state');

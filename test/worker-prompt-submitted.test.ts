@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
 interface Harness {
   child: ChildProcess;
@@ -194,5 +195,49 @@ describe('worker prompt_submitted handler', () => {
       m => m.type === 'screen_update' && m.status === 'working' && m.turnId === undefined,
     );
     expect(workingUpdates).toEqual([]);
+  });
+});
+
+describe('keep-alive vs direct-submit provenance (worker message handler)', () => {
+  function scopeWith(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const sent: WorkerToDaemon[] = [];
+    return {
+      isPromptReady: false,
+      revokePromptReadiness: () => {},
+      idleDetector: undefined,
+      writtenInputs: { takeSubmitted: () => undefined },
+      inFlightKeepaliveAt: null,
+      KEEPALIVE_HOOK_CLAIM_MS: 30_000,
+      send: (m: WorkerToDaemon) => { sent.push(m); },
+      __sent: sent,
+      ...overrides,
+    } as Record<string, unknown>;
+  }
+
+  it('suppresses direct_submit_started when the hook belongs to an in-flight keep-alive', async () => {
+    const scope = scopeWith({ inFlightKeepaliveAt: Date.now() });
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+
+    const sent = (scope.__sent as WorkerToDaemon[]);
+    expect(sent.some(m => m.type === 'direct_submit_started')).toBe(false);
+    // The marker is consumed so it cannot taint the next (real) submit.
+    expect(scope.inFlightKeepaliveAt).toBeNull();
+  });
+
+  it('still emits direct_submit_started for a real submit after the keep-alive window expires', async () => {
+    // Stale marker: a keep-alive whose hook never came back. It must not leak.
+    const scope = scopeWith({ inFlightKeepaliveAt: Date.now() - 31_000 });
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+
+    const sent = (scope.__sent as WorkerToDaemon[]);
+    expect(sent.some(m => m.type === 'direct_submit_started')).toBe(true);
+  });
+
+  it('emits direct_submit_started on a normal prompt_submit with no keep-alive in flight', async () => {
+    const scope = scopeWith();
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+
+    const sent = (scope.__sent as WorkerToDaemon[]);
+    expect(sent.some(m => m.type === 'direct_submit_started')).toBe(true);
   });
 });
