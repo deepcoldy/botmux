@@ -748,6 +748,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_note': '说明：这是 ByteCloud 的授权，和飞书 /login 是两回事，两边都要授权一次。登录态约 3 周有效，到期前不用重复扫码。',
   'cmd.login.bytedcli_pending': '⏳ 还没检测到授权完成。请先点上面那条链接授权，再发 /login bytedcli done。',
   'cmd.login.bytedcli_ok': '✅ ByteCloud 授权已保存。',
+  'cmd.login.bytedcli_already': '✅ ByteCloud 已授权，无需重复授权。如需换账号或重新登录，先发 /logout（会一并撤销你在本机的其它授权），再发 /login bytedcli。',
   'cmd.login.bytedcli_enabled': '当前 Bot 已为 bytedcli 启用按当轮发起人身份注入授权。',
   'cmd.login.bytedcli_configure': '当前 Bot 的 bytedcli 身份注入尚未启用。请管理员将 triggerUserAuth.enabled 设为 true，并在 triggerUserAuth.capabilities 中加入 bytecloud（Meego 加 meego）。注意 capabilities 会替代 tools，需要把想要的能力全部列出（lark-user / bytecloud / meego）；配置在新会话生效。',
   'cmd.login.bytedcli_git_enabled': '当前 Bot 已为 {host} 的 git 鉴权配置当轮 bytedcli 身份。',

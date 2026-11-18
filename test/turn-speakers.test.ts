@@ -205,7 +205,9 @@ describe('BOTMUX_AS on the identity routes', () => {
     const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
     vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply' as any);
     vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
-    vi.spyOn(bytedcliAuth, 'beginBytedcliLogin').mockResolvedValue({ authUrl: 'https://cloud.example/device?code=SECOND' } as any);
+    vi.spyOn(bytedcliAuth, 'startBytedcliLogin').mockResolvedValue({
+      state: 'challenge', challenge: { authUrl: 'https://cloud.example/device?code=SECOND', completeToken: 'tok' },
+    });
     const authRequest = (as?: string) => fetch(`http://127.0.0.1:${ipc.port}/api/sessions/speaker-session/auth-request`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
       body: JSON.stringify({ provider: 'bytedcli', ...(as ? { as } : {}) }),
