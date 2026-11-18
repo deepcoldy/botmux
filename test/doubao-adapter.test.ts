@@ -59,6 +59,7 @@ import {
   DOUBAO_SUBMIT_CAPTURE_BUDGET_MS,
 } from '../src/adapters/cli/doubao.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { resolveDispatchLaunchSpec } from '../src/core/dispatch-launch-spec.js';
 import { STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS } from '../src/services/codex-bridge-queue.js';
 
 const SID = '38450922917357570';
@@ -737,7 +738,7 @@ describe('doubao model discovery', () => {
     expect(parseDoubaoVersion('doubao 1.2.3.4')).toBeNull();
   });
 
-  it('parses doubao model list --json output, trimming and deduplicating names', () => {
+  it('parses doubao model list --json output, preferring model IDs and deduplicating in order', () => {
     const payload = JSON.stringify({
       type: 'result',
       subtype: 'success',
@@ -745,21 +746,98 @@ describe('doubao model discovery', () => {
       result: {
         type: 'model_list',
         models: [
-          { id: '9', name: ' Auto ', is_default: false },
+          { id: ' 9 ', name: ' Auto ', is_default: false },
           { id: 'seed-lite-7b', name: '豆包 2.1 Lite', is_default: false },
-          { id: 'blank', name: '   ' },
-          { id: 'missing-name' },
-          { id: 'dup', name: 'Auto' },
+          { id: '  ', name: 'UniqueFallback' },
+          { id: '9', name: 'Auto duplicate id' },
           { id: '5262373378', name: 'GPT 6.1 Sol' },
         ],
       },
     });
-    expect(parseDoubaoModelListJson(payload)).toEqual(['Auto', '豆包 2.1 Lite', 'GPT 6.1 Sol']);
+    expect(parseDoubaoModelListJson(payload)).toEqual(['9', 'seed-lite-7b', 'UniqueFallback', '5262373378']);
+    expect(parseDoubaoModelListJson(JSON.stringify({
+      is_error: false,
+      result: {
+        models: [
+          { name: 'Shared name' },
+          { name: 'Shared name' },
+        ],
+      },
+    }))).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({
+      is_error: false,
+      result: {
+        models: [
+          { name: 'Shared name' },
+          { id: 'model-b', name: 'Shared name' },
+        ],
+      },
+    }))).toEqual(['model-b']);
+    expect(parseDoubaoModelListJson(JSON.stringify({
+      is_error: false,
+      result: {
+        models: [
+          { name: 'model-b' },
+          { id: 'model-b', name: 'Other' },
+        ],
+      },
+    }))).toEqual(['model-b']);
     expect(parseDoubaoModelListJson('not json')).toBeNull();
-    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: true, result: { models: [{ name: 'Auto' }] } }))).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: true, result: { models: [{ id: '9', name: 'Auto' }] } }))).toBeNull();
     expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: {} }))).toBeNull();
     expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: { models: [] } }))).toBeNull();
-    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: { models: [{ name: '  ' }, { id: 'x' }] } }))).toBeNull();
+    expect(parseDoubaoModelListJson(JSON.stringify({ is_error: false, result: { models: [{ name: '  ' }, { id: '   ', name: '' }] } }))).toBeNull();
+  });
+
+  it('keeps distinct model IDs launchable when multiple entries share the same display name', async () => {
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        cb(null, 'doubao 2.37.1\n', '');
+        return;
+      }
+      cb(null, JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: {
+          type: 'model_list',
+          models: [
+            { id: 'model-a', name: 'Shared name' },
+            { id: 'model-b', name: 'Shared name' },
+          ],
+        },
+      }), '');
+    };
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    const models = await adapter.detectModels!();
+    expect(models).toEqual(['model-a', 'model-b']);
+    expect(models!.map(model => adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true, model }))).toEqual([
+      ['--model', 'model-a'],
+      ['--model', 'model-b'],
+    ]);
+    await expect(resolveDispatchLaunchSpec({
+      requested: { model: 'model-a' },
+      target: { cliId: 'doubao' },
+      detectModels: () => adapter.detectModels!(),
+    })).resolves.toEqual({
+      ok: true,
+      requested: { model: 'model-a' },
+      effective: { model: 'model-a' },
+    });
+    await expect(resolveDispatchLaunchSpec({
+      requested: { model: 'model-b' },
+      target: { cliId: 'doubao' },
+      detectModels: () => adapter.detectModels!(),
+    })).resolves.toEqual({
+      ok: true,
+      requested: { model: 'model-b' },
+      effective: { model: 'model-b' },
+    });
+    await expect(resolveDispatchLaunchSpec({
+      requested: { model: 'Shared name' },
+      target: { cliId: 'doubao' },
+      detectModels: () => adapter.detectModels!(),
+    })).resolves.toMatchObject({ ok: false, error: expect.stringContaining('实时 model catalog') });
   });
 
   it('does not spawn a subprocess on adapter construction or buildArgs', () => {
@@ -797,11 +875,12 @@ describe('doubao model discovery', () => {
     };
 
     const customEnv = Object.freeze({ PATH: '/usr/bin', DOUBAO_CLI_NO_UPDATE_CHECK: '0' });
-    const { detectModels } = createDoubaoAdapter('/bin/doubao');
+    let fakeNow = 10_000;
+    const { detectModels } = createDoubaoAdapter('/bin/doubao', { now: () => fakeNow });
     await expect(detectModels!({ env: customEnv })).resolves.toEqual([
-      'Auto',
-      '豆包 2.1 Lite',
-      'Doubao 2.1 Pro',
+      '9',
+      'seed-lite-7b',
+      '5',
     ]);
     expect(execFileCalls.map(c => ({ file: c.file, args: c.args }))).toEqual([
       { file: '/bin/doubao', args: ['--version'] },
@@ -814,16 +893,63 @@ describe('doubao model discovery', () => {
     expect(customEnv.DOUBAO_CLI_NO_UPDATE_CHECK).toBe('0');
   });
 
+  it('shares a single 10s deadline across --version and the follow-up probe', async () => {
+    let fakeNow = 1_000;
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        fakeNow += 6_000;
+        cb(null, 'doubao 2.37.1\n', '');
+        return;
+      }
+      cb(null, JSON.stringify({ is_error: false, result: { models: [{ id: 'model-a', name: 'Auto' }] } }), '');
+    };
+    const modern = createDoubaoAdapter('/bin/doubao', { now: () => fakeNow });
+    await expect(modern.detectModels!()).resolves.toEqual(['model-a']);
+    expect(execFileCalls.map(c => c.opts.timeout)).toEqual([10_000, 4_000]);
+
+    execFileCalls.length = 0;
+    fakeNow = 5_000;
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        fakeNow += 6_500;
+        cb(null, 'doubao 2.36.2\n', '');
+        return;
+      }
+      cb(
+        new Error('Command failed with exit code 1'),
+        '',
+        'Error: Unsupported --model value. Available models: Auto, Doubao 2.1 Pro. Start doubao without --model and use /model to view available models.',
+      );
+    };
+    const legacy = createDoubaoAdapter('/bin/doubao', { now: () => fakeNow });
+    await expect(legacy.detectModels!()).resolves.toEqual(['Auto', 'Doubao 2.1 Pro']);
+    expect(execFileCalls.map(c => c.opts.timeout)).toEqual([10_000, 3_500]);
+
+    execFileCalls.length = 0;
+    fakeNow = 20_000;
+    execFileHandler = (_file, args, _opts, cb) => {
+      if (args[0] === '--version') {
+        fakeNow += 10_000;
+        cb(null, 'doubao 2.37.1\n', '');
+        return;
+      }
+      cb(null, JSON.stringify({ is_error: false, result: { models: [{ id: 'model-a', name: 'Auto' }] } }), '');
+    };
+    const exhausted = createDoubaoAdapter('/bin/doubao', { now: () => fakeNow });
+    await expect(exhausted.detectModels!()).resolves.toBeNull();
+    expect(execFileCalls.map(c => c.args)).toEqual([['--version']]);
+  });
+
   it.each(['doubao 2.38.0', 'doubao 3.0.0'])('routes newer %s to `model list --json`', async (versionLine) => {
     execFileHandler = (_file, args, _opts, cb) => {
       if (args[0] === '--version') {
         cb(null, versionLine, '');
         return;
       }
-      cb(null, JSON.stringify({ is_error: false, result: { models: [{ name: 'Auto' }] } }), '');
+      cb(null, JSON.stringify({ is_error: false, result: { models: [{ id: '9', name: 'Auto' }] } }), '');
     };
     const adapter = createDoubaoAdapter('/bin/doubao');
-    await expect(adapter.detectModels!()).resolves.toEqual(['Auto']);
+    await expect(adapter.detectModels!()).resolves.toEqual(['9']);
     expect(execFileCalls.map(c => c.args)).toEqual([['--version'], ['model', 'list', '--json']]);
   });
 
@@ -845,7 +971,8 @@ describe('doubao model discovery', () => {
       ['--version'],
       ['--model', '__botmux_model_probe__', '-p', 'probe'],
     ]);
-    expect(execFileCalls[1]!.opts.timeout).toBe(10_000);
+    expect(execFileCalls[1]!.opts.timeout).toBeGreaterThan(0);
+    expect(execFileCalls[1]!.opts.timeout).toBeLessThanOrEqual(10_000);
     expect(execFileCalls[1]!.opts.env?.DOUBAO_CLI_NO_UPDATE_CHECK).toBe('1');
   });
 
@@ -876,9 +1003,9 @@ describe('doubao model discovery', () => {
   });
 
   it.each([
-    ['command error', new Error('exit 2'), JSON.stringify({ is_error: false, result: { models: [{ name: 'Auto' }] } })],
+    ['command error', new Error('exit 2'), JSON.stringify({ is_error: false, result: { models: [{ id: '9', name: 'Auto' }] } })],
     ['malformed JSON', null, '{not-json'],
-    ['is_error envelope', null, JSON.stringify({ is_error: true, result: { models: [{ name: 'Auto' }] } })],
+    ['is_error envelope', null, JSON.stringify({ is_error: true, result: { models: [{ id: '9', name: 'Auto' }] } })],
     ['empty models list', null, JSON.stringify({ is_error: false, result: { models: [] } })],
   ])('returns null on 2.37.1 `model list --json` failure (%s)', async (_label, listErr, listStdout) => {
     execFileHandler = (_file, args, _opts, cb) => {

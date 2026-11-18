@@ -340,8 +340,11 @@ function isDoubaoVersionAtLeast(
   return true;
 }
 
-/** Parse `doubao model list --json` stdout (`result.models[].name`, doubao >= 2.37.1),
- *  trimming whitespace, dropping blanks, and deduplicating in first-seen order. */
+/** Parse `doubao model list --json` stdout (`result.models[]`, doubao >= 2.37.1).
+ *  Uses `id` as the authoritative `--model` launch value (`doubao --model`
+ *  matches `id` first and rejects duplicate `name`s as ambiguous); falls back to
+ *  `name` only when an entry omits `id` and that `name` is unique and does not
+ *  collide with any `id` in the list. */
 export function parseDoubaoModelListJson(stdout: string): string[] | null {
   let parsed: unknown;
   try {
@@ -355,30 +358,44 @@ export function parseDoubaoModelListJson(stdout: string): string[] | null {
   if (typeof envelope.result !== 'object' || envelope.result === null) return null;
   const models = (envelope.result as { models?: unknown }).models;
   if (!Array.isArray(models)) return null;
-  const seen = new Set<string>();
-  const names: string[] = [];
+
+  const ids = new Set<string>();
+  const nameCounts = new Map<string, number>();
   for (const entry of models) {
     if (typeof entry !== 'object' || entry === null) continue;
-    const rawName = (entry as { name?: unknown }).name;
-    if (typeof rawName !== 'string') continue;
-    const name = rawName.trim();
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    names.push(name);
+    const record = entry as { id?: unknown; name?: unknown };
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    if (id) ids.add(id);
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    if (name) nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
   }
-  return names.length > 0 ? names : null;
+
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const entry of models) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const record = entry as { id?: unknown; name?: unknown };
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    const candidate = id || (name && !ids.has(name) && nameCounts.get(name) === 1 ? name : '');
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    values.push(candidate);
+  }
+  return values.length > 0 ? values : null;
 }
 
 function execDoubaoProbe(
   bin: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
+  timeoutMs: number,
   maxBuffer = 64 * 1024,
 ): Promise<{ err: Error | null; stdout: string; stderr: string }> {
   return new Promise(resolve => {
     try {
       execFile(bin, [...args], {
-        timeout: DOUBAO_DETECT_TIMEOUT_MS,
+        timeout: timeoutMs,
         maxBuffer,
         windowsHide: true,
         env,
@@ -417,8 +434,9 @@ export const doubaoBridgeSpec: StructuredBridgeSpec = {
   },
 };
 
-export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
+export function createDoubaoAdapter(pathOverride?: string, deps: { now?: () => number } = {}): CliAdapter {
   const rawBin = pathOverride ?? 'doubao';
+  const now = deps.now ?? (() => Date.now());
   let cachedBin: string | undefined;
   // A fresh spawn learns its native id from the first submit that lands.
   // Each launch owns an immutable identity; per-input state lives on this
@@ -535,27 +553,38 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
 
     async detectModels(options) {
       // Doubao CLI 2.37.1+ adds read-only `doubao model list --json`
-      // (`result.models[].name`) and localizes its invalid `--model` diagnostic
-      // into Chinese, so the legacy English error probe resolves null on 2.37.1+.
-      // Check `doubao --version` asynchronously on demand first (never on adapter
-      // construction or session startup): >= 2.37.1 uses `model list --json`;
-      // older versions keep the unsupported `--model` probe unchanged.
+      // (`result.models[].id` / `.name`) and localizes its invalid `--model`
+      // diagnostic into Chinese, so the legacy English error probe resolves
+      // null on 2.37.1+. Check `doubao --version` asynchronously on demand first
+      // (never on adapter construction or session startup), sharing a single 10s
+      // deadline across both probes: >= 2.37.1 uses `model list --json`; older
+      // versions keep the unsupported `--model` probe unchanged.
       try {
         const bin = cachedBin ??= resolveCommand(rawBin);
         const env: NodeJS.ProcessEnv = {
           ...(options?.env ?? process.env),
           DOUBAO_CLI_NO_UPDATE_CHECK: '1',
         };
-        const versionRes = await execDoubaoProbe(bin, ['--version'], env);
+        const deadline = now() + DOUBAO_DETECT_TIMEOUT_MS;
+        const remainingTimeoutMs = (): number | null => {
+          const remaining = Math.floor(deadline - now());
+          // Avoid passing <= 0 to execFile, where timeout: 0 disables timeouts.
+          return remaining >= 1 ? remaining : null;
+        };
+        const versionTimeout = remainingTimeoutMs();
+        if (versionTimeout === null) return null;
+        const versionRes = await execDoubaoProbe(bin, ['--version'], env, versionTimeout);
         if (versionRes.err) return null;
         const version = parseDoubaoVersion(versionRes.stdout || versionRes.stderr);
         if (!version) return null;
+        const probeTimeout = remainingTimeoutMs();
+        if (probeTimeout === null) return null;
         if (isDoubaoVersionAtLeast(version, DOUBAO_MODEL_LIST_MIN_VERSION)) {
-          const listRes = await execDoubaoProbe(bin, ['model', 'list', '--json'], env, 1024 * 1024);
+          const listRes = await execDoubaoProbe(bin, ['model', 'list', '--json'], env, probeTimeout, 1024 * 1024);
           if (listRes.err) return null;
           return parseDoubaoModelListJson(listRes.stdout);
         }
-        const probeRes = await execDoubaoProbe(bin, ['--model', '__botmux_model_probe__', '-p', 'probe'], env);
+        const probeRes = await execDoubaoProbe(bin, ['--model', '__botmux_model_probe__', '-p', 'probe'], env, probeTimeout);
         return parseDoubaoAvailableModels(`${probeRes.stdout}\n${probeRes.stderr}`);
       } catch {
         return null;
