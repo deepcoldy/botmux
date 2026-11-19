@@ -76,7 +76,7 @@ export interface DelegatedCliIdentity {
   dispatchRoot: string;
   /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
    *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
+  denialReason?: 'target_chat_membership_required' | 'target_identity_unresolved' | 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
     /** A workflow delegation passed on from a node session into a session
      *  that keeps identities on disk: it could not be re-checked per use. */
     | 'passed_on_unsupported';
@@ -277,15 +277,15 @@ async function publishToolIdentity(
 }
 
 function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
-  const reason = user.denialReason === 'target_validation_unavailable'
-    ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
-    : user.denialReason === 'target_access_denied'
-      ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : user.denialReason === 'delegation_inactive'
-        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
-        : user.denialReason === 'passed_on_unsupported'
-          ? 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call, and this session does not. Tools that need the person\'s authorization refuse here; do not request another login.'
-          : 'The source must ask the original human to authorize.';
+  const reasons = {
+    target_validation_unavailable: 'Target user or group membership verification is unavailable. Restore verification before retrying.',
+    target_access_denied: 'The target bot does not allow this requester to talk in the destination context.',
+    target_identity_unresolved: 'The target bot could not resolve the requester in its own application.',
+    target_chat_membership_required: 'The requester is outside the internal dispatch chat. Its membership rule blocked this task before credential issuance. Report to the original topic; another login will not change membership.',
+    delegation_inactive: 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn).',
+    passed_on_unsupported: 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call.',
+  } satisfies Record<NonNullable<DelegatedCliIdentity['denialReason']>, string>;
+  const reason = user.denialReason ? reasons[user.denialReason] : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),

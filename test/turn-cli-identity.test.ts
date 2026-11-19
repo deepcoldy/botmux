@@ -548,7 +548,7 @@ describe('queued identities stay separate from the executing task', () => {
 });
 
 describe('target daemon consumes signed message authority', () => {
-  async function targetHarness(options: { mapping?: 'resolved' | 'transient'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
+  async function targetHarness(options: { mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
@@ -558,7 +558,7 @@ describe('target daemon consumes signed message authority', () => {
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
-      'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
+      'dispatchUserForTurn', 'targetUserForDelegation', 'checkDelegationRecipient', 'delegatedScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
       'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
       'handleIdentityDecisionFlip', 'noteTurnReceived'].map(name => {
@@ -578,16 +578,17 @@ describe('target daemon consumes signed message authority', () => {
         replyTargets: { om_kickoff: { senderOpenId: 'ou_peer', rootMessageId: 'om_root', updatedAt: new Date().toISOString() } },
       },
     };
-    const resolveTargetAppOpenId = vi.fn(async () => options.mapping === 'transient'
-      ? { status: 'transient' } : { status: 'resolved', openId: 'ou_alice_target' });
+    const resolveTargetAppOpenId = vi.fn(async () => options.mapping && options.mapping !== 'resolved'
+      ? { status: options.mapping } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
       getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
-      listChatMemberOpenIds: async () => {
+      listChatMemberOpenIds: async () => options.member === false ? [] : ['ou_alice_target'],
+      findCurrentChatUserMembers: async () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
-        return options.member === false ? [] : ['ou_alice_target'];
+        return new Set(options.member === false ? [] : ['ou_alice_target']);
       },
       publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en',
       clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
@@ -968,7 +969,13 @@ describe('target daemon consumes signed message authority', () => {
       /^\[dispatch-user:audit\] receive source=cli_source target=cli_bot union=on_alice .*turn=om_kickoff .*tools=bytedcli .*result=delegated$/,
     ));
   });
-  it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
+  it.each([
+    [{ mapping: 'transient' as const }, 'target_validation_unavailable'],
+    [{ mapping: 'definitive' as const }, 'target_identity_unresolved'],
+    [{ memberError: true }, 'target_validation_unavailable'],
+    [{ member: false }, 'target_chat_membership_required'],
+    [{ talk: false }, 'target_access_denied'],
+  ] as const)('denies identity when target cannot validate user %j', async (options, expectedReason) => {
     const h = await targetHarness(options);
     bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
     await h.run();
@@ -976,7 +983,7 @@ describe('target daemon consumes signed message authority', () => {
     expect(env).not.toContain('must-not-leak');
     expect(env).toContain('report --dispatch-root om_root');
     expect(h.scopeValues.logger.info).toHaveBeenCalledWith(expect.stringMatching(
-      /^\[dispatch-user:audit\] receive source=cli_source .*result=target_(access_denied|validation_unavailable)$/,
+      new RegExp(`result=${expectedReason}$`),
     ));
   });
   it('never uses root binding for an unrelated later turn', async () => {

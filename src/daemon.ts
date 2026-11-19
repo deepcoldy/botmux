@@ -131,7 +131,7 @@ import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { deliverWelcomeMessageOnce, planStartupWelcomeMessages } from './services/welcome-message.js';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, findCurrentChatUserMembers, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -4566,17 +4566,28 @@ function workflowDelegationRefusalFor(
 
 /** Reads only the bot, chat and chat type of `ds`, so the pre-handoff check
  *  of a workflow delegation runs it for a chat this bot has no session in. */
+async function checkDelegationRecipient(
+  ds: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'chatType'>,
+  user: Pick<import('./core/dispatch-user-delegation.js').DispatchUserAuthority, 'unionId'>,
+) {
+  const resolved = await resolveTargetAppOpenId(ds.larkAppId, user.unionId);
+  if (resolved.status === 'transient') return { denied: 'target_validation_unavailable' } as const;
+  if (resolved.status !== 'resolved') return { denied: 'target_identity_unresolved' } as const;
+  if (!evaluateTalk(ds.larkAppId, ds.chatId, resolved.openId, user.unionId, undefined, ds.chatType).allowed) {
+    return { denied: 'target_access_denied' } as const;
+  }
+  if (ds.chatType === 'group') {
+    const members = await findCurrentChatUserMembers(ds.larkAppId, ds.chatId, [resolved.openId]);
+    if (!members.has(resolved.openId)) return { denied: 'target_chat_membership_required' } as const;
+  }
+  return { openId: resolved.openId } as const;
+}
+
 async function targetUserForDelegation(
   ds: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'chatType'>,
   user: Pick<import('./core/dispatch-user-delegation.js').DispatchUserAuthority, 'unionId'>,
 ): Promise<string | undefined> {
-  const resolved = await resolveTargetAppOpenId(ds.larkAppId, user.unionId);
-  if (resolved.status !== 'resolved'
-    || !evaluateTalk(ds.larkAppId, ds.chatId, resolved.openId, user.unionId, undefined, ds.chatType).allowed) return;
-  // A delegated turn did not itself prove that the human belongs to this chat.
-  // Do not use allowedChatGroups' implicit membership assumption for them.
-  if (ds.chatType === 'group' && !(await listChatMemberOpenIds(ds.larkAppId, ds.chatId)).includes(resolved.openId)) return;
-  return resolved.openId;
+  return (await checkDelegationRecipient(ds, user)).openId;
 }
 
 function delegatedScheduleRuntimeDeps(appId: string) {
@@ -4935,10 +4946,11 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
         delegatedIdentity.denialReason = 'passed_on_unsupported';
         logger.info(`[dispatch-user:audit] workflow delegation passed on into a file-identity session target=${ds.larkAppId} turn=${turnId}`);
       }
-      const targetOpenId = workflowRefusal || passedOnToFileSession
-        ? undefined : await targetUserForDelegation(ds, delegation.authority);
-      if (targetOpenId) delegatedIdentity = {
-        ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
+      const recipient = workflowRefusal || passedOnToFileSession
+        ? undefined : await checkDelegationRecipient(ds, delegation.authority);
+      if (recipient?.denied) delegatedIdentity.denialReason = recipient.denied;
+      if (recipient?.openId) delegatedIdentity = {
+        ...delegatedIdentity, targetOpenId: recipient.openId, tools: delegation.authority.tools,
         denialReason: undefined,
         // Re-checked on every use (dashboard-ipc-server): the run attempt can
         // end, or the handoff be withdrawn, while this turn still runs.
