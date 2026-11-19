@@ -262,6 +262,40 @@ describe('Web startup protocol activity and recovery', () => {
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])('rechecks the deadline when a drain resolves late (firstSubmitConfirmed=%s)', async confirmed => {
+    const h = makeStartupSampler(RESOLVED);
+    const head = h.scope.pendingMessages[0];
+    h.scope.nativeState = 'idle';
+    h.scope.traexFirstSubmitConfirmed = confirmed;
+    h.scope.traexFirstPromptDeadlineAt = 90_000;
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+    h.scope.markPromptReady = vi.fn();
+    h.scope.flushPending = vi.fn(() => h.flush());
+
+    vi.setSystemTime(88_000);
+    h.noteWebInput('\x1b[A');
+    h.scope.backendScreenRevision += 1;
+    vi.setSystemTime(89_000);
+    expect(h.pending()).toBe(true);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(91_000);
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    await h.flush();
+
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(confirmed ? 1 : 0);
+    if (confirmed) {
+      expect(h.scope.pendingMessages).toHaveLength(0);
+      expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
+    } else {
+      expect(h.scope.pendingMessages[0]).toBe(head);
+      expect(h.scope.traexFirstInputAdmissionPending).toBe(true);
+      expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+    }
+  });
+
   it('recovers a transient renderer drain within the fixed startup deadline', async () => {
     const h = makeStartupSampler(RESOLVED);
     const deadline = h.scope.traexFirstPromptDeadlineAt;
