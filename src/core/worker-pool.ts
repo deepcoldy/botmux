@@ -26308,9 +26308,11 @@ function setupWorkerHandlers(
     // Losing the current worker's turn origin leaves --as user and actor
     // current without a requesting user, and losing its identity decision
     // leaves every proven identity wrapper refused (exit 77), so both must be
-    // visible in production.
+    // visible in production. So must losing a terminal-local turn's start: a
+    // zero-prompt session then has nowhere to send that turn's final.
     const logRejected = (reason: string) => {
-      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision') && ds.worker === worker) {
+      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision'
+        || msg.type === 'terminal_turn_started') && ds.worker === worker) {
         logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
@@ -27335,6 +27337,12 @@ function deliverFinalOutput(
     // Never reinterpret an unbound local output as an IM/HTTP completion.
     if (!zeroPromptReply || ds.adoptedFrom || ds.session.adoptedFrom
       || !ds.chatId.startsWith('oc_') || (!frozenReplyTarget && !terminalContext)) {
+      // The last case is a zero-prompt session that should have forwarded this
+      // answer (a background task's wake-up, terminal input) but never recorded
+      // where its turn replies: say so instead of losing it without a trace.
+      if (zeroPromptReply && !ds.adoptedFrom && !ds.session.adoptedFrom && ds.chatId.startsWith('oc_')) {
+        logger.warn(`[${t}] Terminal-local final not delivered: no reply context for turn ${msg.turnId}`);
+      }
       onComplete?.(true);
       return;
     }
