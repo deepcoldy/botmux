@@ -98,7 +98,7 @@ describe('consent card provider availability', () => {
   function check(value: unknown, error?: Error & { code?: number }) {
     const read = async () => { if (error) throw error; return { items: value ? [value] : [] }; };
     const scope = { getMessageDetail: read, getLarkErrorCode: (e: { code?: number }) => e.code,
-      LARK_CODE_MESSAGE_WITHDRAWN: 230011 };
+      LARK_CODE_MESSAGE_WITHDRAWN: 230011, LARK_CODE_MESSAGE_DELETED: 230110 };
     const run = new Function('scope', `with(scope) { ${cardCode}; return dispatchConsentCardAvailable; }`)(scope);
     return run('cli_source', 'oc_source', 'om_card') as Promise<boolean>;
   }
@@ -114,6 +114,7 @@ describe('consent card provider availability', () => {
   });
   it('treats explicit withdrawal as unavailable but propagates inconclusive errors', async () => {
     expect(await check(undefined, Object.assign(new Error('withdrawn'), { code: 230011 }))).toBe(false);
+    expect(await check(undefined, Object.assign(new Error('deleted'), { code: 230110 }))).toBe(false);
     await expect(check(undefined, Object.assign(new Error('permission unavailable'), { code: 99991672 })))
       .rejects.toThrow('permission unavailable');
   });

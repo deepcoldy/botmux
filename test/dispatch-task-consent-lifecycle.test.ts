@@ -193,4 +193,47 @@ describe('source task consent card lifecycle', () => {
     expect((await readTaskBinding(dir, secret, 'om_task'))?.taskOwner?.decision).toBe('denied');
     expect(await decide('om_old', 'approve')).toBe(false);
   });
+
+  it('finishes a rotation stranded before send once the old card is readable again', async () => {
+    const binding = record();
+    // The real rotation path writes replacement:om_old/pending, then the send fails.
+    await expect(outcome(confirmation(binding, {
+      available: async () => false,
+      send: async () => { throw new Error('provider send failed'); },
+    }))).resolves.toEqual({ error: 'provider send failed' });
+    expect(JSON.parse(readFileSync(join(dir, '.dashboard-secret.dispatch-task-decisions', 'om_task.json'), 'utf8')))
+      .toMatchObject({ cardId: 'replacement:om_old', decision: 'pending' });
+    // Provider recovered: the old card is readable again. The stranded marker
+    // must not take the early return — a fresh card is sent and becomes usable.
+    const send = vi.fn(async () => 'om_new');
+    const pending = outcome(confirmation(binding, { available: async () => true, send }));
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    expect(await decide('om_new', 'approve')).toBe(true);
+    expect(await decide('om_old', 'approve')).toBe(false);
+    expect(await pending).toEqual({ value: 'om_new' });
+  });
+
+  it('reconciles a new-card pending left behind when the route update failed', async () => {
+    const { createHmac } = await import('node:crypto');
+    const { dispatchTaskDecisionDirectory } = await import('../src/services/project-authority-paths.js');
+    const { mkdirSync } = await import('node:fs');
+    const binding = record();
+    // Equivalent disk state to a crash between the new-card pending write and
+    // the registry update: decision names om_new, the route still names om_old.
+    const decisionDir = dispatchTaskDecisionDirectory(dir);
+    mkdirSync(decisionDir, { recursive: true });
+    const signature = createHmac('sha256', secret)
+      .update(JSON.stringify(['botmux.task-consent.v1', 'om_task', 'om_new', 'pending'])).digest('base64url');
+    writeFileSync(join(decisionDir, 'om_task.json'), JSON.stringify({ cardId: 'om_new', decision: 'pending', signature }));
+    // Both cards are readable now. The idempotent resend returns the existing card.
+    const send = vi.fn(async () => 'om_new');
+    const pending = outcome(confirmation(binding, { available: async () => true, send }));
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    expect(await decide('om_old', 'approve')).toBe(false);
+    expect(await decide('om_new', 'approve')).toBe(true);
+    expect(await pending).toEqual({ value: 'om_new' });
+    expect((await readTaskBinding(dir, secret, 'om_task'))?.taskOwner).toMatchObject({
+      consentMessageId: 'om_new', decision: 'approved',
+    });
+  });
 });

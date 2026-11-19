@@ -2630,7 +2630,10 @@ export async function dispatchConsentCardAvailable(appId: string, chatId: string
   try {
     item = (await getMessageDetail(appId, messageId, { userCardContent: false, timeoutMs: 5000 }))?.items?.[0];
   } catch (error) {
-    if (getLarkErrorCode(error) === LARK_CODE_MESSAGE_WITHDRAWN) return false;
+    const code = getLarkErrorCode(error);
+    // Both codes are terminal provider states: the message can never become
+    // readable again, so the consent flow must rotate rather than throw forever.
+    if (code === LARK_CODE_MESSAGE_WITHDRAWN || code === LARK_CODE_MESSAGE_DELETED) return false;
     throw error;
   }
   return item?.message_id === messageId && item.chat_id === chatId && !item.deleted

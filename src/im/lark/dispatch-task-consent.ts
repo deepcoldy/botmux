@@ -186,7 +186,14 @@ export async function confirmDispatchTask(input: {
     if (!sameTask(current)) throw new Error('dispatch_task_changed');
     if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
     const previous = current!.taskOwner!.consentMessageId;
-    if (previous && (!input.isCardAvailable || await input.isCardAvailable(previous))) return previous;
+    // A half-finished rotation (process exit, failed card send, registry
+    // write failure) leaves a pending decision whose card differs from the
+    // routed one. When the old card becomes readable again, the early return
+    // would strand the task: neither card accepts a callback and no replacement
+    // is ever sent. Finish the rotation instead.
+    const inflight = await readTaskDecision(input.dataDir, input.secret, binding.dispatchRoot);
+    if (previous && (!inflight || inflight.cardId === previous)
+        && (!input.isCardAvailable || await input.isCardAvailable(previous))) return previous;
     await mkdir(dispatchTaskDecisionDirectory(input.dataDir), { recursive: true, mode: 0o700 });
     const changed = await withFileLock(decisionPath(input.dataDir, binding.dispatchRoot), async () => {
       current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
