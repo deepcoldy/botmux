@@ -217,11 +217,11 @@ function trTextKeys(text: string): string[] {
  * 4. `<label>` 自己的直接文本，以及其内 `<span>` / `<strong>` / `<small>` 的直接文本子节点
  *    （`<label htmlFor>{tr()}</label><input/>`、裸复选框、输入框行）；
  * 5. 紧挨 `<DropdownField>` 的 `<span>` 标题（下拉框没有 `<label>`，标题就是它前面那个 span）；
- * 6. 按常量列表展开的键（REPLY_FOOTER_KEYS / STREAMING_CARD_BUTTON_IDS）与一键静默预设的小标题。
+ * 6. 按常量列表展开的键（REPLY_FOOTER_KEYS / STREAMING_CARD_BUTTON_IDS）与一键静默预设的小标题；
+ * 7. `<h4 className="bd-subsection-title">` 小组标题的直接文本（深链也能定位到 h4）。
  * 已知缺口（不静默跳过，登记在此）：常量数组里的 `tr(option.labelKey)`（如
- * OWNER_REMINDER_STATE_OPTIONS 的 6 个同区块同义勾选项，登记会给 ⌘K 增同义噪音）、
- * `<h4 className="bd-subsection-title">` 小组标题（组标题不是配置行，属产品取舍）——
- * 这两类后续要收时需要新增加常量展开与 h4 扫描规则；
+ * OWNER_REMINDER_STATE_OPTIONS 的 6 个同区块同义勾选项，登记会给 ⌘K 增同义噪音）——
+ * 后续要收时需要新增加常量展开规则；
  * 以及 `<button>{tr()}</button>` 可展开控件（如 autoStartExcludedChats）——需新增 button 标签扫描；
  * 同区块同译文去重（riffModel 与 agentModel 的 zh 译文都是「模型」，条目被
  * buildBotDefaultsSectionItems 的 seen 去重丢掉，⌘K 搜不到）——属条目生成侧，另行跟进。
@@ -251,6 +251,11 @@ function renderedBotConfigLabelKeys(sources: string): Set<string> {
     add(STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`));
   }
   add([...sources.matchAll(/<h4 className="bd-card-setting-heading">\{tr\('(quietPreset\.[^']+)'\)\}<\/h4>/g)].map(m => m[1]!));
+  for (const tag of openingTags(sources, 'h4')) {
+    if (!/\bclassName=["']bd-subsection-title["']/.test(tag.body)) continue;
+    const children = elementChildren(sources.slice(tag.start), 'h4')[0];
+    if (children !== undefined) add(trTextKeys(directText(children)));
+  }
   return keys;
 }
 
@@ -262,6 +267,9 @@ const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
   ['sessionEnv.valueLabel', '同上，环境变量弹窗里的值字段名'],
   ['botDefaults.sgTagRepairAllLabel', '飞书授权流程里一次性「顺便补齐」勾选，repairAll 只用于当次调用、不持久化为 bot 配置'],
   ['botDefaults.autoStartExcludedChatsHelp', '排除群文本框上方的说明文案，不是配置项；其入口 autoStartExcludedChats 是可展开 <button>，扫描器不识别 button 标签，登记需新增扫描规则，另行跟进'],
+  ['botDefaults.quotaFallbackKinds', '额度回退条件的小组标题；各条件行已经登记，标题不另增同义搜索项'],
+  ['botDefaults.ownerReminderStates', '主人提醒状态的小组标题；搜索落到已登记的主人提醒配置行'],
+  ['botDefaults.sectionAutoStart', '自动启动的小组标题；搜索落到已登记的入群和新话题启动配置行'],
 ]);
 
 const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'providerRecovery.', 'roles.', 'blocked.'];
@@ -396,9 +404,15 @@ describe('⌘K index coverage', () => {
       '<div className="bd-field"><span>{tr(\'botDefaults.fixtureDropdown\')}</span>',
       '  <DropdownField ariaLabel={tr(\'botDefaults.fixtureAria\')} /></div>',
       '<div><span>{tr(\'botDefaults.fixtureDescription\')}</span></div>',
+      '<h4 className="bd-subsection-title" title={tr(\'botDefaults.fixtureTooltip\')}>',
+      '  {tr(\'botDefaults.fixtureSubsection\')}',
+      '  <em>{tr(\'botDefaults.fixtureNestedDescription\')}</em>',
+      '</h4>',
+      '<h4>{tr(\'botDefaults.fixtureOtherHeading\')}</h4>',
     ].join('\n');
     expect([...renderedBotConfigLabelKeys(fixture)].sort()).toEqual([
-      'botDefaults.fixtureCheckbox', 'botDefaults.fixtureDropdown', 'botDefaults.fixtureLang', 'botDefaults.fixtureTitle',
+      'botDefaults.fixtureCheckbox', 'botDefaults.fixtureDropdown', 'botDefaults.fixtureLang',
+      'botDefaults.fixtureSubsection', 'botDefaults.fixtureTitle',
     ]);
   });
 
