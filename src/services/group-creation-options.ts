@@ -6,6 +6,11 @@ export interface GroupCreationDefaults {
   tag?: string;
   /** `name` renders the group name; `logo` reuses the session-group logo gradient. */
   avatar?: GroupAvatarMode;
+  /** Opt-in task mode: when `true`, `/g <text>` names the chat from the text
+   *  and this bot starts a session on it there. Absent / `false` keeps the
+   *  released behavior — `/g <text>` only names a plain group. `--start` /
+   *  `--no-start` override it for one command. */
+  autoStart?: boolean;
 }
 
 const AVATAR_MODES: readonly GroupAvatarMode[] = ['name', 'logo', 'off'];
@@ -14,7 +19,7 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('groupCreation must be an object');
   const v = value as Record<string, unknown>;
   for (const key of Object.keys(v)) {
-    if (!['agents', 'tag', 'avatar'].includes(key)) throw new Error(`Unknown groupCreation option: ${key}`);
+    if (!['agents', 'tag', 'avatar', 'autoStart'].includes(key)) throw new Error(`Unknown groupCreation option: ${key}`);
   }
   const out: GroupCreationDefaults = {};
   if (v.agents !== undefined) {
@@ -32,21 +37,29 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
     if (!AVATAR_MODES.includes(v.avatar as GroupAvatarMode)) throw new Error('avatar must be name, logo or off');
     out.avatar = v.avatar as GroupAvatarMode;
   }
+  if (v.autoStart !== undefined) {
+    if (typeof v.autoStart !== 'boolean') throw new Error('autoStart must be true or false');
+    out.autoStart = v.autoStart;
+  }
   return out;
 }
 
 export interface GroupCreationArgs extends GroupCreationDefaults {
   name: string;
+  /** Every line left after removing the options: the task when `autoStart` is true. */
+  body: string;
   roleProfileId?: string;
 }
 
-type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile';
+type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile' | 'start';
 
 /** Discriminated union — value flags only declare `apply`, opt-out flags only
- *  declare `clear`. Keeps every spec truthful about what it supports. */
+ *  declare `clear`, opt-in switches only declare `set`. Keeps every spec
+ *  truthful about what it supports. */
 type FlagSpec =
   | { kind: 'value'; key: OutputKey; apply(bag: Record<string, unknown>, value: string): void }
-  | { kind: 'optOut'; key: OutputKey; clear(bag: Record<string, unknown>): void };
+  | { kind: 'optOut'; key: OutputKey; clear(bag: Record<string, unknown>): void }
+  | { kind: 'optIn'; key: OutputKey; set(bag: Record<string, unknown>): void };
 
 const FLAG_SPECS: Record<string, FlagSpec> = {
   'agents': {
@@ -67,6 +80,9 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
     kind: 'value', key: 'role-profile',
     apply(bag, value) { bag.roleProfileId = value; },
   },
+  // Same key: `--start --no-start` in one command is a duplicate, not a race.
+  'start': { kind: 'optIn', key: 'start', set(bag) { bag.autoStart = true; } },
+  'no-start': { kind: 'optOut', key: 'start', clear(bag) { bag.autoStart = false; } },
 };
 
 /**
@@ -87,13 +103,21 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
  *  - No shell evaluation. Quotes are only syntax for option values; the group
  *    name retains its original punctuation and spacing on the first non-empty
  *    line, matching the historical behavior.
+ *  - Options are read from the first non-empty line only. Later lines are task
+ *    text and stay verbatim: a pasted `docker build --tag x` or
+ *    `git checkout -- file` must neither become an option nor lose its flags.
  */
-export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefaults): GroupCreationArgs {
+export function parseGroupCreationArgs(rawArgs: string, defaults?: GroupCreationDefaults): GroupCreationArgs {
   // `parseGroupCreationDefaults` already normalizes blank defaults to absent,
   // but we may have been handed a raw object from a legacy call site; mirror
   // that normalization locally so defaults can be mutated by opt-outs.
   const bag: Record<string, unknown> = { ...defaults };
   if (typeof bag.tag === 'string' && !bag.tag.trim()) delete bag.tag;
+
+  const firstContent = rawArgs.search(/\S/);
+  const optionsEnd = firstContent < 0 ? -1 : rawArgs.indexOf('\n', firstContent);
+  const raw = optionsEnd < 0 ? rawArgs : rawArgs.slice(0, optionsEnd);
+  const taskTail = optionsEnd < 0 ? '' : rawArgs.slice(optionsEnd);
 
   const seen = new Set<OutputKey>();
   const removals: Array<[number, number]> = [];
@@ -123,9 +147,10 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
     if (seen.has(spec.key)) throw new Error(`Duplicate option: --${name}`);
     seen.add(spec.key);
 
-    if (spec.kind === 'optOut') {
+    if (spec.kind === 'optOut' || spec.kind === 'optIn') {
       if (next === '=') throw new Error(`--${name} takes no value`);
-      spec.clear(bag);
+      if (spec.kind === 'optOut') spec.clear(bag);
+      else spec.set(bag);
       removals.push([m.index, nameEnd]);
       continue;
     }
@@ -168,12 +193,33 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
     body += raw.slice(cursor, s);
     cursor = e;
   }
-  body += raw.slice(cursor);
+  body += raw.slice(cursor) + taskTail;
   const firstLine = body.split(/\r?\n/).map(x => x.trim()).find(Boolean) ?? '';
 
   const roleProfileId = typeof bag.roleProfileId === 'string' ? bag.roleProfileId : undefined;
   delete bag.roleProfileId;
-  return { ...parseGroupCreationDefaults(bag), name: firstLine, roleProfileId };
+  const parsed = parseGroupCreationDefaults(bag);
+  return { ...parsed, name: firstLine, body: body.trim(), roleProfileId };
+}
+
+const GROUP_COMMAND_PREFIX = /^\/(?:group|g)(?=\s|$)/i;
+
+/**
+ * Whether a `/g` command text starts a task for a bot with these
+ * `groupCreation` defaults: `--start` on its first line, or `autoStart: true`
+ * without `--no-start`. Routing uses it to accept a multi-line `/g` only then;
+ * any other multi-line `/g` stays discussion text for the CLI, as before task
+ * mode existed. Unparseable options or defaults → false (legacy routing).
+ */
+export function groupCommandStartsTask(commandText: string, defaults: unknown): boolean {
+  const text = commandText.trim();
+  if (!GROUP_COMMAND_PREFIX.test(text)) return false;
+  try {
+    const base = defaults === undefined ? undefined : parseGroupCreationDefaults(defaults);
+    return parseGroupCreationArgs(text.replace(GROUP_COMMAND_PREFIX, ''), base).autoStart === true;
+  } catch {
+    return false;
+  }
 }
 
 /** What /g should do beyond creating the chat, derived from the parsed args. */

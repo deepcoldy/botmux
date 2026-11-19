@@ -116,6 +116,10 @@ export const BLOCK_META: Record<string, { label: string; hint?: string }> = {
     label: '<summary_memory> /summary 记忆文件规则',
     hint: '首轮与每轮共用',
   },
+  group_task: {
+    label: '/g 任务群开工',
+    hint: '/g 带任务建群后，新群会话的首轮输入',
+  },
   whiteboard_block: {
     label: '<whiteboard> 白板结构化指令',
     hint: '绑定白板的会话，首轮与每轮注入',
@@ -310,6 +314,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.summary_memory.reuse_guard', block: 'summary_memory', stage: 'new', stages: ['followup'], kind: 'placeholder',
     placeholders: ['path'], label: '记忆：条件不齐只能当参考',
     gateLabel: '仅开启 summaryMemory 时',
+  },
+  {
+    key: 'ai.group_task.intro', block: 'group_task', stage: 'new', kind: 'editable',
+    label: '开工引导语（后接用户原话与来源定位）',
+    gateLabel: '仅 /g 带任务建群后，新群会话的首轮',
   },
   {
     key: 'ai.summary_memory.write_guard', block: 'summary_memory', stage: 'new', stages: ['followup'], kind: 'placeholder',

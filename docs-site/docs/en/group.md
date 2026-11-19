@@ -23,7 +23,7 @@ The reply looks roughly like:
 Just start chatting in the new group — the whole group is one CLI session.
 ```
 
-> Creating the group **does not start a session**. The session starts when you send your first message in the new group.
+> Creating the group **does not start a session**. The session starts when you send your first message in the new group. To create the group and start on a task right away, add `--start`; see "Create and start a task" below.
 
 botmux has two kinds of "session group". This page covers both:
 
@@ -38,6 +38,7 @@ botmux has two kinds of "session group". This page covers both:
 ### Group name and avatar
 
 - **With a name**: your name is used and never changed afterwards.
+- **Starting a task** (`--start`): the first 20 characters of the task name the group, then a short title generated from the task replaces it (see "Create and start a task").
 - **Without a name** (just `/g`): the group starts with the placeholder "New session MM/DD HH:mm". After your first substantive message in it, the bot summarizes a title of up to 20 characters and renames the group.
 - **Avatar**: by default, the botmux logo on a gradient background (one of ten palettes, fixed per group). Add `--avatar name` for a text avatar showing the group name, or `--avatar off` to keep Lark's default.
 
@@ -81,6 +82,8 @@ Names are case-insensitive. Unknown or duplicate names fail before the group is 
 | `--tag <name>` | Put the new group into a message group in your Lark sidebar (up to 60 characters) |
 | `--no-tag` | Ignore the default tag |
 | `--avatar logo\|name\|off` | Avatar: gradient logo (default) / group-name text / Lark default |
+| `--start` | Treat the text as a task this time: create the group and start on it there; see "Create and start a task" below |
+| `--no-start` | Only create the group this time (overrides a bot's `"autoStart": true`) |
 | `--role-profile <id>` | Apply a [role profile](/en/roles) to the bots in the group after creation |
 | `--` | End of options: everything after it is part of the group name, handy when the name itself contains text like `--tag` |
 
@@ -97,6 +100,31 @@ Notes:
 - Unknown `--xxx` words are not errors; they stay in the group name as-is.
 - `--tag` is a **message group in your personal sidebar**, not a tenant-wide chat tag. The first time, authorize it: send `/login tags` in a chat with that bot and confirm the link. Without authorization the group is still created and the reply tells you what is missing.
 - Failures to invite bots, set the tag or set the avatar are reported separately in the reply; the created group is kept.
+
+### Create and start a task
+
+With `--start`, the text after `/g` is the **task** (multi-line is fine):
+
+```bash
+/g --start Investigate the wrong cart price, start from the last release
+@Claude @Codex /g --start Add tracking to the checkout page
+```
+
+You can also quote a message and send just `/g --start`; the quoted message is the task.
+
+To make a bot's `/g` start tasks by default, set `"autoStart": true` for it (next section) and you no longer need `--start`; add `--no-start` when you only want a group.
+
+Options (`--start`, `--tag`, …) are read from the first line only; later lines are kept verbatim as the task. If the first line of the task itself contains words like `--tag`, put `--` before the task, e.g. `/g --start -- npm publish --tag canary`.
+
+After the group is created:
+
+- The group is first named after the first 20 characters of the task, then renamed to a short title the bot's own CLI generates from the task (kept as is when the CLI has no one-shot mode or the bot is sandboxed);
+- The quoted message, and the command message if it has attachments, are forwarded into the new group;
+- The creating bot opens a **fresh session** in the new group and starts right away. Its first turn is your words plus where they came from (source chat, message, thread, quote) — no context from the old session; the bot reads the originals itself;
+- Local bots in the group may @ each other without approval (talk-only grants) so they can split the work;
+- You get a reply where you sent the command: the group link plus notes on anything that failed (start, forward, grants). A failure after the group exists never removes the group.
+
+The lead-in of that first turn can be edited on the Dashboard **Customization** page under "Session start → /g task group".
 
 ### Apply a role profile
 
@@ -117,7 +145,8 @@ If your team always uses the same set of bots and the same tag, give the bot def
   "groupCreation": {
     "agents": ["cli_review_app", "cli_build_app"],
     "tag": "Projects",
-    "avatar": "name"
+    "avatar": "name",
+    "autoStart": true
   }
 }
 ```
@@ -127,6 +156,7 @@ You can also send `/botconfig set groupCreation <JSON>` in Lark, and `/botconfig
 - Options in the command override the defaults.
 - With a default list, @-mentioning just one of those bots with `/g` still brings in the whole team (deduplicated).
 - `--no-agents`, `--no-tag` and `--avatar off` only drop defaults; they never remove bots you explicitly @-mentioned.
+- `autoStart` defaults to `false`: the text after `/g` is only the group name; with `true` it is a task the bot starts on (`--no-start` turns that off for one command).
 - Without `groupCreation` and without options, only the current bot and the bots you @-mentioned join.
 
 ### Add missing bots to an existing group
