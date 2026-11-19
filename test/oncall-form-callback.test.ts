@@ -377,7 +377,7 @@ describe('topic classification card and group handoff', () => {
     const result = await handleOncallFormAction(event('oncall_group_form_submit', selected), 'app');
     expect(result.toast.type).toBe('warning'); expect(mocks.forward).not.toHaveBeenCalled();
     await result.afterAck();
-    expect(mocks.withdraw).toHaveBeenCalledWith('app', d.messageId);
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', d.messageId, expect.objectContaining({ acceptWithdrawn: true }));
     expect(mocks.update.mock.calls.every(call => call[1] !== d.messageId)).toBe(true);
     const store = new OncallGroupStore(dir); expect(store.getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_created', handoffError: 'waiting_for_bot' });
     expect(store.pendingHandoffs('app')).toHaveLength(1);
@@ -387,11 +387,10 @@ describe('topic classification card and group handoff', () => {
     const creates = fetcher.mock.calls.filter(call => call[0].endsWith('/chat/'));
     expect(creates).toHaveLength(1); expect(JSON.parse(creates[0][1].body)).toMatchObject({ type_id: 34, region: 'cn', priority: 'P2' });
     expect(mocks.update.mock.calls.some(call => call[1] === 'om_reply' && call[2].includes('link_token=invite-oc_created'))).toBe(true);
-    // A late callback only retries retirement, never creates another group.
+    // A late callback leaves an already-retired form alone.
     const closed = await handleOncallFormAction(event('oncall_group_form_submit', selected), 'app');
-    mocks.withdraw.mockResolvedValueOnce(false);
-    await expect(closed.afterAck()).rejects.toThrow();
     await closed.afterAck();
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(call => call[0].endsWith('/chat/'))).toHaveLength(1);
   });
 });

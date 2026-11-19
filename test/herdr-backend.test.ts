@@ -37,6 +37,7 @@ import {
   HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, PANE_AGENT_START_ATTEMPTS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes,
 } from '../src/adapters/backend/herdr-backend.js';
 import { logger } from '../src/utils/logger.js';
+import { scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -2588,6 +2589,46 @@ describe('HerdrBackend callbacks', () => {
 
 
 describe('HERDR CLI process identity', () => {
+  function startWrapperRetry(be: HerdrBackend, deps: {
+    findRealPid: (launcherPid: number) => number | null;
+    applyRealPid: (realPid: number) => unknown;
+    baseline?: { launcherPid: number; stablePanePid: number | null };
+    intervalMs?: number;
+    maxAttempts?: number;
+    maxElapsedMs?: number;
+  }) {
+    const baseline = deps.baseline ?? { launcherPid: 100, stablePanePid: be.getStablePanePid() };
+    expect(baseline.stablePanePid).toBe(100);
+    let now = 0;
+    const queue: Array<{ fn: () => void; at: number }> = [];
+    scheduleWrapperRealCliPid(baseline.launcherPid, {
+      findRealPid: deps.findRealPid,
+      getBackend: () => be,
+      getChildPid: () => be.getStablePanePid() === baseline.stablePanePid ? baseline.launcherPid : null,
+      applyRealPid: deps.applyRealPid,
+      schedule: (fn, ms) => { queue.push({ fn, at: now + ms }); },
+      intervalMs: deps.intervalMs,
+      maxAttempts: deps.maxAttempts,
+      maxElapsedMs: deps.maxElapsedMs,
+      now: () => now,
+    });
+    return {
+      runAll(maxTicks = 100) {
+        let ticks = 0;
+        while (queue.length > 0) {
+          if (++ticks > maxTicks) throw new Error('wrapper retry did not become quiescent');
+          queue.sort((a, b) => a.at - b.at);
+          const next = queue.shift()!;
+          now = next.at;
+          next.fn();
+        }
+      },
+      advance(ms: number) { now += ms; },
+      elapsed: () => now,
+      pending: () => queue.length,
+    };
+  }
+
   it.each(['claude', 'codex'])('resolves %s in an existing pane and retries missing/ambiguous results', cli => {
     let processes: any[] = [];
     setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
@@ -2602,6 +2643,237 @@ describe('HERDR CLI process identity', () => {
     expect(be.getChildPid()).toBe(21);
     expect(herdrCall('process-info')).toEqual(['--session', SESSION, 'pane', 'process-info', '--pane', 'exact-pane']);
     be.kill();
+  });
+  it('re-reads foreground launch identity independently of cliPid rewrites', () => {
+    let processes: any[] = [];
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: processes } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    expect(be.getChildPid()).toBeNull();
+    processes = [{ pid: 21, argv: ['/bin/claude'] }];
+    expect(be.getChildPid()).toBe(21);
+    expect(be.getStablePanePid()).toBe(21);
+    be.cliPid = 22;
+    processes = [{ pid: 30, argv: ['/bin/claude'] }];
+    expect(be.getChildPid()).toBe(22);
+    expect(be.getStablePanePid()).toBe(30);
+    processes = [];
+    expect(be.getStablePanePid()).toBeNull();
+    processes = [{ pid: 30, argv: ['/bin/claude'] }];
+    expect(be.getStablePanePid()).toBe(30);
+    be.kill();
+  });
+
+  it('keeps wrapper retries alive through one post-baseline process-info failure and resumes after recovery', () => {
+    let failNextProbe = false;
+    let probeDown = false;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (failNextProbe) {
+        failNextProbe = false;
+        probeDown = true;
+        throw new Error('temporary process-info failure');
+      }
+      probeDown = false;
+      return JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 100, argv0: 'claude' }] } },
+      });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    const publications: number[] = [];
+    const discoveriesWhileProbeUp: boolean[] = [];
+    let firstPublication = true;
+    const retry = startWrapperRetry(be, {
+      findRealPid: () => {
+        discoveriesWhileProbeUp.push(!probeDown);
+        return probeDown ? null : 200;
+      },
+      applyRealPid: (pid) => {
+        publications.push(pid);
+        if (firstPublication) {
+          firstPublication = false;
+          failNextProbe = true;
+          return false;
+        }
+        return true;
+      },
+    });
+
+    retry.runAll();
+
+    expect(discoveriesWhileProbeUp).toEqual([true, false, true]);
+    expect(publications).toEqual([200, 200]);
+    expect(retry.pending()).toBe(0);
+    expect(be.getStablePanePid()).toBe(100);
+    be.kill();
+  });
+
+  it('seeds the frozen identity from getChildPid before baseline capture and three down ticks', () => {
+    let probes = 0;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      probes++;
+      // Probe 1 is the production getChildPid() success. Probe 2 is the stable
+      // baseline capture; probes 3-5 are three consecutive down retry ticks.
+      if (probes >= 2 && probes <= 5) throw new Error('temporary process-info outage');
+      return JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 100, argv0: 'claude' }] } },
+      });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    const launcherPid = be.getChildPid();
+    expect(launcherPid).toBe(100);
+    const stablePanePid = be.getStablePanePid() ?? launcherPid;
+    expect(stablePanePid).toBe(100);
+    let discoveries = 0;
+    const publications: number[] = [];
+    const retry = startWrapperRetry(be, {
+      baseline: { launcherPid: launcherPid!, stablePanePid },
+      maxElapsedMs: 6_000,
+      findRealPid: () => { discoveries++; return probes >= 6 ? 200 : null; },
+      applyRealPid: (pid) => { publications.push(pid); return true; },
+    });
+
+    retry.runAll();
+
+    expect(probes).toBe(6);
+    expect(discoveries).toBe(4);
+    expect(publications).toEqual([200]);
+    expect(retry.pending()).toBe(0);
+    be.kill();
+  });
+
+  it('keeps sustained process-info failures inside the scheduler budget without leaving a retry behind', () => {
+    let probeDown = false;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (probeDown) throw new Error('process-info unavailable');
+      return JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 100, argv0: 'claude' }] } },
+      });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    let discoveries = 0;
+    const publications: number[] = [];
+    const maxAttempts = 3;
+    const retry = startWrapperRetry(be, {
+      findRealPid: () => { discoveries++; return null; },
+      applyRealPid: (pid) => { publications.push(pid); },
+      maxAttempts,
+    });
+    probeDown = true;
+
+    retry.runAll();
+
+    expect(discoveries).toBe(maxAttempts);
+    expect(publications).toEqual([]);
+    expect(retry.pending()).toBe(0);
+    be.kill();
+  });
+
+  it('counts synchronous process-info timeouts toward the opt-in wall-clock budget', () => {
+    const intervalMs = 200;
+    const probeTimeoutMs = 5_000;
+    const maxElapsedMs = 6_000;
+    const maxAttempts = 30;
+    let probeDown = false;
+    let downProbes = 0;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (probeDown) {
+        downProbes++;
+        retry.advance(probeTimeoutMs);
+        throw new Error('simulated process-info timeout');
+      }
+      return JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 100, argv0: 'claude' }] } },
+      });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    let discoveries = 0;
+    const publications: number[] = [];
+    const retry = startWrapperRetry(be, {
+      findRealPid: () => { discoveries++; return null; },
+      applyRealPid: (pid) => { publications.push(pid); },
+      intervalMs,
+      maxAttempts,
+      maxElapsedMs,
+    });
+    probeDown = true;
+
+    retry.runAll();
+
+    // The first down tick finishes inside the budget; the second starts inside
+    // it but returns past the deadline, so no discovery or third tick follows.
+    expect(downProbes).toBe(2);
+    expect(discoveries).toBe(1);
+    expect(retry.elapsed()).toBe(2 * intervalMs + 2 * probeTimeoutMs);
+    expect(publications).toEqual([]);
+    expect(retry.pending()).toBe(0);
+    be.kill();
+  });
+
+  it('stops wrapper retries when an answered probe reports a replacement foreground CLI', () => {
+    let foregroundPid = 100;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: foregroundPid, argv0: 'claude' }] } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    const publications: number[] = [];
+    const retry = startWrapperRetry(be, {
+      findRealPid: () => 200,
+      applyRealPid: (pid) => {
+        publications.push(pid);
+        foregroundPid = 300;
+        return false;
+      },
+    });
+
+    retry.runAll();
+
+    expect(publications).toEqual([200]);
+    expect(retry.pending()).toBe(0);
+    expect(be.getStablePanePid()).toBe(300);
+    be.kill();
+  });
+
+  it('clears the frozen identity when an answered probe has no unique foreground CLI', () => {
+    let processes: any[] = [{ pid: 100, argv0: 'claude' }];
+    let probeDown = false;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (probeDown) throw new Error('process-info unavailable');
+      return JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: processes } } });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    expect(be.getStablePanePid()).toBe(100);
+
+    processes = [];
+    expect(be.getStablePanePid()).toBeNull();
+    probeDown = true;
+    expect(be.getStablePanePid()).toBeNull();
+    be.kill();
+  });
+
+  it('returns null for the authoritative exited state even while process-info is unavailable', () => {
+    let probeDown = false;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (probeDown) throw new Error('process-info unavailable');
+      return JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 100, argv0: 'claude' }] } },
+      });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    expect(be.getStablePanePid()).toBe(100);
+    probeDown = true;
+    expect(be.getStablePanePid()).toBe(100);
+
+    be.kill();
+    expect(be.getStablePanePid()).toBeNull();
   });
 });
 

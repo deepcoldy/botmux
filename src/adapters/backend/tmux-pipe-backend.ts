@@ -1663,6 +1663,10 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   getChildPid(): number | null {
+    return this.getStablePanePid();
+  }
+
+  getStablePanePid(): number | null {
     try {
       const out = execSync(
         `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{pane_pid}'`,

@@ -364,9 +364,10 @@ export async function applyPerBotEnvChange(
     const prevLayer = botEnvLayer(entry);
     const prev = sanitizePerBotEnv(entry.env);
     const next = nextPerBotEnv({ prev, ...change });
-    // Same pane-argv budget as the session-env editor: the whole bot layer
-    // (`env` set + `envUnset` removals) must fit a tmux pane start command.
-    // Shrinking stays allowed, so an already-oversized layer stays fixable.
+    // Same retained layer budget as the session-env editor; the legacy
+    // /botconfig path shares the same helper. Private pane-launch files removed
+    // the old deterministic tmux start-command failure, but shrinking stays
+    // allowed so an already-oversized layer stays fixable.
     if (!envLayerWithinBudget(prevLayer, botEnvLayer({ env: next ?? undefined, envUnset: entry.envUnset }))) {
       return { write: false, result: 'layer_too_large' };
     }
@@ -731,10 +732,10 @@ async function applyConfigFieldInternal(
     if (spec.configKey === 'cliId' && !isCodexServiceTierCliId(nextCliId)) {
       delete entry.serviceTier;
     }
-    // The pane-argv budget applies to the legacy /botconfig env / envUnset
-    // writes too — an oversized layer makes every new tmux session of this bot
-    // fail deterministically ("command too long"). Shrinking (including clear)
-    // stays allowed so an already-oversized layer can always be cleaned up.
+    // Legacy /botconfig env / envUnset writes share the retained layer budget.
+    // Private pane-launch files removed the old deterministic tmux failure, but
+    // keep shrinking (including clear) allowed so an already-oversized legacy
+    // layer can always be cleaned up.
     if (prevEnvLayer && !envLayerWithinBudget(prevEnvLayer, botEnvLayer(entry))) {
       return { write: false, result: 'layer_too_large' };
     }

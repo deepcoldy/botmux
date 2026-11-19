@@ -175,8 +175,7 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
-import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
-import { resolveImportedTopicHandoff } from './services/imported-topic-handoff.js';
+import { peerAnswersTopicWithoutMention, resolveGroupMentionMode, resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -289,7 +288,25 @@ import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, PrincipalLaneQueuedTurn, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
-import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
+import { refreshTmuxVersion, scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
+import { detectPlatform } from './setup/detect-platform.js';
+import {
+  defaultTmuxUpgradeProbe,
+  executeTmuxUpgrade,
+  planTmuxUpgrade,
+  readDebianCodename,
+  spawnUpgradeCommand,
+} from './setup/tmux-upgrade-plan.js';
+import {
+  fanOutTmuxSwitchSuspend,
+  killTmuxServer,
+  probeTmuxFacts,
+  retireEmptyTmuxServer,
+  startTmuxUpgradeMonitor,
+} from './core/tmux-upgrade.js';
+import { preferredManagedTmuxSocket } from './adapters/backend/tmux-socket.js';
+import { isBotAdmin } from './im/lark/grant-owner.js';
+import { readProcessStartIdentity } from './utils/process-identity.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { missingCliExecutableAfterRetry } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
@@ -601,6 +618,12 @@ import {
   evaluateProjectDispatchPolicy,
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
+import {
+  findLiveMentionlessSubtopicOwner,
+  resolveManagedSubtopicMentionlessHandoff,
+  type ConfiguredBotIdentity,
+  type ResolveSubtopicHandoffDeps,
+} from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
@@ -4212,9 +4235,85 @@ function scheduleDeferredScheduleSettlement(
   });
 }
 
+function doesBotAnswerTopicWithoutMention(targetAppId: string, chatId: string, observerAppId?: string): boolean | 'unknown' {
+  if (observerAppId && targetAppId === observerAppId) {
+    try {
+      getBot(targetAppId);
+      return resolveGroupMentionMode(targetAppId, chatId) !== 'always';
+    } catch {
+      /* fall through to peer config lookup */
+    }
+  }
+  let cfg: BotConfig | undefined;
+  try {
+    cfg = getBot(targetAppId).config;
+  } catch {
+    try {
+      cfg = loadBotConfigsCached().find(b => b.larkAppId === targetAppId);
+    } catch {
+      cfg = undefined;
+    }
+  }
+  return peerAnswersTopicWithoutMention(cfg, chatId);
+}
+
+function subtopicHandoffDeps(): ResolveSubtopicHandoffDeps {
+  return {
+    dataDir: config.session.dataDir,
+    getLiveThreadSessionsAtRoot: (rootId, chatId) => {
+      const out: Session[] = [];
+      for (const ds of activeSessions.values()) {
+        if (ds.session.status === 'active'
+            && ds.chatId === chatId
+            && (ds.scope ?? ds.session.scope) === 'thread'
+            && ds.session.rootMessageId === rootId
+            && !!ds.larkAppId) {
+          out.push(ds.session.larkAppId ? ds.session : { ...ds.session, larkAppId: ds.larkAppId });
+        }
+      }
+      return out;
+    },
+    findActiveSessionsByRoot: rootId => sessionStore.findActiveSessionsByRoot(rootId),
+    findActiveChatScopeSessionsByChat: chatId => sessionStore.findActiveChatScopeSessionsByChat(chatId),
+    readSessionsByRoots: roots => sessionStore.readSessionsByRoots(roots, { dataDir: config.session.dataDir }),
+    doesBotAnswerTopicWithoutMention: (targetAppId, chatId, observerAppId) =>
+      doesBotAnswerTopicWithoutMention(targetAppId, chatId, observerAppId),
+    getConfiguredBots: () => {
+      const out: ConfiguredBotIdentity[] = [];
+      const seen = new Set<string>();
+      for (const b of getAllBots()) {
+        seen.add(b.config.larkAppId);
+        out.push({
+          larkAppId: b.config.larkAppId,
+          cliId: b.config.cliId,
+          botName: b.botName,
+          botOpenId: b.botOpenId,
+        });
+      }
+      try {
+        for (const c of loadBotConfigsCached()) {
+          if (seen.has(c.larkAppId)) continue;
+          seen.add(c.larkAppId);
+          out.push({ larkAppId: c.larkAppId, cliId: c.cliId });
+        }
+      } catch {
+        /* ignore unconfigured bots.json in tests */
+      }
+      return out;
+    },
+  };
+}
+
 function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
   // A real thread-scope session at this root wins over any historical alias.
   if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
+  // When another bot's live thread-scope session in a managed subtopic (imported,
+  // dispatch, or project workstream) has免@ enabled (`topic` / `ambient` / `never`),
+  // it owns un-@ replies inside its topic even if a coordinator previously answered
+  // an explicit `@coordinator` message inside the same topic.
+  if (findLiveMentionlessSubtopicOwner(subtopicHandoffDeps(), rootId, chatId, larkAppId)) {
+    return null;
+  }
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
     const deferredRoot = reconcileDeferredTopicBinding(ds);
@@ -35398,20 +35497,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
-      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => resolveImportedTopicHandoff({
-        rootId,
-        chatId,
-        larkAppId: appId,
-        // One cross-bot lookup (this bot's own sessions are excluded inside).
-        sessionsAtRoot: sessionStore.findActiveSessionsByRoot(rootId),
-        chatScopeSessions: () => sessionStore.findActiveChatScopeSessionsByChat(chatId),
-        // One bot per daemon: a peer is not registered here, read bots.json.
-        peerConfig: peerAppId => {
-          try { return getBot(peerAppId).config; } catch { /* not this daemon's bot */ }
-          return loadBotConfigsCached().find(b => b.larkAppId === peerAppId);
-        },
-        groupMode: () => readGroupCollaborationMode(config.session.dataDir, chatId),
-      }),
+      resolveSubtopicMentionlessHandoff: (rootId, chatId, appId) =>
+        resolveManagedSubtopicMentionlessHandoff(subtopicHandoffDeps(), rootId, chatId, appId),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,
@@ -36901,6 +36988,49 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       targets: configuredCodexUpdateTargets,
       sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
       log: (m) => logger.info(`[cli-update] ${m}`),
+    });
+    // tmux below TMUX_RECOMMENDED_MIN → owner DM with one-click upgrade and an
+    // owner-chosen server switch. Host-wide like the Codex monitor above.
+    startTmuxUpgradeMonitor({
+      dataDir: config.session.dataDir,
+      larkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      isAdmin: (appId, openId) => isBotAdmin(appId, openId),
+      locale: () => localeForBot(cfg.larkAppId),
+      now: () => Date.now(),
+      tmuxBackendInUse: () => loadBotConfigs().some(b => (b.backendType ?? config.daemon.backendType) === 'tmux'),
+      socketName: () => preferredManagedTmuxSocket(),
+      probeFacts: probeTmuxFacts,
+      plan: (locale) => planTmuxUpgrade(defaultTmuxUpgradeProbe(detectPlatform()), {
+        locale,
+        debianCodename: readDebianCodename(() => readFileSync('/etc/os-release', 'utf8')),
+      }),
+      executeUpgrade: (plan, onLine, onSpawn) => {
+        const platform = detectPlatform();
+        return executeTmuxUpgrade(plan, {
+          platform,
+          run: spawnUpgradeCommand,
+          onLine,
+          onSpawn,
+          aptCandidates: () => defaultTmuxUpgradeProbe(platform).packageCandidates('apt'),
+        });
+      },
+      onBinaryChanged: () => { refreshTmuxVersion(); },
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive'),
+      updateCard: (messageId, card) => updateMessage(cfg.larkAppId, messageId, card),
+      isUpdateExpired: error => error instanceof MessageUpdateExpiredError
+        || error instanceof MessageWithdrawnError
+        || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+      fanOutSuspend: fanOutTmuxSwitchSuspend,
+      killServer: killTmuxServer,
+      retireEmptyServer: retireEmptyTmuxServer,
+      sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+      processStart: readProcessStartIdentity,
+      signalInstaller: (pid, signal) => {
+        try { process.kill(-pid, signal); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      },
+      log: (m) => logger.info(`[tmux-upgrade] ${m}`),
     });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.

@@ -1089,6 +1089,18 @@ export class ZmxBackend implements SessionBackend {
     return pid;
   }
 
+  getStablePanePid(): number | null {
+    // Read the current PTY root independently of cliPid so a same-name session
+    // replacement fails the wrapper retry fence even before history/tail
+    // observers deliver their exit callback.
+    if (!this.lastOpts) return this.backingPid;
+    return zmxStablePanePidFromProbe(
+      ZmxBackend.probeSessions(this.controlEnv(this.lastOpts)),
+      this.sessionName,
+      this.backingPid,
+    );
+  }
+
   /** Best-effort plain-text terminal snapshot supplied by ZMX history. */
   captureCurrentScreen(): string {
     return this.hasSnapshot ? this.snapshotCache : '';
@@ -2675,6 +2687,18 @@ function sessionDetailsFromSnapshot(
     clients: row.clients ?? null,
     command: row.command ?? null,
   };
+}
+
+export function zmxStablePanePidFromProbe(
+  probe: ZmxSessionProbeResult | { ok: false },
+  sessionName: string,
+  lastKnownBackingPid: number | null,
+): number | null {
+  // A transport/control-plane failure is not evidence that the pane changed.
+  // Preserve the frozen identity in that case; only an answered session list
+  // may clear it or replace it with a new PTY root.
+  if (!probe.ok) return lastKnownBackingPid;
+  return sessionDetailsFromSnapshot(probe, sessionName)?.pid ?? null;
 }
 
 export function findSessionPid(sessionName: string): number | null {

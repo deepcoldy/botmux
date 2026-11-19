@@ -181,9 +181,10 @@ export class OncallGroupStore {
         return Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000;
       }
       return request?.status === 'succeeded'
-        && (((!request.inviteLink || request.cardRefreshPending) && !!request.openChatId)
+        && (request.formClosePending
+          || ((!request.inviteLink || request.cardRefreshPending) && !!request.openChatId)
           || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
-            && (!!request.formClosePending || !!request.cardRefreshPending || oncallForwardingPending(request))));
+            && (!!request.cardRefreshPending || oncallForwardingPending(request))));
     }).map(([, source]) => source);
   }
 

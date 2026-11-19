@@ -58,4 +58,13 @@ describe('PtyBackend launchShell boundary', () => {
     });
     expect(JSON.stringify(call)).not.toMatch(/fish/i);
   });
+  it('keeps the spawned process as stable pane identity after cliPid refinement', () => {
+    const backend = new PtyBackend();
+    backend.spawn('/bin/sh', ['-c', 'true'], {
+      cwd: '/tmp', cols: 80, rows: 24, env: {},
+    });
+    backend.cliPid = 999;
+    expect(backend.getChildPid()).toBe(1);
+    expect(backend.getStablePanePid()).toBe(1);
+  });
 });

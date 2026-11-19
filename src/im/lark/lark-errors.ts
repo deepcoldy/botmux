@@ -32,6 +32,10 @@ export const LARK_CODE_CONTACT_NOT_VISIBLE = 41050;
 export const LARK_CODE_MESSAGE_INTERNAL_ERROR = 2200;
 /** 目标消息已撤回。 */
 export const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+/** 目标消息已删除。 */
+export const LARK_CODE_MESSAGE_DELETED = 230110;
+/** 超出租户设置的消息撤回时限。 */
+export const LARK_CODE_MESSAGE_RECALL_EXPIRED = 230009;
 /** 消息超出可编辑时限（仍存在，只是不能再 PATCH）。 */
 export const LARK_CODE_MESSAGE_UPDATE_EXPIRED = 230031;
 /** 消息或群开启了转发限制，原样重试无法解除。 */
@@ -47,6 +51,8 @@ export const LARK_CODE_CARD_CONTENT_REJECTED = 230099;
 export const LARK_CODE_MESSAGE_CONTENT_TOO_LONG = 230025;
 /** ephemeral/v1/send 的目标是话题群 / thread 会话（临时卡片只支持普通 group）。 */
 export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
+/** ephemeral/v1/delete 的目标临时卡片已删除。 */
+export const LARK_CODE_EPHEMERAL_DELETED = 18051;
 
 // ─── Contact API 确定性失败分类 ──────────────────────────────────────────────
 
