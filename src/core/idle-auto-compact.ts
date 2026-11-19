@@ -350,7 +350,6 @@ export function noteIdleAutoCompactScreenStatus(
   // A stale marker (or one a different turn already ended) is just dropped.
   if (setting!.inFlight) { delete setting!.inFlight; changed = true; }
   const warm = ds.idleAutoCompactWarmSince;
-  if (setting!.retry && setting!.retry.stretch !== warm) { delete setting!.retry; changed = true; }
   if (warm !== setting!.idleSince) {
     if (warm === undefined) delete setting!.idleSince;
     else setting!.idleSince = warm;
