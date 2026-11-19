@@ -7,6 +7,7 @@ import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
+import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
@@ -23,6 +24,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'hasConfirmedNativeGrokEffort') return hasConfirmedNativeGrokEffort;
   if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
   if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
+  if (key === 'cliModelMayKeepReasoningEffort') return cliModelMayKeepReasoningEffort;
   if (key === 'config') return { terminalEffortWriteback: false };
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();

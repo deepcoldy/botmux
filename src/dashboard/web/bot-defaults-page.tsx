@@ -35,6 +35,7 @@ import {
   fetchGlobalPromptCache,
   fetchGlobalProviderRecovery,
   fetchDetectedModels,
+  liveCodexReasoningEfforts,
   fetchDshProfiles,
   createDshProfile,
   fmtSince,
@@ -3022,6 +3023,10 @@ export function BotAgentSection(props: {
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
   const [detectedModels, setDetectedModels] = useState<Awaited<ReturnType<typeof fetchDetectedModels>>>(null);
   const [detectingModels, setDetectingModels] = useState(false);
+  // True once the probe for the current CLI/bot row has answered (or failed).
+  // Unlike detectingModels it starts false, so effects that run in the same
+  // commit as the probe's start still see "not answered yet".
+  const [modelCatalogSettled, setModelCatalogSettled] = useState(false);
   useEffect(() => {
     const current = autoDraftRef.current;
     let settings = current.modelSettings;
@@ -3037,16 +3042,22 @@ export function BotAgentSection(props: {
     if (option?.gateway === 'ttadk') {
       setDetectedModels(null);
       setDetectingModels(false);
+      setModelCatalogSettled(true);
       return;
     }
     // stale 标志防卸载/竞态：cliKey 快速切换时旧响应不得覆盖新 CLI 的候选。
     let stale = false;
     setDetectedModels(null);
     setDetectingModels(true);
+    setModelCatalogSettled(false);
     const cancel = afterNextPaint(() => {
       void fetchDetectedModels(cliKey, bot.larkAppId)
         .then(result => { if (!stale) setDetectedModels(result); })
-        .finally(() => { if (!stale) setDetectingModels(false); });
+        .finally(() => {
+          if (stale) return;
+          setDetectingModels(false);
+          setModelCatalogSettled(true);
+        });
     });
     return () => { stale = true; cancel(); };
     // Runtime/path/env-policy/env edits save into the bot row first. A new row
@@ -3515,13 +3526,28 @@ export function BotAgentSection(props: {
   const reasoningEffortOptions = useMemo(
     () => {
       const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;
+      // Codex: the bot runtime's live catalogue (the same judgment the save
+      // and the launch use). A Codex profile picks its own provider, which the
+      // bare catalogue cannot speak for — the static table applies, as on save.
       const live = isTraex
         ? capability?.contextVariants?.find(entry => entry.id === modelBackendVariant)?.reasoningEfforts ?? capability?.reasoningEfforts
-        : isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
-      return live?.filter(isCodexReasoningEffort)
+        : isCodexSelection && !codexProfile ? liveCodexReasoningEfforts(detectedModels?.reasoningEffortsByModel, model) : undefined;
+      const levels = live?.filter(isCodexReasoningEffort)
         ?? reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model);
+      // The bot's saved Codex pair already passed config load. Unless the live
+      // catalogue answered for this model, nothing here refutes it — keep it
+      // selectable instead of clearing it, or a failed/slow probe would erase
+      // the setting on the next save. The server keeps an unchanged pair too.
+      // A runtime or profile edit picks another catalogue: not the saved launch.
+      const savedEffort = isCodexSelection && !live && cliKey === initialKey && bot.reasoningEffort
+        && !runtimeTouched && !codexProfileTouched
+        && model.trim().toLowerCase() === (bot.model ?? '').trim().toLowerCase()
+        ? bot.reasoningEffort : undefined;
+      return savedEffort && !levels.includes(savedEffort)
+        ? CODEX_REASONING_EFFORTS.filter(effort => effort === savedEffort || levels.includes(effort))
+        : levels;
     },
-    [cliKey, detectedModels, isCodexSelection, isTraex, model, modelBackendVariant],
+    [bot.model, bot.reasoningEffort, cliKey, codexProfile, codexProfileTouched, detectedModels, initialKey, isCodexSelection, isTraex, model, modelBackendVariant, runtimeTouched],
   );
   const nativeReasoningEffortOptions = useMemo(
     () => nativeModelMode === 'custom'
@@ -3534,8 +3560,12 @@ export function BotAgentSection(props: {
     // Await positive per-model metadata before clearing a saved TraeX value.
     // A pending or missing live catalog is not evidence that a level is invalid.
     if (isTraex && !detectedModels?.modelCapabilities?.some(entry => entry.slug.toLowerCase() === model.toLowerCase())) return;
+    // Codex: judge the saved level only once the live catalogue has answered.
+    // The static table is the fallback for "no catalogue", not evidence while
+    // the probe is still in flight (it would clear a catalogue-only max/ultra).
+    if (isCodexSelection && !modelCatalogSettled) return;
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
-  }, [reasoningEffort, reasoningEffortOptions, isTraex, detectedModels, model]);
+  }, [reasoningEffort, reasoningEffortOptions, isTraex, isCodexSelection, modelCatalogSettled, detectedModels, model]);
   useEffect(() => {
     if (nativeModelMode !== 'custom') {
       if (nativePolicyErrors.model) setNativePolicyErrors(current => ({ ...current, model: null }));
@@ -4320,6 +4350,7 @@ function WorkingDirSection(props: {
         <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
       </div>
       </AgentManagedLock>
+      <OwnerGroupFollowControls bot={bot} patchBot={props.patchBot} />
       <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
     </section>
   );
@@ -4399,6 +4430,47 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
   const def = bot.defaultOncall ?? { enabled: false, workingDir: '' };
   const mode = def.enabled ? 'oncall' : (bot.defaultWorkingDir ? 'default' : 'off');
   return { mode, workingDir: bot.defaultWorkingDir || def.workingDir || '' };
+}
+
+export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot } = props;
+  const savedExcluded = (bot.ownerGroupFollow?.excludeChatIds ?? []).join('\n');
+  const [excluded, setExcluded] = useState(savedExcluded);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    setExcluded(savedExcluded);
+  }, [bot.larkAppId, savedExcluded]);
+  const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
+    request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
+    setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),
+    onSaved: body => props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null }),
+  });
+  return <div className="bd-subsection" data-owner-group-follow>
+    <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
+    <ToggleRow
+      checked={bot.ownerGroupFollow?.enabled === true}
+      disabled={busy}
+      dataAction="toggle-owner-group-follow"
+      title={tr('botDefaults.ownerGroupFollowEnabled')}
+      help={tr('botDefaults.ownerGroupFollowHelp')}
+      onChange={enabled => { void save({ ...bot.ownerGroupFollow, enabled }); }}
+    />
+    <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowAuth')}</p>
+    <div className="bd-row"><label>
+      <FieldTitle help={tr('botDefaults.ownerGroupFollowExcludedHelp')}>{tr('botDefaults.ownerGroupFollowExcluded')}</FieldTitle>
+      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={excluded} disabled={busy}
+        placeholder={'oc_xxx\noc_yyy'} onChange={event => setExcluded(event.currentTarget.value)} />
+    </label></div>
+    <div className="actions">
+      <button type="button" data-action="save-owner-group-follow-exclusions" disabled={busy}
+        onClick={() => { void save({ ...bot.ownerGroupFollow, excludeChatIds: excluded.split(/\s+/).filter(Boolean) }); }}>
+        {tr('botDefaults.save')}
+      </button>
+      <StatusSpan status={status} />
+    </div>
+  </div>;
 }
 
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {

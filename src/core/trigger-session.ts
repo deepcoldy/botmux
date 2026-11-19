@@ -42,7 +42,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { cliLaunchAcceptsReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
 
@@ -1845,9 +1845,12 @@ async function triggerSessionTurnAdmitted(
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
+  // The bot's own saved pair passed config load; judge it by the same keep-rule
+  // (a Codex level on a model the table does not know is the launch check's).
+  const inheritedPair = effectiveModel === bot.config.model && !req.options?.reasoningEffort;
   if (acceptsTaskOverride && effectiveReasoningEffort
       && bot.config.cliId !== 'traex'
-      && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
+      && !cliLaunchAcceptsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort, inheritedPair)) {
     return {
       ok: false,
       errorCode: 'bad_request',
