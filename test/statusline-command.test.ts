@@ -107,6 +107,40 @@ describe.skipIf(process.platform === 'win32')('statuslineHookCommand 实际执�
     await runHookCommand(env, JSON.stringify(changed));
     expect(JSON.parse(readFileSync(file, 'utf-8')).contextPercent).toBe(42);
   }, 30_000);
+
+  it('Antigravity statusLine payload 经同一 hook 命令落盘 quota 并透传原始 stdin 给 chain', async () => {
+    const dataDir = makeDir();
+    const env = baseEnv(dataDir, 'sess-agy');
+    env.BOTMUX_STATUSLINE_CHAIN = 'cat';
+    const resetIso = new Date(Date.now() + 3600_000).toISOString();
+    const agyPayload = {
+      product: 'antigravity',
+      version: '1.5.12',
+      session_id: 'agy-conv-1',
+      model: { id: 'Gemini 4 Neon (XHigh)', display_name: 'Gemini 4 Neon (XHigh)' },
+      context_window: { context_window_size: 1_048_576, used_percentage: 12 },
+      quota: {
+        'gemini-5h': { remaining_fraction: 0.75, reset_time: resetIso },
+        'gemini-weekly': { remaining_fraction: 0.9, reset_time: resetIso },
+        '3p-5h': { remaining_fraction: 0.1, reset_time: resetIso },
+      },
+    };
+    const raw = JSON.stringify(agyPayload);
+    const r = await runHookCommand(env, raw);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(raw);
+    const written = JSON.parse(readFileSync(statuslineFilePath(dataDir, 'sess-agy'), 'utf-8'));
+    expect(written).toMatchObject({
+      contextPercent: 12,
+      contextWindowTokens: 1_048_576,
+      fiveHourPercent: 25,
+      sevenDayPercent: 10,
+      fiveHourResetsAtMs: Date.parse(resetIso),
+      sevenDayResetsAtMs: Date.parse(resetIso),
+      model: 'Gemini 4 Neon (XHigh)',
+    });
+    expect(written.claudeSessionId).toBeUndefined();
+  }, 30_000);
 });
 
 describe('shouldSkipStatuslineWrite', () => {

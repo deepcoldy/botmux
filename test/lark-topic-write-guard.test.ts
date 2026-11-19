@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { GROUP_SEND_UUID_REUSE_MS, sendRequestBoundMessage } from '../src/services/request-bound-group-send.js';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -111,6 +115,30 @@ describe('stop policy at the actual Lark write boundary', () => {
     expect(beforeWrite).toHaveBeenCalledTimes(2);
     expect(mocks.hook).not.toHaveBeenCalled();
   });
+  it('preserves an unconfirmed reply when the root is withdrawn before the gate retries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topic-retry-'));
+    try {
+      let clock = Date.now();
+      mocks.reply.mockImplementationOnce(async () => {
+        rootDeleted = true;
+        throw Object.assign(new Error('lost reply receipt'), { isAxiosError: true });
+      });
+      const submit = () => sendRequestBoundMessage({
+        larkAppId: 'app', storePath: join(dir, 'posts.json'), now: () => clock,
+        send: (uuid, beforeWrite, onAttemptStart) =>
+          replyMessage('app', 'om_root', 'answer', 'text', true, uuid, undefined, { beforeWrite, onAttemptStart }),
+      }, { chatId: 'oc_chat', rootMessageId: 'om_root' }, 'topic_retry', 'answer');
+      expect(await submit()).toMatchObject({ error: 'outcome_unknown', retryable: false });
+      expect(mocks.request).toHaveBeenCalledTimes(2);
+      rootDeleted = false;
+      clock += GROUP_SEND_UUID_REUSE_MS + 1;
+      expect(await submit()).toMatchObject({ error: 'outcome_unknown', retryable: false });
+      expect(mocks.reply).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('checks authority after the awaited destination lookup before writing a reply', async () => {
     let authorized = true;
     mocks.request.mockImplementationOnce(async ({ url }) => {
