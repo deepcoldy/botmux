@@ -744,7 +744,9 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
       { at: new Date('2026-01-02T01:00:00Z'), usage: third },
     ]);
     reconcileUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-03T00:00:00Z') });
-    const rows = readdirSync(dir).filter(f => f.startsWith('usage-')).flatMap(f =>
+    // Ledger files are named by UTC date; read them in that order. Only Node
+    // lists a directory sorted — Bun hands back the filesystem's own order.
+    const rows = readdirSync(dir).filter(f => f.startsWith('usage-')).sort().flatMap(f =>
       readFileSync(join(dir, f), 'utf8').trim().split('\n').map(line => JSON.parse(line)));
     expect(rows.map(r => [r.ts, r.model, r.inputTokens])).toEqual([
       ['2026-01-01T10:00:00.000Z', 'model-a', 100],
