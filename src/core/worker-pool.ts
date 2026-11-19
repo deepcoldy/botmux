@@ -275,6 +275,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { assistantInitFields } from './assistant-mode.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
@@ -1075,8 +1076,10 @@ import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
 import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-outage-card.js';
 import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
-import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { isSessionGroup, touchSessionGroup, getSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
+import { getAssistantOwner } from '../services/assistant-owner-store.js';
+import { resolveAssistantOwnerOpenId } from './assistant-mode.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -19569,6 +19572,23 @@ function forkWorkerPrepared(
     reportAdmission('rejected');
     return true;
   }
+  // 个人助理模式：每次起 worker 都重新核对归属。会话没有 owner（daemon 之外的建会话路径、
+  // 开模式前的存量会话）、或归属表已变（管理员换了主人 / 主人退群）→ 拒绝 spawn。这是最后
+  // 一道闸：这里放过去，worker 就会拿共享 BOT_HOME 和默认 cwd 起来。
+  if (botCfg.assistantMode === true) {
+    const expected = resolveAssistantOwnerOpenId({
+      chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+      senderOpenId: ds.session.ownerOpenId,
+      sessionGroupOwnerOpenId: ds.session.chatType === 'p2p' ? undefined : getSessionGroup(ds.chatId)?.ownerOpenId,
+      stored: ds.session.chatType === 'p2p' ? undefined : getAssistantOwner(config.session.dataDir, ds.larkAppId, ds.chatId),
+    });
+    const have = ds.session.assistantOwnerOpenId;
+    if (!have || !expected || have !== expected) {
+      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${have ?? '(none)'} vs resolved ${expected ?? '(none)'}`);
+      reportAdmission('rejected');
+      return false;
+    }
+  }
   const admission = checkWorkerAdmission(readGlobalConfig().worker);
   for (const warning of admission.pressure.warnings) {
     if (hostPressureWarningsLogged.has(warning)) continue;
@@ -20351,6 +20371,10 @@ function forkWorkerPrepared(
     // Raw configured value; the worker normalizes + enforces the fail-closed
     // contract (services/cli-credential-source.ts).
     ...(botCfg.credentialsSourceDir ? { credentialsSourceDir: botCfg.credentialsSourceDir } : {}),
+    // 模板缺省 = bot 默认工作目录（同 effectiveDefaultWorkingDir；不从 bot-registry 引入，
+    // 大量单测对该模块做了白名单 mock）。
+    ...assistantInitFields(botCfg, ds.session.assistantOwnerOpenId,
+      botCfg.defaultWorkingDir || (botCfg.defaultOncall?.enabled ? botCfg.defaultOncall.workingDir : undefined)),
     cliInstanceBinding: ds.session.cliInstanceBinding,
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.

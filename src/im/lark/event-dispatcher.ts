@@ -68,6 +68,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
+import { tryHandleAssistantCommand } from './assistant-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
@@ -4359,6 +4360,8 @@ export interface EventHandlers {
    *  from it (`im.chat.member.bot.deleted_v1`). Runs after the event ACK, once
    *  per event id. Each bot's daemon receives its own copy. */
   handleChatGone?: (chatId: string, larkAppId: string, reason: 'disbanded' | 'bot_removed') => Promise<void>;
+  /** 群成员退出（im.chat.member.user.deleted_v1）。个人助理模式用它判断 owner 是否退群。 */
+  handleChatMemberUserDeleted?: (chatId: string, userOpenIds: string[], larkAppId: string) => Promise<void> | void;
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
@@ -5722,7 +5725,7 @@ export function createLarkEventDispatcherRuntime(
     if (!rawText) return false;
     const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
     if (/^\/introduce(?:\s|$)/i.test(text)) return true;
-    const match = /^\/(reply-mode|tabs?|mention-mode|secretary|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
+    const match = /^\/(reply-mode|tabs?|mention-mode|secretary|assistant|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
     if (!match) return false;
     const command = match[1]!.toLowerCase();
     if (message.chat_type !== 'p2p' && !isBotMentioned(larkAppId, message, senderOpenId)) {
@@ -6338,6 +6341,10 @@ export function createLarkEventDispatcherRuntime(
 
       if (await tryHandleSecretaryCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return commandConsumed();
+      }
+
+      if (await tryHandleAssistantCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
       }
 
       if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
@@ -7768,6 +7775,16 @@ export function createLarkEventDispatcherRuntime(
     'im.chat.member.user.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
       if (chatId) invalidateChatStats(larkAppId, chatId);
+      if (chatId && handlers.handleChatMemberUserDeleted) {
+        const users: unknown = data?.users;
+        const ids = (Array.isArray(users) ? users : [])
+          .map((u: any) => u?.user_id?.open_id)
+          .filter((v: unknown): v is string => typeof v === 'string' && v.length > 0);
+        if (ids.length) {
+          void Promise.resolve(handlers.handleChatMemberUserDeleted(chatId, ids, larkAppId))
+            .catch(err => logger.warn(`[event] handleChatMemberUserDeleted failed: ${String(err)}`));
+        }
+      }
     },
     // 文档评论入口（/watch-comment / /subscribe-lark-doc）。notice 事件主要覆盖 @Bot
     // 通知；普通评论由 daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。

@@ -2127,3 +2127,54 @@ describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
   });
 });
 
+
+// ─── 个人助理模式（assistantMode）：owner 的 USER_HOME 取代 BOT_HOME，附件按 owner 分桶 ───
+describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
+  const botmuxHome = '/Users/u/.botmux';
+  const sd = `${botmuxHome}/data`;
+  const botHome = `${botmuxHome}/bots/cli_self`;
+  const A = 'ou_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const B = 'ou_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const ownerCtx = (owner: string) => ctx({
+    botHome: `${botHome}/users/${owner}`,
+    workingDir: `${botHome}/users/${owner}/work`,
+    attachmentsBucket: `${sd}/attachments/cli_self/u/${owner}`,
+    // 助理模式不授角色库：worker 传 undefined（这里 ctx 默认就没有 roleLibrarySubtree）。
+  });
+
+  it("grants only the owner's USER_HOME; the real BOT_HOME and other owners stay denied", () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${botHome}/users/${A}/work/notes.md`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${botHome}/users/${A}/claude/projects/x/memory/MEMORY.md`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${botHome}/users/${B}/work/notes.md`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/users/${B}/claude/.credentials.json`).access).toBe('deny');
+    // bot 级 claude/（共享记忆、共享凭证副本）对助理会话不存在。
+    expect(accessForPath(p.rules, `${botHome}/claude/.credentials.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/claude/projects/shared/memory/MEMORY.md`).access).toBe('deny');
+  });
+
+  it('attachments: only the owner bucket is readWrite; the bot-wide bucket and other owners are denied', () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_1/a.png`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${B}/om_2/b.png`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/om_3/c.png`).access).toBe('deny');
+  });
+
+  it('without attachmentsBucket the whole per-bot bucket stays readWrite (non-assistant behaviour unchanged)', () => {
+    const p = buildFsPolicy(ctx());
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/om_3/c.png`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_1/a.png`).access).toBe('readWrite');
+  });
+
+  it("two owners' policies never grant each other's writable paths", () => {
+    const pa = buildFsPolicy(ownerCtx(A));
+    const pb = buildFsPolicy(ownerCtx(B));
+    const rwA = pa.rules.filter(r => r.access === 'readWrite').map(r => r.path);
+    const rwB = new Set(pb.rules.filter(r => r.access === 'readWrite').map(r => r.path));
+    const shared = rwA.filter(p => rwB.has(p) && !p.includes('/turn-send-ledger/'));
+    // 共享的只能是与 owner 无关的系统路径（工具链、tmp 等），绝不能含 users/<owner> 或 attachments/u/<owner>。
+    for (const p of shared) expect(p, p).not.toMatch(/\/users\/ou_|\/attachments\/cli_self\/u\//);
+    expect(rwA.some(p => p.includes(`/users/${A}`))).toBe(true);
+    expect(rwA.some(p => p.includes(`/users/${B}`))).toBe(false);
+  });
+});

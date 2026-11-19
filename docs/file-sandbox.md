@@ -488,6 +488,17 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
   - 已知边界：同机其它 Kimi 会话的记录在沙盒里也能读到，与 Antigravity 相同。
 - 所有 CLI（只限白名单隔离；scratch 与仅凭据隔离不设）：daemon 以 root 运行时，沙盒内设 `TAR_OPTIONS=--no-same-owner`。`--unshare-user` 只映射当前 uid，GNU tar 以 root 身份解包别人的归档时 chown 失败。Pi 每次启动都会重新下载 fd / rg，启动期间会吞掉送进来的第一条输入。
 
+## 个人助理模式（`assistantMode`）：按主人收窄的沙盒
+
+用户文档见 docs-site `assistant-mode.md`，设计见 `docs/design/2026-11-20-assistant-mode.md`。这里只记沙盒与凭证层的事实。
+
+- 只在 `sandbox: true`（oncall 白名单）下工作；`off` / `scratch` 一律拒绝 spawn（worker 侧 fail-closed，不退回共享目录）。worker-pool 每次 fork 前还会重新核对归属表：会话没有 owner、或归属已变（管理员换人 / 主人退群）→ 拒绝。
+- fs-policy 的 `botHome` 传的是主人的 `USER_HOME = <BOT_HOME>/users/<open_id>`，所以真 `BOT_HOME`（含 bot 级 `claude/` 与别人的 `users/*`）留在 botmux 根的 deny 里；`roleLibrarySubtree` 为空（不授角色库）；新增 ctx `attachmentsBucket`，把整 bot 的 `attachments/<appId>` readWrite 换成 `attachments/<appId>/u/<open_id>`。`session-stores/<appId>` 仍只读（`botmux send` 路由要读 sessions.db）——沙盒能看到别的会话的元数据，看不到内容。
+- CLI 数据目录（`CLAUDE_CONFIG_DIR`）= `<USER_HOME>/claude`。凭证副本经 `stripRefreshToken()`：`claudeAiOauth.refreshToken` 替换成 `botmux-assistant-mode-no-refresh`。会话只拿 AT 干活；AT 过期时它自己刷新失败、只伤自己这份副本，永远碰不到共享账号的 RT。**中央刷新分发脚本要把 glob 扩到 `bots/*/users/*/claude/.credentials.json`**（本机是 `~/.cred-keeper/hooks/on-refreshed-default.sh`），否则主人副本在 AT 到期后全部失效。
+- `assistantTemplateDir`（缺省 = bot 默认工作目录）在每次 spawn 前覆盖同步进 `work/`：模板有的覆盖、模板没有的保留、符号链接跳过；模板目录不存在 → 拒绝 spawn。
+- 宿主侧闸：`lark-tool-identity` IPC 的 `mode=bot` 对带 `assistantOwnerOpenId` 的会话回 403（除非 bot 配 `assistantLarkBotIdentity: true`）；角色切换 IPC 回 403；`/cd` `/repo` 回「目录固定」；`botmux history --session-id` / `quoted` 只接受同一主人的会话、`quoted` 只接受本群消息；`botmux list` 只列同一主人。
+- 归属表：`<dataDir>/assistant-owners/<appId>.json`（0600），记录 `chatId → {openId, since, how, left?}`；`how ∈ p2p|session-group|bot-added|claimed|admin`。私聊和 `/group` 会话群不查表。
+
 ## 后续
 
 - 沙盒目录 GC / 生命周期

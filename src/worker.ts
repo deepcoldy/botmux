@@ -160,6 +160,7 @@ import { hostAuthorityPaths } from './services/project-authority-paths.js';
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { assistantAttachmentsBucket, assistantUserHome, assistantWorkDir, isValidAssistantOpenId, stripRefreshToken, syncAssistantTemplate } from './core/assistant-mode.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
@@ -3078,6 +3079,8 @@ function provisionIsolatedBotHome(
    *  env, its login and its `.claude.json` seed the per-bot dir, so a sandboxed
    *  bot runs the same profile an unsandboxed one would — never the global one. */
   claudeProfileDir?: string,
+  /** 个人助理模式：副本里的 refreshToken 换成垃圾串，只给 AT（见 assistant-mode.ts）。 */
+  stripRefreshTokenInCopy = false,
 ): void {
   try {
     if (isClaude) {
@@ -3111,7 +3114,7 @@ function provisionIsolatedBotHome(
       const fresh = claudeCredFromSource
         ? null
         : claudeProfileDir ? readClaudeCredFile(join(claudeProfileDir, '.credentials.json')) : freshestClaudeCred();
-      if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
+      if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), stripRefreshTokenInCopy ? stripRefreshToken(fresh) : fresh);
       else if (claudeCredFromSource) { /* copied by the caller from credentialsSourceDir */ }
       else if (
         !existsSync(join(cdir, '.credentials.json'))
@@ -28520,10 +28523,48 @@ async function spawnCliBody(
       log(`[read-isolation] WARN could not create BOT_HOME ${ownBotHome}: ${(e as Error).message}`);
     }
   }
+  // 个人助理模式：owner 的 USER_HOME（<BOT_HOME>/users/<open_id>）取代 BOT_HOME 成为这个
+  // 会话的 CLI 数据目录与沙盒可写面。全部 fail-closed：形状不对 / 没开 oncall 沙盒 /
+  // 没有 BOT_HOME 重定向 / workingDir 不是 owner 的 work/ / 目录链是链接 / 模板同步失败
+  // → 拒绝 spawn，而不是退回共享目录（那正是这个模式要堵的洞）。
+  const assistantOwner = cfg.assistantOwnerOpenId;
+  let assistantUserHomeDir: string | undefined;
+  if (assistantOwner !== undefined) {
+    const refuse = (why: string): never => {
+      const msg = `[assistant-mode] refusing to start session ${cfg.sessionId}: ${why}`;
+      log(msg);
+      throw new Error(msg);
+    };
+    if (!isValidAssistantOpenId(assistantOwner)) refuse('invalid owner open_id');
+    if (!sandboxRequested || scratchRequested) refuse('assistantMode requires sandbox "oncall" (true)');
+    if (!ownBotHome || !willRedirectCliData) refuse('assistantMode requires per-bot CLI data redirection (BOT_HOME)');
+    assistantUserHomeDir = assistantUserHome(ownBotHome!, assistantOwner);
+    const expectedWork = assistantWorkDir(assistantUserHomeDir);
+    const lexicalWork = cfg.workingDir.startsWith('~/') ? join(homedir(), cfg.workingDir.slice(2)) : cfg.workingDir;
+    if (lexicalWork !== expectedWork) refuse(`workingDir ${cfg.workingDir} is not the owner's work dir`);
+    try {
+      mkdirSync(expectedWork, { recursive: true, mode: 0o700 });
+      for (const p of [ownBotHome!, assistantUserHomeDir, expectedWork]) {
+        if (lstatSync(p).isSymbolicLink()) refuse(`${p} is a symlink`);
+      }
+    } catch (e) {
+      if ((e as Error).message.startsWith('[assistant-mode]')) throw e;
+      refuse(`cannot prepare owner dirs: ${(e as Error).message}`);
+    }
+    if (cfg.assistantTemplateDir) {
+      const tpl = cfg.assistantTemplateDir.startsWith('~/') ? join(homedir(), cfg.assistantTemplateDir.slice(2)) : cfg.assistantTemplateDir;
+      try {
+        const r = syncAssistantTemplate(tpl, expectedWork);
+        log(`[assistant-mode] template synced from ${tpl}: ${r.copied} files${r.skippedSymlinks ? `, ${r.skippedSymlinks} symlinks skipped` : ''}`);
+      } catch (e) {
+        refuse(`template sync failed: ${(e as Error).message}`);
+      }
+    }
+  }
   let isolationBotHome: string | undefined;
   let isolatedCodexHome: string | undefined;
   if (willRedirectCliData) {
-    isolationBotHome = ownBotHome!;
+    isolationBotHome = assistantUserHomeDir ?? ownBotHome!;
     const isClaudeFam = !!claudeDataDir;
     // Captured before the redirect below: with a config profile the adapter's
     // data root IS the (resolved) profile dir, and it becomes the provisioning
@@ -28550,6 +28591,7 @@ async function spawnCliBody(
         log,
         credentialSourceFiles !== undefined,
         claudeProfileDir,
+        assistantUserHomeDir !== undefined,
       );
       if (credentialSourceFiles && claudeDataDir) {
         // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
@@ -28557,7 +28599,8 @@ async function spawnCliBody(
         // account) credential in place. Atomic 0600 replace: never writes
         // through a planted leaf symlink, never keeps a loose mode.
         for (const [name, raw] of Object.entries(credentialSourceFiles)) {
-          writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
+          const body = assistantUserHomeDir !== undefined && name === '.credentials.json' ? stripRefreshToken(raw) : raw;
+          writeFileAtomic0600(join(claudeDataDir, name), `${body}\n`);
         }
         // The per-bot .claude.json was seeded once from the global state: align
         // its account identity with the source and drop any API-key login.
@@ -30761,6 +30804,9 @@ async function spawnCliBody(
     // 目录（记录是 tmp+rename 原子写，外加同目录的 .lock），先建好给 bwrap 当 bind 源。
     try { mkdirSync(turnSendLedgerSessionDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
+    if (assistantUserHomeDir !== undefined) {
+      try { mkdirSync(assistantAttachmentsBucket(dataDir, cfg.larkAppId, assistantOwner!), { recursive: true, mode: 0o700 }); } catch { /* */ }
+    }
     // Adapter-declared whole-DIRECTORY state roots that the fs-policy bind-
     // mounts readWrite (cursor ~/.cursor, antigravity ~/.gemini). bwrap cannot
     // bind a missing source, and these legitimately do not exist on a fresh
@@ -30961,10 +31007,11 @@ async function spawnCliBody(
     // pre-2026-07 runbooks used) gets no rule, and "the role system EPERMs" is
     // indistinguishable from "sandbox working as intended". Say so out loud instead
     // — the session still runs, only role switching/creation is unavailable.
-    const roleLibSubtree = larkTransportEnabled
+    // 个人助理模式不授角色库（不支持角色系统；授了就是所有 owner 共享的可写面）。
+    const roleLibSubtree = larkTransportEnabled && assistantUserHomeDir === undefined
       ? (roleLibrarySubtree(cfg.larkAppId) ?? undefined)
       : undefined;
-    if (larkTransportEnabled && !roleLibSubtree) {
+    if (larkTransportEnabled && assistantUserHomeDir === undefined && !roleLibSubtree) {
       try {
         // 两种形态都比：配置路径表面在库内、但经中间 symlink 解析到库外时，
         // 只比 canonical 会漏报（而这恰恰也是 roleLibrarySubtree 返回空的场景）。
@@ -31011,7 +31058,11 @@ async function spawnCliBody(
       workingDir: canonical(cfg.workingDir),
       currentAppId: cfg.larkAppId,
       sessionId: cfg.sessionId,
-      botHome: canonical(ownBotHome!),
+      // 个人助理模式：owner 的 USER_HOME 当 botHome 授 rw；真 BOT_HOME 留在 botmux 根 deny 里。
+      botHome: canonical(assistantUserHomeDir ?? ownBotHome!),
+      ...(assistantUserHomeDir !== undefined
+        ? { attachmentsBucket: assistantAttachmentsBucket(canonical(dataDir), cfg.larkAppId, assistantOwner!) }
+        : {}),
       // Resolved above (gated on larkTransportEnabled). roleLibrarySubtree() does
       // the existence + canonicalization + "must be a real dir, not a symlink"
       // checks itself (deliberately NOT via keepExisting: its realpath would follow

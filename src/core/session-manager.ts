@@ -693,7 +693,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string, assistantOwnerOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -704,7 +704,7 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   // return no attachments, same shape as a download failure — the text still processes.
   let dir: string;
   try {
-    dir = getAttachmentsDir(larkAppId, messageId);
+    dir = getAttachmentsDir(larkAppId, messageId, assistantOwnerOpenId);
   } catch (err: any) {
     logger.warn(`[${larkAppId}] skipping attachment download — unusable appId as path segment: ${err.message}`);
     return { attachments: [], needLogin: false };

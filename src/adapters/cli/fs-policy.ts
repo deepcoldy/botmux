@@ -97,8 +97,14 @@ export interface FsPolicyContext {
    *  session's markers. Optional: when absent, no turn-sends grant is emitted
    *  (a non-session policy has no marker to write). */
   sessionId?: string;
-  /** This bot's BOT_HOME (`<botmuxHome>/bots/<appId>`) — always readWrite. */
+  /** This bot's BOT_HOME (`<botmuxHome>/bots/<appId>`) — always readWrite.
+   *  个人助理模式下 worker 传的是 owner 的 USER_HOME（`<BOT_HOME>/users/<open_id>`）：
+   *  真正的 BOT_HOME 留在 botmux 根的 deny 里，别的 owner 的目录与 bot 级 claude/
+   *  数据目录对这个会话都不存在。 */
   botHome: string;
+  /** 个人助理模式：owner 的附件桶 `attachments/<appId>/u/<open_id>`，替代整 bot 的
+   *  `attachments/<appId>` readWrite。缺省（非助理模式）仍授整个 bot 桶。 */
+  attachmentsBucket?: string;
   /** This bot's OWN role-library subtree (`<roleLibraryRoot>/<appId>`) — readWrite.
    *  Optional: absent when the subtree does not exist (bot never used roles) or
    *  when building a non-session policy. See the emission site for why the whole
@@ -970,7 +976,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // bucket lets the pane swap a message directory for a symlink between the
   // host's validation and its open/rename — a cross-process race no path-based
   // check can close — and a read-only bucket removes that class outright.
-  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
+  push([ctx.attachmentsBucket ?? `${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
   // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。

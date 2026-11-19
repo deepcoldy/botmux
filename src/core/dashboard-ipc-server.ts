@@ -4442,6 +4442,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (botSecretWithheld) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
     }
+    // 个人助理模式：bot 身份能读它所在的任何会话（别人的私聊、所在群、共享给 bot 的文档），
+    // 等于绕过按 owner 的隔离。缺省拒绝，只留 --as user；管理员显式 assistantLarkBotIdentity
+    // 才放开。detachedScheduled（定时任务后台）同样按会话的 owner 判。
+    const assistantOwned = ds?.session.assistantOwnerOpenId
+      ?? (detachedScheduled ? sessionStore.getOwnedSession(params.sessionId)?.assistantOwnerOpenId : undefined);
+    if (assistantOwned && bot.assistantLarkBotIdentity !== true) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_disabled_by_assistant_mode' });
+    }
     let token: unknown;
     try {
       // The app-bound SDK caches TATs and refreshes them before expiry. Resolve
@@ -6143,6 +6151,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
   // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
   // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
+  // 个人助理模式不支持角色系统：cwd 由 owner 决定，切角色等于切出 owner 子树。
+  if (ds.session.assistantOwnerOpenId) {
+    return jsonRes(res, 403, { ok: false, error: 'role_system_unavailable_in_assistant_mode' });
+  }
   const v = validateRoleLibraryPath(body?.dir ?? '', undefined, ds.larkAppId);
   if (!v.ok) {
     const forbidden = v.error === 'outside_role_library' || v.error === 'outside_own_role_library';

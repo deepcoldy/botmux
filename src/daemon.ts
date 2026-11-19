@@ -567,6 +567,7 @@ import {
   identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
   sweepTraexInstallChanges,
+  suspendWorker,
 } from './core/worker-pool.js';
 import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
@@ -1216,6 +1217,9 @@ import {
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
+import { assistantUserHome, assistantWorkDir, isValidAssistantOpenId, resolveAssistantOwnerOpenId } from './core/assistant-mode.js';
+import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
+import { botHomePath } from './adapters/cli/read-isolation.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
@@ -10470,6 +10474,8 @@ function capabilityScheduleWorkingDir(ds: DaemonSession, workingDir: string): st
       if (real === ownReal || real.startsWith(`${ownReal}/`)) return real;
     } catch { /* either side missing → fall through to the role-library branch */ }
   }
+  // 个人助理模式不支持角色系统：定时任务只能落在本会话 cwd（owner 的 work/）内。
+  if (ds.session.assistantOwnerOpenId) return undefined;
   const v = validateRoleLibraryPath(workingDir, undefined, ds.larkAppId);
   return v.ok ? v.resolvedPath : undefined;
 }
@@ -23037,6 +23043,73 @@ async function maybeAutoBindDefaultOncall(
  * logs and returns undefined when the path is missing/invalid so the caller
  * falls through to the repo-select card instead of spawning into a bad cwd.
  */
+// ─── 个人助理模式（bot.assistantMode）：会话归属 ───────────────────────────────
+// 每个会话有且只有一个 owner；spawn 前判定，owner 决定 cwd（<BOT_HOME>/users/<owner>/work）
+// 与随后 worker 侧的 CLI 数据目录 / 沙盒子树。群查不到 owner → 不服务（notify + return），
+// 绝不退回共享目录。设计见 docs/design/2026-11-20-assistant-mode.md。
+type AssistantSpawn =
+  | { kind: 'off' }
+  | { kind: 'owner'; openId: string; workDir: string }
+  | { kind: 'unclaimed' };
+
+function resolveAssistantSpawn(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+  senderOpenId: string | undefined,
+): AssistantSpawn {
+  let cfg: BotConfig;
+  try { cfg = getBot(larkAppId).config; } catch { return { kind: 'off' }; }
+  if (cfg.assistantMode !== true) return { kind: 'off' };
+  const owner = resolveAssistantOwnerOpenId({
+    chatType,
+    senderOpenId,
+    sessionGroupOwnerOpenId: chatType === 'group' ? getSessionGroup(chatId)?.ownerOpenId : undefined,
+    stored: chatType === 'group' ? getAssistantOwner(config.session.dataDir, larkAppId, chatId) : undefined,
+  });
+  if (!owner) return { kind: 'unclaimed' };
+  const workDir = assistantWorkDir(assistantUserHome(botHomePath(dirname(config.session.dataDir), larkAppId), owner));
+  try { mkdirSync(workDir, { recursive: true, mode: 0o700 }); } catch (e) {
+    logger.warn(`[assistant-mode:${larkAppId}] cannot create ${workDir}: ${(e as Error).message}`);
+  }
+  return { kind: 'owner', openId: owner, workDir };
+}
+
+const ASSISTANT_UNCLAIMED_TEXT =
+  '这个群还没有认领为谁的助理，我先不在这里工作。把我拉进群的人（或群主）回复 /assistant claim 认领；bot 管理员也可以用 /assistant owner @某人 指定。';
+const ASSISTANT_OWNER_LEFT_TEXT =
+  '这个群的助理主人已退群，我停止在这里工作。需要继续的话，请群里的人回复 /assistant claim 重新认领。';
+const assistantNoticeAt = new Map<string, number>();
+
+/** 未认领提示：同群 10 分钟最多一条，免得每条消息都刷屏。 */
+async function notifyAssistantUnclaimed(larkAppId: string, chatId: string, text = ASSISTANT_UNCLAIMED_TEXT): Promise<void> {
+  const key = `${larkAppId}:${chatId}`;
+  const now = Date.now();
+  if ((assistantNoticeAt.get(key) ?? 0) > now - 10 * 60_000) return;
+  assistantNoticeAt.set(key, now);
+  try { await sendMessage(larkAppId, chatId, text, 'text'); } catch (e) {
+    logger.warn(`[assistant-mode:${larkAppId}] unclaimed notice failed: ${(e as Error).message}`);
+  }
+}
+
+/** owner 退群（im.chat.member.user.deleted_v1）：标 left、挂起该群全部会话、提示重新认领。 */
+async function handleAssistantOwnerLeft(larkAppId: string, chatId: string, userOpenIds: string[]): Promise<void> {
+  let cfg: BotConfig;
+  try { cfg = getBot(larkAppId).config; } catch { return; }
+  if (cfg.assistantMode !== true) return;
+  const rec = getAssistantOwner(config.session.dataDir, larkAppId, chatId);
+  if (!rec || rec.left || !userOpenIds.includes(rec.openId)) return;
+  markAssistantOwnerLeft(config.session.dataDir, larkAppId, chatId);
+  let suspended = 0;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId || ds.chatId !== chatId) continue;
+    if (ds.worker && !ds.worker.killed && suspendWorker(ds, 'assistant_owner_left')) suspended++;
+  }
+  logger.info(`[assistant-mode:${larkAppId}] owner ${rec.openId.slice(0, 12)}… left ${chatId.slice(0, 12)}…; suspended ${suspended} session(s)`);
+  assistantNoticeAt.delete(`${larkAppId}:${chatId}`);
+  await notifyAssistantUnclaimed(larkAppId, chatId, ASSISTANT_OWNER_LEFT_TEXT);
+}
+
 function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
@@ -23079,7 +23152,17 @@ async function resolvePinnedWorkingDir(ctx: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
   listenerWorkingDir?: string;
+  /** 个人助理模式：owner 的 work/。有值时压过一切（listener / oncall / 继承 / 默认）。 */
+  assistantWorkDir?: string;
 }) {
+  if (ctx.assistantWorkDir) {
+    return {
+      pinnedWorkingDir: ctx.assistantWorkDir,
+      oncallEntry: undefined,
+      inheritedFrom: null,
+      pinnedFromBotDefault: false,
+    };
+  }
   if (ctx.listenerWorkingDir) {
     const resolved = expandHome(ctx.listenerWorkingDir);
     try {
@@ -27172,7 +27255,13 @@ async function startInitialPassthroughSession(args: {
     }
     : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, chatType, senderOpenId);
+  if (assistantSpawn.kind === 'unclaimed') {
+    await notifyAssistantUnclaimed(larkAppId, chatId);
+    return;
+  }
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType, undefined, { source: 'ordinary-feishu' });
+  if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, directChatSender);
   session.larkAppId = larkAppId;
@@ -27191,7 +27280,7 @@ async function startInitialPassthroughSession(args: {
 
   const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = lifecycleWorkingDir
     ? { pinnedWorkingDir: lifecycleWorkingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false }
-    : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId, assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined });
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = lifecycle === 'worktree' || willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -28239,8 +28328,18 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (seed) scheduleGroupAutoTitle({ larkAppId, chatId, userText: seed });
   }
 
+  // 个人助理模式：先定归属——附件要落 owner 的桶，会话要落 owner 的 work/；群未认领就不服务。
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, chatType, senderOpenId);
+  if (assistantSpawn.kind === 'unclaimed') {
+    await notifyAssistantUnclaimed(larkAppId, chatId);
+    return;
+  }
+
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources, senderOpenId);
+  const { attachments, needLogin } = await downloadResources(
+    larkAppId, messageId, resources, senderOpenId,
+    assistantSpawn.kind === 'owner' ? assistantSpawn.openId : undefined,
+  );
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -28307,6 +28406,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     chatType,
     larkAppId,
     listenerWorkingDir: messageListener?.workingDir,
+    assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined,
   });
   // 指令头里的 `/repo X` 是**用户显式选仓**，与点选仓卡片上的项目按钮同义：钉目录、
   // 跳过卡片，并且不建 worktree —— auto-worktree 的触发条件是「没人选、目录来自 bot 自己的
@@ -28427,6 +28527,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     ...(messageListener?.replyMode === 'none'
       ? { messageListenerRun: { sourceMessageId: messageId, replyMode: 'none' as const } } : {}),
   });
+  if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
   if (messageListener?.autoCloseAfterCompletion === true) session.messageListenerAutoClose = true;
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
@@ -29064,7 +29165,13 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // disagree with activeSessions's key and downstream card buttons silently
       // break. Chat-scope keeps the inbound messageId as audit only.
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
+      const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, chatType, senderOpenId);
+      if (assistantSpawn.kind === 'unclaimed') {
+        await notifyAssistantUnclaimed(larkAppId, chatId);
+        return false;
+      }
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
+      if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
       const now = Date.now();
       if (chatType === 'p2p') {
         setDirectChatDisplayNameFromSender(
@@ -29096,7 +29203,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // reuse this session and never re-enter a spawn path.
       const { pinnedWorkingDir, pinnedFromBotDefault } = lifecycleWorkingDir
         ? { pinnedWorkingDir: lifecycleWorkingDir, pinnedFromBotDefault: false }
-        : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId, assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined });
       // …EXCEPT when that dir would have triggered auto-worktree. There the bot
       // default is a worktree BASE, not a launch dir: the ordinary spawn paths
       // answer it with `pendingRepo` + a detached worktree build, which a daemon
@@ -29419,6 +29526,15 @@ async function handleBotAdded(
     // that stamp off. lastCallerOpenId is the quote-chain caller for provenance
     // and must not name the app either.
     const humanOperatorOpenId = operatorIsBot ? undefined : operatorOpenId;
+    // 个人助理模式：把 bot 拉进群的人就是这个群的 owner（写归属表，不论随后是否自动开工）。
+    if (botCfg.assistantMode === true && humanOperatorOpenId && isValidAssistantOpenId(humanOperatorOpenId)) {
+      try {
+        setAssistantOwner(config.session.dataDir, larkAppId, chatId, humanOperatorOpenId, 'bot-added');
+        logger.info(`[assistant-mode:${larkAppId}] ${chatId.substring(0, 12)} owner ← ${humanOperatorOpenId.substring(0, 12)}… (bot-added)`);
+      } catch (e) {
+        logger.warn(`[assistant-mode:${larkAppId}] record owner failed: ${(e as Error).message}`);
+      }
+    }
     if (!forced) {
       const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
         larkAppId,
@@ -29529,15 +29645,21 @@ async function handleBotAdded(
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
       return;
     }
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', humanOperatorOpenId);
+    if (assistantSpawn.kind === 'unclaimed') {
+      await notifyAssistantUnclaimed(larkAppId, chatId);
+      return;
+    }
     const needsSharedReply = mode === 'group'
       && regularGroupMode === 'shared'
       && scope === 'chat';
 
-    const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId, assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     refreshCliVersion(botCfg);
 
     const session = sessionStore.createSession(chatId, anchor, title, chatType);
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.ownerOpenId = humanOperatorOpenId;
@@ -31636,6 +31758,11 @@ async function handleThreadReplyAdmitted(
     // For chat-scope:   rootMessageId = the message_id that triggered this auto-create
     //                   (used as audit trail; routing key is chatId).
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, autoCreateChatId, autoCreateChatType, threadSenderOpenId);
+    if (assistantSpawn.kind === 'unclaimed') {
+      await notifyAssistantUnclaimed(larkAppId, autoCreateChatId);
+      return;
+    }
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType, undefined, { source: 'ordinary-feishu' });
     if (pendingTopicContinuity) {
       session.continuity = { ...pendingTopicContinuity, at: new Date().toISOString() };
@@ -31649,6 +31776,7 @@ async function handleThreadReplyAdmitted(
         void sessionReply(anchor, notice, 'text', larkAppId).catch(() => undefined);
       }
     }
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     const now = Date.now();
     // Bot-started handoff sessions have no human owner; keeping the bot as
     // owner makes daemon-generated footers wake that bot again.
@@ -31708,6 +31836,7 @@ async function handleThreadReplyAdmitted(
         chatId: autoCreateChatId,
         chatType: autoCreateChatType,
         larkAppId,
+        assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined,
       });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
@@ -33221,7 +33350,13 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // would be a phantom conversation that only exists to be renamed. Let
       // handleCommand's `!ds` branch reply no_active_session instead.
       if (chatId && slashDecision.sessionPolicy === 'precreate') {
+        const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, chatType, senderOpenId);
+        if (assistantSpawn.kind === 'unclaimed') {
+          await notifyAssistantUnclaimed(larkAppId, chatId);
+          return false;
+        }
         const session = sessionStore.createSession(chatId, anchor, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
+        if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
         const now = Date.now();
         if (chatType === 'p2p') {
           setDirectChatDisplayNameFromSender(
@@ -33248,7 +33383,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         // EVERY session-needing daemon command, not just `/repo`, and skip the
         // pin when it would have meant auto-worktree. This record becomes the
         // thread's real session.
-        const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId, assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined });
         const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
         const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
         if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
@@ -36372,6 +36507,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       handleChatGone: (chatId, appId, reason) =>
         closeSessionsInGoneChat({ larkAppId: appId, chatId, reason, activeSessions }),
+      handleChatMemberUserDeleted: (chatId, userOpenIds, appId) => handleAssistantOwnerLeft(appId, chatId, userOpenIds),
       handleDocComment: (ctx) => handleDocComment(ctx),
       handleVcMeetingPush: (ctx) => withBotTurnAdmission(
         ctx.larkAppId,

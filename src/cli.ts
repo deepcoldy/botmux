@@ -5927,7 +5927,11 @@ function cmdManagedZmxAttach(args: string[]): void {
 
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
-  const active = [...sessions.values()].filter(s => s.status === 'active');
+  // 个人助理模式：从某个 owner 的会话里跑 list，只列同一 owner 的会话。
+  const selfSid = findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
+  const selfOwner = selfSid ? (sessions.get(selfSid) as any)?.assistantOwnerOpenId as string | undefined : undefined;
+  const active = [...sessions.values()].filter(s => s.status === 'active'
+    && (!selfOwner || (s as any).assistantOwnerOpenId === selfOwner));
   if (process.argv.includes('--json')) {
     console.log(JSON.stringify({
       sessions: active.map(session => ({
@@ -9828,6 +9832,24 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
  *  prelude for `history` / `quoted` / similar commands that need to talk to
  *  Lark on behalf of the session that spawned them. Exits with stderr on
  *  failure so callers can stay focused on the happy path. */
+/**
+ * 个人助理模式的宿主侧读闸：沙盒里 sessions.db 对所有 owner 只读可见，`--session-id`
+ * 指向别人会话时，history/quoted 会替它读别人的聊天。规则：当前进程所属会话有
+ * assistantOwnerOpenId 时，目标会话必须是同一 owner 的（或就是自己）。当前会话推不
+ * 出来（宿主终端）不拦——宿主本来就能读一切。
+ */
+function assertAssistantPeerSessionOrExit(target: SessionData, what: string): void {
+  const selfSid = findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
+  if (!selfSid || selfSid === target.sessionId) return;
+  const self = loadSessions().get(selfSid);
+  const owner = (self as any)?.assistantOwnerOpenId as string | undefined;
+  if (!owner) return;
+  if ((target as any).assistantOwnerOpenId !== owner) {
+    console.error(`botmux ${what} refused: session ${target.sessionId} belongs to another assistant owner`);
+    process.exit(2);
+  }
+}
+
 async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ sid: string; larkAppId: string; session: SessionData }> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sid = sessionIdArg ?? findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
@@ -10090,6 +10112,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
   // Target-aware gate: a --session-id pointing at a virtual/apiOnly session must
   // be refused even from a normal turn (env gate above can't see the argument).
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: appId }, 'history');
+  assertAssistantPeerSessionOrExit(s, 'history');
 
   const validScopes = new Set(['session', 'thread', 'chat', 'ambient']);
   if (!validScopes.has(scopeArg)) {
@@ -10232,13 +10255,18 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
+  assertAssistantPeerSessionOrExit(quotedSession, 'quoted');
+  // 个人助理模式：引用只能引本会话所在群的消息（message_id 是全局的，不限就能读到
+  // bot 所在任何群/私聊里别人的消息）。
+  const chatLocked = remoteRunnerSessionTool || Boolean((quotedSession as any).assistantOwnerOpenId);
+
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
     const result = await readQuotedMessages(appId, {
       ...readOptions, raw: rest.includes('--raw'),
-      ...(remoteRunnerSessionTool ? { currentChatId: quotedSession.chatId } : {}),
+      ...(chatLocked ? { currentChatId: quotedSession.chatId } : {}),
     }, {
       getMessageDetail, expandMergeForward, resolveMergedCard: resolveMergedCardContent,
       downloadResources: async (...args) => {
