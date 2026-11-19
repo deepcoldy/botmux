@@ -609,7 +609,7 @@ import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { prepareSandboxWritableFiles } from './adapters/backend/sandbox-writable-files.js';
-import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
+import { HerdrBackend, resolveHerdrResumeCliSessionId, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
 import { codexLaunchCatalogEnv } from './services/codex-launch-catalog-env.js';
@@ -31295,6 +31295,7 @@ async function spawnCliBody(
           modelBackendVariant: cfg.modelBackendVariant,
           reasoningEffort: launchReasoningEffort,
           retryPaneAgentStart: opts.retryPaneAgentStart,
+          resumeCliSessionId: resolveHerdrResumeCliSessionId(effectiveResume, cfg.forkSession, effectiveCliSessionId),
         });
       },
     });

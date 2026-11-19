@@ -281,6 +281,8 @@ export interface SpawnOpts {
    *  restartAttemptId: restarts must finish inside the restart coordinator's
    *  deadline, and a wake-up from suspend (resume attempt id) is left off too. */
   retryPaneAgentStart?: boolean;
+  /** Herdr: CLI session id this launch resumes; panes already running it are closed first. */
+  resumeCliSessionId?: string;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =
