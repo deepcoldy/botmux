@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
-import { reconcileUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from '../src/adapters/cli/antigravity.js';
+import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
 function classifier(raw: () => string, cliId = 'antigravity') {
   const capture = vi.fn(raw);
@@ -12,7 +12,7 @@ function classifier(raw: () => string, cliId = 'antigravity') {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit,
-    usageLimitTracker, reconcileUsageLimitState, lastAntigravityQuota: undefined,
+    usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
   });
   return { classify, capture, usageLimitTracker };
 }
@@ -76,6 +76,45 @@ describe('raw ANSI tmux quota classification', () => {
     expect(fresh?.relativeResetKey).toContain('new');
     expect(fresh?.retryAtMs).toBe(Date.now() + 60_000);
     expect(usageLimitTracker.detectedThisTurn(retryTurn)).toBe(true);
+  });
+
+  it('suppresses an expired refusal revealed by a redraw after a newer refusal', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const oldScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: old' + composer;
+    const newScreen = oldScreen.replace('Error ID: old', 'Error ID: new');
+    let screen = oldScreen;
+    const { classify, usageLimitTracker } = classifier(() => screen);
+    expect(classify('', 'idle').usageLimit?.relativeResetKey).toContain('old');
+
+    vi.advanceTimersByTime(60_000);
+    screen = newScreen;
+    const fresh = classify('', 'idle').usageLimit;
+    expect(fresh?.relativeResetKey).toContain('new');
+
+    screen = oldScreen;
+    const turn = usageLimitTracker.beginTurn(screen);
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    screen = newScreen;
+    vi.advanceTimersByTime(1_000);
+    expect(classify('', 'idle').usageLimit?.retryAtMs).toBe(fresh.retryAtMs);
+  });
+
+  it('evicts the oldest refusal without promoting a repeated key', () => {
+    const first: CliUsageLimitState = {
+      limited: true, kind: 'usage', retryAtMs: 60_000, retryLabel: '1m', retryReady: false,
+      relativeResetKey: 'usage:60000:first', source: 'antigravity-error-composer',
+    };
+    let history = rememberAntigravityQuota(undefined, first);
+    for (let index = 0; index < 32; index++) {
+      const key = `usage:60000:${index}`;
+      expect(rememberAntigravityQuota(history, { ...first, retryAtMs: 120_000 })).toBe(history);
+      history = rememberAntigravityQuota(history, { ...first, relativeResetKey: key });
+    }
+    expect(history).toHaveLength(32);
+    expect(history?.[0]?.relativeResetKey).toBe('usage:60000:0');
+    expect(history?.at(-1)?.relativeResetKey).toBe('usage:60000:31');
   });
 
   it('retains actual working footer authority above a colored historical refusal', () => {

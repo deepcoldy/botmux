@@ -1037,7 +1037,7 @@ import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.j
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
 import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
-import { isAntigravityWorkingScreen } from '../adapters/cli/antigravity.js';
+import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
@@ -4878,9 +4878,7 @@ function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitStat
 export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   if (!ds.usageLimit) return;
   // 旧会话只存了当前限额，恢复时先保留它的身份，后续清除状态也能识别残留提示
-  if (ds.usageLimit.source === 'antigravity-error-composer' && ds.usageLimit.relativeResetKey) {
-    ds.session.lastAntigravityQuota = ds.usageLimit;
-  }
+  ds.session.antigravityQuotaHistory = rememberAntigravityQuota(ds.session.antigravityQuotaHistory, ds.usageLimit);
   ds.lastScreenStatus = 'limited';
   armUsageLimitRetryTimer(ds);
 }
@@ -4901,9 +4899,7 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ) return;
 
   ds.usageLimit = usageLimit;
-  if (usageLimit.source === 'antigravity-error-composer' && usageLimit.relativeResetKey) {
-    ds.session.lastAntigravityQuota = usageLimit;
-  }
+  ds.session.antigravityQuotaHistory = rememberAntigravityQuota(ds.session.antigravityQuotaHistory, usageLimit);
   ds.usageLimitPersistPending = true;
   persistStreamCardState(ds);
   ds.usageLimitPersistPending = false;
@@ -19495,7 +19491,7 @@ function forkWorkerPrepared(
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
     cliId: agentCfg.cliId,
-    ...(agentCfg.cliId === 'antigravity' ? { lastAntigravityQuota: ds.session.lastAntigravityQuota } : {}),
+    ...(agentCfg.cliId === 'antigravity' ? { antigravityQuotaHistory: ds.session.antigravityQuotaHistory } : {}),
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
@@ -28774,7 +28770,7 @@ export function forkAdoptWorker(
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
-    ...(adoptedCliId === 'antigravity' ? { lastAntigravityQuota: ds.session.lastAntigravityQuota } : {}),
+    ...(adoptedCliId === 'antigravity' ? { antigravityQuotaHistory: ds.session.antigravityQuotaHistory } : {}),
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,
     cliRuntime: agentCfg.cliRuntime,

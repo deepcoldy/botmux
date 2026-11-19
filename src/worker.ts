@@ -471,7 +471,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
+import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -9369,7 +9369,7 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isOutputActive: isOutputActivelyProgressing,
 });
 
-let lastAntigravityQuota: CliUsageLimitState | undefined;
+let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -9407,12 +9407,12 @@ function classifyUsageLimitWithNativeEvidence(
       if (!observed.relativeResetKey) return observed;
 
       // 同一个 Error ID 和倒计时在视口里重复出现时，沿用首次观察的截止时间
-      const previous = lastAntigravityQuota;
-      if (previous?.relativeResetKey === observed.relativeResetKey) {
+      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === observed.relativeResetKey);
+      if (previous) {
         const now = Date.now();
         return now >= previous.retryAtMs ? undefined : reconcileUsageLimitState(previous, observed, now);
       }
-      if (observed.source === 'antigravity-error-composer') lastAntigravityQuota = observed;
+      antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, observed);
       return observed;
     });
   }
@@ -38029,7 +38029,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
-      lastAntigravityQuota = msg.lastAntigravityQuota;
+      antigravityQuotaHistory = msg.antigravityQuotaHistory;
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {

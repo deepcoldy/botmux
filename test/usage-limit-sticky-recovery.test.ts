@@ -206,10 +206,42 @@ describe('usage-limit sticky state self-heal', () => {
     expect(ds.usageLimit).toBeUndefined();
     const stored = sessionStore.getSessionFresh(session.sessionId);
     expect(stored?.usageLimit).toBeUndefined();
-    expect(stored?.lastAntigravityQuota).toMatchObject({
+    expect(stored?.antigravityQuotaHistory).toMatchObject([{
       relativeResetKey: initial.relativeResetKey,
       retryAtMs: initial.retryAtMs,
-    });
+    }]);
+  });
+
+  it('restores both native quota episodes with their first deadlines from SQLite', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_native_history', 'native history', 'group', 'chat');
+    const ds = makeDs({ worker, workerPort: 9999, session });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const oldBanner = '⚠ Individual quota reached. Resets in 1m.\nError ID: old\n────\n>\n────\n';
+    const newBanner = oldBanner.replace('Error ID: old', 'Error ID: new');
+    const emitQuota = async (content: string) => {
+      const detected = detectCliUsageLimit(content);
+      if (!detected.limited) throw new Error('Expected relative quota');
+      const usageLimit = annotateAntigravityUsageLimit(content, detected);
+      await dispatch(worker, { type: 'screen_update', content, status: 'limited', usageLimit });
+      return usageLimit;
+    };
+
+    const first = await emitQuota(oldBanner);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const second = await emitQuota(newBanner);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await emitQuota(newBanner);
+    await dispatch(worker, { type: 'screen_update', content: oldBanner, status: 'idle' });
+    expect(ds.usageLimit?.relativeResetKey).toBe(second.relativeResetKey);
+
+    const stored = sessionStore.getSessionFresh(session.sessionId)!;
+    const restored = makeDs({ session: stored, usageLimit: stored.usageLimit });
+    restoreUsageLimitRuntimeState(restored);
+    expect(restored.session.antigravityQuotaHistory).toEqual([first, second]);
+    expect(restored.usageLimit?.retryAtMs).toBe(second.retryAtMs);
   });
 
   it('notifies a fresh refusal after the old window without an intervening idle frame', async () => {

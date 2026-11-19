@@ -187,6 +187,20 @@ export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLim
   return state;
 }
 
+const ANTIGRAVITY_QUOTA_HISTORY_LIMIT = 32;
+
+/** 保留最近首次见到的原生拒绝，重复帧既不改截止时间，也不改变淘汰顺序 */
+export function rememberAntigravityQuota(
+  history: readonly CliUsageLimitState[] | undefined,
+  state: CliUsageLimitState,
+): readonly CliUsageLimitState[] | undefined {
+  const key = state.relativeResetKey;
+  if (state.source !== 'antigravity-error-composer' || !key || history?.some(entry => entry.relativeResetKey === key)) {
+    return history;
+  }
+  return [...(history?.slice(1 - ANTIGRAVITY_QUOTA_HISTORY_LIMIT) ?? []), state];
+}
+
 /** Walk the tail of a viewport (ready footer → separators → composer) and
  *  decide whether agy is parked at an EMPTY composer with its ready footer —
  *  i.e. the live TUI is demonstrably waiting for input. Returns the index of

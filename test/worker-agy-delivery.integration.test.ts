@@ -103,8 +103,12 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
     : mode === 'running'
       ? '● Bash(sleep 30)\n⣻ Running command...\n────────\n>\n────────\nesc to cancel · 1 task(s)\n'
     : ready + '\n';
-  const previousQuota = mode === 'expired-quota' ? detectCliUsageLimit(screen, new Date(0)) : undefined;
-  const lastAntigravityQuota = previousQuota?.limited ? annotateAntigravityUsageLimit(screen, previousQuota) : undefined;
+  const antigravityQuotaHistory = mode === 'expired-quota' ? [screen, screen.replace('native-error-fixture', 'newer-quota-fixture')]
+    .map((banner, index) => {
+      const state = detectCliUsageLimit(banner, index === 0 ? new Date(0) : new Date());
+      if (!state.limited) throw new Error('Expected relative quota');
+      return annotateAntigravityUsageLimit(banner, state);
+    }) : undefined;
   const fakeCli = join(root, 'fake-cli');
   const initialScreenGate = passive ? join(root, 'worker-ready') : '';
   writeFileSync(fakeCli, `#!${tsRunnerPrefix().command}
@@ -181,7 +185,7 @@ setInterval(() => {}, 1_000);
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId, cliPathOverride: fakeCli, backendType: 'pty',
     cliSessionId: nativeId,
-    lastAntigravityQuota,
+    antigravityQuotaHistory,
     prompt: passive ? '' : 'ACTIVATION_UNIQUE_MARKER',
     ...(!passive ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret',
@@ -211,10 +215,12 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     expect(worker.input()).toBe('');
   }, 60_000);
 
-  it('does not re-report a past-reset quota banner on worker reattach', async () => {
+  it('does not re-report an older past-reset quota banner on worker reattach', async () => {
     const worker = startWorker('expired-quota');
-    await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'idle'
-      && m.content.includes('Individual quota reached')), worker.logs, 20_000);
+    const quotaFrame = () => worker.messages.find(m => m.type === 'screen_update'
+      && (m.status === 'idle' || m.status === 'limited') && m.content.includes('Individual quota reached'));
+    await waitFor(() => quotaFrame() !== undefined, worker.logs, 20_000);
+    expect(quotaFrame()).toMatchObject({ status: 'idle' });
     expect(worker.messages.some(m => m.type === 'screen_update' && m.usageLimit)).toBe(false);
   }, 60_000);
 
