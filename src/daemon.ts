@@ -298,6 +298,7 @@ import {
   readDebianCodename,
   spawnUpgradeCommand,
 } from './setup/tmux-upgrade-plan.js';
+import { installManagedTmuxForHost } from './setup/tmux-prebuilt.js';
 import {
   fanOutTmuxSwitchSuspend,
   killTmuxServer,
@@ -37050,6 +37051,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           onLine,
           onSpawn,
           aptCandidates: () => defaultTmuxUpgradeProbe(platform).packageCandidates('apt'),
+          // Hosts no package manager can serve: botmux's own verified copy.
+          installPrebuilt: (line) => installManagedTmuxForHost(line),
         });
       },
       onBinaryChanged: () => { refreshTmuxVersion(); },
