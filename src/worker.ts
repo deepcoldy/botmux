@@ -28373,6 +28373,7 @@ async function spawnCliBody(
           modelBackendVariant: cfg.modelBackendVariant,
           reasoningEffort: cfg.reasoningEffort,
           retryPaneAgentStart: opts.retryPaneAgentStart,
+          resumeCliSessionId: effectiveResume && cfg.forkSession !== true ? effectiveCliSessionId : undefined, // --fork-session writes a new transcript; leave the parent pane alone
         });
       },
     });

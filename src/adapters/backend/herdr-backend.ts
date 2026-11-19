@@ -668,6 +668,33 @@ export class HerdrBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Close idle panes that already run `cliSessionId`. With
+   * `resume_agents_on_restore`, herdr re-launches every Claude pane as
+   * `claude --resume <id>` under a new name Botmux does not track; a cold
+   * resume would then add a second writer to the same transcript. Busy panes
+   * are left alone (a turn is in flight) and only logged.
+   */
+  static closePanesRunningCliSession(sessionName: string, cliSessionId: string): string[] {
+    const raw = jsonCommand(herdrSessionArgs(sessionName, ['pane', 'list']), { timeout: 5000 });
+    const panes: any[] = Array.isArray(raw?.result?.panes) ? raw.result.panes : [];
+    const closed: string[] = [];
+    for (const pane of panes) {
+      const value = pane?.agent_session?.value;
+      if (typeof value !== 'string' || typeof pane?.pane_id !== 'string') continue;
+      if (value !== cliSessionId && !value.endsWith(`_${cliSessionId}.jsonl`)) continue;
+      if (pane.agent_status === 'working' || pane.agent_status === 'blocked') {
+        logger.warn(`[herdr-backend] pane ${pane.pane_id} already runs CLI session ${cliSessionId} but is ${pane.agent_status}; not closing it`);
+        continue;
+      }
+      logger.warn(`[herdr-backend] closing pane ${pane.pane_id}: it already runs CLI session ${cliSessionId} (restored by herdr)`);
+      if (runHerdr(herdrSessionArgs(sessionName, ['pane', 'close', pane.pane_id]), { timeout: 5000 })) {
+        closed.push(pane.pane_id);
+      }
+    }
+    return closed;
+  }
+
   /** Close only the managed pane, never the surrounding user-owned session. */
   static killAgent(sessionName: string, agentName: string): void {
     HerdrBackend.killAgents(sessionName, [agentName]);
@@ -727,6 +754,9 @@ export class HerdrBackend implements SessionBackend {
       // row from persisted metadata, and reuse would skip `agent start` so the
       // new command never ran. killSession() now deletes that metadata, but we
       // also gate reuse on isReattach so a stale row can never be adopted.
+      if (!this.opts.isReattach && opts.resumeCliSessionId) {
+        HerdrBackend.closePanesRunningCliSession(this.sessionName, opts.resumeCliSessionId);
+      }
       const existing = this.opts.isReattach ? this.getAgent() : undefined;
       if (existing) {
         this.actuallyReattached = true;

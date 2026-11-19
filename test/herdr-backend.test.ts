@@ -1309,6 +1309,50 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  describe('cold resume with a pane already running the same CLI session', () => {
+    const SID = '0f8fad5b-d9cb-469f-a165-70867728950e';
+    const pane = (id: string, value: string, status = 'idle') =>
+      ({ pane_id: id, agent: 'claude', agent_status: status, agent_session: { kind: 'id', value } });
+
+    function spawnResume(panes: unknown[], resume = true) {
+      setHerdrResponses([
+        { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+        { match: a => a.includes('pane') && a.includes('list'), reply: () => JSON.stringify({ result: { panes } }) },
+        {
+          match: a => a.includes('agent') && a.includes('start'),
+          reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'fresh-1' } } }),
+        },
+        { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+      ]);
+      vi.spyOn(logger, 'warn').mockImplementation(() => undefined as any);
+      const be = new HerdrBackend(SESSION);
+      be.spawn('claude', ['--resume', SID], { cwd: '/work', cols: 80, rows: 24, env: {}, resumeCliSessionId: resume ? SID : undefined });
+      be.kill();
+    }
+    const callIndex = (...needles: string[]) =>
+      mockedExecFileSync.mock.calls.findIndex(c => needles.every(n => (c[1] as string[]).includes(n)));
+
+    it('closes the idle restored pane before starting the new CLI', () => {
+      spawnResume([pane('9-1', SID), pane('9-2', 'another-session-id')]);
+      const closeIdx = callIndex('pane', 'close', '9-1');
+      expect(closeIdx).toBeGreaterThanOrEqual(0);
+      expect(closeIdx).toBeLessThan(callIndex('agent', 'start'));
+      expect(herdrCall('pane', 'close', '9-2')).toBeUndefined();
+    });
+
+    it('leaves a busy pane running the session alone', () => {
+      spawnResume([pane('9-1', SID, 'working')]);
+      expect(herdrCall('pane', 'close', '9-1')).toBeUndefined();
+      expect(herdrCall('agent', 'start')).toBeDefined();
+    });
+
+    it('does not scan panes when the launch is not a resume', () => {
+      spawnResume([pane('9-1', SID)], false);
+      expect(herdrCall('pane', 'list')).toBeUndefined();
+      expect(herdrCall('pane', 'close')).toBeUndefined();
+    });
+  });
+
   it('launchedNewCli is true only when spawn() launched the CLI itself', () => {
     // The worker's startup guard keys on this: a freshly launched CLI may be
     // reported idle while still booting, but a re-attached or adopted CLI was
