@@ -48,10 +48,13 @@ describe('daemon-side send lease', () => {
   it('records the sender exact identity, blocks freezing while it lives and becomes acknowledgeable after it exits', async () => {
     const directory = await dataDir();
     const child = await sender();
-    const lease = acquireFeedbackSendLeaseFor(directory, { processId: child.pid, sessionId: 'sess-a' });
-    expect(JSON.parse(await readFile(join(directory, 'feedback-send-leases', lease), 'utf8'))).toEqual({
+    const { lease, releaseToken } = acquireFeedbackSendLeaseFor(directory, { processId: child.pid, sessionId: 'sess-a' });
+    const persisted = JSON.parse(await readFile(join(directory, 'feedback-send-leases', lease), 'utf8'));
+    expect(persisted).toEqual({
       processId: child.pid, processStartId: readDurableProcessIdentity(child.pid), sessionId: 'sess-a',
+      releaseTokenHash: expect.any(String),
     });
+    expect(persisted.releaseToken).toBeUndefined();
     await beginFeedbackMaintenance(directory, 'relayed-send');
     expect((await inspectFeedbackMaintenance(directory, 'relayed-send')).blockers).toContain(`send_in_progress:${child.pid}`);
     const [live] = inspectSendRecovery(directory);
@@ -83,23 +86,29 @@ describe('daemon-side send lease', () => {
   it('releases only a lease recorded for the same session and process', async () => {
     const directory = await dataDir();
     const child = await sender();
-    const lease = acquireFeedbackSendLeaseFor(directory, { processId: child.pid, sessionId: 'sess-a' });
-    expect(() => releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-b' })).toThrow('feedback_send_lease_not_owned');
-    expect(() => releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid + 1, sessionId: 'sess-a' })).toThrow('feedback_send_lease_invalid');
-    expect(() => releaseFeedbackSendLeaseFor(directory, { lease: `${child.pid}-../../feedback-maintenance.json`, processId: child.pid, sessionId: 'sess-a' })).toThrow('feedback_send_lease_invalid');
+    const { lease, releaseToken } = acquireFeedbackSendLeaseFor(directory, { processId: child.pid, sessionId: 'sess-a' });
+    expect(() => releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-b', releaseToken })).toThrow('feedback_send_lease_not_owned');
+    expect(() => releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid + 1, sessionId: 'sess-a', releaseToken })).toThrow('feedback_send_lease_invalid');
+    expect(() => releaseFeedbackSendLeaseFor(directory, {
+      lease: `${child.pid}-../../feedback-maintenance.json`, processId: child.pid, sessionId: 'sess-a', releaseToken,
+    })).toThrow('feedback_send_lease_invalid');
+    const wrongToken = `${releaseToken.slice(0, -1)}${releaseToken.endsWith('A') ? 'B' : 'A'}`;
+    expect(() => releaseFeedbackSendLeaseFor(directory, {
+      lease, processId: child.pid, sessionId: 'sess-a', releaseToken: wrongToken,
+    })).toThrow('feedback_send_lease_not_owned');
     expect(await leaseFiles(directory)).toEqual([lease]);
-    releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-a' });
+    releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-a', releaseToken });
     expect(await leaseFiles(directory)).toEqual([]);
-    releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-a' });
+    releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-a', releaseToken });
   });
 
   it('never lets a session release a lease the CLI took in-process', async () => {
     const directory = await dataDir();
     const child = await sender();
-    const lease = acquireFeedbackSendLeaseFor(directory, { processId: child.pid, sessionId: 'sess-a' });
+    const { lease, releaseToken } = acquireFeedbackSendLeaseFor(directory, { processId: child.pid, sessionId: 'sess-a' });
     const path = join(directory, 'feedback-send-leases', lease);
     await writeFile(path, JSON.stringify({ processId: child.pid, processStartId: readDurableProcessIdentity(child.pid) }));
-    expect(() => releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-a' })).toThrow('feedback_send_lease_not_owned');
+    expect(() => releaseFeedbackSendLeaseFor(directory, { lease, processId: child.pid, sessionId: 'sess-a', releaseToken })).toThrow('feedback_send_lease_not_owned');
     expect(await leaseFiles(directory)).toEqual([lease]);
   });
 
@@ -112,11 +121,12 @@ describe('daemon-side send lease', () => {
     // Read the lease before matching: bun's toMatchObject rewrites matched
     // asymmetric fields on the received object.
     const lease = (acquired.body as { lease: string }).lease;
+    const releaseToken = (acquired.body as { releaseToken: string }).releaseToken;
     expect(acquired.status).toBe(200);
     expect(lease.startsWith(`${child.pid}-`)).toBe(true);
-    expect(handleFeedbackSendLeaseRelay(directory, 'sess-b', { action: 'release', processId: child.pid, lease }))
+    expect(handleFeedbackSendLeaseRelay(directory, 'sess-b', { action: 'release', processId: child.pid, lease, releaseToken }))
       .toEqual({ status: 409, body: { ok: false, error: 'feedback_send_lease_not_owned' } });
-    expect(handleFeedbackSendLeaseRelay(directory, 'sess-a', { action: 'release', processId: child.pid, lease }))
+    expect(handleFeedbackSendLeaseRelay(directory, 'sess-a', { action: 'release', processId: child.pid, lease, releaseToken }))
       .toEqual({ status: 200, body: { ok: true } });
     await beginFeedbackMaintenance(directory, 'mapped');
     expect(handleFeedbackSendLeaseRelay(directory, 'sess-a', { action: 'acquire', processId: child.pid }))
@@ -216,7 +226,7 @@ describe('CLI send lease with daemon fallback', () => {
   it('warns and finishes after an unanswered release instead of hanging the delivered send', async () => {
     const warn = vi.fn();
     const hangingRelease: FeedbackSendLeaseRelay = async (body, signal) => {
-      if (body.action === 'acquire') return { ok: true, status: 200, body: { ok: true, lease: '123-abc.json' } };
+      if (body.action === 'acquire') return { ok: true, status: 200, body: { ok: true, lease: '123-abc.json', releaseToken: 'test-release-token' } };
       return new Promise(() => { signal.addEventListener('abort', () => {}, { once: true }); });
     };
     const release = await acquireFeedbackSendLeaseWithRelay({

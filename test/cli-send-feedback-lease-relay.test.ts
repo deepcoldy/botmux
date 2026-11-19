@@ -72,6 +72,7 @@ describe('botmux send feedback lease when the CLI sandbox denies the lease direc
     expect(release.path).toBe(acquire.path);
     expect(release.body.processId).toBe(acquire.body.processId);
     expect(release.body.lease).toBe(`${acquire.body.processId}-0123abcd.json`);
+    expect(release.body.releaseToken).toBe('synthetic-release-token');
   }, 35_000);
 
   it('stops before the provider effect when the daemon refuses the lease', () => {

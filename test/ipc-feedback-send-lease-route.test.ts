@@ -82,13 +82,16 @@ describe('POST /api/sessions/:sessionId/feedback-send-lease', () => {
       .toEqual({ status: 409, body: { ok: false, error: 'feedback_storage_maintenance' } });
   });
 
-  it('releases only through the session the lease was taken for', async () => {
+  it('releases only through the owning session and lease-scoped credential', async () => {
     const pid = await setup({ 'sess-a': liveSession('sess-a', CAP_A), 'sess-b': liveSession('sess-b', CAP_B) });
-    const { body: { lease } } = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
-    expect((await post('sess-b', { originCapability: CAP_B, action: 'release', processId: pid, lease })).status).toBe(409);
-    expect((await post('sess-a', { originCapability: CAP_B, action: 'release', processId: pid, lease })).status).toBe(403);
+    const { body: { lease, releaseToken } } = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
+    expect((await post('sess-b', { originCapability: CAP_B, action: 'release', processId: pid, lease, releaseToken })).status).toBe(409);
+    const wrongToken = `${releaseToken.slice(0, -1)}${releaseToken.endsWith('A') ? 'B' : 'A'}`;
+    expect((await post('sess-a', { originCapability: CAP_B, action: 'release', processId: pid, lease, releaseToken: wrongToken })).status).toBe(409);
     expect(leases()).toEqual([lease]);
-    expect(await post('sess-a', { originCapability: CAP_A, action: 'release', processId: pid, lease })).toEqual({ status: 200, body: { ok: true } });
+    // A stale or absent origin capability does not invalidate the independent
+    // lease credential; a wrong session or token still cannot release it.
+    expect(await post('sess-a', { action: 'release', processId: pid, lease, releaseToken })).toEqual({ status: 200, body: { ok: true } });
     expect(leases()).toEqual([]);
   });
 
@@ -99,7 +102,39 @@ describe('POST /api/sessions/:sessionId/feedback-send-lease', () => {
     const acquired = await post('sess-receiver', { originCapability: CAP_A, action: 'acquire', processId: pid });
     expect(acquired).toMatchObject({ status: 200, body: { ok: true } });
     expect(await post('sess-receiver', {
-      originCapability: CAP_A, action: 'release', processId: pid, lease: acquired.body.lease,
+      originCapability: CAP_A, action: 'release', processId: pid, lease: acquired.body.lease, releaseToken: acquired.body.releaseToken,
     })).toEqual({ status: 200, body: { ok: true } });
+  });
+
+  it('releases after turn rotation, session deactivation and a daemon restart', async () => {
+    const sessions: Record<string, any> = {
+      'sess-a': liveSession('sess-a', CAP_A),
+      'sess-b': liveSession('sess-b', CAP_B),
+    };
+    const pid = await setup(sessions);
+    const rotated = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
+    sessions['sess-a'] = liveSession('sess-a', CAP_B);
+    expect(await post('sess-a', {
+      originCapability: CAP_A, action: 'release', processId: pid,
+      lease: rotated.body.lease, releaseToken: rotated.body.releaseToken,
+    })).toEqual({ status: 200, body: { ok: true } });
+
+    const inactive = await post('sess-a', { originCapability: CAP_B, action: 'acquire', processId: pid });
+    await handle!.close();
+    handle = null;
+    delete sessions['sess-a'];
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const token = inactive.body.releaseToken as string;
+    const wrongToken = `${token.slice(0, -1)}${token.endsWith('A') ? 'B' : 'A'}`;
+    expect((await post('sess-a', {
+      originCapability: CAP_B, action: 'release', processId: pid,
+      lease: inactive.body.lease, releaseToken: wrongToken,
+    })).status).toBe(409);
+    expect(leases()).toEqual([inactive.body.lease]);
+    expect(await post('sess-a', {
+      originCapability: CAP_B, action: 'release', processId: pid,
+      lease: inactive.body.lease, releaseToken: token,
+    })).toEqual({ status: 200, body: { ok: true } });
+    expect(leases()).toEqual([]);
   });
 });

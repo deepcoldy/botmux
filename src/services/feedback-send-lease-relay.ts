@@ -19,10 +19,11 @@ const RELAYED_ERRORS = new Set([
 
 export interface FeedbackSendLeaseRelayResponse {
   status: 200 | 400 | 409;
-  body: { ok: true; lease?: string } | { ok: false; error: string };
+  body: { ok: true; lease?: string; releaseToken?: string } | { ok: false; error: string };
 }
 
-/** Daemon half. `sessionId` comes from the authenticated live session. */
+/** Daemon half. Acquisition uses the authenticated live session; release uses
+ * the URL session plus the lease-scoped credential verified from disk. */
 export function handleFeedbackSendLeaseRelay(
   dataDir: string,
   sessionId: string,
@@ -33,10 +34,13 @@ export function handleFeedbackSendLeaseRelay(
   if (typeof processId !== 'number' || !Number.isSafeInteger(processId)) return invalid;
   try {
     if (body.action === 'acquire') {
-      return { status: 200, body: { ok: true, lease: acquireFeedbackSendLeaseFor(dataDir, { processId, sessionId }) } };
+      const acquired = acquireFeedbackSendLeaseFor(dataDir, { processId, sessionId });
+      return { status: 200, body: { ok: true, ...acquired } };
     }
-    if (body.action === 'release' && typeof body.lease === 'string') {
-      releaseFeedbackSendLeaseFor(dataDir, { lease: body.lease, processId, sessionId });
+    if (body.action === 'release' && typeof body.lease === 'string' && typeof body.releaseToken === 'string') {
+      releaseFeedbackSendLeaseFor(dataDir, {
+        lease: body.lease, processId, sessionId, releaseToken: body.releaseToken,
+      });
       return { status: 200, body: { ok: true } };
     }
     return invalid;
@@ -107,14 +111,15 @@ export async function acquireFeedbackSendLeaseWithRelay(input: {
     };
     const acquired = await request({ action: 'acquire', processId });
     const lease = (acquired.body as { lease?: unknown } | undefined)?.lease;
-    if (!acquired.ok || typeof lease !== 'string') throw new Error(relayError(acquired));
+    const releaseToken = (acquired.body as { releaseToken?: unknown } | undefined)?.releaseToken;
+    if (!acquired.ok || typeof lease !== 'string' || typeof releaseToken !== 'string') throw new Error(relayError(acquired));
     const warn = input.warn ?? ((message: string) => console.error(message));
     return async () => {
       // The message is already delivered: a lost release leaves a lease that
       // turns into an acknowledgeable unknown outcome after this process exits,
       // never a failed send.
       try {
-        const released = await request({ action: 'release', processId, lease });
+        const released = await request({ action: 'release', processId, lease, releaseToken });
         if (!released.ok) warn(`botmux send: feedback send lease release failed: ${relayError(released)}`);
       } catch (error) {
         warn(`botmux send: feedback send lease release failed: ${error instanceof Error ? error.message : String(error)}`);

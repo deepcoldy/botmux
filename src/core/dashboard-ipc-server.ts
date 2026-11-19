@@ -2480,6 +2480,14 @@ ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async 
   try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  // Release uses the lease-scoped credential returned at acquisition, not the
+  // origin turn's current capability. The handler verifies its persisted hash
+  // together with the exact lease/pid/session, so rotation, session close and
+  // daemon restart cannot strand an already-delivered send.
+  if (body.action === 'release') {
+    const result = handleFeedbackSendLeaseRelay(config.session.dataDir, params.sessionId, body);
+    return jsonRes(res, result.status, result.body);
+  }
   const ds = findActiveBySessionId(params.sessionId);
   // Managed meeting sends originate in a receiver session too. This route only
   // guards feedback maintenance; it does not perform a managed session action.

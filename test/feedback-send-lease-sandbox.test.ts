@@ -120,7 +120,10 @@ d('feedback send lease under the compiled Seatbelt policy', () => {
     const lease = JSON.parse(readFileSync(join(dataDir, 'feedback-send-leases', name!), 'utf8'));
     const exactIdentity = readDurableProcessIdentity(child.pid!);
     expect(exactIdentity).toBeDefined();
-    expect(lease).toEqual({ processId: child.pid, processStartId: exactIdentity, sessionId });
+    expect(lease).toEqual({
+      processId: child.pid, processStartId: exactIdentity, sessionId, releaseTokenHash: expect.any(String),
+    });
+    expect(lease.releaseToken).toBeUndefined();
     expect(inspectSendRecovery(dataDir)).toEqual([
       expect.objectContaining({ id: name, processId: child.pid, live: true }),
     ]);

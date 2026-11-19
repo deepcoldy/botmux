@@ -326,7 +326,7 @@ if (process.env.BOTMUX_TEST_FEEDBACK_LEASE_DAEMON) {
     const result = refuse
       ? { ok: false, error: 'feedback_storage_maintenance' }
       : body.action === 'acquire'
-        ? { ok: true, lease: `${body.processId}-0123abcd.json` }
+        ? { ok: true, lease: `${body.processId}-0123abcd.json`, releaseToken: 'synthetic-release-token' }
         : { ok: true };
     return new Response(JSON.stringify(result), { status: refuse ? 409 : 200, headers: { 'content-type': 'application/json' } });
   });
