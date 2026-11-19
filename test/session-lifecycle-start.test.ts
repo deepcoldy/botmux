@@ -281,6 +281,8 @@ import {
   currentGatewayCallerOpenId,
   __testOnly_setSuspendBackingVerifier,
   __testOnly_resetTurnTerminalReportingClis,
+  __testOnly_resetRestartCoordinator,
+  requestSessionRestart,
   manualSuspendWaits,
   queueManualSuspend,
   streamCardLabel,
@@ -319,6 +321,7 @@ import { readWorkerProcessStart } from '../src/core/session-worker-identity.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { botLocale, t as tr } from '../src/i18n/index.js';
 import { invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -565,6 +568,70 @@ describe('worker start operation', () => {
       expect(controller.operation(stop.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
     } finally {
       contractController.value = undefined; store.close(); rmSync(data, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('TraeX empty-pool launch refusal', () => {
+  function blockOnTraexCatalog(): void {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'traex', wrapperCli: undefined, model: 'auto',
+      traexAutoModel: { enabled: true, models: [], catalogUnavailable: true },
+    }));
+  }
+
+  it.each([
+    { name: 'new topic', resumeOrTurnId: { turnId: 'om_catalog_new' } },
+    { name: 'restored session', resumeOrTurnId: { resume: true, turnId: 'om_catalog_restore' } },
+  ])('rejects a $name before any worker or model launch and reports the admission failure', ({ resumeOrTurnId }) => {
+    blockOnTraexCatalog();
+    const ds = makeDs({ session: { ...makeDs().session, cliId: 'traex', agentFrozen: true } });
+    const onAdmission = vi.fn();
+    const onAdmissionBlocked = vi.fn();
+    const turnId = resumeOrTurnId.turnId;
+    expect(forkWorker(ds, 'do not launch', resumeOrTurnId, { onAdmission, onAdmissionBlocked })).toBe(true);
+    expect(onAdmission).toHaveBeenCalledWith('rejected');
+    expect(onAdmissionBlocked).toHaveBeenCalledWith({
+      turnId,
+      content: tr('worker.traex_auto_model.catalog_empty', {}, botLocale(getBot(ds.larkAppId).config)),
+    });
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+  });
+
+  it('still permits a live persistent-backend reattach without launching a model', () => {
+    blockOnTraexCatalog();
+    const ds = makeDs({ session: { ...makeDs().session, cliId: 'traex', agentFrozen: true } });
+    expect(forkWorker(ds, '', { resume: true }, { reattachLiveBackend: true })).toBe(true);
+    expect(forkMock).toHaveBeenCalledOnce();
+    expect(ds.initConfig?.model).toBeUndefined();
+    expect(ds.initConfig?.traexAutoModel).toBeUndefined();
+  });
+
+  it('rejects an in-place restart before IPC and reports catalog_empty through the restart failure path', async () => {
+    blockOnTraexCatalog();
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      session: { ...makeDs().session, cliId: 'traex', agentFrozen: true, model: 'core' },
+      worker, workerReady: true,
+      initConfig: { cliId: 'traex', model: 'core', traexAutoModel: { enabled: true, models: ['core'] } } as any,
+    });
+    const sessionReply = vi.fn(async () => 'om_catalog_restart_failed');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1,
+      closeSession: vi.fn(), loadScheduledTaskForIdentity });
+    const notify = vi.fn(async () => {});
+    __testOnly_resetRestartCoordinator();
+    try {
+      const result = requestSessionRestart(ds, { source: 'slash', notify });
+      expect(result?.startFailure).toBeDefined();
+      expect(worker.send).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(ds.workerReady).toBe(true);
+      await vi.waitFor(() => expect(notify).toHaveBeenCalledWith('failed', expect.any(String)));
+      const expected = tr('worker.traex_auto_model.catalog_empty', {}, botLocale(getBot(ds.larkAppId).config));
+      expect(sessionReply.mock.calls.some(call => call[1] === expected)).toBe(true);
+    } finally {
+      __testOnly_resetRestartCoordinator();
     }
   });
 });
@@ -10241,6 +10308,53 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe(SCHEDULED_TURN);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('continues a turn that failed without any output by re-sending its input after cutting it, not by asking to continue', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    // What the daemon recorded from the worker's directFailure terminal.
+    ds.session.lastFailedTurn = {
+      turnId: SCHEDULED_TURN, userPrompt: 'hourly task prompt', cliInput: 'hourly task prompt',
+      failedAt: new Date().toISOString(), errorCode: 'provider_server_error', status: 'failed',
+      retryable: true, directFailure: true, retryCount: 0,
+    };
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    // Nothing ran, so there is no checkpoint: the worker is told to cut the
+    // failed turn and re-send its input (the recovery prompt is the fallback).
+    expect(continuation.content).toContain('[BOTMUX_RECOVERY]');
+    expect(continuation.failedTurnRewind).toEqual({
+      failedTurnId: SCHEDULED_TURN, failedInput: 'hourly task prompt', mode: 'resend', content: 'hourly task prompt',
+    });
+  });
+
+  it('a continuation re-sends only its own turn: a later failure of the session is not cut and re-sent in its place', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    // Another turn failed without output while the continuation waited.
+    ds.session.lastFailedTurn = {
+      turnId: 'om_newer', userPrompt: 'NEWER_TASK', cliInput: 'NEWER_TASK',
+      failedAt: new Date().toISOString(), errorCode: 'provider_server_error', status: 'failed',
+      retryable: true, directFailure: true, retryCount: 0,
+    };
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    expect(continuation.failedTurnRewind).toBeUndefined();
   });
 
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {

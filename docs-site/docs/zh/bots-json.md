@@ -349,7 +349,8 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
     "enabled": true,
     "intervalMinutes": 30,
     "text": "该会话已等待处理，请继续跟进。",
-    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"]
+    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"],
+    "quietHours": { "enabled": false, "start": "22:00", "end": "09:00" }
   }
 }
 ```
@@ -360,10 +361,12 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 | `intervalMinutes` | 提醒间隔（分钟），默认 30，范围 1–10080 |
 | `text` | 提醒文字，最多 500 字，不能包含 `<at>` 标签 |
 | `states` | 哪些状态要提醒：`idle`（CLI 空闲）、`dormant`（会话已休眠）、`pending_repo`（等选仓库）、`tui_prompt`（等终端里的选项）、`agent_attention`（agent 请求人处理）、`limited`（额度受限）。开启时至少选一个 |
+| `quietHours` | 可选。默认关闭，启用后默认每天 22:00 至次日 09:00。开始和结束时间使用 `HH:mm`，支持跨午夜，按 Botmux 服务本地时区计算 |
 
 - 只对按话题划分的会话生效（话题群、普通群里的话题、`p2pMode: "thread"` 的私聊）；整群或整个私聊共用一个会话时不提醒。会话要有 owner。
 - 状态一直不变时，每隔 `intervalMinutes` 提醒一次；状态变化或会话里有新消息时重新计时。
-- 手写时四个字段都要写全，缺一个或写错都会当作未配置（也就是关闭）。
+- 免打扰从开始时间（含）生效，在结束时间恢复。免打扰期间继续跟踪会话状态和活动，结束后的下一次扫描会发送仍符合条件的到期提醒。
+- 手写时须提供 `enabled`、`intervalMinutes`、`text` 和 `states`。填写 `quietHours` 时须提供其中的三个字段，且开始和结束时间不能相同。配置无效时，整个提醒配置视为未设置。
 
 **`noProgressNotify`**：一轮任务长时间没有可确认的新进展时，发一条提醒卡片。它只是提醒，不会重启、中断或重试任务。
 

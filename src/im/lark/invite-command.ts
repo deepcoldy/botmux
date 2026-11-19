@@ -1,6 +1,7 @@
 /**
  * 拉 bot 进群元命令：`@bot /invite @目标bot [@目标bot2 ...]`，也支持
  * `@bot /invite --app cli_xxx（可多个）` 直接按 app_id 拉任意飞书应用。
+ * `/invite all` 读取当前 bot 的 inviteConfig.agents；无参数仍只显示用法。
  *
  * 与 /grant 同款拦截模型（在 dispatcher 路由/spawn 之前处理，见 event-dispatcher）：
  *  - 必须明确 @ 本 bot 才执行（多 bot 群防重复处理）——执行方（inviter）必须本身
@@ -24,7 +25,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getBotOpenId } from '../../bot-registry.js';
+import { getBot, getBotOpenId, loadBotConfigs } from '../../bot-registry.js';
 import { isBotAdmin } from './grant-owner.js';
 import { config } from '../../config.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
@@ -32,12 +33,13 @@ import { stripLeadingMentions } from './message-parser.js';
 import { addBotToChat } from '../../services/groups-store.js';
 import { fetchTeamBotDirectory, hasAnyTeamDirectorySource } from '../../services/team-bot-directory.js';
 import type { TeamBotMatch } from '../../services/team-bot-directory.js';
-import { listChatBotMembers, replyMessage } from './client.js';
+import { isConfiguredBotInChat, listChatBotMembers, replyMessage } from './client.js';
 import type { ChatBotMember } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 import { parseTargetsAfterCommand, isCommandTargetOnly, stripAllMentions } from './mention-targets.js';
 import { normalizeBotsInfoRouteEntries } from '../../services/bots-info-shape.js';
+import { resolveGroupCreationAgents } from '../../services/group-creation-options.js';
 
 const INVITE_CMD_PATTERN = /\/invite\b/i;
 
@@ -96,21 +98,91 @@ export function parseInviteArgs(text: string, mentions: any[]): ParsedInviteArgs
   return { appIds: [...new Set(appIds)], badAppTokens, leftover: leftoverTokens.join(' ') };
 }
 
-/** 批量拉人；整批全失败且 >1 个时回退逐个拉（镜像 group-creator 的批处理回退）。 */
-async function addBotsResilient(larkAppId: string, chatId: string, ids: string[]) {
-  let results: { id: string; ok: boolean; error?: string }[] = [];
+type InviteInterruption = 'owner_changed' | 'defaults_changed';
+
+/** 批量拉人；每次写入前复查，整批失败时逐个回退，并保留中断前的实际结果。 */
+async function addBotsResilient(
+  larkAppId: string, chatId: string, ids: string[],
+  beforeWrite: () => InviteInterruption | undefined,
+) {
+  const results: { id: string; ok: boolean; error?: string }[] = [];
+  let interruption: InviteInterruption | undefined;
   for (let i = 0; i < ids.length; i += INVITE_BATCH_SIZE) {
+    interruption = beforeWrite();
+    if (interruption) break;
     const batch = ids.slice(i, i + INVITE_BATCH_SIZE);
     let r = await addBotToChat(larkAppId, chatId, batch);
     if (batch.length > 1 && r.every(x => !x.ok)) {
       // 整批失败可能是单个坏 id 拖累全批 → 逐个隔离重试，让好 id 落进去。
-      const perId: typeof r = [];
-      for (const id of batch) perId.push(...await addBotToChat(larkAppId, chatId, [id]));
-      r = perId;
+      for (const id of batch) {
+        interruption = beforeWrite();
+        if (interruption) break;
+        const retry = await addBotToChat(larkAppId, chatId, [id]);
+        r = [...r.filter(result => result.id !== id), ...retry];
+      }
     }
     results.push(...r);
+    if (interruption) break;
   }
-  return results;
+  return { results, interruption };
+}
+
+const INVITE_QUEUE_WAIT_MS = 5000;
+class InviteQueueTimeoutError extends Error {}
+
+interface InviteQueueItem {
+  execute: () => Promise<void>;
+  expire: () => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+}
+interface InviteQueue {
+  active: boolean;
+  waiters: InviteQueueItem[];
+}
+const inviteQueues = new Map<string, InviteQueue>();
+
+function deleteInviteQueueIfIdle(key: string, queue: InviteQueue) {
+  if (!queue.active && queue.waiters.length === 0 && inviteQueues.get(key) === queue) inviteQueues.delete(key);
+}
+
+function startNextInvite(key: string, queue: InviteQueue) {
+  if (queue.active) return;
+  const next = queue.waiters.shift();
+  if (!next) {
+    deleteInviteQueueIfIdle(key, queue);
+    return;
+  }
+  queue.active = true;
+  if (next.timer) clearTimeout(next.timer);
+  const finish = () => {
+    queue.active = false;
+    startNextInvite(key, queue);
+  };
+  void next.execute().then(finish, finish);
+}
+
+/** Strictly serialize side effects; a stuck predecessor turns later commands into bounded retries, never concurrent writes. */
+function serializeInvite<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const queue = inviteQueues.get(key) ?? { active: false, waiters: [] };
+  inviteQueues.set(key, queue);
+  return new Promise<T>((resolve, reject) => {
+    const item: InviteQueueItem = {
+      execute: async () => {
+        try { resolve(await run()); } catch (err) { reject(err); }
+      },
+      expire: () => {
+        const index = queue.waiters.indexOf(item);
+        if (index < 0) return;
+        queue.waiters.splice(index, 1);
+        reject(new InviteQueueTimeoutError());
+        deleteInviteQueueIfIdle(key, queue);
+      },
+      timer: undefined,
+    };
+    item.timer = setTimeout(item.expire, INVITE_QUEUE_WAIT_MS);
+    queue.waiters.push(item);
+    startNextInvite(key, queue);
+  });
 }
 
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
@@ -162,139 +234,190 @@ export async function tryHandleInviteCommand(
 
   const mentionTargets = parseTargetsAfterCommand(message, myOpenId, INVITE_CMD_PATTERN);
   const args = parseInviteArgs(text, message?.mentions ?? []);
-  if (args.badAppTokens.length > 0 || args.leftover) {
+  const usingDefaults = /^all$/i.test(args.leftover);
+  const hasExplicitTargets = mentionTargets.length > 0 || args.appIds.length > 0;
+  if (args.badAppTokens.length > 0 || (args.leftover && !usingDefaults)
+      || (usingDefaults && hasExplicitTargets) || (!usingDefaults && !hasExplicitTargets)) {
     await reply('cmd.invite.usage');
     return true;
   }
-  if (mentionTargets.length === 0 && args.appIds.length === 0) {
-    await reply('cmd.invite.usage');
+  return serializeInvite(JSON.stringify([larkAppId, chatId]), async () => {
+    // A queued command may outlive an admin/configuration change.
+    if (!isBotAdmin(larkAppId, senderOpenId)) {
+      await reply('cmd.invite.owner_only');
+      return true;
+    }
+    const botsInfo = readBotsInfoEntries();
+    let appIds = args.appIds;
+    let expectedAgents: string | undefined;
+    if (usingDefaults) {
+      const refs = getBot(larkAppId).config.inviteConfig?.agents;
+      if (!refs?.length) {
+        await reply('cmd.invite.no_defaults');
+        return true;
+      }
+      expectedAgents = JSON.stringify(refs);
+      try {
+        // Resolve the entire list before any invitation; a stale or ambiguous
+        // default must not silently invite only part of the intended team.
+        appIds = resolveGroupCreationAgents(refs, loadBotConfigs(), botsInfo);
+      } catch (err) {
+        await reply('cmd.invite.invalid_defaults', { reason: err instanceof Error ? err.message : String(err) });
+        return true;
+      }
+    }
+
+    // Discovery tolerates partial query failures. Keep that behavior for explicit
+    // targets; defaults use strict per-app membership below so unknown != absent.
+    let roster: ChatBotMember[] = [];
+    if (!usingDefaults) {
+      try {
+        roster = await listChatBotMembers(larkAppId, chatId);
+      } catch (e: any) {
+        logger.warn(`[invite:${larkAppId}] failed to list chat bot members (already-in-chat detection degraded): ${e?.message ?? e}`);
+      }
+    }
+    const rosterOpenIds = new Set(roster.map(m => m.openId));
+    const rosterAppIds = new Set(roster.map(m => m.larkAppId).filter(Boolean));
+    if (usingDefaults) {
+      try {
+        for (const appId of appIds) {
+          if (appId !== larkAppId && await isConfiguredBotInChat(appId, chatId)) rosterAppIds.add(appId);
+        }
+      } catch (err) {
+        logger.warn(`[invite:${larkAppId}] default target membership unknown: ${err}`);
+        await reply('cmd.invite.roster_unavailable');
+        return true;
+      }
+    }
+    const rosterNameById = new Map(roster.filter(m => m.larkAppId).map(m => [m.larkAppId, m.displayName || m.name || m.larkAppId]));
+
+    const byLowerName = new Map<string, BotsInfoEntry[]>();
+    for (const e of botsInfo) {
+      const k = e.botName?.toLowerCase();
+      if (!k) continue;
+      (byLowerName.get(k) ?? byLowerName.set(k, []).get(k)!).push(e);
+    }
+    /** 团队目录解析出的 appId → 展示名（本机花名册查不到的跨部署 bot，避免结果里退化成裸 appId）。 */
+    const resolvedNameById = new Map<string, string>();
+    const nameOf = (appId: string) =>
+      botsInfo.find(e => e.larkAppId === appId)?.botName ?? rosterNameById.get(appId) ?? resolvedNameById.get(appId) ?? appId;
+
+    const toInvite: string[] = [];
+    const already: string[] = [];
+    const unresolved: string[] = [];
+    const ambiguous: string[] = [];
+    /** 无 app_id 的名字目标，待「本机花名册 + 团队目录」合并后统一解析（跨部署「同团队」bot 走这里）。 */
+    const nameTargets: Array<{ name: string }> = [];
+
+    for (const tgt of mentionTargets) {
+      // 已在群内：open_id 命中 live 成员表即跳过（app_id 形态目标无 open_id，靠下方 appId 分支的 rosterAppIds 判定）。
+      if (tgt.openId && rosterOpenIds.has(tgt.openId)) { already.push(tgt.name); continue; }
+      // 目标 mention 自带 app_id（飞书对「群外 bot」的 @ 形态）→ app_id 就是待拉 id，
+      // 直接用，跳过名字→花名册解析（更可靠，规避重名/查无）。
+      if (tgt.appId) {
+        if (tgt.appId === larkAppId || rosterAppIds.has(tgt.appId)) already.push(tgt.name);
+        else if (!toInvite.includes(tgt.appId)) toInvite.push(tgt.appId);
+        continue;
+      }
+      // 仅有 open_id（无 app_id）：按显示名解析 app_id。⚠️ 不在这里就地按本机单候选
+      // 定案——「本机同名恰好 1 个」并不代表唯一：跨部署「同团队」可能有另一个同名
+      // 不同 app（用户 @ 的正是远端那个但 mention 没带 app_id）。就地拿本机的会静默
+      // 拉错 bot（还连带把错 bot 的 owner 拉进群）。攒起来，下面把本机 + 团队候选
+      // 合并去重后统一判歧义。
+      if (tgt.name) nameTargets.push({ name: tgt.name });
+      else unresolved.push(tgt.name || tgt.openId);
+    }
+
+    // 统一解析无 app_id 的名字目标：把「本机花名册」与「团队目录」的同名候选
+    // 合并、按 appId 去重后再判定——不能用「本机同名恰好 1 个」就地定案（那会让
+    // 一个跨部署同名不同 app 的目标被静默拉成本机的那个）。
+    //   · 合并后唯一 appId → 拉它；
+    //   · 合并后多个不同 appId（跨本机↔团队 / 跨源）→ 报歧义（带来源标注）；
+    //   · 两边都查无 → unresolved。
+    // 团队目录整载一次、按名索引复用；仅在有名字目标 **且** 有团队源时才装载
+    // （无团队源 → 只用本机花名册，且不发 hub HTTP）。
+    if (nameTargets.length > 0) {
+      const teamByLowerName = new Map<string, TeamBotMatch[]>();
+      if (hasAnyTeamDirectorySource(config.session.dataDir)) {
+        const dir = await fetchTeamBotDirectory(config.session.dataDir);
+        for (const m of dir) {
+          const k = m.botName.trim().toLowerCase();
+          (teamByLowerName.get(k) ?? teamByLowerName.set(k, []).get(k)!).push(m);
+        }
+      }
+      for (const nt of nameTargets) {
+        const key = nt.name.trim().toLowerCase();
+        // 本机花名册候选（source=local）+ 团队目录候选，按 appId 去重（同一 app 可能
+        // 两边都出现）。展示名优先本机，其次团队目录。
+        const byAppId = new Map<string, { larkAppId: string; botName: string; source: string }>();
+        for (const e of (byLowerName.get(key) ?? [])) {
+          if (!byAppId.has(e.larkAppId)) byAppId.set(e.larkAppId, { larkAppId: e.larkAppId, botName: e.botName ?? nt.name, source: 'local' });
+        }
+        for (const m of (teamByLowerName.get(key) ?? [])) {
+          if (!byAppId.has(m.larkAppId)) byAppId.set(m.larkAppId, { larkAppId: m.larkAppId, botName: m.botName, source: m.source });
+        }
+        const merged = [...byAppId.values()];
+        if (merged.length === 1) {
+          const { larkAppId: appId, botName } = merged[0];
+          resolvedNameById.set(appId, botName);
+          if (appId === larkAppId || rosterAppIds.has(appId)) already.push(nt.name);
+          else if (!toInvite.includes(appId)) toInvite.push(appId);
+        } else if (merged.length > 1) {
+          ambiguous.push(t('cmd.invite.ambiguous_item', {
+            name: nt.name,
+            apps: merged.map(m => `${m.larkAppId}(${m.source})`).join('、'),
+          }, loc));
+        } else {
+          unresolved.push(nt.name);
+        }
+      }
+    }
+
+    for (const appId of appIds) {
+      if (appId === larkAppId || rosterAppIds.has(appId)) already.push(nameOf(appId));
+      else if (!toInvite.includes(appId)) toInvite.push(appId);
+    }
+
+    const added: string[] = [];
+    const failed: string[] = [];
+    let interruption: InviteInterruption | undefined;
+    if (toInvite.length > 0) {
+      const outcome = await addBotsResilient(larkAppId, chatId, toInvite, () => {
+        if (!isBotAdmin(larkAppId, senderOpenId)) return 'owner_changed';
+        if (usingDefaults && JSON.stringify(getBot(larkAppId).config.inviteConfig?.agents) !== expectedAgents) {
+          return 'defaults_changed';
+        }
+        return undefined;
+      });
+      interruption = outcome.interruption;
+      for (const r of outcome.results) {
+        if (r.ok) added.push(nameOf(r.id));
+        else failed.push(t('cmd.invite.failed_item', { name: nameOf(r.id), reason: r.error ?? 'unknown' }, loc));
+      }
+    }
+
+    const sections: string[] = [];
+    if (added.length) sections.push(t('cmd.invite.ok', { names: added.join('、') }, loc));
+    if (already.length) sections.push(t('cmd.invite.already', { names: [...new Set(already)].join('、') }, loc));
+    if (unresolved.length) sections.push(t('cmd.invite.unresolved', { names: [...new Set(unresolved)].join('、') }, loc));
+    if (ambiguous.length) sections.push(...ambiguous);
+    if (failed.length) sections.push(...failed);
+    if (interruption) sections.push(t(`cmd.invite.${interruption}`, undefined, loc));
+    const body = sections.join('\n') || t('cmd.invite.usage', undefined, loc);
+    await replyMessage(larkAppId, messageId,
+      toInvite.length > 0 || already.length > 0 ? t('cmd.invite.header', undefined, loc) + '\n' + body : body,
+    ).catch(err => logger.debug(`invite result reply failed: ${err}`));
+    logger.info(
+      `[invite:${larkAppId}] chat=${chatId} added=[${added}] already=[${already}] ` +
+      `unresolved=[${unresolved}] ambiguous=${ambiguous.length} failed=[${failed}]`,
+    );
     return true;
-  }
-
-  // live 群 bot 成员表：already-in-chat 判定的权威源。拿不到就降级为空表——
-  // 飞书 API 自身对重复拉人也是幂等报错，不至于出错事（与 /group 对 listChatBotMembers
-  // 的容错一致）。
-  let roster: ChatBotMember[] = [];
-  try {
-    roster = await listChatBotMembers(larkAppId, chatId);
-  } catch (e: any) {
-    logger.warn(`[invite:${larkAppId}] failed to list chat bot members (already-in-chat detection degraded): ${e?.message ?? e}`);
-  }
-  const rosterOpenIds = new Set(roster.map(m => m.openId));
-  const rosterAppIds = new Set(roster.map(m => m.larkAppId).filter(Boolean));
-  const rosterNameById = new Map(roster.filter(m => m.larkAppId).map(m => [m.larkAppId, m.displayName || m.name || m.larkAppId]));
-
-  const botsInfo = readBotsInfoEntries();
-  const byLowerName = new Map<string, BotsInfoEntry[]>();
-  for (const e of botsInfo) {
-    const k = e.botName?.toLowerCase();
-    if (!k) continue;
-    (byLowerName.get(k) ?? byLowerName.set(k, []).get(k)!).push(e);
-  }
-  /** 团队目录解析出的 appId → 展示名（本机花名册查不到的跨部署 bot，避免结果里退化成裸 appId）。 */
-  const resolvedNameById = new Map<string, string>();
-  const nameOf = (appId: string) =>
-    botsInfo.find(e => e.larkAppId === appId)?.botName ?? rosterNameById.get(appId) ?? resolvedNameById.get(appId) ?? appId;
-
-  const toInvite: string[] = [];
-  const already: string[] = [];
-  const unresolved: string[] = [];
-  const ambiguous: string[] = [];
-  /** 无 app_id 的名字目标，待「本机花名册 + 团队目录」合并后统一解析（跨部署「同团队」bot 走这里）。 */
-  const nameTargets: Array<{ name: string }> = [];
-
-  for (const tgt of mentionTargets) {
-    // 已在群内：open_id 命中 live 成员表即跳过（app_id 形态目标无 open_id，靠下方 appId 分支的 rosterAppIds 判定）。
-    if (tgt.openId && rosterOpenIds.has(tgt.openId)) { already.push(tgt.name); continue; }
-    // 目标 mention 自带 app_id（飞书对「群外 bot」的 @ 形态）→ app_id 就是待拉 id，
-    // 直接用，跳过名字→花名册解析（更可靠，规避重名/查无）。
-    if (tgt.appId) {
-      if (tgt.appId === larkAppId || rosterAppIds.has(tgt.appId)) already.push(tgt.name);
-      else if (!toInvite.includes(tgt.appId)) toInvite.push(tgt.appId);
-      continue;
+  }).catch(async err => {
+    if (err instanceof InviteQueueTimeoutError) {
+      await reply('cmd.invite.queue_timeout');
+      return true;
     }
-    // 仅有 open_id（无 app_id）：按显示名解析 app_id。⚠️ 不在这里就地按本机单候选
-    // 定案——「本机同名恰好 1 个」并不代表唯一：跨部署「同团队」可能有另一个同名
-    // 不同 app（用户 @ 的正是远端那个但 mention 没带 app_id）。就地拿本机的会静默
-    // 拉错 bot（还连带把错 bot 的 owner 拉进群）。攒起来，下面把本机 + 团队候选
-    // 合并去重后统一判歧义。
-    if (tgt.name) nameTargets.push({ name: tgt.name });
-    else unresolved.push(tgt.name || tgt.openId);
-  }
-
-  // 统一解析无 app_id 的名字目标：把「本机花名册」与「团队目录」的同名候选
-  // 合并、按 appId 去重后再判定——不能用「本机同名恰好 1 个」就地定案（那会让
-  // 一个跨部署同名不同 app 的目标被静默拉成本机的那个）。
-  //   · 合并后唯一 appId → 拉它；
-  //   · 合并后多个不同 appId（跨本机↔团队 / 跨源）→ 报歧义（带来源标注）；
-  //   · 两边都查无 → unresolved。
-  // 团队目录整载一次、按名索引复用；仅在有名字目标 **且** 有团队源时才装载
-  // （无团队源 → 只用本机花名册，且不发 hub HTTP）。
-  if (nameTargets.length > 0) {
-    const teamByLowerName = new Map<string, TeamBotMatch[]>();
-    if (hasAnyTeamDirectorySource(config.session.dataDir)) {
-      const dir = await fetchTeamBotDirectory(config.session.dataDir);
-      for (const m of dir) {
-        const k = m.botName.trim().toLowerCase();
-        (teamByLowerName.get(k) ?? teamByLowerName.set(k, []).get(k)!).push(m);
-      }
-    }
-    for (const nt of nameTargets) {
-      const key = nt.name.trim().toLowerCase();
-      // 本机花名册候选（source=local）+ 团队目录候选，按 appId 去重（同一 app 可能
-      // 两边都出现）。展示名优先本机，其次团队目录。
-      const byAppId = new Map<string, { larkAppId: string; botName: string; source: string }>();
-      for (const e of (byLowerName.get(key) ?? [])) {
-        if (!byAppId.has(e.larkAppId)) byAppId.set(e.larkAppId, { larkAppId: e.larkAppId, botName: e.botName ?? nt.name, source: 'local' });
-      }
-      for (const m of (teamByLowerName.get(key) ?? [])) {
-        if (!byAppId.has(m.larkAppId)) byAppId.set(m.larkAppId, { larkAppId: m.larkAppId, botName: m.botName, source: m.source });
-      }
-      const merged = [...byAppId.values()];
-      if (merged.length === 1) {
-        const { larkAppId: appId, botName } = merged[0];
-        resolvedNameById.set(appId, botName);
-        if (appId === larkAppId || rosterAppIds.has(appId)) already.push(nt.name);
-        else if (!toInvite.includes(appId)) toInvite.push(appId);
-      } else if (merged.length > 1) {
-        ambiguous.push(t('cmd.invite.ambiguous_item', {
-          name: nt.name,
-          apps: merged.map(m => `${m.larkAppId}(${m.source})`).join('、'),
-        }, loc));
-      } else {
-        unresolved.push(nt.name);
-      }
-    }
-  }
-
-  for (const appId of args.appIds) {
-    if (appId === larkAppId || rosterAppIds.has(appId)) already.push(nameOf(appId));
-    else if (!toInvite.includes(appId)) toInvite.push(appId);
-  }
-
-  const added: string[] = [];
-  const failed: string[] = [];
-  if (toInvite.length > 0) {
-    const results = await addBotsResilient(larkAppId, chatId, toInvite);
-    for (const r of results) {
-      if (r.ok) added.push(nameOf(r.id));
-      else failed.push(t('cmd.invite.failed_item', { name: nameOf(r.id), reason: r.error ?? 'unknown' }, loc));
-    }
-  }
-
-  const sections: string[] = [];
-  if (added.length) sections.push(t('cmd.invite.ok', { names: added.join('、') }, loc));
-  if (already.length) sections.push(t('cmd.invite.already', { names: [...new Set(already)].join('、') }, loc));
-  if (unresolved.length) sections.push(t('cmd.invite.unresolved', { names: [...new Set(unresolved)].join('、') }, loc));
-  if (ambiguous.length) sections.push(...ambiguous);
-  if (failed.length) sections.push(...failed);
-  const body = sections.join('\n') || t('cmd.invite.usage', undefined, loc);
-  await replyMessage(larkAppId, messageId,
-    toInvite.length > 0 || already.length > 0 ? t('cmd.invite.header', undefined, loc) + '\n' + body : body,
-  ).catch(err => logger.debug(`invite result reply failed: ${err}`));
-  logger.info(
-    `[invite:${larkAppId}] chat=${chatId} added=[${added}] already=[${already}] ` +
-    `unresolved=[${unresolved}] ambiguous=${ambiguous.length} failed=[${failed}]`,
-  );
-  return true;
+    throw err;
+  });
 }

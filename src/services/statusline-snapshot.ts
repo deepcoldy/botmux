@@ -34,11 +34,19 @@ export interface StatuslineSnapshot {
   sevenDayResetsAtMs?: number;
   /** model.id，仅存档；卡片的 runtime 段另有来源。 */
   model?: string;
+  /** Claude's effort.level: effective runtime effort, after model-specific clamping. */
+  reasoningEffort?: ClaudeStatuslineEffort;
   transcriptPath?: string;
   /** Claude 自己的 session_id（≠ botmux sessionId）。 */
   claudeSessionId?: string;
   /** 写入时刻（ms）。 */
   ts: number;
+}
+
+export type ClaudeStatuslineEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export function isClaudeStatuslineEffort(value: unknown): value is ClaudeStatuslineEffort {
+  return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max';
 }
 
 /** 卡片用量段需要的子集（md-card 的 `CardUsageSnapshot.quota` 复用此类型）。 */
@@ -111,6 +119,7 @@ export function parseStatuslinePayload(raw: unknown, now: number = Date.now()): 
   set('sevenDayPercent', percent(seven?.used_percentage));
   set('sevenDayResetsAtMs', resetsAtMs(seven?.resets_at));
   set('model', nonEmptyString(o.model?.id));
+  set('reasoningEffort', isClaudeStatuslineEffort(o.effort?.level) ? o.effort.level : undefined);
   set('transcriptPath', nonEmptyString(o.transcript_path));
   set('claudeSessionId', nonEmptyString(o.session_id));
   return snap;
@@ -143,6 +152,7 @@ function readSnapshotFile(path: string): StatuslineSnapshot | undefined {
   if (p(o.sevenDayPercent) !== undefined) snap.sevenDayPercent = p(o.sevenDayPercent);
   if (ms(o.sevenDayResetsAtMs) !== undefined) snap.sevenDayResetsAtMs = ms(o.sevenDayResetsAtMs);
   if (nonEmptyString(o.model)) snap.model = o.model as string;
+  if (isClaudeStatuslineEffort(o.reasoningEffort)) snap.reasoningEffort = o.reasoningEffort;
   if (nonEmptyString(o.transcriptPath)) snap.transcriptPath = o.transcriptPath as string;
   if (nonEmptyString(o.claudeSessionId)) snap.claudeSessionId = o.claudeSessionId as string;
   return snap;

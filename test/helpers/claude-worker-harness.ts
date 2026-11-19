@@ -89,19 +89,25 @@ const record = o => {
     uuid: randomUUID(), timestamp: new Date().toISOString(), sessionId: sid, cwd: cfg.workingDir, ...o,
   }) + '\\n');
 };
-// Claude's own pid-state record, rewritten in place the way Claude does (never
-// through a rename): the worker has to read through a torn record. Withheld
-// until the gate file exists when the scenario wants a transcript nobody can
-// locate.
+// Default: rewrite in place the way Claude does, so the worker has to read
+// through a torn record. Runtime-handoff tests opt into atomic publication:
+// they control whether identity exists, rather than racing the 200ms writer.
+// Withheld until the gate file exists when the scenario wants a transcript
+// nobody can locate.
 const pidState = () => {
   if (cfg.pidStateGate && !fs.existsSync(cfg.pidStateGate)) return;
   fs.mkdirSync(path.join(cfg.claudeDir, 'sessions'), { recursive: true });
-  fs.writeFileSync(path.join(cfg.claudeDir, 'sessions', process.pid + '.json'), JSON.stringify({
+  const file = path.join(cfg.claudeDir, 'sessions', process.pid + '.json');
+  const contents = JSON.stringify({
     pid: process.pid, cwd: cfg.workingDir, procStart, kind: 'interactive',
     // 2.1.123 keeps the spawn-time sessionId in the record across /clear.
     sessionId: cfg.stalePidState ? spawnSid : sid,
     version: cfg.stalePidState ? '2.1.123' : '2.1.305',
-  }));
+  });
+  if (cfg.atomicPidState) {
+    fs.writeFileSync(file + '.tmp', contents);
+    fs.renameSync(file + '.tmp', file);
+  } else fs.writeFileSync(file, contents);
 };
 // Claude holds the active session's tasks dir open, across /clear too.
 let tasksLock;
@@ -412,6 +418,10 @@ export async function cleanUpClaudeHarnesses(): Promise<void> {
 export function setupFakeClaude(opts: {
   turnMs: number;
   pidStateGated?: boolean;
+  /** Keep an existing PID identity readable across periodic writes. Opt-in
+   *  for runtime-handoff tests; default in-place writes retain torn-record
+   *  coverage, and pidStateGated still controls missing-identity scenarios. */
+  atomicPidState?: boolean;
   history?: { sid: string; reply: string };
   /** Launch the fake through a layer botmux does not know: a launcher that
    *  runs it as a child instead of exec'ing it.
@@ -465,6 +475,7 @@ export function setupFakeClaude(opts: {
     events, claudeDir, workingDir, notifyDir, clearSid, forkSid, turnMs: opts.turnMs,
     projectDir: dirname(transcript(sessionId)),
     ...(opts.pidStateGated ? { pidStateGate } : {}),
+    ...(opts.atomicPidState ? { atomicPidState: true } : {}),
     ...(opts.stalePidState ? { stalePidState: true, holdTasksDir: true } : {}),
     ...(opts.unknownLayer === 'cli-named-launcher' ? { commAsClaude: true } : {}),
     ...(opts.startupTicker ? { startupTicker: true } : {}),

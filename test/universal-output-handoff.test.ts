@@ -43,6 +43,15 @@ describe('journal app identity', () => {
   });
 });
 
+it('preserves the first reply model without changing the final output identity', () => {
+  const db = database();
+  const first = outputSnapshot(app, { ...output, replyModel: 'gemini-4-carbon-high' });
+  db.accept(first, { kind: 'managed' });
+  const replay = outputSnapshot(app, output);
+  expect(replay.fingerprint).toBe(first.fingerprint);
+  expect(db.accept(replay, { kind: 'managed' }).output.replyModel).toBe('gemini-4-carbon-high');
+});
+
 describe('attention lifecycle', () => {
   const loadRunOutput = (scope: Record<string, any>) =>
     loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);

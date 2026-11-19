@@ -29,6 +29,7 @@ import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drai
 import { deriveSessionTaskStatus } from '../src/core/session-task-status.js';
 import {
   classifyTurnOutcome,
+  excludedTurnActivityAt,
   holdLastTurnThrough,
   isMaintenanceTurnId,
   isTurnOutcomeExcluded,
@@ -344,6 +345,22 @@ describe('holdLastTurnThrough', () => {
     ds.lastMessageAt = clock - 5;
     expect(holdLastTurnThrough(ds, clock)).toBeUndefined();
     expect(h.writes).toEqual([]);
+  });
+});
+
+describe('excludedTurnActivityAt', () => {
+  it('keeps accepted trigger activity aligned with the registration clock', () => {
+    const ds = makeDs('s-excluded-activity');
+    ds.asyncTriggerResults = new Map([['http', { status: 'pending', createdAt: clock - 1_000 }]]);
+    // Acceptance may happen after registration. The terminal hold must use the
+    // same registration timestamp, not the later wall-clock acceptance time.
+    expect(excludedTurnActivityAt(ds, 'http')).toBe(clock - 1_000);
+    ds.asyncTriggerResults = undefined;
+    ds.pendingWaitPromises = new Map([['http', { resolve: () => undefined, createdAt: clock - 2_000 }]]);
+    expect(excludedTurnActivityAt(ds, 'http')).toBe(clock - 2_000);
+    ds.pendingWaitPromises = undefined;
+    noteTurnStarted(ds, 'http', clock - 3_000);
+    expect(excludedTurnActivityAt(ds, 'http')).toBe(clock - 3_000);
   });
 });
 

@@ -9,6 +9,7 @@ import {
   __providerAuthTrackedForTest, __resetProviderAuthForTest, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
 } from '../src/core/provider-auth-request.js';
 import type { MeegoLoginRequest } from '../src/services/meego-auth.js';
+import type { BytedcliLoginStart } from '../src/services/bytedcli-auth.js';
 
 const MEEGO_URL = 'https://meego.example/device?code=M1';
 const BYTED_URL = 'https://sso.example/device?user_code=B1';
@@ -27,7 +28,7 @@ beforeEach(() => {
     requestMeegoLogin: vi.fn(async () => meego),
     bytedcliAuthorized: vi.fn(async () => false as boolean | 'unknown'),
     adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none'),
-    beginBytedcliLogin: vi.fn(async () => ({ authUrl: BYTED_URL })),
+    startBytedcliLogin: vi.fn(async () => ({ state: 'challenge', challenge: { authUrl: BYTED_URL, completeToken: 'tok-b' } }) as BytedcliLoginStart),
     deliver: vi.fn(async () => delivery),
     now: () => clock,
   };
@@ -147,7 +148,7 @@ describe('requestProviderAuth — ByteCloud', () => {
   it('authorized meanwhile: ready, no new login started', async () => {
     deps.bytedcliAuthorized = vi.fn(async () => true);
     expect((await ask('bytedcli')).status).toBe('ready');
-    expect(deps.beginBytedcliLogin).not.toHaveBeenCalled();
+    expect(deps.startBytedcliLogin).not.toHaveBeenCalled();
     expect(deps.deliver).not.toHaveBeenCalled();
   });
 
@@ -160,9 +161,25 @@ describe('requestProviderAuth — ByteCloud', () => {
     expect(r.message).not.toContain(BYTED_URL);
   });
 
-  it('a login that cannot be started is unavailable', async () => {
-    deps.beginBytedcliLogin = vi.fn(async () => null);
-    expect((await ask('bytedcli')).status).toBe('unavailable');
+  it('a login that cannot be started is unavailable, and the agent hears bytedcli\'s reason', async () => {
+    deps.startBytedcliLogin = vi.fn(async () => ({ state: 'failed', detail: 'AUTH_REQUIRED: Not authenticated' }) as BytedcliLoginStart);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(r.message).toContain('AUTH_REQUIRED: Not authenticated');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  // bytedcli 0.186+ answers `--begin` with the login it already holds. That
+  // used to come back as "cannot start a login" although the person was
+  // authorized; it is the same outcome as finding the login up front.
+  it('a start that finds an existing login is ready and hands it to the turn', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => 'unknown' as boolean | 'unknown');
+    deps.startBytedcliLogin = vi.fn(async () => ({ state: 'authorized' }) as BytedcliLoginStart);
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'adopted' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('ready');
+    expect(r.message).toContain('直接重试');
+    expect(deps.adoptBytedcliForTurn).toHaveBeenCalledWith('ou_alice');
     expect(deps.deliver).not.toHaveBeenCalled();
   });
 

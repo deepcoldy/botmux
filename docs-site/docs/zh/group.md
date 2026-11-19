@@ -129,6 +129,26 @@ botmux 里有两种「会话群」，本页都会讲到：
 - `--no-agents`、`--no-tag`、`--avatar off` 只去掉默认值，不会踢掉你明确 @ 的机器人。
 - 没配 `groupCreation` 也没传参数时，只有当前机器人和你 @ 的机器人入群。
 
+### 在已有群里补齐机器人
+
+每个机器人可在自己的 `bots.json` 条目中配置独立的邀请名单：
+
+```json
+{
+  "inviteConfig": {
+    "agents": ["cli_review_app", "cli_build_app"]
+  }
+}
+```
+
+也可以发 `@机器人 /botconfig set inviteConfig {"agents":["Review","Build"]}` 即时保存，`@机器人 /botconfig unset inviteConfig` 清空。该配置与 `/g` 的 `groupCreation` 独立，不会自动继承或迁移建群名单。
+
+群内的 Bot 管理员发 `@机器人 /invite all` 时，才按该机器人的 `inviteConfig.agents` 补齐成员。名称和 App ID 与 `/g` 使用同样的解析规则，目标须是本部署已配置的飞书机器人。同一 App ID 只邀请一次，当前机器人及已在群内的机器人会跳过；名称不明或有歧义、成员状态无法确认时，整份名单不执行邀请。名单为空时提示先配置，部分邀请失败后可重发命令补齐剩余成员。
+
+不带参数的 `@机器人 /invite` 仍只显示用法。`@机器人 /invite @目标` 和 `/invite --app cli_xxx` 继续只处理指定目标，不读取默认名单。`all` 不能与显式目标混用；邀请不会修改群名、分组或头像。
+
+执行期间撤销管理员权限或修改、清空默认名单，会停止尚未发出的邀请；已完成的邀请保留。确认权限和名单后，可以重新执行 `/invite all`。
+
 ## 在 Dashboard 里建群
 
 不想敲命令的话，打开 `botmux dashboard` 的 **群组管理** 页，点「新建群聊」：
@@ -245,3 +265,16 @@ botmux 里有两种「会话群」，本页都会讲到：
 - 机器人是群主，并且群里只有它一个机器人。飞书没法事先确认其它情况下能不能解散，所以不满足时机器人直接回复没有权限，一个会话都不关。
 
 确认卡片列出本群里本机所有机器人的会话（话题群里每个话题的会话都在内），并说明会解散整个群、群里所有人都受影响。确认后先关闭这些会话，全部关干净才解散群，结果同样私聊通知你。中途停下的情况和上面一样。
+
+## 用户进新群时自动带上机器人
+
+每个 Bot 的 `ownerGroupFollow` 默认关闭。开启后，机器人用主人本人的用户授权检查新加入的群，默认每 60 秒一次；第一次完整扫描只记录已有群，之后才邀请机器人加入新群。
+
+```text
+@机器人 /botconfig set ownerGroupFollow {"enabled":true,"excludeChatIds":["oc_example"]}
+@机器人 /botconfig unset ownerGroupFollow
+```
+
+开关位于 Dashboard「Bot 默认设置 → 常用 → 工作目录」。需要主人授权获取群列表、添加群成员及持续访问，可使用 `/login --scope im:chat:read im:chat.members:write_only offline_access`；应用也需开通对应用户权限。已有平台授权按本 Bot 的凭据策略复用。
+
+排除群不邀请，机器人被移出后不再补拉；关闭后重新开启只建立新基线。群邀请权限和外部群能力限制仍然适用，失败会私聊提示主人。此功能是定期检查，不能保证捕获两次扫描之间短暂的进群再退群。

@@ -46,6 +46,7 @@ export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
   const audience = optionalString(record.audience);
   const dependencies = readDependencies(record.dependencies);
   const service = readService(record.service);
+  if (record.prerequisites !== undefined && record.prerequisites !== true) throw new Error('invalid_plugin_prerequisites');
   return {
     schemaVersion: 1,
     id,
@@ -53,6 +54,7 @@ export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
     ...(audience ? { audience } : {}),
     ...(dependencies ? { dependencies } : {}),
     ...(service ? { service } : {}),
+    ...(record.prerequisites === true ? { prerequisites: true as const } : {}),
   };
 }
 

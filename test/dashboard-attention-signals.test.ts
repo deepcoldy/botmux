@@ -86,6 +86,12 @@ describe('attention signals', () => {
     expect(quiet.tuiPromptActive).toBe(false);
   });
 
+  it('composeRowFromActive exposes live background work for the kanban keep-on-board rule', () => {
+    const active = makeDs({ worker: {} as any, lastScreenStatus: 'idle', backgroundTaskCount: 2 });
+    expect(composeRowFromActive(active).backgroundTaskCount).toBe(2);
+    expect(composeRowFromActive(makeDs({ worker: {} as any, lastScreenStatus: 'idle' })).backgroundTaskCount).toBeUndefined();
+  });
+
   it('projects the frozen runtime identity without changing the adapter id', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex';

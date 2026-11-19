@@ -38,17 +38,23 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-// Mock config so we can point session.dataDir at a temp directory
+// Override the store directory while retaining real configuration helpers
+// used by the integrated worktree creation path.
 let tempDir: string;
 let testWorktreeDirs = new Set<string>();
 
-vi.mock('../src/config.js', () => ({
-  config: {
-    session: {
-      get dataDir() { return tempDir; },
+vi.mock('../src/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/config.js')>();
+  return {
+    ...actual,
+    config: {
+      ...actual.config,
+      session: {
+        get dataDir() { return tempDir; },
+      },
     },
-  },
-}));
+  };
+});
 
 // Mock logger to suppress output
 vi.mock('../src/utils/logger.js', () => ({

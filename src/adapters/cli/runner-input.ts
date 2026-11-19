@@ -47,12 +47,14 @@ export function encodeRunnerInput(
   replyTurnId?: string,
   codexAppSteerable?: boolean,
   trustedCaller?: TrustedCaller,
+  replyDispatchAttempt?: number,
 ): string {
   const payload = {
     type: 'message' as const,
     content,
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
+    ...(replyDispatchAttempt !== undefined ? { replyDispatchAttempt } : {}),
     ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
     ...(trustedCaller ? { trustedCaller } : {}),
   };
@@ -98,8 +100,9 @@ export async function writeRunnerInput(
   replyTurnId?: string,
   codexAppSteerable?: boolean,
   trustedCaller?: TrustedCaller,
+  replyDispatchAttempt?: number,
 ): Promise<{ submitted: boolean; submissionDisposition: RunnerSubmissionDisposition }> {
-  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput, replyTurnId, codexAppSteerable, trustedCaller)}`;
+  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput, replyTurnId, codexAppSteerable, trustedCaller, replyDispatchAttempt)}`;
 
   // Non-tmux fallback (raw PTY): a single write is fine — there's no send-keys
   // process to time out, and the PTY write isn't bounded the same way.

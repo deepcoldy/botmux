@@ -581,6 +581,43 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
 });
 
 describe('CodexBridgeQueue', () => {
+  describe('ownsTurnForNativeInput (adopt CoT attribution)', () => {
+    it('recognizes the marked Lark input before its transcript user event and rejects a local input', () => {
+      const q = new CodexBridgeQueue();
+      q.mark('om_lark', 'Run the build and report failures', 10_000);
+      // The mark exists before the literal write, so the boundary already owns
+      // the turn even though the transcript user event has not been ingested.
+      expect(q.ownsTurnForNativeInput('Run the build and report failures', 10_200)).toBe(true);
+      // A terminal-only input sharing no fingerprint with the mark is rejected.
+      expect(q.ownsTurnForNativeInput('Deploy to staging from the pane', 10_300)).toBe(false);
+      // Replay tolerance matches the ingest path: older than mark-5s is stale.
+      expect(q.ownsTurnForNativeInput('Run the build and report failures', 4_900)).toBe(false);
+    });
+
+    it('requires an exact hash match when the mark demands exact input and stops owning after the terminal', () => {
+      const q = new CodexBridgeQueue();
+      q.mark('om_exact', '/status', 20_000, undefined, undefined, undefined, true);
+      expect(q.ownsTurnForNativeInput('/status', 20_100)).toBe(true);
+      // Fingerprint containment would accept this prefix variant; the exact
+      // hash must not.
+      expect(q.ownsTurnForNativeInput('/status --verbose', 20_200)).toBe(false);
+
+      q.ingest([userEv('/status', 'u-exact', 20_300)]);
+      q.ingest([asstEv('idle', 'a-exact', 20_400)]);
+      q.drainEmittable();
+      // A closed turn must not capture a later local boundary.
+      expect(q.ownsTurnForNativeInput('/status', 20_500)).toBe(false);
+    });
+
+    it('never attributes a boundary to a synthesized local turn', () => {
+      const q = new CodexBridgeQueue();
+      q.setLocalTurns(true, 0);
+      q.ingest([userEv('something typed locally', 'u-local', 30_000)]);
+      expect(q.peek().some(turn => turn.isLocal)).toBe(true);
+      expect(q.ownsTurnForNativeInput('something typed locally', 30_000)).toBe(false);
+    });
+  });
+
   it('reports lifecycle busy only after transcript start until assistant_final closes the turn', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'long-running prompt', 100);
