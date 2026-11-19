@@ -83,6 +83,28 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
   }
 }
 
+/**
+ * Whether a chat is gone for this bot, only on an explicit answer: a dissolved
+ * chat still answers with chat_status `dissolved`/`dissolved_save`, and a chat
+ * the bot was removed from still answers `normal` with is_in_chat=false.
+ * Any error or other state is undefined (unknown), never gone.
+ */
+export async function probeChatGone(larkAppId: string, chatId: string): Promise<'disbanded' | 'bot_removed' | undefined> {
+  const client = getBotClient(larkAppId);
+  const path = `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`;
+  try {
+    const info: any = await larkGet(client, path);
+    if (info.code !== 0) return undefined;
+    const status = info.data?.chat_status;
+    if (status === 'dissolved' || status === 'dissolved_save') return 'disbanded';
+    if (status !== 'normal') return undefined;
+    const member: any = await larkGet(client, `${path}/members/is_in_chat`);
+    return member.code === 0 && member.data?.is_in_chat === false ? 'bot_removed' : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export type RenameChatResult =
   | { ok: true; oldName: string; newName: string; changed: boolean }
   | {
@@ -426,6 +448,24 @@ export async function getChatOwner(
 }
 
 /**
+ * Whether this bot provably owns the group. Feishu omits the owner fields when
+ * the owner is a bot, so with no other bot or agent in the group the owner can
+ * only be this bot. Any other answer, or an error, is false.
+ */
+export async function botProvablyOwnsChat(larkAppId: string, chatId: string): Promise<boolean> {
+  try {
+    // Callers hold the bot's turn gate while waiting.
+    const res: any = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {}, { timeoutMs: 10_000 });
+    const chat = res.code === 0 ? res.data : undefined;
+    return !!chat && chat.chat_status === 'normal' && (chat.chat_mode === 'group' || chat.chat_mode === 'topic')
+      && !chat.owner_id && !chat.owner_id_type
+      && String(chat.bot_count) === '1' && String(chat.agent_count) === '0';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Get a shareable join link for a chat — the link others can click to *join*
  * the group, unlike the applink:// "open chat" URL which only works for members
  * who are already in the chat.
@@ -560,7 +600,15 @@ export async function addUsersToChatByUnionId(
   chatId: string,
   unionIds: string[],
 ): Promise<{ invalidUserIds: string[] }> {
-  const ids = Array.from(new Set(unionIds.filter(Boolean)));
+  return addUsersToChatById(proxyLarkAppId, chatId, unionIds, 'union_id');
+}
+
+export async function addUsersToChatByOpenId(proxyLarkAppId: string, chatId: string, ids: string[]): Promise<{ invalidUserIds: string[] }> {
+  return addUsersToChatById(proxyLarkAppId, chatId, ids, 'open_id');
+}
+
+async function addUsersToChatById(proxyLarkAppId: string, chatId: string, userIds: string[], memberIdType: 'open_id' | 'union_id'): Promise<{ invalidUserIds: string[] }> {
+  const ids = Array.from(new Set(userIds.filter(Boolean)));
   if (ids.length === 0) return { invalidUserIds: [] };
   const client = getBotClient(proxyLarkAppId);
   // Add ONE id per call: Lark fails the WHOLE batch (HTTP 400, code 232024) if any
@@ -571,7 +619,7 @@ export async function addUsersToChatByUnionId(
     try {
       const res: any = await (client as any).im.v1.chatMembers.create({
         path: { chat_id: chatId },
-        params: { member_id_type: 'union_id' },
+        params: { member_id_type: memberIdType },
         data: { id_list: [id] },
       });
       if (res.code !== 0 && res.code !== undefined) {

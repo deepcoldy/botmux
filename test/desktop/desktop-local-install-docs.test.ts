@@ -2,45 +2,18 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 describe('desktop local source installer docs', () => {
-  it('keeps Desktop installation outside the botmux CLI command surface', () => {
+  // 源码结构护栏(K4)：本地安装脚本实际调用的包管理器必须与 package.json 的 packageManager 一致；
+  // shell 脚本无法 import，只能读文本。迁移到 bun 时（#1033）残留的 pnpm 调用在装了 pnpm 的机器上能过，
+  // 只在干净机器上才挂。
+  it('installs Desktop dependencies only with the repo package manager', () => {
+    const pkg = JSON.parse(readFileSync('package.json', 'utf-8')) as { packageManager: string };
     const script = readFileSync('src/desktop/install-local.sh', 'utf-8');
-    const readme = readFileSync('src/desktop/README.md', 'utf-8');
-    const electronBuilderConfig = readFileSync('electron-builder.yml', 'utf-8');
+    const manager = pkg.packageManager.split('@')[0];
 
-    expect(script).toContain('#!/usr/bin/env bash');
-    expect(script).toContain('Node.js 22 or newer is required');
-    expect(script).toContain('resolve_app_version');
-    expect(script).toContain('BOTMUX_DESKTOP_VERSION');
-    expect(script).toContain('-c.extraMetadata.version="$APP_VERSION"');
-    expect(script).toContain('bun run desktop:bundle');
-    expect(script).toContain('bun run desktop:runtime');
-    expect(script).toContain('bun run build');
-    expect(script).toContain('electron-builder --mac dir');
-    expect(script).toContain('codesign --force --deep --sign -');
-    expect(script).toContain('xattr -dr com.apple.quarantine');
-    expect(script).toContain('pgrep -x "Botmux"');
-    expect(script).toContain('bun install --frozen-lockfile');
-    // The installer must not depend on a package manager the repo no longer uses:
-    // this box happens to have pnpm on PATH while CI does not, so a leftover
-    // `pnpm …` call passes locally and only fails on a clean machine.
-    expect(script).not.toMatch(/(^|[^-\w])pnpm\s/m);
-    expect(script).not.toContain('osascript');
-    expect(script).not.toContain('--skip-link');
-    expect(script).not.toContain('botmux app');
-
-    expect(electronBuilderConfig).toContain('afterPack: build/after-pack.cjs');
-    expect(electronBuilderConfig).toContain('from: build/desktop-runtime');
-    expect(electronBuilderConfig).toContain('icon: build/icon.png');
-
-    expect(readme).toContain('bash src/desktop/install-local.sh');
-    expect(readme).toContain('脚本只安装 App');
-    expect(readme).toContain('App 自带版本匹配的 Node 和 botmux');
-    expect(readme).not.toContain('PM2');
-    expect(readme).toContain('BOTMUX_DESKTOP_VERSION');
-    expect(readme).not.toContain('pnpm link --global');
-    expect(readme).not.toContain('~/.botmux/bin/botmux');
-    expect(readme).not.toContain('--skip-link');
-    expect(readme).not.toContain('botmux app');
+    expect(script).toMatch(new RegExp(`(^|[^-\\w])${manager} install\\b`, 'm'));
+    for (const other of ['pnpm', 'yarn'].filter(name => name !== manager)) {
+      expect(script).not.toMatch(new RegExp(`(^|[^-\\w])${other}\\s`, 'm'));
+    }
   });
 
   it('keeps desktop pack output on a concrete app version', () => {

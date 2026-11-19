@@ -147,6 +147,24 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的结构化 Session helper；持久调度写操作还要求部署的 `requiredCapabilities` 和 provider hello 同时显式声明 `session_tool_schedule`。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。自由字符串使用单一 opaque argv token 传递，daemon 对 Remote Runner 请求再次核对当前 Chat、Topic root 和工作目录。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。只升级 Host 而未显式要求新 capability 的旧部署保持原只读权限面。
 
+Bot-authored turn 的 `trustedCaller` 可以携带独立的 `botOwner`。直接调用者仍由 `requestUserOpenId/requestUserUnionId + senderType=bot` 表示；`botOwner` 只在飞书已确认发送者是 Bot、两种 sender ID 同时精确命中目标 Bot 自己的 `botActorOwnerBindings`，且配置的 Owner union_id/email 能由目标 App 的 Contact API 重新解析时生成。该字段不会从消息正文、Session owner、最近真人或中心平台团队目录推断；缺失、重复冲突、邮箱不符和解析失败均保持缺失，由需要真人凭据的 provider 失败关闭。`botOwner` 是 host 只在出站 turn 命令里铸造的字段：provider 在 `ready.recoveredTurn` 里回传的同名字段只做形状校验（形状非法仍整包拒绝），不会写回恢复 turn 的 caller，下一条出站 turn 命令会携带重新铸造的值。
+
+该映射属于接收 Bot 的部署策略，写在同一条 canonical `bots.json` 配置中；open_id 必须是接收 App 实际观察到的 source Bot open_id，union_id 使用同租户稳定值，email 必须是小写 canonical 值。多 Pod 部署的每个 bot-sent turn 都从 daemon 启动时锁定的 `BOTS_CONFIG` 路径重新读取该策略，不把单个 Pod 的热更新内存或网络文件系统 watch 当成全局权威；文件不可读、目标 Bot 缺失/重复或策略格式错误时都保持 `botOwner` 缺失。未知字段、非法 ID、重复 source open_id/union_id 会让整个 Bot 配置拒绝启动，避免安全字段拼错后静默失效：
+
+```json
+{
+  "larkAppId": "cli_target",
+  "botActorOwnerBindings": [
+    {
+      "sourceBotOpenId": "ou_source",
+      "sourceBotUnionId": "on_source",
+      "ownerUnionId": "on_owner",
+      "ownerEmail": "owner@example.com"
+    }
+  ]
+}
+```
+
 Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Actor，可额外协商 `session_tool_schedule_actor`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明该能力时，schedule 写事件才能携带 `controllerOpenId`；该字段不来自模型可写的结构化请求。worker 继续用同一 turn、dispatch attempt 与 backend generation 约束事件，daemon 再按当前 Bot App 解析 union_id，并复核 controller 是 Bot 管理员和目标群成员。`schedule.add` 按该真人 owner/control identity 落盘；`update|remove|pause|resume|run` 只允许管理当前 Chat 中由同一 controller 创建的 direct task，仍拒绝 delegated task、跨 controller、跨群或换代后的请求。该能力不改变原始消息的 bot caller 归因，也不允许选择 App、Chat、Topic、工作目录或运行凭据。
 
 当前 allowlist：
@@ -209,7 +227,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
     "generation": 3,
     "snapshot": {
       "context": { "usedTokens": 7274, "windowTokens": 258400, "percentUsed": 3 },
-      "tokens": { "in": 7230, "out": 44 },
+      "tokens": { "in": 7230, "out": 44, "cacheReadTokens": 6100, "cacheCreateTokens": 1000 },
       "turnTokens": { "in": 7230, "out": 44 },
       "model": "example-model",
       "reasoningEffort": "high"
@@ -220,6 +238,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - `generation` 必须等于当前远端 compute generation；旧 generation 的快照会被拒绝。
 - `context` 和 `tokens` 必须显式为对象或 `null`。缺失指标保持缺失，不得由 provider 估算。
+- `tokens.cacheReadTokens` / `tokens.cacheCreateTokens` 可选，表示累计缓存读 / 写 token，都包含在 `in` 里（不得大于 `in`）。上报后卡片显示 `缓存命中 N%`（N = cacheReadTokens / in，向下取整）；不报则不显示。
 - BotMux 严格校验非负整数、上下文百分比和运行时标签，然后把快照交给普通卡片的同一套 usage renderer。
 - 这是 v1 的可选 additive 字段：旧 provider 不上报时行为不变，旧 BotMux 会忽略该字段，因此无需增加 capability 或升级协议版本。
 - 最近一次通过校验的快照会随 Session 持久化；远端 generation 前进时自动清除，避免恢复后显示旧计算资源的数据。
@@ -242,7 +261,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 - `remoteSessionId` 表示当前计算资源，`agentThreadId` 表示 Agent 对话血缘；二者不能合并。计算资源过期后，provider 可以提升 `generation`、更换 `remoteSessionId`，同时保留 `agentThreadId`。
 - 同一 generation 不得更换 `remoteSessionId`，generation 不得倒退；BotMux 会拒绝违反单调性的状态。
 - `providerState` 是最多 64 KiB、深度受限的普通 JSON。它可以保存恢复定位信息，但不得保存任何凭据。
-- provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。
+- provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。启用 `delegatedSlashCommands` 的 Bot 另有更严格的约束，见下文「按 Bot 下放」。
 - 普通 daemon/worker 重启发送 `resumeMode: "reattach"`（省略时同义），允许接管仍存活的远端资源；用户显式关闭后点击恢复发送 `resumeMode: "rebuild"`，provider 必须新建远端资源并在 `ready` 中推进 `generation`。Node worker 或其 Remote Runner backend 在新的 ready state 落盘前退出时，BotMux 会在远端 lineage 未变化的前提下把逻辑 Session 恢复为 closed，并回收仅剩的本地 worker；若 lineage 已变化则保持保护状态并要求显式对账，不能伪装成恢复成功。
 
 ## 关闭与进程退出
@@ -269,3 +288,43 @@ printf '%s\n' \
 ```
 
 它用于协议联调和测试，不是生产远端执行器。
+
+## 按 Bot 下放 `/adopt`、`/detach`
+
+默认仍由 daemon 处理这些命令。仅在明确选择 remote-runner 后端的 Bot 上配置：
+
+```json
+{ "remoteRunner": { "delegatedSlashCommands": ["/adopt", "/detach"] } }
+```
+
+字段缺省或空数组关闭下放；只接受 `/adopt`、`/detach`、`/disconnect`，不接受其它 daemon 命令。配置归一化会去重并把 `/disconnect` 收敛成 `/detach`，启用任一写法即启用两个别名。命令正文保留调用时的大小写、参数和内部空格；路由仍按普通 slash 规则剥前导提及、去首尾空白，讨论文本/命令列表不作为指令截获。已有会话按冻结的后端判断，不随 Bot 的 CLI 切换而改变。活跃 provider 保持启动时的下放配置，修改在下次 provider 启动生效；路由和帮助展示共用这一口径。
+
+下放只改变执行通道。两个消息入口先执行 grant 限制和 `canRunDaemonCommand`（默认 canOperate，允许 `canTalkDaemonCommands` 按条降级），并保留 `acceptSlashFromBots`。随后复用普通消息的配额、spawn、结构化输入和 FIFO；已授权内容与可信调用者封装在同一个 acceptedInput payload 中，仍经过统一 LinkRefs 收尾。待办激活时保留原任务为 head，下放命令作为独立 tail；忙时排队的是已授权的完整 turn，出队不再分类。`/help` 和 `/list-slash-command` 按有效后端与实际启用项显示 provider 语义。
+
+无会话 `/adopt` 可像普通消息一样启动 provider，等 ready 后提交首个 turn。无会话 `/detach` / `/disconnect` 直接回复无绑定，不创建会话、不启动 provider。primary 协调模式下两种 detach 写法均拒绝。provider 拒绝、ACK 超时、协议错误沿现有 turn 失败通道明确报错，不回落 daemon 的原生命令处理。
+
+### Provider 契约
+
+v1 wire format 不变，不增加协议命令。用户面的下放命令是 `turn.content`，调用者与普通 turn 共用宿主认证的 `trustedCaller`，例如：
+
+```json
+{"protocol":"botmux.remote-runner","version":1,"type":"turn","requestId":"turn:1","turnId":"om_request","content":"/adopt reference-thread:alpha","trustedCaller":{"requestUserOpenId":"ou_caller","requestLarkAppId":"cli_example","senderType":"user"}}
+```
+
+provider 按现有协议先 ACK `status: busy`，可发 `progress`，最后发 `final`（可带完整 `state`）。绑定关系只能在 `final.state` 发布；不要在中间的 `status.state` 或 `lineage_changed` 提前发布业务绑定。沿用 generation 防护：计算资源替换需递增 generation，旧 turn / 旧 generation 不能修改新绑定。`state` 是完整快照，解绑须省略 `agentThreadId`，不能用空字符串；`providerState` 同样必须提交完整的新值，不包含凭据。
+
+多轮选择可在第一次 `/adopt` 的 `final.state.providerState` 保存候选或选择令牌，并在结果正文列出 `/adopt <target>`；后续 turn 根据该状态校验选择，再通过 `final.state.agentThreadId` 提交绑定。重启后 provider 用 `resume.state` 恢复选择上下文和绑定，不依赖本机进程内变量。并发的选择按现有 FIFO 逐轮处理。
+
+下放版 `/detach` / `/disconnect` **只解除 provider 管理的业务绑定**，来源 Agent 保留，BotMux 会话行也保留以接收下一条 `/adopt`。没有绑定时以正常 `final` 返回明确的“无绑定”结果，宿主不清理本地会话。绝不能把它映射到协议 `cancel`（关闭），也不能触发协议 `detach`（宿主关停时可恢复的事务，与 `reattach` 配对）。原生 shared-adopt 的断桥语义继续适用于未启用下放的 Bot。
+
+`examples/remote-runner/reference-runner.mjs` 可直接运行：`/adopt` 列出 alpha/beta，`/adopt reference-thread:alpha` 绑定，`/disconnect` 解绑，重复解绑返回无绑定。候选集保存在 `providerState.adoptCandidates`，只在 `final` 回传业务变更。
+
+实现隔离：未启用下放的 Bot 保持原有路由与输入身份。Remote Runner 的串行刷新和 final-only 绑定守卫同样受该 provider 启动配置的下放开关限制；普通 PTY/tmux/riff/mojo/codex-app 输入不携带 acceptedInput，沿用原来的构造与持久化分支。
+
+下放命令的 LinkRefs 使用内部 `registry-only` 展示政策：仍登记链接、冻结模式并保存来源，但不把 `<botmux_link_refs>` 等模型说明追加到 `turn.content`，包括经过持久队列和重启恢复后。普通对话沿用原有 companion 注入。
+
+启用下放的 provider 会话在 turn 之间同样保护已提交业务绑定：除 `ready` 与有效 `final` 外，`lineage_changed` 以及 cancel/detach/reattach 的 `status` 所带状态，其 `agentThreadId` 与整个 `providerState` 都必须与已提交快照深度相等（只允许 `generation`、`remoteSessionId` 等计算资源字段变化），否则宿主按协议错误终止 provider。因此启用后不要再用 `lineage_changed` 更新 `providerState` 里的任何字段（包括恢复定位信息），改在 `final.state` 中提交。初始化/恢复 ready 可回填已提交快照，有效 final 可提交业务变更；计算资源 lineage 仍可在保持业务快照相等时递增 generation，JSON 对象键序变化不视为业务变更。reference runner 的普通首轮绑定也在 final.state 发布。
+
+无历史的 command scratch 只有在没有持久 provider 快照时才按无绑定处理；已经启动过 provider、保留 remoteBackendState 的空首轮/恢复记录仍是已有会话，不因此拒绝 detach。该判定只用于下放路由，不改变原 /resume 的空壳恢复口径。
+
+绑定提交约束由 provider 启动时的 opt-in 政策统一决定，普通消息和下放命令的 final 都先验证 usage 再发布绑定；不再维护逐 turn 的绑定命令标记。已接纳控制输入的类型只包含 content 与 trustedCaller，不能借此覆盖其它 CLI sidecar 或控制元数据。

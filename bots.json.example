@@ -28,8 +28,7 @@
   {
     "larkAppId": "cli_xxx_bot3",
     "larkAppSecret": "your_secret_3",
-    "cliId": "gemini",
-    "model": "gemini-2.5-pro",
+    "cliId": "antigravity",
     "allowedUsers": ["charlie@company.com"],
     "workingDir": "~/projects"
   },

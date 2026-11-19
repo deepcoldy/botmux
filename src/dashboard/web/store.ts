@@ -16,11 +16,29 @@ export interface StoreSnapshot {
    *  而不是画一个永远为空的面板。false 同时覆盖「没有能力所以没请求」和「请求
    *  失败」两种情况。 */
   schedulesAvailable: boolean;
+  /** True once the first schedules snapshot attempt has committed, including an
+   * unavailable (`schedulesAvailable === false`) result. Stays true on later
+   * reconciles so an established page does not return to a loading state. */
+  schedulesReady: boolean;
   /** True once the first authoritative `/api/sessions` snapshot has been
    *  installed. UI uses it to hold a skeleton instead of flashing an empty
    *  list before the bootstrap fetch lands. Stays true forever after. */
   bootstrapped: boolean;
+  /** Remaining closed-session history, loaded only on explicit request. */
+  closedCursor: string | null;
+  closedTotal: number;
+  /** Changes only when an authoritative session snapshot replaces cached rows. */
+  sessionSnapshotVersion: number;
 }
+
+/** A page read whose snapshot generation was replaced while it was in flight. */
+const STALE_PAGE = Symbol('stale_session_page');
+/** One click keeps paging past pages that add nothing new (rows already merged by
+ *  a search, a deep link or a reconnect), bounded so a click never turns into a
+ *  download of the whole archive. */
+const HISTORY_PAGES_PER_CLICK = 20;
+/** Mirrors the server's `q` bound (session-pagination.ts); longer input is cut, not rejected. */
+const SESSION_QUERY_MAX_LENGTH = 200;
 
 class Store {
   sessions = new Map<string, Session>();
@@ -28,7 +46,14 @@ class Store {
   online = true;
   scheduleTimeZone = '';
   schedulesAvailable = true;
+  private schedulesReady = false;
   private bootstrapped = false;
+  private closedCursor: string | null = null;
+  private closedTotal = 0;
+  private sessionGeneration = 0;
+  private sessionReads = new Map<string, Promise<number | typeof STALE_PAGE>>();
+  private historyLoad: Promise<void> | null = null;
+  private sessionReadEvents = new Set<Array<{ type: string; body: Record<string, unknown> }>>();
   private version = 0;
   private snapshot: StoreSnapshot = {
     sessions: this.sessions,
@@ -37,7 +62,11 @@ class Store {
     version: this.version,
     scheduleTimeZone: this.scheduleTimeZone,
     schedulesAvailable: this.schedulesAvailable,
+    schedulesReady: this.schedulesReady,
     bootstrapped: false,
+    closedCursor: null,
+    closedTotal: 0,
+    sessionSnapshotVersion: 0,
   };
   private listeners = new Set<() => void>();
   // Bot roster changes don't live in this cache (the Bot 配置 page owns its own
@@ -60,12 +89,13 @@ class Store {
    * 排程表清空并标记 {@link StoreSnapshot.schedulesAvailable} 为 false，但**会话
    * 快照照常落库**——P1-14 的整个要害就是别让排程的失败连累会话列表。
    */
-  replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string) {
-    this.sessions.clear();
-    for (const row of rows) this.sessions.set(row.sessionId, row);
+  replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string,
+    history?: { closedCursor?: string | null; closedTotal?: number }) {
+    this.replaceSessionRows(rows, history);
     this.schedules.clear();
     for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
     this.schedulesAvailable = schedules !== null;
+    this.schedulesReady = true;
     if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
     this.bootstrapped = true;
     this.emit();
@@ -73,7 +103,145 @@ class Store {
       for (const fn of this.scheduleRunLogListeners) fn();
     }
   }
+  /** Commit the critical session list without waiting for optional schedules. */
+  replaceSessionsSnapshot(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number }) {
+    this.replaceSessionRows(rows, history);
+    this.bootstrapped = true;
+    this.emit();
+  }
+
+  replaceSchedulesSnapshot(schedules: Schedule[] | null, timezone?: string) {
+    this.schedules.clear();
+    for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
+    this.schedulesAvailable = schedules !== null;
+    this.schedulesReady = true;
+    if (timezone) this.scheduleTimeZone = timezone;
+    this.emit();
+    if (schedules !== null) for (const fn of this.scheduleRunLogListeners) fn();
+  }
+
+  private replaceSessionRows(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number }) {
+    this.sessionGeneration += 1;
+    this.closedCursor = history?.closedCursor ?? null;
+    this.closedTotal = history?.closedTotal ?? 0;
+    // A paginated snapshot only carries the newest closed rows. Older closed rows
+    // the user already paged in, searched for or deep-linked stay across a
+    // reconcile (tab back from the background, SSE watchdog) instead of vanishing
+    // mid-read; the snapshot's own rows win. A legacy full snapshot (no cursor
+    // field) is complete, so nothing is carried over.
+    const keptClosed = history?.closedCursor === undefined
+      ? []
+      : [...this.sessions.values()].filter(row => row.status === 'closed');
+    this.sessions.clear();
+    for (const row of rows) this.sessions.set(row.sessionId, row);
+    for (const row of keptClosed) {
+      if (!this.sessions.has(row.sessionId)) this.sessions.set(row.sessionId, row);
+    }
+  }
+  /**
+   * Load older closed history until at least one new row lands (or history ends).
+   * Concurrent clicks share one load. A page made stale by a snapshot replacement
+   * is retried once against the new snapshot instead of silently doing nothing.
+   */
+  loadMoreClosedSessions(): Promise<void> {
+    if (this.closedCursor === null) return Promise.resolve();
+    this.historyLoad ??= (async () => {
+      for (let page = 0; page < HISTORY_PAGES_PER_CLICK; page += 1) {
+        const added = await this.readCurrent(() => (
+          this.closedCursor === null
+            ? null
+            : `/api/sessions?view=closed&cursor=${encodeURIComponent(this.closedCursor)}`
+        ), true);
+        if (added === null || added > 0 || this.closedCursor === null) return;
+      }
+    })().finally(() => { this.historyLoad = null; });
+    return this.historyLoad;
+  }
+
+  /** Resolve a deep link without downloading the entire session archive. */
+  ensureSession(sessionId: string): Promise<void> {
+    if (this.sessions.has(sessionId)) return Promise.resolve();
+    return this.readCurrent(() => (
+      this.sessions.has(sessionId)
+        ? null
+        : `/api/sessions?view=single&sessionId=${encodeURIComponent(sessionId)}`
+    ), false).then(() => undefined);
+  }
+
+  /**
+   * ⌘K / Workbench keyword search: merge older closed sessions matching `query`
+   * (server-side, over the whole closed archive) so the caller's own matcher can
+   * rank them. Skipped when the browser already holds every closed row.
+   */
+  searchClosedSessions(query: string): Promise<void> {
+    // The server rejects control characters and over-long queries; cut instead of failing.
+    const q = query.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().replace(/\s+/g, ' ')
+      .slice(0, SESSION_QUERY_MAX_LENGTH).trim();
+    if (!q) return Promise.resolve();
+    // closedCursor null = every closed row is already in the browser: nothing to ask for.
+    return this.readCurrent(() => (
+      this.closedCursor === null ? null : `/api/sessions?view=closed&q=${encodeURIComponent(q)}`
+    ), false).then(() => undefined);
+  }
+
+  /** Read one page; when a snapshot replacement made it stale, retry once against
+   *  the new snapshot. Resolves to the number of rows added, or null when there is
+   *  nothing left to read or the retry went stale too. */
+  private async readCurrent(path: () => string | null, history: boolean): Promise<number | null> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const next = path();
+      if (next === null) return null;
+      const result = await this.readSessionPage(next, history);
+      if (result !== STALE_PAGE) return result;
+    }
+    return null;
+  }
+
+  /** Merge missing rows, replay racing session events, and discard responses from an older snapshot. */
+  private readSessionPage(path: string, history: boolean): Promise<number | typeof STALE_PAGE> {
+    const generation = this.sessionGeneration;
+    const key = `${generation}:${path}`;
+    const existing = this.sessionReads.get(key);
+    if (existing) return existing;
+    const events: Array<{ type: string; body: Record<string, unknown> }> = [];
+    this.sessionReadEvents.add(events);
+    const request = (async (): Promise<number | typeof STALE_PAGE> => {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error('session_page_unavailable');
+      const page: { sessions: Session[]; closedCursor?: string | null; closedTotal?: number } = await response.json();
+      if (!Array.isArray(page.sessions)) throw new Error('invalid_session_page');
+      if (generation !== this.sessionGeneration) return STALE_PAGE;
+      const added = new Set<string>();
+      for (const row of page.sessions) {
+        if (!this.sessions.has(row.sessionId)) {
+          this.sessions.set(row.sessionId, row);
+          added.add(row.sessionId);
+        }
+      }
+      this.sessionReadEvents.delete(events);
+      for (const event of events) {
+        if (typeof event.body.sessionId === 'string' && added.has(event.body.sessionId)) {
+          this.applySse(event.type, event.body);
+        }
+      }
+      if (history) {
+        this.closedCursor = page.closedCursor ?? null;
+        this.closedTotal = page.closedTotal ?? this.closedTotal;
+      }
+      this.emit();
+      return added.size;
+    })().finally(() => {
+      this.sessionReadEvents.delete(events);
+      this.sessionReads.delete(key);
+    });
+    this.sessionReads.set(key, request);
+    return request;
+  }
+
   applySse(type: string, body: any) {
+    if (type.startsWith('session.')) {
+      for (const events of this.sessionReadEvents) events.push({ type, body });
+    }
     if (type === 'session.spawned') {
       this.sessions.set(body.session.sessionId, body.session);
     } else if (type === 'session.update') {
@@ -108,6 +276,29 @@ class Store {
     }
     this.emit();
   }
+  /**
+   * Bot 改名后把缓存里会话/排程行的 botName 换成当前名（按 larkAppId 现查）。
+   * 行里的 botName 是快照：session.update 不带它，不改写的话直接读 row.botName 的
+   * 渲染点（工作台分组/搜索/信息栏等）会一直显示旧名。只动内存缓存，不回写服务端。
+   * 有变化才 emit，让按 version 记忆的派生数据重算。
+   */
+  relabelBots(nameOf: (larkAppId: string) => string | undefined): boolean {
+    let changed = false;
+    const relabel = <T extends Record<string, any>>(map: Map<string, T>) => {
+      for (const [key, row] of map) {
+        const appId = typeof row.larkAppId === 'string' ? row.larkAppId : '';
+        const name = appId ? nameOf(appId) : undefined;
+        if (name && row.botName !== name) {
+          map.set(key, { ...row, botName: name });
+          changed = true;
+        }
+      }
+    };
+    relabel(this.sessions);
+    relabel(this.schedules);
+    if (changed) this.emit();
+    return changed;
+  }
   onBotsChanged(fn: () => void) { this.botsListeners.add(fn); return () => this.botsListeners.delete(fn); }
   onScheduleRunLogsChanged(fn: (taskId?: string) => void) {
     this.scheduleRunLogListeners.add(fn);
@@ -127,7 +318,11 @@ class Store {
       version: this.version,
       scheduleTimeZone: this.scheduleTimeZone,
       schedulesAvailable: this.schedulesAvailable,
+      schedulesReady: this.schedulesReady,
       bootstrapped: this.bootstrapped,
+      closedCursor: this.closedCursor,
+      closedTotal: this.closedTotal,
+      sessionSnapshotVersion: this.sessionGeneration,
     };
     for (const fn of this.listeners) fn();
   }
@@ -207,6 +402,7 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
   // authoritative snapshot is installed.
   const buffered: Array<{ type: string; body: any }> = [];
   let snapshotReady = false;
+  let sessionsReady = false;
   const types = [
     'session.spawned', 'session.update', 'session.exited',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
@@ -223,22 +419,33 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
       while (completedReconcile < requestedReconcile) {
         const generation = requestedReconcile;
         snapshotReady = false;
+        sessionsReady = false;
         try {
           // 会话快照是**必需**资源：它失败仍然让 bootstrap reject，EventSource
           // 保持打开、下一次 open 重试（见文件末尾注释与对应测试）。排程是**可选**
           // 资源：拿不到只是这一块降级，绝不能反过来吃掉会话快照。
-          const [s, sch] = await Promise.all([
-            fetch('/api/sessions').then(r => r.json()),
-            canReadSchedules() ? fetchSchedulesSnapshot() : Promise.resolve(null),
-          ]);
-          store.replaceSnapshot(
-            s.sessions ?? [],
-            sch ? sch.schedules : null,
-            sch?.timezone,
-          );
+          const sessions = fetch('/api/sessions?view=board');
+          const schedules = canReadSchedules() ? fetchSchedulesSnapshot() : Promise.resolve(null);
+          const response = await sessions;
+          if (!response.ok) throw new Error('session_snapshot_unavailable');
+          const s = await response.json();
+          store.replaceSessionsSnapshot(s.sessions ?? [], s);
+          sessionsReady = true;
+          // Session events must remain live even while an optional schedule
+          // response hangs. Keep schedule events buffered until its own snapshot
+          // lands, so a late snapshot cannot overwrite a newer SSE update.
+          const scheduleEvents = [];
+          for (const event of buffered.splice(0)) {
+            if (event.type.startsWith('schedule.')) scheduleEvents.push(event);
+            else store.applySse(event.type, event.body);
+          }
+          buffered.push(...scheduleEvents);
+          const sch = await schedules;
+          store.replaceSchedulesSnapshot(sch?.schedules ?? null, sch?.timezone);
           completedReconcile = generation;
         } finally {
           snapshotReady = true;
+          sessionsReady = true;
           for (const event of buffered.splice(0)) {
             store.applySse(event.type, event.body);
           }
@@ -273,7 +480,7 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
   let rosterDigest: string | null = null;
 
   const deliver = (type: string, body: any): void => {
-    if (snapshotReady) store.applySse(type, body);
+    if (snapshotReady || (sessionsReady && !type.startsWith('schedule.'))) store.applySse(type, body);
     else buffered.push({ type, body });
   };
 

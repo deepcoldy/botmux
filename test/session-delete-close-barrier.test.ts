@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import * as larkClient from '../src/im/lark/client.js';
@@ -14,8 +14,17 @@ import { activeSessionKey } from '../src/core/types.js';
 import * as docSubsStore from '../src/services/doc-subs-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { ensureSessionTempDir } from '../src/core/session-temp.js';
+import { pinSessionMcpGatewaySocketRoot, sessionMcpGatewaySocketDir } from '../src/core/plugins/mcp/socket-dir.js';
+import { readMcpGatewayLaunchRecord, writeMcpGatewayLaunchRecord } from '../src/core/plugins/mcp/launch-record.js';
+
+// The daemon names Gateway dirs under its tmpdir(); pin a private short root
+// so these tests never create or remove anything in the shared one.
+const gatewayRoot = mkdtempSync(join(existsSync('/tmp') ? '/tmp' : tmpdir(), 'bmcp-close-'));
+pinSessionMcpGatewaySocketRoot(gatewayRoot);
 
 const tempDirs: string[] = [];
+
+afterAll(() => rmSync(gatewayRoot, { recursive: true, force: true }));
 
 afterEach(() => {
   workerPool.setActiveSessionsRegistry(new Map());
@@ -77,6 +86,49 @@ describe('daemon close barrier used by botmux delete', () => {
       config.session.dataDir = previousDataDir;
     }
   });
+  it.each(['closed', 'resumed'] as const)('removes the Gateway dir only once a durably closed session’s worker exits (%s)', async outcome => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-gateway-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-gateway-close');
+    const oldWorker = Object.assign(new EventEmitter(), {
+      killed: false, exitCode: null, signalCode: null, send: vi.fn(), kill: vi.fn(),
+    });
+    try {
+      const session = sessionStore.createSession('oc_gw', 'om_gw', 'gateway close', 'group');
+      session.larkAppId = 'app-gateway-close';
+      sessionStore.updateSession(session);
+      tempDirs.push(dirname(ensureSessionTempDir(dataDir, session.sessionId)));
+      const gatewayDir = sessionMcpGatewaySocketDir(session.sessionId, dataDir);
+      mkdirSync(gatewayDir, { mode: 0o700 });
+      writeFileSync(join(gatewayDir, 'auth'), 'token\n');
+      writeMcpGatewayLaunchRecord(dataDir, session.sessionId, join(gatewayDir, 'g.sock'));
+      const ds = { session, worker: oldWorker, workerGeneration: 1,
+        larkAppId: session.larkAppId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), lastMessageAt: Date.now(), hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      await workerPool.closeSession(session.sessionId, { awaitWorkerExit: false });
+      // The worker has not exited yet: a pane it still serves keeps its directory.
+      expect(existsSync(gatewayDir)).toBe(true);
+      if (outcome === 'resumed') {
+        const replacement = { ...ds, workerGeneration: 2, worker: null } as any;
+        active.set(activeSessionKey(replacement), replacement);
+      }
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      expect(existsSync(gatewayDir)).toBe(outcome === 'resumed');
+      expect(readMcpGatewayLaunchRecord(dataDir, session.sessionId) !== null).toBe(outcome === 'resumed');
+    } finally {
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
   it('evicts activeSessions and persists closed before awaited doc cleanup', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-barrier-'));
     tempDirs.push(dataDir);

@@ -23,13 +23,15 @@
  * mask mountpoints, then invoke bwrap.
  */
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync, readFileSync, symlinkSync } from 'node:fs';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
+import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
+import { sessionSkillSnapshotRoot, snapshotSessionSkills, type SkillSnapshotTrust } from '../src/core/skills/snapshot.js';
 
 const bwrapUsable = process.platform === 'linux'
   && spawnSync('sh', ['-c', 'command -v bwrap'], { stdio: 'ignore' }).status === 0
@@ -52,7 +54,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
   // Build the bwrap argv the SAME way the worker does (deny masks: mode-000
   // empty sources, missing mountpoints pre-created). Returns the created-mask
   // list too so cleanup tests can assert rmdir-if-empty.
-  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string } = {}) {
+  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string; mandatoryReadOnlyPaths?: string[]; sessionOwnedReadonlyRoots?: string[] } = {}) {
     const emptiesDir = join(S, 'sbx/empties');
     const emptyDir = join(S, 'sbx/empty');
     mkdirSync(emptiesDir, { recursive: true });
@@ -68,6 +70,8 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       userPaths: { readOnly: [join(S, 'ref'), ...(userPaths.readOnly ?? [])], readWrite: userPaths.readWrite, deny: userPaths.deny },
       larkCliLinuxStore: opts.larkCliLinuxStore,
       larkTransportEnabled: opts.larkTransportEnabled,
+      mandatoryReadOnlyPaths: opts.mandatoryReadOnlyPaths,
+      sessionOwnedReadonlyRoots: opts.sessionOwnedReadonlyRoots,
       net: true, writeRegexes: [],
     });
     policy.rules = policy.rules.filter(r => r.access === 'deny' || existsSync(r.path));
@@ -152,6 +156,92 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(read.out).not.toContain('SIBLING-SECRET');
     run(args, `printf 'pwned' >> ${JSON.stringify(sibling)}`);
     expect(readFileSync(sibling, 'utf8')).toBe('SIBLING-SECRET\n');
+  });
+
+  it('sandbox=true × `botmux skill show` (KERNEL-level): own manifest + own snapshot readable, not writable; sibling session + store unreachable', () => {
+    // The worker grants the session's own manifest as a mandatory read-only FILE
+    // and its skill SNAPSHOT root through sessionOwnedReadonlyRoots. Before the
+    // fix both reads hit an unmounted path (ENOENT) inside bwrap.
+    const dataDir = join(S, 'botmux-home/data');
+    const store = join(S, 'botmux-home/skills/store');
+    for (const [name, body] of [['deploy', 'DEPLOY-BODY'], ['payroll', 'PAYROLL-BODY']]) {
+      mkdirSync(join(store, name), { recursive: true });
+      writeFileSync(join(store, name, 'SKILL.md'), `${body}\n`);
+    }
+    const trust: SkillSnapshotTrust = { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') };
+    const snap = (sessionId: string, name: string) => snapshotSessionSkills({
+      sessionId, cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      prioritySkills: [{ id: name, name, tags: [], rootDir: join(store, name), entrypoint: 'SKILL.md',
+        source: { type: 'local-copy', originalPath: join(store, name) }, priorityReason: 'bot:include' }],
+    }, { trust, dataDir }).manifest;
+    const own = snap('e2e-session', 'deploy');
+    snap('other-session', 'payroll');
+    const ownManifest = sessionSkillManifestPath('e2e-session', dataDir);
+    const otherManifest = sessionSkillManifestPath('other-session', dataDir);
+    mkdirSync(dirname(ownManifest), { recursive: true });
+    writeFileSync(ownManifest, '{"own":true}\n');
+    writeFileSync(otherManifest, 'OTHER-MANIFEST\n');
+    const ownSnapshot = sessionSkillSnapshotRoot('e2e-session', dataDir);
+    const otherSnapshot = sessionSkillSnapshotRoot('other-session', dataDir);
+    expect(own.prioritySkills[0].rootDir).toBe(join(ownSnapshot, 'deploy'));
+
+    const { args } = build({}, {
+      mandatoryReadOnlyPaths: [ownManifest],
+      sessionOwnedReadonlyRoots: [ownSnapshot],
+    });
+    const manifest = run(args, `cat ${JSON.stringify(ownManifest)}`);
+    expect(manifest.status).toBe(0);
+    expect(manifest.out).toContain('"own":true');
+    const body = run(args, `cat ${JSON.stringify(join(ownSnapshot, 'deploy/SKILL.md'))}`);
+    expect(body.status).toBe(0);
+    expect(body.out).toContain('DEPLOY-BODY');
+
+    for (const [path, secret] of [
+      [otherManifest, 'OTHER-MANIFEST'],
+      [join(otherSnapshot, 'payroll/SKILL.md'), 'PAYROLL-BODY'],
+      [join(store, 'deploy/SKILL.md'), 'DEPLOY-BODY'],
+      [join(store, 'payroll/SKILL.md'), 'PAYROLL-BODY'],
+    ]) {
+      const r = run(args, `cat ${JSON.stringify(path)}`);
+      expect(r.status, path).not.toBe(0);
+      expect(r.out, path).not.toContain(secret);
+    }
+    // Read-only at the kernel: neither the manifest nor the snapshot can be rewritten.
+    run(args, `echo PWNED > ${JSON.stringify(ownManifest)}; echo PWNED > ${JSON.stringify(join(ownSnapshot, 'deploy/SKILL.md'))}`);
+    expect(readFileSync(ownManifest, 'utf8')).toBe('{"own":true}\n');
+    expect(readFileSync(join(ownSnapshot, 'deploy/SKILL.md'), 'utf8')).toBe('DEPLOY-BODY\n');
+  });
+
+  it('a LIVE sandbox keeps reading its skill snapshot while the store copy is deleted and recreated (updateInstalledSkill shape)', async () => {
+    const dataDir = join(S, 'botmux-home/data');
+    const store = join(S, 'botmux-home/skills/store');
+    mkdirSync(join(store, 'live'), { recursive: true });
+    writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V1\n');
+    snapshotSessionSkills({
+      sessionId: 'e2e-session', cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      prioritySkills: [{ id: 'live', name: 'live', tags: [], rootDir: join(store, 'live'), entrypoint: 'SKILL.md',
+        source: { type: 'local-copy', originalPath: join(store, 'live') }, priorityReason: 'bot:include' }],
+    }, { trust: { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') }, dataDir });
+    const snapshot = sessionSkillSnapshotRoot('e2e-session', dataDir);
+    const go = join(S, 'proj/work/go-live');
+    rmSync(go, { force: true });
+    const { args } = build({}, { sessionOwnedReadonlyRoots: [snapshot] });
+    const child = spawn('bwrap', [...args, '/bin/sh', '-c',
+      `while [ ! -e ${JSON.stringify(go)} ]; do sleep 0.05; done; cat ${JSON.stringify(join(snapshot, 'live/SKILL.md'))}`]);
+    let out = '';
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { out += d; });
+    // Sandbox is up and bound; now replace the store copy underneath it.
+    await new Promise(r => setTimeout(r, 300));
+    rmSync(join(store, 'live'), { recursive: true, force: true });
+    mkdirSync(join(store, 'live'), { recursive: true });
+    writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V2\n');
+    writeFileSync(go, '');
+    const code = await new Promise<number | null>(r => child.on('close', r));
+    expect(code).toBe(0);
+    expect(out).toContain('LIVE-V1');
   });
 
   it('deny DIR (existing): real content unreadable, and mask empty/unlistable for non-root (root may list but sees nothing real)', () => {

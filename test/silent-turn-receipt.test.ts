@@ -407,6 +407,8 @@ describe('deliberate-silence closure (turn_terminal nothing_to_send)', () => {
  * NEW call site: a behavioral test only covers the paths someone remembered to
  * write.
  */
+// 源码结构护栏(K4)：每个 buildStreamingCard 调用点都必须传入静默轮次的 idle 标签与 dshRuntime；调用点在
+// daemon / worker-pool / card-handler 的闭包里，漏传任何一处都只在那条路径上出错，只能逐个调用点核对。
 describe('buildStreamingCard call sites all pass idleCardLabel', () => {
   const files = [
     'src/core/worker-pool.ts',
@@ -439,12 +441,16 @@ describe('buildStreamingCard call sites all pass idleCardLabel', () => {
       const calls = callArgs(readFileSync(file, 'utf8'));
       expect(calls.length).toBeGreaterThan(0);
       const missing = calls
-        // Accepted forms: the live-session resolver `idleCardLabel(ds)`, the
+        // Accepted forms: the live-card resolver `streamCardLabel(ds)` (idle
+        // label, or the background-task count while the main turn has ended),
+        // its cached-state variant `cachedStreamCardLabel(ds)` (same, minus a
+        // count left behind by a worker that is gone), the idle-only
+        // `idleCardLabel(ds)` for frozen/limited cards, the
         // frozen-card resolver `frozenIdleLabel(frozen)`, or beginNewTurn's
         // pre-captured `previousIdleLabel` (captured before the session flags
         // are cleared). Legacy `silentIdleCardFlag(` / `.silentIdle` stay
         // accepted so an older call site is not flagged as a miss.
-        .filter(c => !/(?:idleCardLabel\(|frozenIdleLabel\(|previousIdleLabel\b|silentIdleCardFlag\(|\.silentIdle\b|\.idleLabel\b)/.test(c.args))
+        .filter(c => !/(?:streamCardLabel\(|cachedStreamCardLabel\(|idleCardLabel\(|frozenIdleLabel\(|previousIdleLabel\b|silentIdleCardFlag\(|\.silentIdle\b|\.idleLabel\b)/.test(c.args))
         .map(c => `${file}:${c.line}`);
       expect(missing).toEqual([]);
     });

@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.214.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Use /skills to list available skills.
+
+
+▍ ask me
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Question 3/3 (1 unanswered)
+  Where should it be deployed first?
+
+  ❯ 1. Staging (Recommended)  Safe rollout
+    2. Production             Ship it now
+    3. None of the above      Optionally, add details in notes (tab).
+
+  tab add notes  |  enter submit all  |  ←/→ navigate questions  |  esc interrupt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

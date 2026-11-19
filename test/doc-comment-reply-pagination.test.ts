@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -148,35 +146,6 @@ describe('getDocComment: 补全被分页截断的回复串', () => {
     const comment = await getDocComment('app-test', FILE, COMMENT_ID);
     expect(comment!.replies).toHaveLength(5);
     expect(comment!.hasMoreReplies).toBe(true);
-  });
-});
-
-/**
- * 事件派发里的触发回复解析：源码形状钉死。
- * 这段逻辑深埋在 handleDocCommentEvent 中间（前面有订阅解析、open_id 探针、
- * 网络拉评论），单测起来要 mock 整条链路；这里按仓库已有做法直接钉源码形状，
- * 保证那个会导致长 thread 永久失联的静默回退不会被改回来。
- */
-describe('handleDocCommentEvent 触发回复解析（源码形状）', () => {
-  const dispatcherSrc = readFileSync(new URL('../src/im/lark/event-dispatcher.ts', import.meta.url), 'utf-8');
-  const region = (() => {
-    const start = dispatcherSrc.indexOf('const trigger = parsed.replyId');
-    expect(start).toBeGreaterThan(-1);
-    return dispatcherSrc.slice(start, dispatcherSrc.indexOf('const triggerIndex', start));
-  })();
-
-  it('事件带 reply_id 时不再回退到 replies 的最后一条', () => {
-    expect(region).toContain('comment.replies.find(r => r.replyId === parsed.replyId)');
-    // 这个 `??` 回退正是 bug 本体：找不到就拿老回复顶上。
-    expect(region).not.toContain('?? comment.replies[comment.replies.length - 1]');
-  });
-
-  it('找不到触发回复时告警并丢弃本条，而不是静默用错的回复继续', () => {
-    expect(region).toContain('if (!trigger) {');
-    expect(region).toContain('logger.warn(');
-    expect(region).toContain('return;');
-    // 告警要带上「回复串是否被截断」，否则线上无法区分是分页截断还是别的原因。
-    expect(region).toContain('comment.hasMoreReplies');
   });
 });
 

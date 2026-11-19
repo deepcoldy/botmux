@@ -27,6 +27,10 @@ export interface PendingInjection {
   command: string;
   /** True when this injection carries a cwd move (e.g. `/cd`) and must drain before any user message. */
   barrier: boolean;
+  /** Injection provenance. `keepalive` marks a prompt-cache keep-alive: it is
+   *  bot-generated, not a human Web Terminal submit, so the UserPromptSubmit hook
+   *  it later triggers must not be mistaken for a direct-submit episode. */
+  kind?: 'keepalive';
 }
 
 /**

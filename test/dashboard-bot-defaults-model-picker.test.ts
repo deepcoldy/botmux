@@ -1,21 +1,26 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import {
   fetchDetectedModels,
   mergeModelCandidates,
   modelSuggestionsForOption,
+  type BotDefaultsRow,
   type CliOptionsState,
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotOnboardingDialog } from '../src/dashboard/web/bot-onboarding.js';
+import { ModelPickerField } from '../src/dashboard/web/field-controls.js';
+import { CodexProfilePicker } from '../src/dashboard/web/codex-profile-picker.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 const onboarding = readFileSync(new URL('../src/dashboard/web/bot-onboarding.tsx', import.meta.url), 'utf8');
-const fieldControls = readFileSync(new URL('../src/dashboard/web/field-controls.tsx', import.meta.url), 'utf8');
-const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.url), 'utf8');
 
 const cliState: CliOptionsState = {
   options: [],
@@ -23,42 +28,12 @@ const cliState: CliOptionsState = {
   ttadkModelSuggestions: ['ttadk-a', 'ttadk-b'],
 };
 
-// 源码断言：两处模型输入都换成 ModelPickerField，旧的裸文本框 + datalist 已移除。
-describe('ModelPickerField 源码接线', () => {
-  it('field-controls 导出 ModelPickerField，BotAgentSection 使用它', () => {
-    expect(fieldControls).toMatch(/export function ModelPickerField\b/);
-    const agentSection = page.slice(page.indexOf('export function BotAgentSection'));
-    expect(agentSection).toContain('<ModelPickerField');
-    expect(agentSection).toContain('dataInput="agentModel"');
-  });
-
-  it('Bot runtime 改变但 cliKey 不变时清空并重新探测模型目录', () => {
-    const agentSection = page.slice(page.indexOf('export function BotAgentSection'));
-    expect(agentSection).toContain('setDetectedModels(null);');
-    expect(agentSection).toContain('[cliKey, bot]');
-  });
-
-  it('onboarding 也使用 ModelPickerField，且不静态依赖懒加载的 bot-defaults-page', () => {
-    // onboarding 被 app.tsx 静态引入：若它从 bot-defaults-page 取控件，整页
-    // （8k 行）会被打进首屏 chunk，路由级懒加载失效。
-    expect(onboarding).toContain("import { ModelPickerField } from './field-controls.js';");
-    expect(onboarding).not.toContain("from './bot-defaults-page.js'");
-    expect(onboarding).toContain('<ModelPickerField');
-    expect(onboarding).toContain('dataInput="ob-model"');
-  });
-
-  it('旧的裸文本输入框与 datalist 已移除', () => {
-    // 旧标记是字面量 data-input="agentModel" 的 <input type="text">；新代码只有
-    // data-input={props.dataInput}（自定义模式真实输入框 + 下拉模式 hidden 锚点）。
-    expect(page).not.toMatch(/<input[^>]*data-input="agentModel"/);
-    expect(page).not.toContain('agent-model-suggestions');
-    expect(onboarding).not.toContain('ob-model-suggestions');
-  });
-
-  it('中英 i18n 都含 4 个 modelPicker key', () => {
-    for (const key of ['modelPickerDefault', 'modelPickerCustom', 'modelPickerBack', 'modelPickerDetected']) {
-      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
-    }
+describe('bot-onboarding 的 import 边界', () => {
+  // 源码结构护栏(K1)：onboarding 被 app.tsx 静态引入，若它从 bot-defaults-page 取控件，
+  // 整页（8k 行）会被打进首屏 chunk，路由级懒加载失效——这是 import 依赖方向，只能读源码。
+  // 来历：#1850 把 ModelPickerField 挪进 field-controls 正是为了切断这条边。
+  it('does not statically import the lazily loaded bot-defaults-page', () => {
+    expect(onboarding).not.toMatch(/from\s+['"]\.\/bot-defaults-page(?:\.js)?['"]/);
   });
 });
 
@@ -124,6 +99,311 @@ describe('BotAgentSection runtime catalog hydration', () => {
     } finally {
       if (renderer) act(() => renderer.unmount());
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+});
+
+describe('BotAgentSection Codex reasoning levels from the live catalogue', () => {
+  const SIX = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const FUTURE = 'gpt-6.3-sol'; // a model released after the static table
+
+  async function renderWithCatalog(bot: Record<string, unknown>) {
+    const previousFetch = globalThis.fetch;
+    let answer!: (body: unknown, status?: number) => void;
+    (globalThis as any).fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('/api/cli-options/models')) {
+        return new Promise(resolve => {
+          answer = (body, status = 200) => resolve({ ok: status === 200, status, json: async () => body });
+        });
+      }
+      if (String(url).includes('/api/cli-options/availability')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'unknown' }) };
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_codex_catalog_effort', cliId: 'codex', agentSelectionKey: 'codex', ...bot } as BotDefaultsRow,
+        sessionFallback: 'codex',
+        cliState: { options: [
+          { id: 'codex', label: 'Codex', modelChoices: [FUTURE] },
+          { id: 'codex-app', label: 'Codex App', modelChoices: [FUTURE] },
+        ], ttadkModelDefault: '', ttadkModelSuggestions: [] },
+        patchBot: () => undefined,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const effort = () => renderer.root.findByProps({ dataInput: 'agentReasoningEffort' }).props as {
+      value: string; options: Array<{ value: string }>;
+    };
+    return {
+      effort,
+      levels: () => effort().options.map(option => option.value).filter(Boolean),
+      answer: async (body: unknown, status?: number) => {
+        await act(async () => { answer(body, status); await Promise.resolve(); await Promise.resolve(); });
+      },
+      pickModel: (next: string) => act(() => renderer.root.findByProps({ id: 'bd-menu-agentModel' }).props.onChange(next)),
+      pickProfile: (next: string) => act(() => renderer.root.findByType(CodexProfilePicker).props.onChange(next)),
+      pickCli: (next: string) => act(() => renderer.root.findByProps({ dataInput: 'agentCliId' }).props.onChange(next)),
+      pickCustomRuntime: () => act(() => renderer.root.findByProps({ 'data-action': 'runtime-custom' }).props.onClick()),
+      done: () => { act(() => renderer.unmount()); (globalThis as any).fetch = previousFetch; },
+    };
+  }
+
+  it('keeps a saved catalogue-only level while the catalogue loads, then offers it', async () => {
+    const view = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      expect(view.effort().value).toBe('max');
+      await view.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(view.levels()).toEqual(SIX);
+      expect(view.effort().value).toBe('max');
+    } finally { view.done(); }
+  });
+
+  it.each([
+    ['the catalogue has no word on the model', { models: [FUTURE], source: 'live' }, 200],
+    ['the probe fell back to static choices', { models: [FUTURE], source: 'static' }, 200],
+    ['the probe failed', { error: 'boom' }, 500],
+  ])('keeps the saved pair selectable when %s, and clears it for another model', async (_case, body, status) => {
+    const view = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await view.answer(body, status);
+      expect(view.levels()).toEqual(SIX.slice(0, 5));
+      expect(view.effort().value).toBe('max');
+      view.pickModel('gpt-6.4-sol');
+      expect(view.levels()).toEqual(SIX.slice(0, 4));
+      expect(view.effort().value).toBe('');
+    } finally { view.done(); }
+  });
+
+  it('waits for the catalogue before judging a level on a model picked while it loads', async () => {
+    const view = await renderWithCatalog({ model: 'gpt-6.1-sol', reasoningEffort: 'max' });
+    try {
+      view.pickModel(FUTURE);
+      expect(view.effort().value).toBe('max');
+      await view.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(view.levels()).toEqual(SIX);
+      expect(view.effort().value).toBe('max');
+    } finally { view.done(); }
+  });
+
+  it('stops keeping the saved pair once a profile, runtime or another CLI picks a different catalogue', async () => {
+    const profiled = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await profiled.answer({ models: [FUTURE], source: 'live' });
+      expect(profiled.effort().value).toBe('max');
+      profiled.pickProfile('work');
+      expect(profiled.levels()).toEqual(SIX.slice(0, 4));
+      expect(profiled.effort().value).toBe('');
+    } finally { profiled.done(); }
+    const runtimeEdited = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await runtimeEdited.answer({ models: [FUTURE], source: 'live' });
+      runtimeEdited.pickCustomRuntime();
+      expect(runtimeEdited.levels()).toEqual(SIX.slice(0, 4));
+      expect(runtimeEdited.effort().value).toBe('');
+    } finally { runtimeEdited.done(); }
+    const switched = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await switched.answer({ models: [FUTURE], source: 'live' });
+      switched.pickCli('codex-app');
+      await switched.answer({ models: [FUTURE], source: 'live' });
+      expect(switched.levels()).toEqual(SIX.slice(0, 4));
+      expect(switched.effort().value).toBe('');
+    } finally { switched.done(); }
+  });
+
+  it('clears a saved level the live catalogue answers against', async () => {
+    const view = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await view.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX.slice(0, 4) } });
+      expect(view.levels()).toEqual(SIX.slice(0, 4));
+      expect(view.effort().value).toBe('');
+    } finally { view.done(); }
+  });
+
+  it('matches the catalogue slug case-insensitively and ignores it under a Codex profile', async () => {
+    const plain = await renderWithCatalog({ model: 'GPT-6.3-Sol' });
+    try {
+      await plain.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(plain.levels()).toEqual(SIX);
+    } finally { plain.done(); }
+    const profiled = await renderWithCatalog({ model: FUTURE, codexProfile: 'work' });
+    try {
+      await profiled.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(profiled.levels()).toEqual(SIX.slice(0, 4));
+    } finally { profiled.done(); }
+  });
+});
+
+const FOLLOW_CLI_DEFAULT = '跟随 CLI 默认';
+const PINNED_MODEL = 'gpt-6.1-sol';
+const LIVE_MODELS = [PINNED_MODEL, 'gpt-6-astra'];
+
+type MenuOption = { value: string; label: unknown };
+
+describe('BotAgentSection 主模型选择器', () => {
+  const appId = 'cli_model_default_reset';
+  const originalFetch = globalThis.fetch;
+  let dir: string | undefined;
+  let configPath: string;
+  let server: IpcServerHandle | undefined;
+  let renderer: TestRenderer.ReactTestRenderer | undefined;
+  const agentSaveBodies: Array<Record<string, unknown>> = [];
+
+  afterEach(async () => {
+    if (renderer) act(() => renderer!.unmount());
+    renderer = undefined;
+    if (server) await server.close();
+    server = undefined;
+    setLarkAppId('');
+    __testOnly_resetBotRegistry();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+    agentSaveBodies.length = 0;
+  });
+
+  function stored(): Record<string, unknown> {
+    return JSON.parse(readFileSync(configPath, 'utf8'))[0];
+  }
+
+  async function renderStored(): Promise<void> {
+    if (renderer) act(() => renderer!.unmount());
+    const bot = loadBotConfigs()[0]!;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { ...bot, agentSelectionKey: bot.cliId } as BotDefaultsRow,
+        sessionFallback: bot.cliId!,
+        cliState: {
+          options: [{ id: 'codex', label: 'Codex', modelChoices: ['static-model'] }],
+          ttadkModelDefault: '',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+    });
+  }
+
+  function modelMenu() {
+    return renderer!.root.findByProps({ id: 'bd-menu-agentModel' });
+  }
+
+  it('固定过模型的 Bot 能从下拉顶部选回「跟随 CLI 默认」，保存清掉 model，重新加载仍显示跟随默认', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'dashboard-model-default-'));
+    configPath = join(dir, 'bots.json');
+    vi.stubEnv('BOTS_CONFIG', configPath);
+    writeFileSync(configPath, JSON.stringify([
+      { larkAppId: appId, larkAppSecret: 'fixture', cliId: 'codex', model: PINNED_MODEL },
+    ]));
+    loadBotConfigs().forEach(registerBot);
+    setLarkAppId(appId);
+    server = await startIpcServer({ host: '127.0.0.1', port: 0 });
+    const base = `http://127.0.0.1:${server.port}`;
+    let finishSave: ((result: { status: number; body: unknown }) => void) | undefined;
+    // 模型探测留在本地；保存走组件真实发出的请求体，交给真实 IPC 写入处理落盘。
+    vi.stubGlobal('fetch', (async (url, init) => {
+      const path = String(url);
+      if (path === `/api/bots/${appId}/agent` && init?.method === 'PUT') {
+        agentSaveBodies.push(JSON.parse(String(init.body)));
+        const response = await originalFetch(`${base}/api/bot-agent`, init);
+        finishSave?.({ status: response.status, body: await response.clone().json() });
+        return response;
+      }
+      if (path.startsWith('/api/cli-options/models?')) {
+        return new Response(JSON.stringify({ models: LIVE_MODELS, source: 'live' }));
+      }
+      if (path.startsWith('/api/cli-options/availability?')) {
+        return new Response(JSON.stringify({ status: 'unknown' }));
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    }) as typeof fetch);
+    await renderStored();
+
+    const pinnedMenu = modelMenu();
+    expect(pinnedMenu.props.label).toBe(PINNED_MODEL);
+    expect(pinnedMenu.props.options[0]).toEqual({ value: '', label: FOLLOW_CLI_DEFAULT });
+    expect(pinnedMenu.props.options.map((option: MenuOption) => option.value).slice(1, 3)).toEqual(LIVE_MODELS);
+
+    act(() => pinnedMenu.props.onChange(''));
+    expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+
+    const completed = new Promise<{ status: number; body: unknown }>(resolve => { finishSave = resolve; });
+    await act(async () => {
+      renderer!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+      expect(await completed).toMatchObject({ status: 200, body: { ok: true } });
+    });
+    expect(agentSaveBodies).toHaveLength(1);
+    expect(agentSaveBodies[0]).toMatchObject({ cliId: 'codex', model: '' });
+    expect(stored()).not.toHaveProperty('model');
+    expect(loadBotConfigs()[0]!.model).toBeUndefined();
+
+    await renderStored();
+    expect(renderer!.root.findByType(ModelPickerField).props.value).toBe('');
+    expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+  });
+});
+
+describe('BotOnboardingDialog 模型选择器', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('选过具体模型后能选回「跟随 CLI 默认」，创建请求不再带 model', async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/bot-onboarding/start' && init?.method === 'POST') {
+        startBodies.push(JSON.parse(String(init.body)));
+        // 终态 job：表单提交到此为止，不进入轮询。
+        return new Response(JSON.stringify({ job: { id: 'job_model_default', status: 'failed', message: 'stop' } }));
+      }
+      if (url.startsWith('/api/cli-options/models?')) {
+        return new Response(JSON.stringify({ models: LIVE_MODELS, source: 'live' }));
+      }
+      if (url.startsWith('/api/cli-options/availability?')) {
+        return new Response(JSON.stringify({ status: 'available' }));
+      }
+      if (url === '/api/cli-options') {
+        return new Response(JSON.stringify({
+          options: [{ id: 'codex', label: 'Codex', modelChoices: [PINNED_MODEL] }],
+          ttadkModelSuggestions: [],
+        }));
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(BotOnboardingDialog, { open: true, onClose: () => undefined }));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const modelMenu = () => renderer.root.findByProps({ id: 'bd-menu-ob-model' });
+      expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+
+      await act(async () => {
+        modelMenu().props.onChange(PINNED_MODEL);
+      });
+      expect(modelMenu().props.label).toBe(PINNED_MODEL);
+      expect(modelMenu().props.options[0]).toEqual({ value: '', label: FOLLOW_CLI_DEFAULT });
+
+      await act(async () => {
+        modelMenu().props.onChange('');
+      });
+      expect(renderer.root.findByType(ModelPickerField).props.value).toBe('');
+      expect(modelMenu().props.label).toBe(FOLLOW_CLI_DEFAULT);
+
+      await act(async () => {
+        renderer.root.findByProps({ id: 'onboarding-form' }).props.onSubmit({ preventDefault() {} });
+        await Promise.resolve();
+      });
+      expect(startBodies).toHaveLength(1);
+      expect(startBodies[0]).toMatchObject({ cliId: 'codex' });
+      expect(startBodies[0]).not.toHaveProperty('model');
+    } finally {
+      if (renderer) act(() => renderer.unmount());
     }
   });
 });

@@ -65,6 +65,7 @@ function instances(): FakeSocket[] {
 
 import { openaiSynthesizePcm } from '../src/services/voice/openai.js';
 import { mintSamiToken, samiSynthesizePcm } from '../src/services/voice/sami.js';
+import { volcengineSynthesizePcm } from '../src/services/voice/volcengine.js';
 
 const SAMI_CREDS = {
   accessKey: 'access',
@@ -95,6 +96,38 @@ describe('voice provider effect fences', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it('awaits the Volcengine fence before its unique fetch and starts the deadline afterward', async () => {
+    const gate = deferred();
+    const order: string[] = [];
+    const fetcher = vi.fn(async () => {
+      order.push('fetch');
+      return new Response('{"code":0,"data":"AQI="}{"code":20000000}');
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const synthesis = volcengineSynthesizePcm({ mode: 'agent-plan', apiKey: 'fake' }, 'hi',
+      { speaker: 'voice', timeoutMs: 25 }, { beforeProviderEffect: async () => {
+        order.push('hook');
+        await gate.promise;
+        order.push('authorized');
+      } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fetcher).not.toHaveBeenCalled();
+    gate.resolve();
+    expect((await synthesis).data.length).toBe(2);
+    expect(order).toEqual(['hook', 'authorized', 'fetch']);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('preserves Volcengine revocation identity, asynchronous=%s', async (asyncHook) => {
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    const revoked = new Error('origin revoked');
+    const hook = asyncHook ? async () => { throw revoked; } : () => { throw revoked; };
+    await expect(volcengineSynthesizePcm({ mode: 'standard', apiKey: 'fake' }, 'hi',
+      { speaker: 'voice' }, { beforeProviderEffect: hook })).rejects.toBe(revoked);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('fences SAMI token minting before fetch and fails closed when revoked', async () => {

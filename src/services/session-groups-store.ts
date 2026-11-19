@@ -66,6 +66,10 @@ export interface SessionGroupEntry {
   originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
+  /** Published Agent title awaiting application; bound to the resident session. */
+  pendingNativeTitle?: { sessionId: string; title: string; source: 'native' | 'session'; sourceTitle: string };
+  /** Original placeholder, advanced only by confirmed automatic renames. */
+  autoTitleBaseName?: string;
   /** Actual automatic feed group joined by this chat, scoped to ownerOpenId. */
   feedGroupId?: string;
   /** Failed scheduling rounds (each round contains the service's bounded
@@ -135,6 +139,8 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     originQuotaKey: entry.originQuotaKey,
     originChatId: entry.originChatId,
     titled: entry.titled,
+    pendingNativeTitle: entry.pendingNativeTitle,
+    autoTitleBaseName: entry.autoTitleBaseName,
     feedGroupId: entry.feedGroupId,
     titleAttempts: entry.titleAttempts,
     titleRetryAt: entry.titleRetryAt,
@@ -155,6 +161,30 @@ export function getSessionGroup(chatId: string): SessionGroupEntry | undefined {
   return entries.get(chatId);
 }
 
+/** 群组管理页「会话群」视图要的摘要：排序、状态和「查看会话」入口。 */
+export interface SessionGroupBoardMeta {
+  createdAt: number;
+  /** 注册表时间与当前会话最后一条消息里较新的那个——注册表只在建群 / 恢复 / 换新会话时更新，
+   *  会话里每来一条消息只会推进会话自己的 lastMessageAt。 */
+  lastActiveAt: number;
+  sessionId?: string;
+  sessionStatus?: 'active' | 'closed';
+}
+
+export function sessionGroupBoardMeta(
+  entry: SessionGroupEntry,
+  session?: { status?: string; lastMessageAt?: string } | null,
+): SessionGroupBoardMeta {
+  const sessionActiveAt = session?.lastMessageAt ? Date.parse(session.lastMessageAt) : NaN;
+  const status = session?.status === 'active' || session?.status === 'closed' ? session.status : undefined;
+  return {
+    createdAt: entry.createdAt,
+    lastActiveAt: Number.isFinite(sessionActiveAt) ? Math.max(entry.lastActiveAt, sessionActiveAt) : entry.lastActiveAt,
+    ...(entry.lastSessionId ? { sessionId: entry.lastSessionId } : {}),
+    ...(status ? { sessionStatus: status } : {}),
+  };
+}
+
 /** Remember the automatic group only for the user who owns this session group. */
 export function setSessionGroupFeedGroup(chatId: string, ownerOpenId: string, feedGroupId: string): void {
   const entry = getSessionGroup(chatId);
@@ -168,7 +198,14 @@ export function touchSessionGroup(chatId: string, lastSessionId?: string): void 
   load();
   const cur = entries.get(chatId);
   if (!cur) return;
-  if (lastSessionId) cur.lastSessionId = lastSessionId;
+  if (lastSessionId) {
+    if (lastSessionId !== cur.lastSessionId && cur.pendingNativeTitle) {
+      cur.pendingNativeTitle = undefined;
+      cur.titleAttempts = undefined;
+      cur.titleRetryAt = undefined;
+    }
+    cur.lastSessionId = lastSessionId;
+  }
   cur.lastActiveAt = Date.now();
   persist();
 }
@@ -179,7 +216,34 @@ export function markSessionGroupTitled(chatId: string): void {
   const cur = entries.get(chatId);
   if (!cur || cur.titled) return;
   cur.titled = true;
+  cur.pendingNativeTitle = undefined;
   cur.titleRetryAt = undefined;
+  persist();
+}
+
+/** Persist one generated title for the current resident without resetting duplicate-event backoff. */
+export function rememberSessionGroupNativeTitle(
+  chatId: string,
+  candidate: NonNullable<SessionGroupEntry['pendingNativeTitle']>,
+): boolean {
+  const cur = getSessionGroup(chatId);
+  if (!cur || cur.titled || cur.lastSessionId !== candidate.sessionId || !candidate.title.trim()) return false;
+  if (cur.pendingNativeTitle?.sessionId === candidate.sessionId
+    && cur.pendingNativeTitle.source === candidate.source
+    && cur.pendingNativeTitle.sourceTitle === candidate.sourceTitle) return true;
+  cur.pendingNativeTitle = candidate;
+  // Old one-shot failures must not prevent the first generated title from being applied.
+  cur.titleAttempts = undefined;
+  cur.titleRetryAt = undefined;
+  persist();
+  return true;
+}
+
+/** Advance only the automatic name that this process actually replaced, including a stale request's success. */
+export function recordSessionGroupAutoName(chatId: string, previousName: string, newName: string): void {
+  const cur = getSessionGroup(chatId);
+  if (!cur || cur.autoTitleBaseName !== previousName) return;
+  cur.autoTitleBaseName = newName;
   persist();
 }
 
@@ -201,10 +265,4 @@ export function markSessionGroupTitleFailed(chatId: string, failedAt = Date.now(
 export function removeSessionGroup(chatId: string): void {
   load();
   if (entries.delete(chatId)) persist();
-}
-
-export function listSessionGroups(): Array<{ chatId: string } & SessionGroupEntry> {
-  if (!currentAppId) return [];
-  load();
-  return Array.from(entries.entries()).map(([chatId, v]) => ({ chatId, ...v }));
 }

@@ -8,6 +8,19 @@ const DOMAIN = 'botmux.dispatch-report-binding.v1';
 export const DISPATCH_REPORT_REGISTER_ROUTE = '/api/report-relay/register';
 export const DISPATCH_REPORT_REGISTER_MAX_BYTES = 64 * 1024;
 
+/** Imported workstreams bind reporting authority to one observed source
+ * lifetime. These fields must be signed, never taken from the mutable registry
+ * entry beside the binding. Legacy dispatch bindings deliberately omit them. */
+export interface DispatchReportAttachment {
+  sourceSessionId: string;
+  sourceLarkAppId: string;
+  ownerKey: string;
+  sourceRouteRevision: number;
+  revision: number;
+  state: 'pending' | 'active' | 'moved' | 'closed' | 'unknown';
+  reportCapability: 'verified' | 'manual' | 'unavailable';
+}
+
 export interface DispatchReportBindingPayload {
   domain: typeof DOMAIN;
   dispatchRoot: string;
@@ -17,6 +30,9 @@ export interface DispatchReportBindingPayload {
   targetScope?: 'thread' | 'chat';
   sourceName: string;
   issuedAt: string;
+  /** 单项目直投范围由来源宿主签发，执行端不能改写落点。 */
+  reply?: { rootMessageId: string; sourceTurnId: string; reporterLarkAppId: string };
+  attachment?: DispatchReportAttachment;
 }
 
 export interface SignedDispatchReportBinding {
@@ -91,12 +107,64 @@ export function loadOrCreateDispatchReportBindingSecret(
   }));
 }
 
+/**
+ * Read the dispatch-report secret WITHOUT creating one.
+ *
+ * A caller that only needs to VERIFY an already-issued binding (for example
+ * `botmux send` deciding whether this topic returns its results through
+ * `botmux report`) must never mint signing authority as a side effect: a fresh
+ * secret would silently invalidate every binding the daemon issued with the
+ * real one, and an agent-side process has no business creating host
+ * credentials. Returns undefined when absent or unreadable.
+ */
+export function readDispatchReportBindingSecret(dataDir: string): string | undefined {
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  try {
+    const secret = readSecureHostFileSync(
+      dispatchReportBindingSecretPath(dataDir, { coreOnly }),
+      256,
+    )?.trim();
+    return secret || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function validDispatchRoot(value: string): boolean {
   return /^om_[A-Za-z0-9_-]{1,128}$/.test(value);
 }
 
 function validIdentity(value: string): boolean {
   return value.length > 0 && value.length <= 256 && !value.includes('\0');
+}
+
+function canonicalAttachment(raw: unknown): DispatchReportAttachment {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('invalid dispatch report attachment');
+  }
+  const value = raw as Record<string, unknown>;
+  const keys = ['sourceSessionId', 'sourceLarkAppId', 'ownerKey', 'sourceRouteRevision', 'revision', 'state', 'reportCapability'];
+  if (Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))
+    || typeof value.sourceSessionId !== 'string' || !validIdentity(value.sourceSessionId)
+    || /[\x00-\x20\x7f]/u.test(value.sourceSessionId)
+    || typeof value.sourceLarkAppId !== 'string' || !/^cli_[A-Za-z0-9_-]{1,128}$/u.test(value.sourceLarkAppId)
+    || typeof value.ownerKey !== 'string' || !validIdentity(value.ownerKey)
+    || /[\x00-\x20\x7f]/u.test(value.ownerKey)
+    || typeof value.sourceRouteRevision !== 'number' || !Number.isSafeInteger(value.sourceRouteRevision) || value.sourceRouteRevision < 1
+    || typeof value.revision !== 'number' || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || !['pending', 'active', 'moved', 'closed', 'unknown'].includes(value.state as string)
+    || !['verified', 'manual', 'unavailable'].includes(value.reportCapability as string)) {
+    throw new Error('invalid dispatch report attachment');
+  }
+  return {
+    sourceSessionId: value.sourceSessionId,
+    sourceLarkAppId: value.sourceLarkAppId,
+    ownerKey: value.ownerKey,
+    sourceRouteRevision: value.sourceRouteRevision,
+    revision: value.revision,
+    state: value.state as DispatchReportAttachment['state'],
+    reportCapability: value.reportCapability as DispatchReportAttachment['reportCapability'],
+  };
 }
 
 function canonicalPayload(input: {
@@ -107,6 +175,8 @@ function canonicalPayload(input: {
   targetScope?: 'thread' | 'chat';
   sourceName?: string;
   issuedAt?: string;
+  reply?: DispatchReportBindingPayload['reply'];
+  attachment?: DispatchReportAttachment;
 }): DispatchReportBindingPayload {
   const dispatchRoot = input.dispatchRoot.trim();
   const targetLarkAppId = input.targetLarkAppId.trim();
@@ -125,6 +195,9 @@ function canonicalPayload(input: {
   const sourceName = input.sourceName?.trim().slice(0, 200) || 'dispatched subtask';
   const issuedAt = input.issuedAt ?? new Date().toISOString();
   if (!Number.isFinite(Date.parse(issuedAt))) throw new Error('invalid dispatch report issue time');
+  if (input.reply && (!validDispatchRoot(input.reply.rootMessageId)
+    || !validDispatchRoot(input.reply.sourceTurnId) || !/^cli_[A-Za-z0-9_]+$/.test(input.reply.reporterLarkAppId)
+    || !targetChatId || input.targetScope !== 'thread')) throw new Error('invalid dispatch reply target');
   return {
     domain: DOMAIN,
     dispatchRoot,
@@ -134,6 +207,9 @@ function canonicalPayload(input: {
     ...(input.targetScope ? { targetScope: input.targetScope } : {}),
     sourceName,
     issuedAt,
+    ...(input.reply ? { reply: { rootMessageId: input.reply.rootMessageId,
+      sourceTurnId: input.reply.sourceTurnId, reporterLarkAppId: input.reply.reporterLarkAppId } } : {}),
+    ...(input.attachment !== undefined ? { attachment: canonicalAttachment(input.attachment) } : {}),
   };
 }
 
@@ -177,6 +253,9 @@ export function verifyDispatchReportBinding(
         : undefined,
       sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : '',
       issuedAt: typeof candidate.issuedAt === 'string' ? candidate.issuedAt : '',
+      ...(candidate.reply !== undefined ? { reply: candidate.reply as DispatchReportBindingPayload['reply'] } : {}),
+      ...(candidate.attachment !== undefined
+        ? { attachment: candidate.attachment as DispatchReportAttachment } : {}),
     });
     if (candidate.domain !== DOMAIN || payload.dispatchRoot !== dispatchRoot) return null;
     const expected = Buffer.from(signPayload(secret, payload), 'base64url');
@@ -194,7 +273,7 @@ export function resolveVerifiedDispatchReportTarget(input: {
   secret: string;
 }):
   | { ok: true; binding: DispatchReportBindingPayload }
-  | { ok: false; error: 'dispatch_target_unavailable' | 'dispatch_binding_unproven' } {
+  | { ok: false; error: 'dispatch_target_unavailable' | 'dispatch_binding_unproven' | 'dispatch_attachment_inactive' } {
   const rawEntry = input.registry[input.dispatchRoot];
   if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
     return { ok: false, error: 'dispatch_target_unavailable' };
@@ -204,7 +283,10 @@ export function resolveVerifiedDispatchReportTarget(input: {
     input.dispatchRoot,
     (rawEntry as Record<string, unknown>).reportBinding,
   );
-  return binding
-    ? { ok: true, binding }
-    : { ok: false, error: 'dispatch_binding_unproven' };
+  if (!binding) return { ok: false, error: 'dispatch_binding_unproven' };
+  if (binding.attachment && (binding.attachment.state !== 'active'
+    || binding.attachment.reportCapability !== 'verified')) {
+    return { ok: false, error: 'dispatch_attachment_inactive' };
+  }
+  return { ok: true, binding };
 }

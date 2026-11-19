@@ -1,0 +1,50 @@
+
+  [1mSessionStart hooks
+[0m[39m[49m  [38;5;3m1 hook needs review before it can run.[39m
+[1;7m❯ [!] Hook 1 · new
+[0m[39m[49m  Event     [2mSessionStart[0m[39m[49m
+  Source    [2mSession flags - /<session-flags>/config.toml
+[0m[39m[49m  Command   [2mecho hi[0m[39m[49m
+  Mode      [2mSync
+[0m[39m[49m  Timeout   [2m600s[0m[39m[49m
+  Trust     [2mNew hook - review required[0m[39m[49m
+
+
+  [1mt[0;2m[39m[49m trust  |  [0;1m[39m[49mesc[0;2m[39m[49m go back[0m[39m[49m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

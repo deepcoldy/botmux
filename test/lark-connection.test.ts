@@ -1,140 +1,135 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { startLarkConnection } from '../src/im/lark/transport/connection.js';
+import { getLarkConnectionHealth } from '../src/im/lark/transport/connection-health.js';
+import { createResilientWsClient } from '../src/im/lark/transport/resilient-ws-client.js';
 import { logger } from '../src/utils/logger.js';
 
-let capturedWsClientOptions: Record<string, any> | undefined;
-vi.mock('@larksuiteoapi/node-sdk', () => {
-  class MockWSClient {
-    constructor(options: Record<string, any>) {
-      capturedWsClientOptions = options;
-    }
-    start = vi.fn(async () => {});
-    getConnectionStatus = vi.fn(() => ({ state: 'connected', reconnectAttempts: 0 }));
-  }
-  return {
-    EventDispatcher: class {},
-    WSClient: MockWSClient,
-    LoggerLevel: { info: 2, warn: 3 },
-  };
-});
+type ClientOptions = Parameters<typeof createResilientWsClient>[0];
+type Hooks = NonNullable<Parameters<typeof createResilientWsClient>[1]>;
+let capturedWsClientOptions: ClientOptions | undefined;
+const clients: Array<{
+  options: ClientOptions; hooks: Hooks; start: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn>;
+  getConnectionStatus: () => { state: Lark.WSConnectionState; reconnectAttempts: number };
+}> = [];
+vi.mock('../src/im/lark/transport/resilient-ws-client.js', () => ({
+  createResilientWsClient: (options: ClientOptions, hooks: Hooks) => {
+    capturedWsClientOptions = options;
+    const client = {
+      options, hooks,
+      start: vi.fn(async () => {}), close: vi.fn(),
+      getConnectionStatus: () => ({ state: 'connecting' as Lark.WSConnectionState, reconnectAttempts: 0 }),
+    };
+    clients.push(client);
+    return client;
+  },
+}));
 
-// No registry, session, card, filesystem or PTY mocks: the connection accepts an
-// already registered SDK dispatcher and needs no business bootstrap.
 const eventDispatcher = new Lark.EventDispatcher({});
 let tick: () => void;
-let intervalMs: number | undefined;
-const unref = vi.fn();
-
+let now: number;
 beforeEach(() => {
+  now = 100;
   capturedWsClientOptions = undefined;
-  unref.mockClear();
-  vi.spyOn(globalThis, 'setInterval').mockImplementation((callback, delay) => {
+  clients.length = 0;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  vi.spyOn(globalThis, 'setInterval').mockImplementation(callback => {
     tick = () => callback();
-    intervalMs = delay;
-    // Only unref is used by the connection; probes are driven explicitly.
-    return { unref } as unknown as NodeJS.Timeout;
+    return { unref() {} } as NodeJS.Timeout;
   });
   vi.spyOn(logger, 'info').mockImplementation(() => {});
   vi.spyOn(logger, 'warn').mockImplementation(() => {});
   vi.spyOn(logger, 'error').mockImplementation(() => {});
 });
-
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
 
-// Drain the start().catch().finally() chain without advancing any real timer.
-async function probeRecovery(): Promise<void> {
-  tick();
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-}
-
-describe('startLarkConnection — lifecycle', () => {
-  it.each(['feishu', 'lark'] as const)('preserves %s connection options and passes the dispatcher unchanged', (brand) => {
+describe('startLarkConnection', () => {
+  it.each(['feishu', 'lark'] as const)('preserves %s dial options and passes the dispatcher unchanged', brand => {
     vi.stubEnv('DEBUG', '');
-    const client = startLarkConnection('app-test', 'secret', eventDispatcher, brand);
-    expect(client).toBeInstanceOf(Lark.WSClient);
-    expect(capturedWsClientOptions).toMatchObject({
-      appId: 'app-test',
-      appSecret: 'secret',
-      domain: brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn',
-      loggerLevel: Lark.LoggerLevel.warn,
-      wsConfig: { pingTimeout: 30 },
-      handshakeTimeoutMs: 15_000,
+    const handle = startLarkConnection('app-test', '', eventDispatcher, brand);
+    expect(clients[0].options).toMatchObject({
+      appId: 'app-test', domain: brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn',
+      loggerLevel: Lark.LoggerLevel.warn, wsConfig: { pingTimeout: 30 }, handshakeTimeoutMs: 15_000,
     });
-    expect(client.start).toHaveBeenCalledExactlyOnceWith({ eventDispatcher });
-    expect(intervalMs).toBe(60_000);
-    expect(unref).toHaveBeenCalledOnce();
+    expect(clients[0].start).toHaveBeenCalledExactlyOnceWith({ eventDispatcher });
+    handle.close();
   });
 
-  it('defaults to Feishu, honors DEBUG and retains connection diagnostics', () => {
-    vi.stubEnv('DEBUG', '1');
-    const onReady = vi.fn();
-    const onReconnecting = vi.fn();
-    const onReconnected = vi.fn();
-    startLarkConnection('app-test', 'secret', eventDispatcher, 'feishu', {
-      onReady,
-      onReconnecting,
-      onReconnected,
-    });
-    expect(capturedWsClientOptions?.domain).toBe('https://open.feishu.cn');
-    expect(capturedWsClientOptions?.loggerLevel).toBe(Lark.LoggerLevel.info);
-    capturedWsClientOptions?.onReconnecting();
-    capturedWsClientOptions?.onReady();
-    capturedWsClientOptions?.onReconnected();
-    capturedWsClientOptions?.onError(new Error('offline'));
-    expect(logger.warn).toHaveBeenCalledWith('[ws] app-test reconnecting…');
-    expect(onReconnecting).toHaveBeenCalledOnce();
-    expect(logger.info).toHaveBeenCalledWith('[ws] app-test reconnected');
-    expect(onReconnected).toHaveBeenCalledOnce();
-    expect(onReady).toHaveBeenCalledOnce();
-    expect(logger.info).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test connecting domain=https:\/\/open\.feishu\.cn proxy=.+ runtime=.+$/));
-    expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test terminal error: offline \(proxy=.+ runtime=.+\)$/));
-  });
-
-  it.each(['connected', 'connecting', 'reconnecting', 'idle'] as const)('does not restart while the SDK is %s', async (state) => {
-    const client = startLarkConnection('app-test', 'secret', eventDispatcher);
-    vi.mocked(client.getConnectionStatus).mockReturnValue({ state, reconnectAttempts: 0 });
-    await probeRecovery();
-    expect(client.start).toHaveBeenCalledTimes(1);
-  });
-
-  it('restarts a failed connection with the same dispatcher and does not overlap pending recovery', async () => {
+  it('replaces a stalled reconnect, fences retired callbacks, and closes the current generation on leadership loss', () => {
+    vi.stubEnv('BOTMUX_LARK_WS_RECONNECT_STALE_MS', '500');
     const onRestarting = vi.fn();
-    const client = startLarkConnection('app-test', 'secret', eventDispatcher, 'feishu', { onRestarting });
-    vi.mocked(client.getConnectionStatus).mockReturnValue({ state: 'failed', reconnectAttempts: 3 });
-    let finish!: () => void;
-    vi.mocked(client.start).mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
-    await probeRecovery();
-    expect(client.start).toHaveBeenCalledTimes(2);
-    expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test connection failed \(reconnect exhausted, proxy=.+ runtime=.+\), restarting WSClient$/));
+    const onReconnected = vi.fn();
+    const handle = startLarkConnection('app-test', '', eventDispatcher, 'feishu', { onRestarting, onReconnected });
+    const old = clients[0];
+    old.hooks.onAttempt?.(1);
+    old.options.onReady?.();
+    old.hooks.onInbound?.();
+    old.options.onReconnecting?.();
+    old.getConnectionStatus = () => ({ state: 'reconnecting', reconnectAttempts: 1 });
+    old.hooks.onAttempt?.(1);
+    now += 499;
+    tick();
+    expect(clients).toHaveLength(1);
+    now++;
+    tick();
+    expect(clients).toHaveLength(2);
     expect(onRestarting).toHaveBeenCalledOnce();
-    expect(client.start).toHaveBeenLastCalledWith({ eventDispatcher });
-    await probeRecovery();
-    expect(client.start).toHaveBeenCalledTimes(2);
-    vi.mocked(client.getConnectionStatus).mockReturnValue({ state: 'connected', reconnectAttempts: 0 });
-    finish();
-    await probeRecovery();
-    await probeRecovery();
-    expect(client.start).toHaveBeenCalledTimes(2);
-    // A later terminal failure can start a new recovery round.
-    vi.mocked(client.getConnectionStatus).mockReturnValue({ state: 'failed', reconnectAttempts: 3 });
-    await probeRecovery();
-    expect(client.start).toHaveBeenCalledTimes(3);
+    expect(old.close).toHaveBeenCalledExactlyOnceWith({ force: true });
+    expect(clients[1].start).toHaveBeenCalledExactlyOnceWith({ eventDispatcher });
+    old.hooks.onInbound?.();
+    old.options.onReconnected?.();
+    expect(onReconnected).not.toHaveBeenCalled();
+    clients[1].hooks.onAttempt?.(1);
+    clients[1].options.onReady?.();
+    expect(onReconnected).toHaveBeenCalledOnce();
+    expect(getLarkConnectionHealth('app-test')).toMatchObject({ state: 'connected', attempts: 2, lastInboundAt: 100 });
+    handle.close({ force: true });
+    now += 500;
+    tick();
+    expect(clients).toHaveLength(2);
+    expect(clients[1].close).toHaveBeenCalledOnce();
+    expect(getLarkConnectionHealth('app-test')).toBeUndefined();
   });
 
-  it('logs rejected recovery and allows another attempt on the next probe', async () => {
-    const client = startLarkConnection('app-test', 'secret', eventDispatcher);
-    vi.mocked(client.getConnectionStatus).mockReturnValue({ state: 'failed', reconnectAttempts: 3 });
-    vi.mocked(client.start).mockRejectedValueOnce(new Error('network unavailable'));
-    await probeRecovery();
-    expect(logger.error).toHaveBeenCalledWith('[ws] app-test WSClient restart failed: network unavailable');
-    await probeRecovery();
-    expect(client.start).toHaveBeenCalledTimes(3);
+  it('honors a subscription closed inside the rebuild notification', () => {
+    vi.stubEnv('BOTMUX_LARK_WS_RECONNECT_STALE_MS', '500');
+    const handle = startLarkConnection('app-test', '', eventDispatcher, 'feishu', {
+      onRestarting: () => handle.close(),
+    });
+    now += 500;
+    tick();
+    now += 500;
+    tick();
+    expect(clients).toHaveLength(1);
+    expect(getLarkConnectionHealth('app-test')).toBeUndefined();
+  });
+
+  it('bounds bootstrap and connected sockets that stop receiving frames; real pongs reset the rebuild budget', () => {
+    vi.stubEnv('BOTMUX_LARK_WS_MAX_REBUILDS', '1');
+    vi.stubEnv('BOTMUX_LARK_WS_INBOUND_STALE_MS', '500');
+    const exit = vi.spyOn(process, 'exit').mockImplementation((): never => { throw new Error('fatal exit'); });
+    const handle = startLarkConnection('app-test', '', eventDispatcher);
+    now += 500;
+    tick(); // no HTTP bootstrap result
+    const second = clients[1];
+    second.getConnectionStatus = () => ({ state: 'connected', reconnectAttempts: 0 });
+    second.options.onReady?.();
+    now += 499;
+    second.hooks.onInbound?.();
+    tick();
+    now += 499;
+    tick();
+    expect(clients).toHaveLength(2);
+    now++;
+    tick(); // silent, but the inbound frame earned another rebuild
+    expect(clients).toHaveLength(3);
+    clients[2].getConnectionStatus = () => ({ state: 'failed', reconnectAttempts: 0 });
+    expect(() => tick()).toThrow('fatal exit');
+    expect(exit).toHaveBeenCalledWith(1);
+    handle.close();
   });
 });
 
@@ -181,7 +176,7 @@ describe('startLarkConnection — WebSocket proxy', () => {
     }, () => {
       startLarkConnection('app-test', 'secret', eventDispatcher);
 
-      const agent = capturedWsClientOptions?.agent;
+      const agent = capturedWsClientOptions?.agent as any;
       // Must be HttpsProxyAgent, not ProxyAgent: Bun's built-in ws reads the
       // proxy URL off `agent.proxy` (the HttpsProxyAgent shape) and silently
       // ignores a ProxyAgent, so an http proxy has to arrive as HttpsProxyAgent
@@ -209,7 +204,7 @@ describe('startLarkConnection — WebSocket proxy', () => {
     withWsProxyEnv({ ALL_PROXY: 'socks5://127.0.0.1:1080' }, () => {
       startLarkConnection('app-test', 'secret', eventDispatcher);
 
-      const agent = capturedWsClientOptions?.agent;
+      const agent = capturedWsClientOptions?.agent as any;
       expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('socks5://127.0.0.1:1080');
     });
   });

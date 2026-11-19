@@ -52,6 +52,7 @@ async function fresh() {
   const registry = await import('../src/bot-registry.js');
   const pending = await import('../src/im/lark/grant-pending.js');
   const handler = await import('../src/im/lark/card-handler.js');
+  pending._resetForTest(); // grant-pending 落盘：新模块图会读到上个用例的文件
   const bot = registry.registerBot({ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
   bot.botOpenId = 'ou_bot';
   bot.resolvedAllowedUsers = ['ou_owner'];
@@ -118,5 +119,32 @@ describe('card-handler 部分授权失败', () => {
     expect(pending.checkNonce('h1', 'oc_1', 'ou_fail2', nonce)).toBe(true);
     expect(deleteMock).not.toHaveBeenCalled();
     expect(recordObservedMock).not.toHaveBeenCalled();
+  });
+
+  it('grant-store 抛异常（bots.json 锁超时等）按失败处理：已落盘的卡放回去，重启后仍可重试', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b']);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_a', 'ou_b'], nonce);
+    addChatGrantMock.mockImplementation(async () => { throw new Error('file-lock timeout'); });
+    const res = await handler.handleCardAction(multiAction(['ou_a', 'ou_b'], ['甲', '乙'], nonce), deps, 'h1');
+
+    expect(res?.toast).toEqual({ type: 'error', content: '授权失败：file-lock timeout' });
+    expect(pending.checkNonce('h1', 'oc_1', 'ou_a', nonce)).toBe(true);
+    pending._simulateRestartForTest();
+    expect(pending.checkNonce('h1', 'oc_1', 'ou_b', nonce)).toBe(true);
+  });
+
+  it('部分目标抛异常：成功的照常授权，抛异常的目标进失败清单', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_ok', 'ou_throw']);
+    addChatGrantMock.mockImplementation(async (_app: string, _chat: string, openId: string) => {
+      if (openId === 'ou_throw') throw new Error('EIO');
+      return { ok: true, created: true };
+    });
+    const res = await handler.handleCardAction(multiAction(['ou_ok', 'ou_throw'], ['好', '抛'], nonce), deps, 'h1');
+    expect(res?.toast).toBeUndefined();
+    await flushBackground();
+    expect(replyMock.mock.calls.some(c => String(c[2]).includes('抛'))).toBe(true);
+    expect(pending.checkNonce('h1', 'oc_1', 'ou_throw', nonce)).toBe(false);
   });
 });

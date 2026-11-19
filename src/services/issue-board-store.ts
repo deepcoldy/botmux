@@ -222,11 +222,6 @@ export function isActiveBindState(state: IssueBinding['bindState']): boolean {
   return state === 'pending' || state === 'bound';
 }
 
-/** 按 claimId 反查——崩溃恢复的入口（§六：不依赖平台「按 claimId 查 issue」的接口，那个接口不存在）。 */
-export function findBindingByClaimId(dataDir: string, claimId: string): IssueBinding | null {
-  return listBindings(dataDir).find((b) => b.claimId === claimId) ?? null;
-}
-
 /** 某 issue 当前在本机的活跃 binding（作废/已释放的不算）。用于「这个 issue 是不是我已经领了」。 */
 export function findActiveBindingByIssue(dataDir: string, issueId: string): IssueBinding | null {
   return listBindings(dataDir).find((b) => b.issueId === issueId && isActiveBindState(b.bindState)) ?? null;
@@ -340,12 +335,6 @@ export function clearClaimIntent(dataDir: string, claimId: string): boolean {
   });
 }
 
-/** 对账分类：意图还在、但没有对应 binding 的，就是需要人/流程接手的悬空领取。 */
-export function listDanglingClaimIntents(dataDir: string): IssueClaimIntent[] {
-  const bound = new Set(listBindings(dataDir).map((b) => b.claimId));
-  return listClaimIntents(dataDir).filter((i) => !bound.has(i.claimId));
-}
-
 /** 注意没有 `localTaskRef`：它由 `buildLocalTaskRef(anchorId, larkAppId)` 内生，见上。 */
 export type CreateBindingInput = Omit<
   IssueBinding,
@@ -421,17 +410,6 @@ function updateBindingUnlocked(
   all[anchorId] = next;
   writeBindings(dataDir, all);
   return next;
-}
-
-/** 删除一条 binding（会话彻底结束且 issue 已终态后清理）。返回是否删掉。 */
-export function removeBinding(dataDir: string, anchorId: string): boolean {
-  return withIssueLock(dataDir, () => {
-    const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-    if (!(anchorId in all)) return false;
-    delete all[anchorId];
-    writeBindings(dataDir, all);
-    return true;
-  });
 }
 
 // ── outbox ──────────────────────────────────────────────────────────────────

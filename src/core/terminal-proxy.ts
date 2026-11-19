@@ -2,6 +2,7 @@ import { createServer, connect as netConnect, type Server, type Socket } from 'n
 import type { Locale } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import { terminalStatusHtml, type TerminalStatusKind } from './terminal-status-page.js';
+import type { TerminalWakeDecision, TerminalWakeRequest } from './terminal-wake-policy.js';
 
 /**
  * Single fixed reverse-proxy port per daemon. Each session's xterm.js web
@@ -51,6 +52,13 @@ export interface TerminalProxyOptions {
     sessionId: string,
     capability: { viewToken?: string; token?: string },
   ) => boolean;
+  /**
+   * #2004: authenticate BEFORE waking. Asked only when no live worker is
+   * registered: 'wake' lets `ensureWorkerPort` run, 'suspended' answers with
+   * the session-suspended page, 'deny' skips the wake and falls through to the
+   * usual status page. Omitted → always wake (the historical behavior).
+   */
+  authorizeWake?: (sessionId: string, request: TerminalWakeRequest) => TerminalWakeDecision;
   /** Max upward port probes when `port` is taken (EADDRINUSE). Default 20; 0 disables. */
   maxProbe?: number;
 }
@@ -127,6 +135,23 @@ function writeStatusPage(
   try { sock.end(payload); } catch { /* client already gone */ }
 }
 
+/** Header lines → lower-cased name map. A repeated header becomes an array,
+ * which every credential check treats as absent (fail closed). */
+function requestHeaders(headerLines: string[]): Record<string, string | string[]> {
+  const headers: Record<string, string | string[]> = {};
+  for (const line of headerLines) {
+    const colon = line.indexOf(':');
+    if (colon <= 0) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    const previous = headers[name];
+    headers[name] = previous === undefined
+      ? value
+      : [...(Array.isArray(previous) ? previous : [previous]), value];
+  }
+  return headers;
+}
+
 function requestCapability(rest: string): { viewToken?: string; token?: string } {
   try {
     const url = new URL(rest, 'http://terminal.local');
@@ -145,11 +170,22 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
   const host = opts.host ?? '0.0.0.0';
 
   // Fast sync lookup; fall back to the on-demand wake (slow path) only when no
-  // live worker is registered. Errors in the wake collapse to "not serveable".
-  const resolvePortMaybeWake = async (sessionId: string): Promise<number | undefined> => {
+  // live worker is registered AND the request's credentials allow it (#2004).
+  // Errors in the wake collapse to "not serveable"; an authorization error
+  // fails closed (no wake).
+  const resolvePortMaybeWake = async (
+    sessionId: string,
+    request: () => TerminalWakeRequest,
+  ): Promise<number | 'suspended' | undefined> => {
     const live = opts.resolvePort(sessionId);
     if (live) return live;
     if (!opts.ensureWorkerPort) return undefined;
+    let decision: TerminalWakeDecision = 'wake';
+    if (opts.authorizeWake) {
+      try { decision = opts.authorizeWake(sessionId, request()); } catch { decision = 'deny'; }
+    }
+    if (decision === 'suspended') return 'suspended';
+    if (decision !== 'wake') return undefined;
     try { return await opts.ensureWorkerPort(sessionId); } catch { return undefined; }
   };
 
@@ -210,7 +246,18 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
       const headerLines = headerBlock.length ? headerBlock.split('\r\n') : [];
       const isUpgrade = headerLines.some((l) => /^upgrade\s*:/i.test(l));
 
-      resolvePortMaybeWake(parsed.sessionId).then((port) => {
+      const capability = requestCapability(parsed.rest);
+      resolvePortMaybeWake(
+        parsed.sessionId,
+        () => ({ capability, headers: requestHeaders(headerLines) }),
+      ).then((port) => {
+        if (port === 'suspended') {
+          // A read-only link never wakes a suspended session; say so instead of
+          // a bare 503 the reconnecting page would just retry into.
+          const locale = opts.resolveStatusPageLocale?.(parsed.sessionId);
+          writeStatusPage(client, 503, 'Service Unavailable', 'suspended', locale);
+          return;
+        }
         if (!port) {
           if (!opts.resolveSessionState) {
             writeHttpError(client, 502, 'Bad Gateway', 'session not running');
@@ -218,10 +265,7 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
           }
           const state = opts.resolveSessionState?.(parsed.sessionId) ?? 'unavailable';
           const locale = opts.resolveStatusPageLocale?.(parsed.sessionId);
-          const authorized = opts.authorizeStatusPage?.(
-            parsed.sessionId,
-            requestCapability(parsed.rest),
-          ) ?? true;
+          const authorized = opts.authorizeStatusPage?.(parsed.sessionId, capability) ?? true;
           if (!authorized && state !== 'not-found') {
             writeStatusPage(client, 403, 'Forbidden', 'forbidden', locale);
           } else if (state === 'closed') {

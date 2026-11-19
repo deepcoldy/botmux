@@ -5,9 +5,7 @@ import {
   computeButtonAvailability,
   computeDeliveryButtonAvailability,
   computeNextNRuns,
-  filterAndPaginateSchedules,
   filterSchedules,
-  kindCounts,
   nextScheduleExecutionPosition,
   paginateSchedules,
   resolveScheduleExecutionPlacement,
@@ -252,35 +250,9 @@ describe('schedule-card-model · invariants', () => {
     expect(frozen.map(t => t.id)).toEqual(snapshot);
   });
 
-  it('filterAndPaginateSchedules composes filter/paginate/counts and is JSON-serialisable', () => {
-    const tasks = [
-      makeTask({ id: 'a', parsed: cron('0 * * * *') }),
-      makeTask({ id: 'b', parsed: interval(30), enabled: false }),
-      makeTask({ id: 'c', parsed: once(new Date(FIXED_NOW + 3600_000).toISOString()) }),
-    ];
-    const page = filterAndPaginateSchedules(
-      tasks,
-      { kind: 'all', page: 1, pageSize: 10 },
-      { nowMs: FIXED_NOW, timezone: TZ },
-    );
-    expect(page.meta.total).toBe(3);
-    expect(page.kindCounts).toEqual({ all: 3, once: 1, interval: 1, cron: 1 });
-    expect(page.rows.map(r => r.id)).toEqual(['a', 'b', 'c']);
-    expect(JSON.parse(JSON.stringify(page))).toEqual(page);
-  });
-
   it('computeButtonAvailability is consistent with toScheduleRowDto.actions', () => {
     const t = makeTask({ enabled: false });
     expect(toScheduleRowDto(t, { nowMs: FIXED_NOW }).actions).toEqual(computeButtonAvailability(t));
-  });
-
-  it('kindCounts tallies parsed.kind across the full pool (not just one page)', () => {
-    const tasks = [
-      makeTask({ parsed: cron('0 * * * *') }),
-      makeTask({ parsed: cron('15 * * * *') }),
-      makeTask({ parsed: interval(5) }),
-    ];
-    expect(kindCounts(tasks)).toEqual({ all: 3, once: 0, interval: 1, cron: 2 });
   });
 
   it('row and detail DTOs pass `repeat` through unchanged (object shape matches ScheduledTask.repeat)', () => {

@@ -1,4 +1,4 @@
-import { mkdtempSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -57,50 +57,6 @@ describe('multi-topic orchestration feature gate', () => {
   });
 });
 
-// The daemon route that actually creates a new sub-project topic lives in the
-// narrow untrusted-auth aperture: a sandboxed / read-isolated CLI holding its
-// own session's rotating capability can POST directly, so the CLI-side gate
-// above cannot be the only enforcement point. daemon.ts route handlers are
-// closures over daemon state and cannot be booted in a unit test (the sibling
-// report-relay routes use the same source-wiring assertion shape); the
-// predicate itself is behavior-tested in global-config.test.ts. This pins the
-// call site AND its ordering: authenticate the session first, then refuse with
-// 409 before the daemon performs the authoritative seed send.
-describe('daemon-side dispatch register gate wiring', () => {
-  const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-
-  function registerHandlerPrefix(): string {
-    const start = daemonSource.indexOf("ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE");
-    expect(start).toBeGreaterThan(-1);
-    // Slice ends exactly where the daemon performs the authoritative seed send
-    // that creates the topic — anything asserted inside this slice provably
-    // runs BEFORE a new topic can be created.
-    const sendMarker = 'dispatchRoot = await sendMessage(';
-    const end = daemonSource.indexOf(sendMarker, start);
-    expect(end).toBeGreaterThan(start);
-    return daemonSource.slice(start, end);
-  }
-
-  it('imports the multi-topic gate predicate', () => {
-    expect(daemonSource).toContain('isMultiTopicOrchestrationEnabled');
-  });
-
-  it('refuses with 409 after session identity is verified and before the seed send', () => {
-    const handler = registerHandlerPrefix();
-    const identityCheck = handler.indexOf("error: 'session_identity_incomplete'");
-    const gate = handler.indexOf('if (!isMultiTopicOrchestrationEnabled())');
-    const refused = handler.indexOf("error: 'multi_topic_disabled'");
-    const rejected409 = handler.indexOf('jsonRes(res, 409,');
-    expect(identityCheck).toBeGreaterThan(-1);
-    expect(gate).toBeGreaterThan(identityCheck);
-    expect(rejected409).toBeGreaterThan(gate);
-    expect(refused).toBeGreaterThan(rejected409);
-  });
-
-  it('gates only new-topic creation: the --into path stays outside this route', () => {
-    // The registration route hard-codes the new-topic branch; appending to an
-    // existing topic takes the synchronous project-dispatch path in the CLI.
-    const handler = registerHandlerPrefix();
-    expect(handler).toContain('existingDispatch: false');
-  });
-});
+// The daemon-side 409 on the seed-registration route (the authoritative sink a
+// capability-holding pane can POST to directly) is exercised against the real
+// route handler in dispatch-route-output-sink.test.ts.

@@ -11,11 +11,11 @@ import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
 import type { InputBinding } from '../src/core/plugins/input-capture/store.js';
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
-function setup(ownerless = false) {
+function setup(ownerless = false, chat = { chatId: 'oc_chat', chatType: 'group' }) {
   const dir = mkdtempSync(join(tmpdir(), 'capture-ipc-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const store = createInputCaptureStore(dir, 'cli_capture');
   const runtime = createInputCaptureRuntime({ larkAppId: 'cli_capture', store,
-    session: id => id === 's' ? { sessionId: 's', larkAppId: 'cli_capture', chatId: 'oc_chat', anchor: 'oc_chat', ownerOpenId: ownerless ? '' : 'ou_owner', active: true, scope: 'chat', chatType: 'group' } : undefined,
+    session: id => id === 's' ? { sessionId: 's', larkAppId: 'cli_capture', chatId: chat.chatId, anchor: chat.chatId, ownerOpenId: ownerless ? '' : 'ou_owner', active: true, scope: 'chat', chatType: chat.chatType } : undefined,
     pluginEnabled: id => id === 'example', canTalk: () => true, deliver: async () => { throw new Error('offline'); } });
   cleanup.push(() => runtime.stop()); return { runtime, store };
 }
@@ -74,6 +74,54 @@ it('captures a plugin card reply synchronously while preserving commands, attach
   await f.runtime.drain(); f.runtime.revoke('s', f.store.read().bindings[0].id, 1);
   expect(captureInboundText(event('inspect only'), f.runtime, () => false)).toBe(true);
   expect(f.store.read().inputs).toHaveLength(1);
+});
+it('gives a quote-reply without a topic to the chat-anchored binding, after a binding on the quoted message', async () => {
+  const f = setup();
+  f.runtime.register('s', { pluginId: 'example', requestId: 'chat', providerRef: 'chat' });
+  f.runtime.register('s', { pluginId: 'example', requestId: 'card', providerRef: 'card', inputAnchor: 'om_card' });
+  const ids = Object.fromEntries(f.store.read().bindings.map(b => [b.anchor, b.id]));
+  expect(ids).toMatchObject({ oc_chat: expect.any(String), om_card: expect.any(String) });
+  const reply = (messageId: string, rootId: string, patch = {}) => ({ sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: messageId, chat_id: 'oc_chat', chat_type: 'group', root_id: rootId, parent_id: rootId,
+      message_type: 'text', content: JSON.stringify({ text: `follow-up ${messageId}` }), ...patch } });
+  // Lark quote bubble: root_id without thread_id. Routing treats it as top-level, so the chat binding gets it.
+  expect(captureInboundText(reply('om_quote', 'om_earlier'), f.runtime, () => false)).toBe(true);
+  // a redelivery is the same input, not a second one
+  expect(captureInboundText(reply('om_quote', 'om_earlier'), f.runtime, () => false)).toBe(true);
+  // a reply quoting the card still belongs to the card's binding
+  expect(captureInboundText(reply('om_card_answer', 'om_card'), f.runtime, () => false)).toBe(true);
+  // a reply inside a real topic stays with the topic's own routing
+  expect(captureInboundText(reply('om_in_topic', 'om_earlier', { thread_id: 'omt_topic' }), f.runtime, () => false)).toBe(false);
+  expect(f.store.read().inputs.map(i => [i.messageId, i.bindingId])).toEqual([
+    ['om_quote', ids.oc_chat], ['om_card_answer', ids.om_card],
+  ]);
+  await f.runtime.drain();
+});
+it('gives a p2p chat-mode DM reply (root_id + thread_id) to the chat-anchored binding, after a binding on the replied message', async () => {
+  const f = setup(false, { chatId: 'oc_dm', chatType: 'p2p' });
+  f.runtime.register('s', { pluginId: 'example', requestId: 'chat', providerRef: 'chat' });
+  f.runtime.register('s', { pluginId: 'example', requestId: 'card', providerRef: 'card', inputAnchor: 'om_card' });
+  const ids = Object.fromEntries(f.store.read().bindings.map(b => [b.anchor, b.id]));
+  expect(ids).toMatchObject({ oc_dm: expect.any(String), om_card: expect.any(String) });
+  // Lark gives a DM reply both root_id and thread_id.
+  const reply = (messageId: string, rootId: string, patch = {}) => ({ sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: messageId, chat_id: 'oc_dm', chat_type: 'p2p', root_id: rootId, parent_id: rootId, thread_id: `omt_${rootId.slice(3)}`,
+      message_type: 'text', content: JSON.stringify({ text: `follow-up ${messageId}` }), ...patch } });
+  // Routing folds DM replies into the chat session, except under a /t topic root (or p2pMode thread/group).
+  const folds = (chatId: string, rootId: string) => chatId === 'oc_dm' && rootId !== 'om_topic';
+  const capture = (event: ReturnType<typeof reply>) => captureInboundText(event, f.runtime, () => false, folds);
+  expect(capture(reply('om_dm_reply', 'om_earlier'))).toBe(true);
+  // a redelivery is the same input, not a second one
+  expect(capture(reply('om_dm_reply', 'om_earlier'))).toBe(true);
+  // a reply to the card still belongs to the card's binding, with its thread
+  expect(capture(reply('om_card_answer', 'om_card'))).toBe(true);
+  expect(capture(reply('om_in_topic', 'om_topic'))).toBe(false);
+  expect(captureInboundText(reply('om_thread_mode', 'om_earlier'), f.runtime, () => false, () => false)).toBe(false);
+  expect(capture(reply('om_group_topic', 'om_earlier', { chat_type: 'group' }))).toBe(false);
+  expect(f.store.read().inputs.map(i => [i.messageId, i.bindingId, i.threadId])).toEqual([
+    ['om_dm_reply', ids.oc_dm, undefined], ['om_card_answer', ids.om_card, 'omt_card'],
+  ]);
+  await f.runtime.drain();
 });
 it('authenticates batch revocation and reports atomic conflicts through the real CLI request shape', async () => {
   const f = setup(); setInputCaptureRuntime('cli_capture', f.runtime); setLarkAppId('cli_capture'); setIpcAuthSecret('capture-test-secret');

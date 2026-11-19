@@ -118,9 +118,38 @@ input.on('line', line => {
       }
       status = 'busy';
       emit({ type: 'status', requestId: command.requestId, status, state });
+      // Delegated slash commands arrive verbatim as ordinary authenticated turns.
+      // /disconnect is an alias, but the host preserves the user's original bytes.
+      const match = /^\/(adopt|detach|disconnect)(?:\s+(.*))?$/i.exec(command.content);
+      if (match) {
+        const name = match[1].toLowerCase();
+        const target = match[2]?.trim();
+        if (name === 'adopt') {
+          const candidates = ['reference-thread:alpha', 'reference-thread:beta'];
+          if (!target) {
+            state = { ...state, providerState: { ...state.providerState, adoptCandidates: candidates } };
+            emit({ type: 'progress', turnId: command.turnId, content: 'Listing existing agent sessions' });
+            finishTurn(command, candidates.map(id => `/adopt ${id}`).join('\n'));
+          } else if (!(state.providerState?.adoptCandidates ?? candidates).includes(target)) {
+            fail(command, 'unknown_agent_thread', 'No matching existing agent session');
+            status = 'ready';
+          } else {
+            state = { ...state, agentThreadId: target,
+              providerState: { ...state.providerState, adoptCandidates: candidates } };
+            finishTurn(command, `Bound ${target}`);
+          }
+        } else {
+          const prior = state.agentThreadId;
+          const { agentThreadId, ...unbound } = state;
+          state = unbound;
+          finishTurn(command, prior ? `Unbound ${prior}; source agent preserved` : 'No agent session is bound');
+        }
+        return;
+      }
       if (!state.agentThreadId) {
         state = { ...state, agentThreadId: `reference-thread:${command.turnId}` };
-        emit({ type: 'lineage_changed', state });
+        // Business binding is published with final.state, including an ordinary
+        // first message on a Bot that opted into delegated slash commands.
       }
       emit({ type: 'progress', turnId: command.turnId, content: `reference: ${command.content}` });
       screen = `reference: ${command.content}`;

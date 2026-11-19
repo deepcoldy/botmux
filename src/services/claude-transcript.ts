@@ -11,13 +11,45 @@
  * The functions are pure (no fs.watch — that's the worker's wakeup concern)
  * to keep them unit-testable.
  */
-import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, openSync, readSync, closeSync, statSync, readdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
+import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward, scanJsonlFromOffset } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+// provider-retry-hint 同样零依赖（只用语言内建）。
+import { parseProviderRetryAtMs } from './provider-retry-hint.js';
+
+/** Read the session identity published by one live Claude Code process. */
+export function readClaudeSessionMeta(
+  pid: number,
+): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
+  try {
+    const raw = readFileSync(join(homedir(), '.claude', 'sessions', `${pid}.json`), 'utf-8');
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      sessionId: typeof data.sessionId === 'string' ? data.sessionId : undefined,
+      cwd: typeof data.cwd === 'string' ? data.cwd : undefined,
+      startedAt: typeof data.startedAt === 'number' ? data.startedAt : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Stable enough to skip rebuilding derived history when none of its inputs changed. */
+export function transcriptFilesSignature(paths: readonly string[]): string {
+  return paths.map(path => {
+    try {
+      const stat = statSync(path);
+      return `${path}\0${stat.size}\0${stat.mtimeMs}`;
+    } catch {
+      return `${path}\0missing`;
+    }
+  }).join('\n');
+}
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -99,6 +131,17 @@ export interface TranscriptEvent {
    *  it describes does NOT apply to this conversation. Treated as positive
    *  evidence of "no notice here", exactly like a non-Fable switch. */
   neutralizedByFork?: boolean;
+  /** Structured result Claude Code stores next to a tool_result (`user` lines).
+   *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
+  toolUseResult?: unknown;
+  /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
+  operation?: string;
+  content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -501,7 +544,15 @@ export class ClaudeModelFallbackTracker {
  * retryable only when its bounded text matches a verified transient signature. */
 export type ClaudeTerminalOutcome =
   | { status: 'completed' }
-  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | {
+    status: 'failed';
+    errorCode: string;
+    retryable: boolean;
+    /** Retryable failures only: when the provider's own error text says the
+     *  request may be retried (gateway "available at", Retry-After, "try
+     *  again in 30s"). Absent when it names no usable time. */
+    retryAtMs?: number;
+  }
   | { status: 'ambiguous'; errorCode: string; retryable: false }
   | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
 
@@ -511,6 +562,16 @@ function normalizedApiErrorCode(ev: TranscriptEvent): string {
 
 function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
+}
+
+/** Attach the provider's own "retry at" to a retryable failure. Relative hints
+ *  are anchored at the record's timestamp, not at whenever it is read. */
+function withProviderRetryHint(
+  ev: TranscriptEvent,
+  outcome: { status: 'failed'; errorCode: string; retryable: true },
+): Extract<ClaudeTerminalOutcome, { status: 'failed' }> {
+  const retryAtMs = parseProviderRetryAtMs(apiErrorMessageText(ev), eventTimeMs(ev) ?? Date.now());
+  return retryAtMs === undefined ? outcome : { ...outcome, retryAtMs };
 }
 
 /** Model placeholder Claude Code writes on assistant records no model produced. */
@@ -566,18 +627,28 @@ export function classifyClaudeTerminalEvent(
     }
     if (code.includes('invalid') || code.includes('terms')
       || (typeof status === 'number' && status >= 400 && status <= 499)) {
+      // A 400 caused by an under-sized image is not an ordinary bad request:
+      // Claude Code's Read tool returned the image bytes into the turn, and
+      // the image block now lives in the session transcript. EVERY later
+      // request replays it, so the session stays 400 until the history is
+      // cleared (/clear) — re-sending the prompt or continuing cannot work.
+      // Give it its own code so the failure card can say that instead of the
+      // generic "invalid request, don't retry" line.
+      if (hasApiErrorSignature(ev, /image data \d+ failed: Image dimensions are too small/i)) {
+        return { status: 'failed', errorCode: 'provider_image_too_small', retryable: false };
+      }
       return { status: 'failed', errorCode: 'provider_invalid_request', retryable: false };
     }
     if (code.includes('cancel')) {
       return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
     }
     if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
-      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true });
     }
     if (code === 'server_error'
       || (typeof status === 'number' && status >= 500 && status <= 599)
       || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
-      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_server_error', retryable: true });
     }
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
@@ -607,10 +678,17 @@ export function classifyClaudeTerminalEvent(
  * Both may be present for the same turn, so consumers must deduplicate by the
  * durable turn identity. `tool_use` and `pause_turn` are explicitly excluded:
  * Claude is waiting on a tool/continuation and has not returned to a new turn.
+ *
+ * The two are not equally final. Claude Code writes one record per content
+ * block and stamps every record with the MESSAGE's stop reason, so the thinking
+ * block of a final message already carries `end_turn` while its text block, a
+ * trailing API-error record and the Stop hooks are still to come. Only
+ * `turn_duration` (see {@link isClaudeTurnDurationEvent}) is written after all
+ * of them.
  */
 export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
   if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
-  if (ev.type === 'system' && ev.subtype === 'turn_duration') return true;
+  if (isClaudeTurnDurationEvent(ev)) return true;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return false;
   const reason = ev.message?.stop_reason;
@@ -618,6 +696,69 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason.length > 0
     && reason !== 'tool_use'
     && reason !== 'pause_turn';
+}
+
+/** Claude Code's main-thread `system/turn_duration` record: the last record of
+ *  a turn, written after its final content block, any API-error record and the
+ *  Stop hooks. */
+export function isClaudeTurnDurationEvent(ev: TranscriptEvent): boolean {
+  return !!ev && typeof ev === 'object' && (ev as any).isSidechain !== true
+    && ev.type === 'system' && ev.subtype === 'turn_duration';
+}
+
+/** Same bound and rationale as CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES: the probe
+ *  below runs synchronously at bridge baseline and must stay bounded. Only
+ *  lines mentioning the marker are parsed. */
+const TURN_DURATION_MARKER_PROBE_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Whether a transcript's recent history holds a `turn_duration` record, i.e.
+ *  the CLI writing it closes every turn with that marker. Baseline cursors
+ *  straight to EOF without parsing history, so without this probe the bridge
+ *  queue would only learn it at the end of the first turn after a restart. */
+export function transcriptShowsTurnDurationMarker(path: string): boolean {
+  if (!path || !existsSync(path)) return false;
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return false; }
+  if (completeEnd <= 0) return false;
+  try {
+    return scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - TURN_DURATION_MARKER_PROBE_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => {
+        const text = line.toString('utf8');
+        if (!text.includes('turn_duration')) return false;
+        try { return isClaudeTurnDurationEvent(JSON.parse(text) as TranscriptEvent); } catch { return false; }
+      },
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** How much of a transcript's head transcriptHoldsConversation reads. Claude
+ *  opens a file with a handful of small metadata records (mode,
+ *  permission-mode, title, a file-history snapshot); the first conversation
+ *  record follows within a few KB. */
+const CONVERSATION_PROBE_MAX_BYTES = 256 * 1024;
+
+/** Does the transcript hold a conversation `claude --resume` can open? Claude
+ *  answers "No conversation found" for a file of metadata records alone — what
+ *  a `--fork-session` child's file holds for its first moments (2.1.308) — and
+ *  resumes one with a single user or assistant record. */
+export function transcriptHoldsConversation(path: string): boolean {
+  let found = false;
+  scanJsonlFromOffset(path, 0, {
+    endOffset: CONVERSATION_PROBE_MAX_BYTES,
+    onLine: (line) => {
+      if (found || !/"type":"(user|assistant)"/.test(line)) return;
+      try {
+        const type = (JSON.parse(line) as TranscriptEvent).type;
+        found = type === 'user' || type === 'assistant';
+      } catch { /* a foreign line */ }
+    },
+  });
+  return found;
 }
 
 /** The launch-ack a background Agent/Task tool_result carries the moment it is
@@ -672,19 +813,14 @@ export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUse
   return acks;
 }
 
-/** A `<task-notification>` re-injected when a background agent stops. It is a
- *  synthetic event whose payload STARTS WITH the tag — a tool_result that
- *  merely contains the literal string (e.g. grep over this source) is not one.
- *  Two on-disk shapes carry it: the legacy `role:user` event (text in
- *  `message.content`) and the type-ahead `attachment(queued_command)` form
- *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
- *  current CLI builds write — mirroring {@link extractTurnStartText}.
- *  `status` is the agent's terminal state; the same task-id may notify more
- *  than once (a resumed agent stops again), so a completed/failed notice only
- *  ever RETIRES a tracked id, it never adds one. */
-export function parseTaskNotification(ev: TranscriptEvent):
-  { taskId: string; toolUseId?: string; status: string } | undefined {
-  if (!ev) return undefined;
+/** Text of a `<task-notification>` that Claude Code fed (or is about to feed)
+ *  to the model as a turn input: the legacy `role:user` event (text in
+ *  `message.content`) or the type-ahead `attachment(queued_command)` form (text
+ *  in `attachment.prompt`, `commandMode:'task-notification'`) that current CLI
+ *  builds write — mirroring {@link extractTurnStartText}. The payload must
+ *  START WITH the tag — a tool_result that merely contains the literal string
+ *  (e.g. grep over this source) is not one. */
+function deliveredTaskNotificationText(ev: TranscriptEvent): string | undefined {
   let text: string;
   if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
     const prompt = ev.attachment.prompt;
@@ -699,7 +835,33 @@ export function parseTaskNotification(ev: TranscriptEvent):
         ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
         : '';
   }
-  if (!text.trimStart().startsWith('<task-notification>')) return undefined;
+  return text.trimStart().startsWith('<task-notification>') ? text : undefined;
+}
+
+/** {@link deliveredTaskNotificationText} plus the third on-disk shape: Claude
+ *  Code's `queue-operation enqueue` record, written the instant a task stops.
+ *  It is the only record of a stop the user made in the TUI's task dialog
+ *  (Claude Code does not wake the model for those, so no delivered copy
+ *  follows), and of a notice still queued when the CLI exited. */
+function anyTaskNotificationText(ev: TranscriptEvent): string | undefined {
+  if (ev.type === 'queue-operation') {
+    return ev.operation === 'enqueue' && typeof ev.content === 'string'
+      && ev.content.trimStart().startsWith('<task-notification>')
+      ? ev.content
+      : undefined;
+  }
+  return deliveredTaskNotificationText(ev);
+}
+
+/** A delivered `<task-notification>` (see {@link deliveredTaskNotificationText}).
+ *  `status` is the task's terminal state; the same task-id may notify more
+ *  than once (a resumed agent stops again), so a completed/failed notice only
+ *  ever RETIRES a tracked id, it never adds one. */
+export function parseTaskNotification(ev: TranscriptEvent):
+  { taskId: string; toolUseId?: string; status: string } | undefined {
+  if (!ev) return undefined;
+  const text = deliveredTaskNotificationText(ev);
+  if (text === undefined) return undefined;
   const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
   if (!taskId) return undefined;
   const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
@@ -707,56 +869,296 @@ export function parseTaskNotification(ev: TranscriptEvent):
   return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
 }
 
-/** Live count of background Agent/Task dispatches whose completion notification
- *  has not yet arrived, folded from a transcript event stream. The worker keeps
- *  one per session and consults `pending()` at the PTY idle edge: while a main
- *  turn is only idle because it is awaiting a background sub-agent, the session
- *  card must stay `working` rather than freezing to idle (which Lark surfaces as
- *  「已完成」). State is intentionally id-keyed, not a bare counter, so a
- *  duplicate notification or a re-drained dispatch cannot double-count. */
+export type BackgroundTaskKind = 'agent' | 'shell' | 'monitor';
+
+export interface BackgroundTaskLaunch {
+  taskId: string;
+  kind: BackgroundTaskKind;
+  /** Hard end Claude Code itself enforces (non-persistent Monitor timeout). */
+  expiresAtMs?: number;
+  /** A stopped agent started again (SendMessage), under its original id. */
+  resumed?: true;
+}
+
+export function eventTimeMs(ev: TranscriptEvent): number | undefined {
+  const ms = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/** Background work a main-thread tool_result just launched, read from Claude
+ *  Code's structured `toolUseResult` (the launch-ack text is for the model and
+ *  is not parsed here):
+ *  - Agent `run_in_background` → `{ isAsync:true, status:'async_launched', agentId }`;
+ *  - Bash `run_in_background` (or a command the user backgrounded) →
+ *    `{ backgroundTaskId }`;
+ *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
+ *    expires after `timeoutMs` even if no end record is read, so it carries
+ *    that deadline;
+ *  - SendMessage to an agent that had stopped (2.1.322) →
+ *    `{ success:true, message:'Resuming agent …', resumedAgentId, revivedAgentId }`:
+ *    the agent runs again in the background under its original id, and its
+ *    next stop is reported the same way. A message to an agent that is still
+ *    running (`Message queued for delivery …`) changes nothing.
+ *  The id is the one the task's `<task-notification>` later reports as `<task-id>`. */
+export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunch[] {
+  if (!ev || ev.isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const r = ev.toolUseResult as Record<string, unknown> | undefined;
+  if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
+  if ((r.isAsync === true || r.status === 'async_launched') && typeof r.agentId === 'string' && r.agentId) {
+    return [{ taskId: r.agentId, kind: 'agent' }];
+  }
+  if (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) {
+    return [{ taskId: r.backgroundTaskId, kind: 'shell' }];
+  }
+  if (typeof r.taskId === 'string' && r.taskId && typeof r.timeoutMs === 'number' && typeof r.persistent === 'boolean') {
+    const at = eventTimeMs(ev);
+    const expiresAtMs = !r.persistent && r.timeoutMs > 0 && at !== undefined ? at + r.timeoutMs : undefined;
+    return [{ taskId: r.taskId, kind: 'monitor', ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) }];
+  }
+  const resumedAgentId = typeof r.resumedAgentId === 'string' && r.resumedAgentId ? r.resumedAgentId
+    : typeof r.revivedAgentId === 'string' && r.revivedAgentId ? r.revivedAgentId : undefined;
+  if (r.success !== false && resumedAgentId) {
+    return [{ taskId: resumedAgentId, kind: 'agent', resumed: true }];
+  }
+  return [];
+}
+
+/** Background task ids an event proves have stopped:
+ *  - a `<task-notification>` that carries a `<status>` (completed / failed /
+ *    killed / stopped), in any of its three shapes. A resume-time orphan
+ *    summary lists several `<task-id>` tags, so every one is taken. A Monitor's
+ *    per-event notice has no `<status>` and the Monitor keeps running;
+ *  - a successful TaskStop result (`toolUseResult.task_id` + `task_type`).
+ *    Stopping a shell this way usually writes no notification at all. */
+export function backgroundTaskSettledIds(ev: TranscriptEvent): string[] {
+  if (!ev || ev.isSidechain === true) return [];
+  const text = anyTaskNotificationText(ev);
+  if (text !== undefined) {
+    if (!/<status>[^<]+<\/status>/.test(text)) return [];
+    return [...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].map(m => m[1].trim()).filter(Boolean);
+  }
+  const role = ev.message?.role ?? ev.type;
+  const r = ev.toolUseResult as Record<string, unknown> | undefined;
+  if (role === 'user' && r && typeof r === 'object' && !Array.isArray(r)
+    && typeof r.task_id === 'string' && r.task_id && typeof r.task_type === 'string') {
+    return [r.task_id];
+  }
+  return [];
+}
+
+/** A session file created after the main turn ended stays far below this
+ *  while its first background-task stops land in it. */
+const SIBLING_STOP_SCAN_FRESH_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Stops of background tasks recorded in OTHER transcripts of the same project
+ *  directory, written since `sinceMs`. After a /clear typed in the terminal,
+ *  Claude writes into a new session file — including the stop of a task the
+ *  old file launched — and the bridge may not have re-bound to it yet. Callers
+ *  settle only the ids they track; task ids are unique, so another session's
+ *  file cannot settle them. `offsets` (path → byte offset) is advanced in place
+ *  so each file is read once; a large file first seen here is read from its end
+ *  only (a session born after `sinceMs` is small, an unrelated busy one is not). */
+export function backgroundTaskStopsInSiblingTranscripts(
+  dir: string,
+  excludePath: string,
+  sinceMs: number,
+  offsets: Map<string, number>,
+): string[] {
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  const ids: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.jsonl')) continue;
+    const path = join(dir, name);
+    if (path === excludePath) continue;
+    let size: number;
+    try {
+      const st = statSync(path);
+      if (st.mtimeMs < sinceMs) continue;
+      size = st.size;
+    } catch { continue; }
+    const from = offsets.get(path) ?? (size > SIBLING_STOP_SCAN_FRESH_MAX_BYTES ? size : 0);
+    const result = drainTranscript(path, from);
+    offsets.set(path, result.newOffset);
+    for (const ev of result.events) ids.push(...backgroundTaskSettledIds(ev));
+  }
+  return ids;
+}
+
+/** True when the main agent is (re)starting work: a real prompt (typed, or
+ *  dequeued type-ahead), a scheduler fire, a delivered task notification, or a
+ *  `queue-operation dequeue` (Claude Code took a queued item to run). */
+export function isClaudeMainTurnStart(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return false;
+  if (ev.type === 'queue-operation') return ev.operation === 'dequeue';
+  return isMeaningfulUserEvent(ev)
+    || isMeaningfulQueuedCommand(ev)
+    || isScheduledTurnStartEvent(ev)
+    || deliveredTaskNotificationText(ev) !== undefined;
+}
+
+interface TrackedBackgroundTask {
+  kind: BackgroundTaskKind;
+  expiresAtMs?: number;
+  /** Value of `promptSeq` when launched — see {@link BackgroundTaskTracker.pendingTurnAgents}. */
+  promptSeq: number;
+  /** When this run started (its launch or resume was written). A stop written
+   *  before it belongs to an earlier run of the same agent. */
+  sinceMs?: number;
+}
+
+/** Live set of background work (Agent / Bash / Monitor) the main thread has
+ *  launched and that has not stopped yet, folded from the transcript event
+ *  stream, plus whether the main agent's own turn is open. The worker keeps one
+ *  per session. Readings:
+ *  - `pending()` — everything still running, i.e. what the TUI lists as
+ *    background tasks.
+ *  - `backgroundWait()` — `pending()` while the main turn has ended, else 0:
+ *    the card's 「主回合已结束 · 后台子任务运行中（N）」. The turn is open from a
+ *    turn start ({@link isClaudeMainTurnStart}) or any non-final main-thread
+ *    assistant message, and ends at its terminal record
+ *    ({@link isClaudeTurnTerminalEvent}). Read from the transcript, not the
+ *    screen: current Claude Code keeps reporting itself busy over OSC 7501
+ *    while background work runs, so no idle edge marks the turn's end.
+ *  - `pendingTurnAgents()` — background agents dispatched since the latest
+ *    genuine prompt: the original gate that keeps the card `working` while the
+ *    dispatching turn awaits them.
+ *  A new prompt does NOT end the tasks themselves (Claude Code keeps them
+ *  running and wakes the model when each stops). What bounds the set instead:
+ *  every stop is recorded (see {@link backgroundTaskSettledIds}), a Monitor
+ *  carries its own deadline, and {@link reset} runs when the CLI process is
+ *  replaced, since its tasks die with it. State is id-keyed, not a bare counter,
+ *  so a duplicate notification or a re-drained launch cannot double-count. */
 export class BackgroundTaskTracker {
-  /** agentId → toolUseId that dispatched it, for the ids still in flight. */
-  private readonly live = new Map<string, string>();
+  private readonly live = new Map<string, TrackedBackgroundTask>();
+  /** Ids already seen stopping, with the stop's time when known. A rotation
+   *  re-drain can re-read a launch after its stop (/clear writes the stop into
+   *  the NEW file); it must not revive it. Only a resume written after the stop
+   *  does. */
+  private readonly settled = new Map<string, number | undefined>();
   /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
   private readonly ackByToolUse = new Map<string, string>();
   /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
   private readonly awaitingAck = new Set<string>();
+  private promptSeq = 0;
+  /** Launches stamped earlier than this belong to a CLI process that is gone. */
+  private liveSinceMs = 0;
+  private mainTurnOpen = false;
 
   observe(ev: TranscriptEvent): void {
-    // A genuine user-typed prompt starts a new turn and supersedes any prior
-    // turn's background waits — whether it lands as a `role:user` event or the
-    // type-ahead `attachment(queued_command)` form the CLI writes when it
-    // dequeues a submission (a resumed agent's `<task-notification>` is
-    // synthetic and both predicates exclude it, so it never trips this).
-    // Resetting here bounds the tracker: even if a completion notification is
-    // somehow never parsed, the account cannot leak past the next real prompt
-    // and wedge the card in `working`.
+    if (!ev || ev.isSidechain === true) return;
+    if (isClaudeMainTurnStart(ev)) this.mainTurnOpen = true;
+    else if (isClaudeTurnTerminalEvent(ev)) this.mainTurnOpen = false;
+    else if ((ev.message?.role ?? ev.type) === 'assistant') this.mainTurnOpen = true;
     if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
-      this.reset();
+      this.promptSeq++;
       return;
     }
+    const atMs = eventTimeMs(ev);
+    for (const launch of backgroundTaskLaunches(ev)) {
+      this.launch(launch.taskId, launch.kind, { atMs, expiresAtMs: launch.expiresAtMs, resumed: launch.resumed });
+    }
+    // Builds that predate the structured `toolUseResult` are still recognised
+    // from the dispatch tool_use + launch-ack text pair.
     for (const toolUseId of backgroundTaskDispatchToolUseIds(ev)) {
       const agentId = this.ackByToolUse.get(toolUseId);
-      if (agentId) this.live.set(agentId, toolUseId);
+      if (agentId) this.launch(agentId, 'agent', { atMs });
       else this.awaitingAck.add(toolUseId);
     }
     for (const ack of backgroundTaskDispatchAcks(ev)) {
       this.ackByToolUse.set(ack.toolUseId, ack.agentId);
-      if (this.awaitingAck.delete(ack.toolUseId)) this.live.set(ack.agentId, ack.toolUseId);
+      if (this.awaitingAck.delete(ack.toolUseId)) this.launch(ack.agentId, 'agent', { atMs });
     }
-    const note = parseTaskNotification(ev);
-    if (note) this.live.delete(note.taskId);
+    for (const id of backgroundTaskSettledIds(ev)) this.settle(id, atMs);
   }
 
-  /** Number of background agents still in flight. */
-  pending(): number {
-    return this.live.size;
+  /** Record a running task. `atMs` is when the launch was written; one older
+   *  than the current CLI process (see {@link reset}) is ignored. A `resumed`
+   *  agent runs again after it stopped: it revives a settled id, but only when
+   *  written after that stop (a re-drained resume is older than the next stop). */
+  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number; resumed?: boolean } = {}): void {
+    if (opts.atMs !== undefined && opts.atMs < this.liveSinceMs) return;
+    const running = this.live.get(taskId);
+    if (running) {
+      // Resumed again before its previous stop was read: this run is newer.
+      if (opts.resumed && opts.atMs !== undefined && (running.sinceMs === undefined || opts.atMs > running.sinceMs)) {
+        running.sinceMs = opts.atMs;
+      }
+      return;
+    }
+    if (this.settled.has(taskId)) {
+      const stoppedAtMs = this.settled.get(taskId);
+      if (!opts.resumed || opts.atMs === undefined || stoppedAtMs === undefined || opts.atMs <= stoppedAtMs) return;
+      this.settled.delete(taskId);
+    }
+    this.live.set(taskId, {
+      kind,
+      promptSeq: this.promptSeq,
+      ...(opts.expiresAtMs !== undefined ? { expiresAtMs: opts.expiresAtMs } : {}),
+      ...(opts.atMs !== undefined ? { sinceMs: opts.atMs } : {}),
+    });
   }
 
-  reset(): void {
+  /** Record a task's stop, written at `atMs` when known. A stop written before
+   *  the current run started ends an earlier run: an agent that finished while
+   *  the main turn was still busy has that notice delivered at the next tool
+   *  round, after the SendMessage that resumed it, under the earlier time. */
+  settle(taskId: string, atMs?: number): void {
+    const running = this.live.get(taskId);
+    if (!(running?.sinceMs !== undefined && atMs !== undefined && atMs < running.sinceMs)) this.live.delete(taskId);
+    const previous = this.settled.get(taskId);
+    this.settled.set(taskId, previous !== undefined && (atMs === undefined || previous > atMs) ? previous : atMs);
+  }
+
+  /** Background tasks still running at `nowMs`. */
+  pending(nowMs = Date.now()): number {
+    return this.liveTaskIds(nowMs).length;
+  }
+
+  /** Ids of the background tasks still running at `nowMs` (what
+   *  {@link pending} counts). */
+  liveTaskIds(nowMs = Date.now()): string[] {
+    const ids: string[] = [];
+    for (const [taskId, task] of this.live) {
+      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) ids.push(taskId);
+    }
+    return ids;
+  }
+
+  /** Mark the main turn open or ended from a source other than a Claude
+   *  transcript: input the worker is submitting, or another CLI's turn records. */
+  noteMainTurn(open: boolean): void {
+    this.mainTurnOpen = open;
+  }
+
+  /** Background tasks still running after the main turn has ended; 0 while
+   *  the main agent itself is working. */
+  backgroundWait(nowMs = Date.now()): number {
+    return this.mainTurnOpen ? 0 : this.pending(nowMs);
+  }
+
+  /** Background agents dispatched since the latest genuine prompt. */
+  pendingTurnAgents(): number {
+    let n = 0;
+    for (const task of this.live.values()) {
+      if (task.kind === 'agent' && task.promptSeq === this.promptSeq) n++;
+    }
+    return n;
+  }
+
+  /** Forget everything: the CLI process was replaced, and its background work
+   *  went with it. Launches stamped before `liveSinceMs` are ignored from now
+   *  on (a resumed or re-drained transcript replays them). */
+  reset(liveSinceMs = 0): void {
     this.live.clear();
+    this.settled.clear();
     this.ackByToolUse.clear();
     this.awaitingAck.clear();
+    this.promptSeq = 0;
+    this.liveSinceMs = liveSinceMs;
+    this.mainTurnOpen = false;
   }
 }
 
@@ -866,25 +1268,6 @@ export function extractAssistantText(event: TranscriptEvent): string {
   for (const block of content) {
     if (block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
       parts.push(block.text);
-    }
-  }
-  return parts.join('\n\n');
-}
-
-/**
- * Extract the model's thinking (CoT) text from one assistant event. Walks all
- * `type:'thinking'` blocks in `message.content` and joins them with blank
- * lines. Returns '' when the event carries no thinking blocks. Sidechain /
- * error filtering is the caller's job (bridge-turn-queue already applies it
- * before attribution).
- */
-export function extractAssistantThinking(event: TranscriptEvent): string {
-  const content = event.message?.content;
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block && (block as any).type === 'thinking' && typeof (block as any).thinking === 'string' && (block as any).thinking.length > 0) {
-      parts.push((block as any).thinking);
     }
   }
   return parts.join('\n\n');
@@ -1002,8 +1385,23 @@ function hasToolUseBlock(ev: TranscriptEvent): boolean {
  * never contribute: only uuids in `turnAssistantUuids` are collected.
  * Returns '' for a turn with no text after its last tool_use (nothing worth
  * falling back with — e.g. the turn ended in a `botmux send` call).
+ *
+ * `opts.isHousekeepingToolUse` (transcript-delivery sessions only): Claude
+ * Code's auto-memory step can run AFTER the answer — answer text, memory file
+ * writes, then a short postscript ("I also saved two notes…"). The plain walk
+ * stops at those writes and returns only the postscript, so the answer never
+ * reaches Lark. When the tool calls separating the trailing run from the text
+ * before it are all housekeeping, that earlier run is the answer if it is
+ * substantive and longer than the trailing one; the usual shape — a one-line
+ * "saving memory" note before the writes and the real answer after them —
+ * keeps the trailing run alone. A trailing run that `opts.endsWithSentinel`
+ * flags is returned as is: the model declared its output complete there.
  */
-export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUuids: readonly string[]): string {
+export function trailingAssistantText(
+  events: TranscriptEvent[],
+  turnAssistantUuids: readonly string[],
+  opts: TrailingAnswerOptions = {},
+): string {
   if (turnAssistantUuids.length === 0) return '';
   const uuids = new Set(turnAssistantUuids);
   const lastUuid = turnAssistantUuids[turnAssistantUuids.length - 1];
@@ -1022,23 +1420,127 @@ export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUu
     if (role === 'assistant' && hasToolUseBlock(ev)) return '';
     if (role === 'user' && isMeaningfulUserEvent(ev)) break;
   }
-  const tail: TranscriptEvent[] = [];
+  const { run, boundary } = collectTrailingTextRun(events, end, uuids);
+  const trailing = joinAssistantText(run);
+  if (!opts.isHousekeepingToolUse || !trailing || opts.endsWithSentinel?.(trailing)) return trailing;
+  const answer = textBeforeHousekeeping(events, boundary, uuids, opts.isHousekeepingToolUse);
+  return answer.length >= HOUSEKEEPING_ANSWER_MIN_CHARS && answer.length > trailing.length
+    ? `${answer}\n\n${trailing}`
+    : trailing;
+}
+
+/** Below this the text before housekeeping writes is a narration note
+ *  ("saving memory first"), not an answer. Longer notes exist but precede a
+ *  still longer answer, which the length comparison already keeps alone. */
+const HOUSEKEEPING_ANSWER_MIN_CHARS = 200;
+
+export interface TrailingAnswerOptions {
+  /** tool_use blocks that are bookkeeping rather than work, e.g. Claude Code's
+   *  own memory writes ({@link isClaudeMemoryToolUse}). */
+  isHousekeepingToolUse?: (block: { name?: unknown; input?: unknown }) => boolean;
+  /** The trailing text ends with the nothing-to-send sentinel line. */
+  endsWithSentinel?: (text: string) => boolean;
+}
+
+/** Walk back from `end` over this turn's contiguous assistant-text run.
+ *  `boundary` is the index of the tool_use / user event that ended the walk
+ *  (-1 when it reached the start of the transcript). */
+function collectTrailingTextRun(
+  events: TranscriptEvent[],
+  end: number,
+  uuids: ReadonlySet<string>,
+): { run: TranscriptEvent[]; boundary: number } {
+  const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
     if (!ev || typeof ev !== 'object') continue;
     const role = ev.message?.role ?? ev.type;
     if (role === 'assistant') {
-      if (hasToolUseBlock(ev)) break;
-      if (ev.uuid && uuids.has(ev.uuid)) { tail.unshift(ev); continue; }
+      if (hasToolUseBlock(ev)) return { run, boundary: i };
+      if (ev.uuid && uuids.has(ev.uuid)) { run.unshift(ev); continue; }
       // Thinking-only / non-turn assistant lines: cross unless they belong to
       // a DIFFERENT turn's visible text (then we've walked past our turn).
-      if (pickAssistantTextEvents([ev]).length > 0) break;
+      if (pickAssistantTextEvents([ev]).length > 0) return { run, boundary: i };
       continue;
     }
-    if (role === 'user') break;
+    if (role === 'user') return { run, boundary: i };
     // system / attachment / meta lines (last-prompt, ai-title, …): cross.
   }
-  return joinAssistantText(tail);
+  return { run, boundary: -1 };
+}
+
+/** The turn's text run that directly precedes a run of housekeeping-only tool
+ *  calls ending at `boundary`. '' unless every tool call crossed is
+ *  housekeeping, every tool_result crossed answers one of them, and the run
+ *  belongs to this turn. */
+function textBeforeHousekeeping(
+  events: TranscriptEvent[],
+  boundary: number,
+  uuids: ReadonlySet<string>,
+  isHousekeeping: (block: { name?: unknown; input?: unknown }) => boolean,
+): string {
+  const toolUseIds = new Set<string>();
+  const toolResultIds: string[] = [];
+  let i = boundary;
+  for (; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
+    if (role === 'assistant') {
+      const hasText = pickAssistantTextEvents([ev]).length > 0;
+      const uses = content.filter(b => b?.type === 'tool_use');
+      if (uses.length === 0) {
+        if (hasText) break;
+        continue;
+      }
+      if (hasText || !uses.every(isHousekeeping)) return '';
+      for (const use of uses) if (typeof use.id === 'string') toolUseIds.add(use.id);
+      continue;
+    }
+    if (role === 'user') {
+      if (!isPureToolResultUserEvent(ev.message?.content)) return '';
+      for (const block of content) toolResultIds.push(block.tool_use_id);
+      continue;
+    }
+  }
+  if (i < 0 || toolUseIds.size === 0) return '';
+  if (!toolResultIds.every(id => typeof id === 'string' && toolUseIds.has(id))) return '';
+  if (!events[i].uuid || !uuids.has(events[i].uuid!)) return '';
+  return joinAssistantText(collectTrailingTextRun(events, i, uuids).run);
+}
+
+/**
+ * True when a Claude Code tool_use only maintains the CLI's own auto-memory —
+ * `<dataDir>/projects/<project>/memory/` of the data dir that owns
+ * `transcriptPath` (`<dataDir>/projects/<project>/<session>.jsonl`). The
+ * project slug is not compared: a worktree session keeps its memory under the
+ * main repo's project dir.
+ */
+export function isClaudeMemoryToolUse(
+  block: { name?: unknown; input?: unknown },
+  transcriptPath: string | undefined,
+): boolean {
+  if (!transcriptPath) return false;
+  const marker = '/projects/';
+  const at = transcriptPath.lastIndexOf(marker);
+  if (at === -1) return false;
+  const projectsRoot = transcriptPath.slice(0, at + marker.length);
+  const input = (block.input && typeof block.input === 'object' ? block.input : {}) as Record<string, unknown>;
+  const home = homedir();
+  const roots = [projectsRoot];
+  if (home && projectsRoot.startsWith(`${home}/`)) roots.push(`~${projectsRoot.slice(home.length)}`);
+  const escaped = roots.map(r => r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  if (block.name === 'Write' || block.name === 'Edit' || block.name === 'MultiEdit') {
+    return typeof input.file_path === 'string'
+      && new RegExp(`^(?:${escaped})[^/]+/memory/`).test(input.file_path);
+  }
+  if (block.name === 'Bash') {
+    // e.g. `cd ~/.claude/projects/-repo/memory && printf … >> MEMORY.md`
+    return typeof input.command === 'string'
+      && new RegExp(`(?:${escaped})[^/\\s'"\`]+/memory(?![\\w.-])`).test(input.command);
+  }
+  return false;
 }
 
 /** XML wrappers Claude Code uses for synthetic user events that aren't real
@@ -1187,24 +1689,39 @@ export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined
  *  isMeaningfulUserEvent's defenses (sidechain, empty / synthetic-prefix
  *  prompts) so a queued slash command can't false-start a Lark turn. */
 export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  if (!isSubmittedQueuedCommand(ev)) return false;
+  // Mid-turn absorbed message: intra-turn context, NOT a new conversation
+  // turn boundary (see isMidTurnAbsorbedQueuedCommand).
+  return !isMidTurnAbsorbedRendering(ev);
+}
+
+/** A submitted prompt that Claude Code (2.1+) folded into the turn already
+ *  running instead of starting a new one: the user typed while a turn was in
+ *  progress, and the attachment(queued_command) is rendered to the model as a
+ *  system reminder (`renderedRole: "system"`, `<system-reminder>`). Not a turn
+ *  boundary — but it is the moment that input entered the conversation, and it
+ *  is the only transcript record it gets (no `role:user` line follows). */
+export function isMidTurnAbsorbedQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  return isSubmittedQueuedCommand(ev) && isMidTurnAbsorbedRendering(ev);
+}
+
+function isSubmittedQueuedCommand(ev: TranscriptEvent | null | undefined): ev is TranscriptEvent {
   if (!ev || typeof ev !== 'object') return false;
   if (ev.type !== 'attachment') return false;
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
-  // Mid-turn absorbed message (Claude Code 2.1+): when the user types while
-  // a turn is running, Claude Code logs an attachment(queued_command) rendered
-  // as a system reminder (`renderedRole: "system"`, `<system-reminder>`).
-  // This is intra-turn context, NOT a new conversation turn boundary.
-  if ((ev as any).renderedRole === 'system') return false;
-  const rendered = (ev as any).rendered;
-  if (Array.isArray(rendered) && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'))) {
-    return false;
-  }
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
   return true;
+}
+
+function isMidTurnAbsorbedRendering(ev: TranscriptEvent): boolean {
+  if ((ev as any).renderedRole === 'system') return true;
+  const rendered = (ev as any).rendered;
+  return Array.isArray(rendered)
+    && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'));
 }
 
 export interface AdoptPreamble {
@@ -1217,25 +1734,28 @@ export interface AdoptPreamble {
   assistantText: string;
 }
 
-/** Walk the events forward and return the last *completed* user/assistant
+/** Walk the events forward and return every *completed* user/assistant
  *  exchange. "Completed" here means: a meaningful user prompt followed by
  *  at least one assistant event with visible text. tool_use / tool_result
  *  events do NOT reset the turn — they're intra-turn machinery, so a
  *  prompt → tool_use → tool_result → assistant text sequence still counts
- *  as a single turn. Returns null when there's no meaningful user yet, or
- *  the last user wasn't followed by any visible assistant text (Claude is
- *  mid-tool-use when /adopt fired).
- *
- *  Used by adopt-bridge to surface "the previous round" to the Lark thread
- *  so the user has context for continuing the conversation. */
-export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamble | null {
+ *  as a single turn. An unfinished final user prompt is omitted. */
+function collectAssistantTurns(
+  events: TranscriptEvent[],
+): { turns: AdoptPreamble[]; lastMeaningfulTurnCompleted: boolean } {
+  const turns: AdoptPreamble[] = [];
   let userText: string | null = null;
   let assistantTexts: string[] = [];
+  const flush = () => {
+    if (userText === null || assistantTexts.length === 0) return;
+    turns.push({ userText, assistantText: assistantTexts.join('\n\n') });
+  };
 
   for (const ev of events) {
     if (!ev || typeof ev !== 'object') continue;
     if (isMeaningfulUserEvent(ev)) {
       // New turn boundary — reset the assistant accumulator.
+      flush();
       userText = stringifyUserContent(ev.message?.content);
       assistantTexts = [];
       continue;
@@ -1248,11 +1768,17 @@ export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamb
     if (userText !== null) assistantTexts.push(text);
   }
 
-  if (userText === null || assistantTexts.length === 0) return null;
-  return {
-    userText,
-    assistantText: assistantTexts.join('\n\n'),
-  };
+  flush();
+  return { turns, lastMeaningfulTurnCompleted: userText !== null && assistantTexts.length > 0 };
+}
+
+export function extractAssistantTurns(events: TranscriptEvent[]): AdoptPreamble[] {
+  return collectAssistantTurns(events).turns;
+}
+
+export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamble | null {
+  const collected = collectAssistantTurns(events);
+  return collected.lastMeaningfulTurnCompleted ? collected.turns.at(-1) ?? null : null;
 }
 
 /**
@@ -1379,7 +1905,9 @@ export interface JsonlFingerprintSearchOptions {
   /** Drop events whose `timestamp` field is older than this (millis since
    *  epoch). Defends against short fingerprints ("hello", "test") matching
    *  old user lines in unrelated sibling jsonls — file mtime alone isn't
-   *  enough since a sibling Claude pane could be actively writing. */
+   *  enough since a sibling Claude pane could be actively writing. Events
+   *  with no parseable timestamp are dropped as well (see
+   *  {@link eventAtOrAfter}). */
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
@@ -1391,6 +1919,39 @@ export interface JsonlFingerprintSearchOptions {
    *  under a busier sibling. Default (no callback): accept the first
    *  fingerprint match like the original behaviour. */
   acceptCandidate?: (path: string) => boolean;
+  /** Also scan Task/Agent subagent transcripts at
+   *  `<projectDir>/<sessionId>/subagents/*.jsonl`. While the TUI is viewing a
+   *  subagent, Claude Code hands a submitted prompt to THAT agent and records
+   *  it only in its jsonl — the session jsonl the bridge is watching gets no
+   *  record of it, so the top-level-only scan reports a false
+   *  submit_unconfirmed although the prompt landed. Subagent candidates only
+   *  accept the records Claude writes for a human message forwarded to the
+   *  agent (see jsonlTailMatchFingerprint). Only `<uuid>/subagents/` is
+   *  descended (one level), matching Claude Code's on-disk layout, so
+   *  unrelated nested directories are not walked. Callers that PIN the matched
+   *  path as the new bridge target must leave this off: a subagent jsonl must
+   *  never replace the session jsonl as the watched transcript. */
+  includeSubagentTranscripts?: boolean;
+  /** Also match `attachment(queued_command)` records (text in
+   *  `attachment.prompt`), except task notifications. A prompt handed to a
+   *  RUNNING subagent is only ever written this way, once the agent takes its
+   *  next step. Independent of includeSubagentTranscripts, which only widens
+   *  the file set: this widens what counts as a submit record in every
+   *  scanned file, so callers that pin the matched path or treat a match as
+   *  session-switch evidence must leave it off. */
+  includeQueuedCommandAttachments?: boolean;
+}
+
+/** True when the event carries a parseable timestamp at or after `floorMs`.
+ *  An event without one cannot be placed after the floor: Claude Code writes
+ *  `api-request-blob` records (a copy of a request's user content, no
+ *  timestamp) next to the original prompt, so letting them through matched a
+ *  new Lark turn against an hours-old identical prompt in another session's
+ *  file. */
+function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
+  if (typeof ev.timestamp !== 'string') return false;
+  const evMs = Date.parse(ev.timestamp);
+  return Number.isFinite(evMs) && evMs >= floorMs;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -1438,10 +1999,7 @@ export function jsonlContainsFingerprint(
     // mtime can be recent if a sibling Claude pane is actively writing
     // its own turns). We compare against `event.timestamp` rather than
     // file mtime to be precise.
-    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-      const evMs = Date.parse(ev.timestamp);
-      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
-    }
+    if (minEventTimestampMs !== undefined && !eventAtOrAfter(ev, minEventTimestampMs)) continue;
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
@@ -1466,6 +2024,111 @@ export function jsonlContainsFingerprint(
   return false;
 }
 
+/** A Claude Code session directory is named by the session uuid; subagent
+ *  transcripts live directly under `<uuid>/subagents/`. Matching this shape
+ *  (instead of descending every subdirectory) keeps the fingerprint fan-out
+ *  bounded when a project dir accumulates unrelated nested folders. */
+const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Tail-scan one jsonl file for the fingerprint. Mirrors the event-decoding
+ *  rules used everywhere else: role:user text (pure tool_result events
+ *  skipped), optionally queue-operation enqueue and queued_command
+ *  attachments, whitespace-normalised substring match, with a per-event
+ *  timestamp guard. Returns:
+ *  - 'match' when a fingerprint-bearing event was found,
+ *  - 'veto' when a match was found but acceptCandidate rejected the file,
+ *  - 'none' otherwise. */
+function jsonlTailMatchFingerprint(
+  path: string,
+  fingerprint: string,
+  opts: JsonlFingerprintSearchOptions,
+  requireForwardedSubagentMessage = false,
+): 'match' | 'veto' | 'none' {
+  let hit = false;
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const size = statSync(path).size;
+      // Read at most the trailing 1MB — fingerprints land near the end
+      // of the jsonl when Claude just wrote them. Cheaper than reading
+      // an entire long-lived session.
+      const len = Math.min(size, 1024 * 1024);
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const text = buf.toString('utf8');
+      // We must NOT do a raw includes() here: Claude writes user content
+      // as a JSON-encoded string, so any newline in the Lark message is
+      // serialized as `\n` on disk while our fingerprint has it
+      // collapsed to a single space. Parse each complete jsonl line,
+      // pick role:user events, and apply the same stringify+normalise
+      // we use in BridgeTurnQueue.ingest. Skip the leading partial line
+      // when we read a strict tail (size > len), since it likely begins
+      // mid-line.
+      const lines = text.split('\n');
+      const startIdx = size > len ? 1 : 0;
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let ev: any;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (!ev || typeof ev !== 'object') continue;
+        // Per-event timestamp guard — see jsonlContainsFingerprint for
+        // the full rationale. Required to keep short fingerprints
+        // ("hello", "test") from matching old user lines in unrelated
+        // sibling jsonls.
+        if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
+        const role = ev.message?.role ?? ev.type;
+        let text = '';
+        if (role === 'user') {
+          // A subagent transcript opens with its task instruction and also
+          // gets meta user records that no human sent (system reminders, task
+          // notifications, messages from the parent agent), any of which may
+          // quote the same text. Only a human message forwarded to the agent
+          // proves this submission landed: Claude writes it (when the message
+          // resumes a stopped agent) with isMeta and origin.kind 'human'.
+          if (requireForwardedSubagentMessage && !(ev.isMeta === true && ev.origin?.kind === 'human')) continue;
+          // Skip pure tool_result events — see jsonlContainsFingerprint
+          // for the full rationale; in short, tool_result content is
+          // log output, not user input, and would false-match short
+          // fingerprints like "hello" in unrelated jsonls.
+          if (isPureToolResultUserEvent(ev.message?.content)) continue;
+          text = stringifyUserContent(ev.message?.content);
+        } else if (
+          opts.includeQueueOperations &&
+          // Subagent candidates accept only the forwarded-human shapes.
+          !requireForwardedSubagentMessage &&
+          ev.type === 'queue-operation' &&
+          ev.operation === 'enqueue'
+        ) {
+          text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+        } else if (
+          opts.includeQueuedCommandAttachments &&
+          ev.type === 'attachment' &&
+          ev.attachment?.type === 'queued_command' &&
+          ev.attachment.commandMode !== 'task-notification'
+        ) {
+          // A running subagent also receives queued_command records from its
+          // parent agent (origin 'coordinator') and task notifications.
+          if (requireForwardedSubagentMessage && ev.attachment.origin?.kind !== 'human') continue;
+          const prompt = ev.attachment.prompt;
+          text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+        } else {
+          continue;
+        }
+        const normalisedText = normaliseForFingerprint(text);
+        if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+          hit = true;
+          break;
+        }
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch { /* unreadable — treat as no match */ }
+  if (!hit) return 'none';
+  return opts.acceptCandidate && !opts.acceptCandidate(path) ? 'veto' : 'match';
+}
+
 export function findJsonlContainingFingerprint(
   dir: string,
   fingerprint: string,
@@ -1485,90 +2148,48 @@ export function findJsonlContainingFingerprint(
   // Walk newest-first so a recently-rotated jsonl is found before older
   // ones; if two files contain the fingerprint (rare, e.g. user pasted
   // the same message into two panes) we prefer the more recent.
-  const candidates: Array<{ path: string; mtime: number }> = [];
+  const candidates: Array<{ path: string; mtime: number; subagent: boolean }> = [];
+  const addCandidateFile = (full: string, mtimeMs: number, subagent = false): void => {
+    if (opts.excludePath && full === opts.excludePath) return;
+    if (opts.minMtimeMs !== undefined && mtimeMs < opts.minMtimeMs) return;
+    candidates.push({ path: full, mtime: mtimeMs, subagent });
+  };
   for (const name of entries) {
-    if (!name.endsWith('.jsonl')) continue;
     const full = join(dir, name);
-    if (opts.excludePath && full === opts.excludePath) continue;
     try {
       const st = statSync(full);
-      if (!st.isFile()) continue;
-      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
-      candidates.push({ path: full, mtime: st.mtimeMs });
+      if (st.isFile()) {
+        if (name.endsWith('.jsonl')) addCandidateFile(full, st.mtimeMs);
+        continue;
+      }
+      // Subagent transcripts: <projectDir>/<session-uuid>/subagents/*.jsonl.
+      // A prompt submitted while the TUI views a subagent lands in the
+      // SUBAGENT's jsonl, not the session jsonl. Only this exact shape is
+      // descended (one level) — see SESSION_SUBDIR_RE.
+      if (!st.isDirectory() || !opts.includeSubagentTranscripts) continue;
+      if (!SESSION_SUBDIR_RE.test(name)) continue;
+      const subDir = join(full, 'subagents');
+      let subEntries: string[];
+      try {
+        subEntries = readdirSync(subDir);
+      } catch {
+        continue;
+      }
+      for (const subName of subEntries) {
+        if (!subName.endsWith('.jsonl')) continue;
+        const subFull = join(subDir, subName);
+        try {
+          const subSt = statSync(subFull);
+          if (subSt.isFile()) addCandidateFile(subFull, subSt.mtimeMs, true);
+        } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
   }
   candidates.sort((a, b) => b.mtime - a.mtime);
-  for (const { path } of candidates) {
-    try {
-      const fd = openSync(path, 'r');
-      try {
-        const size = statSync(path).size;
-        // Read at most the trailing 1MB — fingerprints land near the end
-        // of the jsonl when Claude just wrote them. Cheaper than reading
-        // an entire long-lived session.
-        const len = Math.min(size, 1024 * 1024);
-        const buf = Buffer.alloc(len);
-        readSync(fd, buf, 0, len, size - len);
-        const text = buf.toString('utf8');
-        // We must NOT do a raw includes() here: Claude writes user content
-        // as a JSON-encoded string, so any newline in the Lark message is
-        // serialized as `\n` on disk while our fingerprint has it
-        // collapsed to a single space. Parse each complete jsonl line,
-        // pick role:user events, and apply the same stringify+normalise
-        // we use in BridgeTurnQueue.ingest. Skip the leading partial line
-        // when we read a strict tail (size > len), since it likely begins
-        // mid-line.
-        const lines = text.split('\n');
-        const startIdx = size > len ? 1 : 0;
-        for (let i = startIdx; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
-          let ev: any;
-          try { ev = JSON.parse(line); } catch { continue; }
-          if (!ev || typeof ev !== 'object') continue;
-          // Per-event timestamp guard — see jsonlContainsFingerprint for
-          // the full rationale. Required to keep short fingerprints
-          // ("hello", "test") from matching old user lines in unrelated
-          // sibling jsonls.
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
-          const role = ev.message?.role ?? ev.type;
-          let text = '';
-          if (role === 'user') {
-            // Skip pure tool_result events — see jsonlContainsFingerprint
-            // for the full rationale; in short, tool_result content is
-            // log output, not user input, and would false-match short
-            // fingerprints like "hello" in unrelated jsonls.
-            if (isPureToolResultUserEvent(ev.message?.content)) continue;
-            text = stringifyUserContent(ev.message?.content);
-          } else if (
-            opts.includeQueueOperations &&
-            ev.type === 'queue-operation' &&
-            ev.operation === 'enqueue'
-          ) {
-            text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
-          } else {
-            continue;
-          }
-          const normalisedText = normaliseForFingerprint(text);
-          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
-            // Allow caller to veto this candidate (e.g., sibling-pane
-            // hijack guard rejecting an untrusted sessionId). On veto,
-            // break out of the line loop so we move to the next, older
-            // candidate instead of returning `null` after the first
-            // fingerprint hit.
-            if (opts.acceptCandidate && !opts.acceptCandidate(path)) {
-              break;
-            }
-            return path;
-          }
-        }
-      } finally {
-        closeSync(fd);
-      }
-    } catch { /* unreadable — skip */ }
+  for (const { path, subagent } of candidates) {
+    // A veto moves on to the next-older candidate instead of returning null
+    // after the first fingerprint hit (sibling-pane hijack guard).
+    if (jsonlTailMatchFingerprint(path, fingerprint, opts, subagent) === 'match') return path;
   }
   return null;
 }
@@ -1643,10 +2264,7 @@ export function findJsonlsContainingExactContent(
           let ev: any;
           try { ev = JSON.parse(line); } catch { continue; }
           if (!ev || typeof ev !== 'object') continue;
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let raw = '';
           if (role === 'user') {
@@ -1703,65 +2321,4 @@ export function splitTranscriptEventsByCutoff(
     else live.push(ev);
   }
   return { history, live };
-}
-
-/**
- * Read the first event timestamp out of a jsonl. Reads only the leading
- * 4 KB — Claude's `file-history-snapshot` and `SessionStart` events both
- * land in the first few hundred bytes. Returns the parsed millis, or
- * undefined when no parseable timestamp is found in the leading chunk
- * (corrupted file, partial first line, format change).
- *
- * NOTE: not currently wired into the bridge rotation flow. The bridge
- * fingerprint fallback (`decideFingerprintSwitch` in
- * `bridge-rotation-policy.ts`) deliberately rejects candidates outside
- * the pid-derived trust set rather than relying on freshness heuristics
- * — file-creation timestamps cannot prove ownership across panes in
- * the same project dir. Kept here as a reusable primitive for
- * diagnostics and future /clear-recovery work.
- */
-export function readFirstEventTimestamp(path: string): number | undefined {
-  let fd: number;
-  try {
-    fd = openSync(path, 'r');
-  } catch {
-    return undefined;
-  }
-  try {
-    const len = 4096;
-    const buf = Buffer.alloc(len);
-    let bytesRead = 0;
-    try {
-      bytesRead = readSync(fd, buf, 0, len, 0);
-    } catch {
-      return undefined;
-    }
-    if (bytesRead <= 0) return undefined;
-    const text = buf.subarray(0, bytesRead).toString('utf8');
-    const lines = text.split('\n');
-    // Drop the trailing partial line if we read exactly `len` bytes — it
-    // may not be a complete JSON object. When the whole file is shorter
-    // than `len` bytes the last line is complete and we keep it.
-    const usable = bytesRead === len ? lines.slice(0, -1) : lines;
-    for (const line of usable) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let ev: any;
-      try { ev = JSON.parse(trimmed); } catch { continue; }
-      // Top-level `timestamp` field — covers both regular events
-      // (user/assistant/attachment) and `file-history-snapshot` records
-      // whose `timestamp` lives under `snapshot.timestamp` instead.
-      const tsStr = typeof ev?.timestamp === 'string'
-        ? ev.timestamp
-        : typeof ev?.snapshot?.timestamp === 'string'
-          ? ev.snapshot.timestamp
-          : undefined;
-      if (!tsStr) continue;
-      const ms = Date.parse(tsStr);
-      if (Number.isFinite(ms)) return ms;
-    }
-    return undefined;
-  } finally {
-    closeSync(fd);
-  }
 }

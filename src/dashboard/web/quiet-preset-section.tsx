@@ -5,20 +5,22 @@ type Tr = (key: string, values?: Record<string, string | number>) => string;
 type JsonResponse = { ok: boolean; status: number; body: any };
 
 /**
- * 「静默模式」一键预设：思考卡关 + 静默表情回应开 + 流式卡关。
+ * 「静默模式」一键预设：卡内与原生思考过程关 + 静默表情回应开 + 流式卡关。
  *
- * 这是一次性写入的便捷开关，不与三个独立开关的状态绑定：
- * - 打开 = 恰好一次 PUT，body 恰好三个键；
- * - 关闭 = 不产生任何写请求，三个开关保持原值；
+ * 这是一次性写入的便捷开关，不与四个独立开关的状态绑定：
+ * - 打开 = 恰好一次 PUT，body 恰好四个键；
+ * - 关闭 = 不产生任何写请求，四个开关保持原值；
  * - 用户随后单独拨动任一项导致派生条件不成立时，预设标记自动熄灭。
  */
 export function QuietPresetSection(props: {
   tr: Tr;
   cotEnabled: boolean;
+  replyCardNativeCot: boolean;
   silentReactions: boolean;
   disableStreaming: boolean;
   putCardPref(patch: {
     cotEnabled: boolean;
+    replyCardNativeCot: boolean;
     silentTurnReactions: boolean;
     disableStreamingCard: boolean;
   }): Promise<JsonResponse>;
@@ -26,6 +28,7 @@ export function QuietPresetSection(props: {
 }) {
   const { tr } = props;
   const derived = props.cotEnabled === false
+    && props.replyCardNativeCot === false
     && props.silentReactions === true
     && props.disableStreaming === true;
   const [on, setOn] = useState(derived);
@@ -47,6 +50,7 @@ export function QuietPresetSection(props: {
     try {
       const res = await props.putCardPref({
         cotEnabled: false,
+        replyCardNativeCot: false,
         silentTurnReactions: true,
         disableStreamingCard: true,
       });

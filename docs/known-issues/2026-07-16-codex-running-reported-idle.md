@@ -247,7 +247,6 @@ success: false
 - `test/submit-confirmation.test.ts`
 - `test/async-serial-queue.test.ts`
 - `test/runtime-screen-status.test.ts`
-- `test/worker-structured-lifecycle-status.test.ts`
 - `test/raw-input-followup-atomicity.test.ts`
 - `test/session-rename-worker.test.ts`
 - `test/claude-turn-terminal-contract.test.ts`

@@ -1,9 +1,11 @@
 import type { TrustedCaller } from '../types.js';
+import { speakerOf, withSpeaker, type TurnSpeaker } from './turn-speakers.js';
 
 export interface TurnAuthorityIdentity {
   /** Authenticated collaborative input must wait even when sent by the same caller. */
   queueAfterActiveTurn?: true;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   caller?: TrustedCaller;
   /** Stable controller of the surrounding task/session. The active caller may
@@ -15,6 +17,8 @@ export interface TurnAuthorityIdentity {
 export interface ActiveTurnAuthoritySnapshot extends TurnAuthorityIdentity {
   started: boolean;
   reservedAtMs: number;
+  /** Humans whose messages are in this turn, in order of their latest message. */
+  speakers?: readonly TurnSpeaker[];
 }
 
 function mayControlActiveTurn(
@@ -101,12 +105,17 @@ export class ActiveTurnAuthority {
     };
   }
 
+  speakers(): TurnSpeaker[] {
+    return [...(this.active?.speakers ?? [])];
+  }
+
   identity(): TurnAuthorityIdentity {
     if (!this.active) return {};
     return {
       ...(this.active.caller ? { caller: this.active.caller } : {}),
       ...(this.active.controller ? { controller: this.active.controller } : {}),
       ...(this.active.turnId ? { turnId: this.active.turnId } : {}),
+      ...(this.active.identityTurnId ? { identityTurnId: this.active.identityTurnId } : {}),
       ...(this.active.dispatchAttempt !== undefined
         ? { dispatchAttempt: this.active.dispatchAttempt }
         : {}),
@@ -121,11 +130,13 @@ export class ActiveTurnAuthority {
     }
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
       ...(identity.caller ? { caller: frozenCaller(identity.caller) } : {}),
       ...(identity.controller ? { controller: frozenCaller(identity.controller) } : {}),
+      speakers: withSpeaker(undefined, speakerOf(identity)),
       started: false,
       reservedAtMs: nowMs,
     });
@@ -150,11 +161,14 @@ export class ActiveTurnAuthority {
     const active = this.active;
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(active
+        ? { identityTurnId: active.identityTurnId ?? active.turnId }
+        : identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
-      ...(active?.caller
-        ? { caller: active.caller }
+      ...(active
+        ? active.caller ? { caller: active.caller } : {}
         : identity.caller
         ? { caller: frozenCaller(identity.caller) }
         : {}),
@@ -163,6 +177,7 @@ export class ActiveTurnAuthority {
         : identity.controller
         ? { controller: frozenCaller(identity.controller) }
         : {}),
+      speakers: withSpeaker(active?.speakers, speakerOf(identity)),
       started: false,
       reservedAtMs: nowMs,
     });
@@ -178,6 +193,7 @@ export class ActiveTurnAuthority {
       const previous = this.active;
       this.active = Object.freeze({
         turnId: identity.turnId,
+        ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
         ...(identity.dispatchAttempt !== undefined
           ? { dispatchAttempt: identity.dispatchAttempt }
           : {}),
@@ -187,6 +203,7 @@ export class ActiveTurnAuthority {
           : identity.controller
           ? { controller: frozenCaller(identity.controller) }
           : {}),
+        speakers: withSpeaker(previous.speakers, speakerOf(identity)),
         started: true,
         reservedAtMs: Date.now(),
       });

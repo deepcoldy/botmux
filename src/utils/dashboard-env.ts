@@ -45,6 +45,8 @@ import { DASHBOARD_H5_ENV_PREFIX } from './child-env.js';
  *    APP_SECRET below: the dashboard is a real consumer. Not a licence to add
  *    other credentials — a key belongs here only with a named consumer.
  *  - BOTMUX_DASHBOARD_DEV_RELOAD → dashboard.ts dev-reload switch.
+ *  - BOTMUX_TMUX_SOCKET → dashboard/host-terminal.ts: which tmux server holds
+ *    the botmux-managed `bmx-*` sessions it lists and attaches (tmux-socket.ts).
  *  - proxy family → outbound HTTPS from the dashboard itself (npm registry
  *    version/rollback lookups, binary self-update download) on hosts without direct
  *    internet. These are forwarded to CLI children by design elsewhere
@@ -58,6 +60,7 @@ export const DASHBOARD_ENV_ALLOWLIST = [
   'BOTMUX_SCHEDULE_TIMEZONE',
   'FEISHU_USER_ACCESS_TOKEN',
   'BOTMUX_DASHBOARD_DEV_RELOAD',
+  'BOTMUX_TMUX_SOCKET',
   'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
   'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY',
 ] as const;

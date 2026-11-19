@@ -1,68 +1,114 @@
 /**
  * Trigger-user CLI authentication policy.
  *
- * Default OFF. When a bot enables it, that bot's CLI calls out to `lark-cli` /
- * `bytedcli` run as **the person who sent the current message**, instead of
- * "whoever happens to be logged in on this machine".
+ * Default OFF. Each capability (see {@link TRIGGER_USER_AUTH_CAPABILITIES}) is
+ * either native (its CLI runs on whatever this machine is logged in as) or
+ * trigger-user: its CLI calls run as **the person who sent the current
+ * message**.
  *
  * ## The rule this file encodes
  *
- * A CLI call uses the credentials of the current message's sender, or none.
- * The only permitted downgrade is "the bot's own tenant identity", which
- * belongs to nobody. Falling back to *another person's* login is never
- * allowed — not even the owner's. That is what the feature exists to remove,
- * so there is deliberately no config value that asks for it.
+ * A trigger-user call uses the credentials of the current message's sender, or
+ * the call is refused with an authorization entry. There is no downgrade to a
+ * bot or machine identity, and falling back to *another person's* login is
+ * never allowed — not even the owner's. That is what the feature exists to
+ * remove, so there is deliberately no config value that asks for it (the old
+ * `fallback` field is parsed and ignored).
  *
  * Why no owner exception: the moment one exists, "whose permissions ran this?"
  * loses its single answer, and every credential lookup grows a branch. Those
  * bugs are silent — nothing errors, the audit trail just names the wrong
  * person.
  *
- * ## Why the two tools cannot share one rule
- *
- * `lark-cli` has a real non-human identity (app id + secret resolve
- * `identity: bot`), so most calls can degrade safely. `bytedcli` has only SSO
- * personal login — no service account, no AK/SK — so for it "unauthorized"
- * genuinely means "this command cannot run". `supportsBotIdentity` records that
- * asymmetry rather than pretending both tools behave alike.
- *
- * Both tools DO support per-person credentials, by different mechanisms: Lark
+ * Both tools support per-person credentials, by different mechanisms: Lark
  * through an OAuth user token injected as env, ByteCloud through that person's
  * own `bytedcli` login kept in a private HOME (see services/bytedcli-auth.ts).
- * What differs is only the fallback when someone has not authorized.
- *
  * Whether a *particular* lark-cli command accepts `--as bot` is not decided
- * here: the CLI itself declares it (an unsupported one answers `--as bot is
- * not supported, this command only supports: user`). A hand-maintained list of
- * "commands needing a person" would go stale and grow holes.
+ * here: the CLI itself declares it.
  */
+import type { SandboxMode } from '../adapters/cli/sandbox-mode.js';
 
 /** Tools whose credentials botmux can inject per person. */
 export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
+/** Every tool whose wrapper asks the daemon for the turn's identity: the governed
+ *  tools plus the Codebase and Bits CLIs, which follow bytedcli's identity. */
+export const IDENTITY_ROUTE_TOOLS = [...TRIGGER_USER_AUTH_TOOLS, 'codebase', 'bitscli'] as const;
+export type IdentityRouteTool = typeof IDENTITY_ROUTE_TOOLS[number];
+
 /**
- * Policy intent for a sender who has not authorized this tool.
+ * Where a person's credentials come from.
  *
- * RETAINED FOR CONFIG COMPATIBILITY ONLY: neither governed tool currently
- * degrades to a machine identity — bytedcli never had one, and lark-cli's
- * bot-identity downgrade was removed with the per-person HOME model. Both
- * values therefore resolve to a refusal (the refusal carries an authorization
- * link), but the field is still parsed so stored configs keep validating.
+ * - `auto` (default): ask the central platform first when this machine is
+ *   bound to one; otherwise, or when the platform knows nothing about the
+ *   person, fall back to the per-person HOME on this machine. A bound machine
+ *   never STARTS a local device login on its own — the person is pointed at
+ *   the platform, so one authorization serves every machine.
+ * - `platform`: platform only. An unbound machine, or an unreachable platform,
+ *   refuses the call. For deployments that require central audit.
+ * - `local`: today's behaviour — per-person HOME on this machine only, the
+ *   platform is never consulted. The open-source default when unbound.
  *
- * - `bot-identity` (default): legacy value; no longer degrades anything.
- * - `none`: the call fails and the sender is asked to authorize.
- *
- * Note there is no `device` / `machine-login` option — see the file header.
+ * Deliberately a separate field from `credentialsSourceDir` (the per-bot Claude
+ * login directory): that one is the BOT's model account, this one is the
+ * trigger PERSON's tool credentials.
  */
-export const TRIGGER_USER_AUTH_FALLBACKS = ['bot-identity', 'none'] as const;
-export type TriggerUserAuthFallback = typeof TRIGGER_USER_AUTH_FALLBACKS[number];
+export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'] as const;
+export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
+
+/**
+ * Per-bot capability switches. Each is either native (off: the CLI runs with
+ * this machine's own login, untouched) or trigger-user (on: the message
+ * sender's own credentials, or a refusal).
+ *
+ * - `lark-user`: Feishu user identity (`lark-cli --as user`).
+ * - `bytecloud`: bytedcli, codebase, git push, bitscli / bits-cli.
+ * - `meego`: Meego through `bytedcli meego`. The standalone `meegle` command is not governed.
+ */
+export const TRIGGER_USER_AUTH_CAPABILITIES = ['lark-user', 'bytecloud', 'meego'] as const;
+export type TriggerUserAuthCapability = typeof TRIGGER_USER_AUTH_CAPABILITIES[number];
 
 export interface TriggerUserAuthConfig {
   enabled: boolean;
-  /** Tools this applies to. Empty means the policy is inert. */
+  /** Tools this applies to. Empty means the policy is inert. When
+   *  `capabilities` is set this is derived from it. */
   tools: TriggerUserAuthTool[];
-  fallback: TriggerUserAuthFallback;
+  /** Capability switches. Absent: derived from `tools` (lark-cli → lark-user,
+   *  bytedcli → bytecloud + meego); see `policyFromConfig`. */
+  capabilities?: TriggerUserAuthCapability[];
+  /** See {@link TRIGGER_USER_AUTH_CREDENTIAL_SOURCES}. The parser always fills
+   *  it; it is optional on the type only so hand-built configs (tests, legacy
+   *  callers) keep compiling — read it through {@link credentialSourceOf}. */
+  credentialSource?: TriggerUserAuthCredentialSource;
+  /** The legacy `fallback` value as stored. Never acted on; it only keeps the
+   *  background-job policy key of an unedited config what it was. */
+  legacyFallback?: 'bot-identity' | 'none';
+  /**
+   * Whether `botmux send --mention <bot on this machine>` hands this turn's
+   * sender to that bot, the way `botmux dispatch` already does: the daemon
+   * signs a delegation for the exact handoff message, and the receiving bot
+   * runs its governed tools as the same human after its own talk-permission
+   * and chat-membership checks. Default ON; only an explicit `false` is
+   * stored. Cross-machine bots never receive it (the signed record and its
+   * key live on this machine).
+   */
+  delegateOnMention?: boolean;
+  /**
+   * Whether, in a turn several people spoke in, one command can run as another
+   * speaker of that turn (`BOTMUX_AS=<open_id> <command>`). Default off; only
+   * an explicit `true` is stored. Without it `BOTMUX_AS` is refused and the
+   * prompts do not mention it.
+   */
+  allowSpeakerSwitch?: boolean;
+  /** Extra tools signed for a direct human's dispatch, or allowed to pass
+   * through from an already verified delegation, into the exact listed chat
+   * and target apps. They never govern this bot's own CLI calls. */
+  dispatchOnly?: {
+    tools: TriggerUserAuthTool[];
+    targetAppIds: string[];
+    chatIds: string[];
+  };
   /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
@@ -80,50 +126,50 @@ export interface TriggerUserAuthConfig {
   gitTokenExchangeUrl?: string;
 }
 
-/** Per-tool facts that decide what "unauthorized" can degrade to. */
-export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
-  TriggerUserAuthTool,
-  { supportsBotIdentity: boolean }
-> = {
-  // `lark-cli --as bot` works with app credentials alone.
-  'lark-cli': { supportsBotIdentity: true },
-  // `bytedcli auth` offers only SSO personal login — no bot/tenant identity to
-  // degrade to. (Per-person authorization itself IS supported; see
-  // services/bytedcli-auth.ts.)
-  bytedcli: { supportsBotIdentity: false },
-};
-
 /**
  * How well the on-disk token store is actually protected for this session.
  *
  * An honest report, not a reassurance. Botmux stores each person's token as a
  * 0600 file owned by the OS user — but the agent's CLI runs as that same OS
- * user, so without the file sandbox it can simply read every token file in
- * `~/.botmux/data/`. The per-person storage still fixes attribution and the
+ * user, so it can simply read every token file in `~/.botmux/data/` unless
+ * the OS stops it. The per-person storage still fixes attribution and the
  * overwrite bug, and the wrapper still injects only the current sender's
  * credentials; what is missing is any barrier against an agent that goes
  * looking on its own.
  *
- * With the sandbox on, the whole data dir is deny-by-default and only this
- * session's own identity file is granted — the boundary is then enforced by the
- * OS rather than by convention.
+ * Only the allowlist sandbox ('oncall') is such a barrier: the whole data dir
+ * is deny-by-default and only this session's own identity file is granted.
+ * The scratch sandbox isolates WRITES only — it keeps the real disk readable,
+ * including other people's tokens and login state (lark-cli homes, tokens
+ * created after the session started), so it counts as unprotected.
  *
  * Callers surface this so an operator can decide; it deliberately does not gate
  * the feature. Refusing to run without a sandbox would push people away from a
  * change that is an improvement either way, and claiming isolation we do not
  * have would be worse than both.
  */
-export function tokenStoreProtection(sandboxEnabled: boolean): {
+export function tokenStoreProtection(mode: SandboxMode): {
   enforced: boolean;
   advisory?: string;
 } {
-  if (sandboxEnabled) return { enforced: true };
+  if (mode === 'oncall') return { enforced: true };
+  const where = 'Dashboard → Bot 配置 → 权限与安全 → 文件沙盒';
+  if (mode === 'scratch') {
+    return {
+      enforced: false,
+      advisory:
+        'token 文件按人隔离，但当前的 scratch 一次性沙盒只隔离写入、不隔离凭据：'
+        + 'agent 仍能读到这台机器上其他人的 token 和登录态。'
+        + `多人共用的 bot 要隔离凭据，请到 ${where} 改选「白名单隔离」。`,
+    };
+  }
   return {
     enforced: false,
     advisory:
-      'token 文件按人隔离，但未开启文件沙盒：agent 与 botmux 跑在同一个系统用户下，'
-      + '有能力直接读取 ~/.botmux/data/ 里其他人的 token 文件。'
-      + '归因与覆盖问题已解决；要让隔离由操作系统强制，请为本 bot 开启 sandbox。',
+      'token 文件按人隔离，但未开启白名单隔离：agent 与 botmux 跑在同一个系统用户下，'
+      + '能直接读到 ~/.botmux/data/ 里其他人的 token 和登录态。'
+      + `归因与覆盖问题已解决；要让隔离由操作系统强制，请到 ${where} 选「白名单隔离」`
+      + '（scratch 一次性只隔离写入，不算）。',
   };
 }
 
@@ -136,6 +182,18 @@ export class TriggerUserAuthConfigError extends Error {
 
 function isTool(value: unknown): value is TriggerUserAuthTool {
   return typeof value === 'string' && (TRIGGER_USER_AUTH_TOOLS as readonly string[]).includes(value);
+}
+
+function isCapability(value: unknown): value is TriggerUserAuthCapability {
+  return typeof value === 'string' && (TRIGGER_USER_AUTH_CAPABILITIES as readonly string[]).includes(value);
+}
+
+/** The governed tools that carry the given capabilities: Meego and ByteCloud
+ *  both go through bytedcli. */
+export function toolsForCapabilities(capabilities: readonly TriggerUserAuthCapability[]): TriggerUserAuthTool[] {
+  return TRIGGER_USER_AUTH_TOOLS.filter(tool => tool === 'lark-cli'
+    ? capabilities.includes('lark-user')
+    : capabilities.includes('bytecloud') || capabilities.includes('meego'));
 }
 
 /**
@@ -162,7 +220,21 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   const enabled = rec.enabled === true;
 
   let tools: TriggerUserAuthTool[];
-  if (rec.tools === undefined) {
+  let capabilities: TriggerUserAuthCapability[] | undefined;
+  if (rec.capabilities !== undefined && rec.capabilities !== null) {
+    if (!Array.isArray(rec.capabilities)) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.capabilities must be an array');
+    }
+    const unknownCapabilities = rec.capabilities.filter(item => !isCapability(item));
+    if (unknownCapabilities.length) {
+      throw new TriggerUserAuthConfigError(
+        `triggerUserAuth.capabilities has unknown entries: ${unknownCapabilities.map(String).join(', ')}`
+        + ` (supported: ${TRIGGER_USER_AUTH_CAPABILITIES.join(', ')})`,
+      );
+    }
+    capabilities = [...new Set(rec.capabilities as TriggerUserAuthCapability[])];
+    tools = toolsForCapabilities(capabilities);
+  } else if (rec.tools === undefined) {
     // Enabling without naming tools means "all of them" — the operator asked
     // for the boundary, so apply it everywhere rather than nowhere.
     tools = [...TRIGGER_USER_AUTH_TOOLS];
@@ -179,17 +251,25 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     throw new TriggerUserAuthConfigError('triggerUserAuth.tools must be an array');
   }
 
-  let fallback: TriggerUserAuthFallback = 'bot-identity';
-  if (rec.fallback !== undefined) {
-    if (!(TRIGGER_USER_AUTH_FALLBACKS as readonly unknown[]).includes(rec.fallback)) {
-      // Name the rejected value: an operator reaching for "device" needs to be
-      // told it is refused on purpose, not left guessing at a typo.
+  let credentialSource: TriggerUserAuthCredentialSource = 'auto';
+  if (rec.credentialSource !== undefined && rec.credentialSource !== null) {
+    if (!(TRIGGER_USER_AUTH_CREDENTIAL_SOURCES as readonly unknown[]).includes(rec.credentialSource)) {
       throw new TriggerUserAuthConfigError(
-        `triggerUserAuth.fallback must be one of ${TRIGGER_USER_AUTH_FALLBACKS.join(' | ')}`
-        + ` (got ${JSON.stringify(rec.fallback)}; falling back to another person's login is never available)`,
+        `triggerUserAuth.credentialSource must be one of ${TRIGGER_USER_AUTH_CREDENTIAL_SOURCES.join(' | ')}`
+        + ` (got ${JSON.stringify(rec.credentialSource)})`,
       );
     }
-    fallback = rec.fallback as TriggerUserAuthFallback;
+    credentialSource = rec.credentialSource as TriggerUserAuthCredentialSource;
+  }
+
+  if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
+    && typeof rec.delegateOnMention !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.delegateOnMention must be a boolean');
+  }
+
+  if (rec.allowSpeakerSwitch !== undefined && rec.allowSpeakerSwitch !== null
+    && typeof rec.allowSpeakerSwitch !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.allowSpeakerSwitch must be a boolean');
   }
 
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
@@ -198,13 +278,72 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     'triggerUserAuth.gitTokenExchangeUrl',
   );
 
+  let dispatchOnly: TriggerUserAuthConfig['dispatchOnly'];
+  // dispatchOnly only takes effect while the policy is enabled, so a disabled
+  // policy accepts and drops the field instead of validating it. Flipping
+  // `enabled` to false by hand is a natural kill switch; rejecting the load
+  // here would make that one bot's edit fail the whole bots.json and take
+  // every other bot in the file down on the next daemon start. Re-enabling
+  // re-runs this parser, so a malformed scope is still refused before it can
+  // ever govern a dispatch.
+  if (rec.dispatchOnly !== undefined && enabled) {
+    if (typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
+      || Array.isArray(rec.dispatchOnly)) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an object');
+    }
+    const entry = rec.dispatchOnly as Record<string, unknown>;
+    const identifiers = (key: 'targetAppIds' | 'chatIds', pattern: RegExp): string[] => {
+      const value = entry[key];
+      if (!Array.isArray(value) || value.length === 0 || value.some(id => typeof id !== 'string' || !pattern.test(id))) {
+        throw new TriggerUserAuthConfigError(`triggerUserAuth.dispatchOnly.${key} must contain valid IDs`);
+      }
+      return [...new Set(value as string[])];
+    };
+    if (!Array.isArray(entry.tools) || entry.tools.length === 0 || entry.tools.some(tool => !isTool(tool))) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly.tools must contain supported tools');
+    }
+    dispatchOnly = {
+      tools: [...new Set(entry.tools as TriggerUserAuthTool[])],
+      targetAppIds: identifiers('targetAppIds', /^cli_[A-Za-z0-9_-]{1,128}$/),
+      chatIds: identifiers('chatIds', /^oc_[A-Za-z0-9_-]{1,128}$/),
+    };
+  }
+
   return {
     enabled,
     tools,
-    fallback,
+    ...(capabilities ? { capabilities } : {}),
+    credentialSource,
+    ...(rec.fallback === 'none' || rec.fallback === 'bot-identity' ? { legacyFallback: rec.fallback } : {}),
+    // Equal to the default → not stored.
+    ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
+    ...(rec.allowSpeakerSwitch === true ? { allowSpeakerSwitch: true } : {}),
+    ...(dispatchOnly ? { dispatchOnly } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
+}
+
+/** Restrict dispatch-only credentials to a direct human or an already verified
+ * delegation. Inherited authority is intersected with these tools by
+ * authorityForDispatch, so a bot turn cannot mint a new human credential. */
+export function dispatchOnlyToolsForTurn(
+  config: TriggerUserAuthConfig | null | undefined,
+  request: {
+    sourceChatId: string;
+    targetChatId: string;
+    targetAppIds: string[];
+    directHuman: boolean;
+    inherited: boolean;
+  },
+): TriggerUserAuthTool[] {
+  const policy = config?.enabled ? config.dispatchOnly : undefined;
+  if (!policy || (!request.directHuman && !request.inherited)
+    || request.sourceChatId !== request.targetChatId
+    || !policy.chatIds.includes(request.targetChatId)
+    || request.targetAppIds.length === 0
+    || request.targetAppIds.some(id => !policy.targetAppIds.includes(id))) return [];
+  return policy.tools;
 }
 
 /** A bare hostname. Rejects anything carrying a scheme, path, or shell-hostile
@@ -238,6 +377,45 @@ function optionalHttpsUrl(value: unknown, field: string): string | undefined {
   return value;
 }
 
+/** The capabilities that run as the message sender. `capabilities`, when
+ *  present, overrides `tools` (lark-cli → lark-user, bytedcli → bytecloud + meego). */
+export function capabilitiesOf(
+  config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined,
+): Set<TriggerUserAuthCapability> {
+  const caps = new Set<TriggerUserAuthCapability>();
+  if (!config?.enabled) return caps;
+  if (config.capabilities) {
+    config.capabilities.forEach(c => caps.add(c));
+  } else {
+    if (config.tools.includes('lark-cli')) caps.add('lark-user');
+    if (config.tools.includes('bytedcli')) { caps.add('bytecloud'); caps.add('meego'); }
+  }
+  return caps;
+}
+
+export function capabilityOn(
+  config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined,
+  capability: TriggerUserAuthCapability,
+): boolean {
+  return capabilitiesOf(config).has(capability);
+}
+
+/**
+ * Whether a bot with per-person auth on leaves `lark-cli --as user` to the machine's own lark-cli
+ * login: an explicit `capabilities` list without `lark-user`. A config that only names `tools`
+ * (legacy) keeps its upstream behaviour.
+ */
+export function larkUserNative(config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined): boolean {
+  return config?.enabled === true && config.capabilities !== undefined && !capabilityOn(config, 'lark-user');
+}
+
+/** The effective credential source; absent means `auto`. */
+export function credentialSourceOf(
+  config: Pick<TriggerUserAuthConfig, 'credentialSource'> | null | undefined,
+): TriggerUserAuthCredentialSource {
+  return config?.credentialSource ?? 'auto';
+}
+
 /** Whether this policy governs `tool` right now. */
 export function triggerUserAuthApplies(
   config: TriggerUserAuthConfig | null | undefined,
@@ -246,24 +424,12 @@ export function triggerUserAuthApplies(
   return !!config?.enabled && config.tools.includes(tool);
 }
 
-/** How a specific tool behaves when the sender has not authorized it. */
-export type UnauthorizedOutcome = 'bot-identity' | 'fail';
-
-/**
- * Resolve the configured policy intent for `tool` when the current sender has
- * no credentials.
- *
- * Descriptive only: the turn publisher refuses unauthorized calls for BOTH
- * tools today (see turn-cli-identity), so nothing in production branches on
- * this result. It is kept because stored configs still carry the field and
- * tests pin what was configured. `bytedcli` reports `fail` even under
- * `fallback: 'bot-identity'` because it never had a non-human identity.
- */
-export function unauthorizedOutcomeFor(
+/** Whether a `--mention` handoff from this bot can carry the turn's sender to
+ *  a bot on the same machine. Dispatch-only tools can establish this boundary
+ *  even when the source bot governs none of its own CLI tools. */
+export function delegatesOnMention(
   config: TriggerUserAuthConfig | null | undefined,
-  tool: TriggerUserAuthTool,
-): UnauthorizedOutcome {
-  if (!triggerUserAuthApplies(config, tool)) return 'bot-identity';
-  if (config!.fallback === 'none') return 'fail';
-  return TRIGGER_USER_AUTH_TOOL_CAPABILITIES[tool].supportsBotIdentity ? 'bot-identity' : 'fail';
+): boolean {
+  return !!config?.enabled && (config.tools.length > 0 || !!config.dispatchOnly)
+    && config.delegateOnMention !== false;
 }

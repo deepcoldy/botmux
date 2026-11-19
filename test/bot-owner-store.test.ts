@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { logger } from '../src/utils/logger.js';
-import { getBotOwner, setBotOwner, clearBotOwner, listBotOwners } from '../src/services/bot-owner-store.js';
+import { getBotOwner, setBotOwner, listBotOwners } from '../src/services/bot-owner-store.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-owner-')); });
@@ -30,13 +30,6 @@ describe('bot-owner-store', () => {
   it('requires an identity (unionId or openId)', () => {
     expect(setBotOwner(dataDir, 'cli_a', { name: '只有名字' })).toBe(false);
     expect(getBotOwner(dataDir, 'cli_a')).toBeNull();
-  });
-
-  it('clear removes ownership', () => {
-    setBotOwner(dataDir, 'cli_a', { openId: 'ou_1' });
-    expect(clearBotOwner(dataDir, 'cli_a')).toBe(true);
-    expect(getBotOwner(dataDir, 'cli_a')).toBeNull();
-    expect(clearBotOwner(dataDir, 'cli_a')).toBe(false);
   });
 
   it('lists owners per bot', () => {

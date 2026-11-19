@@ -11,15 +11,12 @@ import {
   enqueueDesiredStatus,
   failOutboxRow,
   findActiveBindingByIssue,
-  findBindingByClaimId,
   getBinding,
   getClaimIntent,
   listClaimIntents,
-  listDanglingClaimIntents,
   listOutbox,
   pruneOutbox,
   recordClaimIntent,
-  removeBinding,
   resetInflightToPending,
   settleOutboxRow,
   updateBinding,
@@ -61,12 +58,11 @@ describe('localTaskRef', () => {
 });
 
 describe('bindings', () => {
-  it('新建后可按 anchorId / claimId / issueId 查到，sourceSeq 从 1 起', () => {
+  it('新建后可按 anchorId / issueId 查到，sourceSeq 从 1 起', () => {
     const b = createBinding(dataDir, seed());
     expect(b.bindState).toBe('pending');
     expect(b.nextSourceSeq).toBe(1);
     expect(getBinding(dataDir, 'oc_group1')?.issueId).toBe('iss-1');
-    expect(findBindingByClaimId(dataDir, 'c-random-1')?.anchorId).toBe('oc_group1');
     expect(findActiveBindingByIssue(dataDir, 'iss-1')?.anchorId).toBe('oc_group1');
   });
 
@@ -99,7 +95,6 @@ describe('bindings', () => {
     createBinding(dataDir, seed());
     updateBinding(dataDir, 'oc_group1', { bindState: 'void' });
     expect(findActiveBindingByIssue(dataDir, 'iss-1')).toBeNull();
-    expect(findBindingByClaimId(dataDir, 'c-random-1')).not.toBeNull(); // 反查仍能拿到，供对账
   });
 
   // 终态有两个（void / released），漏改任何一处判断都会让已释放的 issue 仍被当成已领取：
@@ -108,17 +103,14 @@ describe('bindings', () => {
     createBinding(dataDir, seed());
     updateBinding(dataDir, 'oc_group1', { bindState: 'released' });
     expect(findActiveBindingByIssue(dataDir, 'iss-1')).toBeNull();
-    expect(findBindingByClaimId(dataDir, 'c-random-1')).not.toBeNull();
   });
 
-  it('updateBinding 不动 anchorId/createdAt，removeBinding 删得掉', () => {
+  it('updateBinding 不动 anchorId/createdAt', () => {
     const b = createBinding(dataDir, seed());
     const p = updateBinding(dataDir, 'oc_group1', { bindState: 'bound', chatId: 'oc_x' });
     expect(p?.bindState).toBe('bound');
     expect(p?.chatId).toBe('oc_x');
     expect(p?.createdAt).toBe(b.createdAt);
-    expect(removeBinding(dataDir, 'oc_group1')).toBe(true);
-    expect(removeBinding(dataDir, 'oc_group1')).toBe(false);
   });
 
   it('损坏的 bindings 文件不抛异常，按空表处理', async () => {
@@ -378,14 +370,6 @@ describe('claim 意图（补 claim 成功→建群之间的窗口）', () => {
     expect(p?.anchorId).toBe('oc_g1');
     expect(p?.createdAt).toBe(first.createdAt);
     expect(updateClaimIntent(dataDir, '不存在', { anchorId: 'x' })).toBeNull();
-  });
-
-  // 这条是整个机制的用途所在：意图在、binding 不在 = 悬空领取，对账要认领回来。
-  it('悬空判定：有意图无 binding → 列出；binding 建好后不再列出', () => {
-    recordClaimIntent(dataDir, intent());
-    expect(listDanglingClaimIntents(dataDir).map((i) => i.claimId)).toEqual(['c-random-1']);
-    createBinding(dataDir, seed());
-    expect(listDanglingClaimIntents(dataDir)).toEqual([]);
   });
 
   it('清除只影响指定 claimId，重复清除返回 false', () => {

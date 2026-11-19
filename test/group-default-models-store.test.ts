@@ -48,3 +48,16 @@ it('persists per-bot/per-group changes, reloads them, and clears without affecti
   await expect(setGroupDefaultModels('app-a', 'oc_b', { codex: 123 })).rejects.toThrow();
   expect(readFileSync(configPath, 'utf8')).toBe(before);
 });
+
+
+it('persists and reloads Antigravity effort and refuses unsupported levels without changing disk', async () => {
+  vi.resetModules();
+  const registry = await import('../src/bot-registry.js');
+  const { setGroupDefaultModels } = await import('../src/services/group-default-models-store.js');
+  registry.loadBotConfigs().forEach(cfg => registry.registerBot(cfg));
+  await expect(setGroupDefaultModels('app-a', 'oc_agy', { antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } })).resolves.toMatchObject({ ok: true });
+  expect(registry.loadBotConfigs()[0].groupDefaultModels?.oc_agy).toEqual({ antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } });
+  const before = readFileSync(configPath, 'utf8');
+  await expect(setGroupDefaultModels('app-a', 'oc_agy', { antigravity: { reasoningEffort: 'max' } })).resolves.toEqual({ ok: false, reason: 'unsupported_reasoning_effort' });
+  expect(readFileSync(configPath, 'utf8')).toBe(before);
+});

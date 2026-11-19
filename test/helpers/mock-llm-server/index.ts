@@ -6,3 +6,4 @@ export * from './openai-responses-sse.js';
 export * from './recorder.js';
 export * from './server.js';
 
+export * from './sandbox-probe.js';

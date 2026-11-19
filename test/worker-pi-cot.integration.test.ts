@@ -1,8 +1,8 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync, type ChildProcess } from 'node:child_process';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -24,10 +24,22 @@ vi.mock('../src/bot-registry.js', () => ({
 import { finalizeCotMessage, handleCotThinkingUpdate, handleCotThinkingSuperseded } from '../src/im/lark/cot-message.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 
 let child: ChildProcess | undefined;
 let root: string | undefined;
 let tmuxSession: string | undefined;
+// 自带私有 tmux 目录，不依赖全局 tmux 围栏。没有它时，TMUX_TMPDIR 为空的运行（例如绕过
+// setupFiles 的全量）会让 worker 的 `-L botmux` 落到宿主 /tmp/tmux-<uid>/botmux，和线上
+// fleet 共用同一个 server；2026-11-06 就有测试 worker 在宿主 socket 上起了 server，线上会话被
+// 迁到它上面，测试结束 server 退出，又断了一次。目录必须预先存在（tmux 对不存在的
+// TMUX_TMPDIR 会静默回落 /tmp），路径要短（unix socket 路径上限约 104 字节）。
+const tmuxRoot = mkdtempSync('/tmp/bmx-pc-');
+const tmuxEnv = privateTmuxEnv(tmuxRoot);
+// socket 名由 BOTMUX_TMUX_SOCKET 决定，测试围栏不清这个变量；固定成默认的 botmux。
+delete tmuxEnv.BOTMUX_TMUX_SOCKET;
+const privateManagedSocket = join(tmuxRoot, `tmux-${process.getuid?.() ?? 0}`, 'botmux');
 const tmuxAvailable = (() => {
   try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); return true; } catch { return false; }
 })();
@@ -40,12 +52,23 @@ afterEach(async () => {
   }
   child = undefined;
   if (tmuxSession) {
-    try { execFileSync('tmux', ['kill-session', '-t', tmuxSession], { stdio: 'ignore' }); } catch { /* already stopped */ }
+    killWorkerTmuxSession(tmuxSession, tmuxEnv);
   }
   tmuxSession = undefined;
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
   request.mockClear();
+});
+
+afterAll(() => {
+  // 只关本文件私有目录里的 server，再删目录。
+  const uidDir = join(tmuxRoot, `tmux-${process.getuid?.() ?? 0}`);
+  let sockets: string[] = [];
+  try { sockets = readdirSync(uidDir); } catch { /* no server was ever started */ }
+  for (const socket of sockets) {
+    spawnSync('tmux', ['-S', join(uidDir, socket), 'kill-server'], { stdio: 'ignore', timeout: 3_000 });
+  }
+  rmSync(tmuxRoot, { recursive: true, force: true });
 });
 
 async function waitUntil(check: () => boolean, logs: string[]): Promise<void> {
@@ -96,7 +119,7 @@ setInterval(() => {
       child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
-          ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+          ...tmuxEnv, HOME: root, SESSION_DATA_DIR: dataDir,
           BOTMUX_SESSION_ID: 'sid-pi-cot', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test-only',
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -110,15 +133,21 @@ setInterval(() => {
       });
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      if (backendType === 'tmux') tmuxSession = `pi-cot-${process.pid}-${Date.now()}`;
+      // The worker names its pane after the session id; clean up that one.
+      if (backendType === 'tmux') tmuxSession = `bmx-${'sid-pi-cot'.slice(0, 8)}`;
       child.send({
         type: 'init', sessionId: 'sid-pi-cot', chatId: 'oc_test', rootMessageId: 'om_root',
         workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId,
-        backendType, ...(tmuxSession ? { tmuxSessionName: tmuxSession } : {}),
+        backendType,
+        // Exercise Pi's tmux behavior, not the host's default shell startup files.
+        ...(backendType === 'tmux' ? { launchShell: '/bin/bash' } : {}),
         prompt: 'inspect the entry point', larkAppId: 'app_test', larkAppSecret: 'test-only',
         turnId: 'om_pi_turn',
       } satisfies DaemonToWorker);
       await waitUntil(() => logs.some(line => line.includes('Codex bridge fresh-empty:')), logs);
+      // worker 的 server 必须在本文件的私有目录里：全局围栏也会给一个私有 TMUX_TMPDIR，
+      // 不查这里的话，上面的覆盖一旦失效，标准配置下仍会是绿的。
+      if (backendType === 'tmux') await waitUntil(() => existsSync(privateManagedSocket), logs);
       const append = (...rows: object[]) => appendFileSync(transcript, rows.map(message => JSON.stringify({
         type: 'message', timestamp: new Date().toISOString(), message,
       })).join('\n') + '\n');
@@ -203,7 +232,7 @@ setInterval(() => {}, 1000);
       } as DaemonSession;
       child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
-        env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+        env: { ...tmuxEnv, HOME: root, SESSION_DATA_DIR: dataDir,
           BOTMUX_SESSION_ID: 'sid-pi-steer', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test-only' },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
@@ -216,14 +245,17 @@ setInterval(() => {}, 1000);
       });
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      if (backendType === 'tmux') tmuxSession = `pi-steer-${process.pid}-${Date.now()}`;
+      if (backendType === 'tmux') tmuxSession = `bmx-${'sid-pi-steer'.slice(0, 8)}`;
       child.send({
         type: 'init', sessionId: 'sid-pi-steer', chatId: 'oc_test', rootMessageId: 'om_root',
         workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId, backendType,
-        ...(tmuxSession ? { tmuxSessionName: tmuxSession } : {}),
+        ...(backendType === 'tmux' ? { launchShell: '/bin/bash' } : {}),
         prompt: 'warmup', larkAppId: 'app_test', larkAppSecret: 'test-only', turnId: 'om_warmup',
       } satisfies DaemonToWorker);
       await waitUntil(() => logs.some(line => line.includes('Codex bridge fresh-empty:')), logs);
+      // worker 的 server 必须在本文件的私有目录里：全局围栏也会给一个私有 TMUX_TMPDIR，
+      // 不查这里的话，上面的覆盖一旦失效，标准配置下仍会是绿的。
+      if (backendType === 'tmux') await waitUntil(() => existsSync(privateManagedSocket), logs);
       const append = (...rows: object[]) => appendFileSync(transcript, rows.map(message => JSON.stringify({
         type: 'message', timestamp: new Date().toISOString(), message,
       })).join('\n') + '\n');

@@ -18,7 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname, relative, isAbsolute, resolve, sep } from 'node:path';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
 
@@ -49,6 +49,18 @@ export {
   revisitBudgetStatus,
 } from './core-control.js';
 import { decideNext, type V3Action } from './orchestrator.js';
+import { planV3Revisit } from './revisit-plan.js';
+import {
+  currentV3Revision,
+  foldV3Revisions,
+  appendMissingV3RevisionFollowUps,
+  loadEffectiveV3Dag,
+  missingV3RevisionFollowUps,
+  snapshotForSelector,
+  v3ApprovedBotScope,
+  v3NodeHeldByProposal,
+} from './dag-revision.js';
+import { v3CheckpointHeldNodes, v3CheckpointMarkedSince, v3CheckpointSuccesses } from './checkpoint-hold.js';
 import {
   appendEvent,
   appendEventDurable,
@@ -90,6 +102,30 @@ import {
   type V3OpenWorkerAttempt,
 } from './attempt-ledger.js';
 import { openV3HostEffects, type V3OpenHostEffect } from './host-effect-ledger.js';
+import {
+  foldV3ExternalAttempts,
+  openV3ExternalAttempts,
+  type V3ExternalAttempt,
+  type V3ExternalAttemptPhase,
+} from './external-attempt-ledger.js';
+import {
+  V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS,
+  V3_EXTERNAL_CALL_TIMEOUT_MS,
+  V3_EXTERNAL_ERROR_CODES,
+  V3_HANDOFF_IDEMPOTENCY_WINDOW_MS,
+  type V3ExternalDispatchRequest,
+  type V3ExternalNodeExecutor,
+  type V3ExternalStopReason,
+} from './external-executor.js';
+import {
+  appendAcceptedLocked,
+  classifyExternalAttempt,
+  externalAttemptRef,
+  hasExternalInstallIntent,
+  settleExternalInstallIntent,
+  stopExternalAttempt,
+  withExternalCallTimeout,
+} from './external-control.js';
 import {
   prepareV3HostInputArtifact,
   readCrashLeftV3PreparedHostInput,
@@ -205,7 +241,7 @@ export function renderGoalFile(
     ...artifactSection,
     '## How to complete this node',
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
-    'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (also available as the `botmux-goal-ask` skill).',
+    'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (the same protocol is available via `botmux skill show botmux-goal-ask`).',
     '',
     `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If it includes an input entry \`{ "from": "human", "name": "answer", "path": "..." }\`, read that JSON file before continuing. If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
     `- Revisit feedback: if any input has \`"from": "revisit"\`, a DOWNSTREAM node sent this node back because its product was inadequate. You MUST read these before doing anything else: \`reason\` (why you were sent back), \`source:*\` (the downstream node's output — the evidence of what was wrong), and \`previous:*\` (YOUR OWN previous output — edit/fix it, do not rewrite from scratch). Address the reason; do not just reproduce the prior output.`,
@@ -317,193 +353,15 @@ export function mergeNodeCapability(
   };
 }
 
-/** Validation outcome for an opt-in `result.json` against its node schema. */
-export interface ResultValidation {
-  ok: boolean;
-  problems?: string[];
-}
+import { readRevisitRequest, validateResult } from './result-contract.js';
+export {
+  readRevisitRequest,
+  validateResult,
+  type ResultValidation,
+} from './result-contract.js';
 
-/** Read a worker's cross-node revisit request from `result.json` (if any).  A
- *  revisit is `{ "status": "revisit", "revisitTo": "<ancestor>", "reason"? }`.
- *  Absent result.json / non-revisit status → `{ ok:true }` (no request).  A
- *  malformed revisit (missing/blank revisitTo, non-string reason) → `ok:false`
- *  so the runtime blocks it as resultInvalid.  The ancestor membership check
- *  (toNodeId ∈ node.revisitTo) is the caller's (it has the node). */
-export function readRevisitRequest(
-  manifest: Manifest,
-  outputDir: string,
-): { ok: true; request?: { toNodeId: string; reason?: string } } | { ok: false; problems: string[] } {
-  const entry = manifest.files.find((f) => f.path === 'result.json');
-  if (!entry) return { ok: true };
-  let value: unknown;
-  try {
-    value = JSON.parse(readFileSync(join(outputDir, entry.path), 'utf-8'));
-  } catch {
-    return { ok: true }; // unreadable result.json: not a revisit (resultSchema path reports it)
-  }
-  if (!value || typeof value !== 'object' || (value as Record<string, unknown>).status !== 'revisit') {
-    return { ok: true };
-  }
-  const v = value as Record<string, unknown>;
-  const problems: string[] = [];
-  if (typeof v.revisitTo !== 'string' || v.revisitTo.trim() === '') {
-    problems.push('result.json status "revisit" requires a non-empty string "revisitTo"');
-  }
-  if (v.reason !== undefined && typeof v.reason !== 'string') {
-    problems.push('result.json "reason" must be a string when present');
-  }
-  if (problems.length > 0) return { ok: false, problems };
-  return {
-    ok: true,
-    request: {
-      toNodeId: v.revisitTo as string,
-      ...(typeof v.reason === 'string' && v.reason ? { reason: v.reason } : {}),
-    },
-  };
-}
-
-/**
- * Validate a `result.json` against the node's (already dag-validated) result
- * schema subset.  Top-level types only — see `V3ResultSchema`.  Undeclared
- * extra properties are allowed (JSON-Schema default).
- */
-export function validateResult(filePath: string, schema: V3ResultSchema): ResultValidation {
-  if (!existsSync(filePath)) return { ok: false, problems: [`result.json not found at ${filePath}`] };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
-  } catch (err) {
-    return { ok: false, problems: [`result.json is not valid JSON: ${err instanceof Error ? err.message : String(err)}`] };
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, problems: ['result.json root must be a JSON object'] };
-  }
-  const obj = parsed as Record<string, unknown>;
-  const problems: string[] = [];
-  for (const field of schema.required ?? []) {
-    if (!(field in obj)) problems.push(`missing required field "${field}"`);
-  }
-  for (const [name, spec] of Object.entries(schema.properties)) {
-    if (!(name in obj)) continue; // absence is only a problem when required
-    const v = obj[name];
-    const okType =
-      spec.type === 'string' ? typeof v === 'string'
-      : spec.type === 'number' ? typeof v === 'number' && Number.isFinite(v)
-      : spec.type === 'boolean' ? typeof v === 'boolean'
-      : spec.type === 'array' ? Array.isArray(v)
-      : typeof v === 'object' && v !== null && !Array.isArray(v);
-    if (!okType) {
-      problems.push(`field "${name}" must be of type ${spec.type}`);
-      continue;
-    }
-    // Enum enforcement (edge-activation design §1.3): a declared vocabulary
-    // is part of the contract — an out-of-vocabulary value is `resultInvalid`
-    // (blocked, retryable), same as a type violation.
-    if (spec.type === 'string' && spec.enum && !spec.enum.includes(v as string)) {
-      problems.push(`field "${name}" must be one of [${spec.enum.join(', ')}] (got ${JSON.stringify(v)})`);
-    }
-  }
-  return problems.length > 0 ? { ok: false, problems } : { ok: true };
-}
-
-// ─── Attempt numbering (journal-derived — no hardcoded 001) ──────────────────
-
-const ATTEMPT_NNN_RE = /\/attempts\/(\d{3})$/;
-
-function attemptNumber(attemptId: string): number | undefined {
-  const m = ATTEMPT_NNN_RE.exec(attemptId);
-  return m ? parseInt(m[1]!, 10) : undefined;
-}
-
-/**
- * Compute the attemptId the NEXT dispatch of `nodeId` must use, from the
- * journal: an unconsumed `nodeRetryRequested` reservation wins (retry intent
- * is authoritative for the redrive); otherwise max(seen)+1 — which is 001 for
- * a first dispatch.  Dispatch events are the authority for "seen"; a
- * reservation is consumed by a later `nodeDispatched` with the same number.
- */
-export function nextAttemptIdFor(events: StoredEvent[], key: string): string {
-  // `key` is the dispatch namespace: a runtime instance (`A#001`), a loop body
-  // expansion (`loopId.i001.code`), or a legacy nodeId.  Match events by their
-  // instance when they carry one, else by nodeId — so `A#002`'s attempts are
-  // counted separately from `A#001`'s (constraint 3/5).
-  const matches = (e: { nodeId: string; instanceId?: string }): boolean => (e.instanceId ?? e.nodeId) === key;
-  let maxSeen = 0;
-  let reserved: number | undefined;
-  let prepared: string | undefined;
-  for (const e of events) {
-    if (e.type === 'nodeDispatched' && matches(e)) {
-      const n = attemptNumber(e.attemptId);
-      if (n === undefined) continue;
-      maxSeen = Math.max(maxSeen, n);
-      if (reserved === n) reserved = undefined; // reservation consumed
-    } else if (e.type === 'hostInputPrepared' && matches(e)) {
-      const n = attemptNumber(e.attemptId);
-      if (n === undefined) continue;
-      maxSeen = Math.max(maxSeen, n);
-      if (reserved === n) reserved = undefined;
-      prepared = e.attemptId;
-    } else if (
-      (e.type === 'nodeSucceeded' || e.type === 'nodeFailed' || e.type === 'nodeBlocked') &&
-      matches(e)
-    ) {
-      // A pre-intent host crash can leave only a blocked verdict for the
-      // reserved attempt (the sidecar was partial, so no prepared event is
-      // trustworthy). The verdict is still durable proof that this number was
-      // consumed and a retry must advance rather than collide with it.
-      const n = attemptNumber(e.attemptId);
-      if (n !== undefined) maxSeen = Math.max(maxSeen, n);
-      if (prepared === e.attemptId) prepared = undefined;
-    } else if (
-      e.type === 'hostEffectIntent' && matches(e) && prepared === e.attemptId
-    ) {
-      prepared = undefined;
-    } else if (e.type === 'nodeRetryRequested' && matches(e)) {
-      const n = attemptNumber(e.nextAttemptId);
-      if (n === undefined) continue;
-      reserved = n;
-      prepared = undefined;
-      maxSeen = Math.max(maxSeen, n);
-    }
-  }
-  if (prepared) return prepared;
-  const n = reserved ?? maxSeen + 1;
-  return `${key}/attempts/${String(n).padStart(3, '0')}`;
-}
-
-/** Latest dispatched attemptId for a dispatch `key` (the `previousAttemptId` a
- *  retry entrypoint must reference).  `key` is an instance (`A#001`), a loop
- *  body expansion, or a legacy nodeId — matched by `(instanceId ?? nodeId)` so
- *  a retry stays inside the same instance.  Undefined when never dispatched. */
-export function latestAttemptIdFor(events: StoredEvent[], key: string): string | undefined {
-  let latest: string | undefined;
-  let latestNumber = -1;
-  for (const e of events) {
-    if (
-      (
-        e.type === 'nodeDispatched' ||
-        e.type === 'hostInputPrepared' ||
-        e.type === 'hostEffectIntent' ||
-        e.type === 'nodeSucceeded' ||
-        e.type === 'nodeFailed' ||
-        e.type === 'nodeBlocked'
-      ) &&
-      (e.instanceId ?? e.nodeId) === key
-    ) {
-      const n = attemptNumber(e.attemptId);
-      if (n === undefined) {
-        if (latestNumber < 0) latest = e.attemptId;
-      } else if (n >= latestNumber) {
-        // A stale settle for attempt 001 may arrive after attempt 002 was
-        // dispatched. Choose the highest reserved number, never journal order,
-        // so retry/cancel cannot regress to an obsolete attempt.
-        latest = e.attemptId;
-        latestNumber = n;
-      }
-    }
-  }
-  return latest;
-}
+import { attemptNumber, latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
+export { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
 
 // ─── Injected dependencies + options ────────────────────────────────────────
 
@@ -535,7 +393,19 @@ export interface V3RuntimeDeps {
    *  runtime throws if a gate is hit without a handler.  (Wired by
    *  `human-gate.ts` post-milestone.) */
   resolveGate?: GateResolver;
+  /** Transport for `nodeExecutor: "bot"` goal nodes. Required when
+   *  `opts.nodeExecutor === 'bot'`; never consulted otherwise. */
+  externalExecutor?: V3ExternalNodeExecutor;
+  /** Observability sink for external transport failures (dispatch / probe /
+   *  stop). Never affects run semantics: the journal stays authoritative. */
+  onExternalError?: (
+    error: unknown,
+    context: { attemptId: string; operation: 'dispatch' | 'probe' | 'stop' },
+  ) => void;
 }
+
+/** Code defaults for the three concurrency caps (codex's three-layer cap). */
+export const V3_DEFAULT_CONCURRENCY = Object.freeze({ global: 4, perBot: 1, perCli: 2 });
 
 export interface V3RuntimeOptions {
   /** The run lives in `${baseDir}/${dag.runId}`. */
@@ -548,6 +418,8 @@ export interface V3RuntimeOptions {
   globalConcurrency?: number; // default 4
   perBotConcurrency?: number; // default 1
   perCliConcurrency?: number; // default 2
+  /** Per-CLI override of `perCliConcurrency`, keyed by cliId. */
+  perCliConcurrencyById?: Readonly<Record<string, number>>;
   cancelSignal?: AbortSignal;
   /** Bot identities already pinned by an immutable run envelope. When set,
    *  the runtime must use these exact snapshots instead of live bots.json. */
@@ -567,6 +439,14 @@ export interface V3RuntimeOptions {
    *  RunNodeRequest so worker CLI children get real BOTMUX_* identity env.
    *  See RunNodeRequest.chatBinding. */
   chatBinding?: RunChatBinding;
+  /** Frozen from `run.json`. `bot` = goal nodes are handed off to bot sessions
+   *  through `deps.externalExecutor` and wait on disk for their settle event.
+   *  Absent = ephemeral workers via `deps.runNode` (historical behaviour). */
+  nodeExecutor?: 'bot';
+  /** Acceptance window for a sent handoff (engine clock). */
+  externalAcceptTimeoutMs?: number;
+  /** Wall-clock bound on each external transport call. */
+  externalCallTimeoutMs?: number;
 }
 
 export interface V3PendingGate {
@@ -592,7 +472,37 @@ export type V3RunOutcome =
       uncertainHostEffects?: V3UncertainHostEffect[];
       runDir: string;
     }
-  | { reason: 'awaitingGate'; pendingWaits: V3PendingGate[]; runDir: string };
+  | {
+      reason: 'awaitingGate';
+      pendingWaits: V3PendingGate[];
+      /** A flow-revision proposal awaiting the initiator holds back the
+       *  nodes it touches (design §13.5); the rest of the run is idle. */
+      pendingRevision?: number;
+      runDir: string;
+    }
+  | {
+      /** Nothing is dispatchable now and at least one external attempt is
+       *  open. The run is suspended on disk; re-drive on a settle event, a
+       *  human action, or at `wakeAt` (the earliest engine deadline). Gates in
+       *  `pendingWaits` still need their cards posted. */
+      reason: 'awaitingExternal';
+      pendingWaits: V3PendingGate[];
+      externalAttempts: V3ExternalWait[];
+      pendingRevision?: number;
+      wakeAt?: number;
+      runDir: string;
+    };
+
+/** One open external attempt the run is waiting on. */
+export interface V3ExternalWait {
+  nodeId: string;
+  instanceId?: string;
+  attemptId: string;
+  phase: V3ExternalAttemptPhase;
+  targetLarkAppId?: string;
+  /** Engine-clock time at which this attempt next needs attention. */
+  wakeAt?: number;
+}
 
 function assertOrCreateFrozenJson(
   path: string,
@@ -637,6 +547,35 @@ function assertOrCreateFrozenJson(
   }
 }
 
+/** Back-off before a same-key re-send after an unknown dispatch failure. */
+const HANDOFF_RESEND_BACKOFF_MS = 30_000;
+/** Back-off between acceptance probes whose outcome was unknown. */
+const PROBE_RETRY_BACKOFF_MS = 30_000;
+/** How long acceptance may stay unknown past its deadline before the node
+ *  blocks HANDOFF_UNCERTAIN for a human (it is never assumed "not accepted"). */
+const PROBE_UNCERTAIN_AFTER_MS = 10 * 60_000;
+
+/**
+ * Unknown-probe bookkeeping, process-wide so it spans the many short drives
+ * of one daemon (each drive is a fresh runtime). A restart starts a fresh
+ * grace period, which can only delay — never wrongly cause — a block.
+ */
+const probeFailures = new Map<string, { firstFailedAt: number; retryAt: number }>();
+
+function forgetProbeFailuresOf(runDir: string): void {
+  const prefix = `${runDir}\0`;
+  for (const key of probeFailures.keys()) {
+    if (key.startsWith(prefix)) probeFailures.delete(key);
+  }
+}
+
+/** Since when this process has failed to learn whether the target bot
+ *  accepted `attemptId`'s handoff (engine clock), or undefined. The node card
+ *  shows it as "acceptance unknown, retrying" instead of a plain wait. */
+export function v3AcceptanceProbeUnknownSince(runDir: string, attemptId: string): number | undefined {
+  return probeFailures.get(`${runDir}\0${attemptId}`)?.firstFailedAt;
+}
+
 // ─── Main loop ───────────────────────────────────────────────────────────
 
 /**
@@ -645,18 +584,25 @@ function assertOrCreateFrozenJson(
  * instead of re-running completed nodes.
  */
 export async function runWorkflow(
-  dag: V3Dag,
+  authorizedDag: V3Dag,
   deps: V3RuntimeDeps,
   opts: V3RuntimeOptions,
 ): Promise<V3RunOutcome> {
+  // `dag` is the EFFECTIVE flow: the authorized DAG plus every revision the
+  // journal applied (design §13.3). It is re-derived each tick, so closures
+  // below always see the definition the current decision was made on.
+  let dag = authorizedDag;
   const runDir = join(opts.baseDir, dag.runId);
   mkdirSync(runDir, { recursive: true });
   const journalPath = join(runDir, 'journal.ndjson');
   const statePath = join(runDir, 'STATE');
 
-  const globalCap = opts.globalConcurrency ?? 4;
-  const perBotCap = opts.perBotConcurrency ?? 1;
-  const perCliCap = opts.perCliConcurrency ?? 2;
+  const globalCap = opts.globalConcurrency ?? V3_DEFAULT_CONCURRENCY.global;
+  const perBotCap = opts.perBotConcurrency ?? V3_DEFAULT_CONCURRENCY.perBot;
+  const perCliDefaultCap = opts.perCliConcurrency ?? V3_DEFAULT_CONCURRENCY.perCli;
+  const perCliById = opts.perCliConcurrencyById ?? {};
+  const perCliCap = (cliId: string): number =>
+    Object.prototype.hasOwnProperty.call(perCliById, cliId) ? perCliById[cliId]! : perCliDefaultCap;
   const gateMode = opts.gateMode ?? 'blocking';
   const hostResponseWaitMs = opts.hostResponseWaitMs ?? 15_000;
   const executionContext = opts.executionContext ?? opts.resolvedWorkflowData;
@@ -666,8 +612,32 @@ export async function runWorkflow(
   if (!Number.isSafeInteger(hostResponseWaitMs) || hostResponseWaitMs < 1) {
     throw new Error('v3 runtime: hostResponseWaitMs must be a positive safe integer');
   }
+  // External (bot-executed) goal nodes: fail closed when the run is pinned to
+  // the bot executor but this host cannot deliver handoffs.
+  const externalMode = opts.nodeExecutor === 'bot';
+  const externalExecutor = deps.externalExecutor;
+  if (externalMode && !externalExecutor) {
+    throw new Error('v3 runtime: nodeExecutor "bot" requires an external node executor');
+  }
+  const externalAcceptTimeoutMs = opts.externalAcceptTimeoutMs ?? V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(externalAcceptTimeoutMs) || externalAcceptTimeoutMs < 0) {
+    throw new Error('v3 runtime: externalAcceptTimeoutMs must be a non-negative safe integer');
+  }
+  const clock = (): number => deps.now?.() ?? Date.now();
+  const externalCallTimeoutMs = opts.externalCallTimeoutMs ?? V3_EXTERNAL_CALL_TIMEOUT_MS;
+  if (!Number.isSafeInteger(externalCallTimeoutMs) || externalCallTimeoutMs < 1) {
+    throw new Error('v3 runtime: externalCallTimeoutMs must be a positive safe integer');
+  }
+  const probeKey = (attemptId: string): string => `${runDir}\0${attemptId}`;
 
-  const nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
+  let nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
+  // Revision the current tick decided on; every journal claim re-checks it
+  // under the lock so a concurrent edit can never be overtaken by a stale
+  // decision (dispatching an old definition, skipping on old wiring, …).
+  let dagRevision = 1;
+  // Nodes held back by a pending proposal (design §13.5).
+  let pendingTouched: ReadonlySet<string> | undefined;
+  let pendingRevision: number | undefined;
 
   // Freeze bot snapshots once, keyed by the node's `bot` field (''=default),
   // and persist for audit / resume.  Re-resolving mid-run would let a drifted
@@ -700,7 +670,7 @@ export async function runWorkflow(
   // CLI-scope guard: goal-mode rides the native `/goal` command.  Fail the
   // whole run up front — clearly — rather than spawning a worker on a CLI that
   // has not been verified to understand `/goal`.
-  for (const [key, snap] of botSnapshots) {
+  const validateSnapshot = (key: string, snap: BotSnapshot): void => {
     if (deps.validateExecutionSnapshot) {
       deps.validateExecutionSnapshot(snap, key);
     } else if (!isV3SupportedCli(snap.cliId)) {
@@ -709,7 +679,98 @@ export async function runWorkflow(
         `which is not supported by v3 goal-mode (supported: ${V3_SUPPORTED_CLIS.join(', ')})`,
       );
     }
-  }
+  };
+  for (const [key, snap] of botSnapshots) validateSnapshot(key, snap);
+
+  /** The frozen snapshot a node runs on. Revisions only ever reference
+   *  approved selectors or bots their own pinned sidecar brought in. */
+  const botSnapshotFor = (selector: string | undefined): BotSnapshot => {
+    const snap = snapshotForSelector(botSnapshots, selector);
+    if (!snap) {
+      throw new Error(`v3 runtime: no frozen bot snapshot for selector "${selector || '<default>'}"`);
+    }
+    return snap;
+  };
+
+  /**
+   * Fold the journal's flow revisions into the effective DAG. Without any
+   * revision this is a no-op (the authorized DAG, no extra IO). A digest or
+   * chain mismatch throws: the run fails closed rather than schedule a flow
+   * nobody authorized.
+   */
+  const refreshEffectiveDag = (events: readonly StoredEvent[]): void => {
+    const history = foldV3Revisions(events);
+    pendingTouched = history.pending ? new Set(history.pending.touched) : undefined;
+    pendingRevision = history.pending?.revision;
+    if (history.current === dagRevision) return;
+    const effective = loadEffectiveV3Dag(runDir, authorizedDag, events);
+    // The run's approved bot scope grows only through confirmed revisions.
+    for (const [selector, snap] of v3ApprovedBotScope(botSnapshots, effective.botAdditions)) {
+      if (botSnapshots.has(selector)) continue;
+      validateSnapshot(selector, snap);
+      botSnapshots.set(selector, snap);
+    }
+    for (const node of effective.dag.nodes) {
+      if (isHostNode(node) && !deps.hostExecutors?.has(node.executor)) {
+        throw new Error(`v3 runtime: host executor "${node.executor}" is not registered`);
+      }
+      if (isGoalNode(node)) botSnapshotFor(node.bot);
+      if (isLoopNode(node)) for (const body of node.body.nodes) botSnapshotFor(body.bot ?? node.bot);
+    }
+    dag = effective.dag;
+    nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
+    dagRevision = effective.revision;
+  };
+
+  /** Under the journal lock: does the decision this tick made still stand?
+   *  False when a revision took effect since, or a new proposal now holds
+   *  the node back. */
+  const decisionStillCurrent = (
+    latest: readonly StoredEvent[],
+    nodeId?: string,
+    loopId?: string,
+  ): boolean => {
+    if (currentV3Revision(latest) !== dagRevision) return false;
+    if (nodeId === undefined) return true;
+    const pending = foldV3Revisions(latest).pending;
+    return !pending || !v3NodeHeldByProposal(new Set(pending.touched), nodeId, loopId);
+  };
+
+  /** Append one control-sweep event only if the flow it was decided on is
+   *  still the effective one. */
+  const appendControlEvent = (event: V3Event): boolean =>
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      if (!decisionStillCurrent(events)) return false;
+      append(event);
+      return true;
+    });
+
+  // Dependants of a checkpoint success nobody released yet (bot-executed
+  // runs only, design §13.6). Re-derived from the journal every tick.
+  let checkpointHeld: ReadonlySet<string> = new Set();
+  const refreshCheckpointHolds = (events: readonly StoredEvent[]): void => {
+    if (!externalMode) return;
+    checkpointHeld = v3CheckpointHeldNodes(dag, v3CheckpointSuccesses({
+      events,
+      dag,
+      markedSince: v3CheckpointMarkedSince(runDir, authorizedDag, events),
+    }));
+  };
+  /** Held back this tick: by a pending proposal, or behind a checkpoint. */
+  const heldByProposal = (nodeId: string, loopId?: string): boolean =>
+    v3NodeHeldByProposal(pendingTouched, nodeId, loopId) ||
+    checkpointHeld.has(nodeId) ||
+    (loopId !== undefined && checkpointHeld.has(loopId));
+
+  /** A revision's reassign / blocked re-run whose dedicated event was lost
+   *  to a crash between two appends is re-appended (idempotent, §13.3). */
+  const reconcileRevisionFollowUps = (events: readonly StoredEvent[]): boolean => {
+    const live = new Set(dag.nodes.map((node) => node.id));
+    if (missingV3RevisionFollowUps(events, live).length === 0) return false;
+    const result = appendMissingV3RevisionFollowUps(journalPath, { revision: dagRevision, liveNodeIds: live });
+    // stale → a newer flow landed: re-read it before deciding again.
+    return result.kind === 'stale' || result.count > 0;
+  };
 
   if (!opts.authorizedArtifacts) {
     assertOrCreateFrozenJson(
@@ -728,9 +789,16 @@ export async function runWorkflow(
     );
   }
 
-  // First run only: stamp runStarted (idempotent on resume).
+  // First run only: stamp runStarted (idempotent on resume). A daemon-started
+  // run arrives with the journal already rooted by its start intent, which
+  // stamps `nodeExecutor` from the same run.json (start-intent.ts); a root
+  // written before that is never rewritten — readers fall back to run.json.
   if (readJournal(journalPath).length === 0) {
-    appendEvent(journalPath, { type: 'runStarted', runId: dag.runId });
+    appendEvent(journalPath, {
+      type: 'runStarted',
+      runId: dag.runId,
+      ...(externalMode ? { nodeExecutor: 'bot' as const } : {}),
+    });
   }
 
   // In-flight bookkeeping.  Work uses the nodeId as the key; gates use
@@ -744,6 +812,15 @@ export async function runWorkflow(
   const hostPromiseAttempts = new Map<string, string>();
   const hostDeadlineCancels = new Map<string, () => void>();
   const blockingGateOwners = new Map<string, symbol>();
+  // External handoffs in flight in THIS process (attemptId → abort). The
+  // durable truth is the journal; these only avoid double-sending locally.
+  const handoffControllers = new Map<string, AbortController>();
+  // attemptId → engine-clock time of the next same-key re-send after an
+  // unknown dispatch failure. Empty after a restart (cold attach re-sends).
+  const handoffRetryAt = new Map<string, number>();
+  // Sent attempts whose acceptance this process has observed or probed.
+  // A Sent attempt missing here was sent by an earlier process → probe once.
+  const acceptanceObserved = new Set<string>();
 
   class HostProviderResponseTimeoutError extends Error {
     constructor() {
@@ -824,6 +901,9 @@ export async function runWorkflow(
 
   while (true) {
     const events = readJournal(journalPath);
+    refreshEffectiveDag(events);
+    refreshCheckpointHolds(events);
+    if (reconcileRevisionFollowUps(events)) continue;
     const snap = materialize(events);
     writeState(statePath, snap);
 
@@ -851,11 +931,18 @@ export async function runWorkflow(
       continue;
     }
 
+    if (settleExternalLeftovers(events)) continue;
+
     if (snap.runStatus === 'cancelling' && snap.cancelRequestId) {
       // Stop active workers first. Pending/gated nodes can be neutral-cancelled
       // immediately; running nodes become cancelled only after their runNode
       // Promise resolves (the real pool now fences cancellation on worker exit).
       for (const controller of nodeControllers.values()) {
+        if (!controller.signal.aborted) {
+          controller.abort({ kind: 'run', cancelRequestId: snap.cancelRequestId });
+        }
+      }
+      for (const controller of handoffControllers.values()) {
         if (!controller.signal.aborted) {
           controller.abort({ kind: 'run', cancelRequestId: snap.cancelRequestId });
         }
@@ -873,6 +960,13 @@ export async function runWorkflow(
 
       if (inFlight.size > 0) {
         await Promise.race(inFlight.values());
+        continue;
+      }
+
+      // External attempts have no process to fence: stop the bot's turn, then
+      // close the binding in the journal. That close is their proof.
+      if (openV3ExternalAttempts(events).length > 0) {
+        await closeExternalAttemptsForCancellation(snap.cancelRequestId);
         continue;
       }
 
@@ -921,6 +1015,15 @@ export async function runWorkflow(
         if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
         continue;
       }
+      const openExternal = openV3ExternalAttempts(events);
+      if (openExternal.length > 0) {
+        await drainExternalAttempts(
+          openExternal,
+          'runBoundary',
+          trueTerminal ? 'orphanRecovery' : 'terminalPeer',
+        );
+        continue;
+      }
       break;
     }
 
@@ -953,6 +1056,17 @@ export async function runWorkflow(
       continue;
     }
 
+    // External attempts are NOT orphans after a restart: the bot session runs
+    // independently and the attempt waits on disk. Only obsolete ones (early
+    // release / revisit supersession) are stopped and closed here; current
+    // ones are reconciled against their durable phase and deadlines.
+    const obsoleteExternal = obsoleteExternalAttempts(events, snap);
+    if (obsoleteExternal.length > 0) {
+      await drainExternalAttempts(obsoleteExternal, 'obsolete', 'obsoleteAttempt');
+      continue;
+    }
+    if (await reconcileExternalAttempts(events)) continue;
+
     const actions = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances);
 
     // Terminal sweep: write the run terminal event, then re-tick so the top of
@@ -964,6 +1078,15 @@ export async function runWorkflow(
         a.kind === 'completeRunBlocked',
     );
     if (terminal) {
+      // A pending proposal may still re-run or extend finished work: the run
+      // does not declare success until the initiator decides (design §13.5).
+      if (terminal.kind === 'completeRunSucceeded' && pendingRevision !== undefined) {
+        if (inFlight.size > 0) {
+          await waitForInFlightOrDurableCancellation();
+          continue;
+        }
+        return { reason: 'awaitingGate', pendingWaits: [], pendingRevision, runDir };
+      }
       // Gate promises have no process to drain and their guarded callbacks turn
       // stale once this boundary commits. Worker attempts, however, must prove
       // outer close before the terminal event can be published.
@@ -972,6 +1095,14 @@ export async function runWorkflow(
       if (open.length > 0) {
         const drained = await quiesceAttempts(open, 'terminalPeer');
         if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
+      // A run boundary needs every external binding closed as well; a still
+      // working peer bot is stopped and its node requeued, exactly like a
+      // worker peer (scheduler rules are unchanged by the executor).
+      const openExternal = openV3ExternalAttempts(events);
+      if (openExternal.length > 0) {
+        await drainExternalAttempts(openExternal, 'runBoundary', 'terminalPeer');
         continue;
       }
       appendRunTerminalIfQuiescent();
@@ -989,7 +1120,7 @@ export async function runWorkflow(
     // the terminal sweep.  Work dispatches in the same action list simply
     // re-emerge next tick.  Edge resolution is deliberately serial/control
     // phase (H8): no inFlight, no concurrency slot, no AbortController.
-    const controls = actions.filter(
+    const allControls = actions.filter(
       (a): a is
         | Extract<V3Action, { loopId: string }>
         | Extract<V3Action, { kind: 'resolveEdge' | 'skipNode' }> =>
@@ -1000,12 +1131,18 @@ export async function runWorkflow(
         a.kind === 'resolveEdge' ||
         a.kind === 'skipNode',
     );
+    // A node a pending proposal touches neither starts nor settles its wiring
+    // until the initiator decides (design §13.5).
+    const controls = allControls.filter((a) => !heldByProposal(
+      a.kind === 'resolveEdge' ? a.to : a.kind === 'skipNode' ? a.nodeId : a.loopId,
+    ));
+    const heldControls = allControls.length - controls.length;
     if (controls.length > 0) {
       const eventsForControl = readJournal(journalPath);
       for (const a of controls) {
         if (a.kind === 'resolveEdge') applyResolveEdge(a, eventsForControl);
         else if (a.kind === 'skipNode') {
-          appendEvent(journalPath, {
+          appendControlEvent({
             type: 'nodeSkipped',
             nodeId: a.nodeId,
             reason: 'triggerRuleUnsatisfied',
@@ -1018,9 +1155,31 @@ export async function runWorkflow(
 
     // Dispatch the ready set under the three-layer cap.  Anything not started
     // this tick (cap hit) is retried next tick.
+    // An open external attempt holds its global and per-bot slot for as long
+    // as its binding is open — across drives, with no in-memory Promise. Its
+    // in-process handoff send (if any) is the same attempt, so the `::handoff`
+    // in-flight entry is not counted twice. Ephemeral runs have neither.
+    const openExternalNow = openV3ExternalAttempts(events);
+    let externalOccupancy = openExternalNow.length;
+    const externalByBot = new Map<string, number>();
+    for (const attempt of openExternalNow) {
+      if (!attempt.targetLarkAppId) continue;
+      externalByBot.set(attempt.targetLarkAppId, (externalByBot.get(attempt.targetLarkAppId) ?? 0) + 1);
+    }
+    const occupancy = (): number =>
+      inFlight.size - [...inFlight.keys()].filter((key) => key.endsWith('::handoff')).length + externalOccupancy;
+
     let startedThisTick = 0;
+    let heldThisTick = heldControls;
     for (const a of actions) {
-      if (inFlight.size >= globalCap) break;
+      if (occupancy() >= globalCap) break;
+      if (
+        (a.kind === 'dispatchWork' || a.kind === 'dispatchGate') &&
+        heldByProposal(a.nodeId, a.kind === 'dispatchWork' ? a.loop?.loopId : undefined)
+      ) {
+        heldThisTick++;
+        continue;
+      }
       if (a.kind === 'dispatchWork') {
         // Loop body instances are synthesized from the body definition; the
         // instance id is theirs alone (attempt dirs, journal events, retry).
@@ -1029,10 +1188,23 @@ export async function runWorkflow(
           if (!a.instanceId) throw new Error(`v3 runtime: host node "${node.id}" has no runtime instance`);
           if (startHost(node, events, a.instanceId)) startedThisTick++;
         } else {
-          const botKey = node.bot ?? '';
-          const botSnap = botSnapshots.get(botKey)!;
+          const botSnap = botSnapshotFor(node.bot);
+          if (externalMode) {
+            // Bot sessions are managed by each bot's daemon: no per-CLI cap.
+            const target = snap.assignments.get(node.id) ?? botSnap.larkAppId;
+            if ((botInFlight.get(target) ?? 0) + (externalByBot.get(target) ?? 0) >= perBotCap) continue;
+            if (startExternal(node, botSnap, events, a.loop, a.omitted, a.instanceId)) {
+              startedThisTick++;
+              externalOccupancy++;
+              externalByBot.set(target, (externalByBot.get(target) ?? 0) + 1);
+            }
+            continue;
+          }
+          // The per-bot cap is per Lark app, not per selector string: two
+          // selectors resolving to the same bot share its slot.
+          const botKey = botSnap.larkAppId;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
-          if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
+          if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap(botSnap.cliId)) continue;
           if (startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId)) {
             startedThisTick++;
           }
@@ -1042,8 +1214,11 @@ export async function runWorkflow(
       }
     }
 
+    // Cancelling an early-release loser is a decision of the node it lost
+    // to: while that node waits behind a checkpoint, the loser keeps running
+    // (the main bot may still want it once it has seen the result).
     const cancels = actions.filter((a): a is Extract<V3Action, { kind: 'cancelNode' }> =>
-      a.kind === 'cancelNode');
+      a.kind === 'cancelNode' && !heldByProposal(a.nodeId) && !checkpointHeld.has(a.byNodeId));
     let cancelledThisTick = false;
     for (const a of cancels) {
       cancelledThisTick = applyCancelNode(a) || cancelledThisTick;
@@ -1053,14 +1228,32 @@ export async function runWorkflow(
     if (inFlight.size === 0) {
       if (startedThisTick === 0) {
         const pendingWaits = gateMode === 'suspend' ? pendingGateWaits(snap.nodes) : [];
-        if (pendingWaits.length > 0) {
+        // Like a suspend gate, an external attempt waits on disk: return
+        // instead of holding a Promise. Its settle (submission, deadline,
+        // human action) appends an event and the host drives again.
+        const latestEvents = readJournal(journalPath);
+        // A submission / acceptance / reassignment can be appended by another
+        // caller while this tick decided on an older journal: decide again
+        // rather than report a stale suspension (or a false "no progress").
+        if (externalMode && latestEvents.length !== events.length) continue;
+        const waitingExternal = openV3ExternalAttempts(latestEvents);
+        // A proposal can arrive after this tick read the journal: re-decide
+        // rather than report a stale suspension.
+        if (latestEvents.length !== events.length && currentV3Revision(latestEvents) !== dagRevision) continue;
+        if (pendingWaits.length > 0 || waitingExternal.length > 0 || heldThisTick > 0) {
           const open = openV3WorkerAttempts(events);
           if (open.length > 0) {
             const drained = await quiesceAttempts(open, 'orphanRecovery');
             if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
             continue;
           }
-          return { reason: 'awaitingGate', pendingWaits, runDir };
+          if (waitingExternal.length > 0) return awaitingExternalOutcome(waitingExternal, pendingWaits);
+          return {
+            reason: 'awaitingGate',
+            pendingWaits,
+            ...(heldThisTick > 0 && pendingRevision !== undefined ? { pendingRevision } : {}),
+            runDir,
+          };
         }
         // Not terminal, nothing running, nothing dispatchable — a correct
         // decideNext never gets here; guard against an infinite spin.
@@ -1074,6 +1267,10 @@ export async function runWorkflow(
     if (inFlight.size > 0) await waitForInFlightOrDurableCancellation();
   }
 
+  // Every external binding is closed at a run boundary (the terminal sweep
+  // drains them first), so no attempt of this run is probed again: drop its
+  // process-wide unknown-probe bookkeeping instead of keeping it forever.
+  forgetProbeFailuresOf(runDir);
   const finalSnap = materialize(readJournal(journalPath));
   return {
     reason: 'terminal',
@@ -1116,10 +1313,15 @@ export async function runWorkflow(
    *  Cancellation/dispatch races therefore linearize against the same lock. */
   function appendRunTerminalIfQuiescent(): boolean {
     return withJournalMutationSync(journalPath, ({ events, append }) => {
+      // A revision that landed since this tick decided may add or rewire
+      // nodes: never publish a run boundary decided on an older flow.
+      if (!decisionStillCurrent(events)) return false;
       const snap = materialize([...events]);
       if (snap.runStatus !== 'running') return false;
       if (openV3WorkerAttempts(events).length > 0) return false;
+      const pendingProposal = foldV3Revisions(events).pending;
       if (openV3HostEffects(events).length > 0) return false;
+      if (openV3ExternalAttempts(events).length > 0) return false;
       const terminal = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances).find(
         (action) =>
           action.kind === 'completeRunSucceeded' ||
@@ -1127,6 +1329,7 @@ export async function runWorkflow(
           action.kind === 'completeRunBlocked',
       );
       if (!terminal) return false;
+      if (terminal.kind === 'completeRunSucceeded' && pendingProposal) return false;
       const event: Extract<V3Event, { type: 'runSucceeded' | 'runFailed' | 'runBlocked' }> =
         terminal.kind === 'completeRunSucceeded'
           ? { type: 'runSucceeded' }
@@ -1151,13 +1354,49 @@ export async function runWorkflow(
     { type: 'nodeDispatched' | 'gateDispatched' }
   >): boolean {
     return withJournalMutationSync(journalPath, ({ events, append }) => {
+      if (!decisionStillCurrent(
+        events,
+        event.nodeId,
+        event.type === 'nodeDispatched' ? event.loop?.loopId : undefined,
+      )) return false;
       const snap = materialize([...events]);
       if (snap.runStatus !== 'running') return false;
       const status = snap.nodes.get(event.nodeId)?.status ?? 'pending';
       if (status !== 'pending') return false;
+      // A wait id is single-use: replay ignores a re-dispatch of a gate that
+      // was already decided (or voided), so the node would stay pending and
+      // this loop would re-dispatch it forever. Never spin — fail loudly.
+      if (event.type === 'gateDispatched' && gateWaitAlreadyDecided(events, event.waitId)) {
+        throw new Error(
+          `v3 runtime: gate ${event.waitId} of node "${event.nodeId}" was already decided, ` +
+          'but the node has no approval to run on; refusing to re-dispatch the same gate',
+        );
+      }
       append(event, { durable: true });
       return true;
     });
+  }
+
+  function gateWaitAlreadyDecided(events: readonly StoredEvent[], waitId: string): boolean {
+    return events.some((event) =>
+      (event.type === 'gateResolved' && event.waitId === waitId) ||
+      (event.type === 'dagRevised' && (
+        event.effects?.supersede?.some((item) => item.waitId === waitId) === true ||
+        event.effects?.cancel?.some((item) => item.waitId === waitId) === true
+      )));
+  }
+
+  /** Changes whenever a revision is applied, proposed or decided. */
+  function revisionSignature(events: readonly StoredEvent[]): number {
+    let count = 0;
+    for (const event of events) {
+      if (
+        event.type === 'dagRevised' ||
+        event.type === 'dagRevisionProposed' ||
+        event.type === 'dagRevisionRejected'
+      ) count++;
+    }
+    return count;
   }
 
   function isRunCancelling(): boolean {
@@ -1174,6 +1413,11 @@ export async function runWorkflow(
   async function waitForInFlightOrDurableCancellation(): Promise<void> {
     const active = [...inFlight.values()];
     if (active.length === 0) return;
+    // A flow revision (or a proposal decision) appended while workers run
+    // must be acted on now — e.g. stop a worker whose instance it superseded
+    // — not when an unrelated worker happens to settle. Runs that never
+    // revise keep a constant signature, so their wake-ups are unchanged.
+    const revisionSignatureAtStart = revisionSignature(readJournal(journalPath));
     await new Promise<void>((resolve, reject) => {
       let done = false;
       let timer: NodeJS.Timeout | undefined;
@@ -1189,7 +1433,12 @@ export async function runWorkflow(
       const poll = (): void => {
         if (done) return;
         try {
-          if (signal?.aborted || isRunCancelling()) {
+          const latest = readJournal(journalPath);
+          if (
+            signal?.aborted ||
+            materialize(latest).runStatus === 'cancelling' ||
+            revisionSignature(latest) !== revisionSignatureAtStart
+          ) {
             finish();
             return;
           }
@@ -1478,6 +1727,8 @@ export async function runWorkflow(
       const snap = materialize([...events]);
       if (snap.runStatus === 'cancelled') return;
       if (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== cancelRequestId) return;
+      // External bindings must be closed (stopped + journalled) first.
+      if (openV3ExternalAttempts(events).length > 0) return;
       const ids = new Set<string>([
         ...dag.nodes.map((node) => node.id),
         ...snap.nodes.keys(),
@@ -1689,6 +1940,7 @@ export async function runWorkflow(
           executionContext,
         });
         const committed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          if (!decisionStillCurrent(latest, node.id)) return false;
           const current = materialize([...latest]);
           if (current.runStatus !== 'running') return false;
           if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return false;
@@ -1767,6 +2019,9 @@ export async function runWorkflow(
           executionContext,
         });
         withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          // Prepared for a definition a revision has since replaced: drop it;
+          // the fresh instance prepares again from the new input.
+          if (!decisionStillCurrent(latest, node.id)) return;
           const current = materialize([...latest]);
           if (current.runStatus !== 'running') return;
           const status = current.nodes.get(node.id)?.status ?? 'pending';
@@ -1895,6 +2150,7 @@ export async function runWorkflow(
       return blocked;
     }
     const claimed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+      if (!decisionStillCurrent(latest, node.id)) return false;
       const current = materialize([...latest]);
       if (current.runStatus !== 'running') return false;
       const state = current.nodes.get(node.id);
@@ -2397,6 +2653,585 @@ export async function runWorkflow(
     return computeInputHash(value);
   }
 
+  /** Write the attempt-local 0600 file carrying only the Saved Workflow
+   *  params/context keys `node` references; undefined when it needs none. */
+  function writeWorkflowDataFile(node: V3Node, attemptDir: string): string | undefined {
+    if (!executionContext) return undefined;
+    const bindings = savedWorkflowBindingsForNode(node);
+    if (bindings.params.length === 0 && bindings.context.length === 0) return undefined;
+    const params: Record<string, unknown> = Object.create(null);
+    const context: Record<string, string> = Object.create(null);
+    for (const name of bindings.params) {
+      if (!Object.prototype.hasOwnProperty.call(executionContext.params, name)) {
+        throw new Error(`v3 runtime: resolved params missing referenced key ${name}`);
+      }
+      params[name] = executionContext.params[name];
+    }
+    for (const name of bindings.context) {
+      if (!Object.prototype.hasOwnProperty.call(executionContext.context, name)) {
+        throw new Error(`v3 runtime: resolved context missing referenced key ${name}`);
+      }
+      context[name] = executionContext.context[name]!;
+    }
+    const workflowDataPath = join(attemptDir, 'workflow-inputs.json');
+    writeFileSync(
+      workflowDataPath,
+      `${JSON.stringify({ params, context }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    return workflowDataPath;
+  }
+
+  // ─── External (bot-executed) goal attempts ─────────────────────────────
+
+  function reportExternalError(
+    error: unknown,
+    attemptId: string,
+    operation: 'dispatch' | 'probe' | 'stop',
+  ): void {
+    try {
+      deps.onExternalError?.(error, { attemptId, operation });
+    } catch {
+      // Observability must never change run semantics.
+    }
+  }
+
+  async function stopExternal(attempt: V3ExternalAttempt, reason: V3ExternalStopReason): Promise<void> {
+    const stopped = await stopExternalAttempt(externalExecutor, dag.runId, attempt, reason, externalCallTimeoutMs);
+    if (!stopped.ok) reportExternalError(stopped.error, attempt.attemptId, 'stop');
+  }
+
+  /** The node definition an external attempt runs (loop bodies expanded). */
+  function externalNodeFor(attempt: V3ExternalAttempt): V3Node | undefined {
+    return attempt.loop ? instanceNodeFor(attempt.loop) : nodesById.get(attempt.nodeId);
+  }
+
+  /** Claim a pending goal node for an external attempt. The dispatch claim
+   *  and the durable handoff intent are one journal critical section; the
+   *  send itself starts only after both are on disk. */
+  function startExternal(
+    node: V3Node,
+    botSnap: BotSnapshot,
+    events: StoredEvent[],
+    loopRef?: V3LoopRef,
+    omitted?: GoalInputs['omitted'],
+    instanceId?: string,
+  ): boolean {
+    if (!isGoalNode(node)) throw new Error(`v3 runtime: node "${node.id}" is not a goal node`);
+    const dispatchKey = instanceId ?? node.id;
+    const attemptId = nextAttemptIdFor(events, dispatchKey);
+    const attemptNNN = attemptId.slice(attemptId.lastIndexOf('/') + 1);
+    const attemptDir = join(runDir, dispatchKey, 'attempts', attemptNNN);
+    mkdirSync(attemptDir, { recursive: true });
+    const workflowDataPath = writeWorkflowDataFile(node, attemptDir);
+    // Upstream products for the handoff (the transport attaches them).
+    writeFileSync(
+      join(attemptDir, 'inputs.json'),
+      JSON.stringify(buildInputs(node, events, attemptId, loopRef, omitted, workflowDataPath), null, 2),
+    );
+    const claimed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+      if (!decisionStillCurrent(latest, node.id, loopRef?.loopId)) return false;
+      const current = materialize([...latest]);
+      if (current.runStatus !== 'running') return false;
+      if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return false;
+      const identity = { nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId };
+      append({
+        type: 'nodeDispatched',
+        ...identity,
+        loop: loopRef,
+        nodeExecutor: 'bot',
+        ...(dagRevision > 1 ? { revision: dagRevision } : {}),
+      }, { durable: true });
+      append({
+        type: 'nodeHandoffPrepared',
+        ...identity,
+        targetLarkAppId: current.assignments.get(node.id) ?? botSnap.larkAppId,
+        ...externalPlacementIntent(loopRef ? undefined : node),
+        revision: dagRevision,
+        preparedAt: clock(),
+      }, { durable: true });
+      return true;
+    });
+    if (!claimed) return false;
+    const attempt = foldV3ExternalAttempts(readJournal(journalPath)).get(attemptId);
+    if (attempt && !attempt.closed) startHandoffSend(attempt, false);
+    return true;
+  }
+
+  /** Where an attempt is handed off (design §5.1), frozen with its intent:
+   *  a top-level goal node's `placement`, else a node topic. Only a node
+   *  topic has a node card, so only it gets a node-card key. */
+  function externalPlacementIntent(node: V3Node | undefined): {
+    placement: 'topic' | 'main';
+    idempotency: { nodeCard?: string; handoff: string };
+  } {
+    return node && isGoalNode(node) && node.placement === 'main'
+      ? { placement: 'main', idempotency: { handoff: randomUUID() } }
+      : { placement: 'topic', idempotency: { nodeCard: randomUUID(), handoff: randomUUID() } };
+  }
+
+  /** Crash window inside the claim: nodeDispatched without its intent. No
+   *  message can exist yet (the intent precedes every send). */
+  function appendMissingHandoffIntent(attempt: V3ExternalAttempt): boolean {
+    const node = externalNodeFor(attempt);
+    const frozen = node ? snapshotForSelector(botSnapshots, node.bot) : undefined;
+    if (!frozen) return false;
+    return withJournalMutationSync(journalPath, ({ events, append }) => {
+      const current = classifyExternalAttempt(events, attempt.attemptId);
+      if (!current.ok || current.attempt.phase !== 'dispatched') return false;
+      // The intent belongs to the revision the attempt was dispatched under.
+      const dispatched = events.find((event): event is StoredEvent & { type: 'nodeDispatched' } =>
+        event.type === 'nodeDispatched' && event.attemptId === attempt.attemptId);
+      append({
+        type: 'nodeHandoffPrepared',
+        nodeId: attempt.nodeId,
+        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+        attemptId: attempt.attemptId,
+        targetLarkAppId: current.snap.assignments.get(attempt.nodeId) ?? frozen.larkAppId,
+        ...externalPlacementIntent(attempt.loop ? undefined : node),
+        revision: dispatched?.revision ?? 1,
+        preparedAt: clock(),
+      }, { durable: true });
+      return true;
+    });
+  }
+
+  function buildExternalDispatchRequest(
+    attempt: V3ExternalAttempt,
+    redispatch: boolean,
+    signal: AbortSignal,
+  ): V3ExternalDispatchRequest {
+    const ref = externalAttemptRef(dag.runId, attempt);
+    const node = externalNodeFor(attempt);
+    if (!ref || !attempt.idempotency || !node || !isGoalNode(node)) {
+      throw new Error(`v3 runtime: external attempt ${attempt.attemptId} has no prepared goal handoff`);
+    }
+    const attemptDir = safeAttemptDirFromId(attempt.attemptId);
+    const inputsPath = join(attemptDir, 'inputs.json');
+    const inputs = JSON.parse(readFileSync(inputsPath, 'utf-8')) as GoalInputs;
+    const events = readJournal(journalPath);
+    const key = attempt.instanceId ?? attempt.nodeId;
+    const retry = events.find(
+      (event): event is StoredEvent & { type: 'nodeRetryRequested' } =>
+        event.type === 'nodeRetryRequested' &&
+        (event.instanceId ?? event.nodeId) === key &&
+        event.nextAttemptId === attempt.attemptId,
+    );
+    const previousBlock = retry
+      ? [...events].reverse().find(
+          (event): event is StoredEvent & { type: 'nodeBlocked' } =>
+            event.type === 'nodeBlocked' && event.attemptId === retry.previousAttemptId,
+        )
+      : undefined;
+    const reassigned = [...events].reverse().find(
+      (event): event is StoredEvent & { type: 'nodeReassigned' } =>
+        event.type === 'nodeReassigned' &&
+        event.nodeId === attempt.nodeId &&
+        event.to === ref.targetLarkAppId,
+    );
+    // The latest revision that invalidated this node's earlier work or moved
+    // it to this bot: the handoff tells the bot the requirements changed.
+    const revised = [...events].reverse().find(
+      (event): event is StoredEvent & { type: 'dagRevised' } =>
+        event.type === 'dagRevised' &&
+        event.revision <= ref.revision &&
+        (event.effects?.supersede?.some((item) => item.nodeId === attempt.nodeId) === true ||
+          event.effects?.assign?.some((item) => item.nodeId === attempt.nodeId) === true),
+    );
+    const revisedAssign = revised?.effects?.assign?.find((item) =>
+      item.nodeId === attempt.nodeId && item.to === ref.targetLarkAppId);
+    return {
+      ...ref,
+      idempotency: attempt.idempotency,
+      redispatch,
+      node,
+      attemptNumber: attemptNumber(attempt.attemptId) ?? 1,
+      ...(attempt.loop ? { loop: attempt.loop } : {}),
+      inputs,
+      inputsPath,
+      attemptDir,
+      runDir,
+      timeoutSec: node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC,
+      ...(opts.chatBinding ? { chatBinding: opts.chatBinding } : {}),
+      ...(retry
+        ? {
+            retryOf: {
+              attemptId: retry.previousAttemptId,
+              ...(retry.previousErrorCode ? { errorCode: retry.previousErrorCode } : {}),
+              ...(previousBlock?.message ? { message: previousBlock.message } : {}),
+            },
+          }
+        : {}),
+      ...(reassigned
+        ? { reassignedFrom: reassigned.from }
+        : revisedAssign?.from ? { reassignedFrom: revisedAssign.from } : {}),
+      ...(revised ? { revisedBy: { revision: revised.revision, summary: revised.summary } } : {}),
+      signal,
+    };
+  }
+
+  /** Deliver (or same-key re-deliver) one prepared handoff in the background.
+   *  Settles by appending Sent, or a pre-send block; an unknown failure keeps
+   *  the intent open for a same-key re-send inside the idempotency window. */
+  function startHandoffSend(attempt: V3ExternalAttempt, redispatch: boolean): void {
+    const executor = externalExecutor;
+    const key = `${attempt.instanceId ?? attempt.nodeId}::handoff`;
+    if (!executor || inFlight.has(key) || handoffControllers.has(attempt.attemptId)) return;
+    const controller = new AbortController();
+    handoffControllers.set(attempt.attemptId, controller);
+    const p = Promise.resolve()
+      .then(() => withExternalCallTimeout(
+        Promise.resolve().then(() => executor.dispatch(buildExternalDispatchRequest(attempt, redispatch, controller.signal))),
+        externalCallTimeoutMs,
+        'dispatch',
+      ).catch((err: unknown) => {
+        // A hung or failed send is an unknown outcome: tell the transport to
+        // give up, then re-send later with the same keys.
+        if (!controller.signal.aborted) controller.abort(err);
+        throw err;
+      }))
+      .then(async (outcome) => {
+        handoffRetryAt.delete(attempt.attemptId);
+        if (outcome.kind === 'rejected') {
+          // Proven not delivered: block without stopping anything.
+          withJournalMutationSync(journalPath, ({ events, append }) => {
+            const current = classifyExternalAttempt(events, attempt.attemptId);
+            if (!current.ok || current.attempt.phase !== 'prepared') return;
+            append({
+              type: 'nodeBlocked',
+              nodeId: attempt.nodeId,
+              ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+              attemptId: attempt.attemptId,
+              errorClass: 'workerError',
+              errorCode: outcome.code,
+              message: outcome.message ?? `handoff was not sent (${outcome.code})`,
+            }, { durable: true });
+          });
+          return;
+        }
+        acceptanceObserved.add(attempt.attemptId);
+        const sentAt = clock();
+        const recorded = withJournalMutationSync(journalPath, ({ events, append }) => {
+          const latest = foldV3ExternalAttempts(events).get(attempt.attemptId);
+          if (!latest || latest.closed) return false;
+          if (latest.handoffMessageId !== undefined) return true;
+          append({
+            type: 'nodeHandoffSent',
+            nodeId: attempt.nodeId,
+            ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+            attemptId: attempt.attemptId,
+            handoffMessageId: outcome.handoffMessageId,
+            ...(outcome.nodeCardMessageId ? { nodeCardMessageId: outcome.nodeCardMessageId } : {}),
+            ...(outcome.threadId ? { threadId: outcome.threadId } : {}),
+            sentAt,
+            acceptDeadlineAt: sentAt + externalAcceptTimeoutMs,
+          }, { durable: true });
+          return true;
+        });
+        if (!recorded) {
+          // The attempt closed (cancel / reassign / boundary) while this send
+          // was in flight; its stop may have missed the brand-new handoff.
+          await stopExternal({ ...attempt, handoffMessageId: outcome.handoffMessageId }, 'obsolete');
+        }
+      })
+      .catch((err: unknown) => {
+        reportExternalError(err, attempt.attemptId, 'dispatch');
+        handoffRetryAt.set(attempt.attemptId, clock() + HANDOFF_RESEND_BACKOFF_MS);
+      })
+      .finally(() => {
+        if (handoffControllers.get(attempt.attemptId) === controller) {
+          handoffControllers.delete(attempt.attemptId);
+        }
+        if (inFlight.get(key) === p) inFlight.delete(key);
+      });
+    inFlight.set(key, p);
+  }
+
+  /** Stop the bot's turn, then close the attempt with a blocked verdict if it
+   *  is still the current open attempt (a submission that landed first wins). */
+  async function blockExternalAttempt(
+    attempt: V3ExternalAttempt,
+    stopReason: V3ExternalStopReason,
+    verdict: { errorClass: V3ErrorClass; errorCode: string; message: string; recovery?: 'retry' },
+  ): Promise<boolean> {
+    // A crash-left install is settled (next tick) before any deadline close.
+    if (hasExternalInstallIntent(runDir, attempt.attemptId)) return true;
+    await stopExternal(attempt, stopReason);
+    return withJournalMutationSync(journalPath, ({ events, append }) => {
+      if (hasExternalInstallIntent(runDir, attempt.attemptId)) return true;
+      const current = classifyExternalAttempt(events, attempt.attemptId);
+      if (!current.ok) return false;
+      append({
+        type: 'nodeBlocked',
+        nodeId: attempt.nodeId,
+        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+        attemptId: attempt.attemptId,
+        ...verdict,
+      }, { durable: true });
+      return true;
+    });
+  }
+
+  async function probeExternalAcceptance(
+    attempt: V3ExternalAttempt,
+  ): Promise<
+    | { status: 'accepted'; sessionId: string; acceptedAt?: number }
+    | { status: 'notAccepted'; detail?: string }
+    | { status: 'unknown' }
+  > {
+    const ref = externalAttemptRef(dag.runId, attempt);
+    const executor = externalExecutor;
+    if (!executor || !ref || !attempt.handoffMessageId) return { status: 'unknown' };
+    const handoffMessageId = attempt.handoffMessageId;
+    try {
+      const probe = await withExternalCallTimeout(
+        Promise.resolve().then(() => executor.probeAcceptance({ ...ref, handoffMessageId })),
+        externalCallTimeoutMs,
+        'probe',
+      );
+      return probe.status === 'accepted'
+        ? {
+            status: 'accepted',
+            sessionId: probe.sessionId,
+            ...(probe.acceptedAt !== undefined ? { acceptedAt: probe.acceptedAt } : {}),
+          }
+        : { status: 'notAccepted', ...(typeof probe.detail === 'string' && probe.detail ? { detail: probe.detail.slice(0, 2000) } : {}) };
+    } catch (err) {
+      // Unknown is neither "accepted" nor "not accepted".
+      reportExternalError(err, attempt.attemptId, 'probe');
+      return { status: 'unknown' };
+    }
+  }
+
+  /**
+   * Reconcile every current open external attempt against its durable phase
+   * (design §9.5). Returns true when it appended to the journal.
+   *   dispatched (no intent)      → write the intent (nothing was sent)
+   *   prepared, not sending       → same-key re-send inside the idempotency
+   *                                 window, else HANDOFF_UNCERTAIN
+   *   sent, not accepted          → probe once per process and at the
+   *                                 acceptance deadline; accepted → record it,
+   *                                 deadline passed → HANDOFF_NOT_ACCEPTED
+   *   accepted                    → NODE_TIMEOUT once the deadline passed
+   *   handed to a human, not closed → HANDED_TO_HUMAN at once (any phase)
+   * Returns true when the journal may have changed (an append here, or any
+   * awaited transport call during which another caller may have appended),
+   * so the caller re-reads before deciding.
+   */
+  async function reconcileExternalAttempts(events: StoredEvent[]): Promise<boolean> {
+    if (!externalMode) return false;
+    let progressed = false;
+    for (const attempt of openV3ExternalAttempts(events)) {
+      if (handoffControllers.has(attempt.attemptId)) continue; // send in flight here
+      if (!classifyExternalAttempt(events, attempt.attemptId).ok) continue;
+      const now = clock();
+      if (attempt.handedToHuman) {
+        // A hand-over (§13.6) recorded but not closed — a crash between its
+        // two writes. Finish it now rather than at the node's deadline.
+        await blockExternalAttempt(attempt, 'handedToHuman', {
+          errorClass: 'workerError',
+          errorCode: V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN,
+          message: attempt.handedToHuman.reason,
+          recovery: 'retry',
+        });
+        progressed = true;
+        continue;
+      }
+      if (attempt.phase === 'dispatched') {
+        progressed = appendMissingHandoffIntent(attempt) || progressed;
+      } else if (attempt.phase === 'prepared') {
+        if (now >= attempt.preparedAt! + V3_HANDOFF_IDEMPOTENCY_WINDOW_MS) {
+          await blockExternalAttempt(attempt, 'uncertain', {
+            errorClass: 'workerError',
+            errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_UNCERTAIN,
+            message: 'handoff delivery could not be confirmed within the idempotency window; check the chat before retrying',
+          });
+          progressed = true;
+        } else if (now >= (handoffRetryAt.get(attempt.attemptId) ?? 0)) {
+          startHandoffSend(attempt, true);
+        }
+      } else if (attempt.phase === 'sent') {
+        const due = now >= attempt.acceptDeadlineAt!;
+        const key = probeKey(attempt.attemptId);
+        const failure = probeFailures.get(key);
+        const probeDue = failure
+          ? now >= failure.retryAt
+          : !acceptanceObserved.has(attempt.attemptId) || due;
+        if (probeDue) {
+          const probe = await probeExternalAcceptance(attempt);
+          progressed = true;
+          if (probe.status === 'unknown') {
+            // Back off and ask again; only a persistently unknown answer past
+            // the deadline needs a human (HANDOFF_UNCERTAIN).
+            const firstFailedAt = failure?.firstFailedAt ?? now;
+            if (due && now - firstFailedAt >= PROBE_UNCERTAIN_AFTER_MS) {
+              probeFailures.delete(key);
+              await blockExternalAttempt(attempt, 'uncertain', {
+                errorClass: 'workerError',
+                errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_UNCERTAIN,
+                message: 'whether the target bot accepted the handoff could not be confirmed; check the chat before retrying',
+              });
+            } else {
+              probeFailures.set(key, { firstFailedAt, retryAt: now + PROBE_RETRY_BACKOFF_MS });
+            }
+          } else {
+            probeFailures.delete(key);
+            acceptanceObserved.add(attempt.attemptId);
+            if (probe.status === 'accepted') {
+              const { sessionId, acceptedAt } = probe;
+              withJournalMutationSync(journalPath, ({ events: latest, append }) =>
+                appendAcceptedLocked(latest, append, dag, {
+                  attemptId: attempt.attemptId,
+                  sessionId,
+                  ...(acceptedAt !== undefined ? { acceptedAt } : {}),
+                }, clock()));
+            } else if (due) {
+              await blockExternalAttempt(attempt, 'notAccepted', {
+                errorClass: 'workerError',
+                errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_NOT_ACCEPTED,
+                message: probe.detail
+                  ? `the target bot did not accept the handoff before the acceptance deadline: ${probe.detail}`
+                  : 'the target bot did not accept the handoff before the acceptance deadline',
+              });
+            }
+          }
+        }
+      } else if (now >= attempt.deadlineAt!) {
+        await blockExternalAttempt(attempt, 'timeout', {
+          errorClass: 'timeout',
+          errorCode: V3_EXTERNAL_ERROR_CODES.NODE_TIMEOUT,
+          message: attempt.startPending
+            // Main topic (§5.5): accepted into a busy session's queue, and its
+            // own turn never started within the backstop (timeout + grace).
+            ? '到期限还没收到这一轮开始的信号：多半是一直在执行 Bot 的主话题会话里排队（它前面的回合一直没结束），也可能是开始信号没送到；可以重试，或把节点改成节点话题'
+            : 'the node did not submit a valid result before its timeout',
+        });
+        progressed = true;
+      }
+    }
+    return progressed;
+  }
+
+  /**
+   * §9.5 row 4: an installed-but-unrecorded submission (crash between the
+   * install and its journal append) is re-validated and committed while its
+   * attempt is current — before any deadline can discard it — and otherwise
+   * set aside. Runs before cancellation/terminal handling so every run state
+   * converges. Also drops staging leftovers of closed attempts.
+   */
+  function settleExternalLeftovers(events: StoredEvent[]): boolean {
+    let progressed = false;
+    for (const attempt of foldV3ExternalAttempts(events).values()) {
+      if (hasExternalInstallIntent(runDir, attempt.attemptId)) {
+        if (settleExternalInstallIntent(runDir, dag, attempt.attemptId).kind !== 'none') progressed = true;
+      } else if (attempt.closed) {
+        // No submission can land on a closed attempt any more.
+        rmSync(join(safeAttemptDirFromId(attempt.attemptId), 'submissions'), { recursive: true, force: true });
+      }
+    }
+    return progressed;
+  }
+
+  /** Open external attempts whose instance was cancelled (early release) or
+   *  superseded (revisit): their bot must stop and the binding must close. */
+  function obsoleteExternalAttempts(
+    events: StoredEvent[],
+    snap: ReturnType<typeof materialize>,
+  ): V3ExternalAttempt[] {
+    return openV3ExternalAttempts(events).filter((attempt) => {
+      const state = attempt.instanceId
+        ? snap.instances.get(attempt.instanceId)
+        : snap.nodes.get(attempt.nodeId);
+      return state?.status === 'cancelled' || state?.status === 'superseded';
+    });
+  }
+
+  /** Stop each attempt's bot turn, then record the binding close. */
+  async function drainExternalAttempts(
+    attempts: readonly V3ExternalAttempt[],
+    stopReason: V3ExternalStopReason,
+    drainReason: AttemptDrainReason,
+  ): Promise<void> {
+    for (const attempt of attempts) {
+      await stopExternal(attempt, stopReason);
+      withJournalMutationSync(journalPath, ({ events, append }) => {
+        const latest = foldV3ExternalAttempts(events).get(attempt.attemptId);
+        if (!latest || latest.closed) return;
+        append({
+          type: 'nodeAttemptDrained',
+          nodeId: attempt.nodeId,
+          ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+          attemptId: attempt.attemptId,
+          reason: drainReason,
+        }, { durable: true });
+      });
+    }
+  }
+
+  /** Run cancellation for external attempts (design §9.3): stop the bot's
+   *  turn, then record the binding close. `finalizeRuntimeCancellation`
+   *  then writes `nodeCancelled` for every node still running, exactly as
+   *  for a drained worker attempt. */
+  async function closeExternalAttemptsForCancellation(cancelRequestId: string): Promise<void> {
+    for (const attempt of openV3ExternalAttempts(readJournal(journalPath))) {
+      await stopExternal(attempt, 'runCancelled');
+      withJournalMutationSync(journalPath, ({ events, append }) => {
+        const latest = foldV3ExternalAttempts(events).get(attempt.attemptId);
+        if (!latest || latest.closed) return;
+        const snap = materialize([...events]);
+        if (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== cancelRequestId) return;
+        append({
+          type: 'nodeAttemptDrained',
+          nodeId: attempt.nodeId,
+          ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+          attemptId: attempt.attemptId,
+          reason: 'runCancellation',
+        }, { durable: true });
+      });
+    }
+  }
+
+  /** A sent attempt needs attention at its acceptance deadline, or at the
+   *  next probe retry while acceptance is unknown. */
+  function sentWakeAt(attempt: V3ExternalAttempt, now: number): number {
+    const failure = probeFailures.get(probeKey(attempt.attemptId));
+    if (!failure) return attempt.acceptDeadlineAt!;
+    return attempt.acceptDeadlineAt! > now
+      ? Math.min(attempt.acceptDeadlineAt!, failure.retryAt)
+      : failure.retryAt;
+  }
+
+  function awaitingExternalOutcome(
+    open: readonly V3ExternalAttempt[],
+    pendingWaits: V3PendingGate[],
+  ): Extract<V3RunOutcome, { reason: 'awaitingExternal' }> {
+    const now = clock();
+    const externalAttempts: V3ExternalWait[] = open.map((attempt) => {
+      const wakeAt =
+        attempt.phase === 'dispatched' ? now
+        : attempt.phase === 'prepared'
+          ? Math.min(handoffRetryAt.get(attempt.attemptId) ?? now, attempt.preparedAt! + V3_HANDOFF_IDEMPOTENCY_WINDOW_MS)
+        : attempt.phase === 'sent' ? sentWakeAt(attempt, now)
+        : attempt.deadlineAt;
+      return {
+        nodeId: attempt.nodeId,
+        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+        attemptId: attempt.attemptId,
+        phase: attempt.phase,
+        ...(attempt.targetLarkAppId ? { targetLarkAppId: attempt.targetLarkAppId } : {}),
+        ...(wakeAt !== undefined ? { wakeAt } : {}),
+      };
+    });
+    const wakes = externalAttempts.flatMap((attempt) => attempt.wakeAt !== undefined ? [attempt.wakeAt] : []);
+    return {
+      reason: 'awaitingExternal',
+      pendingWaits,
+      externalAttempts,
+      ...(wakes.length > 0 ? { wakeAt: Math.min(...wakes) } : {}),
+      runDir,
+    };
+  }
+
   function startWork(
     node: V3Node,
     botSnap: BotSnapshot,
@@ -2420,32 +3255,7 @@ export async function runWorkflow(
     const outputDir = join(attemptDir, 'work');
     mkdirSync(outputDir, { recursive: true });
 
-    let workflowDataPath: string | undefined;
-    if (executionContext) {
-      const bindings = savedWorkflowBindingsForNode(node);
-      if (bindings.params.length > 0 || bindings.context.length > 0) {
-        const params: Record<string, unknown> = Object.create(null);
-        const context: Record<string, string> = Object.create(null);
-        for (const name of bindings.params) {
-          if (!Object.prototype.hasOwnProperty.call(executionContext.params, name)) {
-            throw new Error(`v3 runtime: resolved params missing referenced key ${name}`);
-          }
-          params[name] = executionContext.params[name];
-        }
-        for (const name of bindings.context) {
-          if (!Object.prototype.hasOwnProperty.call(executionContext.context, name)) {
-            throw new Error(`v3 runtime: resolved context missing referenced key ${name}`);
-          }
-          context[name] = executionContext.context[name]!;
-        }
-        workflowDataPath = join(attemptDir, 'workflow-inputs.json');
-        writeFileSync(
-          workflowDataPath,
-          `${JSON.stringify({ params, context }, null, 2)}\n`,
-          { mode: 0o600 },
-        );
-      }
-    }
+    const workflowDataPath = writeWorkflowDataFile(node, attemptDir);
 
     const goalPath = join(attemptDir, 'goal.txt');
     const loopCtx = loopRef
@@ -2492,6 +3302,7 @@ export async function runWorkflow(
       ...(instanceId ? { instanceId } : {}),
       attemptId,
       loop: loopRef,
+      ...(dagRevision > 1 ? { revision: dagRevision } : {}),
     })) return false;
 
     const leaseBinding: AttemptLeaseBinding = {
@@ -2740,6 +3551,7 @@ export async function runWorkflow(
           }
           appendWorkerOutcome({
             type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
           return;
         }
@@ -2749,7 +3561,11 @@ export async function runWorkflow(
         let errorCode: string | undefined;
         let selfReportedFail = false;
         let retryable: boolean | undefined;
-        if (!verdict.ok) {
+        if (result.status === 'fail' && result.error) {
+          errorClass = 'workerError';
+          errorCode = result.error.code;
+          message = result.error.message;
+        } else if (!verdict.ok) {
           // Manifest missing / malformed.  If the process itself also failed,
           // the worker crash is the root cause; otherwise it's a bad manifest.
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';
@@ -2789,11 +3605,13 @@ export async function runWorkflow(
             type: 'nodeBlocked',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
             ...(ask ? { ask } : {}),
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
         } else {
           appendWorkerOutcome({
             type: 'nodeFailed',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
         }
       })
@@ -2836,25 +3654,6 @@ export async function runWorkflow(
     return true;
   }
 
-  /** A node's transitive downstream cone (the node itself + every node reachable
-   *  via `depends` edges).  The set a revisit to `root` must refresh: `root`'s
-   *  product changed, so every result derived from it is stale. */
-  function affectedNodesFrom(root: string): string[] {
-    const reachable = new Set<string>([root]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const n of dag.nodes) {
-        if (reachable.has(n.id)) continue;
-        if (n.depends.some((d) => reachable.has(d.from))) {
-          reachable.add(n.id);
-          changed = true;
-        }
-      }
-    }
-    return [...reachable];
-  }
-
   /** A worker requested a cross-node revisit to ancestor `toNodeId`: journal the
    *  request, then supersede the CURRENT effective instance of the target AND its
    *  whole downstream cone (mark-only, files kept).  materialize then drops their
@@ -2866,41 +3665,18 @@ export async function runWorkflow(
     request: { toNodeId: string; reason?: string },
     sourceManifestPath: string,
   ): void {
-    // Capture feedback paths BEFORE the supersede sweep, while the target's
-    // current effective instance + its successful manifest are still resolvable.
-    const events0 = readJournal(journalPath);
-    const snap = materialize(events0);
-    const targetEff = snap.nodes.get(request.toNodeId)?.effectiveInstanceId;
-    const targetSucc = targetEff
-      ? [...events0].reverse().find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
-          e.type === 'nodeSucceeded' && (e.instanceId ?? e.nodeId) === targetEff)
-      : undefined;
-    // Persist the reason as a file the target's fresh instance can Read.  The
-    // journal stores runDir-RELATIVE paths (run-dir portability + no abs-path
-    // leakage into projections/cards); buildInputs resolves to absolute on read.
-    let reasonPathRel: string | undefined;
-    if (request.reason) {
-      const dir = join(runDir, 'revisits');
-      mkdirSync(dir, { recursive: true });
-      const abs = join(dir, `${instanceId.replace(/[#/]/g, '-')}-reason.md`);
-      writeFileSync(abs, `# Revisit reason (from ${nodeId} / ${instanceId})\n\n${request.reason}\n`);
-      reasonPathRel = relative(runDir, abs);
-    }
-    appendEvent(journalPath, {
-      type: 'nodeRevisitRequested',
-      nodeId, instanceId, attemptId, toNodeId: request.toNodeId,
-      ...(request.reason ? { reason: request.reason } : {}),
-      ...(reasonPathRel ? { reasonPath: reasonPathRel } : {}),
-      sourceManifestPath: relative(runDir, sourceManifestPath),
-      ...(targetSucc ? { targetPreviousManifestPath: relative(runDir, targetSucc.manifestPath) } : {}),
+    const plan = planV3Revisit({
+      runDir,
+      dag,
+      events: readJournal(journalPath),
+      nodeId,
+      instanceId,
+      attemptId,
+      request,
+      sourceManifestPath,
     });
-    for (const affectedNodeId of affectedNodesFrom(request.toNodeId)) {
-      const eff = snap.nodes.get(affectedNodeId)?.effectiveInstanceId;
-      if (!eff) continue; // never-dispatched downstream node has nothing to supersede
-      appendEvent(journalPath, {
-        type: 'nodeInstanceSuperseded',
-        nodeId: affectedNodeId, instanceId: eff, byNodeId: request.toNodeId, reason: 'refresh',
-      });
+    for (const event of plan.events) appendEvent(journalPath, event);
+    for (const eff of plan.supersededInstanceIds) {
       const controller = nodeControllers.get(eff);
       if (controller && !controller.signal.aborted) {
         controller.abort({ kind: 'attemptDrain', drainReason: 'obsoleteAttempt' });
@@ -3062,11 +3838,11 @@ export async function runWorkflow(
   /** Translate one loop-control action into its single journal append. */
   function applyLoopControl(a: Extract<V3Action, { loopId: string }>): void {
     if (a.kind === 'startLoop') {
-      appendEvent(journalPath, { type: 'loopStarted', loopId: a.loopId });
+      appendControlEvent({ type: 'loopStarted', loopId: a.loopId });
       return;
     }
     if (a.kind === 'startLoopIteration') {
-      appendEvent(journalPath, { type: 'loopIterationStarted', loopId: a.loopId, iteration: a.iteration });
+      appendControlEvent({ type: 'loopIterationStarted', loopId: a.loopId, iteration: a.iteration });
       return;
     }
     const loopNode = nodesById.get(a.loopId) as V3LoopNode;
@@ -3083,14 +3859,14 @@ export async function runWorkflow(
       if (!succ) {
         // Engine anomaly — the decision said exit but the output instance has
         // no success record.  Fail loudly rather than fabricate a product.
-        appendEvent(journalPath, {
+        appendControlEvent({
           type: 'nodeFailed', nodeId: a.loopId, attemptId: `${a.loopId}/iterations/${String(a.iteration).padStart(3, '0')}`,
           errorClass: 'workerError',
           message: `loop "${a.loopId}" decided exit but output node "${outInstId}" has no nodeSucceeded`,
         });
         return;
       }
-      appendEvent(journalPath, {
+      appendControlEvent({
         type: 'nodeSucceeded', nodeId: a.loopId, attemptId: succ.attemptId, manifestPath: succ.manifestPath,
       });
       return;
@@ -3130,7 +3906,7 @@ export async function runWorkflow(
     const effectiveMax = loopNode.maxIterations + granted;
     const anomalous = observed.endsWith('<unreadable>');
     const decision = matched ? 'exit' : !anomalous && a.iteration < effectiveMax ? 'continue' : 'exhausted';
-    appendEvent(journalPath, {
+    appendControlEvent({
       type: 'loopIterationDecision', loopId: a.loopId, iteration: a.iteration, decision,
       detail: `${observed} (iteration ${a.iteration}/${effectiveMax})`,
     });
@@ -3153,7 +3929,7 @@ export async function runWorkflow(
     const target = nodesById.get(a.to);
     const dep = target?.depends.find((d) => d.from === a.from);
     if (!target || !dep?.when) {
-      appendEvent(journalPath, {
+      appendControlEvent({
         type: 'edgeResolved',
         from: a.from,
         to: a.to,
@@ -3189,7 +3965,7 @@ export async function runWorkflow(
         // progressing deterministically and surface the anomaly in detail.
       }
     }
-    appendEvent(journalPath, {
+    appendControlEvent({
       type: 'edgeResolved',
       from: a.from,
       to: a.to,
@@ -3210,7 +3986,7 @@ export async function runWorkflow(
     // settles freely — the cancel suppression in materialize keys by instance.
     const instanceId = snap.nodes.get(a.nodeId)?.effectiveInstanceId;
     const attemptId = latestAttemptIdFor(events, instanceId ?? a.nodeId);
-    appendEvent(journalPath, {
+    const appended = appendControlEvent({
       type: 'nodeCancelled',
       nodeId: a.nodeId,
       ...(instanceId ? { instanceId } : {}),
@@ -3219,6 +3995,8 @@ export async function runWorkflow(
       byNodeId: a.byNodeId,
       detail: a.detail,
     });
+    // A revision landed since the decision: re-decide on the new flow.
+    if (!appended) return true;
 
     const controller = nodeControllers.get(instanceId ?? a.nodeId);
     if (controller && !controller.signal.aborted) {

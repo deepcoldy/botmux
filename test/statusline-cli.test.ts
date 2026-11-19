@@ -1,7 +1,10 @@
 /**
  * `botmux statusline` — Claude Code statusLine.command 客户端的进程级边界测试。
  *
- * 契约（见 src/cli.ts cmdStatusline）：
+ * 两个入口跑同一套契约：轻量入口 `statusline-entry.ts`（新会话的 statusLine.command
+ * 指向它）与 `cli.ts statusline`（命令里写死 cli.js 的老会话 / 编译版仍走这条）。
+ *
+ * 契约（见 src/services/statusline-command.ts）：
  *   - BOTMUX_SESSION_ID 非空 ⇒ 快照落盘 `<DATA_DIR>/statusline/<sid>/latest.json`；缺失 ⇒ 不落盘；
  *   - BOTMUX_STATUSLINE_CHAIN 非空 ⇒ 原始 stdin 字节原样转发给它、透传其退出码，10s 看门狗；
  *   - 无 chain ⇒ stdout 空、exit 0；非 JSON stdin ⇒ exit 0；BOTMUX_WORKFLOW=1 不被根命令白名单拒绝。
@@ -16,6 +19,12 @@ import { spawnTsScript } from './helpers/ts-runner.js';
 import { statuslineFilePath } from '../src/services/statusline-snapshot.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
+const ENTRY_PATH = join(__dirname, '..', 'src', 'statusline-entry.ts');
+const ENTRIES = [
+  { name: 'statusline-entry.ts', script: ENTRY_PATH, args: [] as string[] },
+  { name: 'cli.ts statusline', script: CLI_PATH, args: ['statusline'] },
+];
+type Entry = typeof ENTRIES[number];
 const SID = 'sess_statusline_test';
 const tempDirs: string[] = [];
 
@@ -35,6 +44,7 @@ const PAYLOAD = {
 };
 
 interface RunOpts {
+  entry: Entry;
   dataDir: string;
   sessionId?: string;
   chain?: string;
@@ -44,7 +54,7 @@ interface RunOpts {
   ignoreOutput?: boolean;
 }
 
-function runStatusline(opts: RunOpts): Promise<{ status: number | null; stdout: Buffer; stderr: string; finishedAtMs: number }> {
+function runEntry(opts: RunOpts): Promise<{ status: number | null; stdout: Buffer; stderr: string; finishedAtMs: number }> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env, SESSION_DATA_DIR: opts.dataDir, ...opts.extraEnv };
     delete env.BOTMUX_SESSION_ID;
@@ -53,8 +63,8 @@ function runStatusline(opts: RunOpts): Promise<{ status: number | null; stdout: 
     if (opts.sessionId) env.BOTMUX_SESSION_ID = opts.sessionId;
     if (opts.chain) env.BOTMUX_STATUSLINE_CHAIN = opts.chain;
     const child = spawnTsScript(
-      CLI_PATH,
-      ['statusline'],
+      opts.entry.script,
+      opts.entry.args,
       { env, stdio: ['pipe', opts.ignoreOutput ? 'ignore' : 'pipe', opts.ignoreOutput ? 'ignore' : 'pipe'] },
     ) as ChildProcess;
     const out: Buffer[] = [];
@@ -74,7 +84,9 @@ function makeDataDir(): string {
   return dir;
 }
 
-describe('botmux statusline', () => {
+describe.each(ENTRIES)('botmux statusline（$name）', (entry) => {
+  const runStatusline = (opts: Omit<RunOpts, 'entry'>) => runEntry({ ...opts, entry });
+
   it('① 有 BOTMUX_SESSION_ID：快照落盘、exit 0、stdout 空', async () => {
     const dataDir = makeDataDir();
     const r = await runStatusline({ dataDir, sessionId: SID, stdin: Buffer.from(JSON.stringify(PAYLOAD)) });

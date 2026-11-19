@@ -41,6 +41,7 @@ export interface TokenUsagePricingInput {
   cacheReadTokens: number;
   cacheCreateTokens: number;
   model: string;
+  models?: import('./model-token-usage.js').ModelTokenUsage[];
 }
 
 export const DEFAULT_USD_CNY = 7.2;
@@ -197,6 +198,16 @@ export function resolveModelPrice(modelId: string, overrides?: PricingOverrides)
  */
 export function estimateCostCny(usage: TokenUsagePricingInput, pricing?: ResolvedModelPricing): number | null {
   if (!pricing) return null;
+  if (usage.models) {
+    let total = 0;
+    for (const model of usage.models) {
+      if (model.inputTokens === 0 && model.outputTokens === 0 && model.cacheReadTokens === 0 && model.cacheCreateTokens === 0) continue;
+      const cost = estimateCostCny(model, pricing);
+      if (cost === null) return null;
+      total += cost;
+    }
+    return total;
+  }
   const price = resolveModelPrice(usage.model, pricing.overrides);
   if (!price) return null;
   const cacheRead = price.cacheRead ?? price.input;

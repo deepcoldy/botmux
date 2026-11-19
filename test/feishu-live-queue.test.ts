@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FEISHU_JOB_NAME, QUEUE_JOB_NAME, slotBlockers } from '../scripts/feishu-live-queue.mjs';
+import { FEISHU_JOB_NAME, QUEUE_JOB_NAME, candidateRuns, slotBlockers } from '../scripts/feishu-live-queue.mjs';
 
 const job = (name: string, status: string, conclusion: string | null = null, started_at: string | null = null) => ({
   name,
@@ -52,5 +52,34 @@ describe('Feishu live slot queue', () => {
   it('never blocks on itself', () => {
     const runs = [{ id: 500, jobs: [job(QUEUE_JOB_NAME, 'in_progress', null, '2026-10-17T09:00:00Z'), job(FEISHU_JOB_NAME, 'queued')] }];
     expect(slotBlockers({ ...SELF, runs })).toEqual([]);
+  });
+
+  it('sees runs whose Feishu job is not listed yet: waiters and fresh holders', () => {
+    // GitHub lists a job that `needs` another only once it can be queued.
+    const waiter = (id: number, startedAt: string) => ({ id, jobs: [job(QUEUE_JOB_NAME, 'in_progress', null, startedAt)] });
+    // 2026-10-24: waiters that started earlier were invisible, so all of them
+    // started when the holder finished.
+    expect(slotBlockers({ ...SELF, runs: [waiter(401, '2026-10-17T09:59:00Z')] }).map((b) => b.reason)).toEqual([
+      'is queued ahead',
+    ]);
+    expect(slotBlockers({ ...SELF, runs: [waiter(402, '2026-10-17T10:01:00Z')] })).toEqual([]);
+    // It just took the slot; its Feishu job is not listed yet.
+    const fresh = { id: 403, jobs: [job(QUEUE_JOB_NAME, 'completed', 'success', '2026-10-17T09:00:00Z')] };
+    expect(slotBlockers({ ...SELF, runs: [fresh] }).map((b) => b.reason)).toEqual(['holds the slot']);
+    // A queue job that failed (waited too long) holds nothing.
+    const gaveUp = { id: 404, jobs: [job(QUEUE_JOB_NAME, 'completed', 'failure', '2026-10-17T05:00:00Z')] };
+    expect(slotBlockers({ ...SELF, runs: [gaveUp] })).toEqual([]);
+  });
+
+  it('checks a run that one listing leaves out, once', () => {
+    // 2026-10-22: the `status=in_progress` listing missed a run whose Feishu
+    // job had been running for an hour; the unfiltered listing still had it.
+    const holder = { id: 400, status: 'in_progress' };
+    const listings = [
+      { workflow_runs: [holder, { id: 401, status: 'completed' }, { id: 500, status: 'in_progress' }] },
+      { workflow_runs: [] },
+      { workflow_runs: [{ id: 402, status: 'queued' }, holder] },
+    ];
+    expect(candidateRuns(listings, 500).map((run) => run.id)).toEqual([400, 402]);
   });
 });

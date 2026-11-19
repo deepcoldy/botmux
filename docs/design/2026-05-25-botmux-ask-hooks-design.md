@@ -17,7 +17,7 @@
 
 ### 非目标（本期不做）
 
-- 终端原生 CLI（Kimi / Gemini / Coco / Aiden 等）的答案回传。这些 CLI 的 hook 只能"给出问题"、不能程序化回填，答案必须靠 PTY 键盘注入，可靠性是另一个等级（见 §8）。**本期只做 directive 回填三家，dogfood 通过后再做剩下的。**
+- 终端原生 CLI（Kimi / Coco / Aiden 等）的答案回传。这些 CLI 的 hook 只能"给出问题"、不能程序化回填，答案必须靠 PTY 键盘注入，可靠性是另一个等级（见 §8）。**本期只做 directive 回填三家，dogfood 通过后再做剩下的。**
 
 ### 本期明确包含
 

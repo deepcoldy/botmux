@@ -5,7 +5,10 @@ import { join, resolve } from 'node:path';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
+import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
@@ -14,7 +17,7 @@ for (const mode of ['banner', 'resume', 'resumed-context', 'slow-resume', 'tmux-
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
     `holds input during loading, submits once after ${mode}, and commits only after confirmation`,
     () => runStartupScenario(mode, backendType),
-    115_000,
+    mode === 'slow-resume' ? 145_000 : 115_000,
   );
 }
 
@@ -26,6 +29,8 @@ async function runStartupScenario(mode: string, backendType: 'tmux' | 'pty'): Pr
   const botmuxDir = join(homedir(), '.botmux');
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
   chmodSync(botmuxDir, 0o700);
+  // The runner owns this disposable HOME; do not open zsh-newuser-install.
+  writeFileSync(join(homedir(), '.zshrc'), '# isolated worker test\n');
   const root = mkdtempSync(join(backendType === 'tmux' ? '/tmp' : tmpdir(), 'bmx-startup-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
@@ -70,12 +75,22 @@ const poll = setInterval(() => {
       ? '\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\r\n\x1b[0m\x1b[39m\x1b[49m\r\n  \x1b[36mcustom-model\x1b[0m · \x1b[32m/tmp\x1b[0m'
       : '› Ask Codex to do anything\r\n\r\n  custom-model · /tmp')
     : '\x1b[2J\x1b[H│ model: custom-model /model to change │\r\n│ directory: /tmp │\r\n› Ask Codex to do anything\r\n  custom-model · /tmp')});
+  // Native Codex leaves the cursor at the empty composer, not at the footer.
+  process.stdout.write(${JSON.stringify('\x1b[' + (mode === 'banner' ? '3' : mode === 'resumed-context' ? '1' : '2') + ';3H')});
 }, 50);
 setInterval(() => {}, 1000);
 `);
   chmodSync(fakeCli, 0o755);
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
+  const workerScript = join(root, 'worker-bootstrap.ts');
+  writeFileSync(workerScript, `
+(async () => {
+await import(${JSON.stringify(resolve('src/worker-ipc-preload.ts'))});
+await import(${JSON.stringify(resolve('src/worker.ts'))});
+process.send?.({ type: 'worker_ipc_ready' });
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`);
   let child: ChildProcess | undefined;
   const waitFor = async (condition: () => boolean, timeoutMs = 12_000) => {
     const deadline = Date.now() + timeoutMs;
@@ -87,15 +102,23 @@ setInterval(() => {}, 1000);
   try {
     const spawnOptions: SpawnOptions = {
       cwd: resolve('.'),
-      env: { ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
+      env: privateTmuxEnv(root, { SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
       ? spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], spawnOptions)
-      : spawnNodeTsScript(resolve('src/worker.ts'), [], spawnOptions);
+      : spawnNodeTsScript(workerScript, [], spawnOptions);
     child.on('message', m => messages.push(m as WorkerToDaemon));
     child.stdout?.on('data', b => logs.push(b.toString()));
     child.stderr?.on('data', b => logs.push(b.toString()));
+    // Cold tsx imports can exceed the CLI's first-frame window on a small
+    // runner. Source fixtures ACK only after the full handler is installed.
+    // Compiled-worker fixtures keep their existing init path.
+    const bootstrapDeadline = Date.now() + 30_000;
+    while (!process.env.BOTMUX_TEST_WORKER_BINARY && !messages.some(message => message.type === 'worker_ipc_ready')) {
+      if (Date.now() >= bootstrapDeadline || child.exitCode != null) throw new Error(`worker IPC bootstrap\n${logs.join('')}`);
+      await new Promise(r => setTimeout(r, 50));
+    }
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli,
@@ -137,8 +160,10 @@ setInterval(() => {}, 1000);
     if (backendType === 'tmux') {
       let viewport = '';
       await waitFor(() => {
-        viewport = execFileSync('tmux', ['capture-pane', '-e', '-p'], {
-          env: { ...process.env, TMUX_TMPDIR: root }, encoding: 'utf8',
+        // The worker puts its pane on the managed server (tmux-socket.ts), not
+        // the default one of this private root.
+        viewport = execFileSync('tmux', [...tmuxSocketArgs(preferredManagedTmuxSocket(privateTmuxEnv(root))), 'capture-pane', '-e', '-p'], {
+          env: privateTmuxEnv(root), encoding: 'utf8',
         });
         return viewport.includes('custom-model');
       });
@@ -159,16 +184,15 @@ setInterval(() => {}, 1000);
     await waitFor(() => messages.some(m => m.type === 'turn_input_committed' && m.turnId === 'om_test'));
     expect(readFileSync(inputFile, 'utf8').match(/only-this-startup-prompt/g)).toHaveLength(1);
   } finally {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>(r => child!.once('exit', () => r()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (child) await killProcessTree(child);
     if (existsSync(cliPidFile)) {
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
+      for (const socket of new Set([undefined, preferredManagedTmuxSocket(privateTmuxEnv(root))])) {
+        try { execFileSync('tmux', [...tmuxSocketArgs(socket), 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+      }
     }
     rmSync(root, { recursive: true, force: true });
   }

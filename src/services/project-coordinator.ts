@@ -4,12 +4,14 @@ import {
   buildProjectGroupCard,
   buildProjectGroupOnboardingCard,
   buildProjectGroupStartedNoticeCard,
+  type ProjectGroupCardRuntime,
   type ProjectGroupOnboardingCardInput,
 } from '../im/lark/project-group-card.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import {
   mutateProjectGroup,
   readProjectGroup,
+  visibleProjectWorkstreams,
   type ProjectGroupState,
   type ProjectGroupStatus,
   type ProjectWorkstreamStatus,
@@ -29,12 +31,17 @@ export interface ProjectCoordinatorTransport {
   isMessageWithdrawn(error: unknown): boolean;
   isMessageUpdateExpired(error: unknown): boolean;
   brand(larkAppId: string): Brand;
+  resolveCardRuntime?(
+    project: ProjectGroupState,
+    dataDir: string,
+  ): Promise<ProjectGroupCardRuntime | undefined> | ProjectGroupCardRuntime | undefined;
 }
 
 export type ProjectCoordinatorAction =
   | { action: 'init'; title: string; goal: string; phase?: string; focus?: string; remaining?: string }
   | { action: 'status' }
   | { action: 'refresh' }
+  | { action: 'workstream_rename'; dispatchRoot: string; title: string }
   | {
       action: 'update'; goal?: string; phase?: string; focus?: string; progress?: number;
       remaining?: string; blocker?: string; clearBlockers?: boolean; milestone?: string; nextMilestone?: string;
@@ -48,6 +55,7 @@ export type ProjectCoordinatorAction =
   | {
       action: 'report'; dispatchRoot: string; content: string; status?: ProjectWorkstreamStatus;
       progress?: number; remaining?: string; milestone?: string;
+      expectedAttachment?: { sourceSessionId: string; revision: number; coordinatorSessionId: string };
     };
 
 export interface ProjectCoordinatorContext {
@@ -82,6 +90,11 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
     };
   }
   if (action === 'status') return { action };
+  if (action === 'workstream_rename') {
+    const dispatchRoot = stringField(body, 'dispatchRoot');
+    const title = stringField(body, 'title');
+    return dispatchRoot && title ? { action, dispatchRoot, title } : undefined;
+  }
   if (action === 'update') {
     const progress = body.progress === undefined || typeof body.progress === 'number' ? body.progress as number | undefined : undefined;
     if (body.progress !== undefined && progress === undefined) return undefined;
@@ -116,6 +129,11 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
     return {
       action, dispatchRoot, content, status, progress,
       remaining: stringField(body, 'remaining'), milestone: stringField(body, 'milestone'),
+      ...(body.expectedAttachment && typeof body.expectedAttachment === 'object'
+        && typeof (body.expectedAttachment as Record<string, unknown>).sourceSessionId === 'string'
+        && typeof (body.expectedAttachment as Record<string, unknown>).coordinatorSessionId === 'string'
+        && Number.isSafeInteger((body.expectedAttachment as Record<string, unknown>).revision)
+        ? { expectedAttachment: body.expectedAttachment as { sourceSessionId: string; revision: number; coordinatorSessionId: string } } : {}),
     };
   }
   return undefined;
@@ -243,8 +261,9 @@ export class ProjectCoordinator {
     });
   }
 
-  run(context: ProjectCoordinatorContext, action: ProjectCoordinatorAction): Promise<ProjectGroupState> {
+  run(context: ProjectCoordinatorContext, action: ProjectCoordinatorAction, beforeApply?: () => void): Promise<ProjectGroupState> {
     return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      beforeApply?.();
       if (action.action === 'status') {
         const current = readProjectGroup(context.dataDir, context.chatId);
         if (!current) throw new Error('project_not_found');
@@ -256,7 +275,7 @@ export class ProjectCoordinator {
         if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
         return this.publish(context, current);
       }
-      const changed = await this.apply(context, action);
+      const changed = await this.apply(context, action, beforeApply);
       return this.publish(context, changed);
     });
   }
@@ -264,8 +283,10 @@ export class ProjectCoordinator {
   private async apply(
     context: ProjectCoordinatorContext,
     action: Exclude<ProjectCoordinatorAction, { action: 'status' | 'refresh' }>,
+    beforeApply?: () => void,
   ): Promise<ProjectGroupState> {
     const next = await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      beforeApply?.();
       const now = nowIso();
       if (action.action === 'init') {
         if (current) throw new Error('project_already_exists');
@@ -288,13 +309,25 @@ export class ProjectCoordinator {
       if (current.larkAppId !== context.larkAppId) {
         throw new Error('project_coordinator_mismatch');
       }
+      if (action.action === 'report' && action.expectedAttachment
+        && current.coordinatorSessionId !== action.expectedAttachment.coordinatorSessionId) {
+        throw new Error('project_attachment_revision_conflict');
+      }
       // A chat-scope session may be recreated after an explicit close or daemon
       // migration. The authenticated live session for the same bot+chat becomes
       // the new report target; topic-scoped sessions are rejected by the route.
       current.coordinatorSessionId = context.coordinatorSessionId;
       current.revision += 1;
       current.updatedAt = now;
-      if (action.action === 'update') {
+      if (action.action === 'workstream_rename') {
+        const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
+        if (!item) throw new Error('workstream_not_found');
+        const title = action.title.trim();
+        if (!title || title === '子任务' || title === '子项目') throw new Error('project_workstream_title_required');
+        if (Array.from(title).length > 24) throw new Error('project_workstream_title_too_long');
+        item.title = title;
+        item.updatedAt = now;
+      } else if (action.action === 'update') {
         if (action.goal !== undefined) current.goal = boundedText(action.goal, 500, current.goal);
         if (action.phase !== undefined) current.phase = boundedText(action.phase, 80, current.phase);
         if (action.focus !== undefined) current.focus = boundedText(action.focus, 300, current.focus);
@@ -363,6 +396,11 @@ export class ProjectCoordinator {
       } else if (action.action === 'report') {
         const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
         if (!item) throw new Error('workstream_not_found');
+        if (action.expectedAttachment && (item.attachment?.sourceSessionId !== action.expectedAttachment.sourceSessionId
+          || item.attachment.revision !== action.expectedAttachment.revision || item.attachment.state !== 'active'
+          || context.coordinatorSessionId !== action.expectedAttachment.coordinatorSessionId)) {
+          throw new Error('project_attachment_revision_conflict');
+        }
         const status = action.status ?? 'in_progress';
         item.status = status;
         item.progress = statusProgress(status, action.progress, item.progress);
@@ -408,7 +446,7 @@ export class ProjectCoordinator {
 
   private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState): Promise<ProjectGroupState> {
     let project = initial;
-    const resolutions = await Promise.all(project.workstreams
+    const resolutions = await Promise.all(visibleProjectWorkstreams(project)
       .filter(item => !item.threadId)
       .map(async item => ({ dispatchRoot: item.dispatchRoot, threadId: await this.transport.resolveThreadId(project.larkAppId, item.dispatchRoot) })));
     const found = resolutions.filter((item): item is { dispatchRoot: string; threadId: string } => !!item.threadId);
@@ -424,7 +462,8 @@ export class ProjectCoordinator {
     }
     const mode = readGroupCollaborationMode(context.dataDir, context.chatId);
     const cardConfig = mode?.progressCard;
-    const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig));
+    const runtime = await this.transport.resolveCardRuntime?.(project, context.dataDir);
+    const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig, runtime));
     if (project.card?.messageId) {
       try {
         await this.transport.updateCard(project.larkAppId, project.card.messageId, cardJson);

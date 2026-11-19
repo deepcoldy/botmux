@@ -18,7 +18,6 @@ import {
   isPollingDocTriggerMode,
   recordDocWatchActivity,
   setDocTitle,
-  asDocWatchOutcome,
   DOC_WATCH_LAST_ERROR_MAX,
   type DocSubscription,
 } from '../src/services/doc-subs-store.js';
@@ -190,16 +189,6 @@ describe('doc-subs-store', () => {
       sessionId: undefined,
       chatId: 'doc:doccnFILE1:watch',
     });
-  });
-});
-
-describe('asDocWatchOutcome（跨版本收窄）', () => {
-  it('收已知值，拒绝未知/非字符串', () => {
-    expect(asDocWatchOutcome('dispatched')).toBe('dispatched');
-    expect(asDocWatchOutcome('poll-failed')).toBe('poll-failed');
-    expect(asDocWatchOutcome('from-a-future-version')).toBeUndefined();
-    expect(asDocWatchOutcome(undefined)).toBeUndefined();
-    expect(asDocWatchOutcome(42)).toBeUndefined();
   });
 });
 

@@ -86,7 +86,13 @@ export class FeedbackAnalyticsService {
     const delivery = deliveryWhere(filters); const feedback = feedbackWhere(filters);
     const d = this.db.prepare(`SELECT COUNT(*) delivered, SUM(CASE WHEN d.status='failed' THEN 1 ELSE 0 END) delivery_failures FROM deliveries d WHERE ${delivery.where}`).get(...delivery.params) as any;
     const f = this.db.prepare(`SELECT COUNT(*) ratings, COUNT(DISTINCT d.delivery_id) rated_deliveries, SUM(CASE WHEN lf.semantic='positive' THEN 1 ELSE 0 END) positive, SUM(CASE WHEN lf.semantic='negative' THEN 1 ELSE 0 END) negative, SUM(CASE WHEN lf.semantic='progress' THEN 1 ELSE 0 END) progress FROM deliveries d JOIN (${LATEST}) lf ON lf.delivery_id=d.delivery_id WHERE ${feedback.where}`).get(...feedback.params) as any;
-    const outbox = this.db.prepare(`SELECT COUNT(*) failures FROM feedback_outbox WHERE status='failed' AND created_at>=? AND created_at<?`).get(filters.from, filters.to) as any;
+    // Both event types belong to the selected delivery cohort. Feedback events
+    // aggregate by revision ID, while completion events aggregate by delivery ID.
+    const outbox = this.db.prepare(`SELECT COUNT(*) failures FROM feedback_outbox o
+      JOIN feedback_events e ON e.event_id=o.event_id
+      LEFT JOIN feedback_revisions f ON e.event_type='feedback.revised' AND f.feedback_id=e.aggregate_id
+      JOIN deliveries d ON d.delivery_id=CASE WHEN e.event_type='turn.completed' THEN e.aggregate_id ELSE f.delivery_id END
+      WHERE o.status='failed' AND ${delivery.where}`).get(...delivery.params) as any;
     const delivered = Number(d.delivered ?? 0); const ratings = Number(f.ratings ?? 0); const ratedDeliveries = Number(f.rated_deliveries ?? 0); const positive = Number(f.positive ?? 0);
     return { delivered, ratedDeliveries, ratings, positive, negative: Number(f.negative ?? 0), progress: Number(f.progress ?? 0), ratingCoverage: delivered ? ratedDeliveries / delivered : 0, positiveRate: ratings ? positive / ratings : 0, deliveryFailures: Number(d.delivery_failures ?? 0), outboxFailures: Number(outbox.failures ?? 0) };
   }

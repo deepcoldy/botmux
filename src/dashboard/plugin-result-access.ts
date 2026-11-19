@@ -22,7 +22,8 @@ export function resolvePluginResultViewerIdentity(
   h5Identity: DashboardAuthIdentity | null,
 ): PluginResultViewerIdentity | null {
   if (dashboardIdentity?.principalUnionId) return { principalUnionId: dashboardIdentity.principalUnionId };
-  return h5Identity?.unionId ? { principalUnionId: h5Identity.unionId } : null;
+  // A workflow-sidebar session opens only the workflow sidebar.
+  return h5Identity?.unionId && !h5Identity.workflowViewOnly ? { principalUnionId: h5Identity.unionId } : null;
 }
 
 export interface PluginResultAccessDependencies {

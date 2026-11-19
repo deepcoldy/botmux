@@ -50,6 +50,7 @@ afterEach(async () => {
   handle = null;
   setIpcAuthSecret(null);
   vi.restoreAllMocks();
+  workerPool.__testOnly_resetRestartCoordinator();
 });
 
 /** auth 三态：capability（默认，沙箱/读隔离 CLI 姿势）/ signed（trusted-host
@@ -261,7 +262,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     // TOCTOU 契约：restart 携带的 updateWorkingDir 原样使用校验产出 resolvedPath
     // （realpath 归一），而非请求原始输入。worker 侧据此收敛 lastInitConfig 后
     // respawn（--resume 续上下文 + 新 cwd 开场注入新角色 CLAUDE.md/记忆索引）。
-    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
     // 落盘重钉必须先于 restart（记录 = 唯一事实源；respawn 只是让活进程跟上）。
     expect(repinSpy.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
@@ -337,7 +338,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
-    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(killSpy).not.toHaveBeenCalled();
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
   });
@@ -358,7 +359,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
-    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(killSpy).not.toHaveBeenCalled();
   });
   // ── per-bot 收窄（ds.larkAppId → validateRoleLibraryPath 的 ownAppId）──

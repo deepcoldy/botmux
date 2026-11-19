@@ -6,6 +6,7 @@ import { InvocationService } from './service.js';
 import { rawCliExecutable } from '../../adapters/cli/registry.js';
 import { modelOnlyAdapter, modelOnlyAdapterCapabilities, modelOnlyCapabilities } from './adapters.js';
 import { modelOnlyAssessments } from './support-status.js';
+import { sandboxEnabled } from '../../adapters/backend/sandbox.js';
 
 const services = new Map<string, InvocationService>();
 
@@ -16,7 +17,7 @@ export function invocationCapabilityForBot(botId: string): Record<string, unknow
   const adapter = modelOnlyAdapter(bot.cliId);
   const supported = !!adapter && bot.apiOnly === true && adapter.acceptsIdentity(bot)
     && !bot.wrapperCli && !bot.cliRuntime && !bot.codexInstancePool && !bot.existingAppServer
-    && !bot.triggerUserAuth?.enabled && !bot.sandbox && !bot.readIsolation && process.env.BOTMUX_SANDBOX !== '1'
+    && !bot.triggerUserAuth?.enabled && !bot.sandbox && !bot.readIsolation && !sandboxEnabled()
     && !bot.backendType && !bot.maxLiveWorkers && !(bot.startupCommands?.length)
     && Object.keys(bot.env ?? {}).length === 0;
   return { ...modelOnlyCapabilities, cli: bot.cliId, modelPolicy: adapter?.modelPolicy ?? null,

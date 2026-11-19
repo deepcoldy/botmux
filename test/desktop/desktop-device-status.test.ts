@@ -1,6 +1,26 @@
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { sanitizeDeviceStatusCommandResult } from '../../src/desktop/main/device-status.js';
+import { createMainWindow } from '../../src/desktop/main/window.js';
+
+type AttachWebviewHandler = (event: unknown, webPreferences: Record<string, unknown>) => void;
+const { attachWebviewHandlers } = vi.hoisted(() => ({ attachWebviewHandlers: [] as AttachWebviewHandler[] }));
+
+vi.mock('electron', () => {
+  class BrowserWindow {
+    webContents = {
+      on: (event: string, handler: AttachWebviewHandler) => {
+        if (event === 'will-attach-webview') attachWebviewHandlers.push(handler);
+      },
+      setWindowOpenHandler: () => {},
+    };
+    loadFile = () => Promise.resolve();
+  }
+  return {
+    BrowserWindow,
+    screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1080 } }) },
+    shell: { openExternal: () => {} },
+  };
+});
 
 describe('desktop device status boundary', () => {
   it('accepts the exact enrolled public status shape', () => {
@@ -73,13 +93,18 @@ describe('desktop device status boundary', () => {
     })).toEqual({ ok: false, reason: 'invalid_response' });
   });
 
-  it('keeps credentials in main: preload exposes status only and dashboard webviews get no preload', () => {
-    const preload = readFileSync(new URL('../../src/desktop/preload.ts', import.meta.url), 'utf8');
-    const windowMain = readFileSync(new URL('../../src/desktop/main/window.ts', import.meta.url), 'utf8');
-    expect(preload).toContain("ipcRenderer.invoke('desktop:get-device-status')");
-    expect(preload).not.toContain('accessToken');
-    expect(preload).not.toContain('refreshToken');
-    expect(windowMain).toContain('delete webPreferences.preload');
-    expect(windowMain).toContain('webPreferences.sandbox = true');
+  it('attaches dashboard webviews sandboxed, isolated, and without the privileged shell preload', () => {
+    attachWebviewHandlers.length = 0;
+    createMainWindow('/app/dist/desktop/preload.js', '/app/dist/desktop/renderer');
+    expect(attachWebviewHandlers).toHaveLength(1);
+
+    const webPreferences: Record<string, unknown> = {
+      preload: '/app/dist/desktop/preload.js',
+      nodeIntegration: true,
+      contextIsolation: false,
+      sandbox: false,
+    };
+    attachWebviewHandlers[0]({}, webPreferences);
+    expect(webPreferences).toEqual({ nodeIntegration: false, contextIsolation: true, sandbox: true });
   });
 });

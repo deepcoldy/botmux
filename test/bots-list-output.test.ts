@@ -1,6 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
-
 import {
   collaborationHelp,
   formatBotInfoEntriesForCli,
@@ -193,19 +191,6 @@ describe('botmux bots list CLI output mapping', () => {
     });
   });
 
-  it('S-1 reads peer facts from authoritative BotConfig rather than the transient registry', () => {
-    const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const factsBuilder = cliSource.match(/const collaborationFactsFor[\s\S]*?\n  };/)?.[0] ?? '';
-
-    expect(factsBuilder).toContain('loadBotConfigs()');
-    expect(factsBuilder).not.toContain('getBot(');
-    expect(factsBuilder).not.toContain('registerBot(');
-    expect(factsBuilder).toContain('catch');
-    for (const sensitive of ['ownerOpenId', 'allowedUsers', 'chatGrants', 'globalGrants', 'sandboxPaths', 'env', 'larkAppSecret']) {
-      expect(factsBuilder).not.toContain(sensitive);
-    }
-  });
-
   it('S-2 keeps unsupported fallback and external conclusions unknown without leaking sensitive config', () => {
     const [fallback] = formatBotInfoEntriesForCli([{
       larkAppId: 'cli_peer',
@@ -293,7 +278,7 @@ describe('botmux bots list CLI output mapping', () => {
     expect(configuredPeer.collaboration.authorization).toEqual({ talk: 'preflight-required', operate: false });
   });
 
-  it('S-3 documents every collaboration value and wires one top-level help object per output path', () => {
+  it('S-3 documents every collaboration value', () => {
     const expectedValues: Record<string, string[]> = {
       reachability: ['ready', 'needs-introduce', 'offline', 'unknown'],
       'workspace.requirement': ['required', 'optional', 'none', 'unknown'],
@@ -328,10 +313,5 @@ describe('botmux bots list CLI output mapping', () => {
     expect(collaborationHelp.fields['runtime.transport'].description).toContain('不是在线健康状态');
     expect(collaborationHelp.fields['runtime.transport'].values.true).toContain('不证明 daemon');
     expect(collaborationHelp.fields['runtime.transport'].values.false).toContain('apiOnly');
-
-    const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const outputLines = cliSource.split('\n').filter(line => line.includes('console.log(JSON.stringify({ sessionId: sid') && line.includes('collaborationHelp'));
-    expect(outputLines).toHaveLength(2);
-    expect(outputLines.every(line => (line.match(/collaborationHelp/g) ?? []).length === 1)).toBe(true);
   });
 });

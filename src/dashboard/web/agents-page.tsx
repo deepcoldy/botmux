@@ -13,6 +13,7 @@ import {
   ToggleRow,
 } from './dashboard-components.js';
 import { DropdownField, ModelPickerField } from './field-controls.js';
+import { cliAvailabilityStatus, useCliAvailability } from './cli-availability.js';
 import { ModalDialog } from './modal-dialog.js';
 import { BotMultiSelect } from './bot-multi-select.js';
 import { confirm } from './confirm-modal.js';
@@ -1083,6 +1084,7 @@ function ExecFields(props: {
     return () => { stale = true; };
   }, [draft.cliId]);
   const option = selectedCliOption(cliState.options, draft.cliId);
+  const availabilityStatus = useCliAvailability(draft.cliId, option);
   const candidates = mergeModelCandidates(
     modelSuggestionsForOption(option, cliState),
     detected?.key === draft.cliId ? detected.models : null,
@@ -1094,7 +1096,8 @@ function ExecFields(props: {
     .map(item => ({
       value: item.id,
       label: item.label,
-      hint: item.available === false ? item.availabilityReason ?? tr('agents.cliUnavailable') : undefined,
+      hint: (item.id === draft.cliId ? availabilityStatus : cliAvailabilityStatus(item)) === 'unavailable'
+        ? item.availabilityReason ?? tr('agents.cliUnavailable') : undefined,
     }));
   if (!cliOptions.some(item => item.value === draft.cliId)) cliOptions.unshift({ value: draft.cliId, label: draft.cliId, hint: undefined });
   return (

@@ -12,11 +12,14 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
+import { closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
-import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { isLinuxZombie, readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
@@ -133,6 +136,8 @@ export class FleetSupervisor {
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Keep orphan rows addressable until their exact process generation exits. */
+  private readonly orphanStops = new Map<string, Promise<void>>();
   /** Names an operator explicitly stopped (stop-bot). Their SIGTERM would look
    *  like a crash to onChildExit, so we suppress the restart for exactly one exit
    *  and mark them stopped. Cleared when the bot is explicitly started again. */
@@ -151,6 +156,22 @@ export class FleetSupervisor {
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
   }
 
+  /** Process names can change after setup/clone. Keep an active daemon's name
+   * as its handle until it stops; App ID owns identity, including crash backoff.
+   * Dashboard/plugin members have separate identities and must not coalesce. */
+  private resolveDaemonSpec(spec: FleetBotSpec): FleetBotSpec {
+    if (spec.external || (spec.entry ?? 'daemon') !== 'daemon' || !spec.appId) return spec;
+    // Maintenance admission can defer the very first spawn before any state
+    // row exists. Its in-memory timer still owns this App ID.
+    const pending = [...this.knownSpecs.values()].find(p => p.appId === spec.appId
+      && !p.external && (p.entry ?? 'daemon') === 'daemon'
+      && (this.children.has(p.name) || this.restartTimers.has(p.name)));
+    if (pending) return { ...spec, name: pending.name };
+    const active = (readFleetState(this.opts.statePath)?.procs ?? []).find(p =>
+      p.appId === spec.appId && (p.status === 'online' || p.status === 'launching'));
+    return active ? { ...spec, name: active.name } : spec;
+  }
+
   /** Start (or reconcile) the fleet: spawn every configured bot not already
    *  alive. Idempotent — an already-live child (per state + kill -0) is left be.
    *  This is both the initial start and the resurrect path.
@@ -164,10 +185,19 @@ export class FleetSupervisor {
       this.log(`fleet is owned by live supervisor pid ${owner}; not starting a second one`);
       return false;
     }
-    const specByName = new Map(bots.map((b) => [b.name, b]));
+    const specByName = new Map<string, FleetBotSpec>();
+    const daemonApps = new Set<string>();
+    for (const input of bots) {
+      const spec = this.resolveDaemonSpec(input);
+      if (!spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId) {
+        if (daemonApps.has(spec.appId)) continue;
+        daemonApps.add(spec.appId);
+      }
+      specByName.set(spec.name, spec);
+    }
     // Remember the spec set so queued start-bot/stop-bot can resolve name→spec.
     this.knownSpecs.clear();
-    for (const b of bots) this.knownSpecs.set(b.name, b);
+    for (const b of specByName.values()) this.knownSpecs.set(b.name, b);
     // A full fleet start clears any explicit-stop marks — `botmux start` means
     // "bring everything up", overriding a prior single-bot stop.
     this.explicitStop.clear();
@@ -193,81 +223,110 @@ export class FleetSupervisor {
     // the reconcile branch below are both natural no-ops; only genuinely unowned
     // live procs are reclaimed. (Relying on pid-inequality would miss the corner
     // where the OS recycles the dead supervisor's pid onto the new one.)
-    const unreclaimable = new Set<string>();
-    const unowned = (p: FleetProcState): boolean =>
-      specByName.has(p.name) && p.status === 'online' && pidAlive(p.pid) && !this.children.has(p.name);
     for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
-      if (unowned(p)) {
-        const spec = specByName.get(p.name)!;
-        const expected = spec.external
-          ? { command: spec.external.command, args: spec.external.args ?? [] }
-          : undefined;
-        const builtInEntry = spec.entry === 'dashboard' ? 'dashboard' : 'daemon';
-        const inspection = inspectFleetProcess(
-          p.pid,
-          p.processStart,
-          undefined,
-          commandLine => expected
-            ? commandLine.includes(expected.command) && expected.args.every(arg => commandLine.includes(arg))
-            : builtinFleetEntryMatches(builtInEntry, commandLine),
-          identityRuntime,
-          /* verifyPersistedCommand */ false,
-        );
-        if (inspection.status === 'unverifiable') {
-          unreclaimable.add(p.name);
-          this.log(`cannot verify unowned ${p.name} process identity (pid ${p.pid}); leaving this member untouched`);
-          continue;
-        }
-        if (inspection.status === 'exact') {
-          // Legacy fleet-state rows have no persisted processStart. The exact
-          // inspection above is still safe for the one-release migration path:
-          // it samples a durable birth identity on both sides of a strict
-          // command-line match, then signalAttestedFleetProcess rechecks that
-          // freshly-attested generation immediately before sending SIGTERM.
-          if (!signalAttestedFleetProcess(inspection.attestation, 'SIGTERM', identityRuntime)) {
-            const after = inspectFleetProcess(
-              p.pid,
-              inspection.attestation.processStart,
-              inspection.attestation.pidNamespace,
-              () => true,
-              identityRuntime,
-              /* verifyPersistedCommand */ false,
-            );
-            if (after.status !== 'stale') {
-              unreclaimable.add(p.name);
-              this.log(`lost verification for unowned ${p.name} process (pid ${p.pid}); leaving this member untouched`);
-              continue;
-            }
-          }
-          this.log(`reclaiming unowned live ${p.name} (pid ${p.pid}) from a prior supervisor — SIGTERM + respawn`);
-        } else {
-          this.log(`ignoring stale ${p.name} pid ${p.pid}: process identity does not match`);
-        }
+      const configured = this.specForProc(p);
+      // A bot removed while its supervisor was down may still be online or
+      // partway through retirement. With no configured member, allow only a fresh
+      // built-in daemon command match; never infer plugin/dashboard ownership.
+      const retireOnly = !configured && (p.status === 'online' || p.status === 'launching') && p.pid > 1;
+      const spec = configured ?? (retireOnly ? { name: p.name, appId: p.appId, botIndex: -1 } : undefined);
+      if (spec && (p.status === 'online' || (p.status === 'launching' && p.pid > 1)) && !this.children.has(p.name)) {
+        // Include every alias of a configured App ID, not only its chosen name.
+        // stopUnowned records failures; preserve the row and continue with peers.
+        void this.stopUnowned(p, spec, retireOnly).catch(() => {});
       }
     }
     mutateFleetState(this.opts.statePath, (cur) => {
-      // Drop procs no longer configured; mark not-online any proc we don't own a
-      // live handle to (dead pid, OR alive-but-unowned orphan we just SIGTERM'd)
-      // so planStart respawns it under our ownership — an orphan we hold no handle
-      // to is not a member we supervise.
-      cur.procs = cur.procs.filter((p) => specByName.has(p.name));
+      // Live aliases remain durable while retirement is pending or unverifiable.
+      // Sending SIGTERM alone does not prove that a daemon has stopped.
+      cur.procs = cur.procs.filter(p => specByName.has(p.name)
+        || (p.pid > 1 && identityRuntime.pidExists(p.pid)
+          && (this.specForProc(p) || p.status === 'launching' || this.children.has(p.name) || this.orphanStops.has(p.name))));
       for (const p of cur.procs) {
-        if (p.status === 'online'
-          && (!pidAlive(p.pid) || (!this.children.has(p.name) && !unreclaimable.has(p.name)))) {
+        if (p.status === 'online' && !identityRuntime.pidExists(p.pid)) {
           p.pid = 0;
           p.status = 'stopped';
+        } else if (p.pid > 1 && !this.children.has(p.name) && (this.specForProc(p) || this.orphanStops.has(p.name))) {
+          // Retirement admission may have failed its first write. A successful
+          // reconcile still cannot publish an unowned PID as healthy.
+          p.status = 'launching';
         }
       }
       return cur;
     });
 
     const current = readFleetState(this.opts.statePath)?.procs ?? [];
-    const toStart = planStart([...specByName.keys()], current, (p) => p.status === 'online' && pidAlive(p.pid));
+    const toStart = planStart([...specByName.keys()], current,
+      p => p.status === 'online' && pidAlive(p.pid) && this.children.has(p.name));
     for (const name of toStart) {
       const spec = specByName.get(name);
-      if (spec) this.spawnBot(spec, /* isRestart */ false);
+      if (spec) this.startOneBot(spec);
     }
     return true;
+  }
+
+  private specForProc(proc: FleetProcState): FleetBotSpec | undefined {
+    return (proc.appId && [...this.knownSpecs.values()].find(spec =>
+      !spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId === proc.appId))
+      || this.knownSpecs.get(proc.name);
+  }
+
+  private stopUnowned(proc: FleetProcState, spec: FleetBotSpec, retireOnly = false): Promise<void> {
+    const pending = this.orphanStops.get(proc.name);
+    if (pending) return pending;
+    const stop = this.retireUnowned(proc, spec, retireOnly).catch(error => {
+      this.log(`${error.message}; leaving this member untouched`);
+      throw error;
+    }).finally(() => this.orphanStops.delete(proc.name));
+    this.orphanStops.set(proc.name, stop);
+    return stop;
+  }
+
+  private async retireUnowned(proc: FleetProcState, spec: FleetBotSpec, retireOnly: boolean): Promise<void> {
+    const runtime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
+    // This PID is still addressable, but it is not an owned, healthy daemon.
+    // Keep that distinction durable across a second supervisor crash.
+    mutateFleetState(this.opts.statePath, cur => {
+      const row = cur.procs.find(p => p.name === proc.name && p.pid === proc.pid && p.generation === proc.generation);
+      if (row) row.status = 'launching';
+      return cur;
+    });
+    const expected = spec.external;
+    const inspection = inspectFleetProcess(proc.pid, proc.processStart, undefined,
+      command => expected
+        ? command.includes(expected.command) && (expected.args ?? []).every(arg => command.includes(arg))
+        : builtinFleetEntryMatches(spec.entry === 'dashboard' ? 'dashboard' : 'daemon', command),
+      runtime, /* removed members must re-prove their daemon command */ retireOnly);
+    if (inspection.status === 'unverifiable') throw new Error(`cannot verify unowned ${proc.name} (pid ${proc.pid})`);
+    if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)) {
+      throw new Error(`cannot prove removed ${proc.name} (pid ${proc.pid}) is a botmux daemon`);
+    }
+    if (inspection.status === 'exact') {
+      const target = inspection.attestation;
+      signalAttestedFleetProcess(target, 'SIGTERM', runtime);
+      const killAt = Date.now() + (spec.external?.killTimeoutMs ?? this.killTimeoutMs);
+      let escalated = false;
+      for (;;) {
+        const current = inspectFleetProcess(proc.pid, target.processStart, target.pidNamespace,
+          () => true, runtime, /* verifyPersistedCommand */ false);
+        if (current.status === 'stale' || (current.status === 'exact' && isLinuxZombie(proc.pid))) break;
+        if (current.status === 'unverifiable') throw new Error(`lost verification for unowned ${proc.name}`);
+        if (Date.now() >= killAt + 5_000) throw new Error(`fleet: stop not confirmed for unowned ${proc.name}`);
+        if (!escalated && Date.now() >= killAt) {
+          signalAttestedFleetProcess(target, 'SIGKILL', runtime);
+          escalated = true;
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 50));
+      }
+    }
+    mutateFleetState(this.opts.statePath, cur => {
+      const row = cur.procs.find(p => p.name === proc.name && p.pid === proc.pid && p.generation === proc.generation);
+      if (row) {
+        row.status = 'stopped'; row.pid = 0;
+        if (!this.knownSpecs.has(row.name)) cur.procs = cur.procs.filter(p => p !== row);
+      }
+      return cur;
+    });
   }
 
   /**
@@ -331,6 +390,13 @@ export class FleetSupervisor {
    *  clears any explicit-stop mark (an explicit start overrides a prior stop). */
   startOneBot(spec: FleetBotSpec): void {
     if (this.stopping) return;
+    spec = this.resolveDaemonSpec(spec);
+    const occupant = this.knownSpecs.get(spec.name);
+    if (occupant && occupant.appId !== spec.appId
+      && (this.children.has(spec.name) || this.restartTimers.has(spec.name))) {
+      this.log(`start-bot ${spec.name}: name belongs to another active App ID`);
+      return;
+    }
     this.knownSpecs.set(spec.name, spec);
     this.explicitStop.delete(spec.name);
     // Cancel any pending crash-restart timer FIRST (mirrors stopOneBot). A bot
@@ -389,6 +455,12 @@ export class FleetSupervisor {
     if (timer) { clearTimeout(timer); this.restartTimers.delete(name); }
     const child = this.children.get(name);
     if (!child) {
+      const proc = readFleetState(this.opts.statePath)?.procs.find(p => p.name === name);
+      if (proc && proc.pid > 1) {
+        const spec = this.specForProc(proc);
+        if (!spec) throw new Error(`fleet: unknown unowned member ${name}`);
+        await this.stopUnowned(proc, spec);
+      }
       // Nothing live to signal (already down, or mid-backoff we just cancelled).
       // Reflect stopped in state so status is truthful and no restart is pending.
       this.explicitStop.delete(name);
@@ -417,18 +489,81 @@ export class FleetSupervisor {
       // member in knownSpecs, so use that and fall back to the payload only for
       // a name we have never seen.
       const known = this.knownSpecs.get(cmd.name);
-      const spec: FleetBotSpec = known ?? { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
+      const spec: FleetBotSpec = known?.appId === cmd.appId ? known : { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
       if (cmd.op === 'start-bot') {
-        this.startOneBot(spec);
+        try {
+          this.startOneBot(spec);
+        } catch (error) {
+          this.log(`start-bot ${spec.name} failed: ${error instanceof Error ? error.message : error}`);
+        }
       } else {
-        await this.stopOneBot(cmd.name);
+        // A renamed bot may still run under its previous handle. Include all
+        // aliases so an operator can also retire duplicates from older builds.
+        const aliases = !spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId
+          ? [...(readFleetState(this.opts.statePath)?.procs ?? []), ...this.knownSpecs.values()]
+            .filter(p => p.appId === spec.appId).map(p => p.name)
+          : [cmd.name];
+        for (const name of new Set(aliases)) {
+          try {
+            await this.stopOneBot(name);
+          } catch (error) {
+            // The durable row remains launching/online, so the CLI keeps waiting
+            // instead of seeing a false stop. Do not reject the SIGHUP drain or
+            // skip unrelated commands queued behind this failed alias.
+            this.log(`stop-bot ${name} failed: ${error instanceof Error ? error.message : error}`);
+          }
+        }
       }
     }
   }
 
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
+    // A full reconcile may remove/reassign this member while retirement waits.
+    if (this.knownSpecs.get(spec.name)?.appId !== spec.appId) return;
+    const runtime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
+    const unowned = (readFleetState(this.opts.statePath)?.procs ?? []).filter(p =>
+      (p.name === spec.name
+        || (!spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId && p.appId === spec.appId))
+      && p.pid > 1 && runtime.pidExists(p.pid) && !this.children.has(p.name));
+    if (unowned.length > 0) {
+      if (unowned.some(p => this.orphanStops.has(p.name))) {
+        // The same cancellable start slot covers recovery and crash backoff.
+        const timer = setTimeout(() => {
+          this.restartTimers.delete(spec.name);
+          this.spawnBot(spec, isRestart);
+        }, 100);
+        this.restartTimers.set(spec.name, timer);
+      } else {
+        this.log(`start-bot ${spec.name}: blocked by an unowned live process`);
+      }
+      return;
+    }
     const entry = spec.entry ?? 'daemon';
+    if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
+      this.log(`feedback maintenance: deferred ${spec.name}`);
+      // Publish admission before scheduling: stop-bot must see pending work
+      // even when this daemon has never spawned. Preserve crash/generation
+      // history when maintenance overlaps an existing restart.
+      mutateFleetState(this.opts.statePath, cur => {
+        let pending = cur.procs.find(p => p.name === spec.name);
+        if (!pending) {
+          pending = freshProc(spec.name, spec.appId, 0, new Date().toISOString());
+          cur.procs.push(pending);
+        }
+        pending.appId = spec.appId;
+        pending.status = 'launching';
+        pending.pid = 0;
+        return cur;
+      });
+      const timer = setTimeout(() => {
+        this.restartTimers.delete(spec.name);
+        this.spawnBot(spec, isRestart);
+      }, 1000);
+      timer.unref();
+      this.restartTimers.set(spec.name, timer);
+      return;
+    }
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
     // restart budget, graceful stop — is shared verbatim; only the command and
@@ -457,8 +592,9 @@ export class FleetSupervisor {
     if (this.opts.logDir) {
       try {
         mkdirSync(this.opts.logDir, { recursive: true });
-        outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
-        errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
+        // 打开前按大小轮转（默认 20MiB，保留 1 份 .1），防止单一日志无限增长吃满磁盘。
+        outFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-out.log`));
+        errFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-err.log`));
         stdio = ['ignore', outFd, errFd];
       } catch (err) {
         this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);
@@ -518,6 +654,9 @@ export class FleetSupervisor {
     const generation = mutateFleetState(this.opts.statePath, (cur) => {
       const existing = cur.procs.find((p) => p.name === spec.name);
       if (existing) {
+        // Reusing an index/name for a different application must not leave the
+        // previous identity attached to this newly spawned generation.
+        existing.appId = spec.appId;
         existing.pid = child.pid ?? 0;
         existing.generation += 1;
         existing.status = 'online';
@@ -635,19 +774,24 @@ export class FleetSupervisor {
   /** Graceful stop of the whole fleet: SIGTERM each child, then SIGKILL any that
    *  outlast kill_timeout. Cancels pending restart timers first so a mid-backoff
    *  crash can't respawn during shutdown. Resolves when all children are gone.
-   *  Finalizes fleet-state (all procs stopped, supervisorPid cleared) so a later
-   *  `status` reflects reality — onChildExit is short-circuited while stopping. */
+   *  Finalizes owned rows and clears supervisorPid, retaining unresolved orphan
+   *  rows — onChildExit is short-circuited while stopping. */
   async stopAll(): Promise<void> {
     this.stopping = true;
     for (const t of this.restartTimers.values()) clearTimeout(t);
     this.restartTimers.clear();
     const pending = [...this.children.entries()];
     await Promise.all(pending.map(([name, child]) => this.stopOne(name, child)));
+    await Promise.allSettled(this.orphanStops.values());
     // Reflect the stop in the durable record. onChildExit ignored these exits
     // (stopping=true), so without this the state file would keep the now-dead
     // pids as 'online'. Clear supervisorPid too: this supervisor is exiting.
     mutateFleetState(this.opts.statePath, (cur) => {
       for (const p of cur.procs) {
+        // Unverifiable or failed orphan retirement must survive shutdown for the
+        // next supervisor/operator; do not turn a live PID into a stopped row.
+        if (!pending.some(([name]) => name === p.name)
+          && (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).pidExists(p.pid)) continue;
         if (p.status === 'online' || p.status === 'launching') { p.status = 'stopped'; p.pid = 0; }
       }
       cur.supervisorPid = 0;

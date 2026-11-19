@@ -153,8 +153,10 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     initWorkerPool: vi.fn(),
     isSessionTransferring: vi.fn((...args: Parameters<typeof orig.isSessionTransferring>) => orig.isSessionTransferring(...args)),
     requestSessionRestart: vi.fn((_ds: any, observer: any) => {
-      void observer.notify('in_progress');
-      return { attemptId: 'attempt-card', joined: false };
+      // Fresh attempt per call: the restart status card is shared per attempt.
+      const attemptId = `attempt-card-${Math.random().toString(36).slice(2)}`;
+      void observer.notify('in_progress', attemptId);
+      return { attemptId, joined: false };
     }),
   };
 });
@@ -617,12 +619,13 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
       expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
-      // The confirmation is delivered ephemeral to the clicker (group chat + an
-      // operator open_id), not as a visible group reply.
-      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
-        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('重启'),
+      // One public status card that later restart results patch in place —
+      // the whole chat sees why the CLI restarted, not only the clicker.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('正在重启'), 'interactive', APP_ID,
       );
-      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('restart from a stale Riff card should explain close-and-recreate without IPC', async () => {
@@ -1094,7 +1097,8 @@ describe('Card integration: full event flow', () => {
   // thread-scope session inside a 普通群) must NOT use ephemeral — the
   // restart/close/resume confirmation has to stay in the topic via the visible
   // in-thread reply (sessionReply → reply_in_thread). Flat 普通群 (scope:'chat',
-  // tested in Scenario 4) keeps the ephemeral "visible-to-you" behaviour.
+  // tested in Scenario 4) keeps the ephemeral "visible-to-you" behaviour for
+  // close/resume; restart posts a public status card in both scopes.
 
   describe('Scenario 4b: thread-scope status cards stay in the thread', () => {
     it('restart confirmation in a thread-scope session is a visible in-thread reply, never ephemeral', async () => {
@@ -1113,7 +1117,7 @@ describe('Card integration: full event flow', () => {
       expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID, expect.stringContaining('重启'), undefined, APP_ID,
+        ROOT_ID, expect.stringContaining('正在重启'), 'interactive', APP_ID,
       );
     });
 
@@ -2094,6 +2098,7 @@ describe('Card integration: full event flow', () => {
         },
         lastUserPrompt: '继续',
         lastCliInput: '<user_message>继续</user_message>',
+        lastCliInputTurnId: 'om_limited_turn',
         currentImageKey: 'img_old',
       });
       const sessions = new Map<string, DaemonSession>();
@@ -2102,9 +2107,19 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRetryLastTaskEvent(ROOT_ID), deps, APP_ID);
 
+      const { rememberLastCliInput } = await import('../src/core/session-manager.js');
+      const retryTurnId = vi.mocked(rememberLastCliInput).mock.calls.at(-1)?.[3];
+      expect(retryTurnId).toEqual(expect.any(String));
+      expect(retryTurnId).not.toBe('');
+      expect(retryTurnId).not.toBe('om_limited_turn');
+      expect(rememberLastCliInput).toHaveBeenCalledWith(
+        ds, '继续', { content: '<user_message>继续</user_message>' }, retryTurnId,
+      );
+      expect((ds.worker as any).send).toHaveBeenCalledTimes(1);
       expect((ds.worker as any).send).toHaveBeenCalledWith({
         type: 'message',
         content: '<user_message>继续</user_message>',
+        turnId: retryTurnId,
       });
       expect(ds.usageLimit).toBeUndefined();
       expect(ds.usageLimitRetryTimer).toBeUndefined();

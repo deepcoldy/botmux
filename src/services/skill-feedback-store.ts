@@ -2,8 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { feedbackDeliveryContext } from './feedback-extension-store.js';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
+import { SQLITE_FEEDBACK_STREAM_SCHEMA, validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
 
 /** True when a node:sqlite error is the recoverable write-lock contention that
  *  a burst of concurrent cold-start opens against a shared dataDir produces. */
@@ -386,7 +388,7 @@ export class SkillFeedbackStore {
   readonly path: string;
   private readonly db: DatabaseSyncLike;
 
-  private constructor(dataDir: string, db: DatabaseSyncLike) {
+  private constructor(private readonly dataDir: string, db: DatabaseSyncLike) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'botmux-feedback.sqlite');
     this.db = db;
@@ -566,6 +568,7 @@ export class SkillFeedbackStore {
   }
 
   recordTurnDelivery(input: RecordTurnDeliveryInput): ReturnType<SkillFeedbackStore['mapDelivery']> {
+    input = { ...input, context: feedbackDeliveryContext(this.dataDir, input) };
     const hash = contentHash(input.content);
     const attempt = input.dispatchAttempt ?? 0;
     const discriminator = input.correlationDiscriminator ?? '';
@@ -730,6 +733,29 @@ export class SkillFeedbackStore {
       .map(row => JSON.parse(row.payload_json) as FeedbackEventEnvelope);
   }
 
+  readFeedbackEventsAfter(input: FeedbackEventCursor): SequencedFeedbackEvent[] {
+    validateFeedbackEventCursor(input);
+    if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='feedback_event_stream_insert'").get()) {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.exec(SQLITE_FEEDBACK_STREAM_SCHEMA);
+        this.db.exec('COMMIT');
+      } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    }
+    const rows = this.db.prepare(`SELECT s.sequence,e.payload_json FROM feedback_event_stream s
+      JOIN feedback_events e ON e.event_id=s.event_id WHERE s.sequence>? ORDER BY s.sequence LIMIT ?`)
+      .all(input.after, input.limit) as Array<{ sequence: number; payload_json: string }>;
+    return rows.map(row => ({ sequence: Number(row.sequence), event: JSON.parse(row.payload_json) as FeedbackEventEnvelope }));
+  }
+  findDeliveryById(deliveryId: string): ReturnType<SkillFeedbackStore['mapDelivery']> | undefined {
+    const row = this.db.prepare('SELECT * FROM deliveries WHERE delivery_id=?').get(deliveryId) as DeliveryRow | undefined;
+    return row ? this.mapDelivery(row) : undefined;
+  }
+  listSubjectDeliveries(appId: string, chatId: string, subjectId: string): Array<ReturnType<SkillFeedbackStore['mapDelivery']>> {
+    return (this.db.prepare(`SELECT * FROM deliveries WHERE bot_app_id=? AND chat_id=? AND topic_root_id=?
+      ORDER BY created_at,rowid`).all(appId, chatId, subjectId) as DeliveryRow[]).map(row => this.mapDelivery(row));
+  }
+
   listFeedbackOutbox(): Array<any> {
     return (this.db.prepare(`SELECT o.*,e.payload_json FROM feedback_outbox o JOIN feedback_events e ON e.event_id=o.event_id ORDER BY o.created_at,o.outbox_id`).all() as any[])
       .map(row => ({ outboxId: row.outbox_id, eventId: row.event_id, destinationId: row.destination_id, destination: JSON.parse(row.destination_json) as FrozenWebhookDestination, status: row.status, attempts: row.attempts, nextAttemptAt: row.next_attempt_at, claimToken: row.claim_token ?? undefined, claimedAt: row.claimed_at ?? undefined, lastHttpStatus: row.last_http_status ?? undefined, lastError: row.last_error ?? undefined, event: JSON.parse(row.payload_json) as FeedbackEventEnvelope }));
@@ -739,7 +765,7 @@ export class SkillFeedbackStore {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const ids = (this.db.prepare(`SELECT outbox_id FROM feedback_outbox WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,outbox_id LIMIT ?`).all(input.now, Math.max(1, Math.min(input.limit, 100))) as Array<{ outbox_id: string }>).map(row => row.outbox_id);
-      for (const outboxId of ids) this.db.prepare(`UPDATE feedback_outbox SET status='inflight',attempts=attempts+1,claimed_at=?,claim_token=? WHERE outbox_id=? AND status='pending'`).run(input.now, input.claimToken, outboxId);
+      for (const outboxId of ids) this.db.prepare(`UPDATE feedback_outbox SET status='inflight',attempts=attempts+1,claimed_at=?,claim_token=?,last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_claimed_before_request' END WHERE outbox_id=? AND status='pending'`).run(input.now, input.claimToken, outboxId);
       this.db.exec('COMMIT');
       const wanted = new Set(ids);
       return this.listFeedbackOutbox().filter(row => wanted.has(row.outboxId) && row.claimToken === input.claimToken);
@@ -759,6 +785,13 @@ export class SkillFeedbackStore {
     return this.withNonblockingBusy(() => this.claimFeedbackOutbox(input), rows => ({ done: true, rows }));
   }
 
+  startFeedbackOutboxRequest(outboxId: string, claimToken: string): boolean {
+    return this.db.prepare(`UPDATE feedback_outbox SET last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_request_started' END WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(outboxId, claimToken).changes === 1;
+  }
+  tryStartFeedbackOutboxRequest(outboxId: string, claimToken: string): { done: true; changed: boolean } | { done: false; busy: true } {
+    return this.withNonblockingBusy(() => this.startFeedbackOutboxRequest(outboxId, claimToken), changed => ({ done: true, changed }));
+  }
+
   settleFeedbackOutboxDelivered(outboxId: string, claimToken: string, httpStatus: number, deliveredAt: string): boolean {
     return this.db.prepare(`UPDATE feedback_outbox SET status='delivered',last_http_status=?,delivered_at=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(httpStatus, deliveredAt, outboxId, claimToken).changes === 1;
   }
@@ -770,7 +803,7 @@ export class SkillFeedbackStore {
   }
 
   rescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): boolean {
-    return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=?,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
+    return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE ? END,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
   }
   tryRescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): { done: true; changed: boolean } | { done: false; busy: true } {
     return this.withNonblockingBusy(
@@ -780,7 +813,7 @@ export class SkillFeedbackStore {
   }
 
   resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): number {
-    return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
+    return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error WHEN last_error='webhook_claimed_before_request' THEN 'webhook_stopped_before_request' ELSE 'webhook_outcome_unknown:' || COALESCE(claim_token,outbox_id) END,claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
   }
   tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): { done: true; changed: number } | { done: false; busy: true } {
     return this.withNonblockingBusy(
@@ -1051,28 +1084,12 @@ export class SkillFeedbackStore {
   }
 }
 
-const stores = new Map<string, Promise<SkillFeedbackStore>>();
-
-export function getSkillFeedbackStore(dataDir: string): Promise<SkillFeedbackStore> {
-  let store = stores.get(dataDir);
-  if (!store) {
-    // Evict on rejection so a transient first-open failure (disk full, a
-    // concurrent cold-start lock that outlasted retries, corruption later
-    // repaired) is retried on the next call instead of poisoning the cache and
-    // silently disabling all feedback persistence for the rest of the process.
-    store = SkillFeedbackStore.open(dataDir).catch(error => {
-      if (stores.get(dataDir) === store) stores.delete(dataDir);
-      throw error;
-    });
-    stores.set(dataDir, store);
-  }
-  return store;
+export async function getSkillFeedbackStore(dataDir: string): Promise<import('./feedback-storage-types.js').FeedbackStore> {
+  const { getFeedbackStorage } = await import('./feedback-storage.js');
+  return (await getFeedbackStorage(dataDir)).store;
 }
 
 export async function __testOnly_closeSkillFeedbackStores(): Promise<void> {
-  const pending = [...stores.values()];
-  stores.clear();
-  for (const store of pending) {
-    try { (await store).close(); } catch { /* test cleanup only */ }
-  }
+  const { closeAllFeedbackStorage } = await import('./feedback-storage.js');
+  await closeAllFeedbackStorage();
 }

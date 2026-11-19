@@ -4,7 +4,6 @@ import {
   DISPATCH_LAUNCH_ADMISSION_SCHEMA_VERSION,
   DISPATCH_LAUNCH_CONTROL_LIMITS,
   DISPATCH_LAUNCH_OPERATION_SCHEMA_VERSION,
-  DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION,
   DISPATCH_LAUNCH_POLICY_SCHEMA_VERSION,
   DISPATCH_LAUNCH_KICKOFF_LIMITS,
   canonicalizeDispatchLaunchKickoff,
@@ -14,7 +13,6 @@ import {
   normalizeDispatchLaunchPolicy,
   parseDispatchLaunchAdmissionReceipt,
   parseDispatchLaunchOperation,
-  parseDispatchLaunchOverrideSnapshot,
   parseDispatchLaunchPrepareRequest,
   resolveDispatchLaunchOverride,
   type DispatchLaunchIdentityV1,
@@ -346,15 +344,5 @@ describe('dispatch launch versioned codecs', () => {
       talkAuthorizationReceiptId: 'talk', quotaReceiptId: 'quota', workingDir: '/repo',
       capacityReservationId: 'slot', createdAt: NOW, committedAt: LATER,
     })).toThrow('authorized receipt must be unsettled');
-
-    expect(() => parseDispatchLaunchOverrideSnapshot({
-      schemaVersion: DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION,
-      provenanceId: 'provenance',
-      dispatchId: base.dispatchId,
-      inheritedFromDispatchId: base.dispatchId,
-      effective: base.effectiveOverride,
-      launchIdentity: identity,
-      createdAt: NOW,
-    })).toThrow('exactly one');
   });
 });

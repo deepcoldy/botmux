@@ -17,7 +17,9 @@
 export interface NoProgressNotifyPolicy {
   /** Default true. `false` mutes only the Lark push. */
   enabled: boolean;
-  /** Positive integer within [MIN, MAX]; absent = built-in 90s default. */
+  /** Opt-in daemon-owned Codex CLI notices. App behavior is unchanged. */
+  cliEnabled?: boolean;
+  /** Positive integer within [MIN, MAX]; absent = App 90s / opted-in CLI 5min default. */
   timeoutMs?: number;
 }
 
@@ -36,10 +38,13 @@ export function normalizeNoProgressNotifyPolicy(value: unknown): NoProgressNotif
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'object' || Array.isArray(value)) throw new Error('noProgressNotify must be an object');
   const input = value as Record<string, unknown>;
-  const unknownKey = Object.keys(input).find(key => key !== 'enabled' && key !== 'timeoutMs');
+  const unknownKey = Object.keys(input).find(key => key !== 'enabled' && key !== 'timeoutMs' && key !== 'cliEnabled');
   if (unknownKey) throw new Error(`Unknown noProgressNotify field: ${unknownKey}`);
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') {
     throw new Error('noProgressNotify.enabled must be boolean');
+  }
+  if (input.cliEnabled !== undefined && typeof input.cliEnabled !== 'boolean') {
+    throw new Error('noProgressNotify.cliEnabled must be boolean');
   }
   if (input.timeoutMs !== undefined) {
     if (typeof input.timeoutMs !== 'number' || !Number.isInteger(input.timeoutMs)
@@ -50,6 +55,7 @@ export function normalizeNoProgressNotifyPolicy(value: unknown): NoProgressNotif
   }
   return {
     enabled: input.enabled !== false,
+    ...(input.cliEnabled !== undefined ? { cliEnabled: input.cliEnabled } : {}),
     ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
   };
 }

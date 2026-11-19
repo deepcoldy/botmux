@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { killWorkerTmuxSession, workerTmuxArgs } from './helpers/worker-tmux-session.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children: ChildProcess[] = [];
@@ -17,7 +18,7 @@ afterEach(() => {
   for (const child of children.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   }
-  for (const session of tmuxSessions.splice(0)) TmuxBackend.killSession(session);
+  for (const session of tmuxSessions.splice(0)) killWorkerTmuxSession(session);
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -33,7 +34,7 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
 function paneSize(sessionName: string): string {
   try {
     return execFileSync(
-      'tmux', ['display-message', '-p', '-t', sessionName, '#{pane_width}x#{pane_height}'],
+      'tmux', [...workerTmuxArgs(), 'display-message', '-p', '-t', sessionName, '#{pane_width}x#{pane_height}'],
       { encoding: 'utf-8' },
     ).trim();
   } catch {

@@ -52,6 +52,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>
@@ -61,6 +62,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
   // Default: promotion succeeds. A specific test overrides this to false to
   // exercise the restore-time transient-failure quarantine path.
@@ -113,6 +115,18 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // persisted row closed — so tests verify the eviction MECHANISM, not just
   // the end state.
   closeSession: vi.fn(async (sid: string) => {
+    const reg = wp.registry;
+    if (reg) {
+      for (const [k, v] of reg) {
+        if (v?.session?.sessionId === sid) { reg.delete(k); break; }
+      }
+    }
+    const store = await import('../src/services/session-store.js');
+    const s = store.getSession(sid);
+    if (s && s.status !== 'closed') store.closeSession(sid);
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
+  }),
+  closeSessionForBackgroundCleanup: vi.fn(async (sid: string) => {
     const reg = wp.registry;
     if (reg) {
       for (const [k, v] of reg) {
@@ -181,12 +195,14 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import {
+  persistStreamCardState,
   restoreActiveSessions,
   resumeSession,
   takeOverDurableActiveRemoteSession,
 } from '../src/core/session-manager.js';
 import {
   closeSession,
+  closeSessionForBackgroundCleanup,
   ensureOrdinaryTurnRecoveryAttached,
   forkWorker,
   forkAdoptWorker,
@@ -211,6 +227,7 @@ beforeEach(() => {
   sessionStore.init('app_test');
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(closeSessionForBackgroundCleanup).mockClear();
   vi.mocked(forkWorker).mockReset();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
@@ -487,7 +504,7 @@ describe('resumeSession', () => {
         backendType: 'remote-runner',
       });
       const map = new Map<string, DaemonSession>();
-      let onRemoteBackendStartupExit: (() => boolean) | undefined;
+      let onRemoteBackendStartupExit: (() => boolean | Promise<boolean>) | undefined;
       vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
         ds.worker = { killed: false };
         opts?.onAdmission?.('accepted');
@@ -498,11 +515,51 @@ describe('resumeSession', () => {
       const result = await resumeSession(closed.sessionId, map);
       expect(result.ok).toBe(true);
       expect(onRemoteBackendStartupExit).toBeTypeOf('function');
-      expect(onRemoteBackendStartupExit?.()).toBe(true);
+      await expect(onRemoteBackendStartupExit?.()).resolves.toBe(true);
 
       expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
       expect(map.size).toBe(0);
       expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('authoritatively closes an advanced replacement generation that exits before canonical commit', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        remoteBackendState: {
+          version: 1,
+          provider: 'test-runner',
+          generation: 2,
+          remoteSessionId: 'compute-old',
+        },
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      let onRemoteBackendStartupExit: (() => boolean | Promise<boolean>) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        ds.session.remoteBackendState = {
+          version: 1,
+          provider: 'test-runner',
+          generation: 3,
+          remoteSessionId: 'compute-new',
+        };
+        sessionStore.updateSession(ds.session);
+        opts?.onAdmission?.('accepted');
+        onRemoteBackendStartupExit = opts?.onRemoteBackendStartupExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      await expect(onRemoteBackendStartupExit?.()).resolves.toBe(true);
+
+      expect(closeSessionForBackgroundCleanup).toHaveBeenCalledWith(
+        closed.sessionId,
+        'remote resume provider-exit rollback',
+      );
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
     });
 
     it('reports reconciliation when a rejected remote resume cannot be closed again', async () => {
@@ -1516,6 +1573,47 @@ describe('resumeSession', () => {
 // `quarantinedActivationTailPromotion` flag the guard keys on (see the
 // 'registers a visible quarantined owner …' test above).
 
+
+describe('terminal keys panel state', () => {
+  it('keeps an open grid across a daemon restart and writes the next collapse to disk', async () => {
+    const s = sessionStore.createSession('oc_keys', 'om_keys', 'keys topic', 'group');
+    s.larkAppId = 'app_test';
+    s.scope = 'thread';
+    s.cliId = 'claude-code';
+    s.workingDir = '/tmp/proj';
+    s.streamKeysPanelOpen = true;
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+
+    await restoreActiveSessions(map);
+
+    const restored = map.get(sessionKey('om_keys', 'app_test'))!;
+    expect(restored.keysPanelOpen).toBe(true);
+    restored.keysPanelOpen = false;
+    persistStreamCardState(restored);
+    expect(sessionStore.getSessionFresh(s.sessionId)?.streamKeysPanelOpen).toBe(false);
+    restored.keysPanelOpen = true;
+    persistStreamCardState(restored);
+    expect(sessionStore.getSessionFresh(s.sessionId)?.streamKeysPanelOpen).toBe(true);
+  });
+
+  it('reopens a closed session with the grid state it was closed with', async () => {
+    const closed = makeClosedSession({ rootMessageId: 'om_keys_closed' });
+    const row = sessionStore.getSession(closed.sessionId)!;
+    row.streamKeysPanelOpen = true;
+    sessionStore.updateSession(row);
+    vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+
+    const result = await resumeSession(closed.sessionId, new Map());
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.ds.keysPanelOpen).toBe(true);
+  });
+});
 
 describe('resuming cleanup-archived Codex rows', () => {
   function archivedRow() {

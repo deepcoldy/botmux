@@ -12,18 +12,24 @@ import {
   V3_BLOCKED_RETRY_ACTION,
   V3_BLOCKED_ASK_ANSWER_ACTION,
   V3_BLOCKED_ASK_TEXT_FIELD,
+  V3_BLOCKED_REASSIGN_ACTION,
   buildV3BlockedCard,
+  buildV3BlockedCardForInfo,
   v3BlockedCardNonce,
   type V3BlockedActionValue,
   type V3AskAnswerActionValue,
+  type V3ReassignActionValue,
 } from './v3-blocked-card.js';
+import { handleV3BlockedReassign, type V3BlockedReassignDeps } from './v3-blocked-reassign.js';
 import { requestV3Retry, blockedInfoFor, readV3RunChatBinding } from '../../workflows/v3/daemon-run.js';
 import { readJournal } from '../../workflows/v3/journal.js';
 import { defaultBaseDir, type RunChatBinding } from '../../workflows/v3/grill-state.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3BlockedAction(action: unknown): boolean {
-  return action === V3_BLOCKED_RETRY_ACTION || action === V3_BLOCKED_ASK_ANSWER_ACTION;
+  return action === V3_BLOCKED_RETRY_ACTION
+    || action === V3_BLOCKED_ASK_ANSWER_ACTION
+    || action === V3_BLOCKED_REASSIGN_ACTION;
 }
 
 function isV3AskAnswerValue(
@@ -41,6 +47,9 @@ export interface V3BlockedCardHandlerDeps {
   canResolve?: (binding: RunChatBinding | undefined, operatorOpenId: string | undefined) => boolean;
   /** Injectable for tests. Default = real requestV3Retry. */
   requestRetry?: typeof requestV3Retry;
+  /** 「改派」 on bot-executed runs (live probe + names). Absent = the action
+   *  is refused. */
+  reassign?: V3BlockedReassignDeps;
 }
 
 /**
@@ -48,11 +57,20 @@ export interface V3BlockedCardHandlerDeps {
  * a frozen「已重试」card, or a `{ toast }`.  Triggers `driveRun` on success.
  */
 export async function handleV3BlockedAction(
-  value: V3BlockedActionValue | V3AskAnswerActionValue,
+  value: V3BlockedActionValue | V3AskAnswerActionValue | V3ReassignActionValue,
   operatorOpenId: string | undefined,
   deps: V3BlockedCardHandlerDeps,
   formValue?: Record<string, unknown>,
+  larkAppId?: string,
 ): Promise<unknown> {
+  if (value.action === V3_BLOCKED_REASSIGN_ACTION) {
+    return handleV3BlockedReassign(value, operatorOpenId, larkAppId, formValue, {
+      baseDir: deps.baseDir ?? defaultBaseDir(),
+      driveRun: deps.driveRun,
+      ...(deps.canResolve ? { canResolve: deps.canResolve } : {}),
+      ...(deps.reassign ? { reassign: deps.reassign } : {}),
+    });
+  }
   // 同一张卡两条 action：普通重试 / human-ask 选项答题。后者额外带 selected，
   // 走同一条 requestV3Retry 通道（带 answer），只是冻结卡渲染不同。
   const isAsk = isV3AskAnswerValue(value);
@@ -116,6 +134,21 @@ export async function handleV3BlockedAction(
     };
   }
 
+  if (outcome.kind === 'stale-run' && outcome.reason === 'revised') {
+    // The answer would reach an instance that no longer runs: turn the card
+    // into the voided state (no answer buttons; only the explicit re-run, which
+    // goes through the gate again) so nobody believes it was delivered.
+    const info = blockedInfoFor(readJournal(join(runDir, 'journal.ndjson')), value.nodeId);
+    return JSON.parse(buildV3BlockedCardForInfo(value.runId, {
+      ...info,
+      attemptId: value.attemptId,
+      askVoided: true,
+    }));
+  }
+  if (outcome.kind === 'stale-run' && outcome.reason === 'revision-pending') {
+    // Toast only: the card stays answerable once the proposal is decided.
+    return { toast: { type: 'warning', content: '这个节点有待确认的流程修改，请先处理修改确认卡' } };
+  }
   if (outcome.kind === 'stale-run') {
     return {
       toast: {

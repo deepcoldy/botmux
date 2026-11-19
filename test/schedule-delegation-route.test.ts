@@ -1,13 +1,33 @@
-import { readFileSync } from 'node:fs';
+import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { dispatchCallerFromReply, scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
-import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
+import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
-import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
+import { capabilityOn, parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { capabilityOfTool } from '../src/core/identity-policy.js';
+import { validateScheduleChildOneShot } from '../src/core/schedule-child-one-shot.js';
+import {
+  assertScheduledAuthorityCurrent,
+  authorizeScheduledTurn,
+  parseScheduledTurnId,
+  readScheduledTaskFromAuthority,
+} from '../src/core/scheduled-turn-provenance.js';
+import * as realScheduler from '../src/core/scheduler.js';
+import { parseSchedule } from '../src/core/scheduler.js';
+import { config } from '../src/config.js';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import * as scheduleStore from '../src/services/schedule-store.js';
+
+// A real directory: capabilityScheduleWorkingDir realpaths both sides.
+const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
 
 const source = ts.createSourceFile(
   'daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true,
@@ -19,16 +39,25 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
 const handler = (route.expression as ts.CallExpression).arguments[2];
 const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'scheduleCallerForTurn');
+const workingDirHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'capabilityScheduleWorkingDir');
 const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+${workingDirHelper?.getText(source) ?? ''}
 const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
+
+/** The audit argument every direct (session-bound) create must carry: the
+ *  server-side live turn, never a body value. */
+const DIRECT_TURN = { directTurn: {
+  turnId: 'om_kickoff', maxTasksPerTurn: SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+}, creatingTurn: { sessionId: 'target-session', turnId: 'om_kickoff' } };
 
 function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
-    workingDir: '/repo',
+    workingDir: REPO,
     session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root',
       replyTargets: { [turnId]: { rootMessageId: 'om_root' } } },
     workerGeneration: 7,
@@ -40,23 +69,32 @@ function harness(overrides: Record<string, unknown> = {}) {
   const body: any = {
     sessionId: 'target-session', originCapability: 'c'.repeat(64), originTurnId: turnId,
     task: { id: 'a1b2c3d4', name: 'poll', schedule: 'every 30m', prompt: 'check',
-      workingDir: '/repo', chatId: 'oc_chat', rootMessageId: 'om_root',
+      workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root',
       executionPosition: 'topic', larkAppId: 'cli_target' },
     ...overrides,
   };
-  const commitDelegatedTask = vi.fn(() => ({ ok: true, replay: false,
+  // Typed as the real result union so a test can stub a refusal.
+  const commitDelegatedTask = vi.fn((): { ok: boolean; replay?: boolean; task?: any; error?: string } => ({
+    ok: true, replay: false,
     task: { ...body.task, enabled: true, createdAt: '2026-09-28T00:00:00.000Z' } }));
   const scope: any = {
     readJsonBody: async () => body,
+    realpathSync, existsSync,
+    validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     findActiveBySessionId: () => ds,
     authorizeSessionScopedIpc,
-    isTrustedHostIpcRequest: () => false,
+    // The Remote Runner relay is a host re-exec that signs with the daemon
+    // secret; every other caller here is a capability-only (sandboxed) CLI.
+    isTrustedHostIpcRequest: () => body.remoteRunnerSessionTool === true,
     selfDaemonLarkAppId: 'cli_target',
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
+    matchingScheduleBotGrant,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
-    pickTurnReplyTarget, dispatchCallerFromReply,
+    pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
+    isSilentMessageListenerSession, messageListenerSendBlocked,
+    getMessageChatId: vi.fn(async (): Promise<string | null> => null),
     dispatchUserForTurn: async () => ({
       domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: turnId,
       sourceSessionId: 'source-session', sourceAppId: 'cli_source', sourceTurnId: 'om_human',
@@ -72,17 +110,76 @@ function harness(overrides: Record<string, unknown> = {}) {
     listChatMemberOpenIds: async () => ['ou_user_target'],
     resolveUnionIdFromOpenId: async () => 'on_user',
     computeInputHash,
+    validateScheduleChildOneShot,
+    assertScheduledAuthorityCurrent,
+    authorizeScheduledTurn,
+    parseScheduledTurnId,
+    readScheduledTaskFromAuthority,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-    TRIGGER_USER_AUTH_TOOLS,
+    capabilityOn,
+    capabilityOfTool,
     scheduleAuthorityStore: {},
     createHash,
-    scheduler: { commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
+    scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
   return { ds, body, scope, commitDelegatedTask, run: () => run({}, {}) };
 }
 
 describe('delegated schedule add route', () => {
+  it('redeems a bot grant only while the receiving host permits its exact scope', async () => {
+    const h = harness();
+    const original = h.scope.dispatchUserForTurn;
+    h.scope.dispatchUserForTurn = async () => {
+      const payload = await original();
+      payload.authority.capabilities[0].botGrantId = 'team';
+      return payload;
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_user' }] } });
+    expect((await h.run()).status).toBe(201);
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      grantId: 'bot-policy:cli_source:team:delivery-1:cli_target',
+      control: expect.objectContaining({ runScopes: [] }),
+    }));
+  });
+  describe('bot grant redemption', () => {
+    const policy = { createEnabled: true, botGrants: [{ id: 'team', sourceAppId: 'cli_source',
+      targetAppIds: ['cli_target'], chatIds: ['oc_chat'], controllerUnionId: 'on_user' }] };
+    const granted = (mutate: (payload: any) => void = () => {}) => {
+      const h = harness();
+      const original = h.scope.dispatchUserForTurn;
+      h.scope.dispatchUserForTurn = async () => {
+        const payload = await original();
+        payload.authority.capabilities[0].botGrantId = 'team';
+        mutate(payload);
+        return payload;
+      };
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: policy });
+      return h;
+    };
+    it('commits nothing when the grant is revoked while the controller is being resolved', async () => {
+      const h = granted();
+      h.scope.resolveTargetAppOpenId = async () => {
+        h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true } });
+        return { status: 'resolved', openId: 'ou_user_target' };
+      };
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+      expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    });
+    it.each([
+      ['a controller other than the grant\'s', (payload: any) => { payload.authority.unionId = 'on_other'; }],
+      ['personal tool credentials', (payload: any) => { payload.authority.tools = ['bytedcli']; }],
+      ['persistent run scopes', (payload: any) => { payload.authority.capabilities[0].allowedRunScopes = ['bytedcli']; }],
+    ])('refuses a signed bot-grant delegation that carries %s', async (_label, mutate) => {
+      const h = granted(mutate);
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+      expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    });
+  });
   it('aligns a Remote Runner bot turn with its provider-selected developer Actor', async () => {
     const h = harness({
       remoteRunnerSessionTool: true,
@@ -92,11 +189,25 @@ describe('delegated schedule add route', () => {
     h.scope.getBot = () => ({ config: {} });
     expect(await h.run()).toMatchObject({
       status: 201,
-      value: { task: { ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user' } },
+      value: { task: { owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' } } },
     });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
-    }));
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
+    }), DIRECT_TURN);
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a capability-only caller claiming the host Remote Runner relay', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.isTrustedHostIpcRequest = () => false;
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_session_tool_host_required' },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
@@ -195,6 +306,27 @@ describe('delegated schedule add route', () => {
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['lark-user and meego (bytedcli published for meego only)', ['lark-user', 'meego']],
+    ['bytecloud only', ['bytecloud']],
+  ])('requires target identity isolation for %s', async (_label, capabilities) => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities }) } });
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_delegation_target_identity_isolation_required' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('accepts a target that runs lark-user and bytecloud as the sender', async () => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: parseTriggerUserAuthConfig({
+      enabled: true, capabilities: ['lark-user', 'bytecloud'],
+    }) } });
+    expect((await h.run()).status).toBe(201);
+  });
+
   it('returns a clear forbidden response when the turn task limit is exhausted', async () => {
     const h = harness();
     h.commitDelegatedTask.mockReturnValue({ ok: false, error: 'grant_task_limit' });
@@ -239,6 +371,345 @@ describe('delegated schedule add route', () => {
   });
 });
 
+describe('scheduled turn one-shot child creation', () => {
+  const parentTaskId = 'b1c2d3e4';
+  const turnId = `schedule:${parentTaskId}:12345678-1234-1234-1234-123456789abc`;
+  const runAt = new Date(Date.now() + 10 * 60 * 60_000).toISOString();
+
+  function childHarness() {
+    const h = harness();
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = turnId;
+    h.ds.activeInteractiveTurn = undefined;
+    h.ds.scheduledTurnCallers = new Map([[turnId, {
+      senderType: 'user', source: 'schedule_creator', requestLarkAppId: 'cli_target',
+      requestUserOpenId: 'ou_user_target', requestUserUnionId: 'on_user', taskId: parentTaskId,
+    }]]);
+    Object.assign(h.body.task, {
+      schedule: runAt,
+      executionPosition: 'topic',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      workingDir: REPO,
+      larkAppId: 'cli_target',
+    });
+    const parent = {
+      kind: 'direct', state: 'active',
+      task: {
+        id: parentTaskId, name: 'parent', schedule: '0 0 * * *',
+        parsed: { kind: 'cron', expr: '0 0 * * *', display: 'daily' },
+        prompt: 'parent', workingDir: REPO, chatId: 'oc_chat', larkAppId: 'cli_target',
+        ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+        enabled: true, createdAt: '2026-11-01T00:00:00.000Z',
+      },
+      controlOpenId: 'ou_user_target', controlUnionId: 'on_user',
+      runScopes: [], selfManage: false,
+    };
+    h.scope.scheduleAuthorityStore = { getRecord: vi.fn(() => parent) };
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      childOneShotEnabled: true,
+      childOneShotMaxDelayMinutes: 24 * 60,
+      childOneShotMaxTasksPerTurn: 1,
+    } });
+    h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_user_target' }));
+    h.scope.getDashboardAdminOpenIds = () => ['ou_user_target'];
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_user_target']);
+    return { ...h, parent };
+  }
+
+  it('commits one ownerless child with a controller-bound tool identity in the current topic', async () => {
+    const h = childHarness();
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true, replay: false } });
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      grantId: expect.stringMatching(new RegExp(`^schedule-child:cli_target:${parentTaskId}:`)),
+      sourceMessageId: turnId,
+      sourceSessionId: 'target-session',
+      targetTurnId: turnId,
+      targetGeneration: 7,
+      maxTasksPerTurn: 1,
+      controllerBoundToolIdentity: true,
+      control: {
+        openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_target',
+        runScopes: [], selfManage: false,
+      },
+      params: expect.objectContaining({
+        larkAppId: 'cli_target', chatId: 'oc_chat', executionPosition: 'topic',
+        rootMessageId: 'om_root', workingDir: REPO,
+      }),
+    }));
+  });
+
+  it('is independent from cross-bot createEnabled but remains default-off', async () => {
+    const enabled = childHarness();
+    expect((await enabled.run()).status).toBe(201);
+    const disabled = childHarness();
+    disabled.scope.readGlobalConfig = () => ({ scheduleDelegation: {} });
+    expect(await disabled.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_disabled' },
+    });
+  });
+
+  it.each([
+    [{ schedule: '0 18 * * *' }, 'schedule_child_one_shot_requires_once'],
+    [{ chatId: 'oc_other' }, 'schedule_child_one_shot_scope_invalid'],
+    [{ rootMessageId: 'om_other' }, 'schedule_child_one_shot_scope_invalid'],
+    [{ workingDir: join(REPO, 'subdir') }, 'schedule_child_one_shot_scope_invalid'],
+    [{ executionPosition: 'top-level' }, 'schedule_child_one_shot_scope_invalid'],
+  ])('rejects child scope expansion %o', async (patch, error) => {
+    const h = childHarness();
+    if ('workingDir' in patch) mkdirSync(patch.workingDir as string, { recursive: true });
+    Object.assign(h.body.task, patch);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects grandchildren and parents whose controller can no longer act', async () => {
+    const descendant = childHarness();
+    descendant.parent.kind = 'delegated';
+    expect(await descendant.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_descendant_denied' },
+    });
+
+    const revoked = childHarness();
+    revoked.scope.getDashboardAdminOpenIds = () => [];
+    expect(await revoked.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+  });
+
+  it('requires identity isolation before committing the controller-bound child', async () => {
+    const h = childHarness();
+    h.scope.getBot = () => ({ config: {} });
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_identity_isolation_required' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('maps the per-turn authority-store quota to the child-specific refusal', async () => {
+    const h = childHarness();
+    h.commitDelegatedTask.mockReturnValue({ ok: false, error: 'grant_task_limit' });
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_task_limit' },
+    });
+  });
+
+  it('returns the original task on an idempotent retry', async () => {
+    const h = childHarness();
+    h.commitDelegatedTask.mockReturnValue({ ok: true, replay: true,
+      task: { ...h.body.task, id: 'deadbeef', enabled: true, createdAt: new Date().toISOString() } });
+    expect(await h.run()).toMatchObject({
+      status: 200, value: { ok: true, replay: true, task: { id: 'deadbeef' } },
+    });
+  });
+
+  it('rechecks parent authority and policy after asynchronous identity resolution', async () => {
+    const authorityChanged = childHarness();
+    let changed = false;
+    authorityChanged.scope.scheduleAuthorityStore.getRecord = vi.fn(() => changed
+      ? { ...authorityChanged.parent, state: 'paused', task: {
+        ...authorityChanged.parent.task, enabled: false, disabledReason: 'manual',
+      } }
+      : authorityChanged.parent);
+    authorityChanged.scope.resolveTargetAppOpenId = vi.fn(async () => {
+      changed = true;
+      return { status: 'resolved', openId: 'ou_user_target' };
+    });
+    expect(await authorityChanged.run()).toMatchObject({
+      status: 409, value: { error: 'schedule_child_one_shot_authority_changed' },
+    });
+    expect(authorityChanged.commitDelegatedTask).not.toHaveBeenCalled();
+
+    const policyRevoked = childHarness();
+    let enabled = true;
+    policyRevoked.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      childOneShotEnabled: enabled,
+      childOneShotMaxDelayMinutes: 24 * 60,
+      childOneShotMaxTasksPerTurn: 1,
+    } });
+    policyRevoked.scope.resolveTargetAppOpenId = vi.fn(async () => {
+      enabled = false;
+      return { status: 'resolved', openId: 'ou_user_target' };
+    });
+    expect(await policyRevoked.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_disabled' },
+    });
+    expect(policyRevoked.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('allows a live one-shot parent to create its final bounded child', async () => {
+    const h = childHarness();
+    Object.assign(h.parent, { state: 'completed' });
+    Object.assign(h.parent.task, {
+      schedule: '2026-11-14T00:00:00Z',
+      parsed: { kind: 'once', runAt: '2026-11-14T00:00:00Z', display: 'once' },
+      enabled: false,
+      disabledReason: 'once_completed',
+    });
+    expect((await h.run()).status).toBe(201);
+  });
+
+  it('refuses a completed one-shot parent once its scheduled turn is no longer live', async () => {
+    const h = childHarness();
+    Object.assign(h.parent, { state: 'completed' });
+    Object.assign(h.parent.task, {
+      schedule: '2026-11-14T00:00:00Z',
+      parsed: { kind: 'once', runAt: '2026-11-14T00:00:00Z', display: 'once' },
+      enabled: false,
+      disabledReason: 'once_completed',
+    });
+    // The worker already reported this turn terminal; the managed origin can
+    // still name it until the next turn starts.
+    h.ds.scheduledTurnCallers = undefined;
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a parent turn that runs as a claimant instead of the recorded controller', async () => {
+    const h = childHarness();
+    Object.assign(h.parent.task, { runAsClaim: {
+      openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: 'cli_target',
+      claimedAt: '2026-11-13T00:00:00.000Z',
+    } });
+    // Both people may operate the bot here; only the identity mismatch refuses.
+    h.scope.getDashboardAdminOpenIds = () => ['ou_user_target', 'ou_claimant'];
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_user_target', 'ou_claimant']);
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the controller union_id no longer resolves to the recorded open_id', async () => {
+    const h = childHarness();
+    h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_someone_else' }));
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed controller-bound tool identity before authority commit', () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-child-binding-')), 'data');
+    config.session.dataDir = dataDir;
+    scheduleStore.setScheduleScope('cli_target');
+    const store = ScheduleAuthorityStore.open(dataDir);
+    try {
+      store.initializeApp('cli_target', []);
+      realScheduler.setScheduleAuthorityStore(store);
+      const base = {
+        params: {
+          id: 'c0000001', name: 'child', schedule: 'every 30m', prompt: 'check',
+          workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root',
+          executionPosition: 'topic' as const, larkAppId: 'cli_target',
+        },
+        grantId: 'schedule-child:cli_target:parent01:schedule:parent01:run-1',
+        requestHash: 'hash-child',
+        control: {
+          openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_target',
+          runScopes: [] as const, selfManage: false,
+        },
+        sourceMessageId: 'om_source', sourceSessionId: 'source-session',
+        targetTurnId: 'schedule:parent01:12345678-1234-1234-1234-123456789abc',
+        targetGeneration: 1, maxTasksPerTurn: 1, controllerBoundToolIdentity: true,
+      };
+      const invalid = [
+        { controllerBoundToolIdentity: false },
+        { grantId: 'dispatch:delivery-1:cli_target' },
+        { control: { ...base.control, openId: '' } },
+        { control: { ...base.control, credentialOpenId: 'ou_other' } },
+        { control: { ...base.control, runScopes: ['bytedcli'] as const } },
+        { control: { ...base.control, selfManage: true } },
+      ];
+      for (const patch of invalid) {
+        expect(() => realScheduler.commitDelegatedTask({ ...base, ...patch }))
+          .toThrow('delegated_schedule_controller_binding_invalid');
+      }
+    } finally {
+      realScheduler.setScheduleAuthorityStore(null);
+      store.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(join(dataDir, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('keys the child quota to the exact scheduled turn in the real authority store', async () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-child-')), 'data');
+    config.session.dataDir = dataDir;
+    scheduleStore.setScheduleScope('cli_target');
+    const store = ScheduleAuthorityStore.open(dataDir);
+    try {
+      store.initializeApp('cli_target', []);
+      realScheduler.setScheduleAuthorityStore(store);
+      realScheduler.addTask({
+        id: parentTaskId, name: 'parent', schedule: '0 0 * * *', prompt: 'parent',
+        workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic',
+        larkAppId: 'cli_target', owner: { kind: 'human' as const, openId: 'ou_user_target', unionId: 'on_user' },
+      });
+      const h = childHarness();
+      h.scope.scheduleAuthorityStore = store;
+      h.scope.scheduler = { parseSchedule, commitDelegatedTask: realScheduler.commitDelegatedTask };
+      const atTurn = (id: string, live = true) => {
+        h.ds.managedTurnOrigin.turnId = h.body.originTurnId = id;
+        h.ds.scheduledTurnCallers = live
+          ? new Map([[id, { senderType: 'user', source: 'schedule_creator', requestLarkAppId: 'cli_target',
+            requestUserOpenId: 'ou_user_target', requestUserUnionId: 'on_user', taskId: parentTaskId }]])
+          : undefined;
+      };
+      const request = (clientId: string, prompt: string) => Object.assign(h.body.task, { id: clientId, prompt });
+
+      request('a0000001', 'recheck');
+      const first = await h.run();
+      expect(first).toMatchObject({ status: 201, value: { ok: true, replay: false } });
+      const childId = (first.value as { task: { id: string } }).task.id;
+      const childRecord = store.getRecord('cli_target', childId)!;
+      expect(childRecord).toMatchObject({
+        kind: 'delegated', state: 'active', controlOpenId: 'ou_user_target', controlUnionId: 'on_user',
+        runScopes: [], selfManage: false,
+      });
+      expect(childRecord.task).not.toHaveProperty('ownerOpenId');
+      expect(childRecord.task).not.toHaveProperty('ownerUnionId');
+      // A retry carries a fresh client id; the committed request is the same.
+      request('a0000002', 'recheck');
+      expect(await h.run()).toMatchObject({ status: 200, value: { replay: true, task: { id: childId } } });
+      request('a0000003', 'another recheck');
+      expect(await h.run()).toMatchObject({
+        status: 403, value: { error: 'schedule_child_one_shot_task_limit' },
+      });
+      // Deleting the child does not refill this turn's quota.
+      expect(realScheduler.removeTask(childId)).toBe(true);
+      request('a0000004', 'third recheck');
+      expect(await h.run()).toMatchObject({
+        status: 403, value: { error: 'schedule_child_one_shot_task_limit' },
+      });
+
+      // The next fire of the same parent, in the same session, has its own quota.
+      atTurn(`schedule:${parentTaskId}:22345678-1234-1234-1234-123456789abc`);
+      request('a0000005', 'another recheck');
+      const next = await h.run();
+      expect(next).toMatchObject({ status: 201, value: { ok: true, replay: false } });
+      const nextChildId = (next.value as { task: { id: string } }).task.id;
+      expect(nextChildId).not.toBe(childId);
+
+      // The child's controller-bound tool identity still cannot schedule a grandchild.
+      atTurn(`schedule:${nextChildId}:32345678-1234-1234-1234-123456789abc`, false);
+      request('a0000006', 'grandchild');
+      expect(await h.run()).toMatchObject({
+        status: 403, value: { error: 'schedule_child_one_shot_descendant_denied' },
+      });
+    } finally {
+      realScheduler.stopScheduler();
+      realScheduler.setScheduleAuthorityStore(null);
+      store.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(join(dataDir, '..'), { recursive: true, force: true });
+    }
+  });
+});
+
 function directHumanHarness() {
   const h = harness();
   h.scope.readGlobalConfig = () => ({});
@@ -252,12 +723,269 @@ function directHumanHarness() {
   return h;
 }
 
+describe('schedules created by a silent message listener task', () => {
+  function silentHarness() {
+    const h = directHumanHarness();
+    Object.assign(h.ds.session, { chatId: 'oc_chat', rootMessageId: 'ml:om_source',
+      messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' } });
+    return h;
+  }
+
+  it.each([
+    ['top-level', undefined],
+    ['new-topic', undefined],
+    ['topic', 'ml:om_source'],
+  ])('refuses a %s task in the source group', async (position, root) => {
+    const h = silentHarness();
+    h.body.task.executionPosition = position;
+    if (root) h.body.task.rootMessageId = root;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'silent_message_listener' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['lives in the source group', 'oc_chat'],
+    ['cannot be resolved', null],
+  ])('refuses a topic in another group whose root %s', async (_label, rootChatId) => {
+    const h = silentHarness();
+    h.scope.getMessageChatId = vi.fn(async () => rootChatId);
+    Object.assign(h.body.task, { chatId: 'oc_other', executionPosition: 'topic', rootMessageId: 'om_elsewhere' });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'silent_message_listener' } });
+    expect(h.scope.getMessageChatId).toHaveBeenCalledWith('cli_target', 'om_elsewhere');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit other group available', async () => {
+    const h = silentHarness();
+    h.body.task.chatId = 'oc_other';
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      chatId: 'oc_other', executionPosition: 'new-topic',
+    }), DIRECT_TURN);
+  });
+
+  it('keeps a topic in another group available', async () => {
+    const h = silentHarness();
+    h.scope.getMessageChatId = vi.fn(async () => 'oc_other');
+    Object.assign(h.body.task, { chatId: 'oc_other', executionPosition: 'topic', rootMessageId: 'om_other_topic' });
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      chatId: 'oc_other', rootMessageId: 'om_other_topic',
+    }), DIRECT_TURN);
+  });
+
+  it('leaves ordinary sessions without a root lookup', async () => {
+    const h = directHumanHarness();
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.getMessageChatId).not.toHaveBeenCalled();
+  });
+});
+
+describe('until-done schedule creation', () => {
+  const untilDone = { deadline: '2026-11-20T00:00:00.000Z' };
+
+  it('passes until-done and notify settings from a direct human turn to addTask', async () => {
+    const h = directHumanHarness();
+    h.body.task.untilDone = untilDone;
+    h.body.task.notify = ['failing', 'expired'];
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone, notify: ['failing', 'expired'], owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
+    }), DIRECT_TURN);
+  });
+
+  it('passes until-done settings from the host terminal to addTask', async () => {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.body.task.untilDone = { retryMinutes: 360 };
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone: { retryMinutes: 360 },
+    }));
+  });
+
+  it.each([
+    ['untilDone', untilDone],
+    ['notify', ['failing']],
+  ] as const)('keeps %s out of a bot-delegated grant', async (field, value) => {
+    const h = harness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['untilDone', 'tomorrow'],
+    ['untilDone', { deadline: 20261120 }],
+    ['untilDone', { retryMinutes: '6h' }],
+    ['notify', 'failing'],
+    ['notify', [1]],
+  ] as const)('rejects malformed %s %j before any commit', async (field, value) => {
+    const h = directHumanHarness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
 describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it('canonicalizes every session-bound create before storing it (relay and in-session host CLI)', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-canon-')));
+    const real = join(base, 'real');
+    mkdirSync(real);
+    const link = join(base, 'link');
+    symlinkSync(real, link);
+    // Remote Runner relay: the session records the lexical (symlinked) cwd.
+    const relay = directHumanHarness();
+    relay.ds.workingDir = link;
+    relay.body.remoteRunnerSessionTool = true;
+    relay.body.task.executionPosition = 'topic';
+    relay.body.task.rootMessageId = 'om_root';
+    relay.body.task.workingDir = link;
+    expect(await relay.run()).toMatchObject({ status: 201, value: { task: { workingDir: real } } });
+    // In-session CLI holding the host secret: no pin, still canonical.
+    const host = directHumanHarness();
+    host.scope.isTrustedHostIpcRequest = () => true;
+    host.body.task.workingDir = link;
+    expect(await host.run()).toMatchObject({ status: 201 });
+    expect(host.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: real }), DIRECT_TURN);
+  });
+
+  it('refuses a session-bound create naming a missing directory with the existing codes', async () => {
+    const missing = join(REPO, 'does-not-exist');
+    const host = directHumanHarness();
+    host.scope.isTrustedHostIpcRequest = () => true;
+    host.body.task.workingDir = missing;
+    expect(await host.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    const relay = directHumanHarness();
+    relay.body.remoteRunnerSessionTool = true;
+    relay.body.task.workingDir = missing;
+    expect(await relay.run()).toMatchObject({ status: 403, value: { error: 'schedule_session_tool_scope_invalid' } });
+  });
+
+  it('accepts the canonical cwd and its descendants when the session records a symlinked path', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-link-')));
+    const real = join(base, 'real');
+    mkdirSync(join(real, 'sub'), { recursive: true });
+    const link = join(base, 'link');
+    symlinkSync(real, link);
+    for (const requested of [real, join(real, 'sub'), join(link, 'sub')]) {
+      const h = directHumanHarness();
+      h.ds.workingDir = link; // lexical, as getSessionWorkingDir records it
+      h.body.task.workingDir = requested;
+      expect(await h.run()).toMatchObject({ status: 201 });
+      expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(
+        expect.objectContaining({ workingDir: realpathSync(requested) }), DIRECT_TURN);
+      expect(h.scope.validateRoleLibraryPath).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses a cwd entry that resolves outside the cwd, and a missing directory', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-esc-')));
+    const cwd = join(base, 'cwd');
+    mkdirSync(cwd);
+    symlinkSync(base, join(cwd, 'up'));
+    for (const requested of [join(cwd, 'up'), join(cwd, 'missing')]) {
+      const h = directHumanHarness();
+      h.ds.workingDir = cwd;
+      h.body.task.workingDir = requested;
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+      expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+    }
+  });
+
+  it('counts against the live turn, ignoring any turn the body claims', async () => {
+    const h = directHumanHarness();
+    h.body.turnId = 'om_forged';
+    h.body.targetTurnId = 'om_forged';
+    h.body.task.targetTurnId = 'om_forged';
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask.mock.calls[0][1]).toEqual(DIRECT_TURN);
+  });
+
+  it('maps the per-turn direct limit to 403', async () => {
+    const h = directHumanHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_direct_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_direct_task_limit' } });
+  });
+
+  it('does not limit the host-terminal (sessionless) create', async () => {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask.mock.calls[0]).toHaveLength(1);
+  });
+
+  it('refuses a capability-only caller pinning the task outside its cwd and own role library', async () => {
+    const h = directHumanHarness();
+    h.body.task.workingDir = '/Users/ksher';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    expect(h.scope.validateRoleLibraryPath).toHaveBeenCalledWith('/Users/ksher', undefined, 'cli_target');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('persists the resolved own-role-library path for a capability-only caller', async () => {
+    const h = directHumanHarness();
+    const roleDir = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-role-')));
+    h.body.task.workingDir = '~/botmux-roles/cli_target/shared/pm';
+    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: roleDir }));
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      workingDir: roleDir,
+    }), DIRECT_TURN);
+  });
+
+  it('lets the host pin any working directory', async () => {
+    const h = directHumanHarness();
+    const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-elsewhere-')));
+    h.body.task.workingDir = elsewhere;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: elsewhere }), DIRECT_TURN);
+  });
+
+  it('refuses a capability-only p2p caller aiming at a chat the operator is not in', async () => {
+    const h = directHumanHarness();
+    h.ds.chatType = 'p2p';
+    h.body.task.chatId = 'oc_elsewhere';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_someone_else']);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(h.scope.listChatMemberOpenIds).toHaveBeenCalledWith('cli_target', 'oc_elsewhere');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps a capability-only p2p caller free to schedule into its own chat', async () => {
+    const h = directHumanHarness();
+    h.ds.chatType = 'p2p';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => []);
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.listChatMemberOpenIds).not.toHaveBeenCalled();
+  });
+
+  it.each(['om_current_topic', 'om_explicit_destination'])('keeps creator notifications in the current topic when executing in %s', async root => {
+    const h = directHumanHarness();
+    h.ds.scope = h.ds.session.scope = 'chat';
+    h.ds.session.rootMessageId = 'om_unrelated_first_message';
+    h.ds.session.replyTargets.om_kickoff.rootMessageId = 'om_current_topic';
+    h.ds.session.currentReplyTarget = { turnId: 'om_queued', rootMessageId: 'om_queued_topic' };
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = root;
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    }), DIRECT_TURN);
+  });
+
   it.each(['thread', 'chat'] as const)('uses the exact human sender in %s scope with delegation disabled', async scope => {
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = scope;
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' }, executionPosition: 'new-topic',
     } } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
@@ -271,7 +999,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
       requestUserUnionId: 'on_active_user',
     } };
     h.ds.session.replyTargets = {};
-    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerUnionId: 'on_active_user' } } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { owner: { unionId: 'on_active_user' } } } });
   });
 
   it('accepts a Remote Runner session tool only inside its frozen chat, root, and working directory', async () => {
@@ -280,7 +1008,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     h.body.task.executionPosition = 'topic';
     h.body.task.rootMessageId = 'om_root';
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: '/repo',
+      chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: REPO,
     } } });
   });
 
@@ -380,6 +1108,49 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
   });
 });
 
+describe('auto-start-on-join first turn (join_ synthetic id)', () => {
+  const JOIN_TURN_ID = 'join_9f2b1caa-0000-4000-8000-000000000000';
+  function joinHarness() {
+    const h = directHumanHarness();
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = JOIN_TURN_ID;
+    // The registry entry handleBotAdded writes at session birth: the operator
+    // who added the bot, with the mention-safe incomplete window marker.
+    h.ds.session.replyTargets = {
+      [JOIN_TURN_ID]: {
+        senderOpenId: 'ou_user_target',
+        participants: [{ openId: 'ou_user_target', isBot: false }],
+        participantsIncomplete: true,
+        updatedAt: '2026-10-19T00:00:00.000Z',
+      },
+    };
+    return h;
+  }
+
+  it('resolves the operator who added the bot as the direct human creator', async () => {
+    const h = joinHarness();
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('still fails closed when the join turn entry carries no human sender', async () => {
+    const h = joinHarness();
+    h.ds.session.replyTargets = { [JOIN_TURN_ID]: { updatedAt: '2026-10-19T00:00:00.000Z' } };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_disabled' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['bmx-recovery-123', 'schedule:a1b2c3d4:run'])('keeps other synthetic prefixes excluded: %s', async turnId => {
+    const h = joinHarness();
+    h.ds.session.replyTargets[turnId] = h.ds.session.replyTargets[JOIN_TURN_ID];
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = turnId;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_disabled' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
 // Exercise the production IPC cases as well as the production route. External
 // side effects are stubbed; no live worker or daemon is started by this test.
 it('creates after same-turn revoke/republication without reviving the busy hint', async () => {
@@ -408,6 +1179,7 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
     currentGatewayCallerOpenId: (ds: any, turnId: string) => pickTurnReplyTarget(ds.session, turnId)?.senderOpenId,
     currentTurnProcessIdentities: () => undefined,
     noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(),
+    sessionController: undefined,
   };
   const dispatch = new Function('scope', 'msg', `with (scope) { ${ipcCode} }`);
   dispatch(scope, { type: 'managed_turn_origin_revoked', sessionId: 'target-session',
@@ -419,8 +1191,121 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
   h.body.originCapability = 'd'.repeat(64);
   expect(h.ds.managedTurnOrigin.callerOpenId).toBe('ou_user_target');
   expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-    ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+    owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' }, executionPosition: 'new-topic',
   } } });
   expect(h.ds.activeInteractiveTurn).toBeUndefined();
   expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
+});
+
+// `--run-as` on the host-terminal route: the host admin names a person, but the
+// person becomes the task's creator only after resolution in the executing
+// bot's own app namespace AND a live canOperate admission. Identity fields in
+// the request body are never trusted as-is.
+describe('host-terminal --run-as identity', () => {
+  function hostRunAsHarness(overrides: {
+    runAs?: unknown;
+    extraTask?: Record<string, unknown>;
+    canOperate?: boolean;
+    emailMap?: Map<string, string>;
+    unionId?: string | null;
+  } = {}) {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.body.task.executionPosition = 'top-level';
+    delete h.body.task.rootMessageId;
+    if (overrides.runAs !== undefined) h.body.task.runAs = overrides.runAs;
+    Object.assign(h.body.task, overrides.extraTask ?? {});
+    h.scope.resolveAllowedUsersWithMap = vi.fn(async () => ({
+      resolved: [], map: overrides.emailMap ?? new Map(), errored: false,
+      entryStatus: new Map(), definitiveMisses: [],
+    }));
+    h.scope.resolveUnionIdFromOpenId = vi.fn(async () =>
+      (overrides.unionId === undefined ? 'on_runner' : overrides.unionId));
+    h.scope.canOperate = vi.fn(() => overrides.canOperate ?? true);
+    return h;
+  }
+
+  function addTaskArg(h: ReturnType<typeof hostRunAsHarness>): Record<string, unknown> {
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledTimes(1);
+    return h.scope.scheduler.addTask.mock.calls[0][0] as Record<string, unknown>;
+  }
+
+  it('stamps a verified ou_ identity after the canOperate admission and never persists runAs', async () => {
+    const h = hostRunAsHarness({ runAs: 'ou_runner1' });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.canOperate).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_runner1', 'on_runner');
+    const arg = addTaskArg(h);
+    expect(arg).toMatchObject({
+      owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
+    });
+    expect(arg).not.toHaveProperty('runAs');
+  });
+
+  it('resolves an email to the bot-scoped open_id before admission', async () => {
+    const h = hostRunAsHarness({
+      runAs: 'runner@example.com',
+      emailMap: new Map([['runner@example.com', 'ou_from_email']]),
+    });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.resolveAllowedUsersWithMap)
+      .toHaveBeenCalledWith('cli_target', ['runner@example.com']);
+    expect(h.scope.resolveUnionIdFromOpenId).toHaveBeenCalledWith('cli_target', 'ou_from_email');
+    expect(addTaskArg(h)).toMatchObject({
+      owner: { kind: 'human', openId: 'ou_from_email', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
+    });
+  });
+
+  it('refuses 403 when the named person cannot operate the bot', async () => {
+    const h = hostRunAsHarness({ runAs: 'ou_runner1', canOperate: false });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_run_as_not_allowed' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses 403 when the email does not resolve for this app', async () => {
+    const h = hostRunAsHarness({ runAs: 'ghost@example.com', emailMap: new Map() });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_run_as_unresolved' } });
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses 403 when the open_id does not resolve to a union_id (foreign app / missing scope)', async () => {
+    const h = hostRunAsHarness({ runAs: 'ou_runner1', unionId: null });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_run_as_unresolved' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['bare word', 'badid'],
+    ['ou_ prefix only', 'ou_'],
+    ['whitespace inside', 'ou_has space'],
+    ['not an email', 'notanemail'],
+    ['non-string number', 123],
+    ['empty string', ''],
+  ])('rejects a malformed --run-as value with 400 (%s)', async (_label, runAs) => {
+    const h = hostRunAsHarness({ runAs: runAs as unknown });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_run_as_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('strips body-supplied ownerOpenId/ownerUnionId when no --run-as is given (ownerless host task)', async () => {
+    const h = hostRunAsHarness({ extraTask: { ownerOpenId: 'ou_evil', ownerUnionId: 'on_evil' } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    const arg = addTaskArg(h);
+    expect(arg.owner).toEqual({ kind: 'ownerless' });
+  });
+
+  it('lets a verified --run-as override body-supplied owner fields and creator app', async () => {
+    const h = hostRunAsHarness({
+      runAs: 'ou_runner1',
+      extraTask: {
+        ownerOpenId: 'ou_evil', ownerUnionId: 'on_evil',
+        creatorLarkAppId: 'cli_OTHER', creatorChatId: 'oc_other',
+      },
+    });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(addTaskArg(h)).toMatchObject({
+      owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
+    });
+  });
 });

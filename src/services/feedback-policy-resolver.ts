@@ -1,5 +1,5 @@
 import type { BotConfig } from '../bot-registry.js';
-import { normalizeFeedbackPolicy, validateReviewerEntries, type FeedbackPolicy } from './feedback-policy.js';
+import { normalizeFeedbackPolicy, validateButtonAlign, validateReviewerEntries, type FeedbackButtonAlign, type FeedbackPolicy } from './feedback-policy.js';
 import { getTeam } from './team-store.js';
 import { listTeamGroups } from './team-groups-store.js';
 
@@ -19,9 +19,10 @@ export interface FeedbackPolicyLayer {
     };
   };
   allowReselect?: boolean;
+  buttonAlign?: FeedbackButtonAlign;
 }
 
-const TOP_LEVEL = new Set(['enabled', 'audience', 'reviewers', 'visibleSemantics', 'buttons', 'negativeFollowup', 'allowReselect']);
+const TOP_LEVEL = new Set(['enabled', 'audience', 'reviewers', 'visibleSemantics', 'buttons', 'negativeFollowup', 'allowReselect', 'buttonAlign']);
 const FOLLOWUP = new Set(['reasons', 'comment']);
 const COMMENT = new Set(['enabled', 'required', 'placeholder', 'maxLength']);
 
@@ -42,6 +43,7 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('feedback.enabled must be boolean');
   if (input.audience !== undefined && input.audience !== 'requester' && input.audience !== 'reviewers' && input.audience !== 'everyone') throw new Error('feedback.audience must be requester, reviewers or everyone');
   if (input.allowReselect !== undefined && typeof input.allowReselect !== 'boolean') throw new Error('feedback.allowReselect must be boolean');
+  if (input.buttonAlign !== undefined) validateButtonAlign(input.buttonAlign);
   if (input.reviewers !== undefined && !Array.isArray(input.reviewers)) throw new Error('feedback.reviewers must be an array');
   if (input.visibleSemantics !== undefined && !Array.isArray(input.visibleSemantics)) throw new Error('feedback.visibleSemantics must be an array');
   if (input.buttons !== undefined && !Array.isArray(input.buttons)) throw new Error('feedback.buttons must be an array');
@@ -75,6 +77,7 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
     ...(input.buttons !== undefined ? { buttons: structuredClone(input.buttons) } : {}),
     ...(negativeFollowup !== undefined ? { negativeFollowup } : {}),
     ...(input.allowReselect !== undefined ? { allowReselect: input.allowReselect } : {}),
+    ...(input.buttonAlign !== undefined ? { buttonAlign: input.buttonAlign as FeedbackButtonAlign } : {}),
   };
 
   // Validate the reviewer allowlist FORMAT here (a partial layer may carry
@@ -94,7 +97,7 @@ export function normalizeFeedbackPolicyLayer(raw: unknown): FeedbackPolicyLayer 
 function mergeLayer(target: Record<string, unknown>, raw: FeedbackPolicyLayer | undefined): void {
   if (!raw) return;
   const layer = normalizeFeedbackPolicyLayer(raw);
-  for (const field of ['enabled', 'audience', 'reviewers', 'visibleSemantics', 'buttons', 'allowReselect'] as const) {
+  for (const field of ['enabled', 'audience', 'reviewers', 'visibleSemantics', 'buttons', 'allowReselect', 'buttonAlign'] as const) {
     if (layer[field] !== undefined) target[field] = structuredClone(layer[field]);
   }
   if (layer.negativeFollowup) {
@@ -120,10 +123,10 @@ export function resolveEffectiveFeedbackPolicy(input: {
   mergeLayer(merged, input.bot);
   mergeLayer(merged, input.chat);
   if (merged.enabled !== true) return undefined;
-  // Individually-valid layers can still merge into an invalid whole — most
-  // notably `audience: 'reviewers'` with an empty reviewers allowlist once the
-  // layers are combined. Fail closed (feedback simply not shown) rather than
-  // letting the throw propagate to the unguarded worker-spawn delivery path.
+  // Individually-valid layers can still merge into an invalid whole (for
+  // example, a reviewers allowlist paired with another audience). Fail closed
+  // rather than letting the throw propagate to worker-spawn delivery. An empty
+  // reviewers allowlist is valid and remains visible but unclickable.
   try {
     return structuredClone(normalizeFeedbackPolicy(merged));
   } catch {

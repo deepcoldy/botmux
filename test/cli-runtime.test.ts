@@ -121,6 +121,20 @@ describe('normalizeCliRuntimeConfig', () => {
 });
 
 describe('resolveCliRuntime', () => {
+  it('keeps CodeM distribution identity while using the Kimi interaction contract', () => {
+    const runtime = resolveCliRuntime({
+      cliId: 'kimi',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' } },
+      cliPathOverride: '/opt/bin/codem-wrapper',
+    });
+    expect(runtime).toMatchObject({
+      id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper',
+      source: 'configured', update: { provider: 'none' },
+    });
+    expect(runtimePathOverride(runtime)).toBe('/opt/bin/codem-wrapper');
+    expect(resolveCliRuntime({ cliId: 'kimi' })).toBeUndefined();
+  });
+
   it('resolves plain Codex to the official runtime with its internal update source', () => {
     const runtime = resolveCliRuntime({ cliId: 'codex' });
     expect(runtime).toEqual({

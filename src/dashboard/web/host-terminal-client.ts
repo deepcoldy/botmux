@@ -638,7 +638,7 @@ export class HostTerminalView {
     this.onChange();
   }
 
-  private sendBytes(bytes: Uint8Array): void {
+  private sendBytes(bytes: Uint8Array<ArrayBuffer>): void {
     if (this.ws?.readyState === WebSocket.OPEN && bytes.length) this.ws.send(bytes);
   }
 

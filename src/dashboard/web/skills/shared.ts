@@ -6,7 +6,6 @@ export function nativeLibraryLabel(path: string | undefined, tr: (key: string) =
   if (p.includes('/.claude/skills/')) return tr('skills.sourceClaude');
   if (p.includes('/.trae/skills/')) return tr('skills.sourceTrae');
   if (p.includes('/.cursor/skills/')) return tr('skills.sourceCursor');
-  if (p.includes('/.gemini/skills/')) return tr('skills.sourceGemini');
   if (p.includes('/.config/opencode/skills/')) return tr('skills.sourceOpenCode');
   return null;
 }

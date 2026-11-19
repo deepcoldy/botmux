@@ -1,6 +1,8 @@
 /**
- * grant-store 持久化语义单测。
- * Run: pnpm vitest run test/grant-store.test.ts
+ * grant-store 持久化语义单测。两个持久层后端（bots.json / SQLite 授权库）跑同一套用例：
+ * 预置状态一律写进 bots.json —— SQLite 后端在 initGrantStateForDaemon 时把它并入授权库，
+ * 因此每条用例也顺带走了一遍迁移导入。授权字段的断言经 readGrants() 读当前后端。
+ * Run: bun run vitest run test/grant-store.test.ts
  */
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,12 +15,17 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 let configPath: string;
+let dataDir: string;
+let backend: 'bots-json' | 'sqlite';
+let grantStateStore: typeof import('../src/services/grant-state-store.js');
 
 async function freshModules() {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
   const store = await import('../src/services/grant-store.js');
+  grantStateStore = await import('../src/services/grant-state-store.js');
   registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+  if (backend === 'sqlite') await grantStateStore.initGrantStateForDaemon({ larkAppId: 'a1', dataDir });
   return { registry, store };
 }
 
@@ -26,16 +33,28 @@ function writeConfig(entry: Record<string, unknown>) {
   writeFileSync(configPath, JSON.stringify([{ larkAppId: 'a1', larkAppSecret: 's', cliId: 'claude-code', ...entry }], null, 2), 'utf-8');
 }
 function readConfig(): any { return JSON.parse(readFileSync(configPath, 'utf-8'))[0]; }
+/** 当前后端里持久化的授权状态（bots.json 后端直接取条目上的原始字段）。 */
+function readGrants(): any {
+  if (backend === 'bots-json') {
+    const { chatGrants, globalGrants, quotaState, grantExpiryState, dispatchLaunchQuotaReceipts } = readConfig();
+    return { chatGrants, globalGrants, quotaState, grantExpiryState, dispatchLaunchQuotaReceipts };
+  }
+  const db = grantStateStore.SqliteGrantStateStore.open(dataDir);
+  try { return db.loadState('a1'); } finally { db.close(); }
+}
 
 beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-store-'));
   configPath = join(dir, 'bots.json');
+  dataDir = dir;
   process.env.BOTS_CONFIG = configPath;
-  process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it)
+  process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it) + grants.sqlite
 });
 afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; vi.restoreAllMocks(); });
 
-describe('grant-store', () => {
+describe.each(['bots-json', 'sqlite'] as const)('grant-store [%s]', (kind) => {
+  beforeEach(() => { backend = kind; });
+
   it('addChatGrant persists & syncs in-memory; only affects given chat', async () => {
     writeConfig({
       allowedUsers: ['ou_owner'],
@@ -45,11 +64,11 @@ describe('grant-store', () => {
     const { registry, store } = await freshModules();
     const r = await store.addChatGrant('a1', 'oc_1', 'ou_guest');
     expect(r).toEqual({ ok: true, created: true });
-    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_guest'] });
+    expect(readGrants().chatGrants).toEqual({ oc_1: ['ou_guest'] });
     expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_guest'] });
     expect(readConfig().allowedUsers).toEqual(['ou_owner']);
     expect(readConfig().allowedChatGroups).toEqual(['oc_existing']);
-    expect(readConfig().globalGrants).toEqual(['ou_existing_global']);
+    expect(readGrants().globalGrants).toEqual(['ou_existing_global']);
     // idempotent
     expect(await store.addChatGrant('a1', 'oc_1', 'ou_guest')).toEqual({ ok: true, created: false });
   });
@@ -73,11 +92,10 @@ describe('grant-store', () => {
     const { registry, store } = await freshModules();
     const r = await store.revokeGrant('a1', 'oc_1', 'ou_guest');
     expect(r).toEqual({ ok: true, removed: { chat: true, global: true, globalTalk: false } });
-    const disk = readConfig();
-    expect(disk.allowedUsers).toEqual(['ou_owner']);
-    expect(disk.chatGrants).toEqual({});
+    expect(readConfig().allowedUsers).toEqual(['ou_owner']);
+    expect(readGrants().chatGrants).toBeUndefined();
     expect(registry.getBot('a1').resolvedAllowedUsers).toEqual(['ou_owner']);
-    expect(registry.getBot('a1').config.chatGrants).toEqual({});
+    expect(registry.getBot('a1').config.chatGrants).toBeUndefined();
   });
 
   it('revokeGrant deletes email raw entry via resolution map', async () => {
@@ -124,12 +142,12 @@ describe('grant-store', () => {
     const { registry, store } = await freshModules();
     const r = await store.addGlobalGrant('a1', 'ou_peer_bot');
     expect(r).toEqual({ ok: true, created: true });
-    expect(readConfig().globalGrants).toEqual(['ou_peer_bot']);
+    expect(readGrants().globalGrants).toEqual(['ou_peer_bot']);
     expect(registry.getBot('a1').config.globalGrants).toEqual(['ou_peer_bot']);
     expect(readConfig().allowedUsers).toEqual(['ou_owner']);  // talk-only: operate tier untouched
     // idempotent
     expect(await store.addGlobalGrant('a1', 'ou_peer_bot')).toEqual({ ok: true, created: false });
-    expect(readConfig().globalGrants).toEqual(['ou_peer_bot']);
+    expect(readGrants().globalGrants).toEqual(['ou_peer_bot']);
   });
 
   it('revokeGrant removes a globalGrants-only target (globalTalk), not blocked by would_open guard', async () => {
@@ -138,7 +156,7 @@ describe('grant-store', () => {
     const { registry, store } = await freshModules();
     const r = await store.revokeGrant('a1', 'oc_x', 'ou_peer');
     expect(r).toEqual({ ok: true, removed: { chat: false, global: false, globalTalk: true } });
-    expect(readConfig().globalGrants).toEqual(['ou_other']);
+    expect(readGrants().globalGrants).toEqual(['ou_other']);
     expect(registry.getBot('a1').config.globalGrants).toEqual(['ou_other']);
     expect(readConfig().allowedUsers).toEqual(['ou_owner']);  // untouched
   });
@@ -148,7 +166,7 @@ describe('grant-store', () => {
     const { registry, store } = await freshModules();
     const r = await store.revokeGrant('a1', 'oc_x', 'ou_solo');
     expect(r.ok).toBe(true);
-    expect(readConfig().globalGrants).toBeUndefined();
+    expect(readGrants().globalGrants).toBeUndefined();
     expect(registry.getBot('a1').config.globalGrants).toBeUndefined();
   });
 
@@ -177,7 +195,9 @@ describe('grant-store', () => {
 
 });
 
-describe('grant-store message quota', () => {
+describe.each(['bots-json', 'sqlite'] as const)('grant-store message quota [%s]', (kind) => {
+  beforeEach(() => { backend = kind; });
+
   it('charges a dispatch launch receipt exactly once across repeated calls', async () => {
     const quotaKey = 'chat:oc_1:ou_g';
     writeConfig({
@@ -191,8 +211,8 @@ describe('grant-store message quota', () => {
     };
     expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: true });
     expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: true });
-    expect(readConfig().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
-    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'1'.repeat(32)}`]).toMatchObject({ allow: true });
+    expect(readGrants().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readGrants().dispatchLaunchQuotaReceipts[`quota_${'1'.repeat(32)}`]).toMatchObject({ allow: true });
     expect(registry.getBot('a1').config.quotaState?.[quotaKey]).toEqual({ limit: 3, used: 1 });
   });
 
@@ -209,8 +229,8 @@ describe('grant-store message quota', () => {
     };
     expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: false });
     expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: false });
-    expect(readConfig().quotaState[quotaKey]).toEqual({ limit: 2, used: 2 });
-    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'2'.repeat(32)}`]).toMatchObject({ allow: false });
+    expect(readGrants().quotaState[quotaKey]).toEqual({ limit: 2, used: 2 });
+    expect(readGrants().dispatchLaunchQuotaReceipts[`quota_${'2'.repeat(32)}`]).toMatchObject({ allow: false });
   });
 
   it('fails closed when the frozen dispatch quota key no longer has its grant', async () => {
@@ -220,8 +240,8 @@ describe('grant-store message quota', () => {
     expect(await store.consumeDispatchLaunchQuotaOnce({
       larkAppId: 'a1', quotaKey, receiptId: `quota_${'4'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
     })).toEqual({ allow: false });
-    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'4'.repeat(32)}`]).toMatchObject({ allow: false });
-    expect(readConfig().quotaState).toBeUndefined();
+    expect(readGrants().dispatchLaunchQuotaReceipts[`quota_${'4'.repeat(32)}`]).toMatchObject({ allow: false });
+    expect(readGrants().quotaState).toBeUndefined();
   });
 
   it('atomically exhausts finite dispatch quota and revokes the matching chat grant', async () => {
@@ -236,9 +256,9 @@ describe('grant-store message quota', () => {
     expect(await store.consumeDispatchLaunchQuotaOnce({
       larkAppId: 'a1', quotaKey, receiptId: `quota_${'3'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
     })).toEqual({ allow: true });
-    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_other'] });
-    expect(readConfig().quotaState).toBeUndefined();
-    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(readGrants().chatGrants).toEqual({ oc_1: ['ou_other'] });
+    expect(readGrants().quotaState).toBeUndefined();
+    expect(readGrants().grantExpiryState).toBeUndefined();
     expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_other'] });
     expect(registry.getBot('a1').config.dispatchLaunchQuotaReceipts?.[`quota_${'3'.repeat(32)}`]).toMatchObject({ allow: true });
   });
@@ -248,10 +268,10 @@ describe('grant-store message quota', () => {
     const { registry, store } = await freshModules();
     const expiresAt = Date.now() + 60_000;
     await store.addChatGrant('a1', 'oc_1', 'ou_g', 3, expiresAt);
-    expect(readConfig().grantExpiryState).toEqual({ 'chat:oc_1:ou_g': { expiresAt } });
+    expect(readGrants().grantExpiryState).toEqual({ 'chat:oc_1:ou_g': { expiresAt } });
     expect(registry.getBot('a1').config.grantExpiryState).toEqual({ 'chat:oc_1:ou_g': { expiresAt } });
     await store.addChatGrant('a1', 'oc_1', 'ou_g', 3);
-    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(readGrants().grantExpiryState).toBeUndefined();
     expect(registry.getBot('a1').config.grantExpiryState).toBeUndefined();
   });
 
@@ -267,16 +287,34 @@ describe('grant-store message quota', () => {
     expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
     expect(await store.removeExpiredGrant('a1', 'chat', 'oc_1', 'ou_g', renewedAt, renewedAt))
       .toEqual({ ok: true, removed: true });
-    expect(readConfig().chatGrants).toEqual({});
-    expect(readConfig().quotaState).toBeUndefined();
-    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(readGrants().chatGrants).toBeUndefined();
+    expect(readGrants().quotaState).toBeUndefined();
+    expect(readGrants().grantExpiryState).toBeUndefined();
+  });
+
+  it('expired cleanup holding a stale observed expiry cannot remove a grant renewed as permanent', async () => {
+    // 清理方（下一条消息 / 定时清扫）观察到旧的过期值后，owner 把授权续成永久：有效期记录已删，
+    // 当前值为空 ≠ 观察值 → 绝不能删成员。只判「当前是否在未来」的实现会在这里误删。
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    const expiredAt = Date.now() - 1;
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', undefined, expiredAt);
+    await store.addChatGrant('a1', 'oc_1', 'ou_g'); // 续成永久
+    expect(await store.removeExpiredGrant('a1', 'chat', 'oc_1', 'ou_g', expiredAt)).toEqual({ ok: true, removed: false });
+    expect(readGrants().chatGrants).toEqual({ oc_1: ['ou_g'] });
+    expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
+    // 同理覆盖 global scope
+    await store.addGlobalGrant('a1', 'ou_g', undefined, expiredAt);
+    await store.addGlobalGrant('a1', 'ou_g');
+    expect(await store.removeExpiredGrant('a1', 'global', undefined, 'ou_g', expiredAt)).toEqual({ ok: true, removed: false });
+    expect(readGrants().globalGrants).toEqual(['ou_g']);
   });
 
   it('addChatGrant with quota writes a scope-aware quotaState record (disk + memory)', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();
     await store.addChatGrant('a1', 'oc_1', 'ou_g', 5);
-    expect(readConfig().quotaState).toEqual({ 'chat:oc_1:ou_g': { limit: 5, used: 0 } });
+    expect(readGrants().quotaState).toEqual({ 'chat:oc_1:ou_g': { limit: 5, used: 0 } });
     expect(registry.getBot('a1').config.quotaState).toEqual({ 'chat:oc_1:ou_g': { limit: 5, used: 0 } });
   });
 
@@ -286,18 +324,18 @@ describe('grant-store message quota', () => {
     await store.addChatGrant('a1', 'oc_1', 'ou_g', 5);
     await store.consumeQuota('a1', 'chat:oc_1:ou_g');
     await store.consumeQuota('a1', 'chat:oc_1:ou_g');
-    expect(readConfig().quotaState['chat:oc_1:ou_g'].used).toBe(2);
+    expect(readGrants().quotaState['chat:oc_1:ou_g'].used).toBe(2);
     await store.addChatGrant('a1', 'oc_1', 'ou_g', 3); // refill
-    expect(readConfig().quotaState['chat:oc_1:ou_g']).toEqual({ limit: 3, used: 0 });
+    expect(readGrants().quotaState['chat:oc_1:ou_g']).toEqual({ limit: 3, used: 0 });
     await store.addChatGrant('a1', 'oc_1', 'ou_g'); // no quota → unlimited (record gone)
-    expect(readConfig().quotaState).toBeUndefined();
+    expect(readGrants().quotaState).toBeUndefined();
   });
 
   it('addGlobalGrant with quota uses the global key', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { store } = await freshModules();
     await store.addGlobalGrant('a1', 'ou_g', 7);
-    expect(readConfig().quotaState).toEqual({ 'global:ou_g': { limit: 7, used: 0 } });
+    expect(readGrants().quotaState).toEqual({ 'global:ou_g': { limit: 7, used: 0 } });
   });
 
   it('consumeQuota: tracked=false when no record; increments; exhausted on last; allow=false past limit', async () => {
@@ -325,10 +363,10 @@ describe('grant-store message quota', () => {
     const { registry, store } = await freshModules();
     const r = await store.consumeQuota('a1', qk, 7, { scope: 'chat', chatId: 'oc_1', openId: 'ou_x', now: 5000 });
     expect(r).toMatchObject({ tracked: true, allow: true, used: 1, limit: 7 }); // 回落 default，不再看到 {2,2}
-    expect(readConfig().chatGrants).toEqual({});                 // 成员原子清掉（磁盘）
-    expect(registry.getBot('a1').config.chatGrants).toEqual({}); // 内存一致
-    expect(readConfig().grantExpiryState).toBeUndefined();
-    expect(readConfig().quotaState).toEqual({ [qk]: { limit: 7, used: 1 } });
+    expect(readGrants().chatGrants).toBeUndefined();                 // 成员原子清掉（磁盘）
+    expect(registry.getBot('a1').config.chatGrants).toBeUndefined(); // 内存一致
+    expect(readGrants().grantExpiryState).toBeUndefined();
+    expect(readGrants().quotaState).toEqual({ [qk]: { limit: 7, used: 1 } });
   });
 
   it('consumeQuota(expiredGrant) renewed-to-UNLIMITED (future expiry, still member): stays unlimited, def NOT applied', async () => {
@@ -344,8 +382,8 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     const r = await store.consumeQuota('a1', qk, 7, { scope: 'chat', chatId: 'oc_1', openId: 'ou_x', now: 5000 });
     expect(r).toMatchObject({ tracked: false, allow: true });    // 保持不限，未被 def=7 套回
-    expect(readConfig().quotaState).toBeUndefined();             // 没被 lazy-init 成 {7,1}
-    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_x'] }); // live 成员保留（续期未过期，不误清）
+    expect(readGrants().quotaState).toBeUndefined();             // 没被 lazy-init 成 {7,1}
+    expect(readGrants().chatGrants).toEqual({ oc_1: ['ou_x'] }); // live 成员保留（续期未过期，不误清）
   });
 
   it('consumeQuota(expiredGrant) renewed-to-FINITE-N (future expiry): consumes existing record, def NOT applied', async () => {
@@ -361,7 +399,7 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     const r = await store.consumeQuota('a1', qk, 7, { scope: 'chat', chatId: 'oc_1', openId: 'ou_x', now: 5000 });
     expect(r).toMatchObject({ tracked: true, allow: true, used: 2, limit: 5 }); // 消费现有 {5}，非 7
-    expect(readConfig().grantExpiryState).toEqual({ [qk]: { expiresAt: 99999 } }); // 新 expiry 未动
+    expect(readGrants().grantExpiryState).toEqual({ [qk]: { expiresAt: 99999 } }); // 新 expiry 未动
   });
 
   it('consumeQuota(expiredGrant) grant ALREADY CLEANED (member absent, no expiry) + no rec → falls to default {7,1}', async () => {
@@ -375,7 +413,7 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     const r = await store.consumeQuota('a1', qk, 7, { scope: 'chat', chatId: 'oc_1', openId: 'ou_x', now: 5000 });
     expect(r).toMatchObject({ tracked: true, allow: true, used: 1, limit: 7 }); // 回落 oncall default，非免费不限
-    expect(readConfig().quotaState).toEqual({ [qk]: { limit: 7, used: 1 } });
+    expect(readGrants().quotaState).toEqual({ [qk]: { limit: 7, used: 1 } });
   });
 
   it('consumeQuota(expiredGrant) member absent + existing oncall rec → normal increment (not reset)', async () => {
@@ -405,10 +443,10 @@ describe('grant-store message quota', () => {
     const r = await store.consumeQuota('a1', qk, 7, { scope: 'chat', chatId: 'oc_1', openId: 'ou_x', now: 5000 });
     // 本条即清三样并回落 default，绝不被陈旧 {2,2} 误拒
     expect(r).toMatchObject({ tracked: true, allow: true, used: 1, limit: 7 });
-    expect(readConfig().chatGrants).toEqual({});                 // 成员清掉（磁盘）
-    expect(registry.getBot('a1').config.chatGrants).toEqual({}); // 内存一致
-    expect(readConfig().quotaState).toEqual({ [qk]: { limit: 7, used: 1 } });
-    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(readGrants().chatGrants).toBeUndefined();                 // 成员清掉（磁盘）
+    expect(registry.getBot('a1').config.chatGrants).toBeUndefined(); // 内存一致
+    expect(readGrants().quotaState).toEqual({ [qk]: { limit: 7, used: 1 } });
+    expect(readGrants().grantExpiryState).toBeUndefined();
   });
 
   it('consumeQuota(expiredGrant) current expiry in the FUTURE (renewed) + no rec → stays unlimited (live, def NOT applied)', async () => {
@@ -422,8 +460,8 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     const r = await store.consumeQuota('a1', qk, 7, { scope: 'chat', chatId: 'oc_1', openId: 'ou_x', now: 5000 });
     expect(r).toMatchObject({ tracked: false, allow: true });    // live 续期，保持不限
-    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_x'] }); // 成员保留（未误清）
-    expect(readConfig().grantExpiryState).toEqual({ [qk]: { expiresAt: 99999 } });
+    expect(readGrants().chatGrants).toEqual({ oc_1: ['ou_x'] }); // 成员保留（未误清）
+    expect(readGrants().grantExpiryState).toEqual({ [qk]: { expiresAt: 99999 } });
   });
 
   it('removeExpiredGrant standalone still atomically clears finite/unlimited (grantNotExpired path)', async () => {
@@ -439,15 +477,40 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     expect(await store.removeExpiredGrant('a1', 'chat', 'oc_1', 'ou_y', 1000, 5000))
       .toEqual({ ok: true, removed: true });
-    expect(readConfig().chatGrants).toEqual({});
-    expect(readConfig().quotaState).toBeUndefined();
-    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(readGrants().chatGrants).toBeUndefined();
+    expect(readGrants().quotaState).toBeUndefined();
+    expect(readGrants().grantExpiryState).toBeUndefined();
     // CAS no-op 反向保护：旧 observed 不误删续期授权
     writeConfig({ allowedUsers: ['ou_owner'], chatGrants: { oc_2: ['ou_z'] }, grantExpiryState: { 'chat:oc_2:ou_z': { expiresAt: 9999 } } });
     const { store: store2 } = await freshModules();
     expect(await store2.removeExpiredGrant('a1', 'chat', 'oc_2', 'ou_z', 1000, 5000))
       .toEqual({ ok: true, removed: false });
-    expect(readConfig().chatGrants).toEqual({ oc_2: ['ou_z'] });
+    expect(readGrants().chatGrants).toEqual({ oc_2: ['ou_z'] });
+  });
+
+  it('sweepExpiredGrants clears every expired grant (member + quota + expiry) and keeps live/permanent ones', async () => {
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_old', 'ou_live'], oc_2: ['ou_perm'] },
+      globalGrants: ['ou_gold'],
+      quotaState: { 'chat:oc_1:ou_old': { limit: 3, used: 1 }, 'global:ou_gold': { limit: 2, used: 0 } },
+      grantExpiryState: {
+        'chat:oc_1:ou_old': { expiresAt: 1000 },
+        'chat:oc_1:ou_live': { expiresAt: 9000 },
+        'global:ou_gold': { expiresAt: 2000 },
+        'chat:oc_3:ou_gone': { expiresAt: 1500 }, // 成员早已不在，只剩有效期记录
+      },
+    });
+    const { registry, store } = await freshModules();
+    expect(await store.sweepExpiredGrants('a1', 5000)).toBe(2); // 只剩有效期记录的那条照样清掉，但不算撤销
+    const grants = readGrants();
+    expect(grants.chatGrants).toEqual({ oc_1: ['ou_live'], oc_2: ['ou_perm'] });
+    expect(grants.globalGrants).toBeUndefined();
+    expect(grants.quotaState).toBeUndefined();
+    expect(grants.grantExpiryState).toEqual({ 'chat:oc_1:ou_live': { expiresAt: 9000 } });
+    expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_live'], oc_2: ['ou_perm'] });
+    expect(registry.getBot('a1').config.globalGrants).toBeUndefined();
+    expect(await store.sweepExpiredGrants('a1', 5000)).toBe(0);
   });
 
   it('removeChatGrant clears only the chat grant + its quota key, leaves global intact', async () => {
@@ -456,8 +519,8 @@ describe('grant-store message quota', () => {
     const { registry, store } = await freshModules();
     const r = await store.removeChatGrant('a1', 'oc_1', 'ou_g');
     expect(r).toEqual({ ok: true, removed: true });
-    const disk = readConfig();
-    expect(disk.chatGrants).toEqual({});
+    const disk = readGrants();
+    expect(disk.chatGrants).toBeUndefined();
     expect(disk.globalGrants).toEqual(['ou_g']);       // global untouched
     expect(disk.quotaState).toEqual({ 'global:ou_g': { limit: 9, used: 2 } });
     expect(registry.getBot('a1').config.quotaState).toEqual({ 'global:ou_g': { limit: 9, used: 2 } });
@@ -469,8 +532,8 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     const r = await store.removeGlobalGrant('a1', 'ou_g');
     expect(r).toEqual({ ok: true, removed: true });
-    expect(readConfig().globalGrants).toEqual(['ou_other']);
-    expect(readConfig().quotaState).toBeUndefined();
+    expect(readGrants().globalGrants).toEqual(['ou_other']);
+    expect(readGrants().quotaState).toBeUndefined();
   });
 
   it('manual revokeGrant also clears both scope quota keys for the target', async () => {
@@ -479,7 +542,7 @@ describe('grant-store message quota', () => {
     const { store } = await freshModules();
     const r = await store.revokeGrant('a1', 'oc_1', 'ou_g');
     expect(r.ok).toBe(true);
-    expect(readConfig().quotaState).toBeUndefined();
+    expect(readGrants().quotaState).toBeUndefined();
   });
 
   it('exposes scope-aware key builders', async () => {

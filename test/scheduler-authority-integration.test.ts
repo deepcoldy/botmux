@@ -1,18 +1,31 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
+import { logger } from '../src/utils/logger.js';
+import type { ScheduledTask } from '../src/types.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
+import * as preconditionStore from '../src/services/schedule-precondition-store.js';
+import { createTaskWithOptionalPrecondition, updateTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
+import { executeScheduledTaskWithPrecondition } from '../src/services/schedule-precondition-gate.js';
+import { prepareScheduledRecoveryRun, recordScheduledSessionRun } from '../src/core/scheduled-send.js';
+import type { Session } from '../src/types.js';
+import { isManualScheduledTurn } from '../src/core/scheduled-turn-provenance.js';
+import {
+  botmuxScheduleExecutor,
+  botmuxScheduleReconciler,
+  parseScheduleInput,
+} from '../src/workflows/hostExecutors/botmux-schedule.js';
 
 const APP = 'cli_authority';
 let dataDir: string;
 let store: ScheduleAuthorityStore;
 
 beforeEach(() => {
-  dataDir = mkdtempSync(join(tmpdir(), 'scheduler-authority-'));
+  dataDir = join(mkdtempSync(join(tmpdir(), 'scheduler-authority-')), 'data');
   config.session.dataDir = dataDir;
   scheduleStore.setScheduleScope(APP);
   store = ScheduleAuthorityStore.open(dataDir);
@@ -22,10 +35,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   scheduler.stopScheduler();
   scheduler.setScheduleAuthorityStore(null);
   store.close();
-  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(join(dataDir, '..'), { recursive: true, force: true });
 });
 
 function commit(id = 'a1b2c3d4') {
@@ -43,7 +58,390 @@ function commit(id = 'a1b2c3d4') {
   });
 }
 
+describe('creation observer', () => {
+  afterEach(() => scheduler.setScheduleCreatedObserver(undefined));
+
+  it('hears addTask with the creating turn when the route holds it; delegated commits (another app\'s credential key) are not announced', () => {
+    const seen: Array<[string, string | undefined, string | undefined]> = [];
+    scheduler.setScheduleCreatedObserver((task, turn) => { seen.push([task.id, task.ownerOpenId, turn?.turnId]); });
+    scheduler.addTask({ id: 'direct01', name: 'a', schedule: 'every 30m', prompt: 'p', workingDir: '/repo', chatId: 'oc_chat',
+      larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } }, { creatingTurn: { sessionId: 's1', turnId: 'om_t1' } });
+    scheduler.addTask({ id: 'direct02', name: 'b', schedule: 'every 30m', prompt: 'p', workingDir: '/repo', chatId: 'oc_chat',
+      larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } });
+    commit('a1b2c3d4');
+    expect(seen).toEqual([['direct01', 'ou_owner', 'om_t1'], ['direct02', 'ou_owner', undefined]]);
+  });
+
+  it('returns the stored task and logs when the observer throws', () => {
+    const warn = vi.spyOn(logger, 'warn');
+    scheduler.setScheduleCreatedObserver(() => { throw new Error('Bot not registered: cli_unknown'); });
+    const task = scheduler.addTask({ id: 'direct03', name: 'c', schedule: 'every 30m', prompt: 'p', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_owner' } });
+    expect(task.id).toBe('direct03');
+    expect(scheduleStore.getTask('direct03', APP)).toBeDefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Bot not registered: cli_unknown'));
+    warn.mockRestore();
+  });
+});
+
 describe('scheduler host authority integration', () => {
+  const params = {
+    id: 'direct01', name: 'poll', schedule: 'every 30m', prompt: 'check',
+    workingDir: '/repo', chatId: 'oc_chat', larkAppId: APP,
+    owner: { kind: 'ownerless' as const },
+  };
+
+  it('runs a paused task once, preserves pause, and revokes the exact permit on another pause', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    scheduler.setEnabled(task.id, false);
+    let runId = '';
+    let finish!: () => void;
+    scheduler.setExecuteCallback(async (_task, context) => {
+      runId = context.runId;
+      await new Promise<void>(resolve => { finish = resolve; });
+    });
+    expect(scheduler.runNow(task.id)).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getRecord(APP, task.id)).toMatchObject({ state: 'paused', task: {
+      enabled: false, manualRunAuthorization: { runId, turnIds: [] } } });
+    expect(scheduler.admitManualRunTurn(task.id, runId,
+      `schedule:${task.id}:12345678-1234-1234-1234-123456789abc`, APP)).toBe(true);
+    scheduler.setEnabled(task.id, false);
+    expect(scheduler.admitManualRunTurn(task.id, runId,
+      `schedule:${task.id}:aaaaaaaa-1234-1234-1234-123456789abc`, APP)).toBe(false);
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getRecord(APP, task.id)?.task.enabled).toBe(false);
+    expect(store.getRecord(APP, task.id)?.task.manualRunAuthorization).toBeUndefined();
+  });
+
+  it('queues a paused task for its owning tick without enabling regular scheduling', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    scheduler.setEnabled(task.id, false);
+    const fires: string[] = [];
+    scheduler.setExecuteCallback(async (_task, context) => { fires.push(context.trigger); });
+    scheduler.startScheduler();
+    expect(scheduler.runTaskNow(task.id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fires).toEqual(['dashboard']);
+    expect(store.getRecord(APP, task.id)?.state).toBe('paused');
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(fires).toEqual(['dashboard']);
+  });
+
+  it('records late send failure once without consuming a repeat or changing a manual pause', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask({ ...params, repeat: { times: 3 } });
+    let runId = '';
+    scheduler.setExecuteCallback(async (_task, context) => { runId = context.runId; });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    scheduler.setEnabled(task.id, false);
+    scheduler.recordDeliveryFailure(task.id, runId, 'send rejected', APP);
+    scheduler.recordDeliveryFailure(task.id, runId, 'send rejected', APP);
+    // runNow settles through a background Promise chain; advancing zero drains
+    // it under Vitest but not under Bun, so wait for the persisted settlement.
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task).toMatchObject({ enabled: false,
+      lastStatus: 'error', lastDeliveryError: 'send rejected', repeat: { completed: 1 },
+      runStats: { dispatched: 1, failed: 1, consecutiveFailures: 1 } }));
+    scheduler.runNow(task.id);
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task.lastStatus).toBe('ok'));
+    const latest = store.getRecord(APP, task.id)?.task;
+    scheduler.recordDeliveryFailure(task.id, 'stale-run', 'old send rejected', APP);
+    expect(store.getRecord(APP, task.id)?.task).toEqual(latest);
+  });
+
+  it('binds only the coordinator-owned continuation to a paused manual run', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    scheduler.setEnabled(task.id, false);
+    let runId = '';
+    scheduler.setExecuteCallback(async (_task, context) => { runId = context.runId; });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    const originalTurn = `schedule:${task.id}:12345678-1234-1234-1234-123456789abc`;
+    const nextTurn = `schedule:${task.id}:aaaaaaaa-1234-1234-1234-123456789abc`;
+    expect(scheduler.admitManualRunTurn(task.id, runId, originalTurn, APP)).toBe(true);
+    const s = { sessionId: 'schedule-recovery', larkAppId: APP, chatId: 'oc_chat' } as Session;
+    recordScheduledSessionRun(s, { taskId: task.id, runId, turnId: originalTurn });
+    s.ordinaryTurnRecovery = { logicalTurnId: originalTurn, currentTurnId: nextTurn,
+      status: 'dispatching', continuationsStarted: 1 };
+    const deps = { getAuthority: (id: string) => store.getRecord(APP, id),
+      admitManualTurn: (id: string, run: string, turn: string) => scheduler.admitManualRunTurn(id, run, turn, APP),
+      persist: vi.fn() };
+    prepareScheduledRecoveryRun(s, 'schedule:direct01:bbbbbbbb-1234-1234-1234-123456789abc', deps);
+    expect(deps.persist).not.toHaveBeenCalled();
+    prepareScheduledRecoveryRun(s, nextTurn, deps);
+    expect(s.scheduledRuns?.[nextTurn]).toEqual({ taskId: task.id, runId, turnId: nextTurn });
+    expect(isManualScheduledTurn(store.getRecord(APP, task.id)!.task, nextTurn)).toBe(true);
+    expect(store.getRecord(APP, task.id)?.state).toBe('paused');
+    scheduler.setEnabled(task.id, false);
+    expect(() => prepareScheduledRecoveryRun(s, nextTurn, deps)).toThrow('scheduled recovery');
+  });
+
+  it('preserves an underlying dispatch error when its delivery failure later gets a receipt', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask(params);
+    let runId = '';
+    scheduler.setExecuteCallback(async (_task, context) => {
+      runId = context.runId;
+      scheduler.recordDeliveryFailure(task.id, runId, 'send timeout', APP);
+      throw new Error('another target dispatch failed');
+    });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      lastError: 'another target dispatch failed', runStats: { failed: 1, consecutiveFailures: 1 } }));
+    scheduler.recordDeliverySuccess(task.id, runId, APP);
+    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      lastError: 'another target dispatch failed', runStats: { failed: 1, consecutiveFailures: 1 } });
+    expect(store.getRecord(APP, task.id)?.task.lastDeliveryError).toBeUndefined();
+  });
+
+  it('retains a send failure that arrives before dispatch completes and still consumes exactly one repeat', async () => {
+    vi.useFakeTimers();
+    const task = scheduler.addTask({ ...params, repeat: { times: 3 } });
+    scheduler.setExecuteCallback(async (_task, context) => {
+      scheduler.recordDeliveryFailure(task.id, context.runId, 'send rejected', APP);
+    });
+    scheduler.runNow(task.id);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(store.getRecord(APP, task.id)?.task).toMatchObject({ lastStatus: 'error',
+      repeat: { completed: 1 }, runStats: { dispatched: 1, failed: 1 } }));
+  });
+
+  it('rejects reuse of a deleted direct id without leaving an enabled projection', () => {
+    scheduler.addTask(params);
+    expect(scheduler.removeTask(params.id)).toBe(true);
+    expect(() => scheduler.addTask(params)).toThrow('schedule_task_id_conflict');
+    expect(scheduleStore.getTask(params.id, APP)).toBeUndefined();
+    expect(store.getRecord(APP, params.id)?.state).toBe('revoked');
+    expect(store.listTasks(APP)).toEqual([]);
+  });
+
+  it('returns authoritative runtime state on retry and leaves it intact on input conflict', () => {
+    const active = scheduler.addTask(params);
+    expect(scheduler.addTask(params)).toEqual(active);
+    const current = store.updateTask(APP, params.id, task => ({
+      ...task, enabled: false, lastStatus: 'ok', lastRunId: 'prior-run',
+      nextRunAt: undefined,
+    }))!;
+    scheduleStore.removeAuthoritativeTaskProjection(params.id, APP);
+    expect(scheduler.addTask(params)).toEqual(current);
+    expect(scheduleStore.getTask(params.id, APP)).toEqual(current);
+    expect(() => scheduler.addTask({ ...params, prompt: 'different' }))
+      .toThrow('schedule_task_id_conflict');
+    expect(scheduleStore.getTask(params.id, APP)).toEqual(current);
+  });
+
+  it('retains the committed authority receipt when projection fails and repairs it on retry', () => {
+    const input = { ...params, id: 'direct02' };
+    const projection = vi.spyOn(scheduleStore, 'projectAuthoritativeTask')
+      .mockImplementationOnce(() => { throw new Error('disk full'); });
+    const created = scheduler.addTask(input);
+    expect(store.getRecord(APP, input.id)?.task).toEqual(created);
+    expect(scheduleStore.getTask(input.id, APP)).toBeUndefined();
+    projection.mockRestore();
+    expect(scheduler.addTask(input)).toEqual(created);
+    expect(scheduleStore.getTask(input.id, APP)).toEqual(created);
+  });
+
+  it('rolls back authority if projection and precondition activation both fail', () => {
+    vi.spyOn(scheduleStore, 'projectAuthoritativeTask')
+      .mockImplementation(() => { throw new Error('projection write failed'); });
+    const activate = vi.spyOn(preconditionStore, 'activateSchedulePrecondition')
+      .mockImplementation(() => { throw new Error('activation write failed'); });
+    expect(() => createTaskWithOptionalPrecondition(params, APP, 'echo 1'))
+      .toThrow('activation write failed');
+    const task = activate.mock.calls[0][0];
+    expect(store.getRecord(APP, task.id)).toBeUndefined();
+    expect(store.listTasks(APP)).toEqual([]);
+    expect(scheduleStore.getTask(task.id, APP)).toBeUndefined();
+    // A failed create is a physical DELETE, not a revoke tombstone: the same id
+    // can be created again.
+    vi.restoreAllMocks();
+    const again = scheduler.addTask({ ...params, id: task.id });
+    expect(again.id).toBe(task.id);
+    expect(store.getRecord(APP, task.id)?.state).toBe('active');
+  });
+
+  describe('fire-time workingDir swap check (authority record, turn-created tasks only)', () => {
+    const turn = { directTurn: { turnId: 'om_turn', maxTasksPerTurn: 64 } };
+    const realDir = (name: string) => {
+      const dir = join(dataDir, '..', name);
+      mkdirSync(dir, { recursive: true });
+      return realpathSync(dir);
+    };
+    const swap = (dir: string, target: string) => {
+      renameSync(dir, `${dir}.moved`);
+      symlinkSync(target, dir);
+    };
+
+    it('passes an untouched canonical directory and refuses it once swapped for a symlink', () => {
+      const dir = realDir('cwd/sub');
+      const task = scheduler.addTask({ ...params, id: 'swap0001', workingDir: dir }, turn);
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toBeUndefined();
+      swap(dir, realDir('home'));
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/^schedule_working_dir_swapped: task swap0001/);
+    });
+
+    it('refuses a swapped delegated task too', () => {
+      const dir = realDir('deleg/sub');
+      const result = scheduler.commitDelegatedTask({
+        params: { ...params, id: 'deleg001', workingDir: dir },
+        grantId: 'grant-deleg', requestHash: 'hash-deleg',
+        control: { openId: 'ou_user', unionId: 'on_user', credentialOpenId: 'ou_user', runScopes: [], selfManage: false },
+        sourceMessageId: 'om_kickoff', sourceSessionId: 'source-session',
+        targetTurnId: 'om_kickoff', targetGeneration: 1, maxTasksPerTurn: 64,
+      });
+      expect(result.ok).toBe(true);
+      const task = (result as { task: ScheduledTask }).task;
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toBeUndefined();
+      swap(dir, realDir('elsewhere'));
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/schedule_working_dir_swapped/);
+    });
+
+    it('refuses a missing directory and a fire input that disagrees with the authority record', () => {
+      const dir = realDir('gone');
+      const task = scheduler.addTask({ ...params, id: 'swap0002', workingDir: dir }, turn);
+      expect(scheduler.scheduledWorkingDirSwapReason({ ...task, workingDir: realDir('projection') }))
+        .toMatch(/fire input/);
+      rmSync(dir, { recursive: true });
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/\(missing\)/);
+    });
+
+    it.each([
+      ['inline', { kind: 'inline', script: 'test -f package.json' }],
+      ['file', { kind: 'file', path: 'guard.sh' }],
+    ] as const)('refuses a swapped task before its %s precondition reads or runs anything', async (_kind, source) => {
+      const dir = realDir(`pre-${_kind}/sub`);
+      const task = scheduler.addTask({ ...params, id: `pre${_kind.slice(0, 5)}`.padEnd(8, '0'), workingDir: dir }, turn);
+      const gate = () => {
+        const deps = {
+          resolve: vi.fn(() => ({ kind: 'configured', enabled: true, source }) as never),
+          readFile: vi.fn(() => 'exit 0'),
+          run: vi.fn(async () => ({ decision: 'run' }) as never),
+        };
+        const execute = vi.fn(async () => undefined);
+        return { deps, execute, go: () => executeScheduledTaskWithPrecondition(task, APP, execute, deps) };
+      };
+      const ok = gate();
+      await ok.go();
+      expect(ok.deps.run).toHaveBeenCalledOnce();
+      swap(dir, realDir(`planted-${_kind}`));
+      const refused = gate();
+      const outcome = await refused.go().then(() => undefined, (error: unknown) => error);
+      // The spawn layer first: without the forward check the gate reaches
+      // dependencies.run (the host-side Bash), and this is the line that fails.
+      expect(refused.deps.run).not.toHaveBeenCalled();
+      expect(refused.deps.readFile).not.toHaveBeenCalled();
+      expect(refused.execute).not.toHaveBeenCalled();
+      expect(String(outcome)).toMatch(/schedule_working_dir_swapped/);
+    });
+
+    it('never re-checks host-created or legacy tasks, even at a symlinked path', () => {
+      const link = join(realDir('host'), 'link');
+      symlinkSync(realDir('target'), link);
+      const host = scheduler.addTask({ ...params, id: 'host0009', workingDir: link });
+      expect(scheduler.scheduledWorkingDirSwapReason(host)).toBeUndefined();
+    });
+  });
+
+  describe('per-turn direct create limit', () => {
+    const turn = (turnId = 'om_turn', maxTasksPerTurn = 2) => ({ directTurn: { turnId, maxTasksPerTurn } });
+
+    it('allows distinct tasks within one turn and records the turn outside the task JSON', () => {
+      const a = scheduler.addTask({ ...params, id: 'turn0001' }, turn());
+      const b = scheduler.addTask({ ...params, id: 'turn0002' }, turn());
+      expect(a.id).not.toBe(b.id);
+      expect(store.listTasks(APP).map(t => t.id).sort()).toEqual(['turn0001', 'turn0002']);
+      expect(store.getRecord(APP, 'turn0001')?.targetTurnId).toBe('om_turn');
+      expect(JSON.stringify(scheduleStore.getTask('turn0001', APP))).not.toContain('om_turn');
+    });
+
+    it('refuses the task past the limit, but a different turn and the host stay unaffected', () => {
+      scheduler.addTask({ ...params, id: 'turn0001' }, turn());
+      scheduler.addTask({ ...params, id: 'turn0002' }, turn());
+      expect(() => scheduler.addTask({ ...params, id: 'turn0003' }, turn()))
+        .toThrow('schedule_direct_task_limit');
+      expect(store.getRecord(APP, 'turn0003')).toBeUndefined();
+      expect(scheduleStore.getTask('turn0003', APP)).toBeUndefined();
+      expect(scheduler.addTask({ ...params, id: 'turn0004' }, turn('om_other')).id).toBe('turn0004');
+      expect(scheduler.addTask({ ...params, id: 'host0001' }).id).toBe('host0001');
+      expect(store.getRecord(APP, 'host0001')?.targetTurnId).toBeUndefined();
+    });
+
+    it('keeps a removed task on the turn quota', () => {
+      scheduler.addTask({ ...params, id: 'turn0001' }, turn());
+      scheduler.addTask({ ...params, id: 'turn0002' }, turn());
+      expect(scheduler.removeTask('turn0001')).toBe(true);
+      expect(store.getRecord(APP, 'turn0001')?.targetTurnId).toBe('om_turn');
+      expect(() => scheduler.addTask({ ...params, id: 'turn0003' }, turn()))
+        .toThrow('schedule_direct_task_limit');
+    });
+
+    it('replays an identical create without consuming quota', () => {
+      const first = scheduler.addTask({ ...params, id: 'turn0001' }, turn('om_turn', 1));
+      expect(scheduler.addTask({ ...params, id: 'turn0001' }, turn('om_turn', 1))).toEqual(first);
+    });
+  });
+
+  it('rolls a failed precondition edit back from the authority row, not the projection', () => {
+    const task = scheduler.addTask({ ...params, id: 'guard001', chatId: 'oc_authority' });
+    // schedules.json is writable from a sandboxed session.
+    scheduleStore.updateTask(task.id, { chatId: 'oc_attacker' }, APP);
+    vi.spyOn(preconditionStore, 'activateSchedulePrecondition')
+      .mockImplementationOnce(() => { throw new Error('activation write failed'); });
+    expect(() => updateTaskWithOptionalPrecondition(
+      task.id, { chatId: 'oc_dashboard', prompt: 'edited' }, APP, 'printf 0',
+    )).toThrow('activation write failed');
+    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ chatId: 'oc_authority', prompt: 'check' });
+  });
+
+  describe('v3 botmux-schedule host executor', () => {
+    const frozen = () => parseScheduleInput({
+      name: 'wf poll', schedule: 'every 30m', prompt: 'check', workingDir: '/repo',
+      chatId: 'oc_chat', chatType: 'group', larkAppId: APP,
+    });
+
+    it('commits to authority so the task is schedulable and survives a daemon restart', async () => {
+      const input = frozen();
+      await expect(botmuxScheduleExecutor.invoke(input, 'wf3_poll'))
+        .resolves.toMatchObject({ output: { taskId: 'wf3_poll' } });
+      expect(store.getRecord(APP, 'wf3_poll')?.state).toBe('active');
+      expect(scheduler.getNextRun('wf3_poll')).not.toBeNull();
+
+      store.initializeApp(APP, scheduleStore.listTasks(APP));
+      scheduleStore.replaceAuthoritativeProjection(store.listTasks(APP), APP);
+      expect(scheduleStore.getTask('wf3_poll', APP)?.name).toBe('wf poll');
+
+      await expect(botmuxScheduleExecutor.invoke(input, 'wf3_poll'))
+        .resolves.toMatchObject({ output: { taskId: 'wf3_poll' } });
+      await expect(botmuxScheduleReconciler.readOnlyLookup!('wf3_poll', input))
+        .resolves.toMatchObject({ found: true, externalRefs: { taskId: 'wf3_poll' } });
+      await expect(botmuxScheduleReconciler.readOnlyLookup!('wf3_poll', { ...input, prompt: 'other' }))
+        .rejects.toThrow(/IdempotencyConflict/);
+    });
+
+    it('recovers the receipt from authority when the projection write failed', async () => {
+      const input = frozen();
+      vi.spyOn(scheduleStore, 'projectAuthoritativeTask')
+        .mockImplementationOnce(() => { throw new Error('disk full'); });
+      await botmuxScheduleExecutor.invoke(input, 'wf3_lost');
+      expect(scheduleStore.getTask('wf3_lost', APP)).toBeUndefined();
+      await expect(botmuxScheduleReconciler.readOnlyLookup!('wf3_lost', input))
+        .resolves.toMatchObject({ found: true, externalRefs: { taskId: 'wf3_lost' } });
+    });
+  });
+
+  it('does not roll back a task belonging to a different staged precondition', () => {
+    const task = scheduler.addTask({ ...params, preconditionRef: 'spc_original' });
+    expect(scheduler.rollbackUnpublishedRuntimeTask(task.id, APP, 'spc_other')).toBe(false);
+    expect(store.getRecord(APP, task.id)?.task).toEqual(task);
+  });
+
   it('ignores projection edits to enabled and nextRunAt', () => {
     const result = commit();
     expect(result.ok).toBe(true);
@@ -82,7 +480,7 @@ describe('scheduler host authority integration', () => {
       .toThrow('schedule_authority_store_unavailable');
     expect(() => scheduler.addTask({
       name: 'new', schedule: 'every 30m', prompt: 'new', workingDir: '/repo',
-      chatId: 'oc_chat', larkAppId: APP,
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'ownerless' },
     })).toThrow('schedule_authority_store_unavailable');
   });
 });

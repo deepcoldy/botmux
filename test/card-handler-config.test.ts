@@ -87,6 +87,56 @@ describe('/botconfig usageDisplay enum', () => {
   });
 });
 
+describe('/botconfig CLI change with incompatible effort', () => {
+  it.each(['zh', 'en'])('gives an actionable recovery command without changing config (%s)', async loc => {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config[0].reasoningEffort = 'high';
+    writeFileSync(configPath, JSON.stringify(config));
+    const before = readFileSync(configPath, 'utf8');
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_set', field: 'cli', loc },
+        option: 'minimax',
+      },
+    }, deps, 'app_config');
+    expect(result?.toast?.type).toBe('warning');
+    // The command is a recovery action, not a snapshot of translated prose.
+    expect(result?.toast?.content).toContain('/botconfig unset reasoningEffort');
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('app_config').config).toMatchObject({ cliId: 'claude-code', reasoningEffort: 'high' });
+  });
+});
+
+describe('/botconfig model change with incompatible effort', () => {
+  it.each(['zh', 'en'])('keeps config and points at the effort reset instead of the raw reason (%s)', async loc => {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    Object.assign(config[0], { cliId: 'minimax', model: 'MiniMax-M3.1-Flash#thinking', reasoningEffort: 'xhigh' });
+    writeFileSync(configPath, JSON.stringify(config));
+    const before = readFileSync(configPath, 'utf8');
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: 'config_set', field: 'model', loc }, option: 'MiniMax-M3' },
+    }, deps, 'app_config');
+    expect(result?.toast?.type).toBe('warning');
+    expect(result?.toast?.content).toContain('/botconfig unset reasoningEffort');
+    expect(result?.toast?.content).not.toContain('reasoning_effort_not_supported_by_model');
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('app_config').config).toMatchObject({ model: 'MiniMax-M3.1-Flash#thinking', reasoningEffort: 'xhigh' });
+  });
+
+  it('still reports unrelated write failures as errors with their reason', async () => {
+    const { handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: 'config_set', field: 'reasoningEffort', loc: 'en' }, option: 'ultra' },
+    }, deps, 'app_config');
+    expect(result?.toast?.type).toBe('error');
+  });
+});
+
 describe('/botconfig legacy quota', () => {
   it('keeps the read-only legacy option without rewriting it', async () => {
     const config = JSON.parse(readFileSync(configPath, 'utf8'));

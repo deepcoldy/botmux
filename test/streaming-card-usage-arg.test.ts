@@ -36,6 +36,8 @@ function buildStreamingCardCallSites(source: string): string[] {
   return sites;
 }
 
+// 源码结构护栏(K4)：buildStreamingCard 的调用点散落在 daemon / worker-pool / card-handler 的闭包里，
+// 任何一处漏传用量快照，重渲染时用量行就会被抹掉（#637）。只能逐个调用点核对。
 describe('streaming-card usage arg (source lock — PR #637 regression guard)', () => {
   for (const rel of [
     'src/core/worker-pool.ts',

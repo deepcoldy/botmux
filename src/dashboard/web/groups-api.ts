@@ -33,10 +33,19 @@ export interface GroupChat {
   avatar?: string;
   chatMode?: string;
   sessionGroup?: boolean;
+  /** 会话群摘要（daemon `sessionGroupBoardMeta`）：排序、状态与当前会话入口。 */
+  sessionGroupMeta?: {
+    createdAt: number;
+    lastActiveAt: number;
+    sessionId?: string;
+    sessionStatus?: 'active' | 'closed';
+  };
   collaborationMode?: 'standard' | 'project';
   projectCoordinatorAppId?: string;
   projectWorkerAppIds?: string[];
   projectAutoEnrollWorkers?: boolean;
+  /** Group-level import notification switch (`importedSessionPolicy === 'notify'`), default off. */
+  projectImportNotify?: boolean;
   projectProgressCard?: ProjectProgressCardConfig;
   projectRuntime?: ProjectGroupRuntimeSummary;
   memberBots: GroupMemberBot[];
@@ -44,12 +53,14 @@ export interface GroupChat {
 
 export type ProjectProgressCardTemplateId = 'status-dashboard' | 'compact-list';
 export type ProjectProgressCardSectionId = 'goal' | 'blockers' | 'workstreams' | 'milestones';
+export type ProjectProgressCardCompletedDisplay = 'all' | 'collapsed' | 'recent';
 
 export interface ProjectProgressCardConfig {
   schemaVersion: 1;
   templateId: ProjectProgressCardTemplateId;
   sections: ProjectProgressCardSectionId[];
   milestonesExpanded: boolean;
+  completedDisplay?: ProjectProgressCardCompletedDisplay;
 }
 
 export function defaultProjectProgressCardConfig(): ProjectProgressCardConfig {
@@ -82,6 +93,7 @@ export interface GroupCollaborationModeResponse {
     coordinatorAppId?: string;
     workerAppIds?: string[];
     autoEnrollWorkers?: boolean;
+    importedSessionPolicy?: 'ignore' | 'notify';
     progressCard?: ProjectProgressCardConfig;
   };
   project: ProjectGroupRuntimeSummary | null;
@@ -97,7 +109,8 @@ export interface GroupsSnapshot {
 
 export interface GroupFilters {
   q: string;
-  missingOnly: boolean;
+  /** 只看有这个 bot 在群里的群；空串 = 不限。 */
+  botId: string;
 }
 
 export interface FetchGroupsSnapshotOptions {
@@ -244,12 +257,13 @@ export async function setGroupPinStreamingCard(
 export async function saveGroupCollaborationMode(
   chatId: string,
   input:
-    | { mode: 'standard' }
+    | { mode: 'standard'; importedSessionPolicy?: 'ignore' | 'notify' }
     | {
         mode: 'project';
         coordinatorAppId: string;
         workerAppIds: string[];
         autoEnrollWorkers: boolean;
+        importedSessionPolicy?: 'ignore' | 'notify';
         progressCard: ProjectProgressCardConfig;
       },
 ): Promise<GroupCollaborationModeResponse> {

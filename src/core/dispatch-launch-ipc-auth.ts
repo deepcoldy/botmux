@@ -3,6 +3,7 @@ import type { IncomingMessage } from 'node:http';
 
 import { dashboardSecretPath } from './dashboard-secret.js';
 import { loadDashboardSecret } from '../dashboard/auth.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
 
 export const DISPATCH_LAUNCH_IPC_DOMAIN = 'botmux-dispatch-launch-ipc/v1';
 export const DISPATCH_LAUNCH_IPC_RESPONSE_DOMAIN = 'botmux-dispatch-launch-ipc/v1/response';
@@ -123,10 +124,6 @@ export function createDispatchLaunchIpcNonceStore(
 function headerString(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name];
   return typeof value === 'string' ? value : undefined;
-}
-
-function isLoopback(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || Boolean(address?.endsWith('::ffff:127.0.0.1'));
 }
 
 async function readBoundedBody(
@@ -274,7 +271,7 @@ export async function verifyDispatchLaunchIpcRequest(
   req: IncomingMessage,
   options: DispatchLaunchIpcVerifyOptions,
 ): Promise<DispatchLaunchIpcVerifyResult> {
-  if (!isLoopback(req.socket?.remoteAddress)) {
+  if (!isLoopbackPeer(req.socket?.remoteAddress)) {
     return { ok: false, reason: 'remote_not_loopback', httpStatus: 403 };
   }
   const timestamp = headerString(req, DISPATCH_LAUNCH_IPC_HEADERS.timestamp);

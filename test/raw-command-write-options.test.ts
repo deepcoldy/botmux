@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
+import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { rawCommandWriteOptionsFor } from '../src/core/raw-command-write-options.js';
 
 describe('raw command write options', () => {
@@ -40,5 +41,36 @@ describe('raw command write options', () => {
     expect(options.coco).toBe(false);
     expect(options.pasteLine).toBeUndefined();
     expect(options.pasteSettleMs).toBeUndefined();
+  });
+});
+
+describe('framed stdin runners route raw passthrough through writeInput', () => {
+  it('minimax declares runnerFramedInput and frames a raw objective exactly like a turn', async () => {
+    const adapter = createMinimaxAdapter('/bin/true');
+    expect(adapter.runnerFramedInput).toBe(true);
+
+    const sent: string[] = [];
+    const keys: string[] = [];
+    const pty = {
+      write: (data: string) => sent.push(data),
+      sendText: (text: string) => { sent.push(text); },
+      sendSpecialKeys: (...pressed: string[]) => { keys.push(...pressed); },
+    };
+    const objective = 'Read $BOTMUX_GOAL_PATH. Write files and manifest. Complete it.';
+    await adapter.writeInput(pty as never, objective);
+
+    // One framed line (::botmux-minimax:<base64>); the runner protocol sends a
+    // pre-flush Enter (idempotent on an empty buffer) plus the submit Enter.
+    expect(keys).toEqual(['Enter', 'Enter']);
+    const line = sent.join('');
+    expect(sent.filter((s) => s.startsWith('::botmux-minimax:'))).toHaveLength(1);
+    expect(line.startsWith('::botmux-minimax:')).toBe(true);
+    const decoded = JSON.parse(Buffer.from(line.slice('::botmux-minimax:'.length), 'base64').toString('utf8'));
+    expect(decoded).toEqual({ type: 'message', content: objective });
+  });
+
+  it('generic adapters do not opt into framed raw routing', () => {
+    expect(createClaudeCodeAdapter('/bin/claude').runnerFramedInput).toBeUndefined();
+    expect(createOpenCodeAdapter('/bin/opencode').runnerFramedInput).toBeUndefined();
   });
 });

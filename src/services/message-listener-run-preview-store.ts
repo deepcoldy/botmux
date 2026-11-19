@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
+export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'completed' | 'failed';
 
 export interface MessageListenerRunPreviewResult {
   runId: string;
@@ -109,12 +109,11 @@ export function markMessageListenerRunPreviewTriggered(
   const result = run?.results.find(item => item.messageId === messageId);
   if (!run || !result) return null;
   const at = nowIso();
-  result.ok = true;
-  result.state = 'triggered';
-  result.action = update.action;
-  result.sessionId = update.sessionId;
-  result.triggerId = update.triggerId;
-  result.error = undefined;
+  // Worker events can arrive before the trigger call returns. Enrich the
+  // admission record without rewinding running or terminal state.
+  if (update.action !== undefined) result.action = update.action;
+  if (update.sessionId !== undefined) result.sessionId = update.sessionId;
+  if (update.triggerId !== undefined) result.triggerId = update.triggerId;
   result.updatedAt = at;
   touchRun(run, at);
   if (update.triggerId) turnIndex.set(update.triggerId, { runId, messageId });
@@ -126,7 +125,7 @@ export function markMessageListenerRunPreviewRunning(triggerId: string): Message
   if (!ref) return null;
   const run = runs.get(ref.runId);
   const result = findResult(ref.runId, ref.messageId);
-  if (!run || !result || result.state === 'replied' || result.state === 'failed') return null;
+  if (!run || !result || result.state === 'replied' || result.state === 'completed' || result.state === 'failed') return null;
   const at = nowIso();
   result.state = 'running';
   result.updatedAt = at;
@@ -145,12 +144,29 @@ export function markMessageListenerRunPreviewReplied(
   if (!ref) return null;
   const run = runs.get(ref.runId);
   const result = findResult(ref.runId, ref.messageId);
-  if (!run || !result) return null;
+  if (!run || !result || result.state === 'completed' || result.state === 'failed') return null;
   const at = nowIso();
   result.ok = true;
   result.state = 'replied';
   if (update.sessionId) result.sessionId = update.sessionId;
   if (update.replyMessageId) result.replyMessageId = update.replyMessageId;
+  result.error = undefined;
+  result.finishedAt = at;
+  result.updatedAt = at;
+  touchRun(run, at);
+  return { ...result };
+}
+
+/** Completion without a source-group reply is a successful execution, not a delivery. */
+export function markMessageListenerRunPreviewCompleted(triggerId: string): MessageListenerRunPreviewResult | null {
+  const ref = turnIndex.get(triggerId);
+  if (!ref) return null;
+  const run = runs.get(ref.runId);
+  const result = findResult(ref.runId, ref.messageId);
+  if (!run || !result || result.state === 'failed' || result.state === 'completed') return null;
+  const at = nowIso();
+  result.ok = true;
+  result.state = 'completed';
   result.error = undefined;
   result.finishedAt = at;
   result.updatedAt = at;
@@ -172,7 +188,7 @@ export function markMessageListenerRunPreviewFailed(
   if (!ref) return null;
   const run = runs.get(ref.runId);
   const result = findResult(ref.runId, ref.messageId);
-  if (!run || !result || result.state === 'replied') return null;
+  if (!run || !result || result.state === 'replied' || result.state === 'completed') return null;
   const at = nowIso();
   result.ok = false;
   result.state = 'failed';

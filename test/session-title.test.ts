@@ -110,6 +110,13 @@ describe('extractBotmuxLarkNativeSessionTitlePrompt', () => {
       [{ name: 'TestBot' }],
     )).toBeUndefined();
   });
+
+  // #2716: bare（transcript + solo）续轮没有 <user_message> 壳、走 rawContent
+  // 兜底，追加在正文后的格式提示块（连标签带块体）不能进语义标题。
+  it('bare 续轮追加的 <botmux_formatting> 块不进标题模型输入', () => {
+    const bare = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(bare)).toBe('继续看一下这个 PR');
+  });
 });
 
 describe('updateSessionTitle', () => {

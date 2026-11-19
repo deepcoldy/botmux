@@ -24,7 +24,6 @@ import {
   resolveTerminalAccess,
   resolveTerminalAccessForRequest,
   resolveTerminalWrite,
-  resolveTerminalWriteForRequest,
   readDashboardCookie,
   safeTerminalTokenEqual,
 } from '../src/core/terminal-write-auth.js';
@@ -229,91 +228,6 @@ describe('readDashboardCookie', () => {
     expect(readDashboardCookie('a=1; b=2')).toBeNull();
     expect(readDashboardCookie('botmux_dashboard_token=')).toBeNull();
     expect(readDashboardCookie(undefined)).toBeNull();
-  });
-});
-
-describe('resolveTerminalWriteForRequest', () => {
-  const bound = () => true;
-  const unbound = () => false;
-  const token = () => TOK;
-  const noToken = () => null;
-  const cookie = (v: string) => ({ cookie: `botmux_dashboard_token=${v}` });
-
-  it('honors owner when bound AND the cookie matches the active dashboard token', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, bound, token))
-      .toEqual({ hasWrite: true, platformReadonly: false });
-  });
-
-  it('ignores a forged owner when the dashboard cookie is MISSING → token fallback (the fix)', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner' }, false, bound, token))
-      .toEqual({ hasWrite: false, platformReadonly: false });
-  });
-
-  it('ignores a forged owner when the cookie value is WRONG → token fallback (the fix)', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie('attacker-guess') }, false, bound, token))
-      .toEqual({ hasWrite: false, platformReadonly: false });
-  });
-
-  it('ignores the role when the machine has no active dashboard token', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, bound, noToken))
-      .toEqual({ hasWrite: false, platformReadonly: false });
-  });
-
-  it('fails closed when the live dashboard token cannot be read during rotation', () => {
-    const unreadable = () => { throw new Error('token changed during read'); };
-    expect(() => resolveTerminalWriteForRequest(
-      { 'x-botmux-role': 'owner', ...cookie(TOK) },
-      false,
-      bound,
-      unreadable,
-    )).not.toThrow();
-    expect(resolveTerminalWriteForRequest(
-      { 'x-botmux-role': 'owner', ...cookie(TOK) },
-      false,
-      bound,
-      unreadable,
-    )).toEqual({ hasWrite: false, platformReadonly: false });
-  });
-
-  it('ignores the role when unbound even with a matching cookie', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, unbound, token))
-      .toEqual({ hasWrite: false, platformReadonly: false });
-  });
-
-  it('treats a duplicated (array) role header as absent → token fallback', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'], ...cookie(TOK) }, false, bound, token))
-      .toEqual({ hasWrite: false, platformReadonly: false });
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'], ...cookie(TOK) }, true, bound, token))
-      .toEqual({ hasWrite: true, platformReadonly: false });
-  });
-
-  it('falls back to token when no role header is present', () => {
-    expect(resolveTerminalWriteForRequest({ ...cookie(TOK) }, true, bound, token))
-      .toEqual({ hasWrite: true, platformReadonly: false });
-  });
-
-  // Both thunks must be evaluated per request, never snapshotted: bind/unbind and
-  // dashboard token rotation are hot-reloaded without restarting live workers.
-  it('evaluates binding + token on every call (not cached)', () => {
-    let boundNow = false;
-    let activeTok: string | null = TOK;
-    const isBound = () => boundNow;
-    const getTok = () => activeTok;
-    const req = { 'x-botmux-role': 'owner', ...cookie(TOK) };
-
-    // Unbound: forged owner ignored.
-    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
-      .toEqual({ hasWrite: false, platformReadonly: false });
-
-    // Bound + cookie matches active token → trusted next request.
-    boundNow = true;
-    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
-      .toEqual({ hasWrite: true, platformReadonly: false });
-
-    // Token rotates → the old cookie no longer matches → trust drops immediately.
-    activeTok = 'rotated-token';
-    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
-      .toEqual({ hasWrite: false, platformReadonly: false });
   });
 });
 

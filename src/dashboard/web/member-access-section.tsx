@@ -8,6 +8,7 @@ type Tr = (key: string, values?: Record<string, string | number>) => string;
 
 const MAX_SUBJECTS = 50;
 const READBACK_BATCH = 50;
+const NAMES_IN_TOAST = 3;
 
 const QUOTA_OPTIONS = ['1', '3', '5', '10', '20', '50', '100', '1000', 'unlimited'] as const;
 
@@ -37,9 +38,8 @@ export function MemberAccessSection(props: {
   const [quotaOption, setQuotaOption] = useState<string>('3');
   const [durationOption, setDurationOption] = useState<string>(String(GRANT_DURATION_OPTIONS[0]));
   const [busy, setBusy] = useState(false);
-  // 懒加载：ManageDialog 一打开就为每个在群 bot 打 members-display / 黑名单 /
-  // readback 三个请求太吵；折叠区首次展开才加载。
-  const [active, setActive] = useState(false);
+  // 挂载即加载：群管理抽屉在「成员权限」页签首次打开时才挂载本组件，
+  // 所以打开抽屉本身不会打 members-display / 黑名单 / readback 请求。
   const seqRef = useRef(0);
 
   useEffect(() => {
@@ -49,7 +49,6 @@ export function MemberAccessSection(props: {
   }, [members, appId]);
 
   useEffect(() => {
-    if (!active) return;
     if (!appId) {
       setDisplays(null);
       setGranted(new Set());
@@ -83,7 +82,7 @@ export function MemberAccessSection(props: {
         setLoadError(true);
       }
     }
-  }, [active, appId, chat.chatId]);
+  }, [appId, chat.chatId]);
 
   const blockedSet = useMemo(() => new Set(blocked.resolved), [blocked]);
 
@@ -99,8 +98,16 @@ export function MemberAccessSection(props: {
     };
   }, [displays, search]);
 
+  // 机器人视角下的 bot 自身：后端拒绝给自己授权（receiver_cannot_be_subject），
+  // 所以这一行不可勾选。
+  const selfOpenIds = useMemo(
+    () => new Set((displays ?? []).filter(member => member.self === true).map(member => member.openId)),
+    [displays],
+  );
+
   function toggleMember(openId: string, checked: boolean): void {
     if (disabled || busy) return;
+    if (checked && selfOpenIds.has(openId)) return;
     setSelected(cur => {
       const next = new Set(cur);
       if (checked) next.add(openId);
@@ -139,11 +146,37 @@ export function MemberAccessSection(props: {
         toast(tr('grantAdmin.grantOk', { count: subjectIds.length || ids.length }), { kind: 'success' });
         return;
       }
-      // 成员已离群（receiver 视角 live membership 不含）：明确语义提示，
-      // 不是网络错误。
-      if (r.status === 409 && body.error === 'subject_not_current_chat_bot') {
-        const count = Array.isArray(body.invalidSubjectOpenIds) ? body.invalidSubjectOpenIds.length : ids.length;
-        toast(tr('grantAdmin.notInChat', { count }), { kind: 'warning' });
+      // 整批先按同一份 live 成员快照校验，任何一人不通过就整批不写；
+      // 把被拒的人点名并取消勾选，剩下的人可以直接再点一次授权。
+      const invalid: string[] = Array.isArray(body.invalidSubjectOpenIds)
+        ? body.invalidSubjectOpenIds.map((id: unknown) => String(id))
+        : [];
+      const rejected = invalid.length > 0 ? invalid : ids;
+      // 旧 daemon 只查机器人名单，真人必然被它判成「不在群」：这时说「已离群」
+      // 就是误报，改为提示 daemon 版本过旧。被拒的全是机器人时仍按离群处理。
+      if (r.status === 409 && body.error === 'subject_not_current_chat_bot' && rejected.some(id => !isBotRow(id))) {
+        toast(tr('grantAdmin.daemonTooOld'), { kind: 'warning' });
+        return;
+      }
+      // 成员确实已离群（receiver 视角的 live 群成员 / 机器人名单都不含）。
+      if (r.status === 409 && (body.error === 'subject_not_current_chat_member' || body.error === 'subject_not_current_chat_bot')) {
+        unselect(rejected);
+        toast(tr('grantAdmin.notInChat', { count: rejected.length, names: memberNames(rejected) }), { kind: 'warning' });
+        return;
+      }
+      if (body.error === 'receiver_cannot_be_subject') {
+        unselect(invalid);
+        toast(tr('grantAdmin.selfNotGrantable'), { kind: 'warning' });
+        return;
+      }
+      // 飞书成员接口暂不可用：无法确认是否在群，按 fail-closed 不授权，不是「不在群」。
+      if (body.error === 'live_membership_unavailable') {
+        toast(tr('grantAdmin.membershipUnavailable'), { kind: 'error' });
+        return;
+      }
+      // 群太大、成员名单读不到底：无法排除任何人，重试也不会变，不说「稍后重试」。
+      if (body.error === 'live_membership_too_large') {
+        toast(tr('grantAdmin.membershipTooLarge'), { kind: 'error' });
         return;
       }
       toast(`${tr('grantAdmin.grantFailed')}: ${body.error ?? r.status}`, { kind: 'error' });
@@ -152,6 +185,21 @@ export function MemberAccessSection(props: {
     } finally {
       setBusy(false);
     }
+  }
+
+  function unselect(openIds: string[]): void {
+    if (openIds.length === 0) return;
+    setSelected(cur => new Set([...cur].filter(id => !openIds.includes(id))));
+  }
+
+  function isBotRow(openId: string): boolean {
+    return (displays ?? []).some(member => member.openId === openId && member.memberType === 'bot');
+  }
+
+  function memberNames(openIds: string[]): string {
+    const byId = new Map((displays ?? []).map(member => [member.openId, member.name || member.openId]));
+    const names = openIds.slice(0, NAMES_IN_TOAST).map(id => byId.get(id) ?? id);
+    return openIds.length > NAMES_IN_TOAST ? `${names.join('、')}…` : names.join('、');
   }
 
   async function setWholeGroup(grant: boolean): Promise<void> {
@@ -224,7 +272,6 @@ export function MemberAccessSection(props: {
   if (members.length === 0) {
     return (
       <section className="g-member-access" data-member-access>
-        <h4>{tr('grantAdmin.sectionTitle')}</h4>
         <p className="empty">{tr('grantAdmin.noBot')}</p>
       </section>
     );
@@ -232,122 +279,116 @@ export function MemberAccessSection(props: {
 
   return (
     <section className="g-member-access" data-member-access>
-      <details
-        data-member-access-toggle
-        onToggle={ev => setActive(ev.currentTarget.open)}
-      >
-        <summary><h4>{tr('grantAdmin.sectionTitle')}</h4></summary>
-        <p><small>{tr('grantAdmin.sectionHelp')}</small></p>
-        <label className="checkbox-row">
-          <strong>{tr('grantAdmin.botSwitcher')}</strong>
-          <select
-            data-action="bot-switch"
-            value={appId}
-            disabled={props.disabled === true || busy}
-            onChange={ev => setAppId(ev.currentTarget.value)}
-          >
-            {members.map(member => (
-              <option key={member.larkAppId} value={member.larkAppId}>
-                {`${member.botName ?? member.larkAppId} (${member.larkAppId})`}
-              </option>
-            ))}
-          </select>
-        </label>
+      <p className="g-panel-help">{tr('grantAdmin.sectionHelp')}</p>
+      <label className="checkbox-row">
+        <strong>{tr('grantAdmin.botSwitcher')}</strong>
+        <select
+          data-action="bot-switch"
+          value={appId}
+          disabled={props.disabled === true || busy}
+          onChange={ev => setAppId(ev.currentTarget.value)}
+        >
+          {members.map(member => (
+            <option key={member.larkAppId} value={member.larkAppId}>
+              {`${member.botName ?? member.larkAppId} (${member.larkAppId})`}
+            </option>
+          ))}
+        </select>
+      </label>
 
-        {loadError ? <p className="hint-warn-inline">{tr('grantAdmin.loadFailed')}</p> : null}
-        {active && displays === null && !loadError ? <p className="empty">{tr('grantAdmin.loading')}</p> : null}
+      {loadError ? <p className="hint-warn-inline">{tr('grantAdmin.loadFailed')}</p> : null}
+      {displays === null && !loadError ? <p className="empty">{tr('grantAdmin.loading')}</p> : null}
 
-        {displays !== null ? (
-        <>
-          <input
-            type="search"
-            data-action="member-search"
-            placeholder={tr('grantAdmin.search')}
-            value={search}
+      {displays !== null ? (
+      <>
+        <input
+          type="search"
+          data-action="member-search"
+          placeholder={tr('grantAdmin.search')}
+          value={search}
+          disabled={disabled || busy}
+          onChange={ev => setSearch(ev.currentTarget.value)}
+        />
+        <p><small>{tr('grantAdmin.selected', { count: selected.size })}</small></p>
+
+        {(['users', 'bots'] as const).map(group => {
+          const rows = filtered[group];
+          return (
+            <div className="g-member-access-group" key={group} data-member-group={group}>
+              <strong>{tr(group === 'users' ? 'grantAdmin.groupUsers' : 'grantAdmin.groupBots')} ({rows.length})</strong>
+              {rows.length === 0 ? <p className="empty">—</p> : rows.map(member => (
+                <MemberRow
+                  key={member.openId}
+                  member={member}
+                  checked={selected.has(member.openId)}
+                  granted={granted.has(member.openId)}
+                  blocked={blockedSet.has(member.openId)}
+                  disabled={disabled || busy}
+                  tr={tr}
+                  onToggle={toggleMember}
+                  onSetBlocked={setRowBlocked}
+                />
+              ))}
+            </div>
+          );
+        })}
+
+        <div className="g-member-access-controls">
+          <label>
+            {tr('grantAdmin.quota')}{' '}
+            <select
+              data-action="quota-select"
+              value={quotaOption}
+              disabled={disabled || busy}
+              onChange={ev => setQuotaOption(ev.currentTarget.value)}
+            >
+              {QUOTA_OPTIONS.map(value => (
+                <option key={value} value={value}>
+                  {value === 'unlimited' ? tr('grantAdmin.unlimited') : value}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            {tr('grantAdmin.duration')}{' '}
+            <select
+              data-action="duration-select"
+              value={durationOption}
+              disabled={disabled || busy}
+              onChange={ev => setDurationOption(ev.currentTarget.value)}
+            >
+              {GRANT_DURATION_OPTIONS.map((ms, index) => (
+                <option key={ms} value={String(ms)}>{tr(DURATION_LABEL_KEYS[index] ?? 'grantAdmin.duration1h')}</option>
+              ))}
+              <option value="permanent">{tr('grantAdmin.permanent')}</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="primary"
+            data-action="grant-selected"
+            disabled={disabled || busy || selected.size === 0}
+            onClick={() => void grantSelected()}
+          >{tr('grantAdmin.grantSelected')}</button>
+        </div>
+
+        <div className="g-member-access-whole">
+          <p><small>{tr('grantAdmin.wholeHelp')}</small></p>
+          <button
+            type="button"
+            data-action="whole-grant"
             disabled={disabled || busy}
-            onChange={ev => setSearch(ev.currentTarget.value)}
-          />
-          <p><small>{tr('grantAdmin.selected', { count: selected.size })}</small></p>
-
-          {(['users', 'bots'] as const).map(group => {
-            const rows = filtered[group];
-            return (
-              <div className="g-member-access-group" key={group} data-member-group={group}>
-                <strong>{tr(group === 'users' ? 'grantAdmin.groupUsers' : 'grantAdmin.groupBots')} ({rows.length})</strong>
-                {rows.length === 0 ? <p className="empty">—</p> : rows.map(member => (
-                  <MemberRow
-                    key={member.openId}
-                    member={member}
-                    checked={selected.has(member.openId)}
-                    granted={granted.has(member.openId)}
-                    blocked={blockedSet.has(member.openId)}
-                    disabled={disabled || busy}
-                    tr={tr}
-                    onToggle={toggleMember}
-                    onSetBlocked={setRowBlocked}
-                  />
-                ))}
-              </div>
-            );
-          })}
-
-          <div className="g-member-access-controls">
-            <label>
-              {tr('grantAdmin.quota')}{' '}
-              <select
-                data-action="quota-select"
-                value={quotaOption}
-                disabled={disabled || busy}
-                onChange={ev => setQuotaOption(ev.currentTarget.value)}
-              >
-                {QUOTA_OPTIONS.map(value => (
-                  <option key={value} value={value}>
-                    {value === 'unlimited' ? tr('grantAdmin.unlimited') : value}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              {tr('grantAdmin.duration')}{' '}
-              <select
-                data-action="duration-select"
-                value={durationOption}
-                disabled={disabled || busy}
-                onChange={ev => setDurationOption(ev.currentTarget.value)}
-              >
-                {GRANT_DURATION_OPTIONS.map((ms, index) => (
-                  <option key={ms} value={String(ms)}>{tr(DURATION_LABEL_KEYS[index] ?? 'grantAdmin.duration1h')}</option>
-                ))}
-                <option value="permanent">{tr('grantAdmin.permanent')}</option>
-              </select>
-            </label>
-            <button
-              type="button"
-              className="primary"
-              data-action="grant-selected"
-              disabled={disabled || busy || selected.size === 0}
-              onClick={() => void grantSelected()}
-            >{tr('grantAdmin.grantSelected')}</button>
-          </div>
-
-          <div className="g-member-access-whole">
-            <p><small>{tr('grantAdmin.wholeHelp')}</small></p>
-            <button
-              type="button"
-              data-action="whole-grant"
-              disabled={disabled || busy}
-              onClick={() => void setWholeGroup(true)}
-            >{tr('grantAdmin.wholeGrant')}</button>
-            <button
-              type="button"
-              data-action="whole-revoke"
-              disabled={disabled || busy}
-              onClick={() => void setWholeGroup(false)}
-            >{tr('grantAdmin.wholeRevoke')}</button>
-          </div>
-        </>
-      ) : null}
-      </details>
+            onClick={() => void setWholeGroup(true)}
+          >{tr('grantAdmin.wholeGrant')}</button>
+          <button
+            type="button"
+            data-action="whole-revoke"
+            disabled={disabled || busy}
+            onClick={() => void setWholeGroup(false)}
+          >{tr('grantAdmin.wholeRevoke')}</button>
+        </div>
+      </>
+    ) : null}
     </section>
   );
 }
@@ -370,19 +411,24 @@ function MemberRow(props: {
   onSetBlocked(openId: string, block: boolean): void;
 }) {
   const { member, tr } = props;
+  const isSelf = member.self === true;
+  // 群管理抽屉把 .checkbox-row 里的原生复选框隐藏且不接收点击（整颗胶囊才是点击
+  // 目标），所以这一行必须是 <label>，点胶囊才会勾选；行内的封禁按钮属于交互
+  // 子元素，点它不会连带勾选。
   return (
-    <div className="checkbox-row" data-member-row={member.openId}>
+    <label className="checkbox-row" data-member-row={member.openId}>
       <input
         type="checkbox"
         data-action="member-select"
         value={member.openId}
         checked={props.checked}
-        disabled={props.disabled}
+        disabled={props.disabled || isSelf}
         onChange={ev => props.onToggle(member.openId, ev.currentTarget.checked)}
       />
       <span className="checkbox-row-main">
         <strong>{member.name || member.openId}</strong>
         {member.name ? <small>({member.openId})</small> : null}
+        {isSelf ? <small> · {tr('grantAdmin.selfTag')}</small> : null}
         {props.granted ? <small className="hint-ok"> · {tr('grantAdmin.grantedTag')}</small> : null}
         {props.blocked ? <small className="hint-warn-inline"> · {tr('blocked.rowBlockedTag')}</small> : null}
       </span>
@@ -401,7 +447,7 @@ function MemberRow(props: {
           onClick={() => void props.onSetBlocked(member.openId, true)}
         >{tr('blocked.rowBlock')}</button>
       )}
-    </div>
+    </label>
   );
 }
 

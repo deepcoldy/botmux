@@ -6,12 +6,15 @@
  * Run:  pnpm vitest run test/riff-backend.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir, deriveRiffReposFromDirs } from '../src/adapters/backend/riff-backend.js';
+import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir, deriveRiffReposFromDirs, queryRiffThreadTasks } from '../src/adapters/backend/riff-backend.js';
 
 const BASE = 'https://riff-boe.example.com';
 
@@ -61,6 +64,110 @@ describe('RiffBackend', () => {
   }
 
   const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('refreshes the host-tools binding on follow-ups instead of reusing creation env', async () => {
+    let turn = 0;
+    const be = makeBackend({ hostToolsBinding: () => ({ url: 'https://host.example/api/riff-host-tools',
+      token: String(++turn).repeat(43), sessionId: 'session-1', turnId: `turn-${turn}` }) });
+    const decode = (prompt: string) => JSON.parse(Buffer.from(
+      /botmux riff-host-bind ([A-Za-z0-9_-]+)/.exec(prompt)![1]!, 'base64url').toString());
+    try {
+      be.write('first request');
+      await flush();
+      const first = JSON.parse(calls.find(c => c.url.includes('/api/task-execute'))!.init!.body as string);
+      expect(decode(first.config.userPrompt).turnId).toBe('turn-1');
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      be.write('second request');
+      await flush();
+      const second = JSON.parse(calls.find(c => c.url.includes('/api/task-follow-up'))!.init!.body as string);
+      expect(decode(second.prompt).turnId).toBe('turn-2');
+      expect(decode(second.prompt).token).not.toBe(decode(first.config.userPrompt).token);
+      resolvers.shift()!(taskResponse('task-2'));
+      await flush();
+    } finally { be.kill(); }
+  });
+
+  describe('attachment multipart uploads', () => {
+    let dir: string;
+    let be: RiffBackend;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'riff-attachments-'));
+      be = makeBackend({ injectStatusLines: false });
+      let taskNumber = 0;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        if (u.includes('/api/task-execute') || u.includes('/api/task-follow-up')) {
+          return taskResponse(`task-${++taskNumber}`);
+        }
+        return Response.json({ success: true, data: { task: {} } });
+      });
+    });
+
+    afterEach(() => {
+      be.kill();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    const cases = [
+      { label: 'PNG without an extension', name: 'image', bytes: Buffer.from('89504e470d0a1a0a', 'hex'), mime: 'image/png', tag: 'image' },
+      { label: 'JPEG with a PNG extension', name: 'photo.png', bytes: Buffer.from('ffd8ffe0', 'hex'), mime: 'image/jpeg', tag: 'image' },
+      { label: 'GIF89a with a JPEG extension', name: 'animation.jpg', bytes: gif, mime: 'image/gif', tag: 'image' },
+      { label: 'GIF87a', name: 'old.gif', bytes: Buffer.concat([Buffer.from('GIF87a'), gif.subarray(6)]), mime: 'image/gif', tag: 'image' },
+      { label: 'WebP with an uppercase extension', name: 'picture.PNG', bytes: Buffer.from('RIFF0000WEBPVP8X'), mime: 'image/webp', tag: 'image' },
+      { label: 'PNG sent as a file', name: 'upload.bin', bytes: Buffer.from('89504e470d0a1a0a', 'hex'), mime: 'image/png', tag: 'file' },
+      { label: 'ordinary binary file', name: 'data.bin', bytes: Buffer.from([0, 1, 2, 255]), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'unknown bytes with an image extension', name: 'unknown.png', bytes: Buffer.from('not an image'), mime: 'application/octet-stream', tag: 'image' },
+      { label: 'empty image', name: 'empty.jpg', bytes: Buffer.alloc(0), mime: 'application/octet-stream', tag: 'image' },
+      { label: 'JSON text', name: 'data.json', bytes: Buffer.from('{"ok":true}'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'TXT text', name: 'notes.txt', bytes: Buffer.from('text'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'LOG text', name: 'service.log', bytes: Buffer.from('log'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'Markdown text', name: 'README.md', bytes: Buffer.from('# title'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'CSV text', name: 'rows.csv', bytes: Buffer.from('a,b'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'YAML text', name: 'config.yaml', bytes: Buffer.from('a: b'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'YML text', name: 'config.yml', bytes: Buffer.from('a: b'), mime: 'application/octet-stream', tag: 'file' },
+    ];
+
+    describe.each(['task-execute', 'task-follow-up'])('%s', (endpoint) => {
+      it.each(cases)('preserves the MIME type and bytes of $label on the wire', async ({ name, bytes, mime, tag }) => {
+        const path = join(dir, name);
+        writeFileSync(path, bytes);
+        if (endpoint === 'task-follow-up') {
+          be.write('first message');
+          await (be as any).writeChain;
+        }
+
+        be.write(`inspect this <attachments><${tag} path="${path}" name="${name}"/></attachments>`);
+        await (be as any).writeChain;
+
+        const upload = calls.find(c => c.url.endsWith(`/api/${endpoint}`));
+        expect(upload).toBeDefined();
+        expect(upload!.init?.body).toBeInstanceOf(FormData);
+        // Check serialized bytes directly: runtime multipart parsers may
+        // normalize headers or binary parts and mask wire-level regressions.
+        const request = new Request(upload!.url, upload!.init);
+        const serialized = Buffer.from(await request.clone().arrayBuffer());
+        const multipart = serialized.toString('latin1');
+        const fileHeader = `filename="${name}"\r\nContent-Type: ${mime}\r\n\r\n`;
+        const fileHeaderOffset = multipart.indexOf(fileHeader);
+        expect(fileHeaderOffset).toBeGreaterThanOrEqual(0);
+        expect(multipart.toLowerCase()).not.toContain('charset=');
+        const contentOffset = fileHeaderOffset + Buffer.byteLength(fileHeader, 'latin1');
+        expect(serialized.subarray(contentOffset, contentOffset + bytes.length)).toEqual(bytes);
+        expect(serialized.subarray(contentOffset + bytes.length, contentOffset + bytes.length + 2).toString('latin1')).toBe('\r\n');
+        const form = await request.formData();
+        const payload = JSON.parse(String(form.get('payload')));
+        const prompt = endpoint === 'task-execute' ? payload.config.userPrompt : payload.prompt;
+        expect(prompt).toContain('inspect this');
+        expect(prompt).not.toContain('<attachments>');
+        if (endpoint === 'task-follow-up') expect(payload.parentTaskId).toBe('task-1');
+      });
+    });
+  });
 
   describe('write serialization', () => {
     it('queues a second write until the first task-execute returns (no duplicate createTask)', async () => {
@@ -1169,6 +1276,359 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('close with a follow-up that never answered (outcome unknown)', () => {
+    function timeoutErr(): Error {
+      const err = new Error('The operation was aborted due to timeout');
+      err.name = 'TimeoutError';
+      return err;
+    }
+    /** A backend on task-parent (completed) whose next follow-up hangs until
+     *  the test rejects it, plus a thread the test controls. */
+    async function hungFollowUp(thread: () => Array<Record<string, unknown>> | 'fail') {
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true; // parent already finished: no own cancel
+      let rejectFollowUp!: (err: Error) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) {
+          return new Promise<Response>((_resolve, reject) => { rejectFollowUp = reject; });
+        }
+        if (u.includes('/api/tasks?')) {
+          const nodes = thread();
+          return nodes === 'fail' ? new Response('down', { status: 503 }) : Response.json({ success: true, data: nodes });
+        }
+        if (u.includes('/api/task-cancel')) return Response.json({ success: true, data: {} });
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        return Response.json({ success: true, data: { task: {} } });
+      });
+      be.write('second turn');
+      await flush();
+      return { be, timeOut: () => rejectFollowUp(timeoutErr()) };
+    }
+    const cancelled = () => calls
+      .filter(c => c.url.includes('/api/task-cancel'))
+      .map(c => JSON.parse(String(c.init?.body)).id);
+
+    /** Let the unanswered request's settle time run out: Riff had its whole
+     *  budget plus slack to create the task, so what the thread shows is all
+     *  there is. */
+    const pastSettle = (be: RiffBackend) => { (be as any).unansweredWrite.settleAtMs = Date.now() - 1; };
+
+    it('stops the child the unanswered follow-up created, but keeps refusing until its settle time has passed', async () => {
+      const { be, timeOut } = await hungFollowUp(() => [
+        { id: 'task-parent', status: 'completed' },
+        { id: 'task-child', status: cancelled().includes('task-child') ? 'cancelled' : 'running', followUpParentTaskId: 'task-parent', createdAt: new Date(Date.now() + 500).toISOString() },
+      ]);
+      const first = be.destroySession();
+      timeOut();
+      // The visible child is stopped right away and becomes the lineage...
+      expect(await first).toMatchObject({ ok: false, error: 'close_unknown_write_not_yet_visible', taskId: 'task-child' });
+      expect(cancelled()).toEqual(['task-child']);
+      // ...but before the settle time another task could still appear.
+      pastSettle(be);
+      expect(await be.destroySession()).toEqual({ ok: true, taskId: 'task-child' });
+      expect(cancelled()).toEqual(['task-child']);
+      expect((be as any).unansweredWrite).toBeNull();
+    });
+
+    it('a child that becomes visible only later is stopped by that later close', async () => {
+      let visible = false;
+      const { be, timeOut } = await hungFollowUp(() => [
+        { id: 'task-parent', status: 'completed' },
+        ...(visible ? [{ id: 'task-child', status: cancelled().includes('task-child') ? 'cancelled' : 'running', followUpParentTaskId: 'task-parent', createdAt: new Date(Date.now() + 500).toISOString() }] : []),
+      ]);
+      const first = be.destroySession();
+      timeOut();
+      expect(await first).toMatchObject({ ok: false, error: 'close_unknown_write_not_yet_visible' });
+      expect(cancelled()).toEqual([]);
+
+      visible = true;
+      pastSettle(be);
+      expect(await be.destroySession()).toEqual({ ok: true, taskId: 'task-child' });
+      expect(cancelled()).toEqual(['task-child']);
+    });
+
+    it('a child created without its parent link (the server redirected the parent) is still stopped', async () => {
+      const { be, timeOut } = await hungFollowUp(() => [
+        { id: 'task-parent', status: 'completed' },
+        { id: 'task-redirected', status: 'running', followUpParentTaskId: 'task-other-latest', createdAt: new Date(Date.now() + 500).toISOString() },
+      ]);
+      const first = be.destroySession();
+      timeOut();
+      await first;
+      pastSettle(be);
+      expect(await be.destroySession()).toMatchObject({ ok: true, taskId: 'task-redirected' });
+      expect(cancelled()).toContain('task-redirected');
+    });
+
+    it('does not trust a listing that includes another thread', async () => {
+      const { be, timeOut } = await hungFollowUp(() => [
+        { id: 'task-parent', threadId: 'session-1', status: 'completed' },
+        { id: 'task-other', threadId: 'session-2', status: 'running' },
+      ]);
+      const closing = be.destroySession();
+      timeOut();
+      expect(await closing).toMatchObject({ ok: false, error: 'close_unknown_write_unverifiable' });
+      expect(cancelled()).toEqual([]);
+    });
+
+    it.each([
+      ['an HTTP error', 'fail' as const],
+      ['a failure envelope', { success: false } as const],
+      ['a list under the wrong key', { success: true, data: { tasks: [] } } as const],
+    ])('does not report stopped when the thread listing is %s', async (_label, listing) => {
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true;
+      let rejectFollowUp!: (err: Error) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) return new Promise<Response>((_r, reject) => { rejectFollowUp = reject; });
+        if (u.includes('/api/tasks?')) {
+          return listing === 'fail' ? new Response('down', { status: 503 }) : Response.json(listing);
+        }
+        return Response.json({ success: true, data: {} });
+      });
+      be.write('second turn');
+      await flush();
+      const closing = be.destroySession();
+      rejectFollowUp(timeoutErr());
+      expect(await closing).toMatchObject({ ok: false, error: 'close_unknown_write_unverifiable' });
+      // Even past the settle time: an unusable listing is never "nothing running".
+      pastSettle(be);
+      expect(await be.destroySession()).toMatchObject({ ok: false, error: 'close_unknown_write_unverifiable' });
+    });
+
+    it('once the request is past its settle time with nothing in the thread, it created nothing', async () => {
+      const { be, timeOut } = await hungFollowUp(() => [{ id: 'task-parent', status: 'completed' }]);
+      const first = be.destroySession();
+      timeOut();
+      expect(await first).toMatchObject({ ok: false, error: 'close_unknown_write_not_yet_visible' });
+      pastSettle(be);
+      expect(await be.destroySession()).toEqual({ ok: true, taskId: 'task-parent' });
+      expect(cancelled()).toEqual([]);
+    });
+
+    it('a sweep cut short (one cancel fails) keeps the record, so the next close sweeps again', async () => {
+      let failF1 = true;
+      const status: Record<string, string> = { 'task-f1': 'running', 'task-f2': 'running' };
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true;
+      let rejectFollowUp!: (err: Error) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) return new Promise<Response>((_r, reject) => { rejectFollowUp = reject; });
+        if (u.includes('/api/tasks?')) {
+          return Response.json({ success: true, data: [
+            { id: 'task-parent', status: 'completed' },
+            { id: 'task-f1', status: status['task-f1'], createdAt: new Date(Date.now() + 100).toISOString() },
+            { id: 'task-f2', status: status['task-f2'], createdAt: new Date(Date.now() + 200).toISOString() },
+          ] });
+        }
+        if (u.includes('/api/task-cancel')) {
+          const id = JSON.parse(String(init?.body)).id as string;
+          if (id === 'task-f1' && failF1) return new Response('boom', { status: 500 });
+          status[id] = 'cancelled';
+          return Response.json({ success: true, data: {} });
+        }
+        return Response.json({ success: true, data: {} });
+      });
+      be.write('second turn');
+      await flush();
+      const first = be.destroySession();
+      rejectFollowUp(timeoutErr());
+      for (let i = 0; i < 20 && !(be as any).unansweredWrite; i++) await flush();
+      pastSettle(be);
+      expect(await first).toMatchObject({ ok: false, taskId: 'task-f1' });
+      expect(status['task-f2']).toBe('running');
+      expect((be as any).unansweredWrite).not.toBeNull();
+
+      failF1 = false;
+      expect(await be.destroySession()).toMatchObject({ ok: true });
+      expect(status).toEqual({ 'task-f1': 'cancelled', 'task-f2': 'cancelled' });
+      expect((be as any).unansweredWrite).toBeNull();
+    });
+
+    it('a sweep aborted midway keeps the record and does not leave a running task as the lineage', async () => {
+      const status: Record<string, string> = { 'task-f1': 'running', 'task-f2': 'running' };
+      let releaseCancel!: () => void;
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true;
+      let rejectFollowUp!: (err: Error) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) return new Promise<Response>((_r, reject) => { rejectFollowUp = reject; });
+        if (u.includes('/api/tasks?')) {
+          return Response.json({ success: true, data: [
+            { id: 'task-f1', status: status['task-f1'], createdAt: new Date(Date.now() + 100).toISOString() },
+            { id: 'task-f2', status: status['task-f2'], createdAt: new Date(Date.now() + 200).toISOString() },
+          ] });
+        }
+        if (u.includes('/api/task-cancel')) {
+          const id = JSON.parse(String(init?.body)).id as string;
+          if (id === 'task-f1' && !releaseCancel) {
+            await new Promise<void>(r => { releaseCancel = r; });
+          }
+          status[id] = 'cancelled';
+          return Response.json({ success: true, data: {} });
+        }
+        return Response.json({ success: true, data: {} });
+      });
+      be.write('second turn');
+      await flush();
+      const first = be.destroySession();
+      rejectFollowUp(timeoutErr());
+      for (let i = 0; i < 20 && !releaseCancel; i++) await flush();
+      expect(releaseCancel).toBeDefined();
+      pastSettle(be);
+      const aborting = be.abortDestroySession();
+      releaseCancel();
+      await aborting;
+      expect(await first).toMatchObject({ ok: false, error: 'close_aborted' });
+      expect(status['task-f2']).toBe('running');
+      expect((be as any).unansweredWrite).not.toBeNull();
+
+      expect(await be.destroySession()).toMatchObject({ ok: true });
+      expect(status).toEqual({ 'task-f1': 'cancelled', 'task-f2': 'cancelled' });
+    });
+
+    it('a follow-up that timed out BEFORE the close is still not trusted by the close', async () => {
+      const { be, timeOut } = await hungFollowUp(() => [
+        { id: 'task-parent', status: 'completed' },
+        { id: 'task-child', status: cancelled().includes('task-child') ? 'cancelled' : 'running', followUpParentTaskId: 'task-parent', createdAt: 'not-a-date' },
+      ]);
+      // The turn's own timeout reconcile could not match the child (no usable
+      // createdAt), so the turn ended "not delivered" -- yet the child exists.
+      (be as any).reconcileRetryDelayMs = 0;
+      let turnEnded = false;
+      be.onTaskDone(() => { turnEnded = true; });
+      timeOut();
+      for (let i = 0; i < 50 && !turnEnded; i++) await flush();
+      expect(turnEnded).toBe(true);
+      expect((be as any).closing).toBe(false);
+      expect(cancelled()).toEqual([]);
+
+      pastSettle(be);
+      expect(await be.destroySession()).toEqual({ ok: true, taskId: 'task-child' });
+      expect(cancelled()).toEqual(['task-child']);
+    });
+
+    it('a follow-up the timeout reconcile adopted is tracked again: the close does not list the thread', async () => {
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true;
+      (be as any).reconcileRetryDelayMs = 0;
+      let rejectFollowUp!: (err: Error) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) return new Promise<Response>((_r, reject) => { rejectFollowUp = reject; });
+        if (u.includes('/api/tasks?')) {
+          return Response.json({ success: true, data: [
+            { id: 'task-parent', status: 'completed' },
+            { id: 'task-child', status: 'running', followUpParentTaskId: 'task-parent', createdAt: new Date(Date.now() + 500).toISOString() },
+          ] });
+        }
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        return Response.json({ success: true, data: {} });
+      });
+      be.write('second turn');
+      await flush();
+      rejectFollowUp(timeoutErr());
+      for (let i = 0; i < 20 && (be as any).currentTaskId !== 'task-child'; i++) await flush();
+      expect((be as any).currentTaskId).toBe('task-child');
+      const listsBefore = calls.filter(c => c.url.includes('/api/tasks?')).length;
+
+      expect(await be.destroySession()).toEqual({ ok: true, taskId: 'task-child' });
+      expect(calls.filter(c => c.url.includes('/api/tasks?')).length).toBe(listsBefore);
+    });
+
+    it('a first create that never answered is not trusted by the close either', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      let rejectCreate!: (err: Error) => void;
+      const status: Record<string, string> = { 'task-first': 'running' };
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-execute')) return new Promise<Response>((_r, reject) => { rejectCreate = reject; });
+        if (u.includes('/api/tasks?')) {
+          return Response.json({ success: true, data: [{ id: 'task-first', status: status['task-first'] }] });
+        }
+        if (u.includes('/api/task-cancel')) {
+          status[JSON.parse(String(init?.body)).id] = 'cancelled';
+          return Response.json({ success: true, data: {} });
+        }
+        return Response.json({ success: true, data: {} });
+      });
+      be.write('first');
+      await flush();
+      rejectCreate(timeoutErr());
+      await flush(); await flush();
+      pastSettle(be);
+      expect(await be.destroySession()).toEqual({ ok: true, taskId: 'task-first' });
+      expect(status['task-first']).toBe('cancelled');
+    });
+
+    it.each([502, 503, 504])('a gateway %i may have been sent after Riff accepted: still unanswered', async (code) => {
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true;
+      let answer!: (r: Response) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) return new Promise<Response>(r => { answer = r; });
+        return Response.json({ success: true, data: [] });
+      });
+      be.write('second turn');
+      await flush();
+      answer(new Response('gateway', { status: code }));
+      await flush(); await flush();
+      expect((be as any).unansweredWrite).not.toBeNull();
+      expect(await be.destroySession()).toMatchObject({ ok: false, error: 'close_unknown_write_not_yet_visible' });
+    });
+
+    it('merging two unanswered requests keeps the earliest send and the latest settle time', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const note = (be as any).noteUnansweredWrite.bind(be);
+      const t0 = Date.now();
+      note(timeoutErr(), t0, 30_000);
+      const first = { ...(be as any).unansweredWrite };
+      // A later request whose clock reads earlier (wall-clock step back).
+      note(timeoutErr(), t0 - 5_000, 10_000);
+      expect((be as any).unansweredWrite).toEqual({
+        sentAtMs: t0 - 5_000,
+        settleAtMs: first.settleAtMs,
+      });
+    });
+
+    it('the settle time runs from when the request failed, not only from when it was first sent', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const sentLongAgo = Date.now() - 60_000;
+      (be as any).noteUnansweredWrite(timeoutErr(), sentLongAgo, 30_000);
+      expect((be as any).unansweredWrite.settleAtMs).toBeGreaterThanOrEqual(Date.now() + (be as any).unknownWriteSettleSlackMs - 5);
+    });
+
+    it('an HTTP error answer is definite: nothing was created, no thread check', async () => {
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      (be as any).taskDone = true;
+      let answer!: (r: Response) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-follow-up')) return new Promise<Response>(r => { answer = r; });
+        return Response.json({ success: true, data: [] });
+      });
+      be.write('second turn');
+      await flush();
+      const closing = be.destroySession();
+      answer(new Response('bad', { status: 400 }));
+      expect(await closing).toMatchObject({ ok: true });
+      expect(calls.filter(c => c.url.includes('/api/tasks?'))).toHaveLength(0);
+    });
+  });
+
   describe('close prepare / abort / retry state contract', () => {
     it('restores write admission after cancel failure, then allows a close retry', async () => {
       const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
@@ -2123,5 +2583,68 @@ describe('RiffBackend', () => {
       expect((be3 as any).followUpHotTimeoutMs).toBe(30_000);
       expect((be3 as any).followUpColdTimeoutMs).toBe(60_000);
     });
+  });
+});
+
+
+describe('queryRiffThreadTasks (daemon-side thread listing for close reconciliation)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubFetch(response: () => Response | Promise<Response>) {
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => response());
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('lists every task of the thread with the session identity and lane headers, marking terminal ones', async () => {
+    const fetchMock = stubFetch(() => Response.json({ success: true, data: [
+      { id: 'task-a', status: 'cancelled' },
+      { id: 'task-b', status: 'running' },
+      { id: 'task-c', status: 'completed' },
+      { id: 'task-d', status: 'some_future_state' },
+      { id: 'task-e' },
+    ] }));
+
+    const result = await queryRiffThreadTasks(
+      { baseUrl: BASE, jwt: 'test-jwt', extraHeaders: { 'x-tt-env': 'ppe_x' } },
+      'session/1',
+    );
+
+    expect(result).toEqual({ ok: true, tasks: [
+      { id: 'task-a', status: 'cancelled', terminal: true },
+      { id: 'task-b', status: 'running', terminal: false },
+      { id: 'task-c', status: 'completed', terminal: true },
+      // Unknown or missing status never counts as stopped.
+      { id: 'task-d', status: 'some_future_state', terminal: false },
+      { id: 'task-e', terminal: false },
+    ] });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe(`${BASE}/api/tasks?threadId=session%2F1&view=summary`);
+    expect((init?.headers as Record<string, string>)['x-jwt-token']).toBe('test-jwt');
+    expect((init?.headers as Record<string, string>)['x-tt-env']).toBe('ppe_x');
+  });
+
+  it('reports an empty thread as an empty list', async () => {
+    stubFetch(() => Response.json({ success: true, data: [] }));
+    expect(await queryRiffThreadTasks({ baseUrl: BASE, jwt: 'test-jwt' }, 'session-1'))
+      .toEqual({ ok: true, tasks: [] });
+  });
+
+  it.each([
+    ['an HTTP error', () => new Response('nope', { status: 403 })],
+    ['a failure envelope', () => Response.json({ success: false, data: [] })],
+    ['a missing task list', () => Response.json({ success: true })],
+    ['a task without an id', () => Response.json({ success: true, data: [{ status: 'running' }] })],
+    ['a task from another thread (filter ignored)', () => Response.json({ success: true, data: [
+      { id: 'task-mine', threadId: 'session-1', status: 'cancelled' },
+      { id: 'task-other', threadId: 'session-2', status: 'running' },
+    ] })],
+    ['a network error', () => { throw new TypeError('fetch failed'); }],
+  ])('never turns %s into an empty thread', async (_label, response) => {
+    stubFetch(response);
+    expect(await queryRiffThreadTasks({ baseUrl: BASE, jwt: 'test-jwt' }, 'session-1'))
+      .toMatchObject({ ok: false });
   });
 });

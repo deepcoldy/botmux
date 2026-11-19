@@ -12,15 +12,23 @@
  *  （字符串=用它 / null=当前不该传模型 / undefined=取不到，保持快照=旧行为），
  *  worker 在合并守卫之前覆盖 lastInitConfig.model。
  *
- *  另外两条同族状态转换也在这里锁：
- *  - Codex App 线程接管把 cliId 钉成 codex-app 时必须清掉内存态的
- *    spawnModelOverride（它优先级最高且无条件，否则会泄漏进接管后的启动）；
- *  - session.model 是「上次实际启动用的模型」记录，只在 bot 换过 CLI、
- *    session 被钉在旧 CLI 上时兜底。
+ *  另外：session.model 是「上次实际启动用的模型」记录，只在 bot 换过 CLI、
+ *  session 被钉在旧 CLI 上时兜底；crash-loop park 后由消息触发的恢复重启也要
+ *  刷新模型（见 crash-loop-diagnostic.test.ts）。worker 侧在合并守卫之前覆盖
+ *  lastInitConfig.model 的接线在 worker.ts 闭包里，暂无单测 seam。
  *
  * Run:  pnpm vitest run test/restart-live-worker-model.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const transcriptPathMock = vi.fn();
+vi.mock('../src/services/transcript-resolver.js', async (original) => ({
+  ...await original<typeof import('../src/services/transcript-resolver.js')>(),
+  resolveSessionTranscriptPath: (...args: unknown[]) => transcriptPathMock(...args),
+}));
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -38,18 +46,19 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
   updateSession: (...args: unknown[]) => updateSessionMock(...args),
 }));
 
-import { readFileSync } from 'node:fs';
 import {
   latestModelForRespawn,
+  latestPinEffortForRespawn,
+  __testOnly_sessionAgentConfig,
+  writeSessionModelPin,
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
-import { resolveSessionLaunchModel } from '../src/core/session-model.js';
-
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
-const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+import { resolveSessionLaunchModel, resolveSessionLaunchModelChoice } from '../src/core/session-model.js';
+import * as sessionModel from '../src/core/session-model.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
+import { recordCodexModelLaunch } from '../src/services/codex-model-selection.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 let sessionCounter = 0;
 
@@ -77,7 +86,69 @@ function observer() {
 beforeEach(() => {
   getBotMock.mockReset();
   updateSessionMock.mockReset();
+  transcriptPathMock.mockReset();
   __testOnly_resetRestartCoordinator();
+});
+
+describe('native Codex settings enter both real launch paths', () => {
+  let dir: string;
+  const start = Date.parse('2026-11-04T00:00:00.000Z');
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    dir = mkdtempSync(join(tmpdir(), 'botmux-native-resume-'));
+    const path = join(dir, 'rollout.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(start + 100).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'native-B' } },
+    }) + '\n');
+    transcriptPathMock.mockReturnValue({ path, kind: 'codex' });
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'default-A' } });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('sends the confirmed native choice in a live-worker restart', () => {
+    const { ds, send } = makeDs({ cliSessionId: 'native-1', model: 'default-A' });
+    recordCodexModelLaunch(ds.session, 'default-A');
+    vi.setSystemTime(start + 1000);
+    requestSessionRestart(ds, observer());
+    expect(send.mock.calls[0][0]).toMatchObject({ type: 'restart', model: 'native-B' });
+    expect(ds.session.codexModelSelection).toMatchObject({ nativeSessionId: 'native-1', override: 'native-B' });
+  });
+
+  it('recovers a native choice on cold launch without a worker runtime update', () => {
+    const { ds } = makeDs({ cliSessionId: 'native-1', model: 'default-A', agentFrozen: true });
+    recordCodexModelLaunch(ds.session, 'default-A');
+    vi.setSystemTime(start + 1000);
+    const restored = { ...ds, session: JSON.parse(JSON.stringify(ds.session)), worker: null };
+    const result = __testOnly_sessionAgentConfig(restored, { cliId: 'codex', model: 'default-A' });
+    expect(result.model).toBe('native-B');
+    const args = createCodexAdapter('/test/codex').buildArgs({
+      sessionId: restored.session.sessionId, workingDir: dir,
+      resume: true, resumeSessionId: 'native-1', model: result.model,
+    });
+    expect(args[args.indexOf('--model') + 1]).toBe('native-B');
+    expect(restored.session.model).toBe('native-B');
+    expect(updateSessionMock).toHaveBeenCalledWith(restored.session);
+  });
+
+  it('keeps a saved preference when the native file is unavailable', () => {
+    const { ds } = makeDs({ cliSessionId: 'native-1', model: 'native-B', codexModelSelection: {
+      nativeSessionId: 'native-1', launchModel: 'native-B', launchStartedAtMs: start, override: 'native-B',
+    } });
+    transcriptPathMock.mockReturnValue({ path: join(dir, 'missing.jsonl'), kind: 'codex' });
+    expect(latestModelForRespawn(ds)).toBe('native-B');
+  });
+
+  it('does not consult native settings or change model policy for another CLI', () => {
+    const { ds } = makeDs({ cliId: 'claude-code', model: 'sonnet', cliSessionId: 'native-1' });
+    getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'opus' } });
+    expect(latestModelForRespawn(ds)).toBe('opus');
+    expect(transcriptPathMock).not.toHaveBeenCalled();
+    expect(ds.session.codexModelSelection).toBeUndefined();
+  });
 });
 
 afterEach(() => {
@@ -118,6 +189,29 @@ describe('latestModelForRespawn (daemon-side model carrier)', () => {
     getBotMock.mockImplementation(() => { throw new Error('Bot not registered'); });
     const { ds } = makeDs();
     expect(latestModelForRespawn(ds)).toBeUndefined();
+  });
+});
+
+describe('TraeX empty-pool launch block is visible to every launch carrier', () => {
+  it('keeps an explicit blocked state and rejects all four launch resolution paths', () => {
+    const tombstone = { enabled: true as const, models: [], catalogUnavailable: true as const };
+    const bot = { cliId: 'traex' as const, model: 'auto', traexAutoModel: tombstone };
+    getBotMock.mockReturnValue({ config: bot });
+    const { ds } = makeDs({ cliId: 'traex', model: 'core', agentFrozen: true });
+    expect(resolveSessionLaunchModelChoice(ds, bot)).toMatchObject({
+      blocked: 'catalog_empty', traexAutoModel: tombstone,
+    });
+    expect(() => __testOnly_sessionAgentConfig(ds, bot)).toThrow('catalog_empty');
+    expect(() => latestModelForRespawn(ds)).toThrow('catalog_empty');
+    const scope = {
+      getBot: () => ({ config: bot }), resolveSessionLaunchModelChoice,
+      assertSessionLaunchModelChoiceAllowed: (sessionModel as any).assertSessionLaunchModelChoiceAllowed,
+      isSessionLaunchModelBlockedError: (sessionModel as any).isSessionLaunchModelBlockedError,
+      sessionCliId: () => 'traex', resolveCodexRpcInput: vi.fn(),
+      config: { codexRpcInputDefault: false },
+    };
+    expect(() => loadWorkerPoolFunction('latestTraexAutoModelForRespawn', scope)(ds)).toThrow('catalog_empty');
+    expect(() => loadWorkerPoolFunction('latestCodexRpcInputForRespawn', scope)(ds)).toThrow('catalog_empty');
   });
 });
 
@@ -169,7 +263,9 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
 
     expect(latestModelForRespawn(ds)).toBe('gpt-5.6-terra');
     expect(ds.session.model).toBe('gpt-5.5');
-    expect(updateSessionMock).not.toHaveBeenCalled();
+    // Record the one-shot launch BASELINE, without turning it into a preference.
+    expect(ds.session.codexModelSelection).toMatchObject({ launchModel: 'gpt-5.6-terra' });
+    expect(ds.session.codexModelSelection.override).toBeUndefined();
   });
 
   // THE state sequence the record exists for: launch on A → live `/restart`
@@ -192,118 +288,49 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
   });
 });
 
-// ─── 3. 全部四个 restart IPC 生产者均捎带 model（wiring） ───────────────────
 
-describe('every daemon-side restart IPC producer carries model (source wiring)', () => {
-  it('worker-pool.ts: every {type:restart} send includes model', () => {
-    const sends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBeGreaterThanOrEqual(2); // requestSessionRestart + auto-restart
-    for (const s of sends) {
-      expect(s, `missing model in: ${s}`).toContain('model: latestModelForRespawn(ds)');
-    }
+describe('topic pin across launch channels', () => {
+  const pin = { model: 'gpt-6.1-terra', effort: 'high' as const, source: 'topic-header' as const, setBy: 'owner', setAt: '2026-11-06T00:00:00.000Z' };
+  it.each(['slash', 'dashboard', 'cwd_move', 'cli_crash'] as const)('%s respawn carries pinned launch model AND effort', source => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'low' } });
+    const { ds, send } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    const result = requestSessionRestart(ds, { source, notify: async () => {} });
+    expect(result?.joined).toBe(false);
+    expect(send.mock.calls[0][0]).toMatchObject({ model: pin.model, reasoningEffort: pin.effort });
+    expect(ds.session.model).toBe(pin.model); expect(ds.session.modelPin).toEqual(pin);
   });
-
-  it('dashboard-ipc-server.ts: every {type:restart} send includes model', () => {
-    const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2); // dashboard 重启按钮 + cwd-move
-    for (const s of sends) {
-      expect(s, `missing model in: ${s}`).toContain('model: latestModelForRespawn(ds)');
-    }
+  it('cold restore/refork and message wake after crash park resolve the same choice', () => {
+    const cfg = { cliId: 'codex' as const, model: 'gpt-6.1-sol', reasoningEffort: 'low' as const };
+    getBotMock.mockReturnValue({ config: cfg });
+    const { ds } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    const cold = __testOnly_sessionAgentConfig(ds, cfg);
+    expect(cold).toMatchObject({ model: pin.model, reasoningEffort: pin.effort });
+    expect({ model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) }).toMatchObject({ model: cold.model, reasoningEffort: cold.reasoningEffort });
   });
-
-  it('the restart message type declares the three-state model field', () => {
-    const typesSource = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
-    const restartAt = typesSource.indexOf("| { type: 'restart';");
-    expect(restartAt).toBeGreaterThanOrEqual(0);
-    const line = typesSource.slice(restartAt, typesSource.indexOf('}', restartAt));
-    expect(line).toContain('model?: string | null');
+  it('clear refreshes the worker effort snapshot too; never-pinned sessions keep their wire payload', () => {
+    const cfg = { cliId: 'codex' as const, model: 'gpt-6.1-sol', reasoningEffort: 'low' as const };
+    getBotMock.mockReturnValue({ config: cfg });
+    const { ds } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    writeSessionModelPin(ds, undefined);
+    expect(latestModelForRespawn(ds)).toBe(cfg.model);
+    expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'low' });
+    const { ds: old } = makeDs({ reasoningEffort: 'high' }); expect(latestPinEffortForRespawn(old)).toEqual({});
   });
-});
-
-// ─── 4. worker wiring：respawn 前 merge model（合并守卫之前 + null 清除） ────
-
-describe('worker restart case merges model into lastInitConfig (source pin)', () => {
-  function restartCaseBranch(): string {
-    const start = workerSource.indexOf("case 'restart': {");
-    const end = workerSource.indexOf("case 'expire_durable_turn':", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    return workerSource.slice(start, end);
-  }
-
-  it('full-replaces lastInitConfig.model with null→clear three-state semantics', () => {
-    const branch = restartCaseBranch();
-    expect(branch).toContain('if (msg.model !== undefined && lastInitConfig)');
-    expect(branch).toContain('lastInitConfig.model = msg.model === null ? undefined : msg.model;');
+  it('rejects mismatched CLI, unsupported effort and in-flight restart before changing durable intent', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'opus' } });
+    const { ds } = makeDs({ modelPin: pin });
+    expect(() => writeSessionModelPin(ds, { ...pin, source: 'command' })).toThrow();
+    expect(ds.session.modelPin).toEqual(pin); expect(updateSessionMock).not.toHaveBeenCalled();
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    expect(() => writeSessionModelPin(ds, { ...pin, model: 'gpt-5.2', effort: 'ultra' })).toThrow();
+    requestSessionRestart(ds, observer()); updateSessionMock.mockClear();
+    expect(() => writeSessionModelPin(ds, undefined)).toThrow(); expect(updateSessionMock).not.toHaveBeenCalled();
   });
-
-  it('the model merge sits BEFORE the in-flight merge guard (coalesced restarts still take it)', () => {
-    const branch = restartCaseBranch();
-    const modelMerge = branch.indexOf('if (msg.model !== undefined && lastInitConfig)');
-    const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');
-    expect(modelMerge).toBeGreaterThanOrEqual(0);
-    expect(guard).toBeGreaterThan(modelMerge);
-  });
-});
-
-// ─── 5. Codex App 线程接管必须清掉内存态的 per-trigger 覆盖（source pin） ────
-
-describe('Codex App thread takeover clears the in-memory model override', () => {
-  it('the takeover block that pins cliId=codex-app also clears spawnModelOverride', () => {
-    const pin = daemonSource.indexOf("ds.session.cliId = 'codex-app';");
-    expect(pin).toBeGreaterThanOrEqual(0);
-    // 接管块紧随其后的几行：清 wrapper / 清 model 记录 / 清一次性覆盖 / 置 frozen。
-    const block = daemonSource.slice(pin, pin + 400);
-    expect(block).toContain('delete ds.session.model;');
-    expect(block).toContain('ds.spawnModelOverride = undefined;');
-  });
-});
-
-// ─── 6. crash-loop park 后由消息触发的恢复重启也要刷新模型 ──────────────────
-
-describe('crash-park retry respawn takes the model carried by the message', () => {
-  function messageCaseHead(): string {
-    const start = workerSource.indexOf("case 'message': {");
-    expect(start).toBeGreaterThanOrEqual(0);
-    return workerSource.slice(start, start + 1200);
-  }
-
-  it('the message case merges msg.model into lastInitConfig with null→clear', () => {
-    const head = messageCaseHead();
-    expect(head).toContain('if (msg.model !== undefined && lastInitConfig)');
-    expect(head).toContain('lastInitConfig.model = msg.model === null ? undefined : msg.model;');
-  });
-
-  it('the merge precedes the crash-park retry that respawns from lastInitConfig', () => {
-    const merge = workerSource.indexOf('lastInitConfig.model = msg.model === null ? undefined : msg.model;');
-    const retry = workerSource.indexOf('Message received after crash-loop stop; retrying CLI start');
-    expect(merge).toBeGreaterThanOrEqual(0);
-    expect(retry).toBeGreaterThan(merge);
-    // …and that retry really does spawn from the snapshot this merge updates.
-    const retryBlock = workerSource.slice(retry, retry + 600);
-    expect(retryBlock).toContain('{ ...lastInitConfig, resume: true');
-  });
-
-  it('every daemon-side message IPC refreshes the model while the worker is parked', () => {
-    // Every literal that builds a `{type:'message'}` IPC must carry the refresh,
-    // gated on the parked flag — a send that forgets it leaves the snapshot stale
-    // for the crash-park respawn; an ungated one would put a model field on every
-    // ordinary turn, which changes nothing and only adds noise.
-    const bodies = workerPoolSource.split(/type: 'message',/).slice(1).map(part => part.slice(0, 700));
-    expect(bodies.length).toBeGreaterThanOrEqual(2);
-    for (const body of bodies) {
-      expect(body, `missing model in: ${body.slice(0, 120)}`)
-        .toContain('...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {})');
-    }
-  });
-
-  it('the park request marks the session, and a ready worker clears it', () => {
-    const park = workerPoolSource.indexOf("ds.worker!.send({ type: 'park_diagnostic' }");
-    expect(park).toBeGreaterThanOrEqual(0);
-    // The flag must be set BEFORE the park IPC leaves, so a message racing the
-    // park still carries the refresh.
-    const setAt = workerPoolSource.lastIndexOf('ds.crashDiagnosticParked = true;', park);
-    expect(setAt).toBeGreaterThanOrEqual(0);
-    expect(workerPoolSource).toContain('ds.crashDiagnosticParked = undefined;');
+  it('does not publish a successful mutation if persistence fails', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    const { ds } = makeDs({ modelPin: pin });
+    updateSessionMock.mockImplementationOnce(() => { throw new Error('disk'); });
+    expect(() => writeSessionModelPin(ds, undefined)).toThrow('disk'); expect(ds.session.modelPin).toEqual(pin);
+    expect(ds.modelPinCleared).toBeUndefined();
   });
 });

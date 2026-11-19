@@ -17,6 +17,7 @@ const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs'
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
+const stdinClosedRunner = resolve('test/fixtures/remote-runner-stdin-closed.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -63,8 +64,15 @@ describe('RemoteRunnerBackend', () => {
       content: 'hello',
       trustedCaller: {
         requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test_bot',
         requestLarkAppId: 'cli_test',
-        senderType: 'user',
+        senderType: 'bot',
+        botOwner: {
+          openId: 'ou_owner',
+          unionId: 'on_owner',
+          email: 'owner@bytedance.com',
+          source: 'bot_config',
+        },
       },
     })).resolves.toEqual({ submitted: true });
 
@@ -140,7 +148,7 @@ describe('RemoteRunnerBackend', () => {
       mention: 'explicit',
       mentions: ['ou_target:Target'],
       content: 'final payload',
-    }));
+    }), {});
   });
 
   it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
@@ -557,6 +565,7 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-survived',
       dispatchAttempt: 4,
     });
+    expect(backend.setRecoveredTurnHostContext('turn-survived', {})).toBe(true);
     expect(progress.join('')).toContain('recovered progress');
     await expect(backend.submitTurn({ turnId: 'turn-new', content: 'must not run' }))
       .resolves.toMatchObject({ submitted: false });
@@ -798,6 +807,47 @@ describe('RemoteRunnerBackend', () => {
     });
   });
 
+  it('fails a turn the provider can no longer read without crashing the host process', async () => {
+    const escaped: unknown[] = [];
+    const onUncaught = (error: unknown) => escaped.push(error);
+    process.on('uncaughtException', onUncaught);
+    try {
+      const backend = new RemoteRunnerBackend({
+        expectedProvider: 'stdin-closed',
+        requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'status'],
+      }, 'session-stdin-closed');
+      children.push(backend);
+      const ready = once<void>(cb => backend.onReady(cb));
+      const failure = once<{ status: string; turnId: string }>(cb => {
+        backend.onTurnFailure(value => cb(value));
+      });
+      const exited = once<void>(cb => backend.onExit(() => cb()));
+      spawnBackend(backend, stdinClosedRunner);
+      await ready;
+
+      // The provider closed its stdin before reporting ready, so the turn hits
+      // a pipe nobody reads: EPIPE. The write callback fails the turn, but the
+      // stream also emits 'error'; without a listener that is thrown at process
+      // level. Bun only reports EPIPE for writes the pipe buffer cannot absorb,
+      // so the turn is made larger than that.
+      await expect(backend.submitTurn({
+        turnId: 'turn-stdin-closed',
+        content: 'x'.repeat(256 * 1024),
+      })).resolves.toMatchObject({
+        submitted: false,
+        submissionDisposition: 'dirty_unknown',
+      });
+      await expect(failure).resolves.toMatchObject({
+        turnId: 'turn-stdin-closed',
+        status: 'ambiguous',
+      });
+      await exited;
+      expect(escaped).toEqual([]);
+    } finally {
+      process.removeListener('uncaughtException', onUncaught);
+    }
+  });
+
   it('correlates a provider failure before the busy ACK and keeps the generation usable', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'pre-ack-failure',
@@ -988,5 +1038,43 @@ describe('RemoteRunnerBackend', () => {
       code: 'remote_runner_protocol_error',
     })));
     expect(finals).toEqual([]);
+  });
+});
+
+describe('reference provider delegated adopt/detach contract', () => {
+  it('lists, binds, unbinds and resumes providerState without protocol cancel/detach', async () => {
+    const backend = createBackend();
+    const states: RemoteRunnerBackendState[] = [];
+    backend.onBackendState(state => states.push(structuredClone(state)));
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend);
+    await ready;
+    const caller = { requestUserOpenId: 'ou_operator', requestLarkAppId: 'cli_remote', senderType: 'user' as const };
+    async function turn(target: RemoteRunnerBackend, turnId: string, content: string) {
+      const final = once<string>(cb => target.onTurnFinal(text => cb(text)));
+      expect(await target.submitTurn({ turnId, content, trustedCaller: caller })).toEqual({ submitted: true });
+      return await final;
+    }
+    expect(await turn(backend, 'list', '/adopt')).toContain('/adopt reference-thread:alpha');
+    expect(states.at(-1)?.agentThreadId).toBeUndefined();
+    expect(states.at(-1)?.providerState?.adoptCandidates).toEqual(['reference-thread:alpha', 'reference-thread:beta']);
+    await turn(backend, 'bind-alpha', '/ADOPT  reference-thread:alpha');
+    expect(states.at(-1)?.agentThreadId).toBe('reference-thread:alpha');
+    const bound = structuredClone(states.at(-1)!);
+    backend.kill();
+
+    const restored = createBackend(bound);
+    restored.onBackendState(state => states.push(structuredClone(state)));
+    const resumed = once<void>(cb => restored.onReady(cb));
+    spawnBackend(restored);
+    await resumed;
+    expect(states.at(-1)).toEqual(bound);
+    expect(await turn(restored, 'unbind', '/DISCONNECT')).toContain('source agent preserved');
+    expect(states.at(-1)).not.toHaveProperty('agentThreadId');
+    expect(states.at(-1)?.remoteSessionId).toBe(bound.remoteSessionId);
+    expect(states.at(-1)?.generation).toBe(bound.generation);
+    expect(await turn(restored, 'unbind-again', '/detach')).toContain('No agent session is bound');
+    await turn(restored, 'bind-beta', '/adopt reference-thread:beta');
+    expect(states.at(-1)?.agentThreadId).toBe('reference-thread:beta');
   });
 });

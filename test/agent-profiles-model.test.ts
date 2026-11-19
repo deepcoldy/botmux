@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   AGENT_BACKEND_TYPES,
   agentBotDrift,
-  agentHasSections,
   agentLinkedBots,
   agentPushRequests,
   agentZeroPromptConflict,
@@ -198,8 +197,6 @@ describe('agentPushRequests', () => {
   it('can be limited to the drifted sections only', () => {
     expect(agentPushRequests(fullAgent, 'cli_a', ['sandbox']).map(request => request.section)).toEqual(['sandbox']);
     expect(agentPushRequests({}, 'cli_a')).toEqual([]);
-    expect(agentHasSections({})).toBe(false);
-    expect(agentHasSections({ sandbox: { mode: 'off' } })).toBe(true);
   });
 });
 
@@ -232,12 +229,12 @@ describe('zero injection section', () => {
     expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, antigravity)).toBe(true);
     expect(agentZeroPromptConflict({ sandbox: { mode: 'scratch' } }, antigravity)).toBe(true);
     expect(agentZeroPromptConflict({ backend: { backendType: 'herdr' } }, antigravity)).toBe(false);
-    // Switching the CLI away from antigravity makes zmx fine; to gemini it never is.
+    // Switching the CLI away from antigravity makes zmx fine; to opencode it never is.
     expect(agentZeroPromptConflict({ exec: { cliId: 'claude-code', model: '', reasoningEffort: '', configDir: '' }, backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
-    expect(agentZeroPromptConflict({ exec: { cliId: 'gemini', model: '', reasoningEffort: '', configDir: '' } }, antigravity)).toBe(true);
+    expect(agentZeroPromptConflict({ exec: { cliId: 'opencode', model: '', reasoningEffort: '', configDir: '' } }, antigravity)).toBe(true);
     // The agent turns zero injection on/off itself.
     expect(agentZeroPromptConflict({ promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
-    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, bot({ cliId: 'gemini', agentSelectionKey: 'gemini' }))).toBe(true);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, bot({ cliId: 'opencode', agentSelectionKey: 'opencode' }))).toBe(true);
     expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', promptInjection: 'default' }))).toBe(false);
   });
 
@@ -265,7 +262,7 @@ describe('zero injection section', () => {
     // (zero_prompt_unsupported), so disabling must land first.
     const requests = agentPushRequests({
       promptInjection: { mode: 'default' },
-      exec: { cliId: 'gemini', model: '', reasoningEffort: '', configDir: '' },
+      exec: { cliId: 'opencode', model: '', reasoningEffort: '', configDir: '' },
       backend: { backendType: 'tmux' },
     }, 'cli_a');
     expect(requests.map(request => request.section)).toEqual(['promptInjection', 'exec', 'backend']);

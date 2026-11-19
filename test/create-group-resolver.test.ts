@@ -41,6 +41,25 @@ describe('resolveBotRefs', () => {
     expect(r.larkAppIds).toEqual(['cli_claude_1', 'cli_codex_1']);
   });
 
+  it.each([42, {}, true])('ignores a truthy non-string botName before a valid match: %j', botName => {
+    const r = resolveBotRefs(
+      ['Codex'],
+      [CFG_CODEX],
+      [{ larkAppId: 'cli_malformed', botName }, INFO_CODEX],
+    );
+    expect(r.larkAppIds).toEqual(['cli_codex_1']);
+    expect(r.invalid).toEqual([]);
+  });
+
+  it('ignores null and scalar registry rows before a valid match', () => {
+    const r = resolveBotRefs(
+      ['Codex'],
+      [CFG_CODEX],
+      [null, 42, 'x', INFO_CODEX],
+    );
+    expect(r.larkAppIds).toEqual(['cli_codex_1']);
+  });
+
   it('resolves multiple bots preserving input order', () => {
     const r = resolveBotRefs(['CoCo', 'Claude'], [CFG_COCO_1, CFG_CLAUDE], [INFO_COCO_1, INFO_CLAUDE]);
     expect(r.larkAppIds).toEqual(['cli_coco_1', 'cli_claude_1']);
@@ -207,7 +226,7 @@ describe('createGroupCompletionStatus', () => {
     });
   });
 
-  it('reports completion only after collaboration and requested kickoff both succeed', () => {
+  it('reports completion once a requested kickoff was sent', () => {
     expect(createGroupCompletionStatus({
       chatId: 'oc_created',
       collaborationReady: true,
@@ -219,6 +238,11 @@ describe('createGroupCompletionStatus', () => {
       collaborationReady: true,
       kickoffAccepted: true,
     });
+  });
+
+  it('reports missing bot-to-bot grants without failing the created group', () => {
+    // The grants are best-effort: a non-zero exit here would make callers that
+    // retry on failure create a second group.
     expect(createGroupCompletionStatus({
       chatId: 'oc_created',
       collaborationReady: false,
@@ -226,7 +250,18 @@ describe('createGroupCompletionStatus', () => {
       kickoffMessageId: null,
       kickoffError: null,
     })).toMatchObject({
-      success: false,
+      success: true,
+      collaborationReady: false,
+      kickoffAccepted: true,
+    });
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: false,
+      kickoffRequested: true,
+      kickoffMessageId: 'om_kickoff',
+      kickoffError: null,
+    })).toMatchObject({
+      success: true,
       collaborationReady: false,
       kickoffAccepted: true,
     });

@@ -1,8 +1,22 @@
 /**
  * Structured transcript bridge drainer for Google Antigravity CLI (`agy`).
  *
- * Antigravity writes an append-only conversation log to
- *   ~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+ * Antigravity writes two append-only conversation logs side by side in
+ *   ~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/
+ *   - transcript.jsonl       compact: any long field (content / thinking /
+ *                            tool_calls args) is cut to its head and tail
+ *                            around a `<truncated N bytes>` marker, and the
+ *                            record lists the cut fields in `truncated_fields`;
+ *   - transcript_full.jsonl  the same records, untruncated (never carries
+ *                            `truncated_fields`).
+ * Both hold one line per step in the same order (identical step_index
+ * sequence); agy writes the compact line first and the full line 0–3 ms later.
+ * The bridge reads the FULL log — a long final reply read from the compact log
+ * reached Lark with its middle silently replaced by the marker — and falls
+ * back to the compact log only for an agy build that does not write the full
+ * one (or the few ms before it is created; see
+ * mapAntigravityCompactOffsetToFull for moving a compact bind over). A final
+ * read from the compact log that was cut gets an explicit notice appended.
  *
  * Each line is a self-contained JSON object. This drainer distills the log to
  * the shared CodexBridgeEvent shape (the same one codex/cursor drains emit) so
@@ -75,22 +89,192 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
-import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
+import { beginJsonlDrain, iterateJsonlLines, scanJsonlFromOffset } from './jsonl-cursor.js';
 
 const CONVERSATION_ID_RE = /^[A-Za-z0-9._-]+$/;
+const COMPACT_TRANSCRIPT_NAME = 'transcript.jsonl';
+const FULL_TRANSCRIPT_NAME = 'transcript_full.jsonl';
 
-/** Absolute transcript path for a conversation id, or null when the id is
- *  unsafe/empty (it is interpolated directly rather than discovered by a dir
- *  scan). */
+function defaultBrainDir(): string {
+  return join(homedir(), '.gemini', 'antigravity-cli', 'brain');
+}
+
+function conversationLogPath(conversationId: string | undefined, brainDir: string, name: string): string | null {
+  if (!conversationId || !CONVERSATION_ID_RE.test(conversationId)) return null;
+  return join(brainDir, conversationId, '.system_generated', 'logs', name);
+}
+
+/** Absolute COMPACT transcript path (transcript.jsonl) for a conversation id,
+ *  or null when the id is unsafe/empty (it is interpolated directly rather
+ *  than discovered by a dir scan). Readers want
+ *  {@link resolveAntigravityTranscriptPath}, which prefers the full log. */
 export function antigravityTranscriptPath(
   conversationId: string | undefined,
-  brainDir: string = join(homedir(), '.gemini', 'antigravity-cli', 'brain'),
+  brainDir: string = defaultBrainDir(),
 ): string | null {
-  if (!conversationId || !CONVERSATION_ID_RE.test(conversationId)) return null;
-  return join(brainDir, conversationId, '.system_generated', 'logs', 'transcript.jsonl');
+  return conversationLogPath(conversationId, brainDir, COMPACT_TRANSCRIPT_NAME);
+}
+
+/** Absolute FULL transcript path (transcript_full.jsonl), same id rules. */
+export function antigravityFullTranscriptPath(
+  conversationId: string | undefined,
+  brainDir: string = defaultBrainDir(),
+): string | null {
+  return conversationLogPath(conversationId, brainDir, FULL_TRANSCRIPT_NAME);
+}
+
+/** The transcript a reader should use for a conversation: the full log when it
+ *  is on disk, else the compact log (an agy build without the full log), else
+ *  null. `mapPath` rewrites each candidate before the existence check (the
+ *  dashboard's per-session scratch overlay) and the rewritten path is returned. */
+export function resolveAntigravityTranscriptPath(
+  conversationId: string | undefined,
+  opts: { brainDir?: string; mapPath?: (path: string) => string } = {},
+): string | null {
+  const brainDir = opts.brainDir ?? defaultBrainDir();
+  for (const candidate of [
+    antigravityFullTranscriptPath(conversationId, brainDir),
+    antigravityTranscriptPath(conversationId, brainDir),
+  ]) {
+    if (!candidate) continue;
+    const path = opts.mapPath ? opts.mapPath(candidate) : candidate;
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
+/** transcript_full.jsonl next to a compact transcript path, or null when
+ *  `path` is not a compact transcript. */
+export function antigravityFullSiblingPath(path: string): string | null {
+  return basename(path) === COMPACT_TRANSCRIPT_NAME ? join(dirname(path), FULL_TRANSCRIPT_NAME) : null;
+}
+
+/** transcript.jsonl next to a full transcript path, or null when `path` is not
+ *  a full transcript. */
+export function antigravityCompactSiblingPath(path: string): string | null {
+  return basename(path) === FULL_TRANSCRIPT_NAME ? join(dirname(path), COMPACT_TRANSCRIPT_NAME) : null;
+}
+
+/** Whether two transcript paths belong to the same conversation. The compact
+ *  and full logs are two views of ONE conversation, so a bind moving from one
+ *  to the other is not a `/new` rotation — comparing raw paths would replay
+ *  the whole conversation as a fresh one. */
+export function isSameAntigravityConversation(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const logsDir = (p: string): string => {
+    const name = basename(p);
+    return name === COMPACT_TRANSCRIPT_NAME || name === FULL_TRANSCRIPT_NAME ? dirname(p) : p;
+  };
+  return logsDir(a) === logsDir(b);
+}
+
+function stepIdentity(line: string): string | undefined {
+  try {
+    const obj = JSON.parse(line);
+    return Number.isInteger(obj?.step_index) ? `${obj.step_index}:${obj.type}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Re-express a consumed byte offset of transcript.jsonl as the equivalent
+ * offset of its transcript_full.jsonl sibling, so a reader that started on the
+ * compact log can continue on the full log without re-reading or skipping a
+ * record. "After the N-th record" is the same point in both files (one line
+ * per step, same order); only the byte lengths differ, so a compact offset can
+ * never be used against the full file directly.
+ *
+ * Returns undefined — the caller stays on the compact log and retries later —
+ * when the offset is negative/unsafe, the compact log is shorter than the
+ * consumed offset at either the size probe or the byte frontier the scan
+ * actually reached (a cut landing between the stat and the scan is caught by
+ * the latter), or covers no record before it (it was replaced/truncated:
+ * the drainer holds on that, and a mapping from it would land mid-history or
+ * at byte 0 of the full log and replay those records), the full log has not
+ * yet written all N records as complete lines (it trails the compact log by a
+ * few ms), or the first or N-th records disagree on step_index/type (never
+ * observed; refuse rather than misalign).
+ */
+export function mapAntigravityCompactOffsetToFull(
+  compactPath: string,
+  compactOffset: number,
+  fullPath: string,
+): number | undefined {
+  if (!Number.isSafeInteger(compactOffset) || compactOffset < 0 || !existsSync(fullPath)) return undefined;
+  if (compactOffset === 0) return 0;
+  try {
+    if (statSync(compactPath).size < compactOffset) return undefined;
+  } catch {
+    return undefined;
+  }
+  let records = 0;
+  let firstLine: string | undefined;
+  let lastLine: string | undefined;
+  const compact = scanJsonlFromOffset(compactPath, 0, {
+    endOffset: compactOffset,
+    onLine: line => {
+      if (!line.trim()) return;
+      records++;
+      firstLine ??= line;
+      lastLine = line;
+    },
+  });
+  if (!compact) return undefined;
+  // The size probe above can race a cut that lands before the scan opens: the
+  // stat still saw the full log while the scan only reached an earlier EOF, so
+  // N would count the records of the shortened prefix and map to the N-th of
+  // those, replaying the tail. Re-check the same invariant against the bytes
+  // actually read; a final record consumed without its '\n' rides in
+  // pendingTail, and newOffset + its byte length still equals compactOffset.
+  if (compact.newOffset + Buffer.byteLength(compact.pendingTail, 'utf8') < compactOffset) return undefined;
+  // The drainer also consumes a final record written without its '\n' yet once
+  // it parses (newOffset = size); the scan leaves that record in pendingTail.
+  if (compact.pendingTail.trim()) {
+    records++;
+    firstLine ??= compact.pendingTail;
+    lastLine = compact.pendingTail;
+  }
+  if (records === 0) return undefined;
+  const origin = stepIdentity(firstLine!);
+  const boundary = stepIdentity(lastLine!);
+  if (origin === undefined || boundary === undefined) return undefined;
+
+  let seen = 0;
+  let mapped: number | undefined;
+  let aligned = true;
+  scanJsonlFromOffset(fullPath, 0, {
+    onLine: (line, lineStart) => {
+      if (!aligned || mapped !== undefined || !line.trim()) return;
+      seen++;
+      if (seen === 1 && stepIdentity(line) !== origin) {
+        aligned = false;
+        return;
+      }
+      if (seen < records) return;
+      if (stepIdentity(line) !== boundary) {
+        aligned = false;
+        return;
+      }
+      mapped = lineStart + Buffer.byteLength(line, 'utf8') + 1;
+    },
+  });
+  return aligned ? mapped : undefined;
+}
+
+/** Appended to a final reply that was read from the compact log with its
+ *  content cut (`truncated_fields` lists "content"): the marker alone looks
+ *  like model output, and a half reply must not pass as a complete one. */
+export const ANTIGRAVITY_TRUNCATED_REPLY_NOTICE =
+  '⚠️ 这条回复的中间部分被 Antigravity 的会话日志截掉了（见上文 <truncated … bytes> 处），botmux 没能读到完整内容，请在终端里查看全文。';
+
+function hasTruncatedContent(obj: any): boolean {
+  return Array.isArray(obj?.truncated_fields) && obj.truncated_fields.includes('content');
 }
 
 const USER_REQUEST_OPEN = '<USER_REQUEST>';
@@ -119,6 +303,7 @@ export function unwrapAntigravityUserInput(content: string): string {
  *  user turn confirms it (it gets emitted). */
 export interface AntigravityTranscriptState {
   provisionalFinal?: CodexBridgeEvent;
+  sourceTurnId?: string;
   /** A background task (manage_task / schedule / RUNNING background GENERIC)
    *  is outstanding: the transcript itself proves the turn is not done, so the
    *  quiet-tick flush is refused until the completion SYSTEM_MESSAGE or the
@@ -154,9 +339,11 @@ export interface AntigravityDrainOptions {
   /** Worker-only: release the held trailing candidate after the viewport
    *  quiet-tick probe confirmed the TUI is idle and on the ready marker. */
   flushTrailingFinal?: boolean;
+  /** Bind replies to native inputs when a person can also type in the pane. */
+  adoptMode?: boolean;
 }
 
-function recordTimestampMs(rec: any): number {
+export function recordTimestampMs(rec: any): number {
   const ms = Date.parse(rec?.created_at);
   return Number.isFinite(ms) ? ms : Date.now();
 }
@@ -166,6 +353,7 @@ function cloneState(state: AntigravityTranscriptState | undefined): AntigravityT
   return {
     ...(candidate ? { provisionalFinal: { ...candidate } } : {}),
     ...(state?.hasPendingTask ? { hasPendingTask: true } : {}),
+    ...(state?.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {}),
   };
 }
 
@@ -196,10 +384,10 @@ function foldRecord(
   timestampMs: number,
   events: CodexBridgeEvent[],
   state: AntigravityTranscriptState,
+  adoptMode: boolean,
 ): AntigravityTranscriptState {
   const type = obj?.type;
-  const keepPending = (s: AntigravityTranscriptState): AntigravityTranscriptState =>
-    s.hasPendingTask ? { hasPendingTask: true } : {};
+  const turn = state.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {};
 
   if (type === 'USER_INPUT') {
     // Only agy's own explicit submits start bridge turns. Any other source is
@@ -208,11 +396,20 @@ function foldRecord(
     // A new explicit user turn proves the previous loop really ended AND no
     // background task from it is outstanding: release its held final BEFORE
     // the user event so turns stay interleaved, and reset the turn state.
-    if (state.provisionalFinal) events.push(state.provisionalFinal);
+    const uuid = `${path}:${lineStart}`;
+    if (state.provisionalFinal && !(adoptMode && state.hasPendingTask)) {
+      events.push(state.provisionalFinal);
+    } else if (state.sourceTurnId) {
+      events.push({ uuid: `${uuid}:abort`, timestampMs, kind: 'turn_aborted', text: '', ...turn });
+    }
     const raw = typeof obj.content === 'string' ? obj.content : '';
     const text = unwrapAntigravityUserInput(raw);
     if (text) {
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
+      const next = adoptMode ? { sourceTurnId: uuid } : {};
+      events.push({ uuid, timestampMs, kind: 'user', text, ...next,
+        ...(adoptMode ? { inputTextAliases: [] } : {}),
+      });
+      return next;
     }
     return {};
   }
@@ -232,10 +429,10 @@ function foldRecord(
       //    session 098f4ab3's 491-char release summary) still emit its real
       //    final instead of latching forever.
       if (obj.tool_calls.every(isTaskPollToolCall)) return state;
-      return {};
+      return turn;
     }
     const text = typeof obj.content === 'string' ? obj.content : '';
-    if (!text.trim()) {
+    if (!text.trim() || (adoptMode && !state.sourceTurnId)) {
       // Empty content-only step: the "model output must contain either output
       // text or tool calls" ERROR precursor. Never a final; do not disturb a
       // held candidate or the pending flag.
@@ -244,8 +441,14 @@ function foldRecord(
     // Content-only step: newest candidate wins (a later content-only step
     // replaces an earlier held one). The pending-task flag rides along — the
     // quiet flush checks it and refuses while a task is outstanding.
+    const finalText = hasTruncatedContent(obj) ? `${text}\n\n${ANTIGRAVITY_TRUNCATED_REPLY_NOTICE}` : text;
+    const model = adoptMode && typeof obj.model === 'string' ? obj.model.trim() : '';
     return {
-      provisionalFinal: { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text },
+      ...turn,
+      provisionalFinal: {
+        uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText, ...turn,
+        ...(model && !model.endsWith('-worker-agy') ? { replyModel: model } : {}),
+      },
       ...(state.hasPendingTask ? { hasPendingTask: true } : {}),
     };
   }
@@ -260,7 +463,7 @@ function foldRecord(
   if (type === 'GENERIC') {
     // Foreground tool output after a content-only step cancels the candidate;
     // a possibly-outstanding background task stays recorded.
-    return keepPending(state);
+    return state.hasPendingTask ? { ...turn, hasPendingTask: true } : turn;
   }
 
   // SYSTEM_MESSAGE is the background-task result / stop-hook wake-up: the
@@ -268,7 +471,7 @@ function foldRecord(
   // narration — the planner either continues with tools (re-cancelling) or
   // emits the real final afterwards. ERROR records cancel the candidate too.
   if (type === 'SYSTEM_MESSAGE' || type === 'ERROR_MESSAGE' || type === 'ERROR') {
-    return {};
+    return turn;
   }
 
   // CHECKPOINT / TASK_NOTIFICATION / unknown types neither confirm nor cancel;
@@ -280,6 +483,9 @@ function foldRecord(
  * Increment-read the transcript from `fromOffset`. Mirrors the byte-offset
  * contract of drainCursorTranscript / drainOmpTranscript so the worker reuses
  * the same fs.watch / poll wakeup machinery and the shared CodexBridgeQueue.
+ * `path` is whichever log the caller bound (full or compact) and `fromOffset`
+ * is a byte offset in THAT file — moving between the two goes through
+ * mapAntigravityCompactOffsetToFull.
  *
  * The log is append-only for the life of a conversation; a size that shrank
  * past `fromOffset` (rotation/replace race) is ignored rather than replayed
@@ -317,7 +523,7 @@ export function drainAntigravityTranscript(
   for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state);
+    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
   }
 
   // The final object may sit at EOF without a trailing \n until the next turn.
@@ -325,7 +531,7 @@ export function drainAntigravityTranscript(
   if (pendingTail.length > 0) {
     try {
       const obj = JSON.parse(pendingTail);
-      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state);
+      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
       newOffset = size;
       pendingTail = '';
     } catch {
@@ -339,6 +545,7 @@ export function drainAntigravityTranscript(
   if (options.flushTrailingFinal && state.provisionalFinal && !state.hasPendingTask) {
     events.push(state.provisionalFinal);
     state.provisionalFinal = undefined;
+    delete state.sourceTurnId;
   }
   return { events, newOffset, pendingTail, state };
 }

@@ -1,3 +1,7 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例往 homedir()/.claude/projects 下写 Claude 会话转录；2026-11-06 一次绕过 setupFiles
+// 的全量运行里，这份转录落进了真实的 ~/.claude/projects。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { pendingStartingCardPublication } from '../src/core/starting-card-publication.js';
 /**
  * Unit tests for recallFrozenCards (worker-pool.ts).
@@ -9,15 +13,20 @@ import { pendingStartingCardPublication } from '../src/core/starting-card-public
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
 import { activeSessionKey, sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
-const { loggerWarnMock, loggerDebugMock } = vi.hoisted(() => ({
+const { loggerWarnMock, loggerDebugMock, updateTurnReplyCardMock } = vi.hoisted(() => ({
   loggerWarnMock: vi.fn(),
   loggerDebugMock: vi.fn(),
+  updateTurnReplyCardMock: vi.fn(async () => ({ messageId: 'om_placeholder' })),
 }));
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
@@ -63,6 +72,14 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
+
+vi.mock('../src/core/turn-reply-card.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/turn-reply-card.js')>();
+  return {
+    ...actual,
+    updateTurnReplyCard: (...args: Parameters<typeof actual.updateTurnReplyCard>) => updateTurnReplyCardMock(...args),
+  };
+});
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
@@ -131,6 +148,8 @@ import {
   parkStreamCard,
   postFreshStreamingCard,
   postTurnStartingCard,
+  releaseDeferredUnifiedReplyCard,
+  unifiedReplyTurnNotCapturing,
   setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
@@ -140,10 +159,18 @@ import {
   USAGE_REFRESH_INTERVAL_MS,
   canRestoreStreamingCardIdentity,
   restoreStreamingCardIdentityFromProof,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
+import { replyCardModeFor } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, MessageUpdateExpiredError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
+
+// 转录路径由 homedir() 推导：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 const buildStreamingCardMock = buildStreamingCard as ReturnType<typeof vi.fn>;
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
@@ -211,6 +238,7 @@ beforeEach(() => {
   persistStreamCardStateMock.mockClear();
   loggerWarnMock.mockClear();
   loggerDebugMock.mockClear();
+  updateTurnReplyCardMock.mockClear();
   buildStreamingCardMock.mockClear();
   getBotMock.mockReturnValue({
     config: { larkAppId: APP_ID, cliId: 'claude-code' },
@@ -222,6 +250,7 @@ beforeEach(() => {
 afterEach(() => {
   setActiveSessionsRegistry(undefined as any);
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 function flush(): Promise<void> {
@@ -236,9 +265,9 @@ async function drainPinQueue(): Promise<void> {
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 describe('recallFrozenCards', () => {
-  it('is a no-op when frozenCards is undefined and disk is empty', () => {
+  it('is a no-op when frozenCards is undefined and disk is empty', async () => {
     const ds = makeDs(undefined);
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(loadFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID);
     expect(deleteMessageMock).not.toHaveBeenCalled();
@@ -246,9 +275,9 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('is a no-op when in-memory frozenCards is empty', () => {
+  it('is a no-op when in-memory frozenCards is empty', async () => {
     const ds = makeDs(new Map());
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     // Lazy-load short-circuited because Map exists (just empty).
     expect(loadFrozenCardsMock).not.toHaveBeenCalled();
@@ -256,14 +285,14 @@ describe('recallFrozenCards', () => {
     expect(saveFrozenCardsMock).not.toHaveBeenCalled();
   });
 
-  it('deletes every frozen card via the Lark client', () => {
+  it('deletes every frozen card via the Lark client', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_a'));
     map.set('n2', makeFrozen('om_b'));
     map.set('n3', makeFrozen('om_c'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(3);
     const ids = deleteMessageMock.mock.calls.map(c => c[1]).sort();
@@ -271,25 +300,81 @@ describe('recallFrozenCards', () => {
     deleteMessageMock.mock.calls.forEach(c => expect(c[0]).toBe(APP_ID));
   });
 
-  it('clears the in-memory Map and persists empty state', () => {
+  it('repaints each frozen card to 「等待输入」 before withdrawing it', async () => {
+    const map = new Map<string, FrozenCard>();
+    map.set('n1', makeFrozen('om_a'));
+    map.set('n2', makeFrozen('om_b'));
+    const ds = makeDs(map);
+
+    await recallFrozenCards(ds);
+
+    // Lark keeps a withdrawn message's last frame readable, so deleting a card
+    // frozen mid-work would leave a 「工作中」 tombstone in the thread.
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls.map(c => c[1])).toEqual(['om_a', 'om_b']);
+    expect(buildStreamingCardMock.mock.calls.map(c => c[5])).toEqual(['idle', 'idle']);
+    // Serial, and each repaint precedes its own withdraw.
+    const repaints = updateMessageMock.mock.invocationCallOrder;
+    const withdrawals = deleteMessageMock.mock.invocationCallOrder;
+    expect(repaints[0]).toBeLessThan(withdrawals[0]);
+    expect(withdrawals[0]).toBeLessThan(repaints[1]);
+    expect(repaints[1]).toBeLessThan(withdrawals[1]);
+  });
+
+  it('still withdraws a frozen card when its repaint fails', async () => {
+    updateMessageMock.mockRejectedValue(new Error('expired'));
+    const map = new Map<string, FrozenCard>();
+    map.set('n1', makeFrozen('om_a'));
+    map.set('n2', makeFrozen('om_b'));
+    const ds = makeDs(map);
+
+    await expect(recallFrozenCards(ds)).resolves.toEqual(['om_a', 'om_b']);
+    expect(deleteMessageMock).toHaveBeenCalledTimes(2);
+    expect(ds.frozenCards?.size).toBe(0);
+  });
+
+  it('does not withdraw a frozen card restored as live while its repaint is pending', async () => {
+    const ds = makeDs(new Map([['old', makeFrozen('om_old')]]));
+    ds.streamCardId = 'om_new';
+    let release!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const recalling = recallFrozenCards(ds);
+    ds.streamCardId = 'om_old';
+    release();
+    await recalling;
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not withdraw cards after the session object changes during repaint', async () => {
+    const ds = makeDs(new Map([['old', makeFrozen('om_old')]]));
+    let release!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const recalling = recallFrozenCards(ds);
+    ds.session = { ...ds.session };
+    release();
+    await recalling;
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('clears the in-memory Map and persists empty state', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_a'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(ds.frozenCards?.size).toBe(0);
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
   });
 
-  it('lazy-loads from disk when frozenCards is undefined', () => {
+  it('lazy-loads from disk when frozenCards is undefined', async () => {
     const onDisk = new Map<string, FrozenCard>();
     onDisk.set('persisted', makeFrozen('om_persisted'));
     loadFrozenCardsMock.mockReturnValue(onDisk);
 
     const ds = makeDs(undefined);
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(loadFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
@@ -297,7 +382,7 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('swallows deleteMessage rejections without throwing', () => {
+  it('swallows deleteMessage rejections without throwing', async () => {
     deleteMessageMock.mockImplementationOnce(async () => {
       throw new Error('boom');
     });
@@ -306,26 +391,26 @@ describe('recallFrozenCards', () => {
     map.set('n2', makeFrozen('om_ok'));
     const ds = makeDs(map);
 
-    expect(() => recallFrozenCards(ds)).not.toThrow();
+    await expect(recallFrozenCards(ds)).resolves.toEqual(['om_failing', 'om_ok']);
     expect(deleteMessageMock).toHaveBeenCalledTimes(2);
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('is idempotent — second call after the first does nothing', () => {
+  it('is idempotent — second call after the first does nothing', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_only'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1); // still 1
   });
 
   // ── P2 regression: never delete the live card ─────────────────────────────
 
-  it('skips entries whose messageId equals the active streamCardId', () => {
+  it('skips entries whose messageId equals the active streamCardId', async () => {
     // Reproduces the daemon-restart window where freeze persisted an entry
     // for the still-live card before crash. Recall must not delete it.
     const map = new Map<string, FrozenCard>();
@@ -334,7 +419,7 @@ describe('recallFrozenCards', () => {
     const ds = makeDs(map);
     ds.streamCardId = 'om_active';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_old');
@@ -343,32 +428,32 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.has('nonce_old')).toBe(false);
   });
 
-  it('does not persist or call deleteMessage when only the active entry exists', () => {
+  it('does not persist or call deleteMessage when only the active entry exists', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('nonce_active', makeFrozen('om_active'));
     const ds = makeDs(map);
     ds.streamCardId = 'om_active';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).not.toHaveBeenCalled();
     expect(saveFrozenCardsMock).not.toHaveBeenCalled();
     expect(ds.frozenCards?.size).toBe(1);
   });
 
-  it('treats CARD_POSTING_SENTINEL as no active id (deletes everything)', () => {
+  it('treats CARD_POSTING_SENTINEL as no active id (deletes everything)', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_only'));
     const ds = makeDs(map);
     ds.streamCardId = '__posting__';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_only');
   });
 
-  it('withdraws only frozen cards from the live card reply target', () => {
+  it('withdraws only frozen cards from the live card reply target', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('topic_a', makeFrozen('om_card_a', { replyTargetKey: 'thread:om_topic_a' }));
     map.set('topic_b', makeFrozen('om_card_b', { replyTargetKey: 'thread:om_topic_b' }));
@@ -377,7 +462,7 @@ describe('recallFrozenCards', () => {
     ds.streamCardId = 'om_card_b_live';
     ds.streamCardReplyTargetKey = 'thread:om_topic_b';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_card_b');
@@ -420,7 +505,7 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(buildStreamingCard).toHaveBeenCalledWith(
       SESSION_ID,
       'om_root',
-      `http://localhost:8800/s/${SESSION_ID}`,
+      '',
       't',
       '',
       'limited',
@@ -436,7 +521,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       false,
       // 17th arg: streaming-card usage snapshot (no transcript in this test →
       // empty; turnTokens is always present, null when no turn delta is known).
-      { context: null, tokens: null, turnTokens: null },
+      // A supported Claude session also carries the idle auto-compact toggle state.
+      { context: null, tokens: null, turnTokens: null, idleAutoCompact: { enabled: false, minutes: 55 } },
       // 18th arg: no configured runtime display name for this Claude fixture.
       undefined,
       // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
@@ -448,6 +534,13 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 22nd arg: no streaming-card buttons are hidden by default.
       [],
+      // 23rd arg: screenshot-unavailable placeholder flag — not set on restore.
+      false,
+      // 24th arg: per-chat substitute card control — unavailable for this fixture.
+      undefined,
+      false,
+      // 26th arg: captured Codex App native-stop target — absent for this Claude fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
@@ -714,6 +807,152 @@ describe('postTurnStartingCard', () => {
     expect(ds.streamCardId).toBe('om_turn_card_1');
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('does not post the unified placeholder while another turn still owns the terminal', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 1, turnId: 'om_active' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_should_not_post');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(false);
+
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(true);
+    expect(replyCardModeFor(ds, 'om_followup')).toBe('unified');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    let settlePlaceholder!: (result: { messageId: string }) => void;
+    updateTurnReplyCardMock.mockImplementationOnce(() => new Promise(resolve => { settlePlaceholder = resolve; }));
+    ds.captureIdentity = { workerGeneration: 3, revision: 2, turnId: 'om_followup' };
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(false);
+    const release = releaseDeferredUnifiedReplyCard(ds, sessionReply);
+    expect(pendingStartingCardPublication(ds)).toBeDefined();
+    settlePlaceholder({ messageId: 'om_placeholder' });
+    await expect(release).resolves.toBe(true);
+    await flush();
+    expect(pendingStartingCardPublication(ds)).toBeUndefined();
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'start' });
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds the queue-commit start until capture identity releases a working card', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    const worker = new EventEmitter() as any;
+    worker.killed = false;
+    worker.connected = true;
+    worker.pid = 123;
+    worker.send = vi.fn();
+    worker.kill = vi.fn();
+    worker.stdout = new EventEmitter();
+    worker.stderr = new EventEmitter();
+    ds.worker = worker;
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 1, turnId: 'om_active' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(false);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 3);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_followup' });
+    await flush();
+
+    expect(ds.captureIdentity?.turnId).toBe('om_active');
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_followup' });
+    await vi.waitFor(() => expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1));
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'start' });
+    worker.removeAllListeners();
+    ds.worker = null;
+  });
+
+  it('posts the unified placeholder immediately when this turn is already capturing', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 4, turnId: 'om_followup' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(true);
+
+    expect(replyCardModeFor(ds, 'om_followup')).toBe('unified');
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts the unified placeholder immediately when no capture identity exists yet', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_first';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await postTurnStartingCard(ds, sessionReply, 'om_first');
+
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_first')).toBe(false);
+    expect(replyCardModeFor(ds, 'om_first')).toBe('unified');
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_first');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
   });
 
   it('isolates frozen-card cleanup when one chat session moves A to B to A', async () => {
@@ -1455,7 +1694,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
 // gaps in the first cut; these lock the corrected contract:
 //   - the arm predicate must NOT depend on the Web Terminal port (ZMX ready with
 //     port=0 must still refresh), and must gate on native-usage CLI capability
-//     (gemini/opencode/… have no transcript → nothing to refresh) and on
+//     (opencode/kimi/… have no transcript → nothing to refresh) and on
 //     usageDisplay='streaming';
 //   - the tick reads fresh (breaks the 15s cost-reader throttle) and is
 //     self-correcting (clears its own timer when state no longer qualifies).
@@ -1498,9 +1737,9 @@ describe('usageRefreshShouldRun (arm/clear predicate)', () => {
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
-  it('is false for a CLI without native usage (gemini/opencode/…)', () => {
+  it('is false for a CLI without native usage (opencode/kimi/…)', () => {
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
@@ -1532,15 +1771,31 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
   });
 
   it('reads usage fresh so the 12s tick beats the 15s cost-reader throttle', () => {
-    // The whole point of the tick is to break the reparse throttle. The 17th
-    // buildStreamingCard arg is the streaming usage snapshot; assert the tick
-    // asked for a fresh read (empty transcript here → concrete empty snapshot).
+    // The whole point of the tick is to break the reparse throttle: two ticks
+    // inside one throttle window must both see the transcript as it is now.
+    // The 17th buildStreamingCard arg is the streaming usage snapshot.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'usage-fresh-')));
+    const cliSessionId = 'usage-fresh-sid';
+    const transcript = join(homedir(), '.claude', 'projects', cwd.replace(/[^A-Za-z0-9-]/g, '-'), `${cliSessionId}.jsonl`);
+    mkdirSync(dirname(transcript), { recursive: true });
+    const assistant = (id: string, input: number) => JSON.stringify({
+      type: 'assistant',
+      message: { id, model: 'claude-sonnet-4-20250514', usage: { input_tokens: input, output_tokens: 1 } },
+    });
+    writeFileSync(transcript, `${assistant('msg_a', 100)}\n`);
     const ds = workingDs();
+    ds.workingDir = cwd;
+    ds.session.cliSessionId = cliSessionId;
+
     refreshStreamingCardUsage(ds);
-    const call = buildStreamingCardMock.mock.calls[0]!;
-    // Snapshot present (17th positional arg) and interval < throttle by design.
-    expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null });
+    appendFileSync(transcript, `${assistant('msg_b', 200)}\n`);
+    refreshStreamingCardUsage(ds);
+
+    const [first, second] = buildStreamingCardMock.mock.calls.map(call => call[16]);
+    expect(first.tokens).toMatchObject({ inputTokens: 100 });
+    expect(second.tokens).toMatchObject({ inputTokens: 300 });
     expect(USAGE_REFRESH_INTERVAL_MS).toBeLessThan(15_000);
+    rmSync(cwd, { recursive: true, force: true });
   });
 
   it('renders an empty terminal URL for a port=0 backend (ZMX) — no fake `:undefined` link', () => {
@@ -1553,8 +1808,17 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     expect(call[2]).toBe(''); // 3rd positional arg = read-only terminal URL
   });
 
-  it('renders the read-only terminal URL for a Web-Terminal backend (tmux/pty)', () => {
+  it('renders an empty terminal URL for a Web-Terminal backend that has no live worker port', () => {
     const ds = workingDs();
+    ds.session.webPort = 9101; // persisted from a prior generation
+    refreshStreamingCardUsage(ds);
+    const call = buildStreamingCardMock.mock.calls[0]!;
+    expect(call[2]).toBe('');
+  });
+
+  it('renders the read-only terminal URL for a live Web-Terminal backend (tmux/pty)', () => {
+    const ds = workingDs();
+    ds.worker = { killed: false } as any;
     ds.workerPort = 9101; // a real Web Terminal port
     refreshStreamingCardUsage(ds);
     const call = buildStreamingCardMock.mock.calls[0]!;
@@ -1635,7 +1899,7 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
   it('does not arm for an unsupported CLI (no group-visible empty-usage PATCH storm)', () => {
     vi.useFakeTimers();
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     syncUsageRefreshTimer(ds);
     expect(ds.usageRefreshTimer).toBeUndefined();
     vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS * 3);

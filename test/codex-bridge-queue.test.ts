@@ -5,6 +5,7 @@ import {
   STRUCTURED_TASK_START_CORROBORATION_GRACE_MS,
   STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS,
   STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS,
+  selectStaleRestoredJournalTurns,
 } from '../src/services/codex-bridge-queue.js';
 import { buildBridgeSendMarkerContent, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
@@ -70,6 +71,20 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
       recoveryJsonlPathAtMark: '/rollout.jsonl',
       recoveryOffsetAtMark: 12_345,
     });
+  });
+
+  it('reports a Lark turn whose own user record reached the transcript, and only that', () => {
+    const q = new CodexBridgeQueue();
+    const started: string[] = [];
+    q.setTurnStartObserver(turn => started.push(turn.turnId));
+    q.mark('t1', 'review PR 1650', 100);
+    q.ingest([userEv('something else', 'u-other', 150)]);
+    expect(started).toEqual([]);
+    q.ingest([userEv('review PR 1650', 'u-1', 200)]);
+    expect(started).toEqual(['t1']);
+    // Re-ingesting the same record does not report it again.
+    q.ingest([userEv('review PR 1650', 'u-1', 200)]);
+    expect(started).toEqual(['t1']);
   });
 
   it('rejects CoT from a different native provider turn', () => {
@@ -566,6 +581,43 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
 });
 
 describe('CodexBridgeQueue', () => {
+  describe('ownsTurnForNativeInput (adopt CoT attribution)', () => {
+    it('recognizes the marked Lark input before its transcript user event and rejects a local input', () => {
+      const q = new CodexBridgeQueue();
+      q.mark('om_lark', 'Run the build and report failures', 10_000);
+      // The mark exists before the literal write, so the boundary already owns
+      // the turn even though the transcript user event has not been ingested.
+      expect(q.ownsTurnForNativeInput('Run the build and report failures', 10_200)).toBe(true);
+      // A terminal-only input sharing no fingerprint with the mark is rejected.
+      expect(q.ownsTurnForNativeInput('Deploy to staging from the pane', 10_300)).toBe(false);
+      // Replay tolerance matches the ingest path: older than mark-5s is stale.
+      expect(q.ownsTurnForNativeInput('Run the build and report failures', 4_900)).toBe(false);
+    });
+
+    it('requires an exact hash match when the mark demands exact input and stops owning after the terminal', () => {
+      const q = new CodexBridgeQueue();
+      q.mark('om_exact', '/status', 20_000, undefined, undefined, undefined, true);
+      expect(q.ownsTurnForNativeInput('/status', 20_100)).toBe(true);
+      // Fingerprint containment would accept this prefix variant; the exact
+      // hash must not.
+      expect(q.ownsTurnForNativeInput('/status --verbose', 20_200)).toBe(false);
+
+      q.ingest([userEv('/status', 'u-exact', 20_300)]);
+      q.ingest([asstEv('idle', 'a-exact', 20_400)]);
+      q.drainEmittable();
+      // A closed turn must not capture a later local boundary.
+      expect(q.ownsTurnForNativeInput('/status', 20_500)).toBe(false);
+    });
+
+    it('never attributes a boundary to a synthesized local turn', () => {
+      const q = new CodexBridgeQueue();
+      q.setLocalTurns(true, 0);
+      q.ingest([userEv('something typed locally', 'u-local', 30_000)]);
+      expect(q.peek().some(turn => turn.isLocal)).toBe(true);
+      expect(q.ownsTurnForNativeInput('something typed locally', 30_000)).toBe(false);
+    });
+  });
+
   it('reports lifecycle busy only after transcript start until assistant_final closes the turn', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'long-running prompt', 100);
@@ -728,6 +780,43 @@ describe('CodexBridgeQueue', () => {
     expect(q.peek().map(turn => turn.turnId)).toEqual(['verifying']);
     expect(q.pruneExpiredPreStartHeads(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 1)
       .map(turn => turn.turnId)).toEqual(['verifying']);
+  });
+
+  it('keeps a quarantined delivery head past every lease until the flag clears', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('parked', 'draft waiting in the TRAE composer', now);
+    q.beginSubmitVerification('parked', now);
+    now = 500;
+    q.finishSubmitVerification('parked', now);
+    q.setInputDeliveryQuarantined('parked', true);
+    // Past both verification and attribution graces: an ordinary unattributed
+    // head would be pruned here, but a quarantined draft must survive so a
+    // later manual submit can still release the successors held behind it.
+    const expired = now + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS
+      + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads(expired)).toEqual([]);
+    expect(q.hasPendingTurn('parked')).toBe(true);
+    // Clearing the flag makes the same head prunable again instead of
+    // pinning it forever.
+    q.setInputDeliveryQuarantined('parked', false);
+    expect(q.pruneExpiredPreStartHeads(expired).map(turn => turn.turnId)).toEqual(['parked']);
+  });
+
+  it('scopes the quarantine flag to the exact dispatch attempt', () => {
+    const q = new CodexBridgeQueue(() => 100);
+    q.mark('retry', 'first attempt', 100, undefined);
+    q.mark('retry', 'replayed attempt', 100, 1);
+    q.setInputDeliveryQuarantined('retry', true);
+    expect(q.peek().map(turn => [turn.turnId, turn.dispatchAttempt, turn.inputDeliveryQuarantined === true]))
+      .toEqual([['retry', undefined, true], ['retry', 1, false]]);
+    // Clearing a replay attempt must not touch the original attempt's flag:
+    // the worker releases each quarantine with its own dispatchAttempt.
+    q.setInputDeliveryQuarantined('retry', false, 1);
+    expect(q.peek().map(turn => [turn.dispatchAttempt, turn.inputDeliveryQuarantined === true]))
+      .toEqual([[undefined, true], [1, false]]);
+    q.setInputDeliveryQuarantined('retry', false, undefined);
+    expect(q.peek().every(turn => turn.inputDeliveryQuarantined === undefined)).toBe(true);
   });
 
   it('atomically transitions in-flight verification to a confirmed start lease', () => {
@@ -897,6 +986,117 @@ describe('CodexBridgeQueue', () => {
     expect(q.drainEmittable()).toEqual([
       expect.objectContaining({ turnId: 'real-successor', finalText: 'second prompt done' }),
     ]);
+  });
+
+  it('busy-tick lease refresh keeps a slow-flushing mirror turn alive, then resumes expiry at idle', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+
+    // Cursor mirror shape: writeInput returns undefined (attribution-only
+    // lease), and the transcript flushes the user line only when the first
+    // assistant step / whole turn completes — potentially far beyond the
+    // bare 20s lease. The worker refreshes the lease every tick while the
+    // CLI is visibly busy.
+    q.mark('slow-mirror', 'prompt whose jsonl line flushes late', now);
+    q.beginSubmitVerification('slow-mirror', now);
+    q.finishSubmitVerification('slow-mirror', now);
+
+    // 90s of busy ticks: without refresh this head would expire at 20s.
+    for (now = 1_000; now <= 90_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease()).toBe(1);
+      expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    }
+
+    // Turn end: the mirror flushes user + final together; the head matches.
+    q.ingest([
+      userEv('prompt whose jsonl line flushes late', 'u-slow-mirror', 90_500),
+      asstEv('late-flushed answer', 'a-slow-mirror', 90_501),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'slow-mirror', finalText: 'late-flushed answer' }),
+    ]);
+
+    // A swallowed Enter still expires: once refreshes stop (CLI idle), the
+    // bounded lease resumes counting down from the last refresh.
+    q.mark('swallowed', 'enter never landed', now);
+    q.beginSubmitVerification('swallowed', now);
+    q.finishSubmitVerification('swallowed', now);
+    q.refreshUnstartedHeadAttributionLease();
+    const lastRefresh = now;
+    now = lastRefresh + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['swallowed']);
+  });
+
+  it('busy-tick refresh also covers the submit-confirmed argv-baked first turn', () => {
+    // The argv-baked first cursor turn is mark + confirmPendingTurn at init
+    // (never enters flushPending). Its user line flushes just as late, so the
+    // confirmed lease must be refreshed too — otherwise turn 1 ghosts at 20s.
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('argv-turn', 'baked opening prompt', now);
+    q.confirmPendingTurn('argv-turn', now);
+    for (now = 1_000; now <= 60_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease()).toBe(1);
+      expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    }
+    q.ingest([
+      userEv('baked opening prompt', 'u-argv', 60_500),
+      asstEv('first answer', 'a-argv', 60_501),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'argv-turn', finalText: 'first answer' }),
+    ]);
+  });
+
+  it('busy-tick refresh keeps the whole type-ahead chain alive and honours the hard since-mark cap', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    // Confirmed argv head A + unconfirmed successor B queued behind it.
+    q.mark('a', 'first prompt', now);
+    q.confirmPendingTurn('a', now);
+    now = 1_000;
+    q.mark('b', 'queued follow-up', now);
+    q.beginSubmitVerification('b', now);
+    q.finishSubmitVerification('b', now);
+    // 90s of busy ticks refresh BOTH heads.
+    for (; now <= 90_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease()).toBe(2);
+    }
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    // The mirror flushes both turns together; both complete.
+    q.ingest([
+      userEv('first prompt', 'u-a', 90_500),
+      asstEv('answer a', 'a-a', 90_501),
+      userEv('queued follow-up', 'u-b', 90_600),
+      asstEv('answer b', 'a-b', 90_601),
+    ]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['a', 'b']);
+
+    // Hard cap: a perpetually "busy" screen (swallowed Enter / modal) cannot
+    // refresh a head beyond maxSinceMarkMs even though ticks keep arriving.
+    const q2 = new CodexBridgeQueue(() => 200_000);
+    q2.mark('stuck', 'never flushes', 0);
+    q2.confirmPendingTurn('stuck', 0);
+    expect(q2.refreshUnstartedHeadAttributionLease(60_000, 120_000)).toBe(1);
+    expect(q2.refreshUnstartedHeadAttributionLease(119_000, 120_000)).toBe(1);
+    expect(q2.refreshUnstartedHeadAttributionLease(120_001, 120_000)).toBe(0);
+  });
+
+  it('lease refresh leaves started and rpc-active turns alone', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    expect(q.refreshUnstartedHeadAttributionLease()).toBe(0);
+
+    q.mark('started', 'already running prompt', now);
+    q.ingest([userEv('already running prompt', 'u-refresh-started', 1)]);
+    expect(q.refreshUnstartedHeadAttributionLease()).toBe(0);
+    q.ingest([asstEv('done', 'a-refresh-started', 2)]);
+    q.drainEmittable();
+
+    // Confirmed heads ARE refreshed now (argv first turn).
+    q.mark('confirmed', 'confirmed submit', now);
+    q.confirmPendingTurn('confirmed', now);
+    expect(q.refreshUnstartedHeadAttributionLease()).toBe(1);
   });
 
   it('expires consecutive confirmed stale heads until a buffered live turn can start', () => {
@@ -1098,6 +1298,20 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('a replayed attempt terminal never satisfies an exact-attempt lookup for the retired attempt', () => {
+    // #2648 follow-up: a stale deferred submit timer keeps the OLD
+    // dispatchAttempt. Once a replay with the same turnId has run and closed,
+    // hasTerminalTurn must answer only for the new attempt — otherwise the
+    // stale timer would settle against the replacement delivery.
+    const q = new CodexBridgeQueue();
+    q.mark('delivery', 'same durable body', 100, 1);
+    expect(q.dropPendingTurn('delivery', 1, true)?.turnId).toBe('delivery');
+    q.mark('delivery', 'same durable body', 200, 2);
+    q.ingest([userEv('same durable body', 'u2', 300), asstEv('done', 'a2', 400)]);
+    expect(q.hasTerminalTurn('delivery', 2)).toBe(true);
+    expect(q.hasTerminalTurn('delivery', 1)).toBe(false);
+  });
+
   it('does not let stale submit lifecycle callbacks mutate a replay attempt with the same turnId', () => {
     const q = new CodexBridgeQueue();
     q.mark('same-turn', 'durable prompt', 100, 1);
@@ -1231,6 +1445,25 @@ describe('CodexBridgeQueue', () => {
     const ready = q.drainEmittable();
     expect(ready.map(t => t.turnId)).toEqual(['t1', 't2']);
     expect(ready.map(t => t.finalText)).toEqual(['first reply', 'second reply']);
+  });
+
+  it('keeps each type-ahead turn LinkRef mode frozen on its own final', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t-enabled', 'first prompt', 100, undefined, undefined, 'enabled');
+    q.mark('t-disabled', 'second prompt', 100);
+    q.ingest([
+      userEv('first prompt', 'u-enabled', 5_000),
+      asstEv('first reply', 'a-enabled', 6_000),
+      userEv('second prompt', 'u-disabled', 12_000),
+      asstEv('second reply', 'a-disabled', 13_000),
+    ]);
+
+    const ready = q.drainEmittable();
+    expect(ready).toMatchObject([
+      { turnId: 't-enabled', linkRefMode: 'enabled', finalText: 'first reply' },
+      { turnId: 't-disabled', finalText: 'second reply' },
+    ]);
+    expect(ready[1]).not.toHaveProperty('linkRefMode');
   });
 
   it('Codex steer-merge: user2 steered into active turn before any final → t1 dropped, t2 gets merged final, no wedge', () => {
@@ -1805,5 +2038,137 @@ describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression window
       asstEv('merged reply', 'a1', 15_000),
     ]);
     expect(emitDecisions(q, [])).toEqual([{ turnId: 't2', suppressed: false }]);
+  });
+});
+
+describe('CodexBridgeQueue provisional task_started corroboration', () => {
+  it('reports a provisional claim as started once its own user record corroborates it', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    const started: string[] = [];
+    q.setTurnStartObserver(turn => started.push(turn.turnId));
+    q.mark('t1', 'hello there', 0);
+    q.ingest([startedEv('native-1', 's1', 100)]);
+    expect(started).toEqual([]);
+    q.ingest([{ ...userEv('hello there', 'u1', 90_000), sourceTurnId: 'native-1' }]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it.each([undefined, 'msg-2'])('routes the terminal past a lost provisional claim (message id=%s)', sourceMessageId => {
+    let now = 5_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('lost', 'first message lost', 0);
+    q.mark('t2', 'second message', 500);
+    q.ingest([
+      startedEv('native-1', 's1', 1_000),
+      { ...userEv('second message', 'u1', 1_100), sourceTurnId: 'native-1', sourceMessageId },
+      { ...asstEv('answer two', 'a1', 2_000), sourceTurnId: 'native-1' },
+    ]);
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['lost']);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't2', finalText: 'answer two' }),
+    ]);
+    expect(q.hasBlockingTurn()).toBe(false);
+  });
+});
+
+// Pi persists input submitted while it is busy only when it dequeues it after
+// the current work, which can be minutes past the pre-start lease. The CLI's
+// own "accepted, queued" marker must keep the head; a settle that did not take
+// it up must hand it back to the normal lease.
+describe('input the CLI holds in its own queue', () => {
+  const queuedEv = (uuid: string, ts: number): CodexBridgeEvent => ({ uuid, timestampMs: ts, kind: 'input_queued', text: '' });
+  const settledEv = (uuid: string, ts: number): CodexBridgeEvent => ({ uuid, timestampMs: ts, kind: 'cli_settled', text: '' });
+
+  it('keeps a queued head past its lease until its user record starts it', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('held', 'steer while busy', now);
+    q.confirmPendingTurn('held');
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    // No lease timer to wait out while the CLI holds the input: its user
+    // record (or a settle) is what moves the turn on, not elapsed time.
+    expect(q.preStartLeaseRemainingMs()).toBeUndefined();
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS + 60_000;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.preStartLeaseRemainingMs()).toBeUndefined();
+
+    q.ingest([userEv('steer while busy', 'user-held', now)]);
+    expect(q.peek()[0]).toMatchObject({ turnId: 'held', started: true });
+  });
+
+  it('never starts the head on the marker: the running work belongs to an earlier turn', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('held', 'steer while busy', now);
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    q.ingest([{ uuid: 'final-earlier', timestampMs: now + 400, kind: 'assistant_final', text: 'earlier answer' }]);
+    expect(q.peek()[0]).toMatchObject({ turnId: 'held', started: false });
+    expect(q.peek()[0].finalText).toBeUndefined();
+  });
+
+  it('runs the normal lease again from a settle that did not take the input up', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('held', 'returned to editor', now);
+    q.confirmPendingTurn('held');
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    now += 60_000;
+    q.ingest([settledEv('settled-1', now)]);
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    now += 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['held']);
+  });
+
+  it('ignores a marker that predates the head', () => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('fresh', 'new turn', now);
+    q.confirmPendingTurn('fresh');
+    q.ingest([queuedEv('old-marker', now - 60_000)]);
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['fresh']);
+  });
+
+  it('holds one head per marker, in submit order', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('first', 'first queued', now);
+    q.mark('second', 'second queued', now + 1);
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, false]);
+    q.ingest([queuedEv('queued-2', now + 400)]);
+    expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, true]);
+  });
+});
+
+describe('selectStaleRestoredJournalTurns — cold-resume stale-turn retirement', () => {
+  const turn = (overrides: Partial<import('../src/services/codex-bridge-queue.js').CodexPendingTurn>)
+    : import('../src/services/codex-bridge-queue.js').CodexPendingTurn => ({
+      turnId: 'om_x',
+      started: false,
+      restoredFromJournal: true,
+      ...overrides,
+    });
+  it.each([
+    ['started', { started: true }],
+    ['rpcActive', { started: false, rpcActive: true }],
+    ['cliQueuedAtMs', { cliQueuedAtMs: 1 }],
+    ['submitConfirmedAtMs', { submitConfirmedAtMs: 1 }],
+    ['submitVerificationStartedAtMs', { submitVerificationStartedAtMs: 1 }],
+  ] as const)('retires a journal mark the dead process had already accepted via %s', (_label, overrides) => {
+    expect(selectStaleRestoredJournalTurns([turn(overrides)]).map(t => t.turnId)).toEqual(['om_x']);
+  });
+  it.each([
+    ['bare mark never reached the transcript', {}, 'retained'],
+    ['started turn already has a final', { started: true, finalText: 'done' }, 'retained'],
+    ['new-generation mark without journal provenance', { started: true, restoredFromJournal: undefined }, 'retained'],
+  ] as const)('keeps a %s', (_label, overrides) => {
+    expect(selectStaleRestoredJournalTurns([turn(overrides)])).toEqual([]);
   });
 });

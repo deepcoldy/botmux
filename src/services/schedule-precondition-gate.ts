@@ -4,6 +4,7 @@ import { expandHomePath } from '../utils/working-dir.js';
 import { logger } from '../utils/logger.js';
 import { readSchedulePreconditionFile } from './schedule-precondition-file.js';
 import { resolveSchedulePrecondition } from './schedule-precondition-store.js';
+import { scheduledWorkingDirSwapReason } from '../core/scheduler.js';
 import {
   runSchedulePrecondition,
   SchedulePreconditionError,
@@ -31,12 +32,16 @@ interface SchedulePreconditionGateDependencies {
   resolve: typeof resolveSchedulePrecondition;
   readFile: typeof readSchedulePreconditionFile;
   run: typeof runSchedulePrecondition;
+  /** Defaults to the real authority-backed check even when a caller injects
+   *  only the precondition stand-ins. */
+  workingDirSwapReason?: typeof scheduledWorkingDirSwapReason;
 }
 
 const defaultDependencies: SchedulePreconditionGateDependencies = {
   resolve: resolveSchedulePrecondition,
   readFile: readSchedulePreconditionFile,
   run: runSchedulePrecondition,
+  workingDirSwapReason: scheduledWorkingDirSwapReason,
 };
 
 function resolvePreconditionWorkingDir(workingDir: string): string {
@@ -86,6 +91,16 @@ export async function executeScheduledTaskWithPrecondition(
   dependencies: SchedulePreconditionGateDependencies = defaultDependencies,
   observer?: ScheduledTaskPreconditionObserver,
 ): Promise<ScheduledTaskPreconditionOutcome> {
+  // First step of every fire, before anything spawns with task.workingDir as
+  // cwd: the host-side precondition Bash (and its script file read) would
+  // otherwise run inside a directory the agent swapped for a symlink to files
+  // it planted. Same check executeScheduledTask repeats as defense in depth;
+  // both are read-only.
+  const swapped = (dependencies.workingDirSwapReason ?? scheduledWorkingDirSwapReason)(task);
+  if (swapped) {
+    logger.error(`[scheduler] refusing to fire: ${swapped}`);
+    throw new Error(swapped);
+  }
   let condition: ReturnType<typeof resolveSchedulePrecondition>;
   try {
     condition = dependencies.resolve(task, effectiveAppId);

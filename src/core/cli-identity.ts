@@ -14,10 +14,9 @@
  * whoever started the session — every later turn, by anyone, would keep running
  * as that first person.
  *
- * A file is re-read on every single CLI invocation, so the identity in force is
- * always the one the daemon wrote for the current turn. Switching people costs
- * nothing and never restarts the session (a restart would drop the CLI's whole
- * context, which in practice is unacceptable).
+ * Identity snapshots are prepared per turn. Each invocation reads the worker's
+ * active-turn record and selects that turn's snapshot, so queued messages keep
+ * their credentials separate from the executing task.
  *
  * ## Trust direction
  *
@@ -32,16 +31,236 @@
  * call for zero benefit, since these files hold exactly a couple of opaque
  * values.
  */
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, type Dirent } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { basename, delimiter, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
-import { isCliIdentityPath } from '../utils/child-env.js';
-import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
+import { resolveEntrySpawn } from './self-spawn.js';
+import type { IdentityStorageModel } from './lark-tool-binding.js';
+import { capabilitiesOf, type TriggerUserAuthCapability as Capability, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { isUsableOpenId } from '../utils/user-token.js';
+import { logger } from '../utils/logger.js';
+import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
+import { ensureBackgroundJobHome, ensureMeegoStore, MEEGO_ENV_CREDENTIALS, MEEGO_STORE_DIR } from '../services/bytedcli-home.js';
+import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { NOT_AUTHORIZED_REASONS, PLATFORM_NOT_AUTHORIZED_REASONS, reasonTag } from './refusal-reasons.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
+
+export type { IdentityStorageModel };
 
 /** Where a session's identity files live, under its own data dir. */
 export function sessionIdentityDir(sessionDataDir: string): string {
   return join(sessionDataDir, 'cli-identity');
+}
+
+/**
+ * Proven-model identity contents live ONLY here, in daemon memory, keyed by
+ * session then turn then tool. The current-execution proof route serves these
+ * contents to a wrapper whose process lineage it has verified; nothing holding
+ * a token is ever written to disk in that model, so the same-uid CLI process
+ * can neither enumerate queued people's credentials nor redirect its own
+ * selection at them. Keyed on realpath so data-dir aliases cannot split the
+ * store for one session.
+ */
+const provenIdentityContents = new Map<
+  string,
+  Map<string, Partial<Record<IdentityTool, string>>>
+>();
+
+function provenSessionKey(sessionDataDir: string, sessionId: string): string {
+  let canonical: string;
+  try { canonical = realpathSync(sessionDataDir); } catch { canonical = resolve(sessionDataDir); }
+  return JSON.stringify([canonical, assertSafeSegment(sessionId)]);
+}
+
+function provenSessionMap(key: string, create: boolean) {
+  let turns = provenIdentityContents.get(key);
+  if (!turns && create) {
+    turns = new Map();
+    provenIdentityContents.set(key, turns);
+  }
+  return turns;
+}
+
+/** Store one proven identity env body. Called at the same publication points
+ *  that used to write a per-turn snapshot file. */
+export function rememberProvenIdentityContent(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string,
+  tool: IdentityTool,
+  body: string,
+): void {
+  const key = provenSessionKey(sessionDataDir, sessionId);
+  const turns = provenSessionMap(key, true)!;
+  const tools = turns.get(turnId) ?? {};
+  tools[tool] = body;
+  turns.set(turnId, tools);
+}
+
+/** Recall one proven identity env body, or undefined when that turn/tool was
+ *  never published or has since been collected. */
+export function recallProvenIdentityContent(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string,
+  tool: IdentityTool,
+): string | undefined {
+  return provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false)?.get(turnId)?.[tool];
+}
+
+/** Forget one turn/tool, one whole turn, or everything the session holds. */
+export function forgetProvenIdentityContent(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId?: string,
+  tool?: IdentityTool,
+): void {
+  const turns = provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false);
+  if (!turns) return;
+  if (!turnId) { turns.clear(); return; }
+  if (!tool) { turns.delete(turnId); return; }
+  const tools = turns.get(turnId);
+  if (tools) {
+    delete tools[tool];
+    if (Object.keys(tools).length === 0) turns.delete(turnId);
+  }
+}
+
+function identityOpenIdLine(openId: string): string {
+  return `${OPEN_ID_VAR}=${shellSingleQuote(openId)}`;
+}
+
+function stampedOpenId(body: string): string | undefined {
+  const prefix = `${OPEN_ID_VAR}=`;
+  for (const line of body.split('\n')) {
+    if (!line.startsWith(prefix)) continue;
+    const quoted = line.slice(prefix.length);
+    if (quoted.length < 2 || !quoted.startsWith("'") || !quoted.endsWith("'")) return undefined;
+    return quoted.slice(1, -1).replaceAll("'\\''", "'");
+  }
+  return undefined;
+}
+
+function identityMatchesOpenId(body: string, openId: string): boolean {
+  return body.split('\n').includes(identityOpenIdLine(openId));
+}
+
+function dropMatchingEnvFiles(dir: string, openId: string): number {
+  let entries: Dirent[];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  let dropped = 0;
+  const bytedcliRemoved = new Set<string>();
+  for (const ent of entries) {
+    // A symlink can point outside this session tree. Never follow one.
+    if (ent.isSymbolicLink()) continue;
+    const path = join(dir, ent.name);
+    if (ent.isDirectory()) {
+      dropped += dropMatchingEnvFiles(path, openId);
+      continue;
+    }
+    if (!ent.isFile() || !ent.name.endsWith('.env')) continue;
+    let text: string;
+    try { text = readFileSync(path, 'utf8'); } catch { continue; }
+    if (!identityMatchesOpenId(text, openId)) continue;
+    try {
+      rmSync(path, { force: true });
+      dropped += 1;
+      if (ent.name === 'bytedcli.env') bytedcliRemoved.add(dir);
+    } catch { /* best-effort */ }
+  }
+  for (const parent of bytedcliRemoved) {
+    for (const name of COMPANION_TOOLS) {
+      const companion = join(parent, `${name}.env`);
+      try {
+        const text = readFileSync(companion, 'utf8');
+        const stamped = stampedOpenId(text);
+        if (stamped !== undefined && stamped !== openId) continue;
+        rmSync(companion, { force: true });
+        dropped += 1;
+      } catch { /* already removed, or it names someone else and we kept it */ }
+    }
+  }
+  return dropped;
+}
+
+/**
+ * Drop published trigger-user identities stamped for `openId`.
+ *
+ * The same-principal wrapper keeps a credential when `BOTMUX_IDENTITY_OPEN_ID`
+ * still matches the live caller, so deleting the token store is not enough
+ * until the next publish overwrites the snapshot. Proven bodies live in this
+ * process; single-snapshot `.env` files live under the session data dir.
+ * Denial files have no open-id line and are left alone, except a codebase
+ * companion whose bytedcli body was just removed and which does not name a
+ * different person.
+ */
+export function dropPublishedIdentitiesForOpenId(sessionDataDir: string, openId: string): number {
+  if (!isUsableOpenId(openId)) return 0;
+  const wanted = new Set<string>();
+  try { wanted.add(realpathSync(sessionDataDir)); } catch { /* dir may be missing */ }
+  wanted.add(resolve(sessionDataDir));
+
+  let dropped = 0;
+  for (const key of [...provenIdentityContents.keys()]) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(key); } catch { continue; }
+    if (!Array.isArray(parsed) || typeof parsed[0] !== 'string' || !wanted.has(parsed[0])) continue;
+    const turns = provenIdentityContents.get(key);
+    if (!turns) continue;
+    for (const turnId of [...turns.keys()]) {
+      const tools = turns.get(turnId);
+      if (!tools) continue;
+      let removedBytedcli = false;
+      for (const tool of Object.keys(tools) as IdentityTool[]) {
+        const body = tools[tool];
+        if (typeof body !== 'string' || !identityMatchesOpenId(body, openId)) continue;
+        delete tools[tool];
+        dropped += 1;
+        if (tool === 'bytedcli') removedBytedcli = true;
+      }
+      for (const name of COMPANION_TOOLS) {
+        const body = tools[name];
+        if (!removedBytedcli || typeof body !== 'string') continue;
+        const stamped = stampedOpenId(body);
+        if (stamped === undefined || stamped === openId) {
+          delete tools[name];
+          dropped += 1;
+        }
+      }
+      if (Object.keys(tools).length === 0) turns.delete(turnId);
+    }
+    if (turns.size === 0) provenIdentityContents.delete(key);
+  }
+  dropped += dropMatchingEnvFiles(sessionIdentityDir(sessionDataDir), openId);
+  return dropped;
+}
+
+/**
+ * Terminal GC for proven contents: forget every turn outside `retainTurnIds`.
+ * The retention set is computed by the daemon from live state (current
+ * execution, dispatched queue, schedule/recovery continuations, pending auth
+ * requests, delegations), never from CLI-writable files. Returns the removed
+ * turn ids. Failures bias toward retention.
+ */
+export function collectProvenIdentityContents(
+  sessionDataDir: string,
+  sessionId: string,
+  retainTurnIds: Iterable<string>,
+): string[] {
+  const turns = provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false);
+  if (!turns) return [];
+  const retain = new Set(retainTurnIds);
+  const removed: string[] = [];
+  for (const turnId of turns.keys()) {
+    if (!retain.has(turnId)) { turns.delete(turnId); removed.push(turnId); }
+  }
+  return removed;
 }
 
 /**
@@ -59,17 +278,89 @@ export function sessionIdentityDataDir(sessionDataDir: string, sessionId: string
 }
 
 /**
- * Identity file for one tool in one session.
- *
- * Named by session id so concurrent sessions of the same bot — different people
- * in different chats — never read each other's credentials.
+ * Records which identity publication model a session's on-disk directory was
+ * initialized for. The proven model keeps no token files; the single model
+ * keeps one per-tool file. A session must never reuse the other model's
+ * leftovers: when the marker is absent or names a different model, identity
+ * artifacts are cleared once and the directory recreated for the current one.
+ */
+const IDENTITY_LAYOUT_FILE = 'identity-layout';
+
+function identityLayoutMarkerPath(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), IDENTITY_LAYOUT_FILE);
+}
+
+export function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
+  try {
+    const value = readFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), 'utf8').trim();
+    return value === 'proven-v1' || value === 'single-v1'
+      ? (value.slice(0, -3) as IdentityStorageModel)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Remove every identity artifact (files and per-turn dirs), keeping the
+ *  wrapper binaries, login-shell shims and the lark-tool binding config. Also
+ *  forgets proven in-memory contents for the session: the other model must not
+ *  reuse them. */
+function resetIdentityArtifacts(sessionDataDir: string, sessionId: string): void {
+  forgetProvenIdentityContent(sessionDataDir, sessionId);
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
+    try { rmSync(join(dir, `${tool}.env`), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
+  try { rmSync(join(dir, 'turns'), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
+  for (const name of ['turn', 'turn.json']) {
+    try { rmSync(join(dir, name), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
+}
+
+/** Remove the R3-era per-turn snapshot directory only. R3 (the pre-marker
+ *  layout) left live tokens under turns/<sha>/*.env with no identity-layout
+ *  marker. A first SINGLE init must clear those, but must NOT touch the root
+ *  <tool>.env files: the daemon publishes the opening turn into the root file
+ *  at accept time, BEFORE the worker fork initializes this directory, and
+ *  wiping it there made the very first turn 77. */
+function resetLegacyTurnSnapshots(sessionDataDir: string, sessionId: string): void {
+  try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns'), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
+}
+
+/** Remove the single-model root snapshot files (one per governed tool) while
+ *  leaving the marker, the live turn marker and proven memory untouched. Used
+ *  by the daemon when the worker's report flips the session to proven: any
+ *  plaintext the daemon wrote before the report (cold start / restart window)
+ *  must leave disk BEFORE the proven body is served from memory. */
+export function clearSingleIdentityArtifacts(sessionDataDir: string, sessionId: string): void {
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
+    try { rmSync(join(dir, `${tool}.env`), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
+}
+
+/**
+ * Identity file for one tool and optional prepared turn in a session.
  */
 export function sessionIdentityPath(
   sessionDataDir: string,
   sessionId: string,
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
+  turnId?: string,
 ): string {
-  return join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`);
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  return turnId
+    ? join(dir, 'turns', identityTurnKey(turnId), `${tool}.env`)
+    : join(dir, `${tool}.env`);
+}
+
+function identityTurnKey(turnId: string): string {
+  return createHash('sha256').update(turnId).digest('hex');
 }
 
 /**
@@ -80,39 +371,29 @@ export function sessionIdentityPath(
  * *accepted*, the worker writes this when a turn actually *starts*. The gap
  * between those is the whole problem — see {@link renderIdentityWrapper}.
  *
- * Plain text, one line, no JSON: the wrapper reads it in `/bin/sh` on every
- * invocation, and parsing JSON there would mean spawning `jq`.
+ * Plain text, four lines: turn, caller, sha256(identity turn), identity turn.
+ * The single-model wrapper reads the record once in `/bin/sh` on every
+ * invocation (the first two lines plus the file); the proven-model wrapper
+ * selects no identity from disk and does not read it. Daemon refresh checks
+ * use line 4 as a liveness gate.
  */
 export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn');
 }
 
 /**
- * The live turn id (first line) from the active-turn file, or undefined when
- * absent/empty. Shared by every TS consumer so the file's two-line layout
- * (turn, then caller) is parsed in exactly one place.
- */
-export function readActiveTurnLine(sessionDataDir: string, sessionId: string): string | undefined {
-  try {
-    const first = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n', 1)[0]!;
-    return first.trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Machine-readable companion to {@link sessionActiveTurnPath}:
  * `{"turnId":…,"dispatchAttempt":…}` (one JSON object, 0600).
  *
- * The shell file stays a bare line because the `/bin/sh` identity wrapper
- * sources it per tool call; this one exists for a JSON consumer that must
- * freeze the (turn, dispatch generation) pair it is reporting on. The dsh-tui
- * wrapper plugin reads it synchronously inside the `agent/status` callback
- * (BOTMUX_TURN_IDLE_COMMAND) and carries the pair end-to-end, because a later
- * read can already name the NEXT dispatch — see src/utils/turn-idle-report.ts.
- * Its path layout is therefore mirrored in the generated snippet
- * (src/adapters/dsh-question-bridge.ts): keep the two in sync.
+ * The shell file stays a bare record because a `/bin/sh` identity wrapper in
+ * the single-snapshot model sources it per tool call; this one exists for a
+ * JSON consumer that must freeze the (turn, dispatch generation) pair it is
+ * reporting on. The dsh-tui wrapper plugin reads it synchronously inside the
+ * `agent/status` callback (BOTMUX_TURN_IDLE_COMMAND) and carries the pair
+ * end-to-end, because a later read can already name the NEXT dispatch — see
+ * src/utils/turn-idle-report.ts. Its path layout is therefore mirrored in the
+ * generated snippet (src/adapters/dsh-question-bridge.ts): keep the two in
+ * sync.
  */
 export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.json');
@@ -132,20 +413,19 @@ export function publishActiveTurn(
   turnId: string | undefined,
   dispatchAttempt?: number,
   callerOpenId?: string,
+  identityTurnId: string | undefined = turnId,
 ): void {
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    // turn + caller live in ONE file so the wrapper reads them in a single
-    // open: two separate files cannot be updated atomically together, and a
-    // reader landing between the two writes would see a turn from one
-    // generation with a caller from another (a cross-principal misattribution).
-    // Line 1 = the turn the CLI is executing now; line 2 = the open id of the
-    // human whose turn it is. Both may be empty (unknown turn / absent
-    // principal), which the wrapper treats as a refusal, never an allowance.
+    // turn, caller, identity key and identity turn live in ONE file so readers
+    // get all four in a single open: separate files cannot be updated
+    // atomically together, and a reader landing between writes would see a
+    // turn from one generation with a caller from another (a cross-principal
+    // misattribution).
     atomicWriteFileSync(
       sessionActiveTurnPath(sessionDataDir, sessionId),
-      `${turnId ?? ''}\n${callerOpenId ?? ''}\n`,
+      `${turnId ?? ''}\n${callerOpenId ?? ''}\n${identityTurnId ? identityTurnKey(identityTurnId) : ''}\n${identityTurnId ?? ''}\n`,
       { mode: 0o600 },
     );
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
@@ -156,6 +436,7 @@ export function publishActiveTurn(
         turnId: turnId ?? null,
         dispatchAttempt: dispatchAttempt ?? null,
         ...(callerOpenId ? { callerOpenId } : {}),
+        identityTurnId: identityTurnId ?? null,
       })}\n`,
       { mode: 0o600 },
     );
@@ -184,14 +465,56 @@ function assertSafeSegment(value: string): string {
  * credentials. Injecting the token directly also sidesteps the macOS Keychain
  * (whose master key a sandboxed process cannot read).
  */
-export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> = {
+/**
+ * Tools that get an identity file + wrapper. The policy names `lark-cli` and
+ * `bytedcli`; `codebase` (the Codebase CLI) is a COMPANION of bytedcli — its
+ * credential is the Codebase JWT bytedcli mints, so it is never authorized on
+ * its own: whenever bytedcli's identity is published, codebase's is derived
+ * and published alongside, and whenever bytedcli is governed, codebase is
+ * wrapped too. Keeping it out of the policy type means no config, schedule
+ * scope or dashboard surface has to learn a third name.
+ */
+export const CODEBASE_COMPANION_TOOL = 'codebase' as const;
+/** The Bits CLI is the second bytedcli companion: it reads the same ByteCloud
+ *  JWT, from its own variable. */
+export const BITSCLI_COMPANION_TOOL = 'bitscli' as const;
+export type CompanionTool = typeof CODEBASE_COMPANION_TOOL | typeof BITSCLI_COMPANION_TOOL;
+const COMPANION_TOOLS: readonly CompanionTool[] = [CODEBASE_COMPANION_TOOL, BITSCLI_COMPANION_TOOL];
+export type IdentityTool = TriggerUserAuthTool | CompanionTool;
+
+export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // APP_SECRET appears only in bot mode; in user mode it is absent from the
   // file, and `export` on an unset name puts nothing in the child's env.
   'lark-cli': ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
   // ByteCloud JWT and the Codebase JWT derived from it. The latter is what git
   // pushes authenticate with, so attribution of a commit follows from it.
   bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
+  // The Codebase CLI reads the same Codebase JWT from its own variable
+  // (`codebase auth login --help`: CI usage without persisting credentials).
+  codebase: ['CODEBASE_CLI_USER_JWT'],
+  // bitscli dispatches to several packages with their own credential sources:
+  // devops reads AIME_USER_CLOUD_JWT, pipeline reads CLOUD_JWT, codebase reads
+  // CODEBASE_CLI_USER_JWT. All three are injected, and the exec runs under the
+  // person's scratch HOME so no machine config file can supply another one.
+  bitscli: ['AIME_USER_CLOUD_JWT', 'CLOUD_JWT', 'CODEBASE_CLI_USER_JWT', 'BYTEDCLI_USER_CLOUD_JWT'],
 };
+
+/** Extra command names a tool's wrapper is also installed under (same package, second bin). */
+const IDENTITY_WRAPPER_ALIASES: Partial<Record<IdentityTool, readonly string[]>> = { bitscli: ['bits-cli'] };
+
+/** The identity tools a policy actually governs (policy tools + companions).
+ *  The companions follow the ByteCloud capability, not Meego. */
+export function identityToolsFor(
+  tools: readonly TriggerUserAuthTool[],
+  capabilities: ReadonlySet<Capability>,
+): IdentityTool[] {
+  const out = new Set<IdentityTool>(tools);
+  if (out.has('bytedcli') && capabilities.has('bytecloud')) {
+    out.add(CODEBASE_COMPANION_TOOL);
+    out.add(BITSCLI_COMPANION_TOOL);
+  }
+  return [...out];
+}
 
 /** Common to every variant: the turn these credentials were published FOR.
  *  The wrapper refuses to use them during any other turn. Absent ⇒ no binding
@@ -233,8 +556,33 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+  /** Partition-scoped ByteCloud JWTs selected by `--site`. The default JWT
+   *  also serves `cn` when it claims the CN partition. */
+  regionalCloudJwts?: Partial<Record<BytedcliRegion, string>>;
+  /** Who was asked for {@link regionalCloudJwts}; only shapes the refusal
+   *  text for a missing region. See {@link BytedcliRegionalJwtSource}. */
+  regionalCloudJwtSource?: BytedcliRegionalJwtSource;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
+  /**
+   * HOME the wrapper gives this one bytedcli exec. bytedcli keeps its state
+   * under `$HOME/.local/share/bytedcli` even when it runs on injected JWTs
+   * (measured on 0.76.0: `userinfo.json` with the acting person's profile,
+   * per-person Codebase repo caches, command traces). Left on the machine HOME
+   * those land in a directory every person's turns share. Filled in by
+   * {@link writeSessionIdentity}; see {@link bytedcliTurnHome}.
+   */
+  home?: string;
+  /**
+   * This person's Meego login home (services/meego-auth.ts), outside every
+   * session. The wrapper links `home`/.meegle to its `.meegle`, so a Meego
+   * login made from any session is the one every session uses. Filled in by
+   * {@link writeSessionIdentity} for an identity with an open_id.
+   */
+  meegoHome?: string;
+  /** ByteCloud is native for this bot and only Meego is the person's: `cloudJwt`
+   *  is empty and no companion identity is published. */
+  meegoOnly?: true;
 }
 
 /**
@@ -264,12 +612,38 @@ export interface BotIdentity extends TurnBound {
  * because that is where the locale lives.
  */
 export interface DeniedIdentity extends TurnBound {
-  tool: TriggerUserAuthTool;
+  tool: IdentityTool;
   mode: 'denied';
   message: string;
+  /** The person the refusal is for, when known: a later grant is only taken up for the same one. */
+  openId?: string;
 }
 
-export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
+/**
+ * Codebase CLI as a person: derived from the bytedcli identity's Codebase JWT.
+ * Never resolved on its own — see {@link CODEBASE_COMPANION_TOOL}.
+ */
+export interface CodebaseCliIdentity extends TurnBound {
+  tool: typeof CODEBASE_COMPANION_TOOL;
+  codeJwt: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
+}
+
+/** Bits CLI as a person: the ByteCloud JWT of the bytedcli identity. Never
+ *  resolved on its own — a companion like {@link CodebaseCliIdentity}. */
+export interface BitscliIdentity extends TurnBound {
+  tool: typeof BITSCLI_COMPANION_TOOL;
+  cloudJwt: string;
+  codeJwt?: string;
+  /** The bytedcli identity's per-person HOME: bitscli reads machine config
+   *  files from HOME, so it must see the same scratch directory. */
+  home?: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
+}
+
+export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | CodebaseCliIdentity | BitscliIdentity | BotIdentity | DeniedIdentity;
 
 /** Exit code for a command refused for want of authorization. Distinct from the
  *  tool's own failures so callers can tell "not allowed" from "did not work".
@@ -286,9 +660,227 @@ const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
 /** Open id these credentials act for. Compared with the worker's live-turn
  *  caller when the turn ids disagree: equal principals keep the credential. */
 const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
+/** Set for turns nobody is attending (see isUnattendedIdentityTurnId): the
+ *  wrapper never starts an authorization flow for them. */
+const UNATTENDED_VAR = 'BOTMUX_IDENTITY_UNATTENDED';
+
 /** Per-person HOME for the device-code lark-cli identity. Scoped to the child
  *  exec only — the wrapper sets it inline, never inheriting a parent value. */
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
+/** See {@link BytedCliIdentity.meegoHome}. */
+const MEEGO_HOME_VAR = 'BOTMUX_MEEGO_HOME';
+
+/**
+ * ByteCloud JWTs are partition-scoped. The daemon mints one per region and
+ * the bytedcli wrapper picks the one matching the call's `--site` (or
+ * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
+ */
+export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx' | 'cn';
+const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
+  i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
+  i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
+  tx: 'BOTMUX_IDENTITY_CLOUD_JWT_TX',
+  cn: 'BOTMUX_IDENTITY_CLOUD_JWT_CN',
+};
+/** `--site` values (bytedcli 0.178) grouped by the JWT region each one uses,
+ *  measured by minting with every site. Sites not listed keep the default. */
+const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
+  // The site `i18n` belongs to i18nbd; the i18n region uses i18n-tt.
+  i18n: ['i18n-tt', 'eu-ttp', 'eu-ttp-limited', 'eu-ttp-full'],
+  // us-ttpbd cannot be minted (auth commands reject it): it is scoped to
+  // bmq / apm argos log / cloud-ticket, which all request an i18n-bd JWT.
+  i18nbd: ['i18n', 'i18n-bd', 'us-ttpbd'],
+  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts'],
+  cn: ['cn'],
+};
+/** bytedcli's CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187). Aliases of a
+ *  site without a regional token need no entry in the case below. */
+const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
+  prod: 'cn', online: 'cn', 'sinf-cn': 'cn', boei18n: 'boe', 'boe-i18n': 'boe',
+  row: 'i18n-tt', i18ntt: 'i18n-tt', 'tiktok-row': 'i18n-tt',
+  usttp: 'us-ttp', 'tx-ttp': 'us-ttp', 'ttp-us': 'us-ttp', 'ttp-us-limited': 'us-ttp',
+  usttpbdee: 'us-ttp-bdee', usttpusts: 'us-ttp-usts',
+  euttp: 'eu-ttp', 'ttp-eu': 'eu-ttp',
+};
+
+/**
+ * Who was asked for an identity's regional ByteCloud JWTs. A region with no
+ * token means different things depending on that, and the person reading the
+ * refusal needs to know which:
+ * - `local`: this machine minted from the person's own login and got none
+ *   (no access to that partition, or the mint failed this time);
+ * - `platform`: the bound platform minted and issued none for that region;
+ * - `platform-legacy`: the bound platform does not issue regional tokens at all
+ *   (it predates them), so no person can get one there until it is upgraded.
+ */
+export type BytedcliRegionalJwtSource = 'local' | 'platform' | 'platform-legacy';
+const BYTEDCLI_REGIONAL_SOURCE_VAR = 'BOTMUX_IDENTITY_REGIONAL_SOURCE';
+// A turn's tickets are fixed when the turn is prepared, so a retry inside the
+// same turn gets the same answer: the hints say to send a new message.
+const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
+  local: '本机为发起人签票时没有签到这个分区的票：bytedcli 的登录按站点分开保存，本机的按人授权只登录了默认站点，发起人没在该站点另外登录过就签不出；也可能发起人没有该分区权限，或这次签票失败。可让 bot 改用平台授权（平台凭据页可为海外站点单独授权）。本轮内重试拿不到新票，处理后发一条新消息再试。',
+  platform: '平台为发起人签票时没有签出这个分区的票：海外站点要在平台凭据页单独授权，发起人可能还没授权该站点，或该站点授权已失效；也可能这次签票失败。本轮内重试拿不到新票；授权该站点后发一条新消息再试。',
+  'platform-legacy': '本机绑定的平台还不签发分区票（需要升级平台），海外分区的 bytedcli 命令暂时无法以发起人身份执行。请联系平台管理员；平台升级后发一条新消息再试。',
+};
+const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后，发一条新消息再试。';
+
+/** bytedcli's root options that take a value (`ROOT_OPTIONS_WITH_VALUE` in its
+ *  root-argv, 0.191), so the command after them can be found. */
+const BYTEDCLI_ROOT_OPTIONS_WITH_VALUE = [
+  '--jq', '--site', '--cloud-site', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
+  '--bytecloud-user-jwt-file', '--profile', '--vregion', '--vdc', '--socks5-proxy', '--http-proxy',
+  '--http-print', '--http-header', '--http-trace-file', '--http-body-limit', '--http-timeout-ms',
+  '--http-retry-count', '--http-retry-base-delay-ms', '--http-retry-max-delay-ms',
+] as const;
+/** Commands that never send the ByteCloud JWT to the site's partition: Codebase
+ *  authenticates with the Codebase JWT, Meego with the person's Meego login,
+ *  help with nothing. A site set for the whole session (BYTEDCLI_CLOUD_SITE)
+ *  must not cost a person without that partition's ticket these commands. */
+const BYTEDCLI_REGION_FREE_COMMANDS = ['help', 'codebase', 'meego'] as const;
+
+/**
+ * `__botmux_bd_region_free "$@"`: 0 when this invocation does not use the
+ * ByteCloud JWT of its site's partition — help or version output, no command
+ * at all, or a {@link BYTEDCLI_REGION_FREE_COMMANDS} command. Finds the command
+ * the way bytedcli's getFirstCommandArgIndex does. Anything it cannot place
+ * answers 1, so a missing ticket is refused rather than let through.
+ */
+const BYTEDCLI_REGION_FREE_FN: readonly string[] = [
+  '__botmux_bd_region_free() {',
+  '  __botmux_rf_skip=; __botmux_rf_cmd=',
+  '  for __botmux_rf_a in "$@"; do',
+  '    if [ -n "$__botmux_rf_skip" ]; then __botmux_rf_skip=; continue; fi',
+  '    case "$__botmux_rf_a" in',
+  // Commander reserves --help at every level; past `--` nothing is an option.
+  '      --) [ -n "$__botmux_rf_cmd" ] && break; return 1 ;;',
+  '      --help|--all-help) return 0 ;;',
+  '    esac',
+  '    [ -n "$__botmux_rf_cmd" ] && continue',
+  '    case "$__botmux_rf_a" in',
+  '      -h|--version|-V) return 0 ;;',
+  `      ${BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.join('|')}) __botmux_rf_skip=1 ;;`,
+  '      -*) ;;',
+  '      *) __botmux_rf_cmd=$__botmux_rf_a ;;',
+  '    esac',
+  '  done',
+  '  case "$__botmux_rf_cmd" in',
+  `    ''|${BYTEDCLI_REGION_FREE_COMMANDS.join('|')}) return 0 ;;`,
+  '  esac',
+  '  return 1',
+  '}',
+];
+
+/** Case pattern matching `site` in any letter case. */
+function anyCaseGlob(site: string): string {
+  return site.replace(/[a-z]/g, c => `[${c}${c.toUpperCase()}]`);
+}
+
+/** Shell lines: `case "$<siteVar>"` setting `<jwtVar>` to this identity's
+ *  token for that site's region, and `<regionVar>` (when given) to the region. */
+function bytedcliSiteRegionCase(siteVar: string, jwtVar: string, regionVar?: string): string[] {
+  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
+    const sites = BYTEDCLI_SITE_REGIONS[region];
+    const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
+    // The `|` alternatives are joined here, as literal text: sh does not read
+    // a `|` that comes out of a parameter expansion as a pattern separator.
+    const setRegion = regionVar ? `${regionVar}=${region}; ` : '';
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) ${setRegion}${jwtVar}=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+  });
+  return [`  case "$${siteVar}" in`, ...cases, '  esac'];
+}
+
+/** Shell lines trimming `$<siteVar>` the way bytedcli does (JS `trim()`, which
+ *  also drops Unicode spaces). Stripping every non-site character at either end
+ *  covers that trim; a value it over-strips is not a site bytedcli accepts either. */
+function bytedcliSiteTrim(siteVar: string): string[] {
+  return [
+    `  ${siteVar}=\${${siteVar}#"\${${siteVar}%%[[:alnum:]-]*}"}`,
+    `  ${siteVar}=\${${siteVar}%"\${${siteVar}##*[[:alnum:]-]}"}`,
+  ];
+}
+
+/**
+ * Shell lines selecting the regional ByteCloud JWT for this call's site.
+ *
+ * A call whose global site requires a missing partition token reports that
+ * partition before invoking bytedcli. Help and commands with their own
+ * credentials can still run (see {@link BYTEDCLI_REGION_FREE_FN}).
+ *
+ * The global site is read the way bytedcli 0.191 reads it: from the root
+ * options only — it enables positional options, so a `--site` after the
+ * command is that command's own option (a filter for `bytecloud
+ * list-legacy-vregions`, a preset for `forge`), not the site the call is
+ * authenticated against; `--cloud-site` is its spelling of `--site`; an empty
+ * `--site` counts as not given (the variable then decides); the value is
+ * trimmed with JS `trim()` and matched in any case.
+ *
+ * Which token is swapped in is decided separately and as before (#2472): by
+ * the last `--site` anywhere, so a command that authenticates against its own
+ * `--site` (nac) keeps getting the partition token it was getting.
+ */
+function bytedcliRegionalSelection(): string[] {
+  const rootValueOptions = BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.filter(option => option !== '--site' && option !== '--cloud-site');
+  const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
+    `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
+  return [
+    // The global site: the last --site among the root options, which end at
+    // the first command the way bytedcli's getFirstCommandArgIndex finds it.
+    '  __botmux_gsite=',
+    '  __botmux_next=',
+    '  __botmux_skip=',
+    '  for __botmux_arg in "$@"; do',
+    '    if [ -n "$__botmux_next" ]; then __botmux_gsite=$__botmux_arg; __botmux_next=; continue; fi',
+    '    if [ -n "$__botmux_skip" ]; then __botmux_skip=; continue; fi',
+    '    case "$__botmux_arg" in',
+    '      --) break ;;',
+    '      --site|--cloud-site) __botmux_next=1 ;;',
+    '      --site=*) __botmux_gsite=${__botmux_arg#--site=} ;;',
+    '      --cloud-site=*) __botmux_gsite=${__botmux_arg#--cloud-site=} ;;',
+    `      ${rootValueOptions.join('|')}) __botmux_skip=1 ;;`,
+    '      -*) ;;',
+    '      *) break ;;',
+    '    esac',
+    '  done',
+    '  if [ -z "$__botmux_gsite" ]; then __botmux_gsite=${BYTEDCLI_CLOUD_SITE:-}; fi',
+    ...bytedcliSiteTrim('__botmux_gsite'),
+    '  __botmux_region=',
+    '  __botmux_regional=',
+    ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_regional', '__botmux_region'),
+    '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ] && ! __botmux_bd_region_free "$@"; then',
+    `    case "$${BYTEDCLI_REGIONAL_SOURCE_VAR}" in`,
+    ...hints,
+    `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
+    '    esac',
+    // printf's format carries no prose: the site is the caller's argument.
+    "    printf '%s%s%s%s%s%s%s\\n' "
+      + `${shellSingleQuote('botmux: bytedcli 这次调用的站点 ')} "$__botmux_gsite" `
+      + `${shellSingleQuote(' 属于 ')} "$__botmux_region" `
+      + `${shellSingleQuote(' 分区，需要发起人在该分区的 ByteCloud JWT，但本轮发起人身份里没有这张票，命令未执行。botmux 不会拿默认分区的票去请求 ')} "$__botmux_region" `
+      + `${shellSingleQuote(' 分区（那只会被对方以 401 / 未登录拒绝）。')} >&2`,
+    `    printf '%s\\n' "$__botmux_hint" '[reason=regional_jwt_missing]' >&2`,
+    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '  fi',
+    // The token to send: by the last --site anywhere (#2472). Arguments are
+    // only read, never rewritten: "$@" is passed to the tool unchanged.
+    '  __botmux_site=',
+    '  __botmux_next=',
+    '  for __botmux_arg in "$@"; do',
+    '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
+    '    case "$__botmux_arg" in',
+    '      --) break ;;',
+    '      --site|--cloud-site) __botmux_next=1 ;;',
+    '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
+    '      --cloud-site=*) __botmux_site=${__botmux_arg#--cloud-site=} ;;',
+    '    esac',
+    '  done',
+    '  if [ -z "$__botmux_site" ]; then __botmux_site=${BYTEDCLI_CLOUD_SITE:-}; fi',
+    ...bytedcliSiteTrim('__botmux_site'),
+    '  __botmux_regional=',
+    ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
+    '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
+    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
+  ];
+}
 
 /**
  * Values must survive `.` (source) in `/bin/sh` unchanged.
@@ -328,11 +920,32 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       ['LARKSUITE_CLI_APP_ID', identity.appId],
       ['LARKSUITE_CLI_USER_ACCESS_TOKEN', identity.userAccessToken],
     );
+  } else if (identity.tool === CODEBASE_COMPANION_TOOL) {
+    pairs.push([MODE_VAR, 'user'], ['CODEBASE_CLI_USER_JWT', identity.codeJwt]);
+  } else if (identity.tool === BITSCLI_COMPANION_TOOL) {
+    pairs.push([MODE_VAR, 'user'], ['AIME_USER_CLOUD_JWT', identity.cloudJwt], ['CLOUD_JWT', identity.cloudJwt],
+      ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+    if (identity.codeJwt) pairs.push(['CODEBASE_CLI_USER_JWT', identity.codeJwt]);
+    if (identity.home) pairs.push([HOME_VAR, identity.home]);
   } else {
-    pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
+    pairs.push([MODE_VAR, 'user']);
+    if (identity.cloudJwt) pairs.push(['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    if (!identity.regionalCloudJwts?.cn && jwtClaims(identity.cloudJwt)?.region === 'cn') {
+      pairs.push([BYTEDCLI_REGIONAL_JWT_VARS.cn, identity.cloudJwt]);
+    }
+    for (const [region, jwt] of Object.entries(identity.regionalCloudJwts ?? {})) {
+      const key = BYTEDCLI_REGIONAL_JWT_VARS[region as BytedcliRegion];
+      if (key && jwt) pairs.push([key, jwt]);
+    }
+    if (identity.regionalCloudJwtSource) pairs.push([BYTEDCLI_REGIONAL_SOURCE_VAR, identity.regionalCloudJwtSource]);
+    // Same variable the lark-cli device-code identity uses: the wrapper scopes
+    // HOME to this exec only (see renderIdentityWrapper).
+    if (identity.home) pairs.push([HOME_VAR, identity.home]);
+    if (identity.meegoHome) pairs.push([MEEGO_HOME_VAR, identity.meegoHome]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
+  if (isUnattendedIdentityTurnId(identity.turnId)) pairs.push([UNATTENDED_VAR, '1']);
   if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
   return header + pairs.map(([k, v]) => `${k}=${quoteFor(k, v)}`).join('\n') + '\n';
@@ -350,7 +963,141 @@ function shellSingleQuoteMultiline(value: string): string {
 }
 
 /**
- * Publish the identity in force for this turn.
+ * Per-person bytedcli HOME for one session: `<session temp>/identity-home/
+ * bytedcli/<hash>`. The session temp dir is already the CLI's writable scratch
+ * and is removed when the session closes, so nothing outlives the session and
+ * no long-lived login is exposed — the daemon-side `bytedcli-home/<open_id>`
+ * holding the person's login stays where the sandbox cannot see it.
+ *
+ * Named by realpath: a sandbox binds the scratch by its canonical path and
+ * does not recreate a symlinked home (`/home/u` -> `/data00/home/u`). A lexical
+ * path there resolves into the sandbox's private tmpfs root, where `mkdir -p`
+ * succeeds and every write silently vanishes with the namespace. Outside a
+ * sandbox the canonical form names the same directory.
+ *
+ * What the per-person split is, and is not: it decides which directory one
+ * exec writes into and lets the session's cleanup take it all away. It is NOT
+ * a boundary between people within a session — the directories share the
+ * session's uid and the CLI can read and write the whole scratch. Keep
+ * long-lived or secret credentials out of it.
+ *
+ * Without an open_id (not expected for a granted identity) the session itself
+ * keys the directory, so it stays one stable directory instead of one per turn.
+ * Such a directory name no longer says whose it is; that is intended for a
+ * fallback that cannot tell people apart anyway, not a bug to "fix" back.
+ *
+ * Both publication paths (writeSessionIdentity and refreshSessionIdentity,
+ * which re-enters it) compute the path here, so they always agree.
+ *
+ * The path is spelled through the short alias when that layout is in place and
+ * through the cache root when it is not; see {@link bytedcliHomeRoot}.
+ *
+ * This function is a pure path computation on purpose — it is exported and read
+ * by callers that must not create directories (tests, the identity readers).
+ * Installing the layout and choosing the fallback are the publisher's job.
+ */
+export function bytedcliTurnHome(
+  sessionDataDir: string,
+  sessionId: string,
+  identity: Pick<BytedCliIdentity, 'openId'>,
+): string {
+  return bytedcliHomeFromBase(sessionTempDir(sessionDataDir, sessionId), sessionId, identity);
+}
+
+/**
+ * The per-person HOME under a given session scratch `base`.
+ *
+ * The single place the layout `<base>/identity-home/bytedcli/<digest>` is
+ * spelled. `base` is the only thing the two callers disagree about —
+ * {@link bytedcliTurnHome} passes the plain scratch, {@link publishedIdentityShape}
+ * passes whatever {@link bytedcliHomeRoot} settled on — so keeping the join in
+ * one function is what stops the published path from drifting away from the one
+ * the tests pin. That drift would be a security regression, not a cosmetic one:
+ * this is the boundary between the short alias and the cache root.
+ */
+function bytedcliHomeFromBase(
+  base: string,
+  sessionId: string,
+  identity: Pick<BytedCliIdentity, 'openId'>,
+): string {
+  return canonicalPathNearest(join(base, 'identity-home', 'bytedcli', bytedcliHomeDigest(sessionId, identity)));
+}
+
+/** Directory name for one person (or the session fallback) within a scratch. */
+function bytedcliHomeDigest(sessionId: string, identity: Pick<BytedCliIdentity, 'openId'>): string {
+  const key = identity.openId ? `open_id:${identity.openId}` : `session:${sessionId}`;
+  return createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
+
+/**
+ * The session-scratch base a published bytedcli HOME is placed under, after
+ * putting the short alias in place.
+ *
+ * Failing to install the layout does NOT fail the publication. The alias is a
+ * path-length optimisation, not a prerequisite for the identity being applied;
+ * refusing to publish someone's credential because a scratch alias could not be
+ * installed would turn a cosmetic problem into "this person cannot run the CLI
+ * at all".
+ *
+ * The fallback is the CACHE-ROOT spelling, never the lexical `<hub>/...` one. A
+ * failed layout means an ancestor is a link this code did not create (a hub
+ * symlinked at `/tmp/bm<uid>` pointing into a directory someone else controls);
+ * the executor then runs `mkdir -p` on whatever is published, and `mkdir -p`
+ * follows links. Publishing the lexical hub path would therefore create and fill
+ * that foreign tree — measured: the wrapper exited 0 and left 7 entries in it.
+ * Going through the cache root cannot lead there: it is under the user's HOME.
+ */
+function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
+  try {
+    ensureSessionTempLayout();
+    return sessionTempDir(sessionDataDir, sessionId);
+  } catch (error) {
+    // Only reachable when the hub is not ours to fix (foreign owner, a symlink
+    // planted at it); the session's exec reports it on its own terms.
+    logger.warn(`[cli-identity] session temp layout unavailable, publishing the cache-root HOME: ${
+      error instanceof Error ? error.message : String(error)}`);
+    return sessionTempDirWithoutAlias(sessionDataDir, sessionId);
+  }
+}
+
+/** Path only: the wrapper creates the directory at exec time, inside the
+ *  session scratch the worker has already created and the sandbox binds.
+ *
+ *  This is the enrichment point that touches the filesystem: it installs the
+ *  short-alias layout (or falls back to the cache-root spelling) and only then
+ *  computes the path, so the published HOME is the short one and the executor is
+ *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
+  if (identity.tool !== 'bytedcli' || 'mode' in identity) return identity;
+  if (identity.home) return identity;
+  if (identity.turnId?.startsWith('background:')) {
+    return { ...identity, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
+  }
+  const base = bytedcliHomeRoot(sessionDataDir, sessionId);
+  return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
+}
+
+/** Created here, on the host, so a session that can see the directory can use
+ *  it and one that cannot (a sandbox masks it) is told so by its absence. A
+ *  failure only costs this turn the shared Meego login, never the identity. */
+export function meegoStoreShape(openId: string | undefined): Pick<BytedCliIdentity, 'meegoHome'> {
+  if (!isUsableOpenId(openId)) return {};
+  try {
+    return { meegoHome: ensureMeegoStore(openId) };
+  } catch (error) {
+    logger.warn(`[cli-identity] Meego store unavailable, publishing without it: ${
+      error instanceof Error ? error.message : String(error)}`);
+    return {};
+  }
+}
+
+/**
+ * Publish the identity in force for a turn.
+ *
+ * In the proven model the rendered env body stays in daemon memory (see
+ * {@link rememberProvenIdentityContent}); no token touches disk. In the
+ * single-snapshot model it is written to the one per-tool file and atomically
+ * replaces whatever the previous turn left there.
  *
  * 0600 because the file holds a live token, and the containing dir is 0700.
  * Written atomically: a CLI invocation that lands mid-write must read either the
@@ -360,27 +1107,130 @@ function shellSingleQuoteMultiline(value: string): string {
 export function writeSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
-  identity: CliIdentity,
+  published: CliIdentity,
+  model: IdentityStorageModel,
 ): string {
-  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
-  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
-  atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
-  return path;
+  const identity = publishedIdentityShape(sessionDataDir, sessionId, published);
+  const body = renderIdentityEnv(identity);
+  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
+  if (model === 'proven') {
+    if (!identity.turnId) throw new Error('[cli-identity] proven identity requires a turn id');
+    rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, identity.tool, body);
+    // Companion mirror for the Codebase and Bits CLIs: keep memory and disk
+    // branches in agreement whenever bytedcli publishes, so they never disagree.
+    if (identity.tool === 'bytedcli') {
+      for (const companion of companionsOf(identity)) {
+        rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, companion.tool,
+          renderIdentityEnv(companion));
+      }
+    }
+    return path;
+  }
+  const singlePath = join(sessionIdentityDataDir(sessionDataDir, sessionId), `${identity.tool}.env`);
+  mkdirSync(dirname(singlePath), { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(singlePath, body, { mode: 0o600 });
+  // Companions: every bytedcli publication (grant OR refusal) is mirrored for
+  // the Codebase and Bits CLIs, so they can never disagree about whose turn it
+  // is. Files cannot be committed atomically; if a mirror fails, take the
+  // bytedcli file down with it rather than leave a granted bytedcli next to a
+  // stale companion identity (an absent file is a refusal for every wrapper).
+  if (identity.tool === 'bytedcli') {
+    try {
+      for (const companion of companionsOf(identity)) {
+        atomicWriteFileSync(
+          sessionIdentityPath(sessionDataDir, sessionId, companion.tool),
+          renderIdentityEnv(companion),
+          { mode: 0o600 },
+        );
+      }
+    } catch (e) {
+      try { rmSync(singlePath, { force: true }); } catch { /* best-effort */ }
+      throw e;
+    }
+  }
+  return singlePath;
+}
+
+/** Whether a published identity for the turn/tool still exists, in the model's
+ *  store. Distinguishes "material missing" (a terminal condition for an auth
+ *  poll) from "live turn not active yet" (which keeps the poll pending). */
+export function sessionIdentityMaterialPresent(
+  sessionDataDir: string,
+  sessionId: string,
+  tool: IdentityTool,
+  turnId: string,
+  model: IdentityStorageModel,
+): boolean {
+  if (model === 'proven') return recallProvenIdentityContent(sessionDataDir, sessionId, turnId, tool) !== undefined;
+  return existsSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`));
+}
+
+function isDeniedIdentity(identity: CliIdentity): identity is DeniedIdentity {
+  return 'mode' in identity && identity.mode === 'denied';
+}
+
+/** The codebase identity implied by a bytedcli one. A bytedcli grant without a
+ *  Codebase JWT (the mint is best-effort) refuses codebase rather than letting
+ *  it fall back to the machine's own Codebase login. */
+export function codebaseCompanionOf(identity: BytedCliIdentity | DeniedIdentity): CodebaseCliIdentity | DeniedIdentity {
+  const turn = identity.turnId ? { turnId: identity.turnId } : {};
+  if (isDeniedIdentity(identity)) {
+    return { tool: CODEBASE_COMPANION_TOOL, mode: 'denied', message: identity.message, ...(identity.openId ? { openId: identity.openId } : {}), ...turn };
+  }
+  if (!identity.codeJwt) {
+    return {
+      tool: CODEBASE_COMPANION_TOOL,
+      mode: 'denied',
+      ...turn,
+      message: 'botmux: ByteCloud 已授权，但本轮未能换取 Codebase 身份（Codebase JWT），codebase 命令未执行；请稍后重试，不会改用机器自己的 Codebase 登录。',
+    };
+  }
+  return {
+    tool: CODEBASE_COMPANION_TOOL,
+    codeJwt: identity.codeJwt,
+    ...turn,
+    ...(identity.openId ? { openId: identity.openId } : {}),
+  };
+}
+
+/** Bits CLI identity implied by a bytedcli one: the same ByteCloud JWT. */
+export function bitscliCompanionOf(identity: BytedCliIdentity | DeniedIdentity): BitscliIdentity | DeniedIdentity {
+  const turn = identity.turnId ? { turnId: identity.turnId } : {};
+  if (isDeniedIdentity(identity)) {
+    return { tool: BITSCLI_COMPANION_TOOL, mode: 'denied', message: identity.message, ...(identity.openId ? { openId: identity.openId } : {}), ...turn };
+  }
+  return {
+    tool: BITSCLI_COMPANION_TOOL,
+    cloudJwt: identity.cloudJwt,
+    ...(identity.codeJwt ? { codeJwt: identity.codeJwt } : {}),
+    ...(identity.home ? { home: identity.home } : {}),
+    ...turn,
+    ...(identity.openId ? { openId: identity.openId } : {}),
+  };
+}
+
+function companionsOf(identity: BytedCliIdentity | DeniedIdentity) {
+  if (!isDeniedIdentity(identity) && identity.meegoOnly) return [];
+  return [codebaseCompanionOf(identity), bitscliCompanionOf(identity)];
 }
 
 export function refreshSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
   identity: CliIdentity & { turnId: string },
+  model: IdentityStorageModel,
 ): boolean {
-  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
   const turnLine = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}`;
   const openId = 'openId' in identity ? identity.openId : undefined;
   try {
     // Match the TURN line by line, not by suffix: renderIdentityEnv appends the
     // OPEN_ID line after TURN for every principal-stamped identity, so
     // `endsWith(TURN=…)` is false for exactly the files this feature produces.
-    const lines = readFileSync(path, 'utf8').split('\n');
+    const previous = model === 'proven'
+      ? recallProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, identity.tool)
+      : readFileSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${identity.tool}.env`), 'utf8');
+    if (previous === undefined) return false;
+    const lines = previous.split('\n');
     if (!lines.includes(turnLine)) return false;
     // Incidental consistency: a file already stamped for one principal must not
     // be refreshed into another principal's token. An UNSTAMPED file (the
@@ -389,30 +1239,55 @@ export function refreshSessionIdentity(
     // completed the device grant.
     const stamped = lines.find(line => line.startsWith(`${OPEN_ID_VAR}=`));
     if (stamped && stamped !== `${OPEN_ID_VAR}=${quoteFor(OPEN_ID_VAR, openId ?? '')}`) return false;
-    // The active-turn file is two lines (turn, caller); compare only the turn.
-    if (readActiveTurnLine(sessionDataDir, sessionId) !== identity.turnId) return false;
+    // Proven content is addressed by execution proof, so the live turn marker
+    // only has to still name this identity turn. The single-snapshot model
+    // compares its first line (envelope turn), as before.
+    const active = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n');
+    if (model === 'proven') {
+      if ((active[3] ?? active[0]) !== identity.turnId) return false;
+    } else if ((active[0] ?? '').trim() !== identity.turnId) {
+      return false;
+    }
   } catch {
     return false;
   }
-  writeSessionIdentity(sessionDataDir, sessionId, identity);
+  writeSessionIdentity(sessionDataDir, sessionId, identity, model);
   return true;
 }
 
 /**
- * Remove the identity for one tool.
- *
- * Called when the current sender has no credentials: the file must GO, not go
- * stale. Leaving the previous person's token in place is precisely the failure
- * this feature exists to prevent — the next command would run as them, silently
- * and with the wrong name in the audit trail.
+ * Remove one turn's tool identity, or every snapshot for that tool at teardown.
  */
 export function clearSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
+  turnId: string | undefined,
+  model: IdentityStorageModel,
 ): void {
-  try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool), { force: true }); }
+  if (model === 'proven') {
+    forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, tool);
+    // The companions live and die with bytedcli's in-memory identity.
+    if (tool === 'bytedcli') {
+      forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, CODEBASE_COMPANION_TOOL);
+      forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, BITSCLI_COMPANION_TOOL);
+    }
+    return;
+  }
+  try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+  // The companions live and die with bytedcli's on-disk identity.
+  if (tool === 'bytedcli') {
+    clearSessionIdentity(sessionDataDir, sessionId, CODEBASE_COMPANION_TOOL, turnId, model);
+    clearSessionIdentity(sessionDataDir, sessionId, BITSCLI_COMPANION_TOOL, turnId, model);
+  }
+  if (turnId) return;
+  const turnsDir = join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns');
+  try {
+    for (const entry of readdirSync(turnsDir)) {
+      rmSync(join(turnsDir, entry, `${tool}.env`), { force: true });
+    }
+  } catch { /* best-effort: absence is the desired state */ }
   // Before #1543 identities lived directly under cli-identity/. Upgraded
   // sessions no longer read or overwrite those files, so remove the exact
   // legacy path as well instead of leaving a live token behind indefinitely.
@@ -424,11 +1299,27 @@ export function clearSessionIdentity(
   } catch { /* best-effort: absence is the desired state */ }
 }
 
-/** Drop every identity for a session (teardown). */
+/** Drop every identity for a session (teardown). Proven contents are memory
+ *  only; single-snapshot files and any on-disk leftovers from an older layout
+ *  are removed as well. */
 export function clearAllSessionIdentities(sessionDataDir: string, sessionId: string): void {
   clearLarkToolDelegations(sessionDataDir, sessionId);
+  forgetProvenIdentityContent(sessionDataDir, sessionId);
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
-    clearSessionIdentity(sessionDataDir, sessionId, tool);
+    try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+    try {
+      rmSync(
+        join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`),
+        { force: true },
+      );
+    } catch { /* best-effort: absence is the desired state */ }
+  }
+  try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns'), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
+  for (const name of ['turn', 'turn.json', IDENTITY_LAYOUT_FILE]) {
+    try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), name), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
   }
   try {
     rmSync(
@@ -437,6 +1328,13 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
     );
   } catch { /* best-effort: absence is the desired state */ }
 }
+
+/** Second line of every wrapper {@link renderIdentityWrapper} writes. Also what
+ *  marks a file in the bin dir as ours to remove. */
+const IDENTITY_WRAPPER_MARKER = '# botmux trigger-user identity wrapper — generated, do not edit.';
+/** Every identity tool, derived from the exhaustive map so a new tool cannot be
+ *  left out of stale-wrapper cleanup. */
+const ALL_IDENTITY_TOOLS = Object.keys(IDENTITY_ENV_KEYS) as IdentityTool[];
 
 /**
  * The wrapper script for one tool.
@@ -449,71 +1347,304 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *  - `BOTMUX_SESSION_ID` / `SESSION_DATA_DIR` come from the session env the
  *    worker already injects; the wrapper is identical for every session, so
  *    nothing needs rewriting when sessions come and go.
- *  - **A missing or unrecognized identity file denies the command.** The
- *    earlier version exec'd the tool anyway, on the belief that no env means
- *    "run as the bot". It does not: lark-cli then resolves the operator's
- *    on-disk login and acts as *that person* — the machine account this whole
- *    feature exists to stop. So absence is refusal, and running as the bot is
+ *  - **A missing or unrecognized identity denies the command.** The earlier
+ *    version exec'd the tool anyway, on the belief that no env means "run as
+ *    the bot". It does not: lark-cli then resolves the operator's on-disk
+ *    login and acts as *that person* — the machine account this whole feature
+ *    exists to stop. So absence is refusal, and running as the bot is
  *    something the daemon must ask for explicitly (`mode=bot`).
  *
- *    Failing this way is safe to default to: the only thing an unwritten file
- *    can mean is that the daemon has not yet decided, and borrowing a stranger's
- *    credentials while it decides is worse than not running.
+ * Two identity models (see {@link IdentityStorageModel}):
  *
- *  - **The identity must belong to the turn now running.** The daemon publishes
- *    when a message is ACCEPTED; the CLI runs turns from its own queue, so
- *    while A's turn is still executing, B's message can arrive and overwrite the
- *    file — and A's remaining tool calls would then run with B's permissions.
- *    The daemon cannot close that gap alone (the worker does not wait for it),
- *    so each identity carries the turn it was published for, the worker
- *    publishes the turn it is actually executing, and a mismatch refuses.
- *
- *    The cost is real and deliberate: tool calls in the tail of A's turn fail
- *    once B has spoken. That is the trade this feature is for — a failed command
- *    is recoverable, a command that silently ran as the wrong person is not.
+ *  - `proven`: a helper process proves THIS process tree belongs to the turn
+ *    now executing over the daemon loopback channel, and prints the identity
+ *    env assignments themselves. The wrapper `eval`s them directly — no
+ *    identity file is read or selected, so a same-uid agent cannot redirect
+ *    the choice at another queued turn and no token rests on disk to read.
+ *  - `single` (paths without that channel): the legacy layout — one per-tool
+ *    file the daemon overwrites (or removes) on every turn, plus the live
+ *    turn marker used for the tail-of-turn mismatch refusal.
  */
-export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
-  const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
+/**
+ * The one scan of the wrapped CLI's argv, run once at the top of the wrapper.
+ * Sets __botmux_sc_w1 / _w2 (first two operands), _login (a `login` operand that
+ * is the first operand or comes right after an `auth` or `meego` operand,
+ * whatever options sit between them), _help (some argument is a help/version
+ * flag that cannot be the value of the option before it) and _unknown (an
+ * option whose arity is not known: whether the next word is its value cannot be
+ * told, so callers treat the call as governed, and a following `login` still
+ * counts as an operand). An unknown option only matters for routing while the
+ * first operand is unresolved. The option lists are bytedcli's global options
+ * ({@link BYTEDCLI_ROOT_OPTIONS_WITH_VALUE}) plus `--tenant` (meego) and
+ * bitscli's `--session-id`; after `--` every word is an operand.
+ */
+const BYTEDCLI_SCAN_FN: readonly string[] = [
+  '__botmux_scan() {',
+  '  __botmux_sc_w1=; __botmux_sc_w2=; __botmux_sc_skip=; __botmux_sc_login=; __botmux_sc_websess=; __botmux_sc_help=; __botmux_sc_unknown=; __botmux_sc_end=; __botmux_sc_prev=; __botmux_sc_opt=',
+  '  for __botmux_sc_a in "$@"; do',
+  '    __botmux_sc_optprev=$__botmux_sc_opt; __botmux_sc_opt=',
+  '    if [ -n "$__botmux_sc_skip" ]; then __botmux_sc_skip=; continue; fi',
+  '    if [ -z "$__botmux_sc_end" ]; then',
+  '      case "$__botmux_sc_a" in',
+  '        --) __botmux_sc_end=1; continue ;;',
+  `        ${[...BYTEDCLI_ROOT_OPTIONS_WITH_VALUE, '--tenant', '--session-id'].join('|')}) __botmux_sc_skip=1; continue ;;`,
+  '        -h|--help|-V|--version) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1; continue ;;',
+  '        -d|--debug|-j|--json|--nomask|--yes|--color|--no-color|--tls1.2|--http-debug|--no-auto-upgrade|--all-help) continue ;;',
+  '        -[dhjV][dhjV]*) case "$__botmux_sc_a" in *[hV]*) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1 ;; esac; continue ;;',
+  // `--session[=…]` / `--session-method[=…]` make `auth login` the browser-session login, not the ByteCloud one (`--session-id` is another option).
+  '        --session-method) __botmux_sc_websess=1; __botmux_sc_skip=1; continue ;;',
+  '        --session|--session=*|--session-method=*) __botmux_sc_websess=1; continue ;;',
+  '        --*=*) continue ;;',
+  '        -?*) [ -n "$__botmux_sc_w1" ] || __botmux_sc_unknown=1; __botmux_sc_opt=1; continue ;;',
+  '      esac',
+  '    fi',
+  '    if [ "$__botmux_sc_a" = login ] && { [ -z "$__botmux_sc_prev" ] || [ "$__botmux_sc_prev" = auth ] || [ "$__botmux_sc_prev" = meego ]; }; then __botmux_sc_login=1; fi',
+  '    __botmux_sc_prev=$__botmux_sc_a',
+  '    if [ -z "$__botmux_sc_w1" ]; then __botmux_sc_w1=$__botmux_sc_a; elif [ -z "$__botmux_sc_w2" ]; then __botmux_sc_w2=$__botmux_sc_a; fi',
+  '  done',
+  '}',
+];
+
+/**
+ * Runs a command with only an allowlist of the environment: the non-credential
+ * variables a CLI needs to function, a private HOME with the XDG directories
+ * under it, and the named injected identity variables. Every other exported
+ * variable is unset in this shell before the command starts, so nothing ambient
+ * that could be a credential (or select one) is passed on, and no value is
+ * ever put on a command line.
+ * $1 = HOME, $2 = names of the injected variables, $3 = exec | run, rest = command.
+ */
+// USER / USERNAME: `bitscli pipeline <read command>` takes its Username header from them (it fails with "Missing username" otherwise).
+const BYTECLOUD_CLEAN_RUN_FN: readonly string[] = [
+  '__botmux_run_clean() {',
+  '  export HOME="$1" XDG_CONFIG_HOME="$1/.config" XDG_DATA_HOME="$1/.local/share" XDG_CACHE_HOME="$1/.cache" XDG_STATE_HOME="$1/.local/state"',
+  '  __bc_keep=" HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME PATH LANG LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE LC_NUMERIC LC_TIME LC_MONETARY TERM TZ TMPDIR COLUMNS LINES USER USERNAME NO_COLOR FORCE_COLOR http_proxy https_proxy no_proxy all_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR $2 "; __bc_mode=$3; shift 3',
+  `  for __bc_v in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do`,
+  '    case "$__bc_keep" in *" $__bc_v "*) ;; *) command unset "$__bc_v" 2>/dev/null ;; esac',
+  '  done',
+  '  if [ "$__bc_mode" = exec ]; then exec "$@"; fi',
+  '  "$@"',
+  '}',
+];
+
+/**
+ * Meego (the official meegle CLI under bytedcli) keeps its login in
+ * `$HOME/.meegle`. With the per-exec scratch HOME that store used to live and
+ * die with one session, so a login finished in the DM never reached the group
+ * topic that asked for it. The wrapper links the scratch `.meegle` to the
+ * person's store ({@link BytedCliIdentity.meegoHome}) on every exec, and
+ * leaves logging in to botmux: `bytedcli meego login` and a Meego command with
+ * no login yet ask the daemon, which sends the link to the person privately.
+ * The device link never reaches the agent, so it cannot end up in a group.
+ */
+const BYTEDCLI_MEEGO_FN: readonly string[] = [
+  // Prints the Meego subcommand that needs a login (`login` for a meego→login
+  // pair), from the argv scan; fails for every other call and for
+  // help/status/logout/config, which never need one.
+  '__botmux_meego_sub() {',
+  '  [ -z "$__botmux_sc_help" ] || return 1',
+  '  [ "$__botmux_sc_w1" = meego ] || return 1',
+  `  if [ -n "$__botmux_sc_login" ]; then printf '%s' login; return 0; fi`,
+  '  case "$__botmux_sc_w2" in ""|status|logout|config|help) return 1 ;; esac',
+  `  printf '%s' "$__botmux_sc_w2"`,
+  '}',
+  // The Meego tenant this call runs under, in bytedcli's order: the
+  // `--tenant` flag, BYTEDCLI_MEEGO_TENANT, the tenant saved in this HOME ($1).
+  // Sets __botmux_mg_tenant (`dcar`, or empty for the default) and
+  // __botmux_mg_tset when the flag was given; fails on a flag bytedcli rejects.
+  '__botmux_meego_tenant() {',
+  '  __botmux_mg_tenant=; __botmux_mg_tset=; __botmux_mg_tval=; __botmux_mg_tnext=; __botmux_mg_thome=$1; shift',
+  '  for __botmux_mg_a in "$@"; do',
+  '    if [ -n "$__botmux_mg_tnext" ]; then __botmux_mg_tval=$__botmux_mg_a; __botmux_mg_tnext=; continue; fi',
+  '    case "$__botmux_mg_a" in',
+  '      --tenant) __botmux_mg_tset=1; __botmux_mg_tnext=1; __botmux_mg_tval= ;;',
+  '      --tenant=*) __botmux_mg_tset=1; __botmux_mg_tval=${__botmux_mg_a#--tenant=} ;;',
+  '    esac',
+  '  done',
+  '  if [ -n "$__botmux_mg_tset" ]; then',
+  '    case "$__botmux_mg_tval" in [Dd][Cc][Aa][Rr]) __botmux_mg_tenant=dcar; return 0 ;; esac',
+  '    return 1',
+  '  fi',
+  '  case "$BYTEDCLI_MEEGO_TENANT" in [Dd][Cc][Aa][Rr]) __botmux_mg_tenant=dcar; return 0 ;; esac',
+  `  if grep -Eqs '"(tenant|site)"[[:space:]]*:[[:space:]]*"[Dd][Cc][Aa][Rr]"' \\`,
+  '    "$__botmux_mg_thome/.local/share/bytedcli/data/meego_config.json"; then __botmux_mg_tenant=dcar; fi',
+  '  return 0',
+  '}',
+];
+
+/** A shell `case` pattern matching a refusal that carries any of `reasons`. */
+const reasonCase = (reasons: readonly string[]): string => reasons.map(reason => `*'${reasonTag(reason)}'*`).join('|');
+
+/** Asks botmux to authorize the person, for the ByteCloud refusal and the Meego login alike. */
+const BYTEDCLI_AUTH_REQUEST_FN: readonly string[] = [
+  // Asks the daemon to authorize the person this turn acts for. Exit status is
+  // botmux's: 0 authorized now, 3 not yet (the link went to the person, or
+  // could not), 4 provider unavailable, anything else botmux unreachable. Its
+  // message lands in __botmux_ar_out for the caller to print.
+  '__botmux_auth_request() {',
+  '  __botmux_ar_out=',
+  '  command -v botmux >/dev/null 2>&1 || return 1',
+  '  __botmux_ar_out=$(botmux auth request "$@" 2>/dev/null)',
+  '}',
+  // The one refusal of a governed command in a run nobody attends: botmux is
+  // asked to send the one private notice (its answer never reaches the agent),
+  // then the command does not run. $1 = provider, $2 = message, $3 = Meego
+  // tenant, $4 = message when botmux answers that the credential is valid.
+  '__botmux_unattended_refuse() {',
+  '  __botmux_auth_request --provider "$1" --unattended ${3:+--tenant "$3"}',
+  '  __botmux_rc=$?',
+  `  if [ "$__botmux_rc" -eq 0 ] && [ -n "$4" ]; then printf '%s\\n' "$4" >&2; elif [ "$__botmux_rc" -eq 5 ] && [ -n "$__botmux_ar_out" ]; then printf '%s\\n' "$__botmux_ar_out" >&2; else printf '%s\\n' "$2" >&2; fi`,
+  `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
+  '}',
+];
+
+const UNATTENDED_LOGIN_MSG = 'botmux: 无人值守的运行不会发起 ByteCloud 登录；任务执行人对 ByteCloud 的授权缺失时，命令未执行；授权后，任务下次触发时会正常运行。';
+const UNATTENDED_WEBSESSION_MSG = 'botmux: 无人值守的运行无法完成浏览器会话登录（auth login --session）；命令未执行，请在有人值守的对话里由本人执行。';
+const UNATTENDED_MEEGO_MSG = 'botmux: 无人值守的运行不会发起 Meego 登录；任务执行人的 Meego 登录缺失时，命令未执行；登录后，任务下次触发时会正常运行。';
+const UNATTENDED_LOGIN_READY_MSG = 'botmux: 无人值守的运行不会登录；任务执行人的 ByteCloud 凭据有效，请直接运行要执行的命令，不需要登录。';
+const UNATTENDED_MEEGO_READY_MSG = 'botmux: 无人值守的运行不会登录；任务执行人的 Meego 登录有效，请直接运行要执行的命令，不需要登录。';
+const BYTECLOUD_LOGIN_UNREACHABLE_MSG = 'botmux: ByteCloud 登录由 botmux 发起，授权链接只私下发给你本人；但现在联系不上 botmux，命令未执行。请稍后重试。';
+const MEEGO_LOGIN_UNREACHABLE_MSG = 'botmux: Meego 登录由 botmux 发起，授权链接只私下发给你本人；但现在联系不上 botmux，命令未执行。请稍后重试。';
+const MEEGO_SANDBOX_LOGIN_MSG = 'botmux: 这个会话在沙盒里，看不到你在本机器人里的 Meego 登录，也不能在这里登录（授权链接不会经过会话转发）。请在和我的私聊里完成 Meego 操作。';
+
+const MEEGO_TENANT_INVALID_MSG = 'botmux: Meego 的 --tenant 只能是 dcar（不写即默认租户），命令未执行。';
+
+/** Runs inside the `[ -n HOME_VAR ]` block, after `__botmux_home` exists. */
+function bytedcliMeegoBlock(realBinaryPath: string): string[] {
   return [
-    '#!/bin/sh',
-    '# botmux trigger-user identity wrapper — generated, do not edit.',
-    '# Sources the identity the daemon published for the CURRENT turn, then execs',
-    '# the real tool. Re-read on every invocation, which is what lets the acting',
-    '# identity change without restarting the session.',
-    '#',
-    '# No usable identity => the command does not run. Exec\'ing the tool bare',
-    '# would hand it the machine account\'s login, not the bot\'s.',
-    `${MODE_VAR}=`,
-    `${DENY_MSG_VAR}=`,
-    // Clear inherited copies before sourcing: a parent process that exports a
-    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
-    // the same-principal allowance. Depths of defence only — the values are
-    // re-set from the credential file below when it carries them.
-    `${TURN_VAR}=`,
-    `${OPEN_ID_VAR}=`,
+    `  if [ -n "$${MEEGO_HOME_VAR}" ]; then`,
+    // Inherited from the host, these are the operator's Meego credentials,
+    // and bytedcli would use them ahead of this person's login.
+    `    unset ${MEEGO_ENV_CREDENTIALS.join(' ')}`,
+    `    __botmux_mg_store="$${MEEGO_HOME_VAR}/${MEEGO_STORE_DIR}"`,
+    '    __botmux_mg_sub=$(__botmux_meego_sub) || __botmux_mg_sub=',
+    // A sandbox masks the store, so `-d` is also the "can this session use
+    // it" check. Linking replaces a session-local store (a login made here
+    // before this existed) and a link into a revoked epoch. `-n` matters when
+    // two calls race here: without it, `ln` onto the other's fresh link to a
+    // directory would create a link inside the person's store instead.
+    '    if [ -d "$__botmux_mg_store" ]; then',
+    '      __botmux_mg_link="$__botmux_home/.meegle"',
+    '      if [ "$(readlink "$__botmux_mg_link" 2>/dev/null)" != "$__botmux_mg_store" ]; then',
+    '        [ -L "$__botmux_mg_link" ] || rm -rf "$__botmux_mg_link"',
+    '        ln -sfn "$__botmux_mg_store" "$__botmux_mg_link" 2>/dev/null || true',
+    '      fi',
+    '      __botmux_mg_tok=1',
+    '      __botmux_meego_tenant "$__botmux_home" "$@" || __botmux_mg_tok=',
+    // Never exec the real login, not even when authorized: the store already
+    // holds the login every session uses, and the real one would print a
+    // device link to the agent. A `--tenant` it would have saved is saved.
+    '      if [ "$__botmux_mg_sub" = login ]; then',
+    '        if [ -z "$__botmux_mg_tok" ]; then',
+    `          printf '%s\\n' ${shellSingleQuote(MEEGO_TENANT_INVALID_MSG)} >&2`,
+    '          exit 2',
+    '        fi',
+    `        if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse meego ${shellSingleQuote(UNATTENDED_MEEGO_MSG)} "$__botmux_mg_tenant" ${shellSingleQuote(UNATTENDED_MEEGO_READY_MSG)}; fi`,
+    '        if [ -n "$__botmux_mg_tset" ]; then',
+    `          HOME="$__botmux_home" ${shellSingleQuote(realBinaryPath)} meego config --tenant "$__botmux_mg_tenant" >/dev/null 2>&1 || true`,
+    '        fi',
+    '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
+    '        case $? in',
+    `          0) printf '%s\\n' "$__botmux_ar_out" >&2; exit 0 ;;`,
+    `          3|4) printf '%s\\n' "$__botmux_ar_out" >&2 ;;`,
+    `          *) printf '%s\\n' ${shellSingleQuote(MEEGO_LOGIN_UNREACHABLE_MSG)} >&2 ;;`,
+    '        esac',
+    `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '      fi',
+    // Any login file (meegle keeps one per profile, i.e. per tenant) lets the
+    // call run; with only the other tenant's, meegle fails as before and
+    // `meego login` above then asks for this one. botmux unreachable or the
+    // provider down (4): the command runs and fails as it would have.
+    '      __botmux_mg_has=',
+    '      for __botmux_mg_f in "$__botmux_mg_store"/credentials*.enc; do',
+    '        if [ -s "$__botmux_mg_f" ]; then __botmux_mg_has=1; fi',
+    '      done',
+    '      if [ -n "$__botmux_mg_sub" ] && [ -n "$__botmux_mg_tok" ] && [ -z "$__botmux_mg_has" ]; then',
+    `        if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse meego ${shellSingleQuote(UNATTENDED_MEEGO_MSG)} "$__botmux_mg_tenant"; fi`,
+    '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
+    `        if [ $? -eq 3 ]; then printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
+    '      fi',
+    // Store not visible here (sandbox). In the person's own DM the session-
+    // local login prints its link where only they can see it, as before.
+    '    elif [ "$__botmux_mg_sub" = login ] && [ "$BOTMUX_CHAT_TYPE" != p2p ]; then',
+    `      printf '%s\\n' ${shellSingleQuote(MEEGO_SANDBOX_LOGIN_MSG)} >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    fi',
+    '    unset __botmux_mg_store __botmux_mg_sub __botmux_mg_link __botmux_mg_tok __botmux_mg_has __botmux_mg_f __botmux_ar_out',
+    '  fi',
+  ];
+}
+
+/**
+ * Native capabilities of the bytedcli wrapper. `bytedcli meego ...` and every
+ * other bytedcli command are separate switches: a native one execs the real
+ * binary untouched (machine HOME, no injected JWT, no Meego link, no login
+ * interception) before any identity is resolved.
+ */
+export interface NativeBytedcliCapabilities {
+  /** Meego calls run natively. */
+  meego?: boolean;
+  /** Everything except Meego runs natively. */
+  bytecloud?: boolean;
+}
+
+const AS_UNAVAILABLE_MSG = 'botmux: 这次调用无法使用 BOTMUX_AS（命令使用本机原生登录，或本会话按单快照模式运行，不逐次向 daemon 取身份），命令未执行；去掉 BOTMUX_AS 重试。';
+/** Shell line refusing a call that names `BOTMUX_AS` where the wrapper cannot honour it. */
+const refuseBotmuxAs = (leave: string): string =>
+  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(AS_UNAVAILABLE_MSG)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
+
+function bytedcliNativePassthrough(realBinaryPath: string, native: NativeBytedcliCapabilities): string[] {
+  if (!native.meego && !native.bytecloud) return [];
+  // An option of unknown arity makes the first operand uncertain: the call
+  // stays governed rather than running natively on a guess. While Meego is
+  // governed, the browser-session login stays governed too: it saves the web
+  // session Meego's GoAPI commands read, so it must land in the same HOME.
+  const condition = native.meego
+    ? '[ -z "$__botmux_sc_unknown" ] && [ "$__botmux_sc_w1" = meego ]'
+    : '[ -z "$__botmux_sc_unknown" ] && [ "$__botmux_sc_w1" != meego ] && { [ -z "$__botmux_sc_login" ] || [ -z "$__botmux_sc_websess" ]; }';
+  return [`if ${condition}; then ${refuseBotmuxAs('exit')}; exec ${shellSingleQuote(realBinaryPath)} "$@"; fi`];
+}
+
+export function renderIdentityWrapper(
+  tool: IdentityTool,
+  realBinaryPath: string,
+  model: IdentityStorageModel,
+  identityResolver?: readonly string[],
+  nativeCapabilities: NativeBytedcliCapabilities = {},
+): string {
+  const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
+  const governsByteCloud = !(tool === 'bytedcli' && nativeCapabilities.bytecloud);
+  const governsMeego = tool === 'bytedcli' && !nativeCapabilities.meego;
+  const isBytecloudFamily = tool === 'bytedcli' || tool === CODEBASE_COMPANION_TOOL || tool === BITSCLI_COMPANION_TOOL;
+  const authProvider = tool === 'lark-cli' ? 'lark-cli' : 'bytedcli';
+  const resolveBlock = model === 'proven' ? [
+    // The runner proves this process tree over the daemon loopback channel and
+    // prints the identity env ASSIGNMENTS, never a path. eval consumes that
+    // body straight from the pipe: nothing in the session directory can select
+    // or alter the identity, and no token rests on disk to be read.
+    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    // An empty body is a missing/empty response (no mode assignment below),
+    // never silent permission to run: deny it like a failed proof.
+    `[ -n "$__botmux_cred_body" ] || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    `eval "$__botmux_cred_body" || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    // Defense in depth: the served body must name the mode we know how to
+    // dispatch. The daemon already whitelists these keys, but a wrapper must
+    // not eval a body that hands it an unrecognized mode either.
+    `case "$BOTMUX_IDENTITY_MODE" in user|bot|user-home|turn-mismatch|denied) ;; *) return ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
+    'unset __botmux_cred_body',
+  ] : [
+    // The file-based wrapper never asks the daemon, so it cannot run a call as another speaker.
+    refuseBotmuxAs('return'),
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
+    '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
+    `  __botmux_cred="$__botmux_d/${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
     '    . "$__botmux_cred"',
     '  fi',
-    '  unset __botmux_cred',
-    'fi',
-    '',
-    // Turn binding. `__botmux_live` is the turn the CLI is executing now; the
-    // identity names the turn it was published for. Unequal ⇒ the file has been
-    // replaced by a newer message's credentials while this turn is still
-    // running, so these are somebody else's.
-    '__botmux_live=',
-    '__botmux_live_caller=',
-    'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
-    // ONE open, two reads: the file is (turn, caller) written by a single
-    // atomic rename, so this pair is always from one generation. Two separate
-    // reads could interleave with a rewrite and mix generations.
     '  if [ -f "$__botmux_d/turn" ]; then',
     '    { read -r __botmux_live; read -r __botmux_live_caller; } < "$__botmux_d/turn" || true',
     '  fi',
-    '  unset __botmux_d',
+    '  unset __botmux_d __botmux_cred',
     'fi',
     // Only enforced when both sides state a turn. An identity published without
     // one predates turn binding; a session with no live turn file has nothing to
@@ -533,9 +1664,125 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '  fi',
     'fi',
     'unset __botmux_live __botmux_live_caller __botmux_published_mode',
+  ];
+  return [
+    '#!/bin/sh',
+    IDENTITY_WRAPPER_MARKER,
+    '# Loads the identity the daemon holds for the CURRENT turn, then execs the',
+    '# real tool. Re-resolved on every invocation, which is what lets the acting',
+    '# identity change without restarting the session.',
+    '#',
+    '# No usable identity => the command does not run. Exec\'ing the tool bare',
+    '# would hand it the machine account\'s login, not the bot\'s.',
+    // Definitions only. The scan, the auth request and the Meego helpers run at
+    // the exec site below, after identity resolution where it applies.
+    ...BYTEDCLI_AUTH_REQUEST_FN,
+    ...(isBytecloudFamily ? [...BYTEDCLI_SCAN_FN, ...BYTECLOUD_CLEAN_RUN_FN] : []),
+    ...(tool === 'bytedcli' ? BYTEDCLI_REGION_FREE_FN : []),
+    ...(governsMeego ? BYTEDCLI_MEEGO_FN : []),
+    '__botmux_resolve() {',
+    `  ${MODE_VAR}=`,
+    `  ${DENY_MSG_VAR}=`,
+    // Clear inherited copies before loading: a parent process that exports a
+    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
+    // the same-principal allowance. The values are re-set below from the
+    // daemon-provided identity when it carries them.
+    `  ${TURN_VAR}=`,
+    `  ${OPEN_ID_VAR}=`,
+    `  ${UNATTENDED_VAR}=`,
+    ...(tool === 'bytedcli'
+      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), BYTEDCLI_REGIONAL_SOURCE_VAR].map(key => `  ${key}=`)
+      : []),
+    // Same for the per-exec HOME: an inherited value must not redirect an
+    // identity that does not carry one.
+    `  ${HOME_VAR}=`,
+    ...(tool === 'bytedcli' ? [`  ${MEEGO_HOME_VAR}=`] : []),
+    ...(tool === BITSCLI_COMPANION_TOOL ? [`  unset ${IDENTITY_ENV_KEYS.bitscli.join(' ')}`] : []),
+    '  __botmux_live=',
+    '  __botmux_live_caller=',
+    ...resolveBlock.map(line => `  ${line}`),
+    '}',
+    ...(isBytecloudFamily ? [
+      '__botmux_scan "$@"',
+      ...(tool === 'bytedcli' ? bytedcliNativePassthrough(realBinaryPath, nativeCapabilities) : []),
+      // Bare invocation or exactly one help/version flag needs no credential:
+      // it runs in a private throwaway HOME with a clean environment. Any other
+      // use of those flags goes the normal way, so a help flag cannot hide a login.
+      ...(governsByteCloud ? [
+        '__botmux_hp=',
+        'case "$#:$1" in 0:|1:-h|1:--help|1:-V|1:--version) __botmux_hp=1 ;; esac',
+        // `auth login --help` only prints help too; a Meego login with a help flag is the Meego block's.
+        '[ -z "$__botmux_sc_login" ] || [ -z "$__botmux_sc_help" ] || [ "$__botmux_sc_w1" = meego ] || __botmux_hp=1',
+        'if [ -n "$__botmux_hp" ]; then',
+        '  __botmux_h=$(mktemp -d 2>/dev/null) || { printf \'%s\\n\' \'botmux: 无法创建临时目录，命令未执行。\' >&2; exit 77; }',
+        '  trap \'rm -rf "${__botmux_h:?}"\' EXIT',
+        `  __botmux_run_clean "$__botmux_h" "" run ${shellSingleQuote(realBinaryPath)} "$@"`,
+        '  exit $?',
+        'fi',
+      ] : []),
+      ...(governsByteCloud || governsMeego ? [
+        // The browser-session login (the Feishu web session Meego GoAPI needs) is no
+        // ByteCloud login: attended, the real command runs below under the person's
+        // HOME as upstream does; unattended, nobody can complete it, so it is refused.
+        'if [ -n "$__botmux_sc_login" ] && [ -n "$__botmux_sc_websess" ] && [ "$__botmux_sc_w1" != meego ]; then',
+        '  __botmux_resolve || :',
+        `  if [ -n "$${UNATTENDED_VAR}" ]; then printf '%s\\n' ${shellSingleQuote(UNATTENDED_WEBSESSION_MSG)} >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
+        'fi',
+      ] : []),
+      ...(governsByteCloud ? [
+        // A login would print a device link to the agent. botmux sends it to the
+        // person privately instead, so the real login never runs. (`meego login`
+        // belongs to the Meego block.)
+        'if [ -n "$__botmux_sc_login" ] && [ -z "$__botmux_sc_websess" ] && { [ "$__botmux_sc_w1" != meego ] || [ -n "$__botmux_sc_unknown" ]; }; then',
+        // Whether anyone is attending is a property of the turn: resolve it first.
+        // An identity that cannot be resolved is not needed to ask botmux, which
+        // then reports itself unreachable if it is.
+        '  __botmux_resolve || :',
+        `  if [ -n "$${UNATTENDED_VAR}" ]; then __botmux_unattended_refuse bytedcli ${shellSingleQuote(UNATTENDED_LOGIN_MSG)} "" ${shellSingleQuote(UNATTENDED_LOGIN_READY_MSG)}; fi`,
+        '  __botmux_auth_request --provider bytedcli',
+        '  case $? in',
+        `    0) printf '%s\\n' "$__botmux_ar_out" >&2; exit 0 ;;`,
+        `    3|4) printf '%s\\n' "$__botmux_ar_out" >&2 ;;`,
+        `    *) printf '%s\\n' ${shellSingleQuote(BYTECLOUD_LOGIN_UNREACHABLE_MSG)} >&2 ;;`,
+        '  esac',
+        `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        'fi',
+      ] : []),
+    ] : []),
+    `__botmux_resolve || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // A refusal of an unattended run (published for exactly the lapse of a
+    // credential): the single place that asks botmux for the private notice.
+    `if [ "$${MODE_VAR}" = denied ]; then`,
+    `  case "$${DENY_MSG_VAR}" in *'[reason=unattended]'*) __botmux_unattended_refuse ${authProvider} "$${DENY_MSG_VAR}" ;; esac`,
+    'fi',
+    // Not authorized yet, locally or on the platform: botmux hands the entry
+    // to the person privately (on a bound host the platform's own card). If the person has
+    // meanwhile authorized (answer 0), the identity is resolved once more and
+    // the original command goes on, instead of making the agent repeat it.
+    // Unreachable botmux leaves the published refusal, which carries no link.
+    `if [ "$${MODE_VAR}" = denied ] && [ -z "$${UNATTENDED_VAR}" ]; then`,
+    `  case "$${DENY_MSG_VAR}" in ${reasonCase(tool === 'lark-cli' ? PLATFORM_NOT_AUTHORIZED_REASONS : NOT_AUTHORIZED_REASONS)})`,
+    '    __botmux_t0=$' + TURN_VAR + '; __botmux_o0=$' + OPEN_ID_VAR,
+    `    __botmux_auth_request --provider ${authProvider}`,
+    '    __botmux_rc=$?',
+    '    if [ "$__botmux_rc" -eq 0 ]; then',
+    `      __botmux_resolve || { printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; }`,
+    // Only the same turn and the same person may pick up the new identity;
+    // an identity that names neither is never taken for the same one.
+    `      if [ "$${MODE_VAR}" != user ] || [ -z "$__botmux_t0" ] || [ -z "$__botmux_o0" ] || [ "$${TURN_VAR}" != "$__botmux_t0" ] || [ "$${OPEN_ID_VAR}" != "$__botmux_o0" ]; then`,
+    `        printf '%s\\n' "$__botmux_ar_out" >&2`,
+    `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '      fi',
+    '    elif { [ "$__botmux_rc" -eq 3 ] || [ "$__botmux_rc" -eq 4 ]; } && [ -n "$__botmux_ar_out" ]; then',
+    `      printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    fi',
+    '    ;;',
+    '  esac',
+    'fi',
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
+    ...(tool === 'bytedcli' ? bytedcliRegionalSelection().map(line => `  ${line}`) : []),
     `    export ${exportKeys}`,
     '    ;;',
     '  user-home)',
@@ -548,57 +1795,120 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `      printf '%s\\n' 'botmux: ${tool} 的按人身份目录缺失，命令未执行。请重新发送 /login 完成授权后重试。' >&2`,
     `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    fi',
-    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR}`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${UNATTENDED_VAR}`,
     `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '    ;;',
     '  turn-mismatch)',
-    `    printf '%s\\n' 'botmux: 这条命令属于上一轮对话，而凭证已经切换到新消息的发起人；为避免用错人的权限，命令未执行。' >&2`,
-    `    printf '%s\\n' 'botmux: 请等当前这轮结束后重试，或由本轮发起人重新发起该操作。' >&2`,
+    `    printf '%s\\n' 'botmux: 当前执行的身份材料缺失或与执行主体不匹配，命令未执行。请检查任务执行状态后重试。' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     '  *)',
     // Guidance, not just refusal: whoever reads this needs to know it was a
     // permission decision and what to do next, or they retry the same command.
     `    if [ -n "$${DENY_MSG_VAR}" ]; then`,
+    // Not logged in yet: botmux hands the link to the person privately and
+    // says so; the published text stays the fallback when it cannot be asked.
     `      printf '%s\\n' "$${DENY_MSG_VAR}" >&2`,
     '    else',
-    `      printf '%s\\n' 'botmux: ${tool} 需要发起人本人的授权，当前会话没有可用凭证，命令未执行。请发送 /login 完成授权后重试。' >&2`,
+    // Nothing was published for this call (no refusal text either): the turn's
+    // identity is still being prepared, or its publication failed. That is
+    // not an authorization verdict, so say so instead of sending the person
+    // to /login again.
+    `      printf '%s\\n' 'botmux: ${tool} 本轮的发起人身份还没有准备好（可能仍在获取凭据），命令未执行。这不一定是没授权：稍等几秒重试本命令；连续失败再发 /login status 查看授权状态。' '[reason=identity_not_published]' >&2`,
     '    fi',
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
+    // user|bot only past this point. HOME_VAR set (#2550 per-person scratch
+    // HOME on a bytedcli user identity) is the exec's HOME; unset → machine HOME.
+    // A person-scoped HOME published with a user identity (bytedcli): scoped to
+    // this exec exactly like the user-home branch, so the parent shell and
+    // every other tool keep the machine HOME. Created here, on first use: the
+    // daemon publishes only the path. An unset value means the identity
+    // carries no HOME and the machine HOME is kept.
+    `if [ -n "$${HOME_VAR}" ]; then`,
+    `  __botmux_home=$${HOME_VAR}`,
+    // `mkdir -p -m 700` modes the LAST level only; every intermediate level is
+    // created with plain `mkdir(2)` and so takes the process umask. The path
+    // crosses `/tmp/bm<uid>` (the uid-wide short-alias hub, 0700 by design) and
+    // the session scratch, so at the default umask 022 the hub would land 0755
+    // and every later session on this host would fail its private-owner check
+    // until someone fixed the mode by hand. Creating under its own umask 077
+    // makes every level this creates private, and leaves existing ones alone.
+    '  (umask 077; mkdir -p -m 700 "$__botmux_home") 2>/dev/null || true',
+    '  if [ ! -d "$__botmux_home" ]; then',
+    `    printf '%s\\n' 'botmux: ${tool} 的按人目录无法创建，命令未执行。' >&2`,
+    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '  fi',
+    ...(governsMeego ? bytedcliMeegoBlock(realBinaryPath) : []),
+    `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${UNATTENDED_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
+    tool === BITSCLI_COMPANION_TOOL
+      ? `  __botmux_run_clean "$__botmux_home" ${shellSingleQuote(IDENTITY_ENV_KEYS.bitscli.join(' '))} exec ${shellSingleQuote(realBinaryPath)} "$@"`
+      : `  HOME="$__botmux_home" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    'fi',
+    ...(tool === BITSCLI_COMPANION_TOOL ? [`printf '%s\\n' 'botmux: bitscli 的按人目录缺失，命令未执行。' >&2`, `exit ${IDENTITY_DENIED_EXIT_CODE}`] : []),
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${UNATTENDED_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');
 }
 
 /**
- * Create the per-session identity directory and empty files before sandbox
- * spawn so a sandboxed session can read them later.
+ * Initialize the per-session identity directory for one storage model before
+ * sandbox spawn so a sandboxed session can read the bound directory later.
  *
- * The file sandbox existence-filters its allow list: a directory that does not
- * exist at spawn is dropped. Binding the directory (rather than its files) is
- * also what makes later atomic rename updates visible to a persistent sandbox.
+ * The file sandbox existence-filters its allow list: a path that does not exist
+ * at spawn is dropped. Binding the directory (rather than its files) is also
+ * what makes later atomic rename updates visible to a persistent sandbox.
  *
  * Empty is the right initial content. No identity exists until the first turn
  * resolves one, and both the wrapper and a `.`-source treat an empty file the
  * same as an absent one.
  *
- * Never truncates an existing file: a restart mid-session must not discard the
- * identity already in force.
+ * When the directory was initialized for the OTHER model (or predates this
+ * layout), identity artifacts are reset once first: a session must not reuse
+ * the other model's snapshots. Never truncates an existing file of the current
+ * model: a restart mid-session must not discard the identity already in force.
  */
-export function ensureSessionIdentityPlaceholders(
+export function ensureSessionIdentityStorage(
   sessionDataDir: string,
   sessionId: string,
-  tools: readonly TriggerUserAuthTool[],
+  tools: readonly IdentityTool[],
+  model: IdentityStorageModel,
 ): void {
-  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const current = readIdentityLayout(sessionDataDir, sessionId);
+  if (current !== model) {
+    if (current === undefined && model === 'single') {
+      // No marker, first SINGLE init: remove ONLY R3 per-turn leftovers. The
+      // root files are the live accept→fork publication channel — the daemon
+      // writes the opening turn before this worker spawned, and deleting it
+      // would deny the first turn (N1). A PROVEN init below still wipes
+      // everything, including root files, because proven keeps no disk token.
+      resetLegacyTurnSnapshots(sessionDataDir, sessionId);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } else {
+      // Explicit model switch, or a markerless first PROVEN init: wipe every
+      // artifact of the other layout (and any older build's leftovers).
+      resetIdentityArtifacts(sessionDataDir, sessionId);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    atomicWriteFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), `${model}-v1\n`, { mode: 0o600 });
+  } else if (model === 'proven') {
+    // Already proven, yet plaintext root snapshots can exist: a daemon that
+    // never received this worker's identity decision kept publishing every
+    // turn under the fail-closed single default. The proven wrapper never
+    // reads them, so they are pure exposure; no token rests on disk here.
+    clearSingleIdentityArtifacts(sessionDataDir, sessionId);
+  }
   const paths = [
-    ...tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId, tool)),
-    // Same existence-filter reason: the wrapper reads the active turn on every
-    // invocation, and a path missing at spawn stays unreadable afterwards.
     sessionActiveTurnPath(sessionDataDir, sessionId),
+    // The single model sources these root files on every invocation; the
+    // proven model keeps no token files, so only the turn marker is needed.
+    ...(model === 'single'
+      ? tools.map(tool => join(dir, `${tool}.env`))
+      : []),
   ];
   for (const path of paths) {
     if (existsSync(path)) continue;
@@ -606,9 +1916,73 @@ export function ensureSessionIdentityPlaceholders(
   }
 }
 
+/** A bytedcli identity file left by a policy that still governed ByteCloud keeps its JWTs in
+ *  plaintext; with ByteCloud off, only what Meego needs may stay in it. */
+function stripByteCloudCredentials(sessionDataDir: string, sessionId: string): void {
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  const files = [join(dir, 'bytedcli.env')];
+  try {
+    for (const turn of readdirSync(join(dir, 'turns'))) files.push(join(dir, 'turns', turn, 'bytedcli.env'));
+  } catch { /* no per-turn snapshots */ }
+  for (const file of files) {
+    try {
+      const lines = readFileSync(file, 'utf8').split('\n');
+      const kept = lines.filter(line => !/^(BYTEDCLI_USER_CLOUD_JWT|BYTEDCLI_USER_CODE_JWT|BOTMUX_IDENTITY_CLOUD_JWT_[A-Z0-9]+)=/.test(line));
+      if (kept.length !== lines.length) atomicWriteFileSync(file, kept.join('\n'), { mode: 0o600 });
+    } catch { /* absent or unreadable: nothing of ours to strip */ }
+  }
+}
+
 /** Whether the wrapper for `tool` is currently installed in `binDir`. */
-export function identityWrapperInstalled(binDir: string, tool: TriggerUserAuthTool): boolean {
+export function identityWrapperInstalled(binDir: string, tool: IdentityTool): boolean {
   return existsSync(join(binDir, tool));
+}
+
+/**
+ * Remove this session's identity wrappers for every tool `policy` does not
+ * govern, and report which were removed.
+ *
+ * The wrapper directory outlives the policy that created it: it is also the
+ * lark-cli binding's bin dir, which every bound session puts first on PATH
+ * whether or not trigger-user auth is on. A wrapper left there after the
+ * operator turns the policy off (or drops a tool from it) keeps intercepting
+ * the tool while the daemon, correctly, publishes nothing for it — so every
+ * call is refused, human turns and scheduled ones alike, until the session is
+ * closed. Off has to mean the tool runs exactly as it did before the policy.
+ *
+ * Called only when a worker spawns, like the install it undoes: a live
+ * worker's wrappers follow the policy it was spawned with (next-session
+ * semantics). Removing them mid-life would leave nothing to re-arm them if the
+ * policy were turned back on before a respawn — the tool would then run with
+ * the machine's own login while every turn still publishes an identity.
+ *
+ * Only files this module generated are touched (checked by content, not name):
+ * the lark-cli binding's own entry and anything else in the directory stay.
+ */
+export function removeUngovernedIdentityWrappers(
+  sessionDataDir: string,
+  sessionId: string,
+  policy: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined,
+): IdentityTool[] {
+  const governed = new Set(policy?.enabled ? identityToolsFor(policy.tools, capabilitiesOf(policy)) : []);
+  const binDir = sessionIdentityBinDir(sessionDataDir, sessionId);
+  const removed: IdentityTool[] = [];
+  for (const tool of ALL_IDENTITY_TOOLS) {
+    if (governed.has(tool)) continue;
+    // Identity files a policy that was on left behind hold plaintext JWTs.
+    clearSessionIdentity(sessionDataDir, sessionId, tool, undefined, 'single');
+    for (const name of [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])]) {
+      const path = join(binDir, name);
+      try {
+        const stat = lstatSync(path);
+        if (!stat.isFile() || stat.size > 64 * 1024) continue;
+        if (readFileSync(path, 'utf8').split('\n', 2)[1] !== IDENTITY_WRAPPER_MARKER) continue;
+        rmSync(path, { force: true });
+        if (!removed.includes(tool)) removed.push(tool);
+      } catch { /* absent or unreadable: nothing of ours is in the way */ }
+    }
+  }
+  return removed;
 }
 
 /**
@@ -656,13 +2030,30 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   // instead of prepending some other session's wrapper dir.
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
-    '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    '# Restore session tools AFTER login startup has rebuilt PATH.',
+    '__botmux_tool_path=',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ] && [ -d "$BOTMUX_WRAPPER_BIN" ]; then',
+    '  __botmux_tool_path="$BOTMUX_WRAPPER_BIN"',
+    'fi',
+    // The Linux file sandbox mounts its relay here. A host wrapper can be
+    // absent or unusable in that namespace, even when its locator survives.
+    ...(process.platform === 'linux' ? [
+      'if [ -d /run/sbxbin ]; then',
+      '  __botmux_tool_path="/run/sbxbin${__botmux_tool_path:+:$__botmux_tool_path}"',
+      'fi',
+    ] : []),
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
-    '  case ":$PATH:" in',
-    '    "$BOTMUX_IDENTITY_BIN":*) ;;',
-    '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  __botmux_tool_path="$BOTMUX_IDENTITY_BIN${__botmux_tool_path:+:$__botmux_tool_path}"',
+    'fi',
+    // Restore one ordered prefix so repeated startup hooks do not prepend
+    // the identity and command directories in front of each other forever.
+    'if [ -n "$__botmux_tool_path" ]; then',
+    '  case "$PATH:" in',
+    '    "$__botmux_tool_path":*) ;;',
+    '    *) PATH="$__botmux_tool_path${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
     'fi',
+    'unset __botmux_tool_path',
     '',
   ].join('\n');
   // zsh: source the user's own file FIRST, then put ourselves back in front —
@@ -691,13 +2082,18 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
  */
 export function installIdentityWrapper(
   binDir: string,
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
   realBinaryPath: string | null | undefined,
+  model: IdentityStorageModel,
+  identityResolver?: readonly string[],
+  nativeCapabilities?: NativeBytedcliCapabilities,
+  /** Command name the wrapper is written under, when it differs from the tool's. */
+  commandName: string = tool,
 ): string | null {
   if (!realBinaryPath) return null;
   mkdirSync(binDir, { recursive: true });
-  const path = join(binDir, tool);
-  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath), { mode: 0o755 });
+  const path = join(binDir, commandName);
+  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath, model, identityResolver, nativeCapabilities), { mode: 0o755 });
   return path;
 }
 
@@ -802,11 +2198,14 @@ export function installGitAskpass(
 }
 
 /**
- * Git config that forces an identity-bearing HTTPS path for `host`.
+ * The git `-c` content pairs that force an identity-bearing HTTPS path for
+ * `host`: a host-scoped credential helper plus two URL rewrites.
  *
- * Returned as `GIT_CONFIG_*` env entries rather than written to a config file:
- * they apply to this session's git only, leave the user's own `~/.gitconfig`
- * untouched, and vanish with the process.
+ * This array is the AUTHORITATIVE carrier of the turn's git identity: callers
+ * that forward env into a shell-wrapped pane must pass exactly these pairs
+ * (see SpawnOpts.gitConfigPairs) rather than scan the environment for numbered
+ * `GIT_CONFIG_*` entries, which an ambient layer can push past the authored
+ * set.
  *
  * Two settings, for two different escapes:
  *  - `credential.https://<host>.helper` binds the helper to that host alone, so
@@ -816,21 +2215,101 @@ export function installGitAskpass(
  *    machine's key — the push lands under the host's identity and the whole
  *    attribution chain silently breaks.
  */
-export function gitIdentityConfigEnv(
+export function gitIdentityConfigPairs(
   askpassPath: string,
   host: string,
-): Record<string, string> {
-  const entries: Array<[string, string]> = [
+): Array<[string, string]> {
+  return [
     [`credential.https://${host}.helper`, `!f() { "${askpassPath}" "$@"; }; f`],
     [`url.https://${host}/.insteadOf`, `ssh://git@${host}/`],
     [`url.https://${host}/.insteadOf`, `git@${host}:`],
   ];
-  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
-  entries.forEach(([key, value], i) => {
+}
+
+/**
+ * Encode {@link gitIdentityConfigPairs} as `GIT_CONFIG_*` env entries rather
+ * than writing a config file: they apply to this session's git only, leave the
+ * user's own `~/.gitconfig` untouched, and vanish with the process. Used by the
+ * direct-exec backends (PTY, env -i strict panes), which receive the child
+ * environment wholesale; the shell-wrapped backends instead rebuild the entries
+ * from the pair carrier.
+ */
+export function gitIdentityConfigEnv(
+  askpassPath: string,
+  host: string,
+): Record<string, string> {
+  return encodeGitConfigPairs(gitIdentityConfigPairs(askpassPath, host));
+}
+
+/**
+ * Encode turn-authored git `-c` pairs as the `GIT_CONFIG_*` env block
+ * (`GIT_CONFIG_COUNT` + contiguous 0..n-1 KEY/VALUE entries). The inverse of
+ * the pane-side rebuild in buildBotmuxEnvAssignments: direct-exec backends
+ * (PTY, env -i strict panes) consume the child environment wholesale, so the
+ * worker places exactly this encoded block there after wiping any ambient
+ * numbered git config entries.
+ */
+export function encodeGitConfigPairs(
+  pairs: ReadonlyArray<readonly [string, string]>,
+): Record<string, string> {
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(pairs.length) };
+  pairs.forEach(([key, value], i) => {
     env[`GIT_CONFIG_KEY_${i}`] = key;
     env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
   return env;
+}
+
+/**
+ * Reset the whole git command-line config channel in a child environment to
+ * exactly the turn-authored `pairs`: every inherited
+ * GIT_CONFIG_COUNT/GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> is deleted first
+ * (nested CLIs and hooks share GIT_CONFIG_COUNT as an accumulator, so a
+ * spawned child can carry a pushed-up count and arbitrary high-index pairs),
+ * then the contiguous 0..n-1 block is published. With no authored pairs the
+ * channel is left empty rather than carrying an ambient count.
+ *
+ * This is the direct-exec counterpart of the shell pane carrier rebuild:
+ * PTY children and env -i strict panes inherit the environment wholesale, so
+ * the reset has to happen here, in the worker-built env.
+ */
+export function applyTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  pairs: ReadonlyArray<readonly [string, string]>,
+): void {
+  for (const key of Object.keys(env)) {
+    if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) delete env[key];
+  }
+  if (pairs.length) Object.assign(env, encodeGitConfigPairs(pairs));
+}
+
+/**
+ * The single wiring seam every CLI/engine spawn site must call to install the
+ * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
+ * wrappers) AND resets the git command-line config channel to the authored
+ * pair set in one step, returning that set so pane-style backends also carry
+ * it via SpawnOpts.gitConfigPairs.
+ *
+ * Keeping prepare + reset in ONE function is load-bearing: calling only
+ * prepareTriggerUserCliEnv leaves an inherited/pushed-up GIT_CONFIG_COUNT and
+ * ambient high-index pairs in the env (the field failure — git aborts or a
+ * foreign pair silently applies), which is what happened on the RPC
+ * app-server engineEnv path before it used this seam. Native-pane spawns,
+ * PTY, env -i strict panes and RPC app-servers all go through here.
+ */
+export function prepareTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  sessionDataDir: string | undefined,
+  sessionId: string,
+  policy: TriggerUserAuthConfig | undefined,
+  log: (message: string) => void,
+  model: IdentityStorageModel,
+  execution?: { appId: string; ipcPort?: number },
+  options?: { canonicalPaths?: boolean },
+): Array<[string, string]> {
+  const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution, options);
+  applyTurnGitConfigEnv(env, pairs);
+  return pairs;
 }
 
 /**
@@ -841,7 +2320,7 @@ export function gitIdentityConfigEnv(
  * excluding the wrapper dir keeps that impossible by construction.
  */
 export function findRealToolBinary(
-  tool: TriggerUserAuthTool,
+  tool: string,
   pathValue: string | undefined,
   excludeDirs: readonly string[] = [],
 ): string | null {
@@ -857,44 +2336,114 @@ export function findRealToolBinary(
   return null;
 }
 
+/**
+ * `realpath` that tolerates a not-yet-created tail: resolve the deepest existing
+ * ancestor and re-append the rest. Used to name a path the way a fresh bwrap
+ * root will see it. A relative path is returned as is: resolving it would
+ * silently anchor it to this process's cwd.
+ */
+export function canonicalPathNearest(path: string): string {
+  if (!path.startsWith('/')) return path;
+  try { return realpathSync(path); } catch { /* fall through to the parent */ }
+  const parent = dirname(path);
+  return parent === path ? path : join(canonicalPathNearest(parent), basename(path));
+}
+
+/**
+ * How a host path has to be written into a session's env or into a script the
+ * session runs. A sandboxed session (`canonicalPaths`) lives in a fresh bwrap
+ * root that only mounts canonical paths, so a symlinked home / data root
+ * (`/home/u` -> `/data00/home/u`) has no alias there: absolute paths are named
+ * by realpath. Everything else — unsandboxed sessions, relative paths, flags in
+ * a runner argv — is returned unchanged.
+ */
+export function sessionVisiblePath(path: string, canonicalPaths: boolean | undefined): string {
+  return canonicalPaths ? canonicalPathNearest(path) : path;
+}
+
 /** Install identity interception on the process that actually executes tools.
- * Used before both native CLI and RPC app-server startup. No token is copied
- * into the process environment: wrappers read the current turn on each call. */
+ * Used before both native CLI and RPC app-server startup. In the proven model
+ * no token is copied into the process environment or disk: the wrapper fetches
+ * the current turn's identity from the daemon over the proven loopback channel
+ * on each call; the single model keeps one daemon-written, turn-checked file.
+ *
+ * Returns the git `-c` content pairs authored for THIS turn (empty when git
+ * attribution is not installed). Shell-wrapped backends must forward exactly
+ * that list via SpawnOpts.gitConfigPairs instead of reading GIT_CONFIG_* out
+ * of the environment. */
 export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
-): void {
-  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
+  model: IdentityStorageModel,
+  execution?: { appId: string; ipcPort?: number },
+  /** `canonicalPaths`: the session runs in a fresh bwrap root that only mounts
+   *  CANONICAL paths. A symlinked home / data root (`/home/u` -> `/data00/home/u`)
+   *  has no alias there, so every path written into the session env or into a
+   *  generated script must be the realpath or it is `not found` inside. Left
+   *  off, nothing changes for unsandboxed sessions. */
+  options?: { canonicalPaths?: boolean },
+): Array<[string, string]> {
+  // Before anything else, including the early return below: a policy that is
+  // off now may have been on when this session last spawned.
+  if (sessionDataDir) {
+    try {
+      const removed = removeUngovernedIdentityWrappers(sessionDataDir, sessionId, policy);
+      if (removed.length) log(`[trigger-user-auth] removed wrappers no longer governed: ${removed.join(', ')}`);
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not remove ungoverned wrappers: ${(e as Error).message}`);
+    }
+  }
+  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
+  const canonicalPaths = options?.canonicalPaths === true;
+  sessionDataDir = sessionVisiblePath(sessionDataDir, canonicalPaths);
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
-  // Pre-create the identity files so they survive the sandbox's
-  // existence-filter (it drops allow paths that do not exist at spawn, and a
-  // dropped path would leave the wrapper unable to read what the daemon later
-  // publishes — the session would silently run without the sender's identity).
-  // Empty is the correct initial content: no identity is published until the
-  // first turn resolves one, and the wrapper treats an empty file as "no
-  // identity", the same as absent.
+  // Turn-authored git -c pairs; returned to the caller for the pane carrier.
+  let gitConfigPairs: Array<[string, string]> = [];
+  let identityResolver: string[] | undefined;
+  if (model === 'proven' && process.platform === 'linux' && execution) {
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const sourceExecArgs = process.execArgv.map((arg, index, args) =>
+      args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
+    const runner = moduleDir.endsWith('/src/core')
+      ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
+      : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
+    identityResolver = [...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths)),
+      '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
+      '--ipc-port', String(execution.ipcPort), '--tool'];
+  }
+  // Initialize the directory for THIS model before sandbox spawn so its bound
+  // directory survives the existence-filter and leftovers from the other model
+  // (or an older layout) are cleared rather than reused. Expand the governed
+  // tool list to include the Codebase companion exactly as publication does.
+  const capabilities = capabilitiesOf(policy);
+  const identityTools = identityToolsFor(policy.tools, capabilities);
+  if (!capabilities.has('bytecloud')) stripByteCloudCredentials(sessionDataDir, sessionId);
   try {
-    ensureSessionIdentityPlaceholders(
+    ensureSessionIdentityStorage(
       sessionDataDir,
       sessionId,
-      policy.tools,
+      identityTools,
+      model,
     );
   } catch (e) {
-    log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
+    log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
   let installedAny = false;
-  for (const tool of policy.tools) {
+  for (const [tool, commandName] of identityTools.flatMap(tool =>
+    [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])].map(name => [tool, name] as const))) {
     try {
-      const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
+      const real = findRealToolBinary(commandName, childEnv.PATH, [wrapperDir]);
       if (!real) {
-        log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+        log(`[trigger-user-auth] ${commandName} is not installed; no wrapper written`);
         continue;
       }
-      installIdentityWrapper(wrapperDir, tool, real);
+      const realInSession = sessionVisiblePath(real, canonicalPaths);
+      installIdentityWrapper(wrapperDir, tool, realInSession, model, identityResolver,
+        { meego: !capabilities.has('meego'), bytecloud: !capabilities.has('bytecloud') }, commandName);
       installedAny = true;
-      log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
+      log(`[trigger-user-auth] wrapping ${commandName} -> ${realInSession}`);
     } catch (e) {
       // A missing wrapper means the tool keeps its previous behavior; it must
       // not stop the session from starting.
@@ -919,6 +2468,7 @@ export function prepareTriggerUserCliEnv(
     try {
       const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
       childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
       childEnv.ZDOTDIR = zdotdir;
       childEnv.BASH_ENV = bashEnv;
     } catch (e) {
@@ -935,7 +2485,7 @@ export function prepareTriggerUserCliEnv(
   // machine's identity — and "who opened this MR" is exactly what this feature
   // exists to fix. The helper asks the WRAPPED bytedcli, so it inherits the
   // per-turn identity with no second credential path to keep in sync.
-  if (policy.tools.includes('bytedcli')
+  if (capabilities.has('bytecloud')
       && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
     try {
       const askpass = installGitAskpass(
@@ -951,6 +2501,10 @@ export function prepareTriggerUserCliEnv(
         // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
         // ~/.gitconfig is never touched.
         if (policy.gitHost) {
+          gitConfigPairs = gitIdentityConfigPairs(askpass, policy.gitHost);
+          // Direct-exec backends (PTY, env -i strict panes) receive childEnv
+          // wholesale, so also publish the encoded entries there. The
+          // shell-wrapped backends rebuild them from the returned carrier.
           Object.assign(childEnv, gitIdentityConfigEnv(askpass, policy.gitHost));
           log(`[trigger-user-auth] git pushes to ${policy.gitHost} authenticate as the acting user`);
         } else {
@@ -961,4 +2515,5 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
     }
   }
+  return gitConfigPairs;
 }

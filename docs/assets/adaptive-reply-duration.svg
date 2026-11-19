@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="340" viewBox="0 0 880 340" role="img" aria-labelledby="title description">
+  <title id="title">回复卡片耗时单位显示示意</title>
+  <desc id="description">短耗时保留秒，较长耗时自动显示分和小时；原始毫秒计时不变。</desc>
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: #e5e7eb; }
+    .muted { fill: #9ca3af; }
+    .new { fill: #86efac; }
+    .heading { font-size: 23px; font-weight: 600; }
+    .value { font-size: 20px; }
+    .label { font-size: 15px; }
+  </style>
+  <rect width="880" height="340" rx="16" fill="#1f2329"/>
+  <text x="32" y="44" class="heading">回复卡片：耗时自动换单位</text>
+  <text x="32" y="73" class="label muted">显示示意 · 相同毫秒数据，仅调整展示格式</text>
+  <text x="40" y="117" class="label muted">原显示 / Before</text>
+  <text x="470" y="117" class="label new">新显示 / After</text>
+  <path d="M32 132H848 M32 271H848" stroke="#414751"/>
+  <text x="40" y="166" class="value muted">4.3 秒</text>
+  <text x="470" y="166" class="value new">4.3 秒</text>
+  <text x="40" y="210" class="value muted">1195.6 秒</text>
+  <text x="470" y="210" class="value new">19 分 55.6 秒</text>
+  <text x="40" y="254" class="value muted">4800.0 秒</text>
+  <text x="470" y="254" class="value new">1 小时 20 分</text>
+  <text x="40" y="311" class="label muted">飞书实测：等待 4.5 秒 · 执行至回复 1 分 41.3 秒</text>
+</svg>

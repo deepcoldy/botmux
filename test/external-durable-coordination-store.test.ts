@@ -1,5 +1,7 @@
-import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import {
   type DurableCoordinationProviderMethod,
   validateDurableCoordinationProviderResult,
@@ -14,6 +16,7 @@ import {
 } from '../src/services/external-durable-coordination-store.js';
 import { initializeDurableCoordinationRuntime } from '../src/services/durable-coordination-runtime.js';
 import { resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
+import { killFixturePid, waitForPidFile } from './helpers/pid-file.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const fixture = resolve('test/fixtures/durable-coordination-provider.ts');
@@ -174,6 +177,43 @@ describe('external durable coordination provider', () => {
   it('rejects an incompatible contract version', async () => {
     await expect(ExternalDurableCoordinationStore.connect(providerCommand(['--bad-contract'])))
       .rejects.toThrow(/hello is incompatible/);
+  });
+
+  it('fails the store instead of crashing when the provider stops reading its stdin', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-coordination-stdin-closed-'));
+    const pidPath = join(dir, 'pid');
+    const escaped: unknown[] = [];
+    const onUncaught = (error: unknown) => escaped.push(error);
+    process.on('uncaughtException', onUncaught);
+    let pid: number | undefined;
+    try {
+      const store = await ExternalDurableCoordinationStore.connect({
+        ...providerCommand(['--close-stdin-after-hello']),
+        env: { ...process.env, DURABLE_FIXTURE_PID_PATH: pidPath },
+      });
+      pid = await waitForPidFile(pidPath);
+
+      // The provider closed its stdin before answering hello, so this request
+      // hits a pipe nobody reads: EPIPE. The write callback fails the request,
+      // but the stream also emits 'error'; without a listener that is thrown at
+      // process level, and the daemon has no uncaughtException trap. Bun only
+      // reports EPIPE for writes the pipe buffer cannot absorb, so the request
+      // is made larger than that.
+      await expect(store.readSession('x'.repeat(256 * 1024))).rejects.toThrow();
+      // Nothing reaches the provider any more: later calls fail with that cause
+      // instead of writing into a dead pipe, and the provider is reaped.
+      await vi.waitFor(() => expect(store.readSession('missing')).rejects.toThrow(/stdin error/));
+      const alivePid = pid;
+      await vi.waitFor(() => {
+        expect(() => process.kill(alivePid, 0)).toThrow();
+      }, { timeout: 5_000 });
+      expect(escaped).toEqual([]);
+      store.terminate();
+    } finally {
+      process.removeListener('uncaughtException', onUncaught);
+      if (pid !== undefined) killFixturePid(pid);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('fails closed when a request times out', async () => {

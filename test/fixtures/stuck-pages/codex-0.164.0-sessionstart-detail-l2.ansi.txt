@@ -1,0 +1,50 @@
+
+  [38;5;75m>_ [1m[39mOpenAI Codex[0;2m[39m[49m (v0.164.0)
+[0m[39m[49m     [2m/tmp/repo
+
+[0m[39m[49m  [1m[38;5;211mTip:[0m[39m[49m Maximize usage with GPT-6.1 Sol. Try it on complex work for near-Astra performance at a lower cost.
+
+
+  [1mSessionStart hooks
+[0m[39m[49m  [38;5;3m1 hook needs review before it can run.
+[39m
+[1;7m› [!] [2m 1[0;7m[39m[49m  Unnamed hook · new
+[0m[39m[49m
+  Event     [2mSessionStart
+[0m[39m[49m  Matcher   [2m*
+[0m[39m[49m  Source    [2mUser config - /tmp/home/.codex/hooks.json
+[0m[39m[49m  Command   [2mecho kiro-sessionstart
+[0m[39m[49m  Mode      [2mSync
+[0m[39m[49m  Timeout   [2m10s
+[0m[39m[49m  Trust     [2mNew hook - review required
+[0m[39m[49m
+
+  [1mt[0;2m[39m[49m trust · [0;1m[39m[49mesc[0;2m[39m[49m back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

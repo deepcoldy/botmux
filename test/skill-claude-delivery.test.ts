@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -7,6 +7,7 @@ import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { prepareClaudeSkillPlugin } from '../src/core/skills/claude-plugin-delivery.js';
 import { prepareSkillDelivery } from '../src/core/skills/delivery.js';
 import type { SessionSkillManifest } from '../src/core/skills/types.js';
+import { snapshotSessionSkills, type SkillSnapshotTrust } from '../src/core/skills/snapshot.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -139,5 +140,106 @@ describe('Pi scoped skill delivery', () => {
     });
     const skillDirs = args.flatMap((arg, index) => arg === '--skill' ? [args[index + 1]] : []);
     expect(skillDirs).toContain(prepared.pluginDir);
+  });
+});
+
+// Under sandbox=true the in-sandbox reader (`botmux skill show/read/resources`)
+// resolves `realpath(skill.rootDir)`, which the session snapshot points at this
+// session's own `runtime-skills/<sid>/snapshot`. Delivery hands the sandbox that
+// snapshot root (plus any native copy dir) — never a host source dir.
+describe('skill delivery read-only roots for the sandboxed reader', () => {
+  let root: string;
+  let dataDir: string;
+
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-skill-roots-')));
+    dataDir = mkdtempSync(join(tmpdir(), 'botmux-data-'));
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  // `root/src` plays the botmux skill store (the only snapshotted source kind).
+  const trust = (): SkillSnapshotTrust => ({
+    storeDir: join(root, 'src'), pluginsDir: join(root, 'plugins'),
+    sessionDataDir: dataDir, botsDirs: [], workingDir: join(root, 'proj'),
+  });
+
+  function snapshotManifest(sessionId: string, cliId: SessionSkillManifest['cliId'], names: string[]): SessionSkillManifest {
+    for (const name of [...names, 'not-enabled']) write(join(root, 'src', name, 'SKILL.md'), `# ${name}`);
+    return snapshotSessionSkills({
+      sessionId,
+      cliId,
+      workingDir: '/repo',
+      policyMode: 'priority',
+      prioritySkills: names.map((name) => ({
+        id: name,
+        name,
+        tags: [],
+        rootDir: join(root, 'src', name),
+        entrypoint: 'SKILL.md',
+        source: { type: 'local-copy' as const, originalPath: join(root, 'src', name) },
+        priorityReason: 'bot:include',
+      })),
+      diagnostics: [],
+      generatedAt: '2026-06-14T00:00:00.000Z',
+    }, { trust: trust() }).manifest;
+  }
+
+  const snapshotRoot = (sessionId: string) => realpathSync(join(dataDir, 'runtime-skills', sessionId, 'snapshot'));
+
+  it('prompt delivery grants exactly this session\'s snapshot root — no source dir, no shared parent', () => {
+    const manifest = snapshotManifest('s-prompt', 'claude-code', ['deploy', 'review']);
+    const prepared = prepareSkillDelivery(createCliAdapterSync('claude-code'), manifest, 'prompt');
+    expect(prepared.readonlyRoots).toEqual([snapshotRoot('s-prompt')]);
+    for (const forbidden of [join(root, 'src'), join(root, 'src', 'deploy'), join(root, 'src', 'not-enabled')]) {
+      expect(prepared.readonlyRoots).not.toContain(forbidden);
+    }
+    expect(readFileSync(join(snapshotRoot('s-prompt'), 'deploy', 'SKILL.md'), 'utf-8')).toBe('# deploy');
+  });
+
+  it('auto on a CLI without native delivery (codex) falls back to prompt and grants the snapshot root', () => {
+    const prepared = prepareSkillDelivery(createCliAdapterSync('codex'), snapshotManifest('s-codex', 'codex', ['deploy']), 'auto');
+    expect(prepared.prompt).toBe(true);
+    expect(prepared.pluginDir).toBeUndefined();
+    expect(prepared.readonlyRoots).toEqual([snapshotRoot('s-codex')]);
+  });
+
+  it('claude-plugin delivery grants its copy dir AND the snapshot root (`botmux skill show` reads the snapshot)', () => {
+    const prepared = prepareSkillDelivery(createCliAdapterSync('claude-code'), snapshotManifest('s-claude', 'claude-code', ['deploy']), 'auto');
+    expect(prepared.pluginDir).toBe(join(dataDir, 'runtime-skills', 's-claude', 'claude-plugin'));
+    expect(prepared.readonlyRoots).toEqual([prepared.pluginDir, snapshotRoot('s-claude')]);
+  });
+
+  it('skill-root delivery (pi) grants its copy dir AND the snapshot root', () => {
+    const prepared = prepareSkillDelivery(createCliAdapterSync('pi'), snapshotManifest('s-pi', 'pi', ['deploy']), 'native');
+    expect(prepared.pluginDir).toBe(join(dataDir, 'runtime-skills', 's-pi', 'skills'));
+    expect(prepared.readonlyRoots).toEqual([prepared.pluginDir, snapshotRoot('s-pi')]);
+  });
+
+  it('never grants a skill rootDir that is not this session\'s own snapshot (un-snapshotted, foreign or forged entries)', () => {
+    const manifest = snapshotManifest('s-own', 'codex', ['deploy']);
+    write(join(root, 'src', 'raw', 'SKILL.md'), '# raw');
+    manifest.prioritySkills.push(
+      // not snapshotted (no snapshotOf): a live source dir
+      { ...manifest.prioritySkills[0], id: 'raw', name: 'raw', rootDir: join(root, 'src', 'raw'), snapshotOf: undefined },
+      // claims to be a snapshot but lives elsewhere
+      { ...manifest.prioritySkills[0], id: 'forged', name: 'forged', rootDir: join(root, 'src', 'not-enabled'), snapshotOf: '/x' },
+    );
+    expect(prepareSkillDelivery(createCliAdapterSync('codex'), manifest, 'prompt').readonlyRoots)
+      .toEqual([snapshotRoot('s-own')]);
+    expect(prepareSkillDelivery(createCliAdapterSync('codex'), { ...manifest, prioritySkills: [] }, 'prompt').readonlyRoots)
+      .toEqual([]);
+    expect(prepareSkillDelivery(createCliAdapterSync('codex'), null, 'prompt').readonlyRoots).toEqual([]);
+  });
+
+  it('a fatal native request grants nothing (the spawn aborts)', () => {
+    const prepared = prepareSkillDelivery(createCliAdapterSync('codex'), snapshotManifest('s-fatal', 'codex', ['deploy']), 'native');
+    expect(prepared.fatal).toBe(true);
+    expect(prepared.readonlyRoots).toEqual([]);
   });
 });

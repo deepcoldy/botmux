@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { buildWebhookLogSearchParams } from '../src/dashboard/web/webhook-logs-page.js';
+import { findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
+import { renderConnectorsLogsPage } from '../src/dashboard/web/connectors-page.js';
 
 describe('webhook invocation log dashboard', () => {
   it('builds server-side filters and paging parameters', () => {
@@ -18,27 +19,15 @@ describe('webhook invocation log dashboard', () => {
     expect(Date.parse(params.get('since') || '')).not.toBeNaN();
   });
 
-  it('is wired into the private management navigation and lazy route table', () => {
-    const app = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf8');
-    const routes = readFileSync(new URL('../src/dashboard/web/dashboard-routes.ts', import.meta.url), 'utf8');
-    const page = readFileSync(new URL('../src/dashboard/web/webhook-logs-page.tsx', import.meta.url), 'utf8');
-    const connectors = readFileSync(new URL('../src/dashboard/web/connectors-page.tsx', import.meta.url), 'utf8');
-    expect(app).toContain("id: 'connectors'");
-    expect(app).not.toContain("id: 'webhook-logs'");
-    expect(connectors).toContain("href=\"#/connectors/logs\"");
-    expect(connectors).toContain("connectors.tabLogs");
-    expect(routes).toContain("pageRoute('connectors-logs', '#/connectors/logs'");
-    expect(routes).toContain("pageRoute('webhook-logs', '#/webhook-logs'");
-    expect(page).toContain('const query = event.currentTarget.value;');
-    expect(page).not.toContain('query: event.currentTarget.value');
-  });
-
-  it('shares the compact log layout between standalone and embedded routes', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/webhook-logs-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    expect(page).toContain('webhook-logs-content webhook-logs-panel');
-    expect(page).toContain('page webhook-logs-content webhook-logs-page');
-    expect(css).toContain('.webhook-logs-content form.webhook-log-toolbar');
-    expect(css).toContain('.webhook-logs-panel');
+  it('routes both the connectors logs tab and the legacy webhook-logs hash to the logs page', async () => {
+    // `#/connectors` is a prefix of `#/connectors/logs`; the logs tab must not
+    // be swallowed by the connectors list route.
+    const tab = findDashboardRoute('#/connectors/logs');
+    const legacy = findDashboardRoute('#/webhook-logs');
+    expect(tab?.id).toBe('connectors-logs');
+    expect(legacy?.id).toBe('webhook-logs');
+    expect(findDashboardRoute('#/connectors')?.id).toBe('connectors');
+    expect(await tab!.load()).toBe(renderConnectorsLogsPage);
+    expect(await legacy!.load()).toBe(renderConnectorsLogsPage);
   });
 });

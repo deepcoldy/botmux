@@ -6,6 +6,7 @@ import {
   type RefObject,
 } from 'react';
 import { Cron } from 'croner';
+import { scheduleSupportLines } from '../../core/schedule-followup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { ModalDialog } from './modal-dialog.js';
 import { useStoreSelector, useT, useDashboardLocale } from './react-hooks.js';
@@ -21,7 +22,7 @@ import {
   RefreshIconButton,
 } from './dashboard-components.js';
 import { store } from './store.js';
-import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';
+import { botNameForAppId, chatDisplayTitle, loadNameMaps, ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
@@ -531,6 +532,12 @@ export function initialScheduleEditPosition(
   if (placement === 'task') return 'task';
   if (placement === 'new-topic') return 'new-topic';
   return 'top-level';
+}
+
+function scheduleWorkingDirErrorText(code: unknown, tr: ReturnType<typeof useT>): string | undefined {
+  if (code === 'schedule_working_dir_unavailable') return tr('schedules.form.errWorkingDirUnavailable');
+  if (code === 'invalid_working_dir') return tr('schedules.form.errInvalidWorkingDir');
+  return undefined;
 }
 
 function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
@@ -1230,7 +1237,7 @@ function ScheduleRowCard(props: {
           </span>
         </div>
         <div className="schedule-row-meta">
-          <span>{s.botName ?? s.larkAppId ?? '-'}</span>
+          <span>{botNameForAppId(s.larkAppId) ?? s.botName ?? s.larkAppId ?? '-'}</span>
           <span>·</span>
           <code>{s.parsed?.display ?? '?'}</code>
         </div>
@@ -1262,6 +1269,7 @@ function ScheduleRowCard(props: {
           {s.calendar ? <span>{tr('schedules.form.calendar')}: {scheduleCalendarLabel(s.calendar, s.calendarCheck?.displayNames ?? s.lastCalendarCheck?.displayNames, locale)} · {tr(`schedules.calendarDayType.${s.calendarDayType ?? 'workday'}`)} · {tr('schedules.calendarNext')}: {fmtScheduleDate(s.nextEligibleRunAt, scheduleTimeZone)} · {s.calendarCheck?.reason ? tr(`schedules.calendarReason.${s.calendarCheck.reason}`) : ''}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
+          {scheduleSupportLines(s, locale).slice(1).map(line => <span key={line} className="schedule-support-detail">{line}</span>)}
           {repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}
         </div>
       </OverviewListMain>
@@ -1315,11 +1323,12 @@ function ScheduleRowCard(props: {
   );
 }
 
-function SchedulesPage() {
+export function SchedulesPage() {
   const tr = useT();
-  const { scheduleRows, scheduleTimeZone } = useStoreSelector(snapshot => ({
+  const { scheduleRows, scheduleTimeZone, schedulesReady } = useStoreSelector(snapshot => ({
     scheduleRows: [...snapshot.schedules.values()] as ScheduleRow[],
     scheduleTimeZone: snapshot.scheduleTimeZone,
+    schedulesReady: snapshot.schedulesReady,
   }));
   const [filters, setFilters] = useState<ScheduleFilters>({ q: '', kind: '', enabledOnly: false });
   const [pending, setPending] = useState<string | null>(null);
@@ -1523,7 +1532,7 @@ function SchedulesPage() {
           ? tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })
           : body?.error === 'multiple_chats_task_unsupported'
             ? tr('schedulePos.webTaskMultiChatUnsupported')
-            : body?.error ?? `HTTP ${r.status}`);
+            : scheduleWorkingDirErrorText(body?.error, tr) ?? body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
       toast(
@@ -1542,7 +1551,7 @@ function SchedulesPage() {
           <p className="eyebrow">{tr('nav.schedules')}</p>
           <h1>{tr('schedules.title')}</h1>
         </div>
-        <CreateActionButton onClick={openCreate} disabled={bots.length === 0}>{tr('schedules.create')}</CreateActionButton>
+        <CreateActionButton data-action="create-schedule" onClick={openCreate} disabled={!schedulesReady || bots.length === 0}>{tr('schedules.create')}</CreateActionButton>
       </div>
       <form id="sched-filters" className="filters dashboard-toolbar">
         <input
@@ -1557,6 +1566,7 @@ function SchedulesPage() {
         />
         <DropdownMenu
           id="sched-kind-menu"
+          className="dashboard-toolbar-menu"
           ariaLabel={tr('schedules.anyKind')}
           label={filters.kind || tr('schedules.anyKind')}
           value={filters.kind}
@@ -1586,7 +1596,9 @@ function SchedulesPage() {
       </form>
       <section className="overview-block schedules-list-section">
         <div className="schedules-list-wrap">
-          {rows.length === 0 ? (
+          {!schedulesReady ? (
+            <div id="schedules-tbody" className="empty schedules-list-empty" role="status">{tr('common.loading')}</div>
+          ) : rows.length === 0 ? (
             <div id="schedules-tbody" className="empty schedules-list-empty">{tr('schedules.empty')}</div>
           ) : (
             <OverviewList id="schedules-tbody" className="schedules-list">
@@ -1937,13 +1949,14 @@ export function ScheduleFormModal(props: {
     && chatIds.length === 1
     && !rootMessageId.trim();
   const selectedBot = bots.find(bot => bot.larkAppId === larkAppId);
-  const rawPreconditionWorkingDir = editing
+  // A saved task tests in its stored directory; a new one lets the daemon resolve
+  // the directory from the primary target chat, as task creation will.
+  const preconditionWorkingDir = editing
+    && typeof editing.workingDir === 'string'
+    && editing.workingDir.length > 0
     ? editing.workingDir
-    : selectedBot?.scheduleWorkingDir;
-  const preconditionWorkingDir = typeof rawPreconditionWorkingDir === 'string'
-    && rawPreconditionWorkingDir.length > 0
-    ? rawPreconditionWorkingDir
     : '';
+  const preconditionChatId = editing ? undefined : chatIds[0];
   const preconditionTrustedFileRoot = typeof selectedBot?.schedulePreconditionFileRoot === 'string'
     ? selectedBot.schedulePreconditionFileRoot.trim()
     : '';
@@ -2002,7 +2015,7 @@ export function ScheduleFormModal(props: {
   const canTestPrecondition = preconditionMode !== 'keep'
     && preconditionTestSourceReady
     && Boolean(larkAppId)
-    && Boolean(preconditionWorkingDir)
+    && Boolean(editing ? preconditionWorkingDir : preconditionChatId)
     && !preconditionTestPending;
 
   useEffect(() => {
@@ -2014,6 +2027,7 @@ export function ScheduleFormModal(props: {
     preconditionScript,
     preconditionFilePath,
     preconditionWorkingDir,
+    preconditionChatId,
     larkAppId,
     open,
   ]);
@@ -2032,7 +2046,9 @@ export function ScheduleFormModal(props: {
       const response = await fetch('/api/schedules/precondition/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ larkAppId, workingDir: preconditionWorkingDir, source }),
+        body: JSON.stringify(editing
+          ? { larkAppId, workingDir: preconditionWorkingDir, source }
+          : { larkAppId, chatId: preconditionChatId, source }),
       });
       const body = await response.json().catch(() => ({}));
       if (requestRevision !== preconditionTestRevisionRef.current) return;
@@ -2040,7 +2056,8 @@ export function ScheduleFormModal(props: {
         setPreconditionTestResult({
           outcome: 'error',
           errorCode: typeof body?.errorCode === 'string' ? body.errorCode : `HTTP ${response.status}`,
-          error: typeof body?.error === 'string' ? body.error : tr('schedules.form.preconditionTestUnknownError'),
+          error: (editing ? undefined : scheduleWorkingDirErrorText(body?.errorCode, tr))
+            ?? (typeof body?.error === 'string' ? body.error : tr('schedules.form.preconditionTestUnknownError')),
           ...(Number.isFinite(body?.durationMs) ? { durationMs: body.durationMs } : {}),
         });
         return;
@@ -2155,6 +2172,7 @@ export function ScheduleFormModal(props: {
       // 打开后聚焦首个输入（Esc/遮罩点击走 onClose）
       onOpen={dialog => dialog.querySelector<HTMLElement>('input[name="name"]')?.focus()}
     >
+      <div className="schedule-form-dialog-content">
       <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
       <form onSubmit={handleSubmit} className="schedule-form" noValidate>
         {!editing ? (
@@ -2835,6 +2853,7 @@ export function ScheduleFormModal(props: {
           </button>
         </div>
       </form>
+      </div>
     </ModalDialog>
     <SchedulePreconditionHelpDialog
       open={open && preconditionHelpSource !== null}

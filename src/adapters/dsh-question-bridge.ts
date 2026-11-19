@@ -195,6 +195,11 @@ function runHook(payload, signal) {
       else if (!out.trim()) done({ ok: false, reason: 'passthrough', detail: 'botmux hook returned empty stdout' });
       else done({ ok: true, text: out.trim() });
     });
+    // A hook that exits (or is killed) before reading stdin makes the write below
+    // fail ASYNCHRONOUSLY with EPIPE. Unhandled, that stream 'error' is thrown at
+    // process level and takes the whole dsh TUI down. The hook's outcome is still
+    // reported by 'close' above (nonzero-exit / passthrough), so only swallow it.
+    child.stdin.on('error', () => {});
     try { child.stdin.end(input); }
     catch (error) {
       try { child.kill(); } catch {}

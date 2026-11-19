@@ -1,5 +1,6 @@
 import type { TurnResult, TurnResultBinding, TurnDeliveryReceipt, TurnResultLookup } from '../services/turn-result.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
+import { PersistentTurnResultStore } from '../services/persistent-turn-result-store.js';
 
 export interface TurnResultRuntimeDeps {
   store: TurnResultStore;
@@ -27,9 +28,10 @@ export function createTurnResultRuntime(deps: TurnResultRuntimeDeps) {
     return deps.owns(binding);
   };
   const notify = (binding: TurnResultBinding, before: TurnResultLookup): void => {
-    if (before.status === 'ready' || !deps.onTurnResult || !allowed(binding)) return;
+    if (!deps.onTurnResult || !allowed(binding)) return;
     const lookup = deps.store.read(binding.ref);
     if (lookup.status !== 'ready') return;
+    if (before.status === 'ready' && (lookup.result.resultRevision === undefined || lookup.result.resultRevision === before.result.resultRevision)) return;
     let finished = false;
     const finish = (code?: string): void => {
       if (finished) return;
@@ -79,6 +81,10 @@ export function createTurnResultRuntime(deps: TurnResultRuntimeDeps) {
         return { status: 'unavailable', reason: 'unsupported_mode' };
       }
       return lookup;
+    },
+    readContract(botId: string, sessionId: string, turnId: string, dispatchAttempt?: number) {
+      if (closed || !deps.enabled(botId)) return undefined;
+      return deps.store instanceof PersistentTurnResultStore ? deps.store.readContract({ botId, sessionId, turnId, dispatchAttempt }) : undefined;
     },
     close(): void {
       closed = true;

@@ -290,6 +290,21 @@ describe("worker-pool 'error' transient self-heal wiring", () => {
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
   });
 
+  it('the failure notice names the session and where its daemon log is', async () => {
+    vi.stubEnv('BOTMUX_BOT_INDEX', '42');
+    try {
+      const ds = makeDs('feedface-0000-4000-8000-000000000001', makeFakeWorker());
+      await failOnce(ds, '启动命令过长，被 tmux 拒绝（tmux：command too long，本次 16812 字节，tmux 单条命令上限 16364 字节）');
+      expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+      const notice = String((sessionReplyMock.mock.calls[0] as unknown[])[1]);
+      expect(notice).toContain('启动命令过长，被 tmux 拒绝');
+      expect(notice).toContain('feedface');
+      expect(notice).toContain('~/.botmux/logs/daemon-42-*.log');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('does not double-notify via the pre-ready exit guard once a retry is scheduled', async () => {
     const ds = makeDs('sid-exit-guard', makeFakeWorker());
     const worker = makeFakeWorker();

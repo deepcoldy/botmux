@@ -41,6 +41,37 @@ export interface ResolveCliRuntimeInput {
   context?: string;
 }
 
+/** Adapters whose compatible distributions can carry a frozen runtime identity. */
+export function supportsConfiguredCliRuntime(cliId: unknown): boolean {
+  return cliId === 'codex' || cliId === 'kimi';
+}
+
+/**
+ * Remove a structured distribution descriptor from a mutable raw bots.json
+ * entry when its adapter contract no longer applies (an adapter switch, or an
+ * adapter that cannot carry a runtime). The equal `cliPathOverride` downgrade
+ * shadow is removed with it; a path override that differs from the runtime
+ * executable is a legacy/manual value and is intentionally preserved.
+ *
+ * Every writer that can change `cliId` must call this — setup/dashboard edits
+ * and the /config store alike — otherwise codex↔kimi leaves a descriptor that
+ * reloads legally but runs one family's binary under the other's contract.
+ */
+export function dropConfiguredCliRuntime(entry: {
+  cliRuntime?: unknown;
+  cliPathOverride?: unknown;
+}, shouldDrop: boolean): boolean {
+  if (!shouldDrop) return false;
+  const runtimeExecutable = entry.cliRuntime && typeof entry.cliRuntime === 'object'
+    ? (entry.cliRuntime as { executable?: unknown }).executable
+    : undefined;
+  delete entry.cliRuntime;
+  if (typeof runtimeExecutable === 'string' && entry.cliPathOverride === runtimeExecutable) {
+    delete entry.cliPathOverride;
+  }
+  return true;
+}
+
 export interface CliRuntimeIdentityInput {
   cliId?: string | null;
   cliRuntime?: Pick<CliRuntimeConfig, 'id'> | Pick<CliRuntimeSnapshot, 'id' | 'source'> | null;
@@ -207,7 +238,7 @@ export function normalizeCliRuntimeConfig(raw: unknown, context: string): CliRun
  *
  * - Plain Codex gets the built-in official runtime.
  * - A legacy `cliPathOverride` becomes a stable basename-based snapshot.
- * - Structured runtimes are currently supported only by the Codex adapter.
+ * - Codex and Kimi-compatible distributions can provide a structured identity.
  * - Other plain adapters need no runtime snapshot yet.
  */
 export function resolveCliRuntime(input: ResolveCliRuntimeInput): CliRuntimeSnapshot | undefined {
@@ -215,8 +246,8 @@ export function resolveCliRuntime(input: ResolveCliRuntimeInput): CliRuntimeSnap
   const hasLegacyPath = input.cliPathOverride !== undefined;
 
   if (hasStructured) {
-    if (input.cliId !== 'codex') {
-      fail(input.context ?? 'cliRuntime', 'structured runtimes are currently supported only for cliId "codex"');
+    if (!supportsConfiguredCliRuntime(input.cliId)) {
+      fail(input.context ?? 'cliRuntime', 'structured runtimes are currently supported only for cliId "codex" or "kimi"');
     }
     const configured = normalizeCliRuntimeConfig(input.cliRuntime, input.context ?? 'cliRuntime');
     // New writers shadow the canonical executable into cliPathOverride so a

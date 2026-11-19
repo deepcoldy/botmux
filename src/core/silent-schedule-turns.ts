@@ -31,11 +31,26 @@ export function armSilentScheduledTurn(
   turns.set(turnId, now);
 }
 
+export function resolveDeferredScheduledTurnId(ds: DaemonSession, turnId?: string): string | undefined {
+  const run = ds.session?.deferredScheduleRun;
+  if (!run) return undefined;
+  if (turnId) return turnId === run.turnId ? run.turnId : undefined;
+  // Before materialization the dedicated session can only belong to this run.
+  // Afterwards, an unattributed event must not inherit silence from an older
+  // schedule when a human follow-up already owns the session.
+  return ds.session.rootMessageId === run.routingAnchor || ds.currentTurnId === run.turnId
+    ? run.turnId : undefined;
+}
+
 export function isSilentScheduledTurn(
   ds: DaemonSession,
   turnId?: string,
   now = Date.now(),
 ): boolean {
+  // A deferred run owns a dedicated session. Retirement can clear the worker's
+  // capture identity before its trailing idle frame; neither that nor registry
+  // expiry may make this still-hidden run loud. Explicit other turns stay exact.
+  if (resolveDeferredScheduledTurnId(ds, turnId)) return true;
   if (!turnId) return false;
   const armedAt = ds.silentScheduledTurns?.get(turnId);
   if (armedAt === undefined) return false;

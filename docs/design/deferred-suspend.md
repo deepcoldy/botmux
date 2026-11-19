@@ -405,9 +405,10 @@ CLI 本地的 session store 这些判据一个都没有，要按 daemon 拉一�
 6. **`ownsGeneration` 为假时不挂 worker 且保留标志**；为真时正常兑现
 7. **`suspendWorker` 拒绝时保留标志**（routing transfer 的门是模块私有的，用同样
    「早退且零副作用」的 pty 分支钉这条不变式）
-8. **transfer 拒绝后注册了 `deferUntilSessionTransferSettled` 重试**，且两个 checkpoint
-   传的是 `ownsWorkerSession` 而非 `ownsLifecycleMutation`（transfer 门是模块私有的，
-   这条用源码断言钉）
+8. **transfer 拒绝后在 transfer 结算时重试**：用 `transferSession` + 注入的挂起
+   detach 打开真实的 transfer 门，兑现被拒、标志保留；detach 结束、门释放后重试真的
+   挂起了 worker。（两个 checkpoint 传 `ownsWorkerSession` 而非 `ownsLifecycleMutation`
+   这一点在 worker 闭包里，目前没有行为 seam 钉住。）
 
 `test/ipc-suspend-route.test.ts` — 排队半边（起真 IPC server + `vi.spyOn(workerPool, ...)`，
 写法照抄 `test/ipc-close-route.test.ts`）：

@@ -13,6 +13,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
+import { canOperate, canTalk } from '../src/im/lark/event-dispatcher.js';
+import { t } from '../src/i18n/index.js';
+import { config } from '../src/config.js';
 
 const APP_ID = 'cli_test';
 const ROOT_ID = 'om_root';
@@ -64,6 +69,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
+  updateDeploymentContinuation: vi.fn(),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -472,6 +478,41 @@ describe('stuck-warning card tui_keys handler', () => {
     expect(ds.tuiPromptProcessing).toBe(false);
   });
 
+  it.each([false, true].flatMap(liveOrigin => [[false, false], [true, false], [false, true], [true, true]]
+    .map(([diskFailure, beforeReceipt]) => ({ liveOrigin, diskFailure, beforeReceipt }))))('text input persists cancellation before IPC: $liveOrigin/$diskFailure/$beforeReceipt', async ({ liveOrigin, diskFailure, beforeReceipt }) => {
+    const ds = makeDs({ worker: { killed: false, connected: true, send: workerSend } as any, tuiPromptCardId: CARD_ID });
+    const continuation = { state: 'claimed' as const, turnId: 'om_old', nativeSessionId: 'native', consumedAt: Date.now(),
+      workerGeneration: 1, caller: { senderType: 'user' as const, requestUserOpenId: 'ou_test', requestLarkAppId: APP_ID } };
+    Object.assign(ds.session, { cliId: 'codex', backendType: 'tmux', larkAppId: APP_ID, cliSessionId: 'native', workerGeneration: 1 });
+    ds.activeInteractiveTurn = { turnId: 'om_old', caller: continuation.caller };
+    if (liveOrigin) {
+      ds.activeInteractiveTurn = undefined;
+      ds.managedTurnOrigin = { capability: 'live-origin', turnId: 'om_old', trustedCaller: continuation.caller };
+      ds.currentReplyTarget = { rootMessageId: ROOT_ID, turnId: 'om_stale', updatedAt: new Date().toISOString() };
+    }
+    ds.session.deploymentContinuation = beforeReceipt ? undefined : continuation;
+    const persist = vi.mocked(sessionStore.updateDeploymentContinuation);
+    persist.mockImplementationOnce((row) => {
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(row.deploymentContinuation).toEqual({ state: 'cancelled', turnId: 'om_old' });
+      if (diskFailure) throw new Error('disk unavailable');
+    });
+    const result = await handleCardAction(makeTuiTextEvent('new intent') as any,
+      makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]])), APP_ID);
+    expect(persist).toHaveBeenCalledWith(ds.session, beforeReceipt ? undefined : continuation);
+    expect(workerSend).toHaveBeenCalledTimes(diskFailure ? 0 : 1);
+    if (diskFailure) {
+      expect(ds.session.deploymentContinuation).toBe(beforeReceipt ? undefined : continuation);
+      expect(ds.tuiPromptProcessing).toBe(false);
+      expect(result).toMatchObject({ toast: { type: 'warning' } });
+    } else {
+      expect(recordDeploymentContinuation(ds.session, { type: 'native_input_consumed', ordinaryInteractive: true,
+        turnId: 'om_old', proofKind: 'codex_history_match', nativeSessionId: 'native' },
+      { caller: continuation.caller, currentTurnId: 'om_old', workerGeneration: 1, rpc: false },
+      () => { throw new Error('cancelled receipt must not persist'); })).toBe(false);
+    }
+  });
+
   it('does not render text input as processing when nothing was dispatched', async () => {
     const ds = makeDs({
       worker: null,
@@ -489,3 +530,182 @@ describe('stuck-warning card tui_keys handler', () => {
     expect(ds.tuiPromptCardId).toBe(CARD_ID);
   });
 });
+
+// ─── stuck_key: the card's own gate (initiator or admin) ──────────────────
+
+describe('stuck_key card action', () => {
+  let workerSend: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(false);
+    vi.mocked(canTalk).mockReturnValue(true);
+    // The mocked config has no stuckCardInitiatorKeys: absent = default ON.
+    delete (config as any).stuckCardInitiatorKeys;
+    workerSend = vi.fn((_message, callback?: (error: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+  });
+
+  function stuckDs(overrides?: Partial<DaemonSession>): DaemonSession {
+    return makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 7,
+      stuckWarningNonceCounter: 7,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 4,
+      stuckWarningInitiatorOpenId: 'ou_alice',
+      ...overrides,
+    });
+  }
+
+  function click(ds: DaemonSession, value: Record<string, any>, operator = 'ou_alice', clickedMessageId = CARD_ID) {
+    return handleCardAction({
+      action: { value: { action: 'stuck_key', root_id: ROOT_ID, session_id: ds.session.sessionId, nonce: '7', ...value } },
+      operator: { open_id: operator, union_id: `on_${operator}` },
+      context: { open_message_id: clickedMessageId },
+    } as any, makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]])), APP_ID);
+  }
+
+  it('the initiator (talk-only) may press a decline key; the key comes from the catalog', async () => {
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2', keys: '["rm","-rf","/"]' });
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({
+      type: 'tui_keys',
+      keys: ['Escape'],
+      isFinal: true,
+      rearmStuckDetector: false,
+      stuckNonce: 7,
+      stuckCliLifetime: 4,
+      stuckPageType: 'hook review level 1',
+    });
+    expect(ds.stuckWarningProcessing).toBe(true);
+    expect(result).toEqual({ text: t('card.stuck.processing', undefined, 'zh') });
+    // Talk permission is re-evaluated at click time with the clicker's union id.
+    expect(canTalk).toHaveBeenCalledWith(APP_ID, 'oc_chat', 'ou_alice', undefined, 'on_ou_alice', 'group');
+  });
+
+  it.each(['p2p', 'group'] as const)('%s: the initiator can retry a lock once without sending arbitrary callback keys', async chatType => {
+    const session = stuckDs({ stuckWarningPageType: 'session lock', chatType });
+    await click(session, { selected_index: '0', keys: '["C-c","Enter"]' });
+    await click(session, { selected_index: '0' });
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({
+      type: 'tui_keys', keys: ['r'], stuckPageType: 'session lock',
+      stuckNonce: 7, stuckCliLifetime: 4, rearmStuckDetector: false,
+    });
+    expect(canTalk).toHaveBeenCalledWith(APP_ID, 'oc_chat', 'ou_alice', undefined, 'on_ou_alice', chatType);
+  });
+
+  it.each(['ou_other', 'ou_alice'])('refuses a lock retry for a different or revoked initiator: %s', async operator => {
+    if (operator === 'ou_alice') vi.mocked(canTalk).mockReturnValue(false);
+    await click(stuckDs({ stuckWarningPageType: 'session lock' }), { selected_index: '0' }, operator);
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('global switch off: the initiator is refused on a decline key, an operator still presses it', async () => {
+    (config as any).stuckCardInitiatorKeys = false;
+    const ds = stuckDs();
+    const refused = await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(refused).toEqual({ toast: { type: 'warning', content: t('card.stuck.denied_admin_only', undefined, 'zh') } });
+    expect(ds.stuckWarningProcessing).toBeFalsy();
+
+    vi.mocked(canOperate).mockReturnValue(true);
+    await click(ds, { selected_index: '2' }, 'ou_admin');
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({ keys: ['Escape'] });
+  });
+
+  it('the switch is read at click time: turning it back on lets the same initiator press', async () => {
+    (config as any).stuckCardInitiatorKeys = false;
+    const ds = stuckDs();
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+    (config as any).stuckCardInitiatorKeys = true;
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('another group member is refused with a toast and nothing is sent', async () => {
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2' }, 'ou_bob');
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'warning', content: t('card.stuck.denied', undefined, 'zh') } });
+    expect(ds.stuckWarningProcessing).toBeFalsy();
+  });
+
+  it('the initiator whose talk permission was revoked is refused', async () => {
+    vi.mocked(canTalk).mockReturnValue(false);
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+  });
+
+  it('the initiator may not press an admin-only (trust) key', async () => {
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '0' });
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'warning', content: t('card.stuck.denied_admin_only', undefined, 'zh') } });
+  });
+
+  it('without a frozen initiator nobody but an admin may press', async () => {
+    const ds = stuckDs({ stuckWarningInitiatorOpenId: undefined });
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('an admin may press every key; Enter re-arms the stuck detector', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    await click(ds, { selected_index: '1' }, 'ou_admin');
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({ keys: ['Enter'], rearmStuckDetector: true });
+  });
+
+  it('a stale nonce is dropped silently', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    expect(await click(ds, { selected_index: '2', nonce: '6' })).toBeUndefined();
+    expect(await click(ds, { selected_index: '2', nonce: undefined })).toBeUndefined();
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('a click on a card that is not the active stuck card is dropped silently', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    expect(await click(ds, { selected_index: '2' }, 'ou_admin', 'om_old_card')).toBeUndefined();
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it.each(['3', '-1', '1.5', 'abc', '', '02', ' 2 ', '2e0', '0x2'])('a tampered index %j is dropped without sending', async (index) => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = stuckDs();
+    expect(await click(ds, { selected_index: index }, 'ou_admin')).toBeUndefined();
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('a second click while the first key is in flight is dropped', async () => {
+    const ds = stuckDs();
+    await click(ds, { selected_index: '2' });
+    await click(ds, { selected_index: '2' });
+    expect(workerSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the processing claim when IPC delivery fails', async () => {
+    workerSend.mockImplementation((_message, callback?: (error: Error | null) => void) => {
+      callback?.(new Error('channel closed'));
+      return false;
+    });
+    const ds = stuckDs();
+    const result = await click(ds, { selected_index: '2' });
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+    expect(ds.stuckWarningProcessing).toBe(false);
+  });
+});
+

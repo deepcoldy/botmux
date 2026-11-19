@@ -9,8 +9,11 @@ import {
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
   durableLarkSessionControlPartitionPrefix,
+  durableSessionControlMaxAttempts,
+  DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS,
 } from '../src/services/durable-lark-session-control.js';
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
+import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 
 const tempDirs: string[] = [];
 
@@ -161,6 +164,7 @@ describe('durable session control consumer', () => {
       workerId: 'control-failover',
       ownedPartitionKeys: () => [],
       partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 0,
       dispatch: async control => {
         dispatched.push(control.sessionId);
         return { kind: 'settled' };
@@ -171,6 +175,46 @@ describe('durable session control consumer', () => {
     await consumer.ready;
     expect(dispatched).toEqual(['session-a']);
     await consumer.stop();
+    await store.close();
+  });
+
+  it('gives the exact owner one interval before prefix failover can steal a fresh control', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const standbyDispatch = vi.fn();
+    const standby = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-standby',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: standbyDispatch,
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await standby.ready;
+    expect(standbyDispatch).not.toHaveBeenCalled();
+
+    const ownerDispatch = vi.fn(async () => ({ kind: 'settled' as const }));
+    const owner = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-owner',
+      ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      dispatch: ownerDispatch,
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await owner.ready;
+    expect(ownerDispatch).toHaveBeenCalledOnce();
+    expect(standbyDispatch).not.toHaveBeenCalled();
+
+    now += 1_000;
+    await owner.stop();
+    await standby.stop();
     await store.close();
   });
 
@@ -245,6 +289,52 @@ describe('durable session control consumer', () => {
     await store.close();
   });
 
+  it('requeues an owner handoff quickly instead of paying the backend retry delay', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const retryInboxClaim = vi.spyOn(store, 'retryInboxClaim');
+    const errors: unknown[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-standby',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 0,
+      ownerHandoffRetryDelayMs: 100,
+      retryDelayMs: 5_000,
+      intervalMs: 60_000,
+      concurrency: 1,
+      now: () => now,
+      onError: error => errors.push(error),
+      dispatch: async () => {
+        throw new DurableSessionControlOwnerHandoffError('exact owner still holds the lease');
+      },
+    });
+    await consumer.ready;
+    await consumer.stop();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    expect(retryInboxClaim).toHaveBeenCalledOnce();
+    expect(retryInboxClaim).toHaveBeenCalledWith(expect.objectContaining({ visibleAt: 110 }));
+
+    now = 109;
+    expect(await store.claimNextInbox({
+      workerId: 'too-early',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toBeUndefined();
+    now = 110;
+    expect(await store.claimNextInbox({
+      workerId: 'exact-owner',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toMatchObject({ attempts: 2 });
+    await store.close();
+  });
+
   it('aborts dispatch without completing or retrying after claim ownership is lost', async () => {
     vi.useFakeTimers();
     try {
@@ -304,5 +394,85 @@ describe('durable session control consumer', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe('#2062 per-action retry budget', () => {
+    function displayEvent(sessionId: string, stableEventId: string, now: number) {
+      return durableLarkSessionControlEvent({
+        larkAppId: 'cli_test',
+        eventId: durableLarkSessionControlEventId('cli_test', stableEventId),
+        partitionKey: durableLarkSessionControlPartition('cli_test', sessionId),
+        data: {
+          ...rawControl(sessionId, stableEventId),
+          action: { value: {
+            action: 'toggle_display',
+            target_display_mode: 'screenshot',
+            session_id: sessionId,
+            root_id: `om_root_${sessionId}`,
+          } },
+        },
+        now,
+      });
+    }
+
+    async function run(
+      events: ReturnType<typeof controlEvent>[],
+      failing: (action: string) => boolean,
+      rounds: number,
+    ) {
+      let clock = 10;
+      const store = makeStore(() => clock);
+      for (const event of events) await store.enqueueInbox(event);
+      const dispatched: string[] = [];
+      const settled: Array<{ action: string; kind: string }> = [];
+      const consumer = startDurableSessionControlConsumer({
+        store,
+        workerId: 'control-budget',
+        ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+        maxAttemptsFor: durableSessionControlMaxAttempts,
+        dispatch: async control => {
+          dispatched.push(control.action);
+          if (failing(control.action)) throw new Error(`${control.action} cannot be applied here`);
+          return { kind: 'settled' };
+        },
+        onSettled: ({ control, result }) => settled.push({ action: control.action, kind: result.kind }),
+        onError: () => {},
+        concurrency: 1,
+        intervalMs: 10,
+        retryDelayMs: 100,
+        now: () => clock,
+      });
+      await consumer.ready;
+      for (let round = 0; round < rounds; round += 1) {
+        clock += 100;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      consumer.terminate();
+      await consumer.stop(0);
+      await store.close();
+      return { dispatched, settled };
+    }
+
+    it('settles an unappliable display toggle after its budget and lets the queued close run', async () => {
+      const { dispatched, settled } = await run([
+        displayEvent('session-a', 'evt-display', 1),
+        controlEvent('session-a', 'evt-close', 2),
+      ], action => action === 'toggle_display', 20);
+      expect(dispatched.filter(action => action === 'toggle_display'))
+        .toHaveLength(DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS);
+      expect(dispatched.filter(action => action === 'close')).toHaveLength(1);
+      expect(settled).toEqual([
+        { action: 'toggle_display', kind: 'ignored' },
+        { action: 'close', kind: 'settled' },
+      ]);
+    });
+
+    it('keeps retrying a lifecycle control without a budget', async () => {
+      const { dispatched, settled } = await run([
+        controlEvent('session-a', 'evt-close', 1),
+      ], () => true, 20);
+      expect(dispatched.length).toBeGreaterThan(DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS * 2);
+      expect(settled).toEqual([]);
+    });
   });
 });

@@ -1,17 +1,19 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import { config } from '../src/config.js';
-import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
-import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
+import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, V3_NATIVE_GOAL_COMMAND_CLIS, type RunNodeRequest } from '../src/workflows/v3/contract.js';
+import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import type { BotConfig } from '../src/bot-registry.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
 // path that gets the compiled-binary case right. Mock node:child_process so we
@@ -43,12 +45,17 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 
 let dir: string;
+const originalDataDir = config.session.dataDir;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
+  config.session.dataDir = join(dir, 'data');
+  vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
 });
 
 afterEach(async () => {
+  config.session.dataDir = originalDataDir;
+  vi.unstubAllEnvs();
   // The pool deliberately fire-and-forgets its diagnostic log writes
   // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
   // the attempt dir). A straggler landing after runNode resolves can RECREATE
@@ -69,6 +76,110 @@ afterEach(async () => {
   }
 });
 
+// A v3 attempt runs on a SYNTHETIC session id with no persistent row, so
+// sessionStore.closeSession() never runs for it: the pool must reclaim the
+// attempt's skill manifest + runtime-skills snapshot once the worker process
+// has really exited — on every outcome — and never earlier.
+describe('v3 ephemeral pool reclaims the attempt\'s skill snapshot on worker exit', () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = join(dir, 'data');
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  const plant = (req: RunNodeRequest) => {
+    const sid = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
+    const snapshotFile = join(dataDir, 'runtime-skills', sid, 'snapshot', 'deploy', 'SKILL.md');
+    const manifest = join(dataDir, 'skill-manifests', `${sid}.json`);
+    mkdirSync(dirname(snapshotFile), { recursive: true });
+    writeFileSync(snapshotFile, '# Deploy');
+    mkdirSync(dirname(manifest), { recursive: true });
+    writeFileSync(manifest, '{}');
+    return {
+      present: () => existsSync(snapshotFile) && existsSync(manifest),
+      gone: () => !existsSync(join(dataDir, 'runtime-skills', sid)) && !existsSync(manifest),
+    };
+  };
+  const pool = (worker: WorkerHandle) => createEphemeralPool({
+    factory: { spawn: () => worker }, workerPath: '/tmp/worker.js', quiesceMs: 1,
+    cancelGraceMs: 10_000, resolveLarkAppSecret: () => 'secret',
+  });
+
+  it('ok: kept while the outcome is claimed, removed once the worker exits', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    expect(files.present()).toBe(true); // claimed, but the worker has not exited yet
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+    expect(files.gone()).toBe(true);
+  });
+
+  it('fail: removed on worker exit', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 1, signal: null });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    expect(files.present()).toBe(true);
+    worker.emitExit(1);
+    await expect(running).resolves.toMatchObject({ status: 'fail' });
+    expect(files.gone()).toBe(true);
+  });
+
+  it('cancelled: kept through the cancel request, removed once the worker exits', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const running = pool(worker).runNode({ ...req, cancelSignal: ac.signal });
+    await worker.waitForInit();
+    ac.abort('user-requested');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(worker.kills).toContain('SIGINT');
+    expect(files.present()).toBe(true);
+    worker.emitExit(130);
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' });
+    expect(files.gone()).toBe(true);
+  });
+
+  it('bind failure: removed after the drained outer close', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new UnbindableWorker();
+    const running = pool(worker).runNode(req);
+    await waitFor(() => worker.closeRequested);
+    expect(files.present()).toBe(true);
+    worker.emit('close', 1);
+    await expect(running).rejects.toThrow(/process identity/);
+    expect(files.gone()).toBe(true);
+  });
+
+  it('only touches its own synthetic session (a sibling attempt\'s snapshot stays)', async () => {
+    const req = request();
+    const other = plant({ ...req, attemptId: 'research/attempts/002' });
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: null });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await running;
+    expect(files.gone()).toBe(true);
+    expect(other.present()).toBe(true);
+  });
+});
+
 describe('v3WorkerBackendType', () => {
   it('follows a tmux daemon and keeps PTY for every other backend, never a remote one', () => {
     expect(v3WorkerBackendType('tmux')).toBe('tmux');
@@ -79,6 +190,67 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('does not inherit machine protected env names even when the workflow bot enables no matching plugin', async () => {
+    vi.stubEnv('FIXTURE_SECRET', 'machine-secret');
+    vi.stubEnv('FIXTURE_TOKEN', 'machine-token');
+    vi.stubEnv('INVALID_RECORD_SECRET', 'invalid-record-machine-secret');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(dir, 'current-global.json'));
+    vi.stubEnv('BOTMUX_PROTECTED_SECRET_FD', '3');
+    try {
+      writeFileSync(join(dir, 'current-global.json'), JSON.stringify({ protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: {
+            protectedHomePaths: ['.fixture-credential'],
+            redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+          },
+        },
+        legacy: { secret: { source: 'env', name: 'INVALID_RECORD_SECRET' } },
+      } }));
+      invalidateGlobalConfigCache();
+      const worker = new ScriptedWorker();
+      const factory = factoryFor(worker);
+      const pool = createEphemeralPool({
+        factory,
+        workerPath: '/tmp/worker.js',
+        quiesceMs: 1,
+        resolveLarkAppSecret: () => 'secret',
+        resolveBot: () => ({
+          env: {
+            FIXTURE_SECRET: 'bot-reintroduced-secret',
+            FIXTURE_TOKEN: 'bot-reintroduced-token',
+            INVALID_RECORD_SECRET: 'bot-reintroduced-invalid-record-secret',
+          },
+        }),
+      });
+      const running = pool.runNode(request());
+      await worker.waitForInit();
+      try {
+        expect(factory.lastOpts!.env.FIXTURE_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(factory.lastOpts!.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.BOTMUX_PROTECTED_SECRET_FD).toBeUndefined();
+        expect(worker.init.env.FIXTURE_SECRET).toBeUndefined();
+        expect(worker.init.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(worker.init.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(worker.init.protectedMcpPolicy).toEqual({
+          capabilities: [],
+          protectedHomePaths: ['.secrets/mcp-secret'],
+          redactEnv: ['BOTMUX_PROTECTED_SECRET_FD', 'FIXTURE_SECRET', 'FIXTURE_TOKEN', 'INVALID_RECORD_SECRET'],
+        });
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+    }
+  });
+
   it('freezes only strict names, filters worker inheritance and resolves this bot env without persisting credentials', async () => {
     vi.stubEnv('UNLISTED_CLOUD_CREDENTIAL', 'host-sentinel');
     vi.stubEnv('HTTPS_PROXY', 'proxy-sentinel');
@@ -91,16 +263,16 @@ describe('v3 ephemeral pool', () => {
       const restored = parseFrozenBotSnapshots(JSON.parse(serialized)).get('')!;
       bot.envPolicy = { mode: 'inherit' };
       const worker = new ScriptedWorker(); const factory = factoryFor(worker);
-      const resolveBotEnv = vi.fn(appId => appId === bot.larkAppId ? bot.env : undefined);
+      const resolveBot = vi.fn(appId => appId === bot.larkAppId ? bot : undefined);
       const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1,
-        resolveLarkAppSecret: () => 'secret', resolveBotEnv });
+        resolveLarkAppSecret: () => 'secret', resolveBot });
       const running = pool.runNode({ ...request(), botSnapshot: restored });
       await worker.waitForInit();
       expect(worker.init.envPolicy).toEqual({ mode: 'strict', inherit: ['HTTPS_PROXY'] });
       expect(worker.init.env.MODEL_AUTH === 'bot-sentinel').toBe(true);
       expect(factory.lastOpts!.env.UNLISTED_CLOUD_CREDENTIAL).toBeUndefined();
       expect(factory.lastOpts!.env.HTTPS_PROXY === 'proxy-sentinel').toBe(true);
-      expect(resolveBotEnv).toHaveBeenCalledWith('cli_app');
+      expect(resolveBot).toHaveBeenCalledWith('cli_app');
       worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
       worker.emitMessage({ type: 'prompt_ready' });
       worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
@@ -243,6 +415,160 @@ describe('v3 ephemeral pool', () => {
     expect(worker.init?.wrapperCli).toBe('wrapper codex');
     worker.emitExit(0);
     await promise;
+  });
+
+  it('passes a goal-scoped Codex runtime to worker init and attests the observed runtime', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-verifier',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init).toMatchObject({
+      cliId: 'codex',
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'xhigh',
+      cliInstanceBinding: { source: 'goal', codexHome: '/private/codex-verifier' },
+    });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'ok',
+      runtime: {
+        cliId: 'codex',
+        source: 'worker-active-runtime',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        codexHome: '/private/codex-verifier',
+      },
+    });
+  });
+
+  it('fails a goal-scoped Codex run when the worker reports a different runtime', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'high';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-repairer',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: expect.stringContaining('gpt-5.6-sol/high') },
+      runtime: { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    });
+  });
+
+  function goalBoundRun(worker: ScriptedWorker) {
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-goal',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+    return pool.runNode(req);
+  }
+
+  it('fails an otherwise successful goal-scoped Codex run that never attested its runtime', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    const result = await promise;
+    expect(result).toMatchObject({ status: 'fail', error: { code: 'GOAL_RUNTIME_UNVERIFIED' } });
+    expect(result.runtime).toBeUndefined();
+  });
+
+  it('fails a goal-scoped Codex run whose observed reasoning effort differs', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-6.1-sol', reasoningEffort: 'medium' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: expect.stringContaining('gpt-6.1-sol/medium') },
+    });
+  });
+
+  it('keeps a goal-scoped worker failure instead of reporting it as an unverified runtime', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'error', message: 'Codex instance routing does not support sandbox/readIsolation' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(1);
+
+    const result = await promise;
+    expect(result.status).toBe('fail');
+    expect(result.error).toBeUndefined();
   });
 
   it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
@@ -679,6 +1005,102 @@ describe('v3 ephemeral pool', () => {
     expect(Buffer.byteLength(cmd, 'utf-8')).toBeLessThanOrEqual(180);
   });
 
+  it('recognises its own /goal line, with or without the command, for session discovery', () => {
+    const cmd = buildGoalCommand(request());
+    expect(cmd).toBe(`${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`);
+    expect(isBotmuxGoalObjective(cmd)).toBe(true);
+    // TraeX 0.210 goal mode stores only the objective (threads.preview).
+    expect(isBotmuxGoalObjective(GOAL_COMMAND_OBJECTIVE)).toBe(true);
+    expect(isBotmuxGoalObjective(`  ${GOAL_COMMAND_OBJECTIVE.replace(/ /g, '\n')}  `)).toBe(true);
+    expect(isBotmuxGoalObjective(`${GOAL_COMMAND} ship the release notes`)).toBe(false);
+    expect(isBotmuxGoalObjective(`Please explain: ${GOAL_COMMAND_OBJECTIVE}`)).toBe(false);
+  });
+
+  describe('goal 输入按 CLI 形态区分 /goal 前缀', () => {
+    // request() hardcodes one attempt dir; a second runNode in the same test
+    // must not re-arm the worker fence there, so give each variant its own.
+    const withCli = (
+      cliId: RunNodeRequest['botSnapshot']['cliId'],
+      suffix = '',
+    ): RunNodeRequest => {
+      const req = request();
+      const oldAttemptDir = req.attemptDir;
+      const attemptDir = join(dir, `research${suffix}`, 'attempts', '001');
+      const retarget = (path: string): string => path.replace(oldAttemptDir, attemptDir);
+      return {
+        ...req,
+        runId: `run-v3${suffix}`,
+        attemptId: `research${suffix}/attempts/001`,
+        botSnapshot: { ...req.botSnapshot, cliId },
+        attemptDir,
+        inputsPath: retarget(req.inputsPath),
+        outputDir: retarget(req.outputDir),
+        env: Object.fromEntries(
+          Object.entries(req.env).map(([key, value]) => [
+            key,
+            key === GOAL_ENV.V3_MARKER ? value : retarget(value),
+          ]),
+        ),
+      };
+    };
+
+    it.each(V3_NATIVE_GOAL_COMMAND_CLIS)('%s 保留原生 /goal 前缀', (cliId) => {
+      expect(buildGoalCommand(withCli(cliId))).toBe(`${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`);
+    });
+
+    it('minimax（ACP runner）收到裸 objective，不含 /goal，且仍是单行', () => {
+      const cmd = buildGoalCommand(withCli('minimax'));
+      expect(cmd).toBe(GOAL_COMMAND_OBJECTIVE);
+      expect(cmd.startsWith(GOAL_COMMAND)).toBe(false);
+      expect(cmd).not.toContain('\n');
+      expect(isBotmuxGoalObjective(cmd)).toBe(true);
+    });
+
+    it('minimax 节点实际投递的 raw_input 就是裸 objective', async () => {
+      const worker = new ScriptedWorker();
+      const factory = factoryFor(worker);
+      const pool = createEphemeralPool({
+        factory,
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const promise = pool.runNode(withCli('minimax', '-mmx-input'));
+      await worker.waitForInit();
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      worker.emitMessage({ type: 'prompt_ready' });
+      expect(worker.rawInputs).toEqual([GOAL_COMMAND_OBJECTIVE]);
+      worker.emitExit(0);
+      await promise;
+    });
+
+    it('minimax init 把内层 turn 超时设到节点硬截止之后，其它 CLI 不带该字段', async () => {
+      const minimax = new ScriptedWorker();
+      const poolMinimax = createEphemeralPool({
+        factory: factoryFor(minimax),
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const mmxRun = poolMinimax.runNode(withCli('minimax', '-mmx-timeout'));
+      await minimax.waitForInit();
+      expect(typeof minimax.init.turnTimeoutMs).toBe('number');
+      expect(minimax.init.turnTimeoutMs).toBeGreaterThan(60_000);
+      minimax.emitExit(0);
+      await mmxRun;
+
+      const claude = new ScriptedWorker();
+      const poolClaude = createEphemeralPool({
+        factory: factoryFor(claude),
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const claudeRun = poolClaude.runNode(withCli('claude-code', '-claude-timeout'));
+      await claude.waitForInit();
+      expect(claude.init.turnTimeoutMs).toBeUndefined();
+      claude.emitExit(0);
+      await claudeRun;
+    });
+  });
+
   it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {
     const worker = new ScriptedWorker({ autoReadyAfterInit: true });
     const factory = factoryFor(worker);
@@ -891,6 +1313,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly rawInputs: string[] = [];
   readonly autoReadyAfterInit: boolean;
   init: any;
+  private contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
@@ -903,6 +1326,14 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   send(msg: unknown): void {
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
+      const contract = (msg as any).sessionContract;
+      if (contract) {
+        this.contractScope = new WorkerSessionEventScope(contract.session, contract.worker);
+        const binding = this.contractScope.beginRuntime();
+        this.contractScope.enterRuntime(binding);
+        this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: 'fake-worker', proof: 'opaque' } });
+      }
       this.initResolve?.();
       if (this.autoReadyAfterInit) {
         setImmediate(() => {
@@ -911,6 +1342,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
         });
       }
     }
+    if ((msg as any)?.type === 'runtime_contract_assigned') this.contractScope?.assign((msg as any).bindingId, (msg as any).runtime);
     if ((msg as any)?.type === 'raw_input') {
       this.rawInputs.push((msg as any).content);
     }
@@ -925,7 +1357,8 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   emitMessage(msg: unknown): void {
-    this.emit('message', msg);
+    const binding = this.contractScope?.currentBinding();
+    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
   }
 
   emitExit(code: number | null): void {

@@ -9,6 +9,9 @@
  * screenshot-renderer test. Here we verify the routing + the dimensions
  * end up correct after clamping.
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
@@ -21,6 +24,7 @@ vi.mock('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process');
   return {
     ...actual,
+    execFile: vi.fn(),
     execSync: vi.fn(),
     execFileSync: vi.fn(),
     spawnSync: vi.fn(),

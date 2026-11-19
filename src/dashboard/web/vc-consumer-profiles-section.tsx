@@ -63,6 +63,7 @@ interface BotPolicyDraft {
   /** apiOnly（无飞书连接）→ 结构上收不到会议事件，开关禁用。 */
   vcEligible: boolean;
   vcEnabled: boolean;
+  inviterManagementEnabled: boolean;
   textOutputPolicy: OutputPolicyValue | null;
   voiceOutputPolicy: OutputPolicyValue | null;
   realtimeVoiceEnabled: boolean;
@@ -78,12 +79,13 @@ function policyBaseline(
   voice: OutputPolicyValue | null,
   rtv: boolean,
   catalogDefaultConsumerId: string | null,
+  inviterManagementEnabled = false,
 ): string {
-  return `${vcEnabled ? '1' : '0'}|${text ?? ''}|${voice ?? ''}|${rtv ? '1' : '0'}|${catalogDefaultConsumerId ?? ''}`;
+  return `${vcEnabled ? '1' : '0'}|${text ?? ''}|${voice ?? ''}|${rtv ? '1' : '0'}|${catalogDefaultConsumerId ?? ''}|${inviterManagementEnabled ? '1' : '0'}`;
 }
 
 function rowBaseline(row: BotPolicyDraft): string {
-  return policyBaseline(row.vcEnabled, row.textOutputPolicy, row.voiceOutputPolicy, row.realtimeVoiceEnabled, row.catalogDefaultConsumerId);
+  return policyBaseline(row.vcEnabled, row.textOutputPolicy, row.voiceOutputPolicy, row.realtimeVoiceEnabled, row.catalogDefaultConsumerId, row.inviterManagementEnabled);
 }
 
 function toBotPolicyDrafts(agentOptions: VcMeetingAgentOptionDto[]): BotPolicyDraft[] {
@@ -105,11 +107,12 @@ function toBotPolicyDrafts(agentOptions: VcMeetingAgentOptionDto[]): BotPolicyDr
       sandboxIsolated: agent.sandboxIsolated,
       vcEligible,
       vcEnabled,
+      inviterManagementEnabled: agent.inviterManagementEnabled === true,
       textOutputPolicy: text,
       voiceOutputPolicy: voice,
       realtimeVoiceEnabled: rtv,
       catalogDefaultConsumerId,
-      baseline: policyBaseline(vcEnabled, text, voice, rtv, catalogDefaultConsumerId),
+      baseline: policyBaseline(vcEnabled, text, voice, rtv, catalogDefaultConsumerId, agent.inviterManagementEnabled === true),
     };
   });
 }
@@ -329,6 +332,7 @@ export function VcConsumerProfilesSection(props: {
             .map(row => ({
               appId: row.appId,
               vcEnabled: row.vcEnabled,
+              inviterManagementEnabled: row.inviterManagementEnabled,
               textOutputPolicy: row.textOutputPolicy,
               voiceOutputPolicy: row.voiceOutputPolicy,
               realtimeVoiceEnabled: row.realtimeVoiceEnabled,
@@ -371,7 +375,7 @@ export function VcConsumerProfilesSection(props: {
 
   const updateBotPolicy = useCallback((
     appId: string,
-    patch: Partial<Pick<BotPolicyDraft, 'vcEnabled' | 'textOutputPolicy' | 'voiceOutputPolicy' | 'realtimeVoiceEnabled' | 'catalogDefaultConsumerId'>>,
+    patch: Partial<Pick<BotPolicyDraft, 'inviterManagementEnabled' | 'vcEnabled' | 'textOutputPolicy' | 'voiceOutputPolicy' | 'realtimeVoiceEnabled' | 'catalogDefaultConsumerId'>>,
   ) => {
     setCatalog(prev => {
       if (!prev) return prev;
@@ -771,6 +775,12 @@ export function VcConsumerProfilesSection(props: {
                         onChange={(event) => updateBotPolicy(row.appId, { realtimeVoiceEnabled: event.target.checked })}
                       />
                       <span>{tr('settings.vcProfiles.botPolicies.realtimeVoice')}</span>
+                    </label>
+                    <label className="vc-bot-policy-cell vc-bot-policy-rtv" title={tr('settings.vcProfiles.botPolicies.inviterManagementHelp')}>
+                      <input type="checkbox" checked={row.inviterManagementEnabled}
+                        disabled={rowFrozen || !row.vcEligible || !row.vcEnabled}
+                        onChange={event => updateBotPolicy(row.appId, { inviterManagementEnabled: event.target.checked })} />
+                      <span>{tr('settings.vcProfiles.botPolicies.inviterManagement')}</span>
                     </label>
                     <span className="vc-bot-policy-effective hint">
                       {tr('settings.vcProfiles.botPolicies.effective')}

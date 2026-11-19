@@ -66,7 +66,9 @@ function optionalSummary(args: string[]): { ok: true; summary?: string } | { ok:
     return { ok: false, error: '--summary 需要文本参数' };
   }
   const summary = flagValue(args, '--summary');
-  if (summary !== undefined && summary.length > MAX_SUMMARY_CHARS) {
+  const containsLinkRef = summary !== undefined
+    && /\{\{botmux_link:lr_[0-9a-f]{32}\}\}/u.test(summary);
+  if (summary !== undefined && summary.length > MAX_SUMMARY_CHARS && !containsLinkRef) {
     return { ok: false, error: `--summary 最多 ${MAX_SUMMARY_CHARS} 字符` };
   }
   return { ok: true, ...(summary !== undefined ? { summary } : {}) };

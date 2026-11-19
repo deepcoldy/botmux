@@ -13,7 +13,7 @@ This table lists all available Nodes. See [Node Details](#node-details) below fo
 | feishu.close | Click 关闭会话. The screen recording is published when the browser context closes. |
 | feishu.openAndSend | Open Feishu Messenger and send the case prompt. Codex also opens the thread and clicks 直接开启会话 before any streaming-card wait. |
 | feishu.runScenario | Run one migrated Botmux Feishu browser scenario |
-| feishu.showStreamingOutput | Scroll the streaming card into view and toggle 显示输出. Codex cases skip this. |
+| feishu.showStreamingOutput | Unfold 更多操作 on the streaming card and turn 显示输出 on. Codex cases skip this. |
 | feishu.waitForBotResponse | Wait for the Claude ACK reply bubble, or a Codex-side response. The card title 等待输入 is not the success gate. |
 | feishu.waitForStreamingCard | Wait until the current session streaming card is visible. Codex cases skip this. |
 
@@ -25,7 +25,11 @@ Projects created by `midscene-test create` select `cases/**/*.{yaml,yml}` by def
 
 **Config file:** `midscene.config.ts`
 
+**Case files:** `cases/core-group-modes.yaml` (Execution Project: feishu-core-group-modes)
+
 **Case files:** `cases/core-claude.yaml` (Execution Project: feishu-core-claude)
+
+**Case files:** `cases/core-clis.yaml` (Execution Project: feishu-core-clis)
 
 **Case files:** `cases/core-codex.yaml` (Execution Project: feishu-core-codex)
 
@@ -35,17 +39,9 @@ Projects created by `midscene-test create` select `cases/**/*.{yaml,yml}` by def
 
 **Case files:** `cases/core-dm-modes-codex.yaml` (Execution Project: feishu-core-dm-modes-codex)
 
-**Case files:** `cases/core-group-modes.yaml` (Execution Project: feishu-core-group-modes)
-
 **Case files:** `cases/core-queue.yaml` (Execution Project: feishu-core-queue)
 
-**Case files:** `cases/full-bots.yaml` (Execution Project: feishu-full-bots)
-
-**Case files:** `cases/full-claude-ui.yaml` (Execution Project: feishu-full-claude-ui)
-
-**Case files:** `cases/full-group.yaml` (Execution Project: feishu-full-group)
-
-**Case files:** `cases/full-schedule.yaml` (Execution Project: feishu-full-schedule)
+**Case files:** `cases/core-sandbox.yaml` (Execution Project: feishu-core-sandbox)
 
 Files matching `files.exclude` are not selected. Midscene Test always ignores `.git/`, `.midscene/`, `midscene_run/`, and `node_modules/` directories, including nested ones.
 
@@ -148,6 +144,11 @@ Run one migrated Botmux Feishu browser scenario
         "bot-codex-basic",
         "bot-codex-prompt",
         "bot-opencode-basic",
+        "bot-pi-basic",
+        "bot-ohmypi-basic",
+        "bot-kimi-basic",
+        "bot-antigravity-basic",
+        "bot-grok-basic",
         "bot-reply-smoke",
         "bot-collaboration",
         "card-lifecycle",
@@ -161,6 +162,7 @@ Run one migrated Botmux Feishu browser scenario
         "private-topic-reply",
         "scheduled-task-thread",
         "web-terminal",
+        "sandbox-file-isolation",
         "traex-ambient-continuity",
         "dm-chat-claude",
         "dm-thread-claude",
@@ -197,7 +199,7 @@ Run one migrated Botmux Feishu browser scenario
 
 ### `feishu.showStreamingOutput`
 
-Scroll the streaming card into view and toggle 显示输出. Codex cases skip this.
+Unfold 更多操作 on the streaming card and turn 显示输出 on. Codex cases skip this.
 
 **String shorthand:** Not supported by this Node.
 

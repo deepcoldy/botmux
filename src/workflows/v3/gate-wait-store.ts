@@ -50,7 +50,9 @@ export {
   selectedResolution,
 } from './gate-policy.js';
 
-export type GateWaitStatus = 'pending' | 'approved' | 'rejected';
+/** `voided` = a runtime flow revision changed the gated node before anyone
+ *  decided; the gate is re-dispatched under the new definition. */
+export type GateWaitStatus = 'pending' | 'approved' | 'rejected' | 'voided';
 
 export interface GateWait {
   waitId: string;
@@ -72,6 +74,9 @@ export interface GateWait {
   selected?: string;
   /** Host-only: the exact frozen provider input this approval covers. */
   hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+  /** Delivery state: approval-card messages posted for this wait, so a
+   *  voided gate's cards can be frozen in place. */
+  cardMessageIds?: string[];
 }
 
 export type { GateResolver };
@@ -301,7 +306,53 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
     by: raw.by,
     selected: raw.selected,
     ...(hostApproval ? { hostApproval } : {}),
+    ...(Array.isArray(raw.cardMessageIds)
+      ? { cardMessageIds: raw.cardMessageIds.filter((id): id is string => typeof id === 'string' && id.length > 0) }
+      : {}),
   };
+}
+
+/** Void a still-pending wait (a flow revision replaced its node). First
+ *  decision wins: an already-resolved wait is returned unchanged. */
+export function voidWaitOnce(runDir: string, waitId: string, by: string): { wait: GateWait; changed: boolean } | undefined {
+  const path = waitPath(runDir, waitId);
+  if (!existsSync(path)) return undefined;
+  return withFileLockSync(path, () => {
+    const existing = readWait(runDir, waitId);
+    if (!existing) return undefined;
+    if (existing.status !== 'pending') return { wait: existing, changed: false };
+    const voided: GateWait = { ...existing, status: 'voided', resolvedAt: Date.now(), by };
+    atomicWriteJson(path, voided);
+    return { wait: voided, changed: true };
+  });
+}
+
+/** A decision a runtime flow revision overtook (the click's CAS won the wait
+ *  but the revision voided the gate in the journal first): record the wait as
+ *  voided so every later read agrees with the journal. */
+export function markWaitVoided(runDir: string, waitId: string, by: string): GateWait | undefined {
+  const path = waitPath(runDir, waitId);
+  if (!existsSync(path)) return undefined;
+  return withFileLockSync(path, () => {
+    const existing = readWait(runDir, waitId);
+    if (!existing) return undefined;
+    const voided: GateWait = { ...existing, status: 'voided', resolvedAt: Date.now(), by };
+    atomicWriteJson(path, voided);
+    return voided;
+  });
+}
+
+/** Remember an approval card's message id on its wait (best effort). */
+export function recordWaitCardMessage(runDir: string, waitId: string, messageId: string): void {
+  const path = waitPath(runDir, waitId);
+  if (!messageId || !existsSync(path)) return;
+  withFileLockSync(path, () => {
+    const existing = readWait(runDir, waitId);
+    if (!existing) return;
+    const ids = existing.cardMessageIds ?? [];
+    if (ids.includes(messageId)) return;
+    atomicWriteJson(path, { ...existing, cardMessageIds: [...ids, messageId].slice(-8) });
+  });
 }
 
 // ─── Gate resolver (injected into the runtime) ──────────────────────────────

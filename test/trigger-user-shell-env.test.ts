@@ -4,17 +4,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
 import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
+import { isMessageListenerTaskAnchor } from '../src/core/message-listener-silence.js';
 import { describe, expect, it } from 'vitest';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
 import {
   GIT_ASKPASS_BASENAME,
   IDENTITY_DENIED_EXIT_CODE,
   installIdentityWrapper,
+  prepareTriggerUserCliEnv,
   publishActiveTurn,
   sessionIdentityBinDir,
   writeSessionIdentity,
 } from '../src/core/cli-identity.js';
+import { capabilityOn } from '../src/services/trigger-user-auth.js';
 
 // worker.ts is a process entrypoint: execute its actual environment-assembly
 // block without starting a worker, rather than recreating that block in a fixture.
@@ -26,13 +30,16 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
-  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
+  'perBotInjectEnv', 'sandboxRequested', 'effectiveResume',
+  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir',
+  'isMessageListenerTaskAnchor', 'capabilityOn', `${assembly}\nreturn identityShellEnv;`);
 
-function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false): Record<string, string> {
+function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false, path?: string, sandboxRequested = false, launch: { cliId?: string; wrapperCli?: string; path?: string } = {}): Record<string, string> {
   return assemble(
-    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', triggerUserAuth: { enabled, tools } },
-    { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' } },
-    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
+    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } },
+    { env: { PATH: path, ...(sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' }) } },
+    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, false, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
+    isMessageListenerTaskAnchor, capabilityOn,
   );
 }
 
@@ -49,6 +56,46 @@ function shellOverrides(args: string[]): Record<string, string> {
 const routingEnv = { BOTMUX_SESSION_ID: 'botmux-session', BOTMUX_CHAT_ID: 'oc_chat', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_SESSION_SCOPE: 'chat' };
 
 describe('worker trigger-user shell contract', () => {
+  it('uses the configured per-bot PATH ahead of the daemon PATH', () => {
+    const env = workerShellEnv('/tmp/data', false, [], true, '/daemon/bin', false, { path: '/bot/bin:/usr/bin' });
+    expect(env.PATH).toBe(env.BOTMUX_IDENTITY_BIN + ':/bot/bin:/usr/bin');
+  });
+  it.each(['aiden x codex', 'cjadk codex'])('leaves final %s gateway composition unchanged', wrapperCli => {
+    const createAdapter = createCodexAdapter;
+    const current = workerShellEnv('/tmp/data', false, [], true, '/daemon/bin', false, { cliId: 'codex', wrapperCli });
+    const prior = { ...current }; delete prior.PATH;
+    const compose = (shellSubprocessEnv: Record<string, string>) => buildWrappedLaunch(wrapperCli,
+      createAdapter('/bin/cli').buildArgs({ sessionId: 'native-session', shellSubprocessEnv }), bin => '/bin/' + bin);
+    expect(compose(current)).toEqual(compose(prior));
+    expect(current).not.toHaveProperty('PATH');
+  });
+  it('does not change other CLI tool PATH policies', () => {
+    expect(workerShellEnv('/tmp/data', false, [], true, '/daemon/bin', false, { cliId: 'codex' })).not.toHaveProperty('PATH');
+  });
+  it('preserves the sandbox-owned command PATH instead of overriding it with host paths', () => {
+    expect(workerShellEnv('/tmp/data', false, [], true, '/usr/bin:/bin', true)).not.toHaveProperty('PATH');
+  });
+  it('pins the managed wrapper PATH in explicit tool policy after a CLI launcher resets its inherited PATH', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'managed-tool-path-'));
+    try {
+      const inheritedPath = '/usr/bin:/bin';
+      const shellEnv = workerShellEnv(dataDir, false, [], true, inheritedPath);
+      const bin = shellEnv.BOTMUX_IDENTITY_BIN;
+      // Install a harmless wrapper fixture through the same generated layout.
+      const wrapper = installIdentityWrapper(bin, 'bytedcli', '/bin/true')!;
+      for (const createAdapter of [createTraexAdapter]) {
+        const args = createAdapter('/bin/cli').buildArgs({ sessionId: 'native-session', shellSubprocessEnv: shellEnv });
+        const overrides = shellOverrides(args);
+        // CLI tool processes may reset PATH and use sh without reading BASH_ENV.
+        // Only explicit .set entries cross that boundary reliably.
+        const result = spawnSync('/bin/sh', ['-c', 'command -v bytedcli'], {
+          env: { PATH: inheritedPath, ...overrides }, encoding: 'utf8', timeout: 5000,
+        });
+        expect(result.stdout.trim()).toBe(wrapper);
+        expect(overrides.PATH.split(':')[0]).toBe(bin);
+      }
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
   it('uses the credential file identity, not the native CLI resume identity', () => {
     const dataDir = '/tmp/data "quoted"';
     expect(workerShellEnv(dataDir)).toEqual({
@@ -85,6 +132,41 @@ describe('worker trigger-user shell contract', () => {
   });
 });
 
+describe('wrapper rendering model (review gate: no resolver argv on legacy paths)', () => {
+  function install(model: 'single' | 'proven', execution?: { appId: string; ipcPort?: number }): string {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-wrapper-model-'));
+    const realTool = join(dataDir, 'bytedcli');
+    writeFileSync(realTool, '#!/bin/sh\nprintf ok\n', { mode: 0o755 });
+    const shellEnv: Record<string, string> = { PATH: dataDir };
+    const log = () => {};
+    prepareTriggerUserCliEnv(
+      shellEnv, dataDir, 'gate-session',
+      { enabled: true, tools: ['bytedcli'] } as any, log, model, execution,
+    );
+    const wrapper = join(shellEnv.BOTMUX_IDENTITY_BIN!, 'bytedcli');
+    return readFileSync(wrapper, 'utf8');
+  }
+
+  it('renders NO cli-identity-runner argv and NO --ipc-port for the single model', () => {
+    const text = install('single');
+    expect(text).not.toContain('cli-identity-runner');
+    expect(text).not.toContain('--ipc-port');
+    // It uses the legacy single-file source block instead.
+    expect(text).toContain('.data"');
+  });
+
+  it('renders the runner argv and eval block for the proven model', () => {
+    const text = install('proven', { appId: 'cli_app', ipcPort: 12345 });
+    expect(text).toContain('cli-identity-runner');
+    expect(text).toContain('--ipc-port');
+    expect(text).toContain('12345');
+    expect(text).toContain('eval "$__botmux_cred_body"');
+    // Proven wrapper must never name a turns/ path or source a disk file.
+    expect(text).not.toContain('turns/');
+    expect(text).not.toContain('. "$__botmux_cred"');
+  });
+});
+
 describe.each([
   ['traex', createTraexAdapter],
   ['codex', createCodexAdapter],
@@ -114,7 +196,7 @@ describe.each([
       const shellEnv = workerShellEnv(dataDir);
       const realTool = join(dataDir, 'real-tool');
       writeFileSync(realTool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n', { mode: 0o755 });
-      const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool)!;
+      const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool, 'single')!;
       const args = createAdapter('/bin/cli').buildArgs({
         sessionId: 'native-session',
         resume,
@@ -125,7 +207,7 @@ describe.each([
       // tests our contract, not any particular TRAE version's inheritance policy.
       const toolEnv = { PATH: '/usr/bin:/bin', ...shellOverrides(args) };
       expect(toolEnv).not.toHaveProperty('BYTEDCLI_USER_CLOUD_JWT');
-      const run = (env: Record<string, string> = toolEnv) => spawnSync('/bin/sh', [wrapper], {
+      const run = (env: Record<string, string> = toolEnv) => spawnSync('/bin/sh', [wrapper, 'x'], {
         env, encoding: 'utf8', timeout: 5_000,
       });
       const publish = (token: string, turnId: string) => {
@@ -143,6 +225,11 @@ describe.each([
         expect(run(missing)).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
       }
       publishActiveTurn(dataDir, 'botmux-session', 'turn-a');
+      // Single-snapshot model: B's publication overwrote the only file (stamped
+      // turn-b), so pointing the marker back at turn-a is a mismatch and denies.
+      // Per-turn tail access across overwrite is the proven model's contract.
+      expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
+      publishActiveTurn(dataDir, 'botmux-session', 'turn-unprepared');
       expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });

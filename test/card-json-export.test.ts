@@ -307,7 +307,12 @@ describe('renderQuotedMessage: interactive merge replaces content AND resources'
 
 // ─── insights cleanPromptText tolerates the alt suffix ────────────────────
 
-describe('cleanPromptText: strips [图片 N: alt] placeholder lines', () => {
+describe('cleanPromptText: strips internal prompt metadata', () => {
+  it('removes botmux formatting guidance from bare transcript prompts', () => {
+    const out = cleanPromptText('继续\n\n<botmux_formatting>internal formatting guidance</botmux_formatting>');
+    expect(out).toBe('继续');
+  });
+
   it('placeholder with alt suffix is removed like the bare form', () => {
     const out = cleanPromptText('看这个\n[图片 1: 报警前30分钟今(红)昨(蓝)同比] 其余\n[文件 2: spec.pdf] x\n正文');
     expect(out).not.toContain('图片 1');

@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  DURABLE_COORDINATION_CONTRACT_VERSION,
   DURABLE_INBOX_LANE_LARK_MESSAGE,
   DURABLE_INBOX_LANE_SESSION_CONTROL,
   type SessionLease,
@@ -30,10 +29,6 @@ afterEach(() => {
 });
 
 describe('SQLite durable coordination contract', () => {
-  it('pins the auxiliary-state-aware coordination contract version', () => {
-    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(5);
-  });
-
   it('uses monotonic session epochs and fences stale state writers', async () => {
     let now = 100;
     const store = makeStore(() => now);

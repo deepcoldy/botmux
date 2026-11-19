@@ -9,7 +9,7 @@ describe('new-topic default models', () => {
     expect(normalizeGroupDefaultModels({ oc_a: { codex: 'a' }, oc_b: { 'claude-code': 'sonnet' }, oc_bad: null }))
       .toEqual({ oc_a: { codex: 'a' }, oc_b: { 'claude-code': 'sonnet' } });
   });
-  for (const raw of [null, [], { gemini: 'flash' }, { codex: 2 }, { codex: 'x\nflag' }, { codex: 'x'.repeat(201) }]) {
+  for (const raw of [null, [], { opencode: 'flash' }, { codex: 2 }, { codex: 'x\nflag' }, { codex: 'x'.repeat(201) }]) {
     it(`rejects invalid config ${JSON.stringify(raw)}`, () => {
       expect(() => parseGroupDefaultModels(raw)).toThrow();
     });
@@ -22,10 +22,10 @@ describe('new-topic default models', () => {
     expect(resolveSessionLaunchModel({ session: { ...session, cliId: 'claude-code' } }, { cliId: 'codex' })).toBe('sonnet');
   });
   it('preserves fallback and other CLIs including Codex App', () => {
-    for (const cliId of ['codex', 'claude-code', 'gemini', 'codex-app']) {
+    for (const cliId of ['codex', 'claude-code', 'opencode', 'codex-app']) {
       expect(resolveSessionLaunchModel({ session: { cliId } }, { cliId, model: 'bot' })).toBe('bot');
     }
-    expect(resolveSessionLaunchModel({ session: { cliId: 'gemini', groupDefaultModels: { codex: 'codex-only' } } }, { cliId: 'gemini', model: 'flash' })).toBe('flash');
+    expect(resolveSessionLaunchModel({ session: { cliId: 'opencode', groupDefaultModels: { codex: 'codex-only' } } }, { cliId: 'opencode', model: 'flash' })).toBe('flash');
   });
 });
 
@@ -43,4 +43,16 @@ it('accepts model and effort overrides while preserving legacy model strings', (
   expect(()=>parseGroupDefaultModels({codex:{reasoningEffort:'invalid'}})).toThrow();
   expect(()=>parseGroupDefaultModels({codex:{model:42}})).toThrow();
   expect(resolveSessionLaunchModel({session:{cliId:'codex',groupDefaultModels:{codex:{model:'group',reasoningEffort:'high'}}}}, {cliId:'codex',model:'global'})).toBe('group');
+});
+
+
+it('loads Antigravity group snapshots without applying another CLI’s model or live edits', () => {
+  const models = parseGroupDefaultModels({ antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } });
+  expect(normalizeGroupDefaultModels({ oc_agy: models }).oc_agy).toEqual(models);
+  const session = { cliId: 'antigravity' as const, groupDefaultModels: structuredClone(models) };
+  models.antigravity = 'changed-after-creation';
+  expect(resolveSessionLaunchModel({ session }, { cliId: 'antigravity', model: 'live-global' })).toBe('gemini-4-argon-high');
+  expect(resolveSessionLaunchModel({ session, spawnModelOverride: 'explicit-trigger' })).toBe('explicit-trigger');
+  expect(resolveSessionLaunchModel({ session: { ...session, scope: 'chat' } }, { cliId: 'antigravity', model: 'global' })).toBe('global');
+  expect(resolveSessionLaunchModel({ session: { ...session, cliId: 'codex' } }, { cliId: 'codex', model: 'codex-global' })).toBe('codex-global');
 });

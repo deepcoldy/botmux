@@ -28,7 +28,12 @@ import { setGroupContextSettings } from '../src/services/group-context-settings-
 
 const APP = 'cli_app';
 const CHAT = 'oc_room';
-const CREATE = 1_791_240_348_974;
+// Wall-clock-relative base: these rows go through the retention prune path
+// (default 30 days) on every write. A fixed absolute epoch silently crosses
+// that cutoff one month later and every retained-row assertion starts failing
+// with "undefined.revision" (the 2026-10-05 fixture died on 2026-11-04). The
+// cases only care about relative offsets (+1s … +9s), never the epoch itself.
+const CREATE = Date.now();
 const ALEX = { key: '@_user_1', name: 'Alex', openId: 'ou_alex' };
 let dataDir: string;
 

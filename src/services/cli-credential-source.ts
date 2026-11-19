@@ -170,7 +170,7 @@ function redirectBlocker(input: {
   sessionDataDirPresent: boolean;
 }): string {
   if (input.wrapperCli) {
-    return `wrapperCli is set (under the sandbox the wrapper is ignored and the CLI data dir is not redirected) — remove wrapperCli and retry`;
+    return `wrapperCli is set (a wrapper may replace the CLI env, so the CLI data dir is not redirected behind it) — remove wrapperCli and retry`;
   }
   if (!input.supportsReadIsolation) return `adapter ${input.cliId} does not support per-bot data dir redirection`;
   if (!input.sessionDataDirPresent) return 'SESSION_DATA_DIR is missing, so there is no per-bot data dir to copy into';

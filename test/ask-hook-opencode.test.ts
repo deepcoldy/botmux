@@ -23,6 +23,7 @@ describe('OpenCode hook adapter', () => {
       expect(parsed!.questions[0].options).toHaveLength(2);
       expect(parsed!.questions[0].options[0].key).toBe('蓝绿部署');
       expect(parsed!.questions[0].options[0].label).toBe('蓝绿部署');
+      expect(parsed!.questions[0].options.map(o => o.description)).toEqual(['零停机', '逐步切流']);
       expect(parsed!.questions[0].options[1].key).toBe('滚动更新');
     });
 

@@ -1,8 +1,9 @@
 export interface TurnResult {
   version: 1;
+  resultRevision?: number;
   ref: { botId: string; sessionId: string; turnId: string; dispatchAttempt?: number };
   source: { kind: 'im' | 'http'; platform?: string; chatId?: string; messageId?: string };
-  execution: { status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; completedAt?: string; durationMs?: number };
+  execution: { status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; errorCode?: string; completedAt?: string; durationMs?: number };
   output: { status: 'available' | 'empty' | 'unavailable'; format?: 'text' | 'markdown'; content?: string; source?: 'explicit' | 'transcript'; reason?: string };
   deliveries: TurnDeliveryReceipt[];
 }

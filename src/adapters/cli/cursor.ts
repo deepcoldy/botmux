@@ -5,8 +5,10 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { delay } from '../../utils/timing.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -20,18 +22,35 @@ const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
  *  of truth for both the adapter's `pluginDir` field and the spawn-time flag. */
 export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
 
-/** Cursor agent-transcripts JSONL. Bridge-active only in adopt mode or zero-prompt
- *  spawns. The transcript carries no per-event timestamps, so adopt baselines the
- *  history by byte offset instead of the timestamp-cutoff split-live. */
+/** Cursor agent-transcripts JSONL. Always-on structured fallback (adopt,
+ *  ordinary spawns and zero-prompt spawns share the same send-marker-gated
+ *  harvest — except under the scratch COW sandbox, where the host cannot read
+ *  the overlay mirror). The transcript carries no per-event timestamps, so
+ *  adopt baselines history by byte offset instead of the timestamp-cutoff
+ *  split-live. */
 export const cursorBridgeSpec: StructuredBridgeSpec = {
   drain: (path, offset) => drainCursorTranscript(path, offset),
   locate: {
     bySessionId: sessionId => findCursorTranscriptByChatId(sessionId),
     byPid: pid => findCursorTranscriptByPid(pid)?.path,
   },
-  spawn: { sessionId: 'cli', baseline: 'resume-aware', zeroPromptOnly: true },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware' },
   adopt: { attach: 'baseline-skip-tail' },
 };
+
+/** The mounted composer's placeholder (empty composer); see readyPattern. */
+const CURSOR_EMPTY_COMPOSER = /→\s+(?:Plan, search, build anything|Add a follow-up)/;
+
+/** True when a stopped Cursor turn left a queued follow-up parked: the turn has
+ *  ended, the follow-ups panel offers `enter steer`, and the composer is empty,
+ *  so exactly one Enter submits that item as the next turn. Cursor flushes the
+ *  queue only when a turn ends naturally; after Ctrl-C the item stays parked. */
+export function cursorStopLeftParkedFollowUp(screen: string): boolean {
+  const text = stripAnsiScreenText(screen);
+  return /\benter steer\b/.test(text)
+    && CURSOR_EMPTY_COMPOSER.test(text)
+    && !/ctrl\+c to stop/i.test(text);
+}
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -71,7 +90,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
         base.push('--model', model.trim());
       }
       if (promptInjection !== 'none') {
-        base.push('--plugin-dir', CURSOR_PLUGIN_DIR);
+        base.push('--plugin-dir', builtinPluginDirForSession(CURSOR_PLUGIN_DIR));
         if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
       }
       if (!resume) {
@@ -209,7 +228,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     // permanently suppressed, no idle edge). Matching the post-turn placeholder
     // too keeps every turn's idle edge alive. Neither placeholder appears on the
     // login/startup screens, so the boot-time guard is unchanged.
-    readyPattern: /→\s+(?:Plan, search, build anything|Add a follow-up)/,
+    readyPattern: CURSOR_EMPTY_COMPOSER,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
     pluginDir: CURSOR_PLUGIN_DIR,

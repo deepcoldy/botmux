@@ -1,6 +1,6 @@
 import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 /** 角色库根：v0 固定约定，不做配置。 */
 export function roleLibraryRoot(): string {
@@ -31,12 +31,15 @@ const APP_ID_SEGMENT_RE = /^(?!\.{1,2}$)[A-Za-z0-9_.-]+$/;
  *    末两段确定不是链接、上层已 realpath，返回值天然是 canonical 路径，调用方不得再
  *    realpath（再跟一次就把这道校验作废了）。
  *
- * 明确不在本函数（也不在本文件）射程内的两件事，都需要宿主级写权限，而拿到宿主级写
- * 权限的人本来就能直接改 bots.json 关掉沙盒 —— 且这两条对策略里**每一条**路径规则
- * （workingDir、botHome、cliDataPaths…全都在同一时点做一次存在性检查）都同样成立，
- * 只为这一条规则加固属于安全戏剧：
+ * 明确不在本函数（也不在本文件）射程内的两件事。一般形态下都需要宿主级写权限，而拿到
+ * 宿主级写权限的人本来就能直接改 bots.json 关掉沙盒 —— 且这两条对策略里**每一条**路径
+ * 规则（workingDir、botHome、cliDataPaths…全都在同一时点做一次存在性检查）都同样成立：
  * - TOCTOU：lstat 之后、真正 spawn/bind 之前把目录换成符号链接。路径型沙盒（Seatbelt
  *   吃路径字符串、bwrap 吃 bind 源）无法靠持 fd 关闭这个窗口。
+ *   **例外：workingDir 位于本 bot 角色库子树之内时不需要宿主权限**——子树本身授了 rw，
+ *   沙盒 agent 可自行把 workingDir（或其子树内的祖先）rename 掉、换成指向 `$HOME` 的
+ *   链接，下次 spawn（定时任务 fire、/cd 后 respawn…）就把链接目标当 workingDir 授 rw。
+ *   这一族由 roleLibraryWorkingDirEscapes() 在 worker spawn 处单点 fail-closed。
  * - mount point：末段是 bind/FUSE 挂载点时仍是「真目录」，能把挂载目标整棵授出去。
  *
  * 另一件既有遗留：大小写不敏感卷上两个仅大小写不同的 appId 指向同一目录。那是角色库
@@ -57,6 +60,44 @@ export function roleLibrarySubtree(appId: string, rootOverride?: string): string
   const rootPath = realDir(join(parentReal, basename(root)));
   if (!rootPath) return null;
   return realDir(join(rootPath, appId));
+}
+
+/** worker spawn 前的单点闸：workingDir 字面上（展开 `~`、不 realpath）落在本 bot
+ *  角色库子树内（含相等；字面子树或 canonical 子树任一），但 realpath 后已不在
+ *  canonical 子树内（含相等）→ true，调用方必须拒绝 spawn。解析失败也按逃逸处理
+ *  （fail-closed）。字面上不在子树内的路径（普通项目目录、`$HOME` 本身是链接的机器上
+ *  的库外路径）一律返回 false，不改变既有行为。 */
+export function roleLibraryWorkingDirEscapes(
+  workingDir: string,
+  subtreeReal: string,
+  lexicalSubtree: string,
+): boolean {
+  const under = (root: string, p: string) => p === root || p.startsWith(`${root}/`);
+  const lexical = workingDir === '~' ? homedir()
+    : workingDir.startsWith('~/') ? join(homedir(), workingDir.slice(2))
+    : workingDir;
+  const norm = resolve(lexical);
+  if (!under(resolve(lexicalSubtree), norm) && !under(subtreeReal, norm)) return false;
+  let real: string;
+  try { real = realpathSync(norm); } catch { return true; }
+  try {
+    const a = statSync(real), b = statSync(subtreeReal);
+    if (a.dev === b.dev && a.ino === b.ino) return false;
+    return !isContainedIn(real, subtreeReal);
+  } catch { return true; }
+}
+
+/** worker spawn 用的硬闸：subtreeReal 为空（非沙盒 / 无 Lark 传输 / 无子树）时不适用；
+ *  否则 workingDir 发生 roleLibraryWorkingDirEscapes 所述逃逸即抛错，调用方不得吞掉。 */
+export function assertWorkingDirStaysInRoleLibrary(
+  workingDir: string,
+  subtreeReal: string | undefined,
+  appId: string,
+): void {
+  if (!subtreeReal) return;
+  if (!roleLibraryWorkingDirEscapes(workingDir, subtreeReal, join(roleLibraryRoot(), appId))) return;
+  throw new Error(`workingDir ${workingDir} is inside the role library subtree ${subtreeReal} `
+    + 'but resolves outside it (symlink swap)');
 }
 
 /** 文件系统身份包含判断（dev+ino）：从 childReal 逐级向上，某祖先与 rootReal 同一目录即包含。

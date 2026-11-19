@@ -31,6 +31,8 @@ const GROUPS: Group[] = [
 ];
 
 const ALL = GROUPS.flatMap(g => g.options);
+/** 主题可选值（⌘K 面板的「主题：xxx」条目复用同一份，不另抄列表）。 */
+export const THEME_OPTIONS: ReadonlyArray<Pick<Opt, 'value' | 'labelKey'>> = ALL;
 let open = false;
 let closeTimer: number | null = null;
 let hideTimer: number | null = null;

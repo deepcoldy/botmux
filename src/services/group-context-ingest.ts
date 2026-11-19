@@ -14,7 +14,8 @@
  */
 
 import { parseEventMessage, structuredMentionRefs, rawPlaceholderText, postMentionRefs } from '../im/lark/message-parser.js';
-import { projectGroupContextCard, GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-card.js';
+import { GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-card.js';
+import { projectObservedGroupContextCard } from './group-context-card-source.js';
 import { logger } from '../utils/logger.js';
 import { isGroupContextNoise, isUnavailableGroupContextCard, sanitizeGroupContextText } from './group-context-content.js';
 import { groupContextCardObservationTime } from './group-context-card-observation.js';
@@ -108,7 +109,7 @@ export function normalizeGroupContextEvent(larkAppId: string, data: any): GroupC
   const senderType = normalizeSenderType(sender?.sender_type);
   const msgType: string = typeof message.message_type === 'string' ? message.message_type : 'unknown';
   const projection = senderType === 'bot' && msgType === 'interactive'
-    ? projectGroupContextCard(message.content ?? '') : undefined;
+    ? projectObservedGroupContextCard(message.content ?? '', larkAppId, senderId) : undefined;
   if (projection && projection.kind !== 'conversation') return undefined;
   if (projection?.kind === 'conversation') message = { ...message, content: projection.content };
   const createTime = Math.trunc(Number(message.create_time) || 0);

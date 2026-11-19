@@ -6,6 +6,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
+import { createHash } from 'node:crypto';
 
 let dir: string;
 let path: string;
@@ -19,10 +20,30 @@ const events = [start, event('cot', 11_000), event('cot', 21_000), final];
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'codex-adopt-recovery-')); path = join(dir, 'journal.json'); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-function checkpoint(dispatchAttempt?: number) {
+it('checkpoints exact native input proof only after a real user attribution and when opted in', () => {
+  const queue = new CodexBridgeQueue(() => 10_000);
+  queue.mark('om_original', start.text, 10_000);
+  checkpointCodexAdoptTurns(path, rollout, queue, 0, true);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof).toBeUndefined();
+  queue.ingest([start]);
+  checkpointCodexAdoptTurns(path, rollout, queue, 0, true);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof).toEqual({ uuid: start.uuid,
+    hash: createHash('sha256').update(start.text).digest('hex'), timestampMs: start.timestampMs, trajectoryOffset: 0 });
+  queue.ingest([final]);
+  checkpointCodexAdoptTurns(path, rollout, queue, 999, true);
+  checkpointCodexAdoptTurns(path, rollout, queue, 1_999, true);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof?.trajectoryOffset).toBe(0);
+  checkpointCodexAdoptTurns(path, rollout, queue);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof).toBeUndefined();
+});
+
+function checkpoint(
+  dispatchAttempt?: number,
+  linkRefMode?: 'observe' | 'enabled',
+) {
   const queue = new CodexBridgeQueue(() => 10_000);
   queue.setLocalTurns(true, 10_000);
-  queue.mark('om_original', start.text, 10_000, dispatchAttempt);
+  queue.mark('om_original', start.text, 10_000, dispatchAttempt, undefined, linkRefMode);
   queue.ingest([start]);
   checkpointCodexAdoptTurns(path, rollout, queue);
   return queue;
@@ -65,6 +86,17 @@ describe('adopted Codex turn recovery', () => {
     expect(restore(events, 40_000).queue.drainEmittable()).toEqual([]);
   });
 
+  it('restores the admission-frozen LinkRef mode with the exact pending turn', () => {
+    checkpoint(undefined, 'enabled');
+    expect(readBridgeTurnJournal(path)).toMatchObject([
+      { turnId: 'om_original', linkRefMode: 'enabled' },
+    ]);
+    const { queue } = restore(events, 40_000);
+    expect(queue.drainEmittable()).toMatchObject([
+      { turnId: 'om_original', finalText: 'Finished', linkRefMode: 'enabled' },
+    ]);
+  });
+
   it('recovers a final produced while the daemon was offline', () => {
     checkpoint();
     expect(restore(events, 40_000).queue.drainEmittable())
@@ -86,7 +118,9 @@ describe('adopted Codex turn recovery', () => {
     const result = restoreCodexAdoptTurns(path, rollout, queue, events, 20_000, 20_000);
     expect(result.restored).toBe(1);
     expect(queue.peek().map(t => t.turnId)).toEqual(['om_original', 'om_new']);
+    expect(queue.peek()[0]).toMatchObject({ turnId: 'om_original', restoredFromJournal: true });
     expect(queue.peek()[1]).toBe(current);
+    expect(current.restoredFromJournal).toBeUndefined();
     queue.absorb(result.history);
     queue.ingest(result.live);
     expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_original', finalText: 'Finished' }]);

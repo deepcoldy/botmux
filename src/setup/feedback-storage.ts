@@ -1,0 +1,30 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline/promises';
+import { readFeedbackStorageConfig } from '../services/feedback-storage-config.js';
+import { configureFeedbackStorageFile, initializeFeedbackStorage } from '../services/feedback-storage-management.js';
+import { t } from '../i18n/index.js';
+
+export async function configureFeedbackStorage(dataDir: string): Promise<void> {
+  if (process.env.BOTMUX_FEEDBACK_CONFIG_FILE) {
+    const config = await configureFeedbackStorageFile(dataDir, process.env.BOTMUX_FEEDBACK_CONFIG_FILE);
+    if (config.candidate?.backend === 'supabase') {
+      process.stdout.write(t('feedback.storage.supabaseBootstrap') + '\n');
+    } else if (config.candidate) await initializeFeedbackStorage(dataDir, config.generation);
+    return;
+  }
+  if (existsSync(join(dataDir, 'feedback-storage.json')) || existsSync(join(dataDir, 'botmux-feedback.sqlite'))) return;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return;
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const choice = (await prompt.question(t('feedback.storage.choose'))).trim().toLowerCase();
+    if (choice && !['sqlite', 'postgresql', 'supabase'].includes(choice)) throw new Error('feedback_storage_target_invalid');
+    if (choice === 'postgresql' || choice === 'supabase') {
+      const file = (await prompt.question(t('feedback.storage.configPath'))).trim();
+      const config = await configureFeedbackStorageFile(dataDir, file);
+      if ((config.candidate ?? config.active).backend !== choice) throw new Error('feedback_storage_target_invalid');
+      if (choice === 'supabase') process.stdout.write(t('feedback.storage.supabaseBootstrap') + '\n');
+      else await initializeFeedbackStorage(dataDir, config.generation);
+    } else await readFeedbackStorageConfig(dataDir);
+  } finally { prompt.close(); }
+}

@@ -124,9 +124,12 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
       NORMAL, 'card_x', 'loader', { img_key: 'img_x' }, 3, 'u3',
     )).resolves.toBeUndefined();
     expect(fakeClient.im.v1.message.create).toHaveBeenCalled();
+    // forwardMessage now always carries a dedupe uuid in params (api-gate
+    // retries reuse it so a lost response cannot post the message twice), so
+    // this boundary case pins the unchanged fields and only requires a token.
     expect(fakeClient.im.v1.message.forward).toHaveBeenCalledWith({
       path: { message_id: 'om' },
-      params: { receive_id_type: 'chat_id' },
+      params: { receive_id_type: 'chat_id', uuid: expect.any(String) },
       data: { receive_id: 'oc' },
     });
     expect(fakeClient.im.v1.message.patch).toHaveBeenCalled();

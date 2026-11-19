@@ -5,36 +5,12 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  RETRY_COOLDOWN_MS,
-  shouldRecordFailedTurn,
   buildFailedTurnRecord,
   retryCooldownRemaining,
   markRetryAttempt,
+  refundRetryAttempt,
 } from '../src/services/failed-turn-retry.js';
 import type { FailedTurnRecord } from '../src/types.js';
-
-describe('shouldRecordFailedTurn', () => {
-  it('records failed terminals whose turn matches the current reply target', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'failed' }, 't1')).toBe(true);
-  });
-
-  it('records ambiguous terminals (interrupted turns)', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'ambiguous' }, 't1')).toBe(true);
-  });
-
-  it('does not record completed or cancelled terminals', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'completed' }, 't1')).toBe(false);
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'cancelled' }, 't1')).toBe(false);
-  });
-
-  it('skips type-ahead scenarios: a newer turn already owns the prompt', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'failed' }, 't2')).toBe(false);
-  });
-
-  it('records when no current reply target is known (best-effort)', () => {
-    expect(shouldRecordFailedTurn({ turnId: 't1', status: 'failed' }, undefined)).toBe(true);
-  });
-});
 
 describe('buildFailedTurnRecord', () => {
   it('builds a complete record from terminal + sources', () => {
@@ -162,8 +138,60 @@ describe('markRetryAttempt', () => {
   });
 });
 
-describe('RETRY_COOLDOWN_MS', () => {
-  it('is 10 seconds', () => {
-    expect(RETRY_COOLDOWN_MS).toBe(10_000);
+describe('refundRetryAttempt', () => {
+  function session(overrides: Partial<FailedTurnRecord> = {}): { lastFailedTurn?: FailedTurnRecord } {
+    return {
+      lastFailedTurn: {
+        turnId: 't1',
+        userPrompt: 'p',
+        cliInput: 'i',
+        failedAt: '2026-08-21T10:00:00.000Z',
+        status: 'failed',
+        retryCount: 0,
+        ...overrides,
+      },
+    };
+  }
+
+  it('gives back the cooldown of an attempt that never ran', () => {
+    const s = session();
+    const receipt = markRetryAttempt(s, new Date('2026-08-21T10:00:05.000Z'))!;
+    expect(retryCooldownRemaining(s.lastFailedTurn!, new Date('2026-08-21T10:00:06.000Z'))).toBeGreaterThan(0);
+
+    expect(refundRetryAttempt(s, receipt)).toBe(true);
+    expect(s.lastFailedTurn!.retryCount).toBe(0);
+    expect(s.lastFailedTurn!.lastRetryAt).toBeUndefined();
+    expect(retryCooldownRemaining(s.lastFailedTurn!, new Date('2026-08-21T10:00:06.000Z'))).toBe(0);
+    expect(refundRetryAttempt(s, receipt)).toBe(false);
+  });
+
+  it('restores the previous attempt stamp rather than clearing it', () => {
+    const s = session({ retryCount: 2, lastRetryAt: '2026-08-21T09:00:00.000Z' });
+    const receipt = markRetryAttempt(s, new Date('2026-08-21T10:00:05.000Z'))!;
+    expect(refundRetryAttempt(s, receipt)).toBe(true);
+    expect(s.lastFailedTurn).toMatchObject({ retryCount: 2, lastRetryAt: '2026-08-21T09:00:00.000Z' });
+  });
+
+  it('leaves a newer failure or a later attempt alone', () => {
+    const replaced = session();
+    const staleReceipt = markRetryAttempt(replaced, new Date('2026-08-21T10:00:05.000Z'))!;
+    replaced.lastFailedTurn = { ...replaced.lastFailedTurn!, turnId: 't2' };
+    expect(refundRetryAttempt(replaced, staleReceipt)).toBe(false);
+    expect(replaced.lastFailedTurn.retryCount).toBe(1);
+
+    const retried = session();
+    const firstReceipt = markRetryAttempt(retried, new Date('2026-08-21T10:00:05.000Z'))!;
+    markRetryAttempt(retried, new Date('2026-08-21T10:00:20.000Z'));
+    expect(refundRetryAttempt(retried, firstReceipt)).toBe(false);
+    expect(retried.lastFailedTurn).toMatchObject({ retryCount: 2, lastRetryAt: '2026-08-21T10:00:20.000Z' });
+  });
+
+  it('does not let an old receipt undo a newer attempt at the same count', () => {
+    const s = session();
+    const old = markRetryAttempt(s, new Date('2026-08-21T10:00:05.000Z'))!;
+    refundRetryAttempt(s, old);
+    markRetryAttempt(s, new Date('2026-08-21T10:00:30.000Z'));
+    expect(refundRetryAttempt(s, old)).toBe(false);
+    expect(s.lastFailedTurn).toMatchObject({ retryCount: 1, lastRetryAt: '2026-08-21T10:00:30.000Z' });
   });
 });

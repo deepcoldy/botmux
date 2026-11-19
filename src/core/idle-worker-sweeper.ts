@@ -1,7 +1,22 @@
 import type { DaemonSession } from './types.js';
-import { suspendWorker } from './worker-pool.js';
-import { isSuspendableBackendType } from './persistent-backend.js';
+import {
+  cliReportsTurnTerminals,
+  hasPendingOrdinaryImInput,
+  hasUnacceptedCliInput,
+  hasUnsettledAcceptedInput,
+  isSessionTransferring,
+  latestUnsettledAcceptedInput,
+  suspendWorker,
+} from './worker-pool.js';
+import { oldestFinalOutputDeliveryStartedAt } from './final-output-delivery-drain.js';
+import {
+  getSessionPersistentBackendType,
+  isSuspendableBackendType,
+  persistentBackendTargetForSession,
+} from './persistent-backend.js';
 import { tryWithBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { logger } from '../utils/logger.js';
 
 /**
  * Default per-bot live-session cap applied when a bot has no explicit
@@ -21,6 +36,26 @@ export const IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS = 1_000;
 export const ADMISSION_RECLAIM_MAX_SUSPEND = 4;
 export const ADMISSION_RECLAIM_REASON = 'admission_memory';
 export const IDLE_TTL_REASON = 'idle_ttl';
+/**
+ * How long the automatic reclaims (count cap, idle TTL, admission rescue) wait
+ * for an idle session's last accepted turn to report its terminal. The worker
+ * reports it once the transcript bridge has handed the answer over (or decided
+ * none is due); normally within 1–2 s of the idle edge. A turn whose terminal
+ * never comes (the bridge lost it, the CLI died mid-turn) must not keep the
+ * session live, and 2 min is far beyond any terminal that is still coming.
+ * Clocked from the later of the idle edge and the turn's acceptance.
+ */
+export const UNSETTLED_TURN_RECLAIM_GRACE_MS = 120_000;
+/**
+ * How long the automatic reclaims wait for an answer the daemon is still
+ * delivering to Lark, clocked from the start of that delivery. A delivery is up
+ * to three attempts (immediate, +5 s, +15 s) of a few Lark calls each (reply,
+ * card patch, overflow or image uploads), and every call may wait out three
+ * rate-limit retries of up to 32 s (api-gate). The requests themselves carry no
+ * timeout, so a stuck one needs this bound; 10 min covers six calls each
+ * spending the whole retry budget.
+ */
+export const FINAL_DELIVERY_RECLAIM_GRACE_MS = 600_000;
 
 export interface IdleWorkerSweepOptions {
   /**
@@ -63,8 +98,432 @@ export interface IdleWorkerSweepResult {
   reason: string;
 }
 
+export interface IdleSuspendCandidate {
+  sessionId: string;
+  larkAppId: string;
+  title: string;
+  lastActivityAt: number;
+  idleForMs: number;
+  workerPid?: number;
+  backendType: string;
+  backendTarget?: string;
+  processTypes: string[];
+  backingReleased?: boolean;
+  workerRetirementRequested?: boolean;
+}
+
+export interface IdleAgeSweepOptions {
+  olderThanMs: number;
+  now?: number;
+  mutationAcquireTimeoutMs?: number;
+  /**
+   * Suspend reason recorded on the session (default `idle_timeout`). Automatic
+   * policies pass their own (`idle_spin`, `host_pressure`) so logs and the
+   * persisted cold-resume state name the policy that parked the worker.
+   */
+  reason?: string;
+  /**
+   * Hard cap on candidates acted on in this pass. `undefined` = no cap (the
+   * operator command). Automatic policies bound a pass so one sweep cannot
+   * monopolize the event loop across dozens of teardowns.
+   */
+  maxCandidates?: number;
+  /** Checked before each candidate (daemon shutdown fence). */
+  shouldAbort?: () => boolean;
+}
+
+export interface IdleAgeSweepFailure {
+  candidate: IdleSuspendCandidate;
+  error: 'session_changed' | 'suspend_refused' | 'suspend_failed';
+}
+
+export interface IdleAgeSweepResult {
+  candidates: IdleSuspendCandidate[];
+  suspended: IdleSuspendCandidate[];
+  failures: IdleAgeSweepFailure[];
+}
+
 function liveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
   return [...activeSessions.values()].filter(ds => !!ds.worker && !ds.worker.killed);
+}
+
+function uniqueLiveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
+  const seen = new Set<string>();
+  return liveWorkers(activeSessions).filter(ds => {
+    const sessionId = ds.session.sessionId;
+    if (seen.has(sessionId)) return false;
+    seen.add(sessionId);
+    return true;
+  });
+}
+
+function conservativeIdleActivityAt(ds: DaemonSession): number | undefined {
+  const persisted = Date.parse(ds.session.lastMessageAt ?? '');
+  // idleSinceAt and spawnedAt are conservative safety clocks: an old message
+  // must not make a newly-idle or newly-restored worker look seven days idle.
+  const values = [persisted, ds.lastMessageAt, ds.idleSinceAt, ds.spawnedAt]
+    .filter((value): value is number => typeof value === 'number'
+      && Number.isFinite(value) && value > 0);
+  return values.length > 0 ? Math.max(...values) : undefined;
+}
+
+/**
+ * Strict "this generation owns no unsettled work" predicate shared by the
+ * operator age sweep and the CPU-driven idle-spin / host-pressure reclaims.
+ *
+ * This is deliberately stronger than `suspendableIdleCandidates` (the cap/TTL
+ * fast path): an idle screen can coexist with a turn the worker has accepted
+ * but not submitted, a scheduled run whose settlement is pending, a dashboard
+ * activation tail, or a prompt-cache keep-alive / idle auto-compact turn. Any
+ * of those would be destroyed by a suspend, so unknown or pending state fails
+ * closed here. New guards must be added HERE, not only to the automatic
+ * selector, so operator and automatic reclaims never drift apart.
+ */
+export function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
+  return hasProtectedSessionMutationOwnership(ds)
+    || isSessionTransferring(ds)
+    || !!ds.pendingRepo
+    || !!ds.pendingRepoCommitInFlight
+    || !!ds.worktreeCreating
+    || !!ds.pendingRawInput
+    || !!ds.pendingFollowUpInput
+    || (ds.pendingFollowUps?.length ?? 0) > 0
+    || !!ds.cascadeInFlight
+    || (ds.cascadeDeferred?.length ?? 0) > 0
+    || !!ds.tuiPromptCardId
+    || (ds.tuiPromptOptions?.length ?? 0) > 0
+    || !!ds.tuiPromptProcessing
+    || !!ds.agentAttention
+    || !!ds.usageLimit
+    // A turn the worker accepted is not the same as a turn the CLI started;
+    // the screen can still show a cached idle.
+    || hasPendingOrdinaryImInput(ds)
+    || hasUnsettledAcceptedInput(ds)
+    // Dashboard backlog activation journal / FIFO: input has not reached the
+    // CLI yet, so the generation still owns it.
+    || !!ds.session.queued
+    || ds.session.queuedActivationPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || ds.initialStartPending === true
+    || ds.pendingPrompt !== undefined
+    || ds.pendingTurnId !== undefined
+    // Scheduled runs must keep the existing deferred/held contract: never
+    // suspend while a hidden run is in flight or its settlement is pending.
+    || ds.session.deferredScheduleRun !== undefined
+    || ds.deferredScheduleUndeliveredTurnId !== undefined
+    || ds.deferredScheduleUnconfirmedTurnId !== undefined
+    // Claude Code idle keep-alive deliberately wakes an idle CLI; suspending
+    // it would defeat the cache-keepalive feature. Idle auto-compact is a
+    // botmux-authored turn for the same reason.
+    || ds.promptCacheKeepalive !== undefined
+    || ds.idleAutoCompactArm !== undefined
+    // `idleAutoCompactWarmSince` is tracked even while the feature is OFF
+    // (the CLI's idle edge is a useful clock). Only an enabled auto-compact
+    // can dispatch a turn from that stretch, so only then is it a blocker.
+    || (ds.session.idleAutoCompact?.enabled === true && ds.idleAutoCompactWarmSince !== undefined)
+    || ds.idleAutoCompactPendingNotice !== undefined
+    || ds.idleAutoCompactDispatchedTurnId !== undefined
+    // Background tasks still running die with the CLI (same guard as the
+    // cap / TTL / admission candidates in suspendableIdleCandidates).
+    || (ds.backgroundTaskCount ?? 0) > 0
+    || (ds.finalOutputDeliveriesInFlight?.size ?? 0) > 0
+    || hasUnacceptedCliInput(ds)
+    || !!ds.pendingSuspendReason
+    || ds.pendingSuspendGeneration !== undefined
+    || ds.remoteCloseState !== undefined
+    || ds.remoteShutdownState !== undefined;
+}
+
+function expectedReleasedProcessTypes(ds: DaemonSession, backendType: string): string[] {
+  const cliId = ds.session.cliId ?? ds.initConfig?.cliId ?? 'cli';
+  const processTypes = ['botmux __worker', `${backendType} session`, cliId];
+  if (cliId === 'traex') processTypes.push('traex-code-mode-host');
+  return processTypes;
+}
+
+/**
+ * Read-only candidate selection for the operator maintenance command. This is
+ * intentionally stricter than memory-pressure reclaim: unknown readiness or
+ * activity fails closed, and manually locked / user-attention sessions are
+ * never proposed. Selection uses daemon-owned runtime state, not `botmux list`
+ * process guesses.
+ */
+export function selectIdleSuspendCandidates(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+): IdleSuspendCandidate[] {
+  if (!Number.isFinite(opts.olderThanMs) || opts.olderThanMs <= 0) return [];
+  const now = opts.now ?? Date.now();
+  if (!Number.isFinite(now) || now <= 0) return [];
+
+  return uniqueLiveWorkers(activeSessions)
+    .filter(ds => ds.session.status === 'active')
+    .filter(ds => !ds.adoptedFrom && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode)
+    .filter(ds => ds.session.locked !== true)
+    .filter(ds => getSessionPersistentBackendType(ds) !== undefined)
+    .filter(ds => ds.workerReady === true && ds.lastScreenStatus === 'idle')
+    .filter(ds => !hasUnsettledIdleSuspendState(ds))
+    .map((ds): IdleSuspendCandidate | undefined => {
+      const lastActivityAt = conservativeIdleActivityAt(ds);
+      if (lastActivityAt === undefined || lastActivityAt > now
+        || now - lastActivityAt < opts.olderThanMs) return undefined;
+      const backend = persistentBackendTargetForSession(ds);
+      if (!backend) return undefined;
+      const backendTarget = 'agentName' in backend && backend.agentName
+        ? `${backend.sessionName}:${backend.agentName}`
+        : backend.sessionName;
+      return {
+        sessionId: ds.session.sessionId,
+        larkAppId: ds.larkAppId,
+        title: ds.session.title ?? '',
+        lastActivityAt,
+        idleForMs: now - lastActivityAt,
+        ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
+        backendType: backend.backendType,
+        backendTarget,
+        processTypes: expectedReleasedProcessTypes(ds, backend.backendType),
+      };
+    })
+    .filter((candidate): candidate is IdleSuspendCandidate => candidate !== undefined)
+    .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+}
+
+export function sweepIdleWorkersByAge(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+): IdleAgeSweepResult {
+  const candidates = selectIdleSuspendCandidates(activeSessions, opts);
+  const bySessionId = new Map(
+    uniqueLiveWorkers(activeSessions).map(ds => [ds.session.sessionId, ds] as const),
+  );
+  const suspended: IdleSuspendCandidate[] = [];
+  const failures: IdleAgeSweepFailure[] = [];
+  for (const candidate of candidates) {
+    const ds = bySessionId.get(candidate.sessionId);
+    if (!ds) {
+      failures.push({ candidate, error: 'session_changed' });
+      continue;
+    }
+    try {
+      if (suspendWorker(ds, 'idle_timeout')) {
+        suspended.push({
+          ...candidate,
+          backingReleased: true,
+          workerRetirementRequested: true,
+        });
+      }
+      else failures.push({ candidate, error: 'suspend_refused' });
+    } catch (error) {
+      failures.push({ candidate, error: 'suspend_failed' });
+      logger.error(
+        `[idle-suspend] failed session=${candidate.sessionId} bot=${candidate.larkAppId}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return { candidates, suspended, failures };
+}
+
+/**
+ * Batch variant for the operator route. The verifier's kill/probe are
+ * synchronous spawns (tmux/herdr/zellij CLI calls with multi-second deadlines,
+ * up to two attempts each), so back-to-back candidates block the daemon event
+ * loop for the sum of their worst-case durations. Yielding between candidates
+ * (setImmediate, which runs after pending I/O) keeps Lark events, other
+ * sessions and dashboard IPC flowing and bounds any single stall to one
+ * candidate's teardown.
+ *
+ * Every candidate is re-checked against live state immediately before acting:
+ * the previous candidate's kill/probe yielded the loop, so a worker screen can
+ * have flipped idle→working (a scheduled turn) or an attention/prompt marker
+ * can have arrived without a new admitted turn — the mutation gate blocks
+ * admissions, not worker IPC observations.
+ */
+export async function sweepIdleWorkersByAgeAsync(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+  yieldBetweenCandidates: () => Promise<void> = () => new Promise<void>(resolve => setImmediate(resolve)),
+): Promise<IdleAgeSweepResult> {
+  return suspendSelectedIdleCandidatesAsync(
+    activeSessions,
+    undefined,
+    opts,
+    yieldBetweenCandidates,
+  );
+}
+
+/**
+ * Shared action loop for every strict idle policy (operator age sweep,
+ * CPU-driven idle-spin, host-pressure reclaim).
+ *
+ * `selectIds` narrows the strict candidate set (the CPU policy only acts on
+ * sessions whose sampled CPU crossed its threshold); `undefined` means "all
+ * strict candidates". The guard set is ALWAYS {@link selectIdleSuspendCandidates}
+ * — both for the initial selection and for the pre-suspend re-check — so an
+ * operator-triggered sweep and an automatic reclaim can never disagree about
+ * which sessions are safe to park.
+ */
+export async function suspendSelectedIdleCandidatesAsync(
+  activeSessions: Map<string, DaemonSession>,
+  selectIds: ReadonlySet<string> | undefined,
+  opts: IdleAgeSweepOptions,
+  yieldBetweenCandidates: () => Promise<void> = () => new Promise<void>(resolve => setImmediate(resolve)),
+): Promise<IdleAgeSweepResult> {
+  const reason = opts.reason ?? 'idle_timeout';
+  const maxCandidates = opts.maxCandidates !== undefined && Number.isFinite(opts.maxCandidates)
+    ? Math.max(0, Math.floor(opts.maxCandidates))
+    : undefined;
+  if (maxCandidates === 0) return { candidates: [], suspended: [], failures: [] };
+
+  let candidates = selectIdleSuspendCandidates(activeSessions, opts);
+  if (selectIds !== undefined) {
+    candidates = candidates.filter(candidate => selectIds.has(candidate.sessionId));
+  }
+  if (maxCandidates !== undefined) candidates = candidates.slice(0, maxCandidates);
+
+  const suspended: IdleSuspendCandidate[] = [];
+  const failures: IdleAgeSweepFailure[] = [];
+  for (const candidate of candidates) {
+    await yieldBetweenCandidates();
+    if (opts.shouldAbort?.()) break;
+    // Re-run the full guard set rather than re-checking one field: the
+    // eligibility predicate must stay identical to the dry-run selection.
+    const stillEligible = selectIdleSuspendCandidates(activeSessions, {
+      ...opts,
+      now: opts.now ?? Date.now(),
+    }).some(item => item.sessionId === candidate.sessionId
+      && (selectIds === undefined || selectIds.has(item.sessionId)));
+    if (!stillEligible) {
+      failures.push({ candidate, error: 'session_changed' });
+      continue;
+    }
+    const bySessionId = new Map(
+      uniqueLiveWorkers(activeSessions).map(ds => [ds.session.sessionId, ds] as const),
+    );
+    const ds = bySessionId.get(candidate.sessionId);
+    if (!ds) {
+      failures.push({ candidate, error: 'session_changed' });
+      continue;
+    }
+    try {
+      if (suspendWorker(ds, reason)) {
+        suspended.push({
+          ...candidate,
+          backingReleased: true,
+          workerRetirementRequested: true,
+        });
+      }
+      else failures.push({ candidate, error: 'suspend_refused' });
+    } catch (error) {
+      failures.push({ candidate, error: 'suspend_failed' });
+      logger.error(
+        `[idle-suspend] failed session=${candidate.sessionId} bot=${candidate.larkAppId}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return { candidates, suspended, failures };
+}
+
+export function sweepIdleWorkersByAgeAfterTurnDrain(
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+): Promise<IdleAgeSweepResult | null> {
+  return tryWithBotTurnMutation(
+    larkAppId,
+    opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
+    () => sweepIdleWorkersByAgeAsync(activeSessions, opts),
+  ).then(result => result.acquired ? result.value : null);
+}
+
+/** Mutation-gated variant for CPU / host-pressure policies that act on a
+ *  subset of the strict candidates. Returns null when the bot gate stayed busy;
+ *  the caller retries on the next sampling tick. */
+export function suspendSelectedIdleCandidatesAfterTurnDrain(
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+  selectIds: ReadonlySet<string> | undefined,
+  opts: IdleAgeSweepOptions,
+): Promise<IdleAgeSweepResult | null> {
+  return tryWithBotTurnMutation(
+    larkAppId,
+    opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
+    () => suspendSelectedIdleCandidatesAsync(activeSessions, selectIds, opts),
+  ).then(result => result.acquired ? result.value : null);
+}
+
+interface UnsettledTurnHold {
+  /** What is still outstanding. */
+  waitingOn: 'final_delivery' | 'turn_terminal';
+  /** When the wait began; the hold ends at `since + graceMs`. */
+  since: number;
+  graceMs: number;
+}
+
+/**
+ * Why reclaiming this session now could lose the reply to its last turn:
+ *  - the daemon is still delivering a final answer: a suspend makes the
+ *    delivery's ownership re-check fail before its next Lark write, and the
+ *    answer is dropped; or
+ *  - the worker accepted the latest input and its turn has no terminal yet,
+ *    while the session already looks idle: the transcript bridge may not have
+ *    handed the answer over, and a suspend stops it. Only for a CLI this
+ *    daemon has seen report a turn terminal; for others none ever comes.
+ * Once neither holds, the answer is out or known not to be needed (the worker
+ * reports a terminal only after handing the answer over or suppressing it,
+ * e.g. after an explicit `botmux send`). Each wait is bounded, so a stuck
+ * delivery or bridge cannot keep the session live.
+ */
+function unsettledTurnHold(ds: DaemonSession): UnsettledTurnHold | undefined {
+  const deliverySince = oldestFinalOutputDeliveryStartedAt(ds);
+  if (deliverySince !== undefined) {
+    return { waitingOn: 'final_delivery', since: deliverySince, graceMs: FINAL_DELIVERY_RECLAIM_GRACE_MS };
+  }
+  if (!cliReportsTurnTerminals(ds)) return undefined;
+  const latest = latestUnsettledAcceptedInput(ds);
+  if (!latest) return undefined;
+  // A turn that never showed as working keeps an old idle edge.
+  return {
+    waitingOn: 'turn_terminal',
+    since: Math.max(ds.idleSinceAt ?? 0, latest.at),
+    graceMs: UNSETTLED_TURN_RECLAIM_GRACE_MS,
+  };
+}
+
+/** Holds already logged, so repeated sweeps log a hold and its expiry once. */
+const loggedUnsettledHold = new WeakMap<DaemonSession, string>();
+
+/**
+ * When an automatic reclaim or a queued suspend of this session may go ahead
+ * as far as its last reply is concerned: `undefined` when nothing holds it,
+ * else the time the current hold ends (its bound; it ends sooner when the
+ * reply settles).
+ */
+export function unsettledReplyHoldUntil(ds: DaemonSession, now: number = Date.now()): number | undefined {
+  const hold = unsettledTurnHold(ds);
+  if (!hold) return undefined;
+  const until = hold.since + hold.graceMs;
+  return now < until ? until : undefined;
+}
+
+function holdsReclaimForUnsettledTurn(ds: DaemonSession, now: number): boolean {
+  const hold = unsettledTurnHold(ds);
+  if (!hold) return false;
+  const expired = now - hold.since >= hold.graceMs;
+  const logKey = `${hold.waitingOn}:${hold.since}:${expired}`;
+  if (loggedUnsettledHold.get(ds) !== logKey) {
+    loggedUnsettledHold.set(ds, logKey);
+    if (expired) {
+      logger.warn(
+        `[idle-worker-sweeper] session=${ds.session.sessionId} still waiting on ${hold.waitingOn} `
+        + `after ${Math.round((now - hold.since) / 1000)}s; no longer holding reclaim`,
+      );
+    } else {
+      logger.info(`[idle-worker-sweeper] holding reclaim of session=${ds.session.sessionId}: waiting on ${hold.waitingOn}`);
+    }
+  }
+  return !expired;
 }
 
 /**
@@ -74,10 +533,17 @@ function liveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[
  *    observe/bridge session into a normal botmux session on resume), and
  *  - its backend survives a kill + cold resume (tmux/herdr/zellij/zmx only;
  *    pty/riff/mojo are skipped), and
- *  - it is currently idle (never cut off an in-flight reply).
+ *  - it is currently idle (never cut off an in-flight reply), and
+ *  - no background task it launched is still running, and
+ *  - no input delivered to it is still waiting for its CLI to take it, and
+ *  - no answer of its last turn is still on its way to the group (bounded,
+ *    see {@link unsettledTurnHold}).
  * Ordered least-recently-messaged first so all policies evict LRU.
  */
-function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
+function suspendableIdleCandidates(
+  activeSessions: Map<string, DaemonSession>,
+  now: number = Date.now(),
+): DaemonSession[] {
   return liveWorkers(activeSessions)
     // Never suspend an adopted session. forkAdoptWorker stamps its
     // initConfig.backendType as tmux/herdr/zellij/zmx (so it would otherwise pass
@@ -92,7 +558,64 @@ function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): 
     // Correctness guard (not a timeout): never suspend a session that is
     // currently producing output — that would cut off an in-flight reply.
     .filter(ds => ds.lastScreenStatus === 'idle')
+    // Same guard for work the turn left running: a CI monitor or test run in
+    // the background (the card's 「后台子任务运行中（N）」) dies with the CLI and
+    // a cold resume cannot bring it back, so the session would never hear its
+    // result. Such a session counts as busy until the task stops.
+    .filter(ds => !(ds.backgroundTaskCount && ds.backgroundTaskCount > 0))
+    // An idle screen does not mean the input has landed: a freshly woken
+    // session shows its prompt while the message that woke it is still queued
+    // or being typed, and suspending then destroys it with the CLI.
+    .filter(ds => !hasUnacceptedCliInput(ds))
+    // The input landed, but the turn it started has not settled (output side
+    // of the guard above): its answer would be lost with the worker.
+    .filter(ds => !holdsReclaimForUnsettledTurn(ds, now))
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
+}
+
+function isCurrentSuspendableIdleCandidate(
+  activeSessions: Map<string, DaemonSession>,
+  candidate: DaemonSession,
+  now: number = Date.now(),
+): boolean {
+  // Require the exact generation object selected before the async boundary.
+  // A replacement generation with the same durable session id is new work and
+  // must wait for a later sweep instead of inheriting this candidate snapshot.
+  // Reuse the selector itself so later guard additions cannot drift between
+  // initial selection and the pre-kill recheck.
+  return suspendableIdleCandidates(activeSessions, now).includes(candidate);
+}
+
+function idleTtlExpiredNow(ds: DaemonSession, opts: IdleWorkerSweepOptions): boolean {
+  return opts.idleTtlMs !== undefined
+    && ds.idleSinceAt !== undefined
+    && ds.idleSinceAt + opts.idleTtlMs <= (opts.now ?? Date.now());
+}
+
+const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
+
+function suspendAutomaticCandidate(
+  ds: DaemonSession,
+  reason: string,
+  policy: 'cap_ttl' | 'admission',
+): boolean {
+  try {
+    const suspended = suspendWorker(ds, reason);
+    if (!suspended) {
+      logger.warn(
+        `[idle-worker-sweeper] candidate refused session=${ds.session.sessionId} `
+        + `policy=${policy} reason=${reason}`,
+      );
+    }
+    return suspended;
+  } catch (error) {
+    logger.error(
+      `[idle-worker-sweeper] candidate failed session=${ds.session.sessionId} `
+      + `policy=${policy} reason=${reason}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
 }
 
 /**
@@ -106,8 +629,9 @@ function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): 
  *
  * The count policy deliberately has NO idle-time threshold: while resources
  * allow, an old session is never timed out by the cap. A session mid-turn
- * (`lastScreenStatus !== 'idle'`) is never suspended. If every over-cap session
- * is busy, none are count-suspended this round and the next sweep retries.
+ * (`lastScreenStatus !== 'idle'`), or one whose background tasks still run, is
+ * never suspended. If every over-cap session is busy, none are count-suspended
+ * this round and the next sweep retries.
  */
 export function sweepIdleWorkers(
   activeSessions: Map<string, DaemonSession>,
@@ -134,7 +658,7 @@ export function sweepIdleWorkers(
 
   const suspended: IdleWorkerSweepResult[] = [];
   let liveCount = running.length;
-  for (const ds of suspendableIdleCandidates(activeSessions)) {
+  for (const ds of suspendableIdleCandidates(activeSessions, now)) {
     const isTtl = ttlExpired.has(ds.session.sessionId);
     // TTL victims suspend regardless of the cap; a non-TTL candidate only
     // fills the count backfill while still over cap (TTL suspensions lower
@@ -145,6 +669,40 @@ export function sweepIdleWorkers(
     if (!suspendWorker(ds, reason)) continue;
     suspended.push({ sessionId: ds.session.sessionId, reason });
     liveCount--;
+  }
+  return suspended;
+}
+
+/**
+ * Event-loop-friendly automatic cap/TTL sweep. The synchronous API above stays
+ * available for explicit callers and legacy tests; daemon automatic paths use
+ * this variant so each candidate gets an I/O turn and a fresh generation/state
+ * check immediately before its synchronous kill + post-probe.
+ */
+export async function sweepIdleWorkersAsync(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleWorkerSweepOptions = {},
+  yieldBetweenCandidates: () => Promise<void> = yieldToEventLoop,
+): Promise<IdleWorkerSweepResult[]> {
+  const cap = opts.maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS;
+  const ttlEnabled = opts.idleTtlMs !== undefined;
+  const initialRunning = liveWorkers(activeSessions);
+  const initiallyOverCap = cap > 0 ? initialRunning.length > cap : false;
+  const initiallyTtlDue = ttlEnabled && initialRunning.some(ds => idleTtlExpiredNow(ds, opts));
+  if (!initiallyOverCap && !initiallyTtlDue) return [];
+
+  const candidates = suspendableIdleCandidates(activeSessions, opts.now ?? Date.now());
+  const suspended: IdleWorkerSweepResult[] = [];
+  for (const candidate of candidates) {
+    await yieldBetweenCandidates();
+    if (!isCurrentSuspendableIdleCandidate(activeSessions, candidate, opts.now ?? Date.now())) continue;
+
+    const isTtl = idleTtlExpiredNow(candidate, opts);
+    const isOverCap = cap > 0 && liveWorkers(activeSessions).length > cap;
+    if (!isTtl && !isOverCap) continue;
+    const reason = isTtl ? IDLE_TTL_REASON : 'live_worker_cap';
+    if (!suspendAutomaticCandidate(candidate, reason, 'cap_ttl')) continue;
+    suspended.push({ sessionId: candidate.session.sessionId, reason });
   }
   return suspended;
 }
@@ -172,6 +730,58 @@ export function reclaimIdleWorkersForAdmission(
   return suspended;
 }
 
+/** Async automatic admission reclaim with per-candidate revalidation/isolation. */
+export async function reclaimIdleWorkersForAdmissionAsync(
+  activeSessions: Map<string, DaemonSession>,
+  opts: ReclaimIdleWorkersOptions = {},
+  yieldBetweenCandidates: () => Promise<void> = yieldToEventLoop,
+): Promise<IdleWorkerSweepResult[]> {
+  const maxSuspend = opts.maxSuspend ?? ADMISSION_RECLAIM_MAX_SUSPEND;
+  if (maxSuspend <= 0) return [];
+  const candidates = suspendableIdleCandidates(activeSessions);
+  const suspended: IdleWorkerSweepResult[] = [];
+  for (const candidate of candidates) {
+    if (suspended.length >= maxSuspend) break;
+    await yieldBetweenCandidates();
+    if (!isCurrentSuspendableIdleCandidate(activeSessions, candidate)) continue;
+    if (opts.excludeSessionId !== undefined
+      && candidate.session.sessionId === opts.excludeSessionId) continue;
+    if (!suspendAutomaticCandidate(candidate, ADMISSION_RECLAIM_REASON, 'admission')) continue;
+    suspended.push({
+      sessionId: candidate.session.sessionId,
+      reason: ADMISSION_RECLAIM_REASON,
+    });
+  }
+  return suspended;
+}
+
+/**
+ * Coalesce sweep triggers (spawn and idle edges, settled turns, the periodic
+ * timer): while one sweep runs, further triggers collapse into a single rerun
+ * after it. A trigger cannot simply be dropped: it may come after the running
+ * sweep took its candidate list (a held session whose turn just settled), and
+ * that session would otherwise wait for the next periodic tick. `run` must
+ * not reject.
+ */
+export function coalesceSweepTriggers<S>(run: (source: S) => Promise<void>): (source: S) => void {
+  let running = false;
+  let rerun: { source: S } | undefined;
+  const trigger = (source: S): void => {
+    if (running) {
+      rerun ??= { source };
+      return;
+    }
+    running = true;
+    void run(source).finally(() => {
+      running = false;
+      const next = rerun;
+      rerun = undefined;
+      if (next) trigger(next.source);
+    });
+  };
+  return trigger;
+}
+
 /**
  * Run a cap/TTL sweep only after every already-admitted inbound turn has either
  * durably accepted its input or finished.  A worker spawn can put the bot over
@@ -193,7 +803,7 @@ export function sweepIdleWorkersAfterTurnDrain(
   return tryWithBotTurnMutation(
     larkAppId,
     opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
-    () => sweepIdleWorkers(activeSessions, opts),
+    () => sweepIdleWorkersAsync(activeSessions, opts),
   ).then(result => result.acquired ? result.value : []);
 }
 
@@ -211,6 +821,6 @@ export function reclaimIdleWorkersForAdmissionAfterTurnDrain(
   return tryWithBotTurnMutation(
     larkAppId,
     opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
-    () => reclaimIdleWorkersForAdmission(activeSessions, opts),
+    () => reclaimIdleWorkersForAdmissionAsync(activeSessions, opts),
   ).then(result => result.acquired ? result.value : []);
 }

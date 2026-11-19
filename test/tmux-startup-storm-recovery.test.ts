@@ -97,7 +97,19 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       `REAL='${REAL_TMUX}'`,
       `MARKER='${markerPath}'`,
       `ATTEMPTS='${attemptLogPath}'`,
-      'if [ "$1" = "new-session" ]; then',
+      // Find the command word past tmux's global flags: once a server answers,
+      // the anti-fork gate prefixes the retry with `-N` (and a socket label
+      // would add `-L <name>`), so `$1` alone no longer identifies new-session.
+      'CMD=""; SKIP=0',
+      'for a in "$@"; do',
+      '  if [ "$SKIP" = 1 ]; then SKIP=0; continue; fi',
+      '  case "$a" in',
+      '    -L|-S|-f) SKIP=1 ;;',
+      '    -*) ;;',
+      '    *) CMD="$a"; break ;;',
+      '  esac',
+      'done',
+      'if [ "$CMD" = "new-session" ]; then',
       '  echo attempt >> "$ATTEMPTS"',
       '  if [ ! -e "$MARKER" ]; then',
       '    : > "$MARKER"',
@@ -169,10 +181,10 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       // The deadline genuinely fired (this was not a fast-path success) …
       expect(existsSync(markerPath)).toBe(true);
       expect(elapsedMs).toBeGreaterThanOrEqual(4500);
-      // … the retry ran and adopted the already-created session ("duplicate
-      // session" answered by the real server) instead of failing the launch.
+      // The printed identity proves creation even if the client later times
+      // out. Recover its subscription without trying to create it again.
       const attempts = readFileSync(attemptLogPath, 'utf-8').trim().split('\n').length;
-      expect(attempts).toBe(2);
+      expect(attempts).toBe(1);
       // The session the timed-out first attempt created is alive and is the one
       // we attached to (authoritative check against the real server).
       expect(() => execFileSync(REAL_TMUX!, ['has-session', '-t', SESSION_NAME], {

@@ -10,6 +10,7 @@
  * real on-disk asset path under `/$bunfs`.
  *
  * `/g --avatar logo` reuses the same avatar and cache via applyLogoGroupAvatar.
+ * Newly created bot apps reuse the same gradients at 512px (see bot-app-icon.ts).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -21,10 +22,11 @@ import { SESSION_GROUP_AVATAR_LOGO_BASE64 } from './session-group-avatar-logo-da
 
 const AVATAR_SIZE = 360;
 const MAX_PNG_PIXELS = 4096 * 4096;
-const LOGO_X = 69;
-const LOGO_Y = 86;
 const LOGO_WIDTH = 221;
 const LOGO_HEIGHT = 187;
+// renderLogoAvatarPng centers the logo; on the 360px canvas that lands at (69, 86).
+const LOGO_X = Math.floor((AVATAR_SIZE - LOGO_WIDTH) / 2);
+const LOGO_Y = Math.floor((AVATAR_SIZE - LOGO_HEIGHT) / 2);
 
 export interface AvatarVariant {
   id: string;
@@ -151,7 +153,7 @@ interface AvatarCache {
   imageKeys?: Record<string, string>;
 }
 
-interface DecodedPng {
+export interface DecodedPng {
   width: number;
   height: number;
   data: Uint8Array;
@@ -214,15 +216,22 @@ function mix(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function fillBackground(rgba: Uint8Array, variant: AvatarVariant): void {
+function fillBackground(rgba: Uint8Array, variant: AvatarVariant, size: number): void {
   const [topLeft, topRight, bottomLeft, bottomRight] = variant.corners;
   const [glowR, glowG, glowB] = variant.glow;
   const maxDistance = Math.sqrt(0.5 ** 2 + 0.5 ** 2);
+  // The glow is laid out in 360px canvas units; scale it with the canvas so a
+  // larger render keeps the same look (scale 1 leaves the 360px output as is).
+  const scale = size / AVATAR_SIZE;
+  const glowX = 92 * scale;
+  const glowY = 78 * scale;
+  const glowRadiusX = 230 * scale;
+  const glowRadiusY = 220 * scale;
 
-  for (let y = 0; y < AVATAR_SIZE; y += 1) {
-    const ty = y / (AVATAR_SIZE - 1);
-    for (let x = 0; x < AVATAR_SIZE; x += 1) {
-      const tx = x / (AVATAR_SIZE - 1);
+  for (let y = 0; y < size; y += 1) {
+    const ty = y / (size - 1);
+    for (let x = 0; x < size; x += 1) {
+      const tx = x / (size - 1);
       const rowMixLeft = [
         mix(topLeft[0], bottomLeft[0], ty),
         mix(topLeft[1], bottomLeft[1], ty),
@@ -238,8 +247,8 @@ function fillBackground(rgba: Uint8Array, variant: AvatarVariant): void {
       let g = mix(rowMixLeft[1], rowMixRight[1], tx);
       let b = mix(rowMixLeft[2], rowMixRight[2], tx);
 
-      const glowDx = (x - 92) / 230;
-      const glowDy = (y - 78) / 220;
+      const glowDx = (x - glowX) / glowRadiusX;
+      const glowDy = (y - glowY) / glowRadiusY;
       const glowStrength = Math.max(0, 1 - Math.sqrt(glowDx * glowDx + glowDy * glowDy));
       r = mix(r, glowR, glowStrength * 0.28);
       g = mix(g, glowG, glowStrength * 0.28);
@@ -250,7 +259,7 @@ function fillBackground(rgba: Uint8Array, variant: AvatarVariant): void {
       const vignette = Math.max(0, Math.sqrt(dx * dx + dy * dy) / maxDistance - 0.2) / 0.8;
       const shade = 1 - vignette * 0.14;
 
-      const index = (y * AVATAR_SIZE + x) * 4;
+      const index = (y * size + x) * 4;
       rgba[index] = clampByte(r * shade);
       rgba[index + 1] = clampByte(g * shade);
       rgba[index + 2] = clampByte(b * shade);
@@ -405,12 +414,13 @@ function blendPixel(target: Uint8Array, index: number, sr: number, sg: number, s
   target[index + 3] = clampByte(outA * 255);
 }
 
-function compositeLogo(canvas: Uint8Array): void {
-  const logo = decodeInlineLogo();
+function compositeLogo(canvas: Uint8Array, size: number, logo: DecodedPng): void {
+  const left = Math.floor((size - logo.width) / 2);
+  const top = Math.floor((size - logo.height) / 2);
   for (let y = 0; y < logo.height; y += 1) {
     for (let x = 0; x < logo.width; x += 1) {
       const sourceIndex = (y * logo.width + x) * 4;
-      const targetIndex = ((LOGO_Y + y) * AVATAR_SIZE + (LOGO_X + x)) * 4;
+      const targetIndex = ((top + y) * size + (left + x)) * 4;
       blendPixel(
         canvas,
         targetIndex,
@@ -478,11 +488,20 @@ export function encodePngRgba(width: number, height: number, rgba: Uint8Array): 
   ]);
 }
 
+/**
+ * Render `variant`'s gradient on a `size`×`size` canvas with `logo` (straight
+ * RGBA) centered on it. The logo is composited 1:1, so callers pass one already
+ * resized for that canvas.
+ */
+export function renderLogoAvatarPng(variant: AvatarVariant, size: number, logo: DecodedPng): Buffer {
+  const rgba = new Uint8Array(size * size * 4);
+  fillBackground(rgba, variant, size);
+  compositeLogo(rgba, size, logo);
+  return encodePngRgba(size, size, rgba);
+}
+
 export function renderSessionGroupAvatarPng(variant: AvatarVariant): Buffer {
-  const rgba = new Uint8Array(AVATAR_SIZE * AVATAR_SIZE * 4);
-  fillBackground(rgba, variant);
-  compositeLogo(rgba);
-  return encodePngRgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
+  return renderLogoAvatarPng(variant, AVATAR_SIZE, decodeInlineLogo());
 }
 
 async function ensureAvatarImageKey(larkAppId: string, variant: AvatarVariant): Promise<string | null> {

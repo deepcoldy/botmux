@@ -40,7 +40,8 @@ describe('recommended answers stay drafts until submitted', () => {
     const ask = getAskSnapshot(sent[0].askId)!;
     expect(ask).toMatchObject({ settled: false, selections: [['a'], ['a', 'b']] });
     const standalone = JSON.parse(buildAskCard(ask));
-    const buttons = standalone.elements.flatMap((e: any) => e.actions ?? []);
+    const nodes = (v: any): any[] => v && typeof v === 'object' ? [v, ...Object.values(v).flatMap(nodes)] : [];
+    const buttons = nodes(standalone).filter((n: any) => n.tag === 'button');
     expect(buttons.filter((b: any) => b.value.action === 'ask_submit')).toHaveLength(1);
     expect(buttons.filter((b: any) => b.type === 'primary' && b.value.action === 'ask_toggle')).toHaveLength(3);
     const inline = JSON.stringify(buildTurnReplyAskElements({ ask }));

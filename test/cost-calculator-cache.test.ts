@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/cost-calculator-cache.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('node:fs', () => {
   // `require` inside the factory, not the vitest-only `importOriginal` argument

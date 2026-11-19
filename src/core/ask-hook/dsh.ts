@@ -123,17 +123,19 @@ const dshAdapter: HookAskAdapter = {
     answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
     parsed: ParsedAsk,
     comment?: string | null,
+    customAnswers?: ReadonlyArray<string | null>,
   ): string {
     const rawQuestions = Array.isArray((parsed.raw as { rawQuestions?: unknown }).rawQuestions)
       ? ((parsed.raw as { rawQuestions: RawDshQuestion[] }).rawQuestions)
       : [];
     const customText = (comment ?? '').trim();
     const answers = parsed.questions.map((_q, i) => {
-      const selected = [...(answersByQuestion[i] ?? [])];
+      const text = customAnswers?.[i] ?? customText;
+      const selected = customAnswers?.[i] ? [] : [...(answersByQuestion[i] ?? [])];
       return {
         id: rawQuestionId(rawQuestions[i] ?? {}, i),
         selected,
-        ...(selected.length === 0 && customText.length > 0 ? { custom: customText } : {}),
+        ...(selected.length === 0 && text.length > 0 ? { custom: text } : {}),
       };
     });
     return JSON.stringify({ answers });

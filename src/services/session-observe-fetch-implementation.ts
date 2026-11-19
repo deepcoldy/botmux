@@ -22,6 +22,7 @@ import {
 } from '../utils/daemon-discovery.js';
 import {
   OBSERVE_SCHEMA_VERSION,
+  isRecentlyActiveObserveSession,
   normalizeSessionRow,
   type ObserveDaemonEnvelope,
   type ObserveProbe,
@@ -39,6 +40,11 @@ export interface ObserveFetchQuery {
   /** Include the raw SessionRow beneath `session.raw` for diagnostics. Off by
    *  default because callers typically consume only the canonical fields. */
   includeRaw?: boolean;
+  /** Add the `task` block (shared task-status derivation) to every session. */
+  includeTask?: boolean;
+  /** List only: keep sessions that are not closed and either alive or had
+   *  activity within this many milliseconds before `observedAt`. */
+  activeWithinMs?: number;
 }
 
 type DaemonIpcFetch = (
@@ -156,7 +162,15 @@ export async function fetchObserveSnapshotImplementation(
 
   const envelopes = await Promise.all(targets.map(async (daemon): Promise<ObserveDaemonEnvelope> => {
     const ctx: DaemonProbeContext = { daemon, fetch: fetchFn, secret, timeoutMs };
-    return await probeDaemonList(ctx, observedAt, options.includeRaw === true);
+    const envelope = await probeDaemonList(ctx, observedAt, {
+      includeRaw: options.includeRaw === true,
+      includeTask: options.includeTask === true,
+    });
+    if (options.activeWithinMs !== undefined) {
+      const cutoff = observedAt - options.activeWithinMs;
+      envelope.sessions = envelope.sessions.filter(s => isRecentlyActiveObserveSession(s, cutoff));
+    }
+    return envelope;
   }));
 
   return {
@@ -169,7 +183,7 @@ export async function fetchObserveSnapshotImplementation(
 async function probeDaemonList(
   ctx: DaemonProbeContext,
   observedAt: number,
-  includeRaw: boolean,
+  output: { includeRaw: boolean; includeTask: boolean },
 ): Promise<ObserveDaemonEnvelope> {
   const envelopeBase: ObserveDaemonEnvelope = {
     larkAppId: ctx.daemon.larkAppId,
@@ -197,7 +211,7 @@ async function probeDaemonList(
     envelopeBase.sessions = rows.map(row => normalizeSessionRow(row, {
       observedAt,
       probe: probeFrom('ok', ctx.daemon),
-      includeRaw,
+      ...output,
     }));
     return envelopeBase;
   } catch (err) {
@@ -231,7 +245,7 @@ export async function fetchObserveSessionImplementation(
   const timeoutMs = Number.isFinite(dependencies.timeoutMs) && (dependencies.timeoutMs ?? 0) > 0
     ? Number(dependencies.timeoutMs)
     : DEFAULT_TIMEOUT_MS;
-  const includeRaw = options.includeRaw === true;
+  const output = { includeRaw: options.includeRaw === true, includeTask: options.includeTask === true };
 
   const online = discover(dependencies.dataDir);
   const targets = options.larkAppId
@@ -254,7 +268,7 @@ export async function fetchObserveSessionImplementation(
 
   const outcomes = await Promise.all(targets.map(async daemon => {
     const ctx: DaemonProbeContext = { daemon, fetch: fetchFn, secret, timeoutMs };
-    return await probeDaemonSession(ctx, sessionId, observedAt, includeRaw);
+    return await probeDaemonSession(ctx, sessionId, observedAt, output);
   }));
   const hit = outcomes.find((outcome): outcome is Extract<SessionProbeOutcome, { kind: 'ok' }> => (
     outcome.kind === 'ok'
@@ -288,7 +302,7 @@ async function probeDaemonSession(
   ctx: DaemonProbeContext,
   sessionId: string,
   observedAt: number,
-  includeRaw: boolean,
+  output: { includeRaw: boolean; includeTask: boolean },
 ): Promise<SessionProbeOutcome> {
   const encoded = encodeURIComponent(sessionId);
   try {
@@ -316,7 +330,7 @@ async function probeDaemonSession(
       session: normalizeSessionRow(row, {
         observedAt,
         probe: probeFrom('ok', ctx.daemon),
-        includeRaw,
+        ...output,
       }),
     };
   } catch (err) {

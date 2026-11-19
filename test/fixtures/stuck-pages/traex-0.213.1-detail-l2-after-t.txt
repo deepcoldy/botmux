@@ -1,0 +1,50 @@
+
+  SessionStart hooks
+  Turn hooks on or off. Your changes are saved automatically.
+❯ [✓] Hook 1
+  Event     SessionStart
+  Source    Session flags - /<session-flags>/config.toml
+  Command   echo hi
+  Mode      Sync
+  Timeout   600s
+  Trust     Trusted
+
+
+  space/enter toggle  |  esc go back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

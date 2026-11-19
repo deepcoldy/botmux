@@ -57,6 +57,7 @@ docker run --rm \
   -e EXPECTED_UNAME="$expected_uname" \
   -e HOST_UID="$(id -u)" \
   -e HOST_GID="$(id -g)" \
+  -e ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
   "$image" /bin/bash -euo pipefail -c '
     [ "$(uname -m)" = "$EXPECTED_UNAME" ] || {
       echo "runner/image architecture mismatch: expected $EXPECTED_UNAME, got $(uname -m)" >&2
@@ -90,7 +91,12 @@ docker run --rm \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1
     export PATH="/opt/node/bin:$PATH"
     node --version
-    npm install -g bun@1.4.3 --loglevel=error
+    # The Node distribution already includes matching headers. Reuse them so
+    # node-gyp does not download them again through its HTTP client at install.
+    test -f /opt/node/include/node/node.h
+    test -f /opt/node/include/node/config.gypi
+    export npm_config_nodedir=/opt/node
+    node scripts/ci-net-retry.mjs npm install -g bun@1.4.4 --loglevel=error
     bun --version
 
     # Compiles node-pty on glibc 2.28; trustedDependencies makes this lifecycle
@@ -99,7 +105,7 @@ docker run --rm \
     # and compile, so the floor check below inspects what we built. It only takes
     # effect when node-pty is actually (re)installed — a clean checkout in CI.
     # Stamp only after the frozen install, mirroring release.
-    npm_config_build_from_source=true bun install --frozen-lockfile
+    npm_config_build_from_source=true node scripts/ci-net-retry.mjs bun install --frozen-lockfile
     npm version "$BUILD_VERSION" --no-git-tag-version --allow-same-version
     bun run build
 

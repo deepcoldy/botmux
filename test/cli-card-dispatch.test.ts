@@ -21,7 +21,6 @@ import {
   executeCardPatch,
   parseCardPatchArgs,
   readCardPatchInput,
-  sessionHasNoFeishuTransport,
 } from '../src/cli/card-dispatch.js';
 
 class MessageWithdrawnError extends Error {
@@ -289,24 +288,6 @@ describe('executeCardPatch', () => {
       expect(outcome.exitCode).toBe(1);
       expect(outcome.error).toBe('更新失败: network down');
     }
-  });
-});
-
-describe('sessionHasNoFeishuTransport (gate verdict)', () => {
-  const isApiOnly = (appId: string) => appId === 'api_only_app';
-
-  it('flags an apiOnly bot session', () => {
-    expect(sessionHasNoFeishuTransport({ chatId: 'oc_real', larkAppId: 'api_only_app' }, isApiOnly)).toBe(true);
-  });
-
-  it('flags HTTP virtual sessions even on a normal bot', () => {
-    expect(sessionHasNoFeishuTransport({ chatId: 'http_async_abc', larkAppId: 'normal_app' }, isApiOnly)).toBe(true);
-    expect(sessionHasNoFeishuTransport({ chatId: 'http_wait_xyz', larkAppId: 'normal_app' }, isApiOnly)).toBe(true);
-    expect(sessionHasNoFeishuTransport({ chatId: 'headless_hl_abc12345', larkAppId: 'normal_app' }, isApiOnly)).toBe(true);
-  });
-
-  it('passes a normal bot in a real chat', () => {
-    expect(sessionHasNoFeishuTransport({ chatId: 'oc_real', larkAppId: 'normal_app' }, isApiOnly)).toBe(false);
   });
 });
 

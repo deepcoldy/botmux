@@ -33,6 +33,35 @@ const RETIRED_TEMPLATE_SUBCOMMANDS = new Set([
   'show',
 ]);
 
+/**
+ * Run one `botmux workflow …` command. A refusal the workflow code raises on
+ * purpose (a guard, a usage error — missing / invalid run id, a run that does
+ * not exist —, an illegal state transition, a caller that may not act on the
+ * run) is a message for whoever typed the command — often the main
+ * bot, which relays it to the chat — so it is printed alone and the command
+ * exits 1. Anything else is a bug and keeps its stack (rethrown).
+ */
+export async function runWorkflowCliCommand(run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (err) {
+    if (!(await isWorkflowRefusal(err))) throw err;
+    console.error(`❌ ${(err as Error).message}`);
+    process.exitCode = 1;
+  }
+}
+
+async function isWorkflowRefusal(err: unknown): Promise<boolean> {
+  if (!(err instanceof Error)) return false;
+  const [{ HostGuardError, WorkflowUsageError }, { GrillTransitionError }, { V3DaemonCommandAuthorityError }] = await Promise.all([
+    import('../workflows/v3/host.js'),
+    import('../workflows/v3/grill-state.js'),
+    import('../workflows/v3/cli-daemon-command-authority.js'),
+  ]);
+  return err instanceof HostGuardError || err instanceof WorkflowUsageError
+    || err instanceof GrillTransitionError || err instanceof V3DaemonCommandAuthorityError;
+}
+
 export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
   // Machine-wide workflow kill-switch. Authoring (host verbs) and launching
   // (saved `run` / `save`) are refused when the feature is off; read-only
@@ -113,7 +142,7 @@ v2 资产离线处理: botmux template <migrate-v3|archive-runs>
 `);
     return;
   }
-  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant> [...]
+  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant|status|edit|ask-human> [...]
 
 Saved Workflow:
   save [last|runId] [名称] [--workflow-id <chat-scope-id>]
@@ -124,6 +153,13 @@ Saved Workflow:
 即兴 Workflow:
   new / spec-finalize / approve-spec / architect / approve-dag / start
   cancel <runId> [--reason <text>] [--bot <larkAppId>]
+
+运行中修改（仅 run 主会话）:
+  status <runId> [--json]
+  edit <runId> --patch-file <文件|-> --base <版本> [--reason <理由>] [--json]
+  retry <runId> [--node <id>] [--reason <理由>]
+  ask-human <runId> --node <id> --reason <理由>
+  （事件唤醒的回合里 retry / edit / ask-human 都必须带 --reason）
 
 v2 资产离线处理: botmux template <migrate-v3|archive-runs>
 `);

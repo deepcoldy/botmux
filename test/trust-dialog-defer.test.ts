@@ -9,8 +9,7 @@
  *
  * worker.ts is a process entry point with no exports, so the handler under
  * test is extracted from source, transpiled, and evaluated with its module
- * level dependencies injected as globals — the same source-truth pattern
- * backend-gate.test.ts uses for the same helper.
+ * level dependencies injected as globals.
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -23,6 +22,7 @@ type TrustHandler = (data: string) => boolean;
 
 // The handler's free variables, injected as globals for the eval'd copy.
 let trustHandledValue = false;
+let invalidateEvidence: ReturnType<typeof vi.fn>;
 
 function installGlobals(backend: unknown): void {
   const g = globalThis as Record<string, unknown>;
@@ -36,6 +36,9 @@ function installGlobals(backend: unknown): void {
   g.lastInitConfig = {};
   g.log = () => {};
   g.backend = backend;
+  // handleVisibleStartupInteraction 的延迟 Enter 现在会先作废旧准入截图证据
+  invalidateEvidence = vi.fn();
+  g.invalidatePromptReadinessEvidence = invalidateEvidence;
   // 围栏变量：延迟 Enter 回调校验 respawn 代际，eval 上下文需注入
   g.cliSpawnGeneration = 0;
   const patternMatch = workerSource.match(/const TRUST_DIALOG_PATTERN = (\/[^;]+\/);/);
@@ -90,9 +93,11 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
 
     vi.advanceTimersByTime(399);
     expect(sendSpecialKeys).not.toHaveBeenCalled();
+    expect(invalidateEvidence, 'invalidation must be deferred with the Enter, not scheduled early').not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(invalidateEvidence).toHaveBeenCalledTimes(1);
   });
 
   it('recognizes the Codex 0.155 trust-dialog wording', () => {
@@ -157,16 +162,6 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
     (globalThis as Record<string, unknown>).backend = { sendSpecialKeys: vi.fn() };
     vi.advanceTimersByTime(1_000);
     expect(sendSpecialKeys, '旧 timer 不得向新会话 backend 发 Enter').not.toHaveBeenCalled();
-  });
-
-  it('keeps the 400ms deferral in the production trust branch', () => {
-    // Source-level guard: the behavioral tests above extract the real
-    // function, but pin the intent here so a "simplification" back to a
-    // synchronous send is caught even at a glance.
-    const start = workerSource.indexOf('function handleVisibleStartupInteraction(');
-    const end = workerSource.indexOf('const APP_RUNNER_OSC_CLI_IDS', start);
-    const helper = workerSource.slice(start, end);
-    expect(helper).toMatch(/setTimeout\([^]*\},\s*400\)/);
-    expect(helper.indexOf('trustHandled = true;')).toBeLessThan(helper.indexOf('setTimeout('));
+    expect(invalidateEvidence, 'respawn 围栏先返回，不得为未发生的写入作废证据').not.toHaveBeenCalled();
   });
 });

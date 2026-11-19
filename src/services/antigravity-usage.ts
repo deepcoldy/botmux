@@ -1,8 +1,9 @@
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import type { SessionContextUsage, SessionTokenUsage } from '../core/cost-calculator.js';
+import type { ModelTokenUsage } from './model-token-usage.js';
 
 interface ProtoField {
   wireType: number;
@@ -77,6 +78,8 @@ export interface AntigravityStepUsage {
   cacheReadTokens: number;
   reasoningTokens: number;
   model: string;
+  /** Native user-facing model name, distinct from internal execution IDs. */
+  modelDisplayName?: string;
 }
 
 export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUsage | null {
@@ -90,6 +93,8 @@ export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUs
   const f1Buf = Buffer.isBuffer(f1Raw) ? f1Raw : Buffer.from(f1Raw as Uint8Array);
 
   const f1 = decodeProtoBuffer(f1Buf);
+  const displayName = f1.get(21)?.[0]?.val;
+  const modelDisplayName = displayName instanceof Uint8Array ? Buffer.from(displayName).toString('utf8').trim() : undefined;
   let model = '';
   const modelList = f1.get(19);
   if (modelList && modelList.length > 0 && typeof modelList[0].val === 'object') {
@@ -99,7 +104,8 @@ export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUs
 
   const f4List = f1.get(4);
   if (!f4List || f4List.length === 0 || typeof f4List[0].val !== 'object') {
-    return model ? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, model } : null;
+    return model || modelDisplayName ? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, model,
+      ...(modelDisplayName ? { modelDisplayName } : {}) } : null;
   }
 
   const f4Buf = Buffer.isBuffer(f4List[0].val) ? f4List[0].val : Buffer.from(f4List[0].val as Uint8Array);
@@ -115,6 +121,7 @@ export function parseGenMetadataRow(raw: Buffer | Uint8Array): AntigravityStepUs
     cacheReadTokens,
     reasoningTokens,
     model,
+    ...(modelDisplayName ? { modelDisplayName } : {}),
   };
 }
 
@@ -150,6 +157,61 @@ export interface AntigravityUsageReadResult {
   result: SessionTokenUsage | null;
 }
 
+/** Read only recent native generation metadata for the session's model.
+ * Independent of usage display and transcript growth; WAL commits may precede
+ * the next transcript record. Missing evidence never invents a default model. */
+export function readLatestAntigravityRuntime(
+  cliSessionId: string,
+  opts?: { conversationsDir?: string },
+): { model?: string } {
+  const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
+  if (!dbPath || !existsSync(dbPath)) return {};
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return {};
+  try {
+    // Most recent row normally carries the model. Keep a small backward window
+    // for partial metadata without rereading all historical token counts.
+    const rows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16').all() as Array<{ data: unknown }>;
+    for (const row of rows) {
+      if (!(row.data instanceof Uint8Array)) continue;
+      const parsed = parseGenMetadataRow(row.data);
+      // f19 is the execution/routing ID; orchestrator calls may end on an
+      // internal worker. f21 is the native display identity for that call.
+      const model = (parsed?.modelDisplayName
+        || (parsed?.model.endsWith('-worker-agy') ? undefined : parsed?.model))?.trim();
+      if (model) return { model };
+    }
+  } catch { /* unavailable/old schema: keep identity unknown */ }
+  finally { try { db.close(); } catch { /* best-effort */ } }
+  return {};
+}
+
+function antigravityRuntimeDbPath(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
+  if (!cliSessionId || !/^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$/.test(cliSessionId)) return;
+  return join(opts?.conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations'), `${cliSessionId}.db`);
+}
+
+/** WAL commits need not change the main database. Sample before reading so a
+ * concurrent commit cannot be cached as though that newer snapshot was read.
+ * Exclude ctime: opening a WAL read-only may change that metadata without any
+ * new database content, which would invalidate every successful cache read. */
+export function antigravityRuntimeSignature(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
+  const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
+  if (!dbPath) return;
+  const signature = (path: string, optional = false): string => {
+    try {
+      const st = statSync(path, { bigint: true });
+      if (!st.isFile()) throw new Error('Not a native database file');
+      return [st.dev, st.ino, st.size, st.mtimeNs].join(':');
+    } catch (error) {
+      if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+      throw error;
+    }
+  };
+  try { return `${signature(dbPath)}|${signature(dbPath + '-wal', true)}`; }
+  catch { return; }
+}
+
 export function readAntigravityTokenUsage(
   cliSessionId: string,
   opts?: { conversationsDir?: string; dbPath?: string },
@@ -172,6 +234,7 @@ export function readAntigravityTokenUsage(
     let totalCacheRead = 0;
     let turns = 0;
     let latestModel = '';
+    const models = new Map<string, ModelTokenUsage>();
     let lastStepInput = 0;
     let lastStepCache = 0;
 
@@ -184,6 +247,11 @@ export function readAntigravityTokenUsage(
       if (!parsed) continue;
 
       if (parsed.model) latestModel = parsed.model;
+      const usage = models.get(parsed.model) ?? { model: parsed.model, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 };
+      usage.inputTokens += parsed.inputTokens;
+      usage.outputTokens += parsed.outputTokens;
+      usage.cacheReadTokens += parsed.cacheReadTokens;
+      models.set(parsed.model, usage);
       totalInput += parsed.inputTokens;
       totalOutput += parsed.outputTokens;
       totalCacheRead += parsed.cacheReadTokens;
@@ -213,7 +281,10 @@ export function readAntigravityTokenUsage(
       outputTokens: totalOutput,
       cacheReadTokens: totalCacheRead,
       cacheCreateTokens: 0,
-      model: latestModel,
+      // A mixed aggregate has no single execution model. Preserve each model
+      // for accounting; card identity is read independently above.
+      model: models.size === 1 ? latestModel : '',
+      models: [...models.values()].sort((a, b) => a.model.localeCompare(b.model)),
       turns,
     };
 

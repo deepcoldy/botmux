@@ -60,6 +60,9 @@ describe.skipIf(!available)('ZMX persisted socket directory', () => {
       const spawnOpts = {
         cwd: root, cols: 80, rows: 24,
         env: process.env as Record<string, string>, launchShell: '/bin/sh',
+        // Identity bindings inject a CLI-only PATH. Control clients must still
+        // find host zmx throughout create, send, reattach and exact close.
+        injectEnv: { PATH: `/cli-only:${process.env.PATH ?? ''}` },
       };
       const command = ['-c', 'echo READY; while IFS= read -r line; do echo "GOT:$line"; done'];
       original.spawn('/bin/sh', command, spawnOpts);

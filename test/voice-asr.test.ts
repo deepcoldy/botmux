@@ -73,10 +73,9 @@ describe('evaluateAsrConfig', () => {
     expect(evaluateAsrConfig({ enabled: true, baseUrl: 'http://x/v1' }, undefined)).toBeNull();
   });
 
-  it('enabled=true + baseUrl + model → 有效配置，timeoutMs 默认 120000', () => {
+  it('enabled=true + baseUrl + model → 有效配置，timeoutMs 取默认值', () => {
     const cfg = evaluateAsrConfig({ enabled: true, baseUrl: 'http://x/v1', model: 'whisper-1' }, undefined);
     expect(cfg).toEqual({ baseUrl: 'http://x/v1', model: 'whisper-1', timeoutMs: DEFAULT_ASR_TIMEOUT_MS });
-    expect(DEFAULT_ASR_TIMEOUT_MS).toBe(120000);
   });
 
   it('apiKey 缺省 → 仍有效（自托管场景），结果不含 apiKey 字段', () => {

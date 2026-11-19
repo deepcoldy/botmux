@@ -185,4 +185,301 @@ describe('antigravity writeInput — single-Enter submit', () => {
     expect(typeof result?.recheck).toBe('function');
     expect(fake.enterCount()).toBe(1);
   });
+
+  /** Build through the actual launch contract so capability is tied to this adapter instance. */
+  function adapterForVersion(cliVersion?: string) {
+    const selected = createAntigravityAdapter('/usr/local/bin/agy');
+    selected.buildArgs({ sessionId: 'agy-paste-test', resume: false, reattach: false, cliVersion });
+    return selected;
+  }
+
+  it('submits long modern input as one framed PTY write with one trailing Enter', async () => {
+    resetHistory();
+    const selected = adapterForVersion('1.5.4');
+    const content = '<user_message>\n中文🙂 input\n\n' + 'padding\n'.repeat(1000) + '</user_message>';
+    const writes: string[] = [];
+    const fake = makePty();
+    fake.pty.write = data => { writes.push(data); appendHistory(content); return true; };
+    await selected.writeInput(fake.pty, content);
+    expect(writes).toEqual(['\x1b[200~' + content + '\x1b[201~\r']);
+    expect(fake.texts).toEqual([]);
+    expect(fake.specialKeys).toEqual([]);
+  });
+
+  it('uses an atomic backend paste+submit capability without sending another Enter', async () => {
+    resetHistory();
+    const content = 'atomic\n中文\n';
+    const calls: string[] = [];
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = text => { calls.push(text); appendHistory(text); return true; };
+    fake.pty.write = () => { throw new Error('unexpected raw write'); };
+    await adapterForVersion('1.5.4').writeInput(fake.pty, content);
+    expect(calls).toEqual([content]);
+    expect(fake.specialKeys).toEqual([]);
+    expect(fake.texts).toEqual([]);
+  });
+
+  for (const version of [undefined, 'unknown', '1.5.3', '1.5.4-beta.1']) {
+    it(`retains the legacy soft-newline path for version ${version}`, async () => {
+      resetHistory();
+      const content = 'legacy\n中文';
+      const fake = makePty({ onEnter: () => appendHistory(content) });
+      let atomicCalls = 0;
+      fake.pty.submitBracketedPaste = () => { atomicCalls++; return true; };
+      await adapterForVersion(version).writeInput(fake.pty, content);
+      expect(fake.texts).toEqual(['legacy', '中文']);
+      expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
+      expect(atomicCalls).toBe(0);
+    });
+  }
+
+  for (const failure of ['false', 'throw'] as const) {
+    it(`does not replay or switch input methods after an ambiguous modern write: ${failure}`, async () => {
+      resetHistory();
+      const content = 'ambiguous\nmessage';
+      const fake = makePty();
+      let calls = 0;
+      fake.pty.submitBracketedPaste = () => {
+        calls++;
+        if (failure === 'throw') throw new Error('acknowledgement lost');
+        return false;
+      };
+      const result = await adapterForVersion('1.5.4').writeInput(fake.pty, content);
+      expect(result?.submitted).toBe(false);
+      expect(calls).toBe(1);
+      expect(fake.texts).toEqual([]);
+      expect(fake.specialKeys).toEqual([]);
+      appendHistory(content);
+      expect(result?.recheck?.()).toBe(true);
+    });
+  }
+
+  it('accepts a late receipt after a modern write returned false, without retrying', async () => {
+    resetHistory();
+    const content = 'late paste receipt';
+    let calls = 0;
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = () => { calls++; void delay(800).then(() => appendHistory(content)); return false; };
+    expect(await adapterForVersion('1.5.4').writeInput(fake.pty, content)).toBeUndefined();
+    expect(calls).toBe(1);
+    expect(fake.specialKeys).toEqual([]);
+  });
+
+  it('normalizes pasted CRLF and refuses ESC before any terminal write', async () => {
+    resetHistory();
+    const selected = adapterForVersion('1.5.4');
+    const writes: string[] = [];
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = text => { writes.push(text); appendHistory(text); return true; };
+    await selected.writeInput(fake.pty, 'one\r\ntwo\rthree');
+    expect(writes).toEqual(['one\ntwo\nthree']);
+    const blocked = await selected.writeInput(fake.pty, 'payload\x1b[201~\r/clear');
+    expect(blocked?.submitted).toBe(false);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('keeps version selection local to each launch and resets it on unknown launches', async () => {
+    resetHistory();
+    const content = 'one\ntwo';
+    const selected = adapterForVersion('1.5.4');
+    selected.buildArgs({ sessionId: 'agy-new-generation', resume: true, cliVersion: 'unknown' });
+    const fake = makePty({ onEnter: () => appendHistory(content) });
+    await selected.writeInput(fake.pty, content);
+    expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
+  });
+
+  it('does not apply an upgraded installation version to a surviving older pane', async () => {
+    resetHistory();
+    const selected = adapterForVersion('1.5.4');
+    selected.buildArgs({ sessionId: 'agy-existing-pane', resume: true, reattach: true, cliVersion: '1.5.4' });
+    const content = 'surviving\nolder CLI';
+    const fake = makePty({ onEnter: () => appendHistory(content) });
+    await selected.writeInput(fake.pty, content);
+    expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
+  });
+
+  it('holds post-submit startup grace against premature +1s idle until transcript grows, screen interrupts, or grace expires', async () => {
+    resetHistory();
+    const convId = '11111111-2222-3333-4444-555555555555';
+    const logsDir = join(home, '.gemini', 'antigravity-cli', 'brain', convId, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    const transcriptPath = join(logsDir, 'transcript_full.jsonl');
+    writeFileSync(transcriptPath, '{"type":"USER_INPUT","status":"DONE"}\n{"type":"PLANNER_RESPONSE","status":"DONE","content":"ready"}\n');
+
+    const selected = adapterForVersion('1.5.4');
+    const content = 'run long deployment task';
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = text => {
+      mkdirSync(join(home, '.gemini', 'antigravity-cli'), { recursive: true });
+      appendFileSync(
+        HISTORY_PATH,
+        `{"display":${encodeDisplay(text)},"timestamp":${Date.now()},"workspace":"/x","conversationId":"${convId}"}\n`,
+      );
+      return true;
+    };
+    await selected.writeInput(fake.pty, content);
+
+    const idleComposerScreen = [
+      '────────────────────────',
+      '>',
+      '────────────────────────',
+      '? for shortcuts                                          accept-edits · Gemini 3.8 Flash · high',
+    ].join('\n');
+
+    // Immediately after submit (simulating the worker's +1.0s post-submit probe before agy flushes
+    // USER_INPUT to transcript_full.jsonl or before cliSessionId is bound), session must stay busy.
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => idleComposerScreen })).toBe(true);
+    expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleComposerScreen })).toBe(true);
+
+    // Once transcript_full.jsonl grows with a completed turn and the composer is idle, grace clears immediately.
+    appendFileSync(transcriptPath, '{"type":"USER_INPUT","status":"DONE"}\n{"type":"PLANNER_RESPONSE","status":"DONE","content":"done"}\n');
+    expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleComposerScreen })).toBe(false);
+
+    // Re-submit and verify an explicit native error / interrupted screen releases grace immediately.
+    await selected.writeInput(fake.pty, 'second submit hitting immediate error');
+    const errorScreen = '⚠ Request failed. Please try again.\nError ID: err-grace\n────────────────────────\n>\n────────────────────────\n';
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => errorScreen })).toBe(false);
+
+    // Re-submit and verify grace expires cleanly after scaled 10s (10_000 * 0.05 = 500ms).
+    await selected.writeInput(fake.pty, 'third submit timing out grace');
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => idleComposerScreen })).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 560));
+    expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => idleComposerScreen })).toBe(false);
+  });
+
+  describe('post-submit busy grace baselines', () => {
+    const idleScreen = [
+      '● previous reply',
+      '────────────────────────',
+      '>',
+      '────────────────────────',
+      '? for shortcuts                                          accept-edits · Gemini 3.8 Flash · high',
+    ].join('\n');
+    const finishedTurn = '{"type":"USER_INPUT","status":"DONE"}\n{"type":"PLANNER_RESPONSE","status":"DONE","content":"done"}\n';
+
+    function transcriptOf(convId: string): string {
+      const dir = join(home, '.gemini', 'antigravity-cli', 'brain', convId, '.system_generated', 'logs');
+      mkdirSync(dir, { recursive: true });
+      return join(dir, 'transcript_full.jsonl');
+    }
+
+    function nativeLogOf(sessionId: string): string {
+      return join(home, '.gemini', 'antigravity-cli', 'botmux', `${encodeURIComponent(sessionId)}.log`);
+    }
+
+    /** Fresh launch: agy is writing its --log-file but has streamed no conversation yet. */
+    function freshLaunch(sessionId: string, convId: string) {
+      const selected = createAntigravityAdapter('/usr/local/bin/agy');
+      selected.buildArgs({ sessionId, resume: false, reattach: false, cliVersion: '1.5.4' });
+      const log = nativeLogOf(sessionId);
+      writeFileSync(log, 'agy starting\n');
+      const fake = makePty();
+      fake.pty.submitBracketedPaste = text => {
+        appendHistory(text);
+        appendFileSync(log, `Streaming conversation ${convId}\n`);
+        return true;
+      };
+      return { selected, fake };
+    }
+
+    it('releases a fresh conversation whose first turn already finished before the first probe', async () => {
+      resetHistory();
+      const convId = 'aaaaaaaa-0000-4000-8000-000000000001';
+      const { selected, fake } = freshLaunch('agy-grace-fresh-finished', convId);
+      expect(await selected.writeInput(fake.pty, 'quick question')).toEqual({ submitted: true, cliSessionId: convId });
+
+      // Before agy creates the transcript, the grace still holds the turn busy.
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(true);
+      // agy creates the transcript and finishes the whole turn before the worker probes again.
+      writeFileSync(transcriptOf(convId), finishedTurn);
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+    });
+
+    it('releases a conversation started by /new in a resumed session whose first turn already finished before the first probe', async () => {
+      resetHistory();
+      const oldId = 'aaaaaaaa-0000-4000-8000-000000000006';
+      const newId = 'aaaaaaaa-0000-4000-8000-000000000007';
+      writeFileSync(transcriptOf(oldId), finishedTurn);
+      const selected = createAntigravityAdapter('/usr/local/bin/agy');
+      selected.buildArgs({ sessionId: 'agy-grace-new', resume: true, resumeSessionId: oldId, reattach: false, cliVersion: '1.5.4' });
+      // agy streamed the resumed conversation, then /new switched to one with no transcript yet.
+      writeFileSync(nativeLogOf('agy-grace-new'), `Streaming conversation ${oldId}\nStreaming conversation ${newId}\n`);
+      const fake = makePty();
+      fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
+      expect(await selected.writeInput(fake.pty, 'first turn after new')).toEqual({ submitted: true, cliSessionId: newId });
+      writeFileSync(transcriptOf(newId), finishedTurn);
+      expect(selected.isSessionBusy!({ cliSessionId: newId, getCurrentScreen: () => idleScreen })).toBe(false);
+    });
+
+    it('keeps a fresh conversation busy until its new transcript records the USER_INPUT', async () => {
+      resetHistory();
+      const convId = 'aaaaaaaa-0000-4000-8000-000000000002';
+      const { selected, fake } = freshLaunch('agy-grace-fresh-pending', convId);
+      await selected.writeInput(fake.pty, 'pending question');
+      const transcript = transcriptOf(convId);
+      writeFileSync(transcript, '{"type":"CHECKPOINT","status":"DONE"}\n');
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(true);
+      // More non-input records are not the submit being taken either, even when
+      // their text mentions one.
+      appendFileSync(transcript, '{"type":"CHECKPOINT","status":"DONE","content":"waiting for USER_INPUT"}\n');
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(true);
+      appendFileSync(transcript, finishedTurn);
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+    });
+
+    it('takes the pre-submit baseline from an id learned on an earlier probe', async () => {
+      resetHistory();
+      const convId = 'aaaaaaaa-0000-4000-8000-000000000003';
+      const transcript = transcriptOf(convId);
+      writeFileSync(transcript, finishedTurn);
+      const selected = adapterForVersion('1.5.4');
+      // The adapter itself cannot resolve the conversation (no native log, no pid);
+      // the worker's probe tells it.
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+      const fake = makePty();
+      fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
+      await selected.writeInput(fake.pty, 'second turn answered at once');
+      appendFileSync(transcript, finishedTurn);
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+    });
+
+    it('takes the pre-submit baseline from the resumed conversation id', async () => {
+      resetHistory();
+      const convId = 'aaaaaaaa-0000-4000-8000-000000000004';
+      const transcript = transcriptOf(convId);
+      writeFileSync(transcript, finishedTurn);
+      const selected = createAntigravityAdapter('/usr/local/bin/agy');
+      selected.buildArgs({ sessionId: 'agy-grace-resume', resume: true, resumeSessionId: convId, reattach: false, cliVersion: '1.5.4' });
+      const fake = makePty();
+      fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
+      await selected.writeInput(fake.pty, 'resumed turn answered at once');
+      appendFileSync(transcript, finishedTurn);
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+    });
+
+    it('hands back to the regular verdict when the transcript already shows the turn running', async () => {
+      resetHistory();
+      const convId = 'aaaaaaaa-0000-4000-8000-000000000005';
+      const transcript = transcriptOf(convId);
+      writeFileSync(transcript, finishedTurn);
+      const selected = adapterForVersion('1.5.4');
+      const fake = makePty();
+      fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
+      await selected.writeInput(fake.pty, 'turn with unknown id at submit');
+      appendFileSync(transcript, '{"type":"USER_INPUT","status":"DONE"}\n');
+      // Regular verdict: a running transcript yields to an empty composer on screen
+      // (cancelled turn), which the grace must not override.
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+    });
+
+    it('stays busy during the grace when no viewport can be read', async () => {
+      resetHistory();
+      const selected = adapterForVersion('1.5.4');
+      const fake = makePty();
+      fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
+      await selected.writeInput(fake.pty, 'no viewport');
+      expect(selected.isSessionBusy!({ cliSessionId: undefined })).toBe(true);
+      expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => { throw new Error('pane gone'); } })).toBe(true);
+    });
+  });
 });

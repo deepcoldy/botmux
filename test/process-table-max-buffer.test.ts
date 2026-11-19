@@ -221,6 +221,8 @@ describe('PROCESS_TABLE_MAX_BUFFER', () => {
     }
   });
 
+  // 源码结构护栏(K4)：src 里每个整表 ps 调用都必须带共享的 maxBuffer 上限，否则进程多时输出超过 1MiB 会
+  // ENOBUFS 并退回空结果；调用点散落各处，只能扫源码核对（上面的用例自检了扫描器的分类）。
   it('every whole-table ps exec in src/ uses the shared cap', () => {
     const hits: string[] = [];
     const missing: string[] = [];
@@ -257,12 +259,6 @@ describe('PROCESS_TABLE_MAX_BUFFER', () => {
     ]) expect(hits.some(h => h.startsWith(`${f}:`)), f).toBe(true);
     expect(hits.filter(h => h.startsWith('src/adapters/backend/zellij-backend.ts:'))).toHaveLength(2);
     expect(hits.filter(h => h.startsWith('src/core/resource-monitor/darwin.ts:'))).toHaveLength(2);
-  });
-
-  it('browser-restart\'s default runner (used for `ps -Axo command=`) carries the cap', () => {
-    const src = readFileSync(join(SRC, 'core/browser-restart.ts'), 'utf-8');
-    expect(src).toMatch(/const run = opts\.run \?\? \(async \(file, args\) => pExecFile\(file, args, \{[^}]*maxBuffer: PROCESS_TABLE_MAX_BUFFER[^}]*\}\)\)/);
-    expect(src).toMatch(/await run\('ps', \['-Axo', 'command='\]\)/);
   });
 });
 

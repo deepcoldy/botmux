@@ -1,0 +1,30 @@
+[2m• [0m[39m[49mCreated outside-probe.txt ([38;2;166;227;161m/tmp/outside-probe.txt[39m) with content [38;2;166;227;161mhello[39m.
+
+[2m  Worked for 26s • 9:09 PM
+
+
+[1m› [0m[39m[49mFetch https://example.com with curl and show me the first line
+
+
+[2m• [0m[39m[49mI’ll fetch the page with [38;2;166;227;161mcurl[39m and show its first line.
+
+[1m[38;5;2m•[0m[39m[49m [1mRan[0m[39m[49m [38;2;137;180;250mcurl[38;2;147;153;178m -[38;2;235;160;172mfsSL[38;2;205;214;244m https://example.com [38;2;148;226;213m|[38;2;205;214;244m [38;2;137;180;250mhead[38;2;147;153;178m -[38;2;235;160;172mn[38;2;205;214;244m 1
+[2m[39m  └ curl: (6) Could not resolve host: example.com
+[0m[39m[49m
+• [1mRunning[0m[39m[49m [38;2;137;180;250mcurl[38;2;147;153;178m -[38;2;235;160;172mfsSL[38;2;205;214;244m https://example.com [38;2;148;226;213m|[38;2;205;214;244m [38;2;137;180;250mhead[38;2;147;153;178m -[38;2;235;160;172mn[38;2;205;214;244m 1
+[39m
+
+  [1mWould you like to run the following command?
+[0m[39m[49m
+  Environment: [1mlocal
+[0m[39m[49m
+  Reason: [3mMay I allow network access to fetch https://example.com with curl and show its first line?
+[0m[39m[49m
+  $ [38;2;137;180;250mcurl[38;2;147;153;178m -[38;2;235;160;172mfsSL[38;2;205;214;244m https://example.com [38;2;148;226;213m|[38;2;205;214;244m [38;2;137;180;250mhead[38;2;147;153;178m -[38;2;235;160;172mn[38;2;205;214;244m 1
+[39m
+
+[1;7m› 1. Yes, proceed (y)
+[0m[39m[49m  2. Yes, and don't ask again for commands that start with `curl -fsSL https://example.com` ([1mp[0m[39m[49m)
+  3. No, and tell Codex what to do differently ([1mesc[0m[39m[49m)
+
+  [2mPress [0;1m[39m[49menter[0;2m[39m[49m to confirm or [0;1m[39m[49mesc[0;2m[39m[49m to cancel

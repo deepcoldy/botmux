@@ -1,4 +1,4 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { isBunRuntime, spawnTsScript } from './helpers/ts-runner.js';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 
 type Origin = Extract<WorkerToDaemon, { type: 'managed_turn_origin' }>;
 type OriginRevoke = Extract<WorkerToDaemon, { type: 'managed_turn_origin_revoked' }>;
@@ -178,7 +179,7 @@ afterEach(async () => {
   }
   children.clear();
   for (const session of tmuxSessions) {
-    try { execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'ignore' }); } catch { /* gone */ }
+    killWorkerTmuxSession(session);
   }
   tmuxSessions.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });

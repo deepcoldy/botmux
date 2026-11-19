@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  AUTO_CLEANUP_TICK_MS,
   createAutoCleanupTickRunner,
   evaluateAutoCleanupDue,
   resolveCleanupHours,
@@ -42,6 +41,7 @@ describe('auto-cleanup config resolution', () => {
     // Unsupported thresholds fall back to the default, never pass through.
     expect(resolveCleanupHours({ olderThanHours: 12 as never })).toBe(168);
     expect(resolveCleanupHours({ olderThanHours: 0 as never })).toBe(168);
+    expect(resolveCleanupHours({ olderThanHours: 1 as never })).toBe(168);
   });
 
   it('resolves the interval, defaulting to 60min and enforcing a 5min floor', () => {
@@ -202,10 +202,6 @@ describe('runAutoCleanupTick', () => {
     const { deps, closed } = makeDeps({ enabled: true, olderThanHours: 24 }, rows, undefined);
     await runAutoCleanupTick(deps);
     expect(closed.sort()).toEqual(['old-dormant', 'old-idle']);
-  });
-
-  it('exposes a sane tick cadence constant', () => {
-    expect(AUTO_CLEANUP_TICK_MS).toBe(60_000);
   });
 });
 

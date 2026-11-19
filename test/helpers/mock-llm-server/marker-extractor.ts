@@ -130,7 +130,7 @@ export function extractFirstAckMarker(messages: unknown[]): string | null {
 }
 
 /** User texts of the current turn: everything after the last assistant item. */
-function currentTurnTexts(messages: unknown[]): string[] {
+export function currentTurnTexts(messages: unknown[]): string[] {
   let start = 0;
   messages.forEach((item, index) => {
     if (item && typeof item === 'object' && (item as { role?: string }).role === 'assistant') start = index + 1;

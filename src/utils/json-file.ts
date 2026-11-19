@@ -32,7 +32,8 @@
  * 只管读。写入请直接用 `atomicWriteFileSync`（./atomic-write.ts），保留各 store
  * 自己的序列化格式 / mode。
  */
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, renameSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, statSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import { errorMessage } from './error-message.js';
 import { logger } from './logger.js';
 
@@ -132,4 +133,125 @@ export function readJsonFileSoft<T>(path: string, opts: ReadJsonFileSoftOptions<
     }
   }
   return parsed as T;
+}
+
+/**
+ * 持久化读路径上的「暂时读不了」：文件存在与否、内容是否完好都无法判断（EMFILE /
+ * ENFILE / EIO / EACCES / EAGAIN……）。fail-closed 的 store 遇到它必须**照样失败**，
+ * 但**不能隔离**——隔离只属于「确实读到了字节、字节不合法」这一种情形。
+ *
+ * 2026-11-06 的事故：一份内容为 `{}\n` 的合法 VC runtime store 被一个读失败的进程
+ * 当成损坏改名成 `.corrupt.*`，此后所有 daemon 每次读都抛「quarantined evidence」，
+ * 把整条群消息丢掉。读错误与内容错误混在同一个 try 里就是这个形状。
+ */
+export class StoreFileUnavailableError extends Error {
+  readonly code: string | undefined;
+  /** Which stage failed: 'read' | 'parse' | 'stat' | 'list' | 'lock' | 'update' | 'quarantine' …
+   * 'parse' means bytes were read but the content is unusable (callers may
+   * offer a rebuild path); the others mean a transient I/O failure.
+   * Convention: 'parse' is reserved for "bytes read, content invalid" and
+   * drives user-facing "rebuild instead of retry" replies (see the /vc
+   * handler). Introducing a new op value — or reusing 'parse' for anything
+   * else — must review every consumer that classifies on it. */
+  readonly op: string;
+  constructor(label: string, path: string, op: string, cause: unknown) {
+    const code = errCode(cause);
+    super(`${label}: cannot ${op} ${path} (${code ?? errorMessage(cause)}); treating as temporarily unavailable`);
+    this.name = 'StoreFileUnavailableError';
+    this.code = code;
+    this.op = op;
+  }
+}
+
+export function isStoreFileUnavailableError(err: unknown): err is StoreFileUnavailableError {
+  return err instanceof StoreFileUnavailableError;
+}
+
+/**
+ * fail-closed 读文本：不存在（ENOENT）→ `undefined`；其它读错误 → 抛
+ * `StoreFileUnavailableError`（调用方不得据此隔离）；读到内容 → 原样返回，
+ * 解析与结构校验由调用方负责（它们失败才是「损坏」）。
+ */
+export function readStoreFileTextStrict(path: string, label: string): string | undefined {
+  return readStoreFileStrict(path, label)?.text;
+}
+
+export interface StoreFileRead {
+  text: string;
+  /** Identity of the inode the bytes came from; pass to {@link quarantineStoreFileIfUnchanged}. */
+  ident: { dev: number; ino: number };
+}
+
+/** {@link readStoreFileTextStrict} plus the identity of the inode that was read. */
+export function readStoreFileStrict(path: string, label: string): StoreFileRead | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const st = fstatSync(fd);
+    return { text: readFileSync(fd, 'utf-8'), ident: { dev: st.dev, ino: st.ino } };
+  } catch (err) {
+    const code = errCode(err);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
+    throw new StoreFileUnavailableError(label, path, 'read', err);
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
+
+/**
+ * Move a store judged corrupt aside — but only if the path still holds the
+ * inode whose bytes were judged. An operator (or another writer) may have
+ * atomically replaced it with a good file between read and rename; blindly
+ * renaming would quarantine the repaired file. Returns `false` when the file
+ * changed or vanished meanwhile (caller should treat the read as transient).
+ */
+export function quarantineStoreFileIfUnchanged(
+  path: string,
+  ident: { dev: number; ino: number },
+  dest: string,
+): boolean {
+  try {
+    const cur = statSync(path);
+    if (cur.dev !== ident.dev || cur.ino !== ident.ino) return false;
+  } catch {
+    return false;
+  }
+  renameSync(path, dest);
+  return true;
+}
+
+/**
+ * fail-closed 的 `existsSync`：`existsSync` 把**任何** stat 失败都报成「不存在」，
+ * 于是一次暂时性错误就会让 store 走「全新初始化」分支、随后的写入覆盖真实数据。
+ * 这里只有 ENOENT/ENOTDIR 算不存在，其它错误抛 `StoreFileUnavailableError`。
+ */
+export function storeFileExistsStrict(path: string, label: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (err) {
+    const code = errCode(err);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw new StoreFileUnavailableError(label, path, 'stat', err);
+  }
+}
+
+/**
+ * 主文件缺失时，同目录下是否留有 `${basename}${marker}` 开头的隔离证据。
+ * 目录不存在 → false（全新 scope 可初始化）；目录读不了 → 抛
+ * `StoreFileUnavailableError`——看不见证据不等于没有证据，不能据此初始化。
+ */
+export function hasQuarantinedSibling(path: string, marker: string, label: string): boolean {
+  const prefix = `${basename(path)}${marker}`;
+  let names: string[];
+  try {
+    names = readdirSync(dirname(path));
+  } catch (err) {
+    const code = errCode(err);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw new StoreFileUnavailableError(label, dirname(path), 'list', err);
+  }
+  return names.some(name => name.startsWith(prefix));
 }

@@ -14,6 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  decideFirstWriteLiveness,
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
@@ -110,6 +111,12 @@ describe('shouldReleaseFirstPromptTimeout', () => {
       elapsedMs: 15_000,
       hardTimeoutMs: 90_000,
     })).toBe(true);
+  });
+
+  it('releases at the soft timeout when the backend screen already shows a ready input box', () => {
+    const deferred = { deferFirstPromptTimeoutUntilReady: true, hasReadyPattern: true, elapsedMs: 15_000, hardTimeoutMs: 90_000 };
+    expect(shouldReleaseFirstPromptTimeout({ ...deferred, inputBoxReady: true })).toBe(true);
+    expect(shouldReleaseFirstPromptTimeout({ ...deferred, inputBoxReady: false })).toBe(false);
   });
 });
 
@@ -370,5 +377,59 @@ describe('decideHardTimeoutAction', () => {
     // to mark-ready so markPromptReady() sets isPromptReady and flushes the
     // held first message.
     expect(decideHardTimeoutAction(false)).toBe('mark-ready');
+  });
+});
+
+describe('decideFirstWriteLiveness', () => {
+  const claude = /❯/;
+  const composer = '\x1b[1m Claude Code\x1b[0m\n────────\n❯ \n────────';
+  const base = { readyPattern: claude, readySignal: false, hardCapReached: false };
+
+  it('holds the first write while a booting CLI has not drawn its prompt (2026-10-20 cold start)', () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: '\n\n' }))
+      .toEqual({ write: false, reason: 'prompt-not-visible' });
+    expect(decideFirstWriteLiveness({ ...base, viewport: 'Loading…' }).write).toBe(false);
+  });
+
+  it('writes once the input prompt is on screen (ANSI-wrapped glyphs included)', () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: composer }))
+      .toEqual({ write: true, reason: 'prompt-visible' });
+    expect(decideFirstWriteLiveness({ ...base, viewport: '\x1b[36m❯\x1b[0m' }).write).toBe(true);
+  });
+
+  it("trusts the CLI's own ready signal even on a blank screen", () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: '', readySignal: true }))
+      .toEqual({ write: true, reason: 'ready-signal' });
+  });
+
+  it('keeps the first-prompt hard cap a real deadline (stale readyPattern escape hatch)', () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: '', hardCapReached: true }))
+      .toEqual({ write: true, reason: 'hard-cap' });
+  });
+
+  it('keeps the legacy behavior when there is nothing to check', () => {
+    expect(decideFirstWriteLiveness({ ...base, readyPattern: undefined, viewport: '' }).write).toBe(true);
+    expect(decideFirstWriteLiveness({ ...base, viewport: undefined }).write).toBe(true);
+  });
+
+  describe("with the adapter's own input-box verdict", () => {
+    // Codex 0.166 paints `›` before its footer; its writeInput refuses that box.
+    const codex = { ...base, readyPattern: /[›»](?!\s*\d+\.)|\d+% left/, viewport: '› Ask Codex to do anything' };
+
+    it('holds the first write while the box is not ready even though the prompt marker is visible', () => {
+      expect(decideFirstWriteLiveness({ ...codex, inputBoxReady: false }))
+        .toEqual({ write: false, reason: 'input-box-not-ready' });
+      expect(decideFirstWriteLiveness({ ...codex, inputBoxReady: false, readySignal: true }).write).toBe(false);
+    });
+
+    it('keeps the first message queued past the hard cap instead of forcing it into a refused write', () => {
+      expect(decideFirstWriteLiveness({ ...codex, inputBoxReady: false, hardCapReached: true }))
+        .toEqual({ write: false, reason: 'input-box-not-ready' });
+    });
+
+    it('writes as soon as the box is ready, even before the stream showed a prompt', () => {
+      expect(decideFirstWriteLiveness({ ...codex, viewport: undefined, inputBoxReady: true }))
+        .toEqual({ write: true, reason: 'input-box-ready' });
+    });
   });
 });

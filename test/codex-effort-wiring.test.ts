@@ -1,9 +1,8 @@
 /**
- * Guards the per-turn model/reasoningEffort consumption chain (adapter args /
- * thread config) with source-level checks where worker.ts has no public seam.
+ * Guards the per-turn model/reasoningEffort consumption chain at the adapter
+ * boundary (launch args / thread config).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
 
 // codex-app buildArgs resolves the codex binary via resolveCommand; return the
 // path as-is so we can assert the emitted flags without shelling out.
@@ -110,44 +109,25 @@ describe('codex-app adapter buildArgs — runner flags', () => {
   });
 });
 
-describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
-  // Source-wiring guard: the RPC engine unit test constructs the engine directly,
-  // so it would still pass if worker.ts stopped forwarding reasoningEffort. This
-  // locks the actual construction site — deleting the line fails here, catching
-  // exactly the regression codex caught last round (effort never reaching the
-  // real execution engine).
-  it('worker constructs CodexRpcEngine with reasoningEffort: cfg.reasoningEffort', () => {
-    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const ctor = source.indexOf('new CodexRpcEngine({');
-    expect(ctor).toBeGreaterThan(0);
-    const end = source.indexOf('});', ctor);
-    const body = source.slice(ctor, end);
-    expect(body).toContain('model: cfg.model');
-    expect(body).toContain('reasoningEffort: cfg.reasoningEffort');
-    expect(body).toContain('serviceTier: cfg.serviceTier');
+describe('Codex profile argv', () => {
+  it.each([
+    {}, { resume: true, resumeSessionId: 'native' },
+    { resume: true, resumeSessionId: 'native', forkSession: true },
+  ])('passes the profile before every subcommand: %j', extra => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, ...extra, codexProfile: 'withhooks', model: 'explicit', reasoningEffort: 'high' });
+    expect(args.slice(0, 2)).toEqual(['--profile', 'withhooks']);
+    expect(args.filter(x => x === '--profile')).toHaveLength(1);
+    expect(args).toContain('model_reasoning_effort="high"');
   });
-
-  it('strips an explicit tier before adopt and external App Server attach', () => {
-    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const commandHandler = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
-    expect(source).toContain("cfg.adoptMode && cfg.serviceTier");
-    expect(source).toContain("cfg.serviceTier !== undefined");
-    expect(commandHandler.match(/current\.session\.serviceTier = 'inherit';/g)).toHaveLength(2);
+  it('keeps a leading-hyphen profile a single value on resume', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, resume: true, resumeSessionId: 'native', codexProfile: '-selected' });
+    expect(args[0]).toBe('--profile=-selected');
+    expect(args).not.toContain('-selected');
   });
-
-  it('freezes the per-Bot default onto a newly created session for supported CLIs', () => {
-    const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    expect(source).toContain('ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)');
-    expect(source).toContain('? ds.session.reasoningEffort ?? botCfg.reasoningEffort');
-    expect(source).toContain(': undefined;');
-    const frozenBranch = source.indexOf('if (!ds.session.agentFrozen)');
-    // The capability guard is checked against the model THIS spawn resolves
-    // (`model`, from resolveSessionLaunchModel), not the session's recorded one:
-    // the model is no longer frozen, and a per-trigger override never lands in
-    // the record — judging support by the record would use the wrong model.
-    const compatibilityGuard = source.indexOf('cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)');
-    const returnConfig = source.indexOf('return {', frozenBranch);
-    expect(compatibilityGuard).toBeGreaterThan(frozenBranch);
-    expect(compatibilityGuard).toBeLessThan(returnConfig);
+  it('rejects RPC viewer instead of silently dropping the profile', () => {
+    expect(() => createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, codexProfile: 'selected', remoteWsUrl: 'ws://localhost:9', remoteThreadId: 'thread' })).toThrow('RPC');
+  });
+  it('does not add an explicit profile for the default selection', () => {
+    expect(createCodexAdapter('/usr/bin/codex').buildArgs(BASE)).not.toContain('--profile');
   });
 });

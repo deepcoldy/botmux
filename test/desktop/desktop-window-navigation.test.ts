@@ -45,6 +45,8 @@ describe('desktop window navigation guard', () => {
     expect(desktopWindowInitialWidth(1200)).toBe(desktopWindowMinWidth);
   });
 
+  // 源码结构护栏(K4)：渲染层 CSS 的侧栏宽度/最小宽度必须与原生窗口常量一致；CSS 无法 import，只能读文本比对
+  // （b5940ba4ab 放宽桌面页展示宽度时两边需同步改）。
   it('keeps renderer minimum width aligned with the native window minimum', () => {
     const styleSource = readFileSync(
       fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),

@@ -378,6 +378,59 @@ describe('git skill install', () => {
     }
   });
 
+  describe('a source recorded with a branch name', () => {
+    function commitDeploy(description: string): string {
+      write(join(repo, 'skills', 'deploy', 'SKILL.md'), `---\nname: deploy\ndescription: ${description}\n---\n# Deploy`);
+      run('git', ['add', '.'], repo);
+      run('git', ['commit', '-m', description], repo);
+      return run('git', ['rev-parse', 'HEAD'], repo);
+    }
+
+    beforeEach(() => {
+      // A non-default branch: the clone's initial checkout never touches it.
+      run('git', ['checkout', '-b', 'release'], repo);
+      commitDeploy('Release v1');
+    });
+
+    it('updates to the remote branch tip, not the stale local branch of the cache', () => {
+      installGitSkill({ url: repo, path: 'skills/deploy', ref: 'release' });
+      expect(readSkillRegistry().skills.deploy.description).toBe('Release v1');
+      // A cache written by an earlier build holds a LOCAL `release` branch at
+      // the first-installed commit; fetch never moves it.
+      const cache = installedGitSourceDir(home);
+      run('git', ['branch', '-f', 'release', 'HEAD'], cache);
+      const v2 = commitDeploy('Release v2');
+
+      const result = updateInstalledSkill('deploy');
+
+      expect(result.ok).toBe(true);
+      expect(readSkillRegistry().skills.deploy.description).toBe('Release v2');
+      expect(readSkillRegistry().skills.deploy.source).toMatchObject({ ref: 'release', commit: v2 });
+    });
+
+    it('does the same for dashboard (async) updates', async () => {
+      await installGitSkillAsync({ url: repo, path: 'skills/deploy', ref: 'release' });
+      run('git', ['branch', '-f', 'release', 'HEAD'], installedGitSourceDir(home));
+      const v2 = commitDeploy('Release v2 async');
+
+      const result = await updateInstalledSkillAsync('deploy');
+
+      expect(result.ok).toBe(true);
+      expect(readSkillRegistry().skills.deploy.description).toBe('Release v2 async');
+      expect(readSkillRegistry().skills.deploy.source).toMatchObject({ ref: 'release', commit: v2 });
+    });
+
+    it('keeps a tag or commit pinned where it points', () => {
+      const pinned = run('git', ['rev-parse', 'HEAD'], repo);
+      run('git', ['tag', 'v1'], repo);
+      installGitSkill({ url: repo, path: 'skills/deploy', ref: 'v1' });
+      commitDeploy('Release v2');
+
+      expect(updateInstalledSkill('deploy').ok).toBe(true);
+      expect(readSkillRegistry().skills.deploy).toMatchObject({ description: 'Release v1', source: { commit: pinned } });
+    });
+  });
+
   it('supports async install and update for dashboard jobs', async () => {
     await installGitSkillAsync({ url: repo, path: 'skills/deploy', ref: 'HEAD' });
     write(join(repo, 'skills', 'deploy', 'SKILL.md'), '---\nname: deploy\ndescription: Async Updated\n---\n# Deploy');

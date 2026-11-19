@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -54,6 +53,7 @@ describe('dashboard desktop compat manifest', () => {
       schedules: { supported: true, route: '#/schedules' },
       settings: { supported: true, route: '#/settings' },
       workflow: { supported: false },
+      team: { supported: false },
     });
     expect(manifest.capabilities).toMatchObject({
       'overview.read': true,
@@ -66,8 +66,10 @@ describe('dashboard desktop compat manifest', () => {
       'settings.manage': true,
       'workflow.read': false,
       'workflow.manage': false,
+      'team.read': false,
     });
     expect(manifest.routes).not.toContain('#/workflows');
+    expect(manifest.routes).not.toContain('#/team');
     expect(manifest.routes).toEqual(
       Object.values(manifest.modules)
         .filter(module => module.supported && module.route)
@@ -135,12 +137,6 @@ describe('dashboard desktop compat manifest', () => {
 
     const post = await fetch(`${started.baseUrl}/__desktop/compat`, { method: 'POST' });
     expect(post.status).toBe(404);
-  });
-
-  it('uses the shared dashboard HTTP helper instead of the removed workflow module', () => {
-    const compatSource = readFileSync(new URL('../../src/dashboard/compat.ts', import.meta.url), 'utf8');
-    expect(compatSource).toContain("from './http.js'");
-    expect(compatSource).not.toContain('./workflow-api.js');
   });
 });
 

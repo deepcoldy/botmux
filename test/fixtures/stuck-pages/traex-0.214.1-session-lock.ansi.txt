@@ -1,0 +1,50 @@
+
+  [1m[38;5;2m▄▄▄▄▄▄▄
+[0m[39m[49m  [1m[38;5;2m█[0m[39m[49m [1m[38;5;2m◆[0m[39m[49m [1m[38;5;2m◆[0m[39m[49m [1m[38;5;2m█[0m[39m[49m  [1m[38;5;2mTRAE CLI[0;2m[39m[49m (v0.214.1)
+[0m[39m[49m   [1m[38;5;2m▀▀▀▀▀▀
+[0m[39m[49m  /tmp/repo
+  [2mpermissions: [0;1m[38;5;5m[49mYOLO mode
+
+[0m[39m[49m  [38;5;2mGood evening, user
+
+[39m  [1mTip:[0m[39m[49m Use /vim to toggle vim keybindings in the composer.
+
+
+[2m▍ [0m[39m[49mReply with the single word ok and nothing else.
+
+
+[2m◆ [0m[39m[49mok
+
+[2m  Worked for 3s • 6:44 PM
+
+
+[0m[39m[48;5;235m  🔒  [1mThis conversation is open in another app[0m[39m[48;5;235m                                                                                                      [1m[38;5;75mR[0m[39m[48;5;235m to Retry
+      Owner: PID 2079297
+      [2mClose it there and press R to continue here.
+
+[0m[39m[49m   [1mr[0;2m[39m[49m retry  |  [0;1m[39m[49m←/esc[0;2m[39m[49m dashboard  |  [0;1m[39m[49mctrl+c/q[0;2m[39m[49m exit  |  [0;1m[39m[49mctrl+o[0;2m[39m[49m transcript
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

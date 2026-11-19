@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { startIpcServer } from '../src/core/dashboard-ipc-server.js';
+import { DEFAULT_PROBE_SPAN } from '../src/utils/listen-with-probe.js';
 
 const handles: Array<{ close: () => Promise<void> }> = [];
 afterEach(async () => { for (const h of handles.splice(0)) await h.close(); });
@@ -22,6 +23,10 @@ describe('startIpcServer EADDRINUSE resilience', () => {
     // Second daemon resolves the SAME port -> must step up, not reject/crash.
     const second = await startIpcServer({ port: first.port, host: '127.0.0.1' });
     handles.push(second);
-    expect(second.port).toBe(first.port + 1);
+    // The contract is "the next FREE port upward", not "+1": first.port is an
+    // ephemeral port, so on a shared runner an unrelated socket can already hold
+    // first.port + 1 (CI observed +2), and asserting +1 made this test flaky.
+    expect(second.port).toBeGreaterThan(first.port);
+    expect(second.port).toBeLessThanOrEqual(first.port + DEFAULT_PROBE_SPAN);
   });
 });

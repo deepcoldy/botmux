@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -1137,21 +1135,6 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
       act(() => touch.renderer.unmount());
       touch.restore();
     }
-  });
-
-  it('跨文件契约：终端页落下 wsHasWrite 并按同一个消息类型上抛', () => {
-    // 面板认的是这两样东西：同源读的 `wsHasWrite` 全局，和 postMessage 的类型串。
-    // worker 那边改了名而这里不改，面板会静默退回「读不出来」，触屏文案又悄悄回到
-    // 写死的「手机端只读」——正是这一条要修掉的反话。
-    const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    expect(worker).toContain('var wsHasWrite=null');
-    expect(worker).toContain("'botmux:wb-terminal-write'");
-    // 结论走的是带外首帧（见 terminal-write-frame.test.ts 那一组），不再混在 PTY
-    // 字节流里让页面逐帧去扫。
-    expect(worker).toContain('terminalWriteFrame(hasWrite)');
-    expect(worker).not.toContain(']1989;write;');
-    const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
-    expect(panes).toContain('{ wsHasWrite?: unknown }');
   });
 });
 

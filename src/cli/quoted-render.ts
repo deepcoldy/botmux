@@ -1,15 +1,38 @@
 /**
- * Pure-function render pipeline for `botmux quoted`. Extracted so unit tests
+ * Fetch/render pipeline for `botmux quoted`. Extracted so unit tests
  * can exercise the wire-up (numberer sharing, extraResources merging) without
  * spinning up the CLI dispatcher or hitting Lark APIs.
  */
 import type { LarkMessage } from '../types.js';
+import { config } from '../config.js';
+import { ReplyDeliveryStore, type ReplyDelivery } from '../services/reply-delivery-store.js';
+import { LARK_CODE_MESSAGE_INTERNAL_ERROR, structuredLarkCode } from '../im/lark/lark-errors.js';
 import {
   parseApiMessage,
   extractResources,
   createImgNumberer,
   type MessageResource,
 } from '../im/lark/message-parser.js';
+
+/** Keep full card JSON on successful lookups. Some merge_forward parents return
+ *  Lark 2200 with user_card_content; retry once without that parameter so the
+ *  renderer can reach the existing forwarded-tree/card recovery pipeline. */
+export async function getQuotedMessageDetail(
+  larkAppId: string,
+  messageId: string,
+  getMessageDetail: typeof import('../im/lark/client.js').getMessageDetail,
+): Promise<any> {
+  try {
+    return await getMessageDetail(larkAppId, messageId);
+  } catch (err) {
+    // Only the known provider error gets a representation fallback. Permission,
+    // withdrawn-message, rate-limit and transport failures remain failures.
+    if (structuredLarkCode(err) !== LARK_CODE_MESSAGE_INTERNAL_ERROR) throw err;
+    // 2200 describes a representation failure, not one message type. Standalone
+    // cards can also degrade to a placeholder; the fallback is attempted once.
+    return getMessageDetail(larkAppId, messageId, { userCardContent: false });
+  }
+}
 
 /** Subset of expandMergeForward used here — accepts the parsed message and a
  *  numberer, mutates parsed.content to the rendered tree, returns extra
@@ -19,6 +42,7 @@ export type ExpandMergeForwardFn = (
   messageId: string,
   parsed: LarkMessage,
   numberer: ReturnType<typeof createImgNumberer>,
+  initialDetail?: { items?: any[] },
 ) => Promise<{ extraResources: MessageResource[] }>;
 
 /** Subset of resolveMergedCardContent used here (dependency-injected so tests
@@ -35,6 +59,8 @@ export interface RenderedQuotedMessage extends LarkMessage {
   /** Structured card JSON from the merge pass — set only for interactive
    *  messages that were successfully re-resolved (`quoted --raw` → cardJson). */
   mergedStructuredContent?: string;
+  delivery?: ReplyDelivery;
+  deliveryError?: 'unavailable';
 }
 
 /**
@@ -54,6 +80,8 @@ export async function renderQuotedMessage(
   rawMessage: any,
   expandMergeForward: ExpandMergeForwardFn,
   resolveMergedCard?: ResolveMergedCardFn,
+  initialDetail?: { items?: any[] },
+  deliveryStore = new ReplyDeliveryStore(config.session.dataDir),
 ): Promise<RenderedQuotedMessage> {
   const numberer = createImgNumberer();
   // Order: extractResources first so top-level keys get their numbers, then
@@ -63,8 +91,15 @@ export async function renderQuotedMessage(
   // that haven't been declared yet via extractResources).
   const resources = extractResources(rawMessage.msg_type ?? '', rawMessage.body?.content ?? '', numberer);
   const parsed = parseApiMessage(rawMessage, numberer);
+  let delivery: ReplyDelivery | undefined;
+  let deliveryError: 'unavailable' | undefined;
+  if (typeof rawMessage.chat_id === 'string') {
+    try { delivery = deliveryStore.read(larkAppId, parsed.messageId, rawMessage.chat_id); }
+    catch { deliveryError = 'unavailable'; }
+  }
+  const evidence = { ...(delivery ? { delivery } : {}), ...(deliveryError ? { deliveryError } : {}) };
   if (parsed.msgType === 'merge_forward') {
-    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer);
+    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer, initialDetail);
     resources.push(...extraResources);
   }
   // Interactive cards: union both im.message.get representations so the quoted
@@ -79,8 +114,8 @@ export async function renderQuotedMessage(
     const merged = await resolveMergedCard(larkAppId, parsed.messageId, cardNumberer).catch(() => null);
     if (merged) {
       parsed.content = merged.text;
-      return { ...parsed, resources: merged.resources, mergedStructuredContent: merged.structuredContent };
+      return { ...parsed, ...evidence, resources: merged.resources, mergedStructuredContent: merged.structuredContent };
     }
   }
-  return { ...parsed, resources };
+  return { ...parsed, ...evidence, resources };
 }

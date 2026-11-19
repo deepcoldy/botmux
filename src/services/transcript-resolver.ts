@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
@@ -12,13 +12,27 @@ import { config } from '../config.js';
 import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
-import { antigravityTranscriptPath } from './antigravity-transcript.js';
+import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
+import { findKimiWireBySessionId, findKimiWireForBotmuxSession, kimiSessionIndexStamp } from './kimi-transcript.js';
+import { isKimiSessionId } from '../adapters/cli/kimi-session.js';
 import { minimaxDataDirForBot } from './minimax-paths.js';
+import { getBot } from '../bot-registry.js';
+import { botOneShotEnv } from '../core/session-env-resolve.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity' | 'minimax';
+/** Kimi path hits are re-validated after this long (see the `kimi` case). */
+const KIMI_PATH_HIT_TTL_MS = 30_000;
+
+/** The env a bot's Kimi runs with (a bot may relocate KIMI_CODE_HOME in its
+ *  bots.json `env`), so usage reads the same data dir the worker spawned on. */
+export function kimiEnvForBot(larkAppId?: string): NodeJS.ProcessEnv {
+  if (!larkAppId) return process.env;
+  try { return botOneShotEnv(process.env, getBot(larkAppId).config); } catch { return process.env; }
+}
+
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'kimi' | 'antigravity' | 'minimax';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -29,13 +43,20 @@ export interface TranscriptPathQuery {
    *  (CLI-data-redirected) bots whose transcripts live under
    *  `<botmuxHome>/bots/<appId>/claude` instead of the global data dir. */
   larkAppId?: string;
-  /** Bypass a cached miss for lazily-created transcripts. */
+  /** Bypass a cached miss; for Codex also refresh a possibly rotated path. */
   fresh?: boolean;
 }
 
 export interface ResolvedTranscriptPath {
   path: string;
   kind: TranscriptKind;
+  /** Set when the path runs through a tree the session's CLI can write to (a
+   *  sandboxed bot's BOT_HOME, a scratch view): the directory, outside that
+   *  tree, below which every component must be a real directory and the leaf
+   *  a regular file. The check made here is only as good as the moment it is
+   *  made, so a reader of such a path re-checks the file it actually opened
+   *  (see context-rewind's transcript reads). */
+  writableTreeRoot?: string;
 }
 
 const sessionPathCache = new Map<string, { path: string | null; atMs: number }>();
@@ -43,6 +64,7 @@ const SESSION_PATH_CACHE_MAX_ENTRIES = 1024;
 /** A missed lookup (transcript not on disk yet) is retried only after this
  *  window — fresh sessions otherwise trigger a directory scan per row render. */
 const PATH_MISS_RETRY_MS = 30_000;
+const CODEX_PATH_HIT_TTL_MS = 5_000;
 
 export function __resetTranscriptResolverCacheForTest(): void {
   sessionPathCache.clear();
@@ -76,11 +98,20 @@ export function cachedTranscriptPathLookup(
   return path;
 }
 
+function isRegularFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
+}
+
 /** cwd → the path Claude Code keys its project dir by: the REALPATH (symlinks
  *  resolved), falling back to a lexical resolve only when the path isn't on disk.
  *  Claude keys projects by realpath, so a symlinked cwd (e.g. /home/x →
  *  /data00/home/x) must resolve to the same string the CLI used — a lexical
- *  resolve() would point at a project key Claude never writes to. */
+ *  resolve() would point at a project key Claude never writes to.
+ *  The fallback keeps resolve() (a weak realpath): oncall bindings persist the
+ *  owner's raw string (a trailing slash, '.', '..' are common), and after that
+ *  directory is deleted realpathSync throws. A raw-string fallback would then
+ *  hash the un-normalized spelling to a key that never matches; resolve() keeps
+ *  POSIX lexical normalization for free. */
 function realCwd(cwd: string): string {
   const expanded = expandHome(cwd);
   try { return realpathSync(expanded); } catch { return resolve(expanded); }
@@ -99,7 +130,7 @@ function findClaudeJsonlByGlob(projectsDir: string, slug: string, sessionId: str
   const hits = entries
     .filter(name => name === prefix || name.startsWith(`${prefix}-`))
     .map(name => join(projectsDir, name, target))
-    .filter(p => existsSync(p));
+    .filter(isRegularFile);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -120,7 +151,7 @@ export function getClaudeSessionJsonlPath(
   const projectDir = join(projectsDir, projectKey);
   const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
   if (!opts?.noFollow) {
-    if (existsSync(jsonlPath)) return jsonlPath;
+    if (isRegularFile(jsonlPath)) return jsonlPath;
     return findClaudeJsonlByGlob(projectsDir, projectKey, sessionId);
   }
   if (isDirectoryNoFollow(dataDir)
@@ -187,6 +218,45 @@ function botHomeCliDataDir(
     return cliDataDir;
   } catch {
     return null; // unsafe app id — never build a path from it
+  }
+}
+
+/** The root of the CLI-writable tree `path` runs through, if any: for a
+ *  scratch view, the view's own root (the session cannot replace the view it
+ *  lives in); for a path under a bot's BOT_HOME, the `bots` directory holding
+ *  it, so BOT_HOME itself is checked too (the resolver rejects a replaced app
+ *  root for the same reason). Decided from where the path lies, never from
+ *  the tree's current state: a check that fails here must not drop the root
+ *  and leave the path unguarded. */
+export function claudeWritableTreeRoot(
+  path: string,
+  scratch: ScratchPathMapping[] | undefined,
+  larkAppId: string | undefined,
+): string | undefined {
+  const within = (root: string) => {
+    const rel = relative(resolve(root), resolve(path));
+    return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  };
+  if (scratch) {
+    // Longest view prefix first, like scratchViewPath's host-side lookup. A
+    // scratch path outside every view is not one this resolver hands out;
+    // should it happen, the longest view is still the tree to check against.
+    const views = scratch.map(m => m.to).sort((a, b) => b.length - a.length);
+    return views.find(within) ?? views[0];
+  }
+  const bots = botsDirOf(larkAppId);
+  return bots && within(bots) ? bots : undefined;
+}
+
+/** `<botmuxHome>/bots`, derived exactly like botHomeCliDataDir but without
+ *  looking at the disk. */
+function botsDirOf(larkAppId: string | undefined): string | undefined {
+  const sessionDataDir = process.env.SESSION_DATA_DIR;
+  if (!larkAppId || !sessionDataDir) return undefined;
+  try {
+    return dirname(botHomePath(dirname(sessionDataDir), larkAppId));
+  } catch {
+    return undefined; // unsafe app id: botHomeCliDataDir never builds a path from it either
   }
 }
 
@@ -295,14 +365,14 @@ function codexRolloutInHome(
   };
   let path = cachedTranscriptPathLookup(
     key,
-    null,
+    CODEX_PATH_HIT_TTL_MS,
     lookup,
-    { retryMiss: q.fresh },
+    { retryMiss: q.fresh, refreshHit: q.fresh },
   );
   // Positive entries were historically cached forever. Refresh immediately if
   // the file vanished or was replaced by a symlink/non-regular node.
   if (path && candidateMtime(path) === null) {
-    path = cachedTranscriptPathLookup(key, null, lookup, { refreshHit: true, retryMiss: true });
+    path = cachedTranscriptPathLookup(key, CODEX_PATH_HIT_TTL_MS, lookup, { refreshHit: true, retryMiss: true });
   }
   return candidateMtime(path) === null ? null : path;
 }
@@ -313,7 +383,9 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'kimi', 'antigravity', 'minimax',
+  // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
+  'zcode',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -373,7 +445,9 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = svMappings
         ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
         : claudeJsonlWithBotHomeFallback(sid, sq, dataRoot);
-      return path ? { path, kind: 'claude' } : null;
+      if (!path) return null;
+      const writableTreeRoot = claudeWritableTreeRoot(path, svMappings, q.larkAppId);
+      return { path, kind: 'claude', ...(writableTreeRoot ? { writableTreeRoot } : {}) };
     }
     case 'aiden': {
       const homeRoot = v(join(homedir(), '.claude'));
@@ -453,6 +527,32 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       );
       return path ? { path, kind: 'grok' } : null;
     }
+    case 'kimi': {
+      // Kimi mints its own `session_<uuid>` ids. Without a persisted one, the
+      // session is the newest one in this cwd carrying this botmux session's
+      // routing marker. Kimi indexes every new session (fresh spawn, `/new`),
+      // so the index stamp in the key makes a new generation take over at
+      // once; the TTL only re-checks a hit whose marker evidence moved.
+      //
+      // The stamp only watches the NEWEST index entry's state.json, so a
+      // sibling conversation that creates a session after ours hides our
+      // generation's prompt writes from it. Fresh reads (turn boundaries AND
+      // the streaming-card tick) therefore bypass the hit TTL and re-run the
+      // marker lookup over every entry; only non-fresh callers (dashboard
+      // rows and the like) ride the TTL. Wire-log misses are cached per log
+      // size/mtime inside the lookup, so the repeated scan stays cheap.
+      const kimiSid = q.cliSessionId && isKimiSessionId(q.cliSessionId) ? q.cliSessionId : undefined;
+      const kimiEnv = kimiEnvForBot(q.larkAppId);
+      const path = cachedTranscriptPathLookup(
+        `kimi:${q.sessionId}:${kimiSid ?? ''}:${q.cwd ?? ''}:${kimiEnv.KIMI_CODE_HOME ?? ''}:${kimiSessionIndexStamp(kimiEnv)}`,
+        KIMI_PATH_HIT_TTL_MS,
+        () => foundWrap(kimiSid
+          ? findKimiWireBySessionId(kimiSid, kimiEnv)
+          : findKimiWireForBotmuxSession(q.sessionId, q.cwd, { env: kimiEnv }), v),
+        { retryMiss: q.fresh, refreshHit: q.fresh },
+      );
+      return path ? { path, kind: 'kimi' } : null;
+    }
     case 'pi': {
       const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => foundWrap(findPiTranscriptBySessionId(sid, q.cwd), v), { retryMiss: q.fresh });
       return path ? { path, kind: 'pi' } : null;
@@ -460,11 +560,11 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
     case 'antigravity': {
       // The conversation id is interpolated into the brain path; the helper
       // validates the charset (traversal / separators). Read it through the
-      // per-session scratch overlay like every other host-derived root, and
-      // existsSync keeps the null-when-absent contract every branch honors.
-      const pReal = antigravityTranscriptPath(q.cliSessionId);
-      const p = pReal ? v(pReal) : null;
-      return p && existsSync(p) ? { path: p, kind: 'antigravity' } : null;
+      // per-session scratch overlay like every other host-derived root; the
+      // untruncated transcript_full.jsonl wins over the compact log, and the
+      // existence check keeps the null-when-absent contract every branch honors.
+      const p = resolveAntigravityTranscriptPath(q.cliSessionId, { mapPath: v });
+      return p ? { path: p, kind: 'antigravity' } : null;
     }
     default:
       return null;

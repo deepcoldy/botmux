@@ -38,12 +38,16 @@ describe('buildTurnTerminalFooterPatch', () => {
     ] } };
     const input = JSON.stringify(card);
     const patch = buildTurnTerminalFooterPatch(input, 'completed', 'zh');
-    expect(patch).toEqual({ content: "brand · 发送给：<at id=ou_user></at> · <font color='grey'>✓ 本轮已结束 · 等待输入</font>" });
+    expect(patch).toEqual({
+      content: "brand · 发送给：<at id=ou_user></at> · <font color='grey'>✓ 本轮已结束 · 等待输入</font>",
+      alreadyApplied: false,
+    });
     expect(JSON.stringify(card)).toBe(input);
     expect(JSON.stringify(patch)).not.toContain(body);
+    // A replayed terminal reads back the receipt it already wrote.
     expect(buildTurnTerminalFooterPatch(JSON.stringify({ schema: '2.0', body: { elements: [{
-      tag: 'markdown', element_id: 'botmux_reply_footer', ...patch,
-    }] } }), 'completed', 'zh')).toEqual(patch);
+      tag: 'markdown', element_id: 'botmux_reply_footer', content: patch!.content,
+    }] } }), 'completed', 'zh')).toEqual({ content: patch!.content, alreadyApplied: true });
   });
 
   it.each(['not json', '{}', JSON.stringify({ schema: '2.0', body: { elements: [] } }),

@@ -227,11 +227,11 @@ async function runHook(
       timedOut = true;
       child.kill('SIGKILL');
     }, options.exitTimeoutMs ?? (
-      // `trackTranscriptAccess` eval-imports the whole CLI after patching fs.
-      // Under a loaded shard that spawn regularly exceeds 5s (CI shard 3:
-      // hostile case 5074ms → SIGKILL → status null). Hang protection stays;
-      // the bound just has to outlast a cold CLI import, not win a race.
-      options.trackTranscriptAccess ? 20_000 : 5_000
+      // Every case cold-imports the whole CLI, not only the fs-patched eval.
+      // A loaded shard can exceed 5s before the hook starts (including the
+      // malformed-input case). Keep a finite hang bound above import time;
+      // cases testing stdin deadlines still set their own explicit bound.
+      20_000
     ));
     child.once('exit', code => {
       clearTimeout(timer);
@@ -262,17 +262,16 @@ describe('native-subagent-runtime-hook CLI', () => {
     expect(capturedRequests).toHaveLength(0);
   });
 
-  it('is a no-op for malformed or oversized stdin', async () => {
-    for (const input of [
-      '{bad json',
-      JSON.stringify({ ...spawnPayload, padding: 'secret-never-echo'.repeat(100_000) }),
-    ]) {
-      const result = await runHook(input, { startServer: false });
-      expect(result.status).toBe(0);
-      expect(result.stdout).toBe('');
-      expect(result.stderr.length).toBeLessThanOrEqual(1024);
-      expect(result.stderr).not.toContain('secret-never-echo');
-    }
+  it.each([
+    ['malformed', '{bad json'],
+    ['oversized', JSON.stringify({ ...spawnPayload, padding: 'secret-never-echo'.repeat(100_000) })],
+  ])('is a no-op for %s stdin', async (_kind, input) => {
+    const result = await runHook(input, { startServer: false });
+    expect(result.timedOut).toBe(false);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr.length).toBeLessThanOrEqual(1024);
+    expect(result.stderr).not.toContain('secret-never-echo');
   });
 
   it('stops reading oversized stdin without waiting for EOF', async () => {
@@ -479,21 +478,23 @@ describe('native-subagent-runtime-hook CLI', () => {
     expect(overloaded.stderr).toContain('policy service overloaded; denying spawn');
   });
 
+  // The hang bound is runHook's default cold-import budget, not a tight one:
+  // the clock starts before the CLI is imported (>5s on a loaded shard), and
+  // the hook's own 2s response deadline only starts after that. A stream the
+  // hook failed to cancel never ends, so it still hits the bound and fails.
   it('cancels oversized and timed-out never-ending response streams', async () => {
     const oversized = await runHook(JSON.stringify(spawnPayload), {
       responseMode: 'oversized-never-ending',
-      exitTimeoutMs: 6_000,
     });
-    expect(oversized.timedOut).toBe(false);
+    expect(oversized.timedOut, `hook killed before exit; stderr=${oversized.stderr}`).toBe(false);
     expect(oversized.stdout).toBe('');
 
     const partial = await runHook(JSON.stringify(spawnPayload), {
       responseMode: 'partial-never-ending',
-      exitTimeoutMs: 6_000,
     });
-    expect(partial.timedOut).toBe(false);
+    expect(partial.timedOut, `hook killed before exit; stderr=${partial.stderr}`).toBe(false);
     expect(partial.stdout).toBe('');
-  }, 12_000);
+  }, 50_000);
 
   it('is a no-op when the policy passes both runtime dimensions through', async () => {
     const result = await runHook(JSON.stringify(spawnPayload), { policy: undefined });

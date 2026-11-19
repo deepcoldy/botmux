@@ -12,6 +12,75 @@ const key = {
 };
 
 describe('TurnSendLedger', () => {
+  it('keeps unmarked final publishers on their existing contract when the global rollout switch is on', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'handoff-unmarked-'));
+    const previous = process.env.BOTMUX_FINAL_OUTPUT_HANDOFF;
+    process.env.BOTMUX_FINAL_OUTPUT_HANDOFF = '1';
+    try {
+      const ledger = new TurnSendLedger(root);
+      await expect(ledger.execute(key, 'final', 'legacy answer', async () => { throw new Error('failed'); })).rejects.toThrow('failed');
+      expect(ledger.read(key)?.publication).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_FINAL_OUTPUT_HANDOFF; else process.env.BOTMUX_FINAL_OUTPUT_HANDOFF = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('fences an explicitly published final using the admitted-turn marker without launcher env', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'final-handoff-admitted-'));
+    const previous = process.env.BOTMUX_FINAL_OUTPUT_HANDOFF;
+    delete process.env.BOTMUX_FINAL_OUTPUT_HANDOFF;
+    try {
+      const ledger = new TurnSendLedger(root);
+      ledger.enableHandoffFence(key);
+      await expect(ledger.execute(key, 'final', 'answer', async () => { throw new Error('response lost'); })).rejects.toThrow();
+      expect(ledger.read(key)?.publication).toBeDefined();
+      const duplicate = vi.fn(async () => 'om_second');
+      await expect(ledger.execute(key, 'final', 'bridge answer', duplicate, { fenced: true, reuseExistingFinal: true })).rejects.toThrow('未知');
+      expect(duplicate).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_FINAL_OUTPUT_HANDOFF; else process.env.BOTMUX_FINAL_OUTPUT_HANDOFF = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('fences an unknown final and does not erase earlier uncertainty after a later rejection', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'final-publication-unknown-'));
+    try {
+      const ledger = new TurnSendLedger(root);
+      await expect(ledger.execute(key, 'final', 'answer', async () => { throw new Error('response lost'); }, { fenced: true })).rejects.toThrow('response lost');
+      const uuid = ledger.read(key)?.publication?.providerUuid;
+      const next = vi.fn(async () => { throw new Error('rejected'); });
+      await expect(ledger.execute(key, 'final', 'answer', next, { fenced: true, noSideEffect: () => true })).rejects.toThrow('earlier attempt');
+      expect(ledger.read(key)?.publication?.providerUuid).toBe(uuid);
+      const other = vi.fn(async () => 'om_other');
+      await expect(ledger.execute(key, 'final', 'different', other)).rejects.toThrow('未知');
+      await expect(ledger.execute(key, 'progress', 'progress', other)).rejects.toThrow('未知');
+      expect(other).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('releases a first-attempt publication fence only for a proved rejection', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'final-publication-rejected-'));
+    try {
+      const ledger = new TurnSendLedger(root);
+      await expect(ledger.execute(key, 'final', 'rejected', async () => { throw new Error('rejected'); }, { fenced: true, noSideEffect: () => true })).rejects.toThrow('rejected');
+      expect(ledger.read(key)).toBeUndefined();
+      await expect(ledger.execute(key, 'final', 'corrected', async () => 'om_corrected', { fenced: true })).resolves.toMatchObject({ messageId: 'om_corrected' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('blocks retry after the provider UUID window and retains its inspection record', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'final-publication-expired-'));
+    try {
+      const ledger = new TurnSendLedger(root); const initial = Date.now();
+      await expect(ledger.execute(key, 'final', 'answer', async () => { throw new Error('response lost'); }, { fenced: true })).rejects.toThrow();
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(initial + 2 * 60 * 60_000);
+      const send = vi.fn(async () => 'om_duplicate');
+      await expect(ledger.execute(key, 'final', 'answer', send, { fenced: true })).rejects.toThrow('去重窗口已过期');
+      expect(send).not.toHaveBeenCalled();
+      expect(ledger.inspect()).toMatchObject([{ state: 'in_flight', turnId: key.turnId }]);
+      clock.mockRestore();
+    } finally { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); }
+  });
   it('reuses the first message id for an identical final retry', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
     try {

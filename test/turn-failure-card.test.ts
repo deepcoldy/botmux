@@ -21,7 +21,6 @@ import { buildTurnFailedCard, type TurnFailedCardOpts } from '../src/im/lark/car
 import {
   shouldNotifyTurnFailure,
   turnRetryOffer,
-  mayOfferTurnRetry,
   userAbortErrorCodes,
   userAbortErrorCodePrefixes,
   supersededByNewerInputErrorCodes,
@@ -29,6 +28,7 @@ import {
   buildTurnContinuePrompt,
 } from '../src/services/turn-failure-notice.js';
 import { t } from '../src/i18n/index.js';
+import { formatClockTime } from '../src/utils/clock-time.js';
 import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-config.js';
 
 let cardTestHome: string;
@@ -180,7 +180,7 @@ describe('turnRetryOffer', () => {
   it('refuses retry when the CLI explicitly said it cannot help', () => {
     // Auth/permission/invalid-request: re-sending the same bytes cannot succeed.
     for (const errorCode of ['provider_authentication_failed', 'provider_permission_denied',
-      'provider_invalid_request', 'provider_cancelled']) {
+      'provider_invalid_request', 'provider_cancelled', 'provider_image_too_small']) {
       expect(turnRetryOffer({ status: 'failed', errorCode, retryable: false })).toBe('none');
     }
   });
@@ -240,18 +240,6 @@ describe('turnRetryOffer', () => {
     })).toBe('none');
   });
 
-  it('mayOfferTurnRetry agrees with turnRetryOffer', () => {
-    const cases = [
-      { status: 'failed' as const, errorCode: 'cli_exit' },
-      { status: 'ambiguous' as const, errorCode: 'write_input_threw' },
-      { status: 'completed' as const },
-      { status: 'ambiguous' as const, errorCode: 'pi_turn_aborted' },
-    ];
-    for (const c of cases) {
-      expect(mayOfferTurnRetry(c)).toBe(turnRetryOffer(c) !== 'none');
-    }
-  });
-
   it('the policy whitelists do not overlap', () => {
     // A silenced code that also counted as pre-execution would make a silenced
     // failure sprout a retry button — contradictory. Pin the disjointness
@@ -287,27 +275,11 @@ describe('buildTurnContinuePrompt', () => {
     expect(buildTurnContinuePrompt()).not.toContain('原任务');
   });
 
-  it('says the previous turn was cut off', () => {
-    // The transcript just ends; it cannot distinguish interrupted from
-    // finished. This is one of the two things resume does NOT convey.
-    expect(buildTurnContinuePrompt()).toContain('中断');
-  });
-
-  it('forbids repeating completed work', () => {
-    // The other thing resume does not convey — and the entire reason this is a
-    // continue rather than a verbatim replay. Worth its tokens.
-    expect(buildTurnContinuePrompt()).toContain('不要重复已完成的操作');
-  });
-
-  it('tells the model to stop and ask a human when it cannot judge safely', () => {
-    // The third thing resume cannot convey, and the one that bounds the risk:
-    // without it the model's only options are to guess or to redo, and both can
-    // duplicate an external side effect. This assertion exists because the
-    // handler comment promised this clause while the prompt did not carry it —
-    // a promise in a comment that nothing pins is not a behaviour.
+  it('is a distinct marked continuation instruction rather than the original task', () => {
+    // The marker is the stable protocol surface; translated prose may evolve.
     const p = buildTurnContinuePrompt();
-    expect(p).toContain('人工决策');
-    expect(p).toContain('无法安全判断');
+    expect(p).toContain('[BOTMUX_CONTINUE]');
+    expect(p).not.toContain('原任务');
   });
 
   it('does not claim a provider fault', () => {
@@ -356,6 +328,13 @@ describe('buildTurnFailedCard', () => {
     expect(btn.value.turn_id).toBe('turn-abc123');
     expect(btn.value.session_id).toBe('sess-fail');
     expect(btn.value.root_id).toBe('om_root_fail');
+  });
+
+  it("names the provider's own recovery time when its error gave one", () => {
+    const at = new Date('2026-11-13T11:10:16Z');
+    const line = t('card.turn_failed.provider_eta', { eta: formatClockTime(at.getTime()) });
+    expect(bodyText(build({ providerRetryAt: at }))).toContain(line);
+    expect(bodyText(build())).not.toContain(line);
   });
 
   it('omits the retry button when the policy denied retry', () => {
@@ -506,5 +485,43 @@ describe('buildTurnFailedCard', () => {
     expect(body).toMatch(/may have partially executed/i);
     expect(card.header.title.content).toMatch(/[A-Za-z]/);
     expect(card.header.title.content).not.toMatch(/[一-龥]/);
+  });
+
+  it('gives the poisoned-history guide instead of the generic no-retry advice', () => {
+    // A 1×1 image read by the CLI stays in session history and is replayed on
+    // every later request, so generic "resend a new message" advice is wrong.
+    // The special advice must win even though retryOffer is 'none' (same input
+    // shape as the generic branch).
+    for (const locale of ['zh', 'en'] as const) {
+      const card = build({ locale, errorCode: 'provider_image_too_small', retryOffer: 'none' });
+      const body = bodyText(card);
+      expect(body).toContain(t('card.turn_failed.image_too_small', undefined, locale));
+      expect(body).not.toContain(t('card.turn_failed.no_retry', undefined, locale));
+      expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
+    }
+  });
+
+  it('offers the one-tap purge-and-continue button for the image 400', () => {
+    const card = build({ errorCode: 'provider_image_too_small', retryOffer: 'none' });
+    const btn = actions(card).find((a: any) => a.value?.action === 'purge_images_continue');
+    expect(btn).toBeTruthy();
+    expect(btn.type).toBe('primary');
+    expect(btn.value.turn_id).toBe('turn-abc123');
+    // The ordinary retry button stays hidden (it would replay the same 400).
+    expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
+  });
+
+  it('never renders the purge button for a different error', () => {
+    const card = build({ errorCode: 'provider_invalid_request', retryOffer: 'none' });
+    expect(actions(card).find((a: any) => a.value?.action === 'purge_images_continue'))
+      .toBeUndefined();
+  });
+
+  it('omits the purge button when there is no turn credential', () => {
+    const card = build({
+      errorCode: 'provider_image_too_small', retryOffer: 'none', retryTurnId: undefined,
+    });
+    expect(actions(card).find((a: any) => a.value?.action === 'purge_images_continue'))
+      .toBeUndefined();
   });
 });

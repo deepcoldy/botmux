@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_WORKBENCH_SKIN,
@@ -186,16 +185,6 @@ describe('工作台外观：终端双风格', () => {
     expect(workbenchTermContainerClass('classic')).toBe('wb-term-classic');
     expect(workbenchTermTheme('classic', 'warm-graphite')).toBe(WORKBENCH_CLASSIC_TERM_THEME);
     expect(workbenchTermTheme('reader', 'warm-graphite')).toBe(WORKBENCH_READER_TERM_THEMES['warm-graphite']);
-  });
-
-  it('classic = 终端页现有配色原样（存量零变化）', () => {
-    const terminalPage = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const marker = terminalPage.indexOf('var term=new Terminal({');
-    expect(marker).toBeGreaterThan(0);
-    const themeBlock = terminalPage.slice(marker, marker + 400);
-    for (const value of Object.values(WORKBENCH_CLASSIC_TERM_THEME)) {
-      expect(themeBlock).toContain(value);
-    }
   });
 
   it('阅读风每套配色都给全 theme，且背景就是该套的终端画布色', () => {
@@ -404,22 +393,18 @@ describe('工作台外观 store：落到文档根 / 跨 tab / 跟随系统', () 
     unmount();
   });
 
-  it('终端外壳底色跟随实际渲染风格：阅读风=皮肤 --term-bg，经典=经典预设的真实底色', () => {
+  it('终端外壳底色跟随实际渲染风格：阅读风=该皮肤的 xterm 底色，经典=经典预设的真实底色', () => {
     // 外壳（.wb-pane-frame-shell）那圈安全边距原本刷皮肤令牌 --term-bg。阅读风下两者
     // 本来同色，可经典渲染的 xterm 底是它自己的 #1a1b26，于是画布外露出一圈更黑的
     // 边框 —— 线上反馈的「经典终端黑色边框」。这个函数把外壳底色接到**同一份**
     // theme 上（也就是同一次 postMessage 下发给 iframe 的那份），不存在第二份字面量。
-    const css = readFileSync('src/dashboard/web/style.css', 'utf8');
     for (const skin of WORKBENCH_SKIN_IDS) {
       // 经典：恒等于终端页那份 Tokyo Night 底色，与皮肤无关。
       expect(workbenchTermCanvasStyle('classic', skin)['--term-canvas-bg'], skin)
         .toBe(WORKBENCH_CLASSIC_TERM_THEME.background);
-      // 阅读风：等于该皮肤的 xterm 底色，而它按设计规范就等于这套皮肤的 --term-bg 令牌。
-      const readerBg = workbenchTermCanvasStyle('reader', skin)['--term-canvas-bg'];
-      expect(readerBg, skin).toBe(WORKBENCH_READER_TERM_THEMES[skin].background);
-      const anchor = `:root[data-skin="${skin}"] .agent-workbench-dock`;
-      const body = css.slice(css.indexOf(anchor), css.indexOf('}', css.indexOf(anchor)));
-      expect(body.toLowerCase(), `${skin} 的 --term-bg`).toContain(`--term-bg: ${readerBg.toLowerCase()};`);
+      // 阅读风：等于该皮肤下发给 xterm 的那份底色。
+      expect(workbenchTermCanvasStyle('reader', skin)['--term-canvas-bg'], skin)
+        .toBe(WORKBENCH_READER_TERM_THEMES[skin].background);
     }
     // 两套风格必须真的不同色，否则这次修复什么也没修。
     expect(workbenchTermCanvasStyle('classic', 'slate-blue')['--term-canvas-bg'])

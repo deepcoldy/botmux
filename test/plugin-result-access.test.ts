@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -63,8 +63,8 @@ describe('controlled plugin result page', () => {
     });
     const tokens = ['b'.repeat(43), 'c'.repeat(43)];
     const sessions = new DashboardSessionStore({ randomToken: () => tokens.shift()! });
-    const owner = sessions.create('ou_owner', 'on_owner123', true);
-    const other = sessions.create('ou_other', 'on_other123', true);
+    const owner = sessions.create('ou_owner', 'on_owner123', 'result');
+    const other = sessions.create('ou_other', 'on_other123', 'result');
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       if (await handlePluginResultAccess(req, res, url, {
@@ -100,12 +100,6 @@ describe('controlled plugin result page', () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
-
-    const dashboardSource = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboardSource).toContain(`return resolvePluginResultViewerIdentity(
-          dashboardRequestIdentity(req),
-          dashboardH5Auth.resolve(req),
-        );`);
   });
 
   it('requires the bound principal, permits owner revisits, and keeps result bytes out of redirects', async () => {

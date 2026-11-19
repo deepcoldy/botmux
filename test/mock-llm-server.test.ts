@@ -237,6 +237,124 @@ describe('MockLlmServer', () => {
     });
   });
 
+  describe('shell tool of each CLI', () => {
+    const post = (path: string, body: unknown) =>
+      fetch(`${baseUrl}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.text());
+    const prompt = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-cli-1793300000000"';
+
+    it('calls Grok\'s run_terminal_command with its required description', async () => {
+      const text = await post('/v1/messages', {
+        model: 'mock-model',
+        stream: true,
+        tools: [
+          { name: 'session_title', input_schema: { type: 'object', properties: { title: { type: 'string' } } } },
+          {
+            name: 'run_terminal_command',
+            input_schema: { type: 'object', required: ['command', 'description'], properties: { command: { type: 'string' }, description: { type: 'string' } } },
+          },
+        ],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const input = JSON.parse(JSON.parse(text.match(/"partial_json":("(?:[^"\\]|\\.)*")/)![1]));
+      expect(text).toContain('"name":"run_terminal_command"');
+      expect(input.command).toContain('ACK-e2e-cli-1793300000000');
+      expect(typeof input.description).toBe('string');
+    });
+
+    it('answers a call whose tools hold no shell with text, not an unknown tool', async () => {
+      const text = await post('/v1/messages', {
+        model: 'mock-model',
+        tools: [{ name: 'session_title', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(text).not.toContain('tool_use');
+    });
+
+    it('prefers Claude\'s exact Bash over BashOutput and KillShell', async () => {
+      const text = await post('/v1/messages', {
+        model: 'mock-model',
+        tools: ['BashOutput', 'KillShell', 'Bash'].map((name) => ({ name, input_schema: { type: 'object' } })),
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(text).toContain('"name":"Bash"');
+    });
+
+    it('calls the OpenAI-chat tool by the name the CLI offers (Kimi: Bash)', async () => {
+      const text = await post('/v1/chat/completions', {
+        model: 'mock-model',
+        tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', required: ['command'], properties: { command: { type: 'string' } } } } }],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(text).toContain('"name":"Bash"');
+      expect(text).toContain('ACK-e2e-cli-1793300000000');
+    });
+
+    it('speaks the Gemini API for Antigravity: a run_command call, then text after the functionResponse', async () => {
+      // Antigravity's run_command as agy 1.4.12 declares it: the command field
+      // is `CommandLine`, and `toolSummary` / `WaitMsBeforeAsync` are required.
+      const tools = [{ functionDeclarations: [{
+        name: 'run_command',
+        parametersJsonSchema: {
+          type: 'object',
+          required: ['CommandLine', 'toolSummary', 'WaitMsBeforeAsync'],
+          properties: { CommandLine: { type: 'string' }, IsDaemon: { type: 'boolean' }, WaitMsBeforeAsync: { type: 'integer' }, toolSummary: { type: 'string' } },
+        },
+      }] }];
+      const first = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools,
+      });
+      const call = JSON.parse(first.replace(/^data: /, '').trim()).candidates[0].content.parts[0].functionCall;
+      expect(call.name).toBe('run_command');
+      expect(call.args.CommandLine).toBe("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+      expect(call.args).not.toHaveProperty('command');
+      expect(call.args.toolSummary).toBeTypeOf('string');
+      expect(call.args.WaitMsBeforeAsync).toBeTypeOf('number');
+      expect(call.args).not.toHaveProperty('IsDaemon');
+
+      const second = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [
+          { role: 'user', parts: [{ text: prompt }] },
+          { role: 'model', parts: [{ functionCall: call }] },
+          { role: 'user', parts: [{ functionResponse: { name: 'run_command', response: { output: 'sent' } } }] },
+        ],
+        tools,
+      });
+      expect(JSON.parse(second.replace(/^data: /, '').trim()).candidates[0].content.parts[0].text).toBeTypeOf('string');
+    });
+
+    it('answers a Gemini API request that declares no tools (Antigravity title call) with text', async () => {
+      const text = await post('/v1beta/models/gemini-3.1-flash-lite-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
+
+    it('answers a Gemini API tools group holding only a built-in (googleSearch) with text', async () => {
+      // A non-empty `tools` array that declares no callable function must not
+      // fall through to a fabricated run_command the request never offered.
+      const text = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ googleSearch: {} }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
+
+    it('answers a Gemini API request whose functions hold no shell with text', async () => {
+      const text = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ functionDeclarations: [{ name: 'session_title', parametersJsonSchema: { type: 'object' } }] }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
+  });
+
   describe('OpenAI Responses API (/v1/responses)', () => {
     it('generates response SSE stream with extracted marker', async () => {
       const res = await fetch(`${baseUrl}/v1/responses`, {

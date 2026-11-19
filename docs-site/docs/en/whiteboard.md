@@ -1,74 +1,110 @@
 # Local Whiteboard
 
-Multiple bots / sessions in the same Lark group share a **local markdown whiteboard** that captures the "current project state" (goals / how work is organized / core plan / key progress / next steps) across sessions and bots.
+The whiteboard is a markdown note stored on your machine. All bots and sessions in the same Feishu group share one. It records where the project stands right now: goals, roles, approach, progress, next steps.
 
-The board is a **latest-state snapshot**: `update` overwrites the whole thing instead of appending history, so a later agent reads the current consensus directly instead of scrolling chat history. It fits multi-agent collaboration, long-task checkpoints, and cross-topic handoff.
+When a new session or a different bot takes over, the agent reads the whiteboard and catches up without scrolling through chat history. Useful for multi-agent work, resuming long tasks, and handing off across topics.
 
-> Disabled by default. It's an optional enhancement — when off, no board is created, no session is bound, no prompt is injected, and an agent's read/write commands are rejected.
+The whiteboard is a **snapshot, not a log**: every update rewrites the whole thing as the latest state. Old content is not kept.
 
-## Enable / Disable
+> Off by default. While off, no boards are created, no sessions are bound, nothing is added to prompts, and agent read/write commands are rejected.
 
-```bash
-botmux whiteboard enable      # turn the capability on (does not create a board)
-botmux whiteboard disable     # turn off (existing boards stay on disk; Dashboard can still view them read-only)
-botmux whiteboard status      # show enabled state + board count
+## Quick start
+
+1. Turn the feature on (either way):
+   - CLI: `botmux whiteboard enable`
+   - Dashboard: **Settings → Local Whiteboard → Enable project whiteboards**
+2. Start a topic in a group and talk to a bot as usual. When the session starts (or on the next turn after you turn the feature on), a board for that group is created and bound automatically.
+3. To have the agent record something, just say "update the whiteboard" or "write the current progress to the whiteboard". To restore context, say "check the whiteboard".
+4. View the content on the **Whiteboards** page in the Dashboard.
+
+No daemon restart needed: new sessions and later turns follow the new setting. Turning it on does not create a board by itself; a board is created the first time a session needs one.
+
+## How boards are shared
+
+| Situation | Which board |
+| --- | --- |
+| Sessions in a Feishu group | One default board per group, shared by every bot and every working directory in that group |
+| Not in a group (e.g. running commands from a local terminal) | One board per working directory |
+| Adopted local sessions (`/adopt`) | No board is bound automatically |
+
+Once a session is bound to a board it keeps using it. If the board is deleted, a new one is created automatically on that session's next turn.
+
+New boards start from a template that guides the agent to fill in these sections:
+
+```markdown
+# 当前状态
+## 项目目标
+## 组织方式
+## 核心方案
+## 关键进展
+## 下一步
 ```
 
-You can also toggle it on the **Dashboard → Settings** page.
+(The template is in Chinese: Current state / Goals / Organization / Approach / Key progress / Next steps.)
 
-**`enable` only turns the capability on — it does not create a board**; a board is created **lazily** the first time a group needs one.
+## How agents read and write
 
-## Sharing Granularity: Per Group
+Once enabled, every turn of a session bound to a board gets a `<whiteboard>` block telling the agent the board id and the read/write commands. The block **only contains the id and commands, never the board content or the local file path**, and reminds the agent not to write secrets or private data.
 
-Different bots and working directories in the same group share **one** board by default (binding key `chat:<chatId>:default`). A group is thus a single shared context board — whoever updates it, everyone else sees it on their next turn.
+CLIs that support Skills also get the `botmux-whiteboard` Skill, which triggers when the user mentions things like "whiteboard", "project context", or "handoff".
 
-## How Agents Use It
+The recommended pattern is "read, merge, write the whole thing back":
 
-Once enabled, the daemon injects a `<whiteboard>` hint block into each prompt telling the agent the current board id and how to read/write it (**only the board id + commands are exposed, never local file paths**, with a reminder not to store secrets / private data). Recommended flow:
+1. Read the content and its version:
 
-1. Read first to get the content and version:
+   ```bash
+   botmux whiteboard read --id <id> --json
+   # { "id": "wb_...", "updatedAt": "2026-...", "content": "..." }
+   ```
 
-```bash
-botmux whiteboard read --id <id> --json
-# { "id": "...", "updatedAt": "2026-...", "content": "..." }
-```
+2. Merge the new information and rewrite it as one complete current state (don't just append this turn's notes).
 
-2. Merge new information and **rewrite the whole thing** into one complete current state.
+3. Write it back with the version you just read:
 
-3. Write back with the version you just read (optimistic concurrency / CAS):
+   ```bash
+   botmux whiteboard update --id <id> --expected-updated-at <updatedAt> "new full content"
+   ```
 
-```bash
-botmux whiteboard update --id <id> --expected-updated-at <updatedAt> "the full new state"
-```
+   Content can also come from a pipe (`cat note.md | botmux whiteboard update --id <id>`) or `--content-file <path>`, which is easier for long text.
 
-If another agent changed the board in the meantime, you get `whiteboard_cas_mismatch` (exit code 2) — just re-read the latest content and re-merge.
+If another agent changed the board in the meantime, step 3 fails with `whiteboard_cas_mismatch` (exit code 2). Run step 1 again to get the latest content and merge again.
 
-Agents can also use the `botmux-whiteboard` Skill directly: asking it to "update the whiteboard" or "show the project context" triggers it.
+Inside a session you can omit `--id`; the session's bound board is used. If `update` finds no board, it creates one using the sharing rules above.
 
-## Concurrency & Safety
+## Protection against bad writes
 
-- **Serialized writes** — each board has its own file lock, so two agents running `update` at once never produce a half-written file, with dead-lock recovery (the lock auto-expires if the holding process is killed).
-- **CAS conflict detection** — `--expected-updated-at` rejects an overwrite when the board changed since you last read it, avoiding silent lost updates; omitting it falls back to a direct overwrite (backward-compatible).
-- **Empty content rejected** — writing blank content is refused so a shared board can't be accidentally blanked.
-- **No paths / no secrets** — the prompt only exposes the board id and commands, and reminds the agent not to write secrets or private data to the board.
+| Protection | What it does |
+| --- | --- |
+| Version check | With `--expected-updated-at`, the write is rejected if the board changed since you read it, so you never silently overwrite someone else's update. Without it, the write simply overwrites |
+| Write lock | Two agents writing at once are queued, so no half-written file. If the lock holder is killed, the lock is released automatically |
+| No empty content | Empty or whitespace-only content is rejected, so the shared board can't be wiped by accident |
+| `write` needs confirmation | `write` is a force overwrite and requires `--yes`. Use `update` for normal updates |
 
-## Dashboard Whiteboard Page
+There is no version history; overwritten content cannot be recovered. Keep a separate copy of anything important.
 
-The Dashboard provides a whiteboard page grouped by "group → board":
+## Dashboard Whiteboards page
 
-- The left list is grouped by chat; the right detail panel shows the selected board's metadata and a preview of the current content.
-- **Protected deletion** — deleting requires the dashboard token (removes board files + clears index bindings + clears session references).
-- The whiteboard read/write API is **not exposed to anonymous read-only visitors** by default (fail-closed), so it never leaks board content or local paths.
+The **Whiteboards** page in the Dashboard sidebar lists all boards by group (this page's labels are currently shown in Chinese only):
 
-## Command Reference
+- Boards are grouped by chat on the left. Select one to see its group, scope, last update time, source directory, and a read-only preview of `board.md` on the right.
+- **删除白板** (Delete whiteboard) removes the board files and unbinds it from the group and sessions. You must be logged in to the Dashboard, and it cannot be undone.
+- Anonymous read-only visitors cannot see the board list or content.
+- When the feature is off, the page shows a notice at the top. Existing boards can still be viewed read-only and deleted.
+
+You can reword the `<whiteboard>` prompt on the Dashboard **Customization** page (search for "whiteboard").
+
+## Command reference
 
 | Command | Description |
 | --- | --- |
-| `whiteboard status` | Show enabled state + board count |
-| `whiteboard enable` / `disable` | Turn the capability on / off |
-| `whiteboard list` | List local boards (read-only, works even when disabled) |
-| `whiteboard current [--create]` | Show the current group's default board; `--create` creates it on demand |
-| `whiteboard read --id <id> [--json]` | Read board.md; `--json` emits `{ id, updatedAt, content }` |
-| `whiteboard update --id <id> [--expected-updated-at <ts>] <content>` | Overwrite the current state (content via args / stdin / `--content-file`) |
-| `whiteboard write --yes --id <id> <content>` | Force-overwrite escape hatch (requires `--yes`) |
-| `whiteboard create [--id ID] [--title T]` | Explicitly create a new board |
+| `botmux whiteboard status` | Show whether it's enabled and how many boards exist |
+| `botmux whiteboard enable` / `disable` | Turn the feature on / off. Existing boards stay on disk when off |
+| `botmux whiteboard list` | List all local boards (works even when off) |
+| `botmux whiteboard current [--create]` | Show the current session's board; `--create` makes one if missing |
+| `botmux whiteboard read [--id <id>] [--json]` | Read the content; `--json` prints `{ id, updatedAt, content }` |
+| `botmux whiteboard update [--id <id>] [--expected-updated-at <ts>] <content>` | Overwrite with the latest state (content via args / pipe / `--content-file`) |
+| `botmux whiteboard write --yes [--id <id>] <content>` | Force overwrite; `--yes` required |
+| `botmux whiteboard create [--id <id>] [--title <title>]` | Create a board manually |
+| `botmux whiteboard path [--id <id>]` | Print where the board's files live on this machine |
+
+Outside a session, use `--session-id`, `--chat-id`, or `--working-dir` to set the context. When the feature is off, `current` / `create` / `read` / `update` / `write` exit with an error (exit code 2).

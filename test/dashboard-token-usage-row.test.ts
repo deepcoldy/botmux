@@ -1,22 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/core/cost-calculator.js', () => ({
-  getSessionTokenUsage: vi.fn(() => ({
-    in: 1234,
-    out: 567,
-    inputTokens: 1200,
-    outputTokens: 567,
-    cacheReadTokens: 30,
-    cacheCreateTokens: 4,
-    turns: 3,
-    model: 'test-model',
+  getSessionUsageWithContext: vi.fn(() => ({
+    snapshot: {
+      context: null,
+      turnTokens: null,
+      tokens: {
+        in: 1234,
+        out: 567,
+        inputTokens: 1200,
+        outputTokens: 567,
+        cacheReadTokens: 30,
+        cacheCreateTokens: 4,
+        turns: 3,
+        model: 'test-model',
+      },
+    },
   })),
 }));
 
-import { getSessionTokenUsage } from '../src/core/cost-calculator.js';
+import { getSessionUsageWithContext } from '../src/core/cost-calculator.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 
 beforeEach(() => {
@@ -107,7 +111,7 @@ describe('dashboard SessionRow token usage', () => {
   it('carries native token in/out totals for the sessions table', () => {
     const row = composeRowFromActive(makeDs());
 
-    expect(getSessionTokenUsage).toHaveBeenCalledWith({
+    expect(getSessionUsageWithContext).toHaveBeenCalledWith({
       cliId: 'claude-code',
       sessionId: 'sess-1',
       cliSessionId: 'cli-sess-1',
@@ -139,7 +143,7 @@ describe('dashboard SessionRow token usage', () => {
     expect(active.tokenUsage).toBeNull();
     expect(persisted.tokenUsage).toBeNull();
     expect(closed.tokenUsage).toBeNull();
-    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+    expect(getSessionUsageWithContext).not.toHaveBeenCalled();
   });
 
   it('keeps closed token usage visible even when bulk scans are disabled', () => {
@@ -160,7 +164,7 @@ describe('dashboard SessionRow token usage', () => {
     }, { includeTokenUsage: false });
 
     expect(row.tokenUsage).toEqual(tokenUsage);
-    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+    expect(getSessionUsageWithContext).not.toHaveBeenCalled();
   });
 
   it('does not expose stale token usage for persisted active rows in bulk list mode', () => {
@@ -180,7 +184,7 @@ describe('dashboard SessionRow token usage', () => {
     }, { includeTokenUsage: false });
 
     expect(row.tokenUsage).toBeNull();
-    expect(getSessionTokenUsage).not.toHaveBeenCalled();
+    expect(getSessionUsageWithContext).not.toHaveBeenCalled();
   });
 
   it('does not let a persisted active detail row short-circuit on a stale snapshot', () => {
@@ -200,7 +204,7 @@ describe('dashboard SessionRow token usage', () => {
       },
     });
 
-    expect(getSessionTokenUsage).toHaveBeenCalledWith({
+    expect(getSessionUsageWithContext).toHaveBeenCalledWith({
       cliId: 'claude-code',
       sessionId: 'sess-1',
       cliSessionId: 'cli-sess-1',
@@ -234,7 +238,7 @@ describe('dashboard SessionRow token usage', () => {
 
     const row = composeRowFromActive(ds);
 
-    expect(getSessionTokenUsage).toHaveBeenCalledWith({
+    expect(getSessionUsageWithContext).toHaveBeenCalledWith({
       cliId: 'claude-code',
       sessionId: 'sess-1',
       cliSessionId: 'cli-sess-1',
@@ -268,15 +272,7 @@ describe('dashboard SessionRow token usage', () => {
     const row = composeRowFromActive(ds, { includeTokenUsage: false });
 
     expect(row.tokenUsage).toBeNull();
-    expect(getSessionTokenUsage).not.toHaveBeenCalled();
-  });
-
-  it('worker-pool close publishes the durable token usage snapshot directly', () => {
-    const source = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
-
-    expect(source).toContain('{ tokenUsage: after?.tokenUsage ?? null }');
-    expect(source).not.toContain("import { composeRowFromActive, composeRowFromClosed }");
-    expect(source).not.toContain('composeRowFromClosed(after).tokenUsage');
+    expect(getSessionUsageWithContext).not.toHaveBeenCalled();
   });
 
   it('carries chatType for active and closed rows', () => {

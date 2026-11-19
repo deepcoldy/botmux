@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/oncall-store.test.ts
  */
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -234,6 +234,48 @@ describe('default-oncall store persistence', () => {
     const chatIds = (persisted.oncallChats ?? []).map((c: any) => c.chatId).sort();
     expect(chatIds).toEqual(ids.slice().sort());
     expect((persisted.defaultOncallAutoboundChats ?? []).slice().sort()).toEqual(ids.slice().sort());
+  });
+
+  // ── getBotDefaultOncall: 当前绑定数 ≠ 自动绑定过的累计列表（Dashboard 名字行计数） ──
+  it('getBotDefaultOncall reports the live binding count apart from the autobound tombstone list', async () => {
+    writeConfig({
+      oncallChats: [
+        { chatId: 'oc_auto_a', workingDir: '/repos/oncall' },
+        { chatId: 'oc_auto_b', workingDir: '/repos/oncall' },
+        { chatId: 'oc_manual', workingDir: '/repos/manual' },
+      ],
+      defaultOncallAutoboundChats: ['oc_auto_a', 'oc_auto_b'],
+      defaultOncall: { enabled: true, workingDir: '/repos/oncall', since: 5_000 },
+    });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const before = store.getBotDefaultOncall('app_default');
+    expect(before.oncallChatCount).toBe(3);
+    expect(before.autoboundChats).toHaveLength(2);
+
+    // /oncall unbind 和切出 oncall 模式都只让当前绑定变少；累计列表一个不减。
+    expect((await store.unbindOncall('app_default', 'oc_auto_a')).ok).toBe(true);
+    expect((await store.setWorkingDirMode('app_default', 'off', '')).ok).toBe(true);
+
+    const after = store.getBotDefaultOncall('app_default');
+    expect(after.oncallChatCount).toBe(1); // 只剩手动绑定的 oc_manual
+    expect(after.autoboundChats.slice().sort()).toEqual(['oc_auto_a', 'oc_auto_b']);
+  });
+
+  it('getBotDefaultOncall counts bindings another process wrote to bots.json', async () => {
+    writeConfig({ defaultOncallAutoboundChats: ['oc_old'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotDefaultOncall('app_default').oncallChatCount).toBe(0);
+
+    // e.g. `botmux create-group --working-dir` binds from its own one-shot process.
+    writeConfig({
+      defaultOncallAutoboundChats: ['oc_old'],
+      oncallChats: [{ chatId: 'oc_new_group', workingDir: '/repos/x' }],
+    });
+    utimesSync(configPath, 1_000_000, 1_000_000); // distinct mtime regardless of fs timestamp granularity
+    expect(store.getBotDefaultOncall('app_default').oncallChatCount).toBe(1);
   });
 
   // ── setWorkingDirMode: dashboard 三态互斥写盘 (PR #311 Codex review) ──────────

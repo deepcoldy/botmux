@@ -18,6 +18,7 @@
 | 新建派发 | 发种子，然后以 `reply_in_thread=true` 发送简报；有 `--repo` 时先发送目录预设 | 回复与原有回执处理完成后读取种子根消息 |
 | `--standby --repo` | 发种子和话题内 `/repo` 预设，不发简报，`taskSent=false` | `/repo` 回复后读取种子根消息，仍可获得话题 ID |
 | `--into <om_根消息ID>` | 不建新种子，向给定根消息发送话题内追加简报；不新增 `seedMessageId` | 追加回复后读取给定根消息，返回已有话题的 ID |
+| `--into <om_根消息ID> --bot <open_id> --repo <目录> --standby` | 不建种子、不发简报、不改原 dispatch 的生命周期与项目卡；向给定根消息发话题内 `/repo` 预设（与新话题 `--standby` 同一条文本），由目标 bot 关掉该话题正在跑的会话并在该目录起全新会话。`mode=into-standby`、`taskSent=false`，回执带 `primeMessageId` 与 `freshSession`（只证明命令已发出；新会话 id 由目标 daemon 分配，需事后用 `botmux observe` 按 `rootMessageId` + `closed=false` 确认）。根消息不在目标群时拒绝且不发送 | 预设回复后读取给定根消息 |
 
 以上行为对普通群（`normal`）和话题群（`topic`）一致，不依赖群类型缓存。普通群支持话题回复时，原有回复操作即可形成话题；不支持话题回复的群仍按原有发送错误处理，本次不改建群能力或群类型。
 

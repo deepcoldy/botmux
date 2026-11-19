@@ -1,9 +1,9 @@
 /**
  * Source-level guard for /goal-style raw-passthrough cold-start ownership.
  *
- * startInitialPassthroughSession() is a daemon.ts closure (not exported), so
- * ownership semantics are pinned the same way dashboard-attention-signals
- * pins handleThreadReply ordering: by asserting on the source.
+ * startInitialPassthroughSession() is a daemon.ts closure (not exported), and a
+ * bot-started cold start sits behind the slash gates of both entries, so the
+ * ownership invariant is pinned on the source.
  *
  * What must hold (PR #157 review blocker):
  *  - Ownership is the CALLER's decision. The function must NOT re-fill an
@@ -11,125 +11,39 @@
  *    senderOpenId` was the bug: a foreign-bot cold start got the bot as
  *    owner, so daemon-generated footers woke that bot again and owner-gated
  *    surfaces leaked to a bot).
- *  - The args type keeps ownerOpenId / ownerUnionId / creatorOpenId REQUIRED
- *    (may be undefined) so a new call site can't silently omit them.
  *  - The thread-reply injection point keeps the foreign-bot guard on BOTH
  *    ownerOpenId and ownerUnionId.
  *
- * Run: pnpm vitest run test/initial-passthrough-ownership.test.ts
+ * The new-topic twin (handleNewTopic) is exercised for real in
+ * listener-foreign-bot-owner-behavior.test.ts.
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
 
-function fnRegion(name: string, span = 6000): string {
+function fnRegion(name: string): string {
   const start = src.indexOf(`async function ${name}(`);
   expect(start, `${name} not found in daemon.ts`).toBeGreaterThanOrEqual(0);
-  return src.slice(start, start + span);
+  const end = src.indexOf('\nasync function ', start + 1);
+  return src.slice(start, end > start ? end : undefined);
 }
 
-describe('startInitialPassthroughSession ownership', () => {
-  // span widened past the default: the fn body grew (per-turn participant
-  // window build) and the registration-loser handoff sits ~6.1k chars in.
-  const region = fnRegion('startInitialPassthroughSession', 8000);
+describe('raw-passthrough cold-start ownership', () => {
+  // 源码结构护栏(K2)：会话 owner 是 daemon 认证的身份，owner-gated 面（restart/report/卡片）以它为准。
+  // 冷启动 passthrough 的 owner 必须完全由调用方决定，函数内不得用 sender 回填；thread 入口在外部 bot
+  // 发起时必须压掉 owner。startInitialPassthroughSession / executeThreadSlash 是 daemon.ts 闭包，bot 发起的
+  // 冷启动被两个入口的 slash 闸门挡在现有 harness 之外。PR #157 review blocker：`ownerOpenId ?? senderOpenId`
+  // 让外部 bot 成了 owner。
+  it('takes session ownership only from the caller, and the thread entry withholds it from foreign bots', () => {
+    const coldStart = fnRegion('startInitialPassthroughSession');
+    expect(coldStart).not.toMatch(/\b(ownerOpenId|ownerUnionId|creatorOpenId)\s*\?\?/);
+    expect(coldStart).toMatch(/session\.ownerOpenId\s*=\s*ownerOpenId\s*;/);
+    expect(coldStart).toMatch(/session\.ownerUnionId\s*=\s*ownerUnionId\s*;/);
 
-  it('never falls back from an explicit undefined owner to the sender', () => {
-    expect(region).not.toContain('ownerOpenId ??');
-    expect(region).not.toContain('creatorOpenId ??');
-    expect(region).not.toContain('ownerUnionId ??');
-  });
-
-  it('declares ownership args as required (string | undefined), not optional', () => {
-    expect(region).toContain('ownerOpenId: string | undefined;');
-    expect(region).toContain('ownerUnionId: string | undefined;');
-    expect(region).toContain('creatorOpenId: string | undefined;');
-    expect(region).not.toContain('ownerOpenId?:');
-    expect(region).not.toContain('creatorOpenId?:');
-  });
-
-  it('assigns session ownership straight from the caller-provided args', () => {
-    expect(region).toContain('session.ownerOpenId = ownerOpenId;');
-    expect(region).toContain('session.ownerUnionId = ownerUnionId;');
-    expect(region).toContain('session.creatorOpenId = creatorOpenId;');
-  });
-
-  it('hands a registration loser to the current canonical owner via the ownership claim', () => {
-    // PR #597's ownership backbone: startInitialPassthroughSession claims the
-    // routing key through claimNewDaemonSession (compare-and-set). On loss to an
-    // existing owner it routes the inbound to that canonical owner instead of
-    // silently dropping it — the same intent master expressed via
-    // rollbackRejectedSessionAndGetWinner, now expressed through the claim +
-    // routeToCanonicalOwner callback.
-    expect(region).toContain('claimNewDaemonSession(activeSessions, ds)');
-    expect(region).toContain("registration.reason === 'existing_owner'");
-    expect(region).toContain('activeSessions.get(registration.key) === registration.owner');
-    expect(region).toContain('await routeToCanonicalOwner();');
-  });
-});
-
-describe('startInitialPassthroughSession substitute marking', () => {
-  it('carries quoteOnly / substitute onto the reply target like every other inbound path', () => {
-    // Regression: `substitute` was destructured but never read, so a
-    // substitute-triggered cold-start passthrough lost its chat-scope
-    // quote-reply / footer substitute addressing.
-    const region = fnRegion('startInitialPassthroughSession', 14000);
-    const call = region.slice(region.indexOf('beginReplyTargetTurn(ds, replyRootId, messageId'));
-    expect(call.slice(0, 400)).toMatch(/quoteOnly: substituteReplyMode === 'quote', substitute,/);
-    expect(region).toMatch(/const substituteReplyMode = substitute\s*\?/);
-  });
-});
-
-describe('startInitialPassthroughSession call sites', () => {
-  it('thread-reply injection keeps the foreign-bot guard on owner fields', () => {
-    // thread 执行段（executeThreadSlash）里的字段名已与新话题入口对齐：isForeignBotSender / senderOpenId。
-    expect(src).toContain('ownerOpenId: isForeignBotSender ? undefined : senderOpenId');
-    expect(src).toMatch(/ownerUnionId: isForeignBotSender \? undefined :/);
-  });
-
-  it('every call site passes ownership explicitly', () => {
-    // Each call must spell out ownerOpenId — TypeScript enforces this for
-    // typed call sites; this guard catches `as any`-style escapes too.
-    const calls = src.split('await startInitialPassthroughSession({').slice(1);
-    expect(calls.length).toBeGreaterThanOrEqual(2);
-    for (const call of calls) {
-      const body = call.slice(0, call.indexOf('});'));
-      expect(body).toContain('cmd,');
-      expect(body).toContain('ownerOpenId:');
-      expect(body).toContain('creatorOpenId:');
-    }
-  });
-});
-
-describe('registration loser command handoff', () => {
-  it('routes new-topic and thread daemon commands through the ownership claim', () => {
-    // Both the new-topic and thread daemon-command paths claim the routing key
-    // through claimNewDaemonSession(activeSessions, cmdDs). On loss to an
-    // existing owner they still deliver the command (handleCommand) so the
-    // inbound reaches the canonical session — PR #597's ownership backbone
-    // replacing master's rollbackRejectedSessionAndGetWinner here.
-    const claimCalls = src.split('claimNewDaemonSession(activeSessions, cmdDs)').length - 1;
-    expect(claimCalls).toBeGreaterThanOrEqual(2);
-    // 执行段搬进 executeNewTopicSlash / executeThreadSlash 之后用 true 表示「已处理」，入口据此 return。
-    expect(src).toContain("if (registration.reason !== 'existing_owner') return true;");
-    expect(src).toContain(
-      'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId)',
-    );
-    expect(src).toContain(
-      'await handleCommand(cmd, anchor, cmdMessage, invocationDeps, larkAppId)',
-    );
-  });
-
-  it('prepared message handoff skips duplicate resolve, identity-learning, and hook effects', () => {
-    const start = src.indexOf('async function handleThreadReply(');
-    const end = src.indexOf('/**\n * 文档评论入口', start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const region = src.slice(start, end);
-    // prepared 重投与级联推迟重入（replay 快照）都不再重新解析。replay 不是 prepared，配额与下载仍重过。
-    expect(region).toContain('if (!prepared && !replay) await resolveNonsupportMessage(data, larkAppId);');
-    // runtime 级联正文重入（cascadeBodyReentry）与 Completion Proposal 合成续跑同样跳过这两处一次性副作用。
-    expect(region).toContain('if (!prepared && !ctx.cascadeBodyReentry && !ctx.completionProposalContinuation) learnFromMentions(larkAppId, parsed.mentions);');
-    expect(region).toMatch(/if \(!prepared && !ctx\.cascadeBodyReentry && !ctx\.completionProposalContinuation\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
+    const threadEntry = fnRegion('executeThreadSlash');
+    const call = threadEntry.slice(threadEntry.indexOf('await startInitialPassthroughSession({'));
+    expect(call).toMatch(/ownerOpenId:\s*isForeignBotSender\s*\?\s*undefined\s*:/);
+    expect(call).toMatch(/ownerUnionId:\s*isForeignBotSender\s*\?\s*undefined\s*:/);
   });
 });

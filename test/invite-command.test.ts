@@ -14,14 +14,21 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // 拦截回执与拉人 API，避免真实 Lark 调用。
 const replyMock = vi.fn(async () => 'om_reply');
 const rosterMock = vi.fn(async (_app: string, _chat: string) => [] as any[]);
+const membershipMock = vi.fn(async (_app: string, _chat: string) => false);
 const addBotMock = vi.fn(async (_app: string, _chat: string, ids: string[]) =>
   ids.map(id => ({ id, ok: true })) as { id: string; ok: boolean; error?: string }[]);
+const configsMock = vi.fn(() => [] as Array<{ larkAppId: string; displayName?: string; apiOnly?: boolean }>);
+vi.mock('../src/bot-registry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/bot-registry.js')>();
+  return { ...actual, loadBotConfigs: () => configsMock() };
+});
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
     ...actual,
     replyMessage: (...a: any[]) => replyMock(...a),
     listChatBotMembers: (...a: any[]) => rosterMock(...a),
+    isConfiguredBotInChat: (...a: any[]) => membershipMock(...a),
   };
 });
 vi.mock('../src/services/groups-store.js', async (importOriginal) => {
@@ -34,8 +41,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tryHandleInviteCommand, parseInviteArgs, readBotsInfoEntries } from '../src/im/lark/invite-command.js';
 import { isCommandTargetOnly } from '../src/im/lark/mention-targets.js';
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { localeForBot, t } from '../src/i18n/index.js';
 
 const OWNER = 'ou_owner';
 const ME = 'ou_bot';
@@ -56,7 +64,7 @@ function inviteMessage(overrides: {
 }
 
 let tmpDir: string;
-function writeBotsInfo(entries: Array<{ larkAppId: string; botName: string | null }>) {
+function writeBotsInfo(entries: Array<{ larkAppId: string; botName?: unknown }>) {
   writeFileSync(join(tmpDir, 'bots-info.json'), JSON.stringify(entries));
 }
 function writePlatformSync(bots: Array<{ appId: string; name?: string; unionId?: string }>) {
@@ -79,7 +87,9 @@ function writeMemberships() {
 beforeEach(() => {
   replyMock.mockClear();
   rosterMock.mockClear();
+  membershipMock.mockReset().mockResolvedValue(false);
   addBotMock.mockClear();
+  configsMock.mockReset().mockReturnValue([]);
   rosterMock.mockImplementation(async () => []);
   addBotMock.mockImplementation(async (_a, _c, ids: string[]) => ids.map(id => ({ id, ok: true })));
   const bot = registerBot({ larkAppId: 'b1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] });
@@ -87,6 +97,312 @@ beforeEach(() => {
   bot.resolvedAllowedUsers = [OWNER];
   tmpDir = mkdtempSync(join(tmpdir(), 'invite-cmd-'));
   config.session.dataDir = tmpDir;
+});
+
+describe('/invite all configured defaults', () => {
+  const allMessage = () => inviteMessage({ text: '@_user_1 /invite all', mentions: [
+    { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+  ] });
+  function defaults(refs: string[]) {
+    getBot('b1').config.inviteConfig = { agents: refs };
+    configsMock.mockReturnValue([
+      { larkAppId: 'b1', displayName: 'Claude' },
+      { larkAppId: 'cli_review', displayName: 'Review' },
+      { larkAppId: 'cli_build', displayName: 'Build' },
+    ]);
+  }
+
+  it('bare /invite remains usage-only even when both defaults are configured', async () => {
+    defaults(['Build']);
+    getBot('b1').config.groupCreation = { agents: ['Review'] };
+    await tryHandleInviteCommand('b1', inviteMessage({
+      text: '@_user_1 /invite', mentions: allMessage().mentions,
+    }), OWNER);
+    expect(configsMock).not.toHaveBeenCalled();
+    expect(membershipMock).not.toHaveBeenCalled();
+    expect(rosterMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledWith('b1', 'om_inv', t('cmd.invite.usage', undefined, localeForBot('b1')));
+  });
+
+  it('all reads inviteConfig without inheriting groupCreation agents', async () => {
+    defaults(['Build']);
+    getBot('b1').config.groupCreation = { agents: ['Review'] };
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_build']]]);
+  });
+
+  it('all without inviteConfig does not fall back to groupCreation', async () => {
+    getBot('b1').config.groupCreation = { agents: ['Review'] };
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(configsMock).not.toHaveBeenCalled();
+    expect(membershipMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it('uses the addressed bot\'s own invitation list', async () => {
+    defaults(['Build']);
+    const other = registerBot({
+      larkAppId: 'b2', larkAppSecret: 's', cliId: 'codex', allowedUsers: [OWNER],
+      inviteConfig: { agents: ['Review'] },
+    });
+    other.botOpenId = 'ou_otherbot';
+    other.resolvedAllowedUsers = [OWNER];
+    await tryHandleInviteCommand('b2', inviteMessage({
+      text: '@_user_1 /invite all',
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_otherbot' }, name: 'Other' }],
+    }), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b2', 'oc_1', ['cli_review']]]);
+  });
+
+  it('reports an unreadable bot configuration and allows a later retry', async () => {
+    defaults(['Build']);
+    configsMock.mockImplementationOnce(() => { throw new Error('configuration unavailable'); });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(membershipMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_build']]]);
+  });
+
+  it.each(['all --app cli_explicit', 'all @_user_2', 'all unexpected', 'all all'])('rejects mixed or malformed all syntax: %s', async args => {
+    defaults(['Build']);
+    await tryHandleInviteCommand('b1', inviteMessage({ text: `@_user_1 /invite ${args}` }), OWNER);
+    expect(configsMock).not.toHaveBeenCalled();
+    expect(membershipMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledWith('b1', 'om_inv', t('cmd.invite.usage', undefined, localeForBot('b1')));
+  });
+
+  it('resolves names and IDs once, skips self and live members by app ID', async () => {
+    defaults(['Claude', 'Review', 'cli_review', 'Build', 'cli_build']);
+    membershipMock.mockImplementation(async app => app === 'cli_review');
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_build']]]);
+  });
+
+  it('all configured bots present: performs no invitation', async () => {
+    defaults(['b1', 'Review']);
+    membershipMock.mockImplementation(async app => app === 'cli_review');
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(membershipMock).toHaveBeenCalledOnce();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it('empty configured defaults do not query membership or invite anyone', async () => {
+    defaults([]);
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(configsMock).not.toHaveBeenCalled();
+    expect(rosterMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it('batches a larger default list without repeating alias targets', async () => {
+    const configs = Array.from({ length: 7 }, (_, i) => ({ larkAppId: `cli_bot${i}`, displayName: `Bot ${i}` }));
+    defaults(configs.flatMap(bot => [bot.displayName, bot.larkAppId]));
+    configsMock.mockReturnValue(configs);
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls.map(call => call[2])).toEqual([
+      configs.slice(0, 5).map(bot => bot.larkAppId),
+      configs.slice(5).map(bot => bot.larkAppId),
+    ]);
+  });
+
+  it('does not mistake a same-name different app for a configured member', async () => {
+    defaults(['cli_build']);
+    rosterMock.mockResolvedValue([{ larkAppId: 'cli_other', openId: 'ou_other', displayName: 'Build' }]);
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_build']]]);
+  });
+
+  it.each(['--app cli_explicit', '@_user_2'])('explicit targets override invalid defaults: %s', async target => {
+    defaults(['missing']);
+    writeBotsInfo([{ larkAppId: 'cli_explicit', botName: 'Codex' }]);
+    await tryHandleInviteCommand('b1', inviteMessage({ text: `@_user_1 /invite ${target}` }), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_explicit']]]);
+    expect(configsMock).not.toHaveBeenCalled();
+  });
+
+  it('explicit already-present target never falls back to defaults', async () => {
+    defaults(['Build']);
+    rosterMock.mockResolvedValue([{ larkAppId: 'cli_review', openId: 'ou_codex' }]);
+    await tryHandleInviteCommand('b1', inviteMessage(), OWNER);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(configsMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['missing', 'cli_retired', 'cli_api', 'Duplicate'])('rejects the whole invalid default list before writing: %s', async ref => {
+    defaults(['Build', ref]);
+    configsMock.mockReturnValue([
+      { larkAppId: 'cli_build', displayName: 'Build' },
+      { larkAppId: 'cli_api', displayName: 'API', apiOnly: true },
+      { larkAppId: 'cli_one', displayName: 'Duplicate' },
+      { larkAppId: 'cli_two', displayName: 'Duplicate' },
+    ]);
+    writeBotsInfo([{ larkAppId: 'cli_retired', botName: 'Old' }]);
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+    expect(String(replyMock.mock.calls[0][2])).toContain(ref);
+  });
+
+  it('does not access defaults or group membership for unauthorized callers', async () => {
+    defaults(['Build']);
+    await tryHandleInviteCommand('b1', allMessage(), 'ou_stranger');
+    expect(configsMock).not.toHaveBeenCalled();
+    expect(rosterMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+  });
+
+  it('does not send the default list when roster lookup throws', async () => {
+    defaults(['Build']);
+    membershipMock.mockRejectedValue(new Error('membership unavailable'));
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(membershipMock).toHaveBeenCalledOnce();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['permission', 'defaults'])('stops before inviting when %s changes during membership lookup', async change => {
+    defaults(['Build']);
+    membershipMock.mockImplementationOnce(async () => {
+      if (change === 'permission') {
+        getBot('b1').config.allowedUsers = [];
+        getBot('b1').resolvedAllowedUsers = [];
+      } else {
+        getBot('b1').config.inviteConfig = undefined;
+      }
+      return false;
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(membershipMock).toHaveBeenCalledOnce();
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['permission', 'defaults'])('stops remaining batches when %s changes after a partial write', async change => {
+    const configs = Array.from({ length: 7 }, (_, i) => ({ larkAppId: `cli_bot${i}` }));
+    defaults(configs.map(bot => bot.larkAppId));
+    configsMock.mockReturnValue(configs);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      if (change === 'permission') {
+        getBot('b1').config.allowedUsers = [];
+        getBot('b1').resolvedAllowedUsers = [];
+      } else {
+        getBot('b1').config.inviteConfig = { agents: ['cli_bot6'] };
+      }
+      return ids.map(id => ({ id, ok: true }));
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls.map(call => call[2])).toEqual([configs.slice(0, 5).map(bot => bot.larkAppId)]);
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain(t('cmd.invite.ok', {
+      names: configs.slice(0, 5).map(bot => bot.larkAppId).join('、'),
+    }, localeForBot('b1')));
+  });
+
+  it('rechecks permissions before individual retries of a failed batch', async () => {
+    defaults(['Review', 'Build']);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      getBot('b1').config.allowedUsers = [];
+      getBot('b1').resolvedAllowedUsers = [];
+      return ids.map(id => ({ id, ok: false, error: 'batch failed' }));
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_review', 'cli_build']]]);
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['permission', 'defaults'])('rechecks %s between individual fallback invitations', async change => {
+    defaults(['Review', 'Build']);
+    addBotMock.mockResolvedValueOnce([
+      { id: 'cli_review', ok: false, error: 'batch failed' },
+      { id: 'cli_build', ok: false, error: 'batch failed' },
+    ]);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      if (change === 'permission') {
+        getBot('b1').config.allowedUsers = [];
+        getBot('b1').resolvedAllowedUsers = [];
+      } else {
+        getBot('b1').config.inviteConfig = undefined;
+      }
+      return ids.map(id => ({ id, ok: true }));
+    });
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([
+      ['b1', 'oc_1', ['cli_review', 'cli_build']],
+      ['b1', 'oc_1', ['cli_review']],
+    ]);
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain(t('cmd.invite.ok', { names: 'cli_review' }, localeForBot('b1')));
+  });
+
+  it('rechecks admin access after queueing before reading membership again', async () => {
+    defaults(['Build']);
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      entered();
+      await pending;
+      return ids.map(id => ({ id, ok: true }));
+    });
+    const first = tryHandleInviteCommand('b1', allMessage(), OWNER);
+    await started;
+    const second = tryHandleInviteCommand('b1', allMessage(), OWNER);
+    getBot('b1').config.allowedUsers = [];
+    getBot('b1').resolvedAllowedUsers = [];
+    release();
+    await Promise.all([first, second]);
+    expect(membershipMock).toHaveBeenCalledOnce();
+    expect(addBotMock).toHaveBeenCalledOnce();
+    expect(replyMock).toHaveBeenLastCalledWith('b1', 'om_inv', t('cmd.invite.owner_only', undefined, localeForBot('b1')));
+  });
+
+  it('repeated commands only invite bots still missing after a partial batch failure', async () => {
+    defaults(['Review', 'Build']);
+    addBotMock.mockResolvedValueOnce([{ id: 'cli_review', ok: true }, { id: 'cli_build', ok: false, error: 'denied' }]);
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    membershipMock.mockImplementation(async app => app === 'cli_review');
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock.mock.calls).toEqual([
+      ['b1', 'oc_1', ['cli_review', 'cli_build']],
+      ['b1', 'oc_1', ['cli_build']],
+    ]);
+  });
+
+  it('serializes overlapping requests and rechecks membership after the first finishes', async () => {
+    defaults(['Build']);
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let present = false;
+    membershipMock.mockImplementation(async () => present);
+    addBotMock.mockImplementationOnce(async (_a, _c, ids) => {
+      entered();
+      await pending;
+      present = true;
+      return ids.map(id => ({ id, ok: true }));
+    });
+    const first = tryHandleInviteCommand('b1', allMessage(), OWNER);
+    await started;
+    const second = tryHandleInviteCommand('b1', allMessage(), OWNER);
+    release();
+    await Promise.all([first, second]);
+    expect(addBotMock.mock.calls).toEqual([['b1', 'oc_1', ['cli_build']]]);
+  });
+
+  it('releases the per-chat queue after an unexpected invitation error', async () => {
+    defaults(['Build']);
+    addBotMock.mockRejectedValueOnce(new Error('transport failed'));
+    await expect(tryHandleInviteCommand('b1', allMessage(), OWNER)).rejects.toThrow('transport failed');
+    await tryHandleInviteCommand('b1', allMessage(), OWNER);
+    expect(addBotMock).toHaveBeenCalledTimes(2);
+  });
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -125,6 +441,21 @@ describe('readBotsInfoEntries', () => {
   it('parses entries with larkAppId', () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     expect(readBotsInfoEntries()).toEqual([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+  });
+  it('drops malformed rows (null/scalar/bad appId/truthy non-string botName) but keeps valid rows', () => {
+    writeBotsInfo([
+      null,
+      'scalar',
+      { larkAppId: '', botName: 'EmptyApp' },
+      { larkAppId: 'cli_bad_name', botName: 42 },
+      { larkAppId: 'cli_array_name', botName: ['Codex'] },
+      { larkAppId: 'cli_null_name', botName: null },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ] as any);
+    expect(readBotsInfoEntries()).toEqual([
+      { larkAppId: 'cli_null_name', botName: null },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ]);
   });
 });
 
@@ -207,6 +538,18 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(out).toContain('Codex');
   });
 
+  it('malformed row (truthy non-string botName) before a valid row neither crashes the command nor hides the valid row', async () => {
+    // bots-info.json 可手工编辑/半写入：truthy 非字符串 botName 曾让
+    // e.botName?.toLowerCase() 抛 TypeError，/invite 在任何回执发出前崩溃（静默失效）。
+    writeBotsInfo([
+      { larkAppId: 'cli_bad', botName: 42 },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+    expect(replyMock).toHaveBeenCalled();
+  });
+
   it('already-in-chat target (live roster openId match) is skipped', async () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     rosterMock.mockImplementation(async () => [
@@ -218,7 +561,7 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
   });
 
   it('name not in bots-info → unresolved with --app hint, no add', async () => {
-    writeBotsInfo([{ larkAppId: 'cli_gemini', botName: 'Gemini' }]);
+    writeBotsInfo([{ larkAppId: 'cli_kimi', botName: 'Kimi' }]);
     expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
     expect(addBotMock).not.toHaveBeenCalled();
     const out = String(replyMock.mock.calls.at(-1)![2]);
@@ -255,14 +598,14 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     rosterMock.mockImplementation(async () => [
       { larkAppId: 'b1', openId: ME, name: 'Claude', displayName: 'Claude' },
-      { larkAppId: 'cli_gemini', openId: 'ou_gemini', name: 'Gemini', displayName: 'Gemini' },
+      { larkAppId: 'cli_kimi', openId: 'ou_kimi', name: 'Kimi', displayName: 'Kimi' },
     ]);
     const msg = inviteMessage({
       text: '@_user_1 /invite @_user_2 @_user_3 @_user_4',
       mentions: [
         { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
         { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
-        { key: '@_user_3', id: { open_id: 'ou_gemini' }, name: 'Gemini' },
+        { key: '@_user_3', id: { open_id: 'ou_kimi' }, name: 'Kimi' },
         { key: '@_user_4', id: { open_id: 'ou_ghost' }, name: 'Ghost' },
       ],
     });
@@ -271,7 +614,7 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     const out = String(replyMock.mock.calls.at(-1)![2]);
     expect(out).toContain('Codex');
     expect(out).toContain('已在群内');
-    expect(out).toContain('Gemini');
+    expect(out).toContain('Kimi');
     expect(out).toContain('无法解析');
     expect(out).toContain('Ghost');
   });
@@ -279,18 +622,18 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
   it('whole-batch failure falls back to per-id invites and reports individual results', async () => {
     writeBotsInfo([
       { larkAppId: 'cli_codex', botName: 'Codex' },
-      { larkAppId: 'cli_gemini', botName: 'Gemini' },
+      { larkAppId: 'cli_kimi', botName: 'Kimi' },
     ]);
     addBotMock
       .mockImplementationOnce(async (_a, _c, ids: string[]) => ids.map(id => ({ id, ok: false, error: 'batch boom' })))
       .mockImplementation(async (_a, _c, ids: string[]) =>
-        ids.map(id => ({ id, ok: id !== 'cli_gemini', ...(id === 'cli_gemini' ? { error: 'invalid_id' } : {}) })));
+        ids.map(id => ({ id, ok: id !== 'cli_kimi', ...(id === 'cli_kimi' ? { error: 'invalid_id' } : {}) })));
     const msg = inviteMessage({
       text: '@_user_1 /invite @_user_2 @_user_3',
       mentions: [
         { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
         { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
-        { key: '@_user_3', id: { open_id: 'ou_gemini' }, name: 'Gemini' },
+        { key: '@_user_3', id: { open_id: 'ou_kimi' }, name: 'Kimi' },
       ],
     });
     expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
@@ -300,7 +643,7 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(out).toContain('已拉进群');
     expect(out).toContain('Codex');
     expect(out).toContain('拉入失败');
-    expect(out).toContain('Gemini');
+    expect(out).toContain('Kimi');
   });
 
   it('post (rich-text) form: operator at-node + invite text node + target at-node', async () => {

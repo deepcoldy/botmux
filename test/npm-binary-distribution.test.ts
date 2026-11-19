@@ -1,5 +1,5 @@
-import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { describe, expect, it, afterEach, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -317,12 +317,17 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
      *  Needed to exercise idempotence across two installs (the startup file has to
      *  survive between them, which a fresh tmp home cannot show). */
     reuseHome?: string;
+    /** PNPM_HOME exported to the child, relative to the tmp base. */
+    pnpmHomeRelPath?: string;
+    /** Symlinks created in the tmp base first, as [link, target] relative paths. */
+    symlinks?: Array<[string, string]>;
   }) {
     const base = tmp();
     const home = opts.reuseHome ?? join(base, 'home');
     const pkg = join(base, opts.pkgRelPath ?? 'pkg');
     mkdirSync(home, { recursive: true });
     mkdirSync(join(pkg, 'scripts'), { recursive: true });
+    for (const [link, target] of opts.symlinks ?? []) symlinkSync(join(base, target), join(base, link), 'dir');
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), readFileSync(POSTINSTALL));
     // Guard 1's location check imports the repo's own layout classifier from
     // `dist/` (it ships via package.json `files`). That module has a small import
@@ -381,6 +386,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     if (opts.global !== undefined) env.npm_config_global = opts.global;
     if (opts.binDirOnPath) env.PATH = `${join(home, '.botmux', 'bin')}:${process.env.PATH}`;
     if (opts.shell) env.SHELL = opts.shell;
+    if (opts.pnpmHomeRelPath) env.PNPM_HOME = join(base, opts.pnpmHomeRelPath);
 
     const r = runNodeScript(join(pkg, 'scripts', 'postinstall-bin.mjs'), env);
     return { ...r, launcher, binary, home, wrote: existsSync(launcher) };
@@ -540,6 +546,18 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.status).toBe(0);
     expect(r.wrote, r.stderr).toBe(true);
     expect(readFileSync(r.launcher, 'utf-8')).toBe(`#!/bin/sh\nexec "${realpathSync(r.binary)}" "$@"\n`);
+  });
+
+  it('pnpm 11 store under a custom PNPM_HOME spelled through a symlink still writes the launcher (#1127)', () => {
+    // Node runs this script from its realpath, while PNPM_HOME keeps the spelling
+    // the user exported, e.g. under a home directory that is itself a symlink.
+    const r = runPostinstall({
+      pkgRelPath: join('real', '.pnpm-bin', 'store', 'v11', 'links', '@', 'botmux', '3.18.9', 'x', 'node_modules', 'botmux'),
+      symlinks: [['link', 'real']],
+      pnpmHomeRelPath: join('link', '.pnpm-bin'),
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote, r.stderr).toBe(true);
   });
 
   it('SAFETY: a LOCAL dependency install is not mistaken for a global one', () => {
@@ -809,6 +827,46 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
       expect(inlined(p), `inlined claimed global: ${p}`).toBe(false);
       expect(detectGlobalInstallManager(p, 'linux'), `classifier claimed known: ${p}`)
         .toBe('unknown');
+    }
+  });
+
+  it('PARITY: a pnpm 11 store path counts as global only under the user\'s own PNPM_HOME (#1127)', () => {
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const fn = src.match(/function locationSaysGlobal\(root\) \{[\s\S]*?\n\}/)?.[0]!;
+    // The script's module scope provides realpathSync; the extracted copy needs it handed in.
+    // eslint-disable-next-line no-new-func
+    const inlined = new Function('realpathSync', `${fn}; return locationSaysGlobal;`)(realpathSync) as (r: string) => boolean;
+    const custom = '/root/.pnpm-bin/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux';
+    const verdicts = (root = custom) => [inlined(root), detectGlobalInstallManager(root, 'linux')];
+    try {
+      vi.stubEnv('PNPM_HOME', '/root/.pnpm-bin');
+      expect(verdicts()).toEqual([true, 'pnpm']);
+      // The store parent must BE PNPM_HOME: not one level deeper, and PNPM_HOME
+      // must not be merely an ancestor or a trailing part of it.
+      expect(verdicts('/root/.pnpm-bin/store/tmp/v11/links/@/botmux/3.18.9/x/node_modules/botmux'))
+        .toEqual([false, 'unknown']);
+      vi.stubEnv('PNPM_HOME', '/root');
+      expect(verdicts()).toEqual([false, 'unknown']);
+      vi.stubEnv('PNPM_HOME', '/.pnpm-bin');
+      expect(verdicts()).toEqual([false, 'unknown']);
+      vi.stubEnv('PNPM_HOME', 'C:\\Users\\u\\.pnpm-bin\\');
+      expect(inlined('C:\\Users\\u\\.pnpm-bin\\store\\v11\\links\\@\\botmux\\3.18.9\\x\\node_modules\\botmux')).toBe(true);
+      vi.stubEnv('PNPM_HOME', '/data/pnpm-global');
+      expect(verdicts()).toEqual([false, 'unknown']);
+      vi.stubEnv('PNPM_HOME', '');
+      expect(verdicts()).toEqual([false, 'unknown']);
+      expect(verdicts('/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux')).toEqual([false, 'unknown']);
+
+      // Both checks see a realpath, while PNPM_HOME keeps the spelling the user
+      // exported, e.g. under a home directory that is itself a symlink.
+      const base = tmp();
+      mkdirSync(join(base, 'real', '.pnpm-bin'), { recursive: true });
+      symlinkSync(join(base, 'real'), join(base, 'link'), 'dir');
+      vi.stubEnv('PNPM_HOME', join(base, 'link', '.pnpm-bin'));
+      const viaSymlink = join(realpathSync(join(base, 'real', '.pnpm-bin')), 'store/v11/links/@/botmux/3.18.9/x/node_modules/botmux');
+      expect(verdicts(viaSymlink)).toEqual([true, 'pnpm']);
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 

@@ -5,13 +5,17 @@ import {
   replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
-import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
+import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard, prepareCardMarkdown, stripCardMarkdownImages } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
+import { repairCardStrongPunctuation } from './card-strong-punctuation.js';
+import { buildNextStepElement, NEXT_STEP_ELEMENT_ID } from './next-step-card.js';
+import { buildRecapElement } from './turn-recap-card.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
   showProcess: boolean;
+  showTools?: boolean;
   showToolResults: boolean;
   canStop: boolean;
   workingDir?: string;
@@ -60,8 +64,23 @@ function bounded(text: string, bytes: number, measure = (value: string) => Buffe
 
 function publicText(text: string): string {
   // Tool arguments/results are display data; never execute their @mentions.
-  return text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+  const withoutMentions = text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]');
+  // This text has no image-upload path: strip image syntax so an invalid key in
+  // the process panel cannot get the whole card rejected (which would also
+  // delete the body's valid images via the whole-card fallback). Code examples,
+  // escaped syntax and ordinary links are preserved.
+  // Stripping a bare fragment is only half the job: this text is later PREFIXED
+  // (`💬 `) and JOINED with other entries, and either step can move a fence so
+  // that image syntax which was inert here becomes a live token. Every place
+  // that assembles rendered markdown therefore strips the COMPOSED result too.
+  return stripCardMarkdownImages(withoutMentions)
     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Model narration is markdown prose rendered by Feishu, like the reply body:
+ * apply the same strong-emphasis punctuation repair (tool output stays raw). */
+function narrationText(text: string): string {
+  return repairCardStrongPunctuation(publicText(text));
 }
 
 /** Match the tool categories used by CoT, including Codex's exec command names. */
@@ -154,11 +173,14 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const en = presentation.locale === 'en';
   const terminal = replyCardIsTerminal(record);
   const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
+  // Native thinking carries the runtime status, so only its opt-in turns drop the in-card chrome.
+  const simpleFinal = record.nativeCot === true && !!record.finalCard && record.phase === 'completed' && !pendingAsks.length;
+  const compactRuntime = record.nativeCot === true && !terminal && !record.finalCard && !pendingAsks.length;
   const phaseLabels = en
     ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted', superseded: 'Continued in a later message' }
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认', superseded: '已由后续消息接续' };
   const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️', superseded: '↪️' };
-  const toolCount = presentation.showProcess ? record.tools.length : 0;
+  const toolCount = presentation.showProcess && presentation.showTools !== false ? record.tools.length : 0;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
   const title = [
@@ -173,7 +195,8 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // Keep the canonical footer and action controls. Full original content
     // is in the native attachment; a visible notice always accompanies it.
     card.body.elements = card.body.elements.filter(element =>
-      element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_feedback'
+      element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_reply_actions'
+      || element.element_id === 'botmux_feedback'
       || element.element_id === 'botmux_oncall_group');
     card.body.elements.unshift({ tag: 'markdown', content: en
       ? 'The full answer is included in this turn’s **Markdown attachment**.'
@@ -196,7 +219,18 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
   if (!record.finalCard && !pendingAsks.length) {
     const latest = record.progress.at(-1);
-    const content = latest ? bounded(latest, 6000)
+    // Live progress is display-only text with no image upload path, just like
+    // the process panel: strip its image syntax BEFORE the body renderer. The
+    // renderer's key-aware normalization would otherwise keep a key-shaped but
+    // invalid token (hallucinated or another Lark app's app-scoped key), which
+    // can reject this working PATCH and persist the whole-card downgrade that
+    // later deletes the final answer's valid images.
+    // The body renderer runs its own fence repair (`unescapeFenceLines`), which
+    // can turn escaped fences into real ones and thereby hand back image syntax
+    // that was inert when we scanned. Run the same normalization first so the
+    // strip sees exactly the text the renderer will parse.
+    const content = latest
+      ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
       : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
         : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
@@ -210,12 +244,14 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // narration visible until a newer narration or another card view replaces it.
     const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
-      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: `💭 ${publicText(bounded(latest.text, 600))}` });
+      // Compose first, then strip: the `💭 ` prefix shifts the first line and can
+      // un-fence it, exposing image syntax that was inert in the bare text.
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: stripCardMarkdownImages(`💭 ${narrationText(bounded(latest.text, 600))}`) });
     }
-    if (!terminal && !record.finalCard && !pendingAsks.length && record.tools.length) {
-      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: record.tools.slice(-2).map(tool =>
+    if (!terminal && !record.finalCard && !pendingAsks.length && presentation.showTools !== false && record.tools.length) {
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: stripCardMarkdownImages(record.tools.slice(-2).map(tool =>
         toolLine(tool, 300),
-      ).join('\n') });
+      ).join('\n')) });
     }
   }
   const activity: ReplyCardActivity[] = record.activity ?? [
@@ -224,13 +260,13 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   ];
   for (const item of activity) {
     if (item.kind === 'progress') {
-      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${publicText(item.text)}` });
+      if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${narrationText(item.text)}` });
     } else if (item.kind === 'ask') {
       const entry = record.asks?.find(entry => entry.ask.askId === item.id);
       if (entry?.result) process.push({ kind: 'text', content: turnReplyAskSummary(entry, presentation.locale) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
-      process.push({ kind: 'text', content: `💭 ${publicText(item.text)}` });
-    } else if (presentation.showProcess && item.kind === 'tool') {
+      process.push({ kind: 'text', content: `💭 ${narrationText(item.text)}` });
+    } else if (presentation.showProcess && presentation.showTools !== false && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
       if (tool) process.push({ kind: 'tool', label: toolLine({ ...tool, subject: '' }), content: toolLine(tool)
         + (presentation.showToolResults && tool.result ? `\n${publicText(tool.result)}` : '') });
@@ -239,7 +275,8 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   if (process.length) {
     for (const entry of process) entry.content = closeProcessCodeFence(entry.content);
     const footerIndex = card.body.elements.findIndex(element =>
-      element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer');
+      element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer'
+      || element.element_id === 'botmux_reply_actions');
     const panel = {
       tag: 'collapsible_panel', element_id: 'botmux_turn_process', expanded: false,
       background_color: 'grey-50', padding: '4px 12px 12px 12px', margin: '4px 0px 0px 0px',
@@ -259,29 +296,51 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       panel.header.title.content = toolCount
         ? (en ? `📋 Activity (${toolCountLabel})` : `📋 执行过程（${toolCountLabel}）`)
         : presentation.showProcess ? (en ? '📋 Activity' : '📋 执行过程') : (en ? '📋 Turn record' : '📋 本轮记录');
-      panel.elements[0].content = preview.content;
+      // Single sink for panel markdown: entries were sanitized individually, but
+      // the `💬 `/`💭 ` prefixes, the `\n` join and the fence repair above can all
+      // shift a fence and turn previously-inert image syntax into a live token.
+      // Strip the final composed string so what the card actually carries is
+      // image-free. This also runs inside the size-fitting loop, so the byte
+      // accounting below measures the text that is really sent.
+      panel.elements[0].content = stripCardMarkdownImages(preview.content);
     };
     setProcessPreview({ content: process.map(entry => entry.content).join('\n'), shownTools: process.filter(entry => entry.kind === 'tool').length });
     card.body.elements.splice(footerIndex < 0 ? card.body.elements.length : footerIndex, 0, panel);
   }
 
   // A runtime status is separate from a model-authored layout title.
-  card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
+  if (!compactRuntime && !simpleFinal) card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
   const usage = presentation.showLiveUsage && record.usage
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
   // Final cards already carry their frozen runtime identity in the footer.
-  const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage) : null;
+  const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage, presentation.locale) : null;
   const usageLine = [usage, runtime].filter(Boolean).join(' · ');
-  if (usageLine) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
+  if (usageLine && !compactRuntime && !simpleFinal) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
   if (!terminal && !record.finalCard && ['working', 'waiting'].includes(record.phase) && presentation.canStop) {
     card.body.elements.push({ tag: 'column_set', element_id: 'botmux_turn_control_0', columns: [{ tag: 'column', width: 'auto', elements: [{
-      tag: 'button', text: { tag: 'plain_text', content: en ? '⏹ Stop' : '⏹ 停止' }, type: 'danger',
+      tag: 'button', text: { tag: 'plain_text', content: compactRuntime ? (en ? 'Stop' : '停止') : (en ? '⏹ Stop' : '⏹ 停止') },
+      type: compactRuntime ? 'default' : 'danger', ...(compactRuntime ? { size: 'small' } : {}),
       behaviors: [{ type: 'callback', value: {
         action: 'stop_turn', session_id: record.sessionId, root_id: record.rootId,
         lark_app_id: record.larkAppId, chat_id: record.chatId, reply_card_turn_id: record.turnId,
         ...(record.dispatchAttempt !== undefined ? { reply_card_attempt: record.dispatchAttempt } : {}),
       } }],
     }] }] });
+  }
+  if (compactRuntime) {
+    card.body.padding = '8px 12px';
+    card.body.vertical_spacing = '4px';
+    const controls = card.body.elements.find(element => element.element_id === 'botmux_turn_control_0') as any;
+    card.body.elements = card.body.elements.filter(element => element !== controls
+      && (record.progress.length > 0 || !element.element_id?.startsWith('botmux_turn_progress_')));
+    card.body.elements.push({ tag: 'column_set', element_id: 'botmux_reply_actions', flex_mode: 'none',
+      horizontal_spacing: '8px', vertical_align: 'center', columns: [
+        // Reuse the visible chrome text as the purpose-marker carrier so the
+        // marker stamper does not append an otherwise empty Markdown row.
+        { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [{ tag: 'markdown', element_id: 'botmux_reply_footer',
+          text_size: 'notation', content: `<font color='grey'>${en ? 'Working…' : '正在处理…'}</font>` }] },
+        ...(controls?.columns ?? []),
+      ] } as any);
   }
   // Feedback becomes clickable after runtime settlement, avoiding a feedback
   // callback racing with the last status PATCH.
@@ -308,12 +367,38 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       if (budget <= 0) serialized = serialize();
     }
   }
+  // The next-step row is optional chrome, added last: it goes on only when the
+  // card as already fitted still fits with it. It never shortens the activity
+  // panel and never pushes the answer itself into an overflow attachment.
+  if (record.nextStep && terminal && record.phase === 'completed' && !pendingAsks.length) {
+    const footerIndex = card.body.elements.findIndex(element =>
+      element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer'
+      || element.element_id === 'botmux_reply_actions');
+    const index = footerIndex < 0 ? card.body.elements.length : footerIndex;
+    card.body.elements.splice(index, 0, buildNextStepElement(record.nextStep, presentation.locale));
+    const withRow = serialize();
+    if (turnReplyCardRequestBytes(withRow, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES) serialized = withRow;
+    else card.body.elements.splice(index, 1);
+  }
+  // The collapsed「本轮回顾」panel goes above that row (or the footer) on the
+  // same terms, after it: when space runs short the row keeps its place.
+  if (record.recap && terminal && record.phase === 'completed' && !pendingAsks.length) {
+    const anchorIndex = card.body.elements.findIndex(element =>
+      element.element_id === NEXT_STEP_ELEMENT_ID || element.element_id === 'botmux_feedback'
+      || element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_reply_actions');
+    const index = anchorIndex < 0 ? card.body.elements.length : anchorIndex;
+    card.body.elements.splice(index, 0, buildRecapElement(record.recap.markdown, presentation.locale));
+    const withPanel = serialize();
+    if (turnReplyCardRequestBytes(withPanel, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES) serialized = withPanel;
+    else card.body.elements.splice(index, 1);
+  }
   return serialized;
 }
 
-export function replyCardPresentation(config: Pick<BotConfig, 'cotEnabled' | 'thinkingCardToolResult' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showToolResults' | 'canStop'> {
+export function replyCardPresentation(config: Pick<BotConfig, 'cotEnabled' | 'thinkingCardToolResult' | 'replyCardShowTools' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showTools' | 'showToolResults' | 'canStop'> {
   return {
     showProcess: config.cotEnabled !== false && !config.noCotChats?.includes(chatId),
+    showTools: config.replyCardShowTools !== false,
     showToolResults: config.thinkingCardToolResult !== false,
     canStop: !config.hiddenStreamingCardButtons?.includes('stop'),
   };

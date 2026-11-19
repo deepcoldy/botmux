@@ -6,9 +6,13 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runHook } from '../src/cli.js';
 import type { AskResult } from '../src/core/ask-types.js';
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
 // ── Claude AskUserQuestion payload fixture ─────────────────────────────────────
 
@@ -516,43 +520,39 @@ describe('runHook', () => {
     });
   });
 
-  // 语义③（Codex 建议）：workflow subagent 里 `botmux ask` 必须被拒绝——审批走
-  // humanGate/decision 进 event log，不能用 ad-hoc ask 绕过。cmdAsk 用 process.exit(2)
-  // 拒绝，未导出、无法直接单测，这里用源码断言钉住该 gate，防被静默移除。
-  describe('语义③：workflow 里 botmux ask 拒绝（源码 gate 守卫）', () => {
-    it('cmdAsk 含 BOTMUX_WORKFLOW gate + exit 2 拒绝', () => {
-      const src = readFileSync(
-        new URL('../src/cli.ts', import.meta.url),
-        'utf-8',
-      );
-      const cmdAskIdx = src.indexOf('async function cmdAsk(');
-      expect(cmdAskIdx).toBeGreaterThanOrEqual(0);
-      // gate 在 cmdAsk 函数体起始处
-      const region = src.slice(cmdAskIdx, cmdAskIdx + 1500);
-      expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
-      expect(region).toContain('process.exit(2)');
-      expect(region.toLowerCase()).toContain('refused');
-    });
-  });
+  // 语义③：workflow subagent 里 `botmux ask` 必须被拒绝——审批走 humanGate/decision 进
+  // event log，不能用 ad-hoc ask 绕过；举手已并入 `botmux send --attention`，由 send 自身的
+  // workflow gate 覆盖。两者都通过真实 CLI 入口验证，并以同参数、无 BOTMUX_WORKFLOW 作对照。
+  describe('workflow subagent 里 ask / send --attention 被拒绝（真实 CLI）', () => {
+    const repo = fileURLToPath(new URL('..', import.meta.url));
+    const runCli = (args: string[], workflow: string) => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-workflow-gate-'));
+      try {
+        return spawnSyncTsScript(join(repo, 'src', 'cli.ts'), args, {
+          cwd: repo,
+          encoding: 'utf8',
+          timeout: 30_000,
+          env: {
+            PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: join(root, 'data'),
+            BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: 'sid_workflow_gate',
+            BOTMUX_WORKFLOW: workflow, BOTMUX_WORKFLOW_RUN_ID: 'run-1', BOTMUX_WORKFLOW_NODE_ID: 'node-1',
+          },
+        });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    };
 
-  describe('workflow 里举手走 send 自身的 gate（attention 已并入 send，不再是独立命令）', () => {
-    it('cmdAttention 已移除，send --attention 由 send 的 BOTMUX_WORKFLOW gate 覆盖', () => {
-      const src = readFileSync(
-        new URL('../src/cli.ts', import.meta.url),
-        'utf-8',
-      );
-      // 旧的独立举手入口已删除——举手并入 `botmux send --attention`。
-      expect(src.includes('async function cmdAttention(')).toBe(false);
-      // send 顶部已有 workflow-subagent gate（subagent 里 send 直接 refused），
-      // --attention 是 send 的一个 flag，因此天然被同一道 gate 覆盖。
-      const cmdSendIdx = src.indexOf('async function cmdSend(');
-      expect(cmdSendIdx).toBeGreaterThanOrEqual(0);
-      // cmdSend also performs live VC-origin verification before reaching the
-      // workflow gate; inspect a bounded function prefix without coupling this
-      // source-contract test to the exact size of that verification block.
-      const region = src.slice(cmdSendIdx, cmdSendIdx + 5000);
-      expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
-      expect(region).toContain('process.exit(2)');
-    });
+    it.each([
+      ['ask', ['ask', '--options', '继续,取消', '继续还是取消？']],
+      ['send --attention', ['send', '--attention', '--no-mention', '我卡住了']],
+    ])('%s exits 2 inside a workflow subagent', (name, args) => {
+      const gated = runCli(args, '1');
+      expect(gated.status, String(gated.stderr)).toBe(2);
+      expect(String(gated.stderr)).toContain(`botmux ${name.split(" ")[0]} refused inside workflow subagent`);
+
+      const control = runCli(args, '');
+      expect(String(control.stderr)).not.toContain('refused inside workflow subagent');
+    }, 60_000);
   });
 });

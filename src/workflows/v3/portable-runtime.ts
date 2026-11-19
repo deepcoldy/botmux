@@ -257,6 +257,10 @@ export async function runPortableWorkflow(
       ]),
     ),
   });
+  if (outcome.reason === 'awaitingExternal') {
+    // Never reached: this adapter does not pin nodeExecutor "bot".
+    throw new Error('portable workflow runtime does not drive bot-executed goal nodes');
+  }
   if (outcome.reason !== 'terminal') return outcome;
   return {
     ...outcome,

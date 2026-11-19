@@ -1,3 +1,4 @@
+import { withManagedDirectoriesAsync } from './managed-directory-retention.js';
 /**
  * 共享的 bots.json 读改写原语：跨进程文件锁 + 原子 rename。
  * oncall-store 与 grant-store 共用，保证对同一 bots.json 的并发写不丢更新。
@@ -7,6 +8,7 @@ import { getLoadedConfigPath } from '../bot-registry.js';
 import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
+import { assertChangedBotsCodexProfile } from './codex-profiles.js';
 import {
   assertChangedBotConfigInvariants,
   botConfigInvariantError,
@@ -24,6 +26,18 @@ export async function readRawConfig(path: string): Promise<any[]> {
   return raw;
 }
 
+/**
+ * Content gate every changed bots.json entry must pass before persistence.
+ * Mirrors the codexProfile checks the daemon loader runs, so no write surface
+ * (/config, config cards, setup/onboarding, rmwBotEntry callers) can persist a
+ * profile combined with an unsupported launch — a combination that would make
+ * parseBotConfigsFromText reject the WHOLE file on the next startup. Unchanged
+ * legacy entries are skipped, like assertChangedBotConfigInvariants.
+ */
+export function assertNextBotsGenerationContent(previous: any[], next: any[]): void {
+  assertChangedBotsCodexProfile(previous, next);
+}
+
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
   assertDurableConfigMutationAllowed('bots');
   let previous: any[] = [];
@@ -33,10 +47,13 @@ export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<vo
   // Validate the complete next generation, not the currently loaded registry.
   // Callers invoke this while holding the cross-process lock.
   assertQuotaFallbackGraphAcyclic(raw);
+  assertNextBotsGenerationContent(previous, raw);
   const tmp = path + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
-  await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  await fsp.rename(tmp, path);
+  await withManagedDirectoriesAsync(raw, async () => {
+    await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
+    await fsp.rename(tmp, path);
+  }, undefined, path);
 }
 
 export function findEntryIndex(raw: any[], larkAppId: string): number {
@@ -52,12 +69,16 @@ export function requireConfigPath(): string {
 /**
  * 在跨进程锁内对某个 bot 条目做 read-modify-write。`mutate` 拿到最新磁盘快照决定
  * 写什么；返回 `{ write:false }` 表示不写。沿用 oncall-store 原有语义。
+ * `options.path` 给没加载过 bot registry 的调用方（如 CLI）显式指定 bots.json。
+ * `options.onCommitted` 在原子写成功后、文件锁释放前执行，供需要与磁盘
+ * 代际严格有序的内存快照发布使用；失败写入不会触发。
  */
 export async function rmwBotEntry<T>(
   larkAppId: string,
   mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T | Promise<{ write: boolean; result: T } | T>,
+  options: { path?: string; onCommitted?: () => void | Promise<void> } = {},
 ): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
-  const path = requireConfigPath();
+  const path = options.path ?? requireConfigPath();
   return runDurableConfigMutation({
     scope: 'bots',
     path,
@@ -65,20 +86,47 @@ export async function rmwBotEntry<T>(
       const raw = await readRawConfig(path);
       const idx = findEntryIndex(raw, larkAppId);
       if (idx < 0) return { ok: false as const, reason: 'bot_not_in_config' };
+      // mutate() edits `raw` in place; keep the on-disk generation for the
+      // changed-entry diff the parser gate needs.
+      const previousRaw: any[] = JSON.parse(JSON.stringify(raw));
       const entry = raw[idx];
       const out = await mutate(entry, raw);
+      // Content gate only: a changed entry the loader would parse-reject is a
+      // field-combination error (e.g. codexProfile + unsupported launch), so it
+      // is surfaced as a structured { ok:false } like the invariant checks and
+      // no tmp file is touched. Genuine persistence errors below (ENOSPC /
+      // read-only fs / lock timeout) must still THROW: callers such as grant
+      // revoke rely on the rejection for their error/rollback path.
+      const changedEntryParseError = (): string | undefined => {
+        try {
+          assertNextBotsGenerationContent(previousRaw, raw);
+          return undefined;
+        } catch (error) {
+          return (error as Error).message;
+        }
+      };
+      const persist = async () => {
+        const parseError = changedEntryParseError();
+        if (parseError) return { ok: false as const, reason: parseError };
+        await writeRawConfigAtomic(path, raw);
+        return { ok: true as const };
+      };
       if (out && typeof out === 'object' && 'write' in (out as any)) {
         const wrap = out as { write: boolean; result: T };
         if (wrap.write) {
           const invariantError = botConfigInvariantError(entry);
           if (invariantError) return { ok: false as const, reason: invariantError };
-          await writeRawConfigAtomic(path, raw);
+          const w = await persist();
+          if (!w.ok) return { ok: false as const, reason: w.reason };
+          await options.onCommitted?.();
         }
         return { ok: true as const, result: wrap.result };
       }
       const invariantError = botConfigInvariantError(entry);
       if (invariantError) return { ok: false as const, reason: invariantError };
-      await writeRawConfigAtomic(path, raw);
+      const w = await persist();
+      if (!w.ok) return { ok: false as const, reason: w.reason };
+      await options.onCommitted?.();
       return { ok: true as const, result: out as T };
     }),
   });

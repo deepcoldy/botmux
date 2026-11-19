@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  GROUP_CONTEXT_CARD_CONTENT_VERSION, markGroupContextCardPurpose, projectGroupContextCard,
+  markGroupContextCardPurpose,
+  projectGroupContextCard,
 } from '../src/im/lark/group-context-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { buildCanonicalFinalReplyCard, buildImageCardElements } from '../src/im/lark/md-card.js';
@@ -104,7 +105,6 @@ describe('group-context card projection', () => {
 
   it('stamps standalone progress and messages with an invisible purpose that survives Format A', () => {
     const raw = buildCanonicalFinalReplyCard({ markdown: 'Completed is an ordinary answer' });
-    expect(GROUP_CONTEXT_CARD_CONTENT_VERSION).toBe(1);
     const runtime = markGroupContextCardPurpose(raw, 'runtime');
     expect(projectGroupContextCard(runtime)).toEqual({ kind: 'runtime' });
     expect(projectGroupContextCard(simplified(runtime))).toEqual({ kind: 'runtime' });
@@ -138,6 +138,114 @@ describe('group-context card projection', () => {
     expect(messageCard.body.elements[0].content).toBe(`PUBLIC_PROGRESS${'\u2063'.repeat(13)}`);
     expect(conversation(message).text).toBe('PUBLIC_PROGRESS');
     expect(conversation(simplified(message)).text).toBe('PUBLIC_PROGRESS');
+  });
+
+  it.each(['runtime', 'message', 'turn-message'] as const)('carries %s on existing image/table content without a Footer', purpose => {
+    for (const body of ['![Preview](img_v3_purpose)', '| A | B |\n| --- | --- |\n| 1 | 2 |']) {
+      const original = { schema: '2.0', body: { elements: buildImageCardElements(body, [], undefined, undefined, 'medium') } };
+      const saved = structuredClone(original);
+      const marked = markGroupContextCardPurpose(original, purpose);
+      expect(original).toEqual(saved);
+      expect(marked.body.elements).toHaveLength(saved.body.elements.length);
+      expect(JSON.stringify(marked)).not.toContain('botmux_reply_footer');
+      expect(markGroupContextCardPurpose(marked, purpose)).toEqual(marked);
+      expect(projectGroupContextCard(JSON.stringify(marked))?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+      if (body.startsWith('!')) {
+        // The list API drops image alt; it must request structured B rather
+        // than accidentally sharing runtime images as conversation.
+        expect(projectGroupContextCard(simplified(JSON.stringify(marked)), { botmuxSender: true })).toEqual({ kind: 'unresolved' });
+      } else {
+        const table = marked.body.elements[0];
+        const flattened = JSON.stringify({ elements: [[{ tag: 'text', text: `A B\n${table.rows[0].c0} ${table.rows[0].c1}` }]] });
+        expect(projectGroupContextCard(flattened)?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+        expect(extractCardContent(flattened)).not.toContain('\u2063');
+      }
+      const message = markGroupContextCardPurpose(marked, 'message');
+      const projection = conversation(JSON.stringify(message));
+      expect(projection.text).not.toContain('\u2063');
+      expect(extractCardContent(JSON.stringify(message))).not.toContain('\u2063');
+      expect(projection.content).not.toContain('\u2063');
+      expect(projection.resources.map(resource => resource.key)).toEqual(body.startsWith('!') ? ['img_v3_purpose'] : []);
+      if (body.startsWith('!')) expect(projection.text).toContain('Preview');
+      else expect(projection.text).toContain('| A | B |');
+    }
+  });
+
+  describe.each(['image-first', 'table-first'])('%s mixed media', order => {
+    it.each(['runtime', 'message', 'turn-message'] as const)('retains %s after the list API drops image alt', purpose => {
+      const image = '![Preview](img_v3_mixed)';
+      const table = '| A | B |\n| --- | --- |\n| 1 | 2 |';
+      const body = order === 'image-first' ? `${image}\n\n${table}` : `${table}\n\n${image}`;
+      const marked = markGroupContextCardPurpose({ schema: '2.0', body: {
+        elements: buildImageCardElements(body, [], undefined, undefined, 'medium'),
+      } }, purpose);
+      const flat: any[][] = [];
+      const visit = (node: any): void => {
+        if (Array.isArray(node)) { node.forEach(visit); return; }
+        if (!node || typeof node !== 'object') return;
+        if (node.tag === 'img') flat.push([{ tag: 'img', image_key: node.img_key }]);
+        if (node.tag === 'table') flat.push([{ tag: 'text', text: `A B\n${node.rows[0].c0} ${node.rows[0].c1}` }]);
+        visit(node.elements); visit(node.columns);
+      };
+      visit(marked.body.elements);
+      const raw = JSON.stringify({ elements: flat });
+      expect(projectGroupContextCard(raw)?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+      expect(JSON.stringify(marked)).not.toContain('botmux_reply_footer');
+      if (purpose === 'message') {
+        const projected = conversation(raw);
+        expect(projected.resources.map(resource => resource.key)).toEqual(['img_v3_mixed']);
+        expect(projected.text).toContain('1 2');
+        expect(projected.text).not.toContain('\u2063');
+      }
+    });
+  });
+
+  it('replaces an older image purpose when switching mixed cards to a table carrier', () => {
+    const card = { schema: '2.0', body: { elements: [
+      { tag: 'img', img_key: 'img_v3_old', alt: { tag: 'plain_text', content: `Preview${'\u2063'.repeat(12)}` } },
+      { tag: 'table', columns: [{ name: 'c0', display_name: 'A', data_type: 'lark_md' }], rows: [{ c0: 'Public' }] },
+    ] } };
+    const next = markGroupContextCardPurpose(card, 'message');
+    expect(next.body.elements[0].alt?.content).toBe('Preview');
+    expect(projectGroupContextCard(JSON.stringify(next))?.kind).toBe('conversation');
+    expect(markGroupContextCardPurpose(next, 'message')).toEqual(next);
+    expect(JSON.stringify(card)).toContain('\u2063');
+  });
+
+  it('keeps unmarked image lists on the ordinary parsing path without producer evidence', () => {
+    const raw = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_external' }]] });
+    expect(projectGroupContextCard(raw)).toBeUndefined();
+  });
+
+  describe.each([undefined, 'Sales'])('native chart title=%s', title => {
+    it.each(['runtime', 'message', 'turn-message'] as const)('carries %s without adding a Footer or changing chart data', purpose => {
+      const fence = '```vega-lite\n' + JSON.stringify({ ...(title ? { title } : {}),
+        data: { values: [{ category: 'A', value: 1 }, { category: 'B', value: 2 }] },
+        mark: 'bar', encoding: { x: { field: 'category' }, y: { field: 'value' } },
+      }) + '\n```';
+      const original = { schema: '2.0', body: { elements: buildImageCardElements(fence, []) } };
+      const snapshot = structuredClone(original);
+      const marked = markGroupContextCardPurpose(original, purpose);
+      expect(original).toEqual(snapshot);
+      expect(marked.body.elements.map((node: any) => node.tag)).toEqual(['chart']);
+      expect(marked.body.elements[0].chart_spec).toEqual(snapshot.body.elements[0].chart_spec);
+      expect(JSON.stringify(marked)).not.toContain('botmux_reply_footer');
+      expect(markGroupContextCardPurpose(marked, purpose)).toEqual(marked);
+      expect(projectGroupContextCard(JSON.stringify(marked))?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+      const message = markGroupContextCardPurpose(marked, 'message');
+      const projected = conversation(JSON.stringify(message));
+      expect(projected.text).toContain('| A | 1 |');
+      expect(projected.text).toContain('| B | 2 |');
+      if (title) expect(projected.text).toContain(title);
+      expect(projected.text).not.toContain('botmux_group_context_chart');
+      expect(projected.text).not.toContain('\u2063');
+    });
+  });
+
+  it('keeps unmarked structured image cards on the ordinary parsing path', () => {
+    expect(projectGroupContextCard(JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'img', img_key: 'img_v3_unmarked', alt: { tag: 'plain_text', content: 'Preview' } },
+    ] } }))).toBeUndefined();
   });
 
   it('strips an inline purpose marker from a promoted heading in both API shapes', () => {

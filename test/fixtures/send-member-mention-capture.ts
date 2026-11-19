@@ -8,7 +8,9 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
     data = { code: 0, tenant_access_token: 'test-token', expire: 7200 };
   } else if (url.includes('/contact/v3/users/batch_get_id')) {
     console.log('CONTACT_LOOKUP=' + config.data);
-    data = { code: 0, data: { user_list: [] } };
+    data = { code: 0, data: { user_list: process.env.TEST_MEMBER_SCENARIO === 'outsider'
+      ? [{ email: 'recipient@example.com', user_id: 'ou_outside' }]
+      : [] } };
   } else if (url.includes('/im/v1/chats/oc_test/members')) {
     const scenario = process.env.TEST_MEMBER_SCENARIO;
     const items = scenario === 'missing'
@@ -22,7 +24,12 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
   } else if (url.endsWith('/im/v1/messages')) {
     const body = JSON.parse(config.data);
     console.log('CAPTURE_MESSAGE=' + JSON.stringify(body));
-    data = { code: 0, data: { message_id: 'om_test_sent' } };
+    if (process.env.TEST_MESSAGE_STARTED_PORT) {
+      await fetch(`http://127.0.0.1:${process.env.TEST_MESSAGE_STARTED_PORT}/test/message-started`, { method: 'POST' });
+    }
+    data = process.env.TEST_MESSAGE_FAILURE === '1'
+      ? { code: 230049, msg: 'message is being sent; acknowledgement unavailable' }
+      : { code: 0, data: { message_id: 'om_test_sent' } };
   } else if (url.includes('/im/v1/chats/oc_test')) {
     data = { code: 0, data: { chat_mode: 'group', chat_type: 'private' } };
   } else {

@@ -9,7 +9,7 @@ import {
   READ_ONLY_SCROLL_SESSION_BUDGET,
   readTextIfPresent,
   sendScroll,
-  startOpenCodeWorker,
+  startReadOnlyScrollWorker,
   waitForStableOccurrenceCount,
   WHEEL_UP,
   WHEEL_UP_HEX,
@@ -17,7 +17,21 @@ import {
 
 describe('worker read-only terminal remote scroll', () => {
   it('forwards one legal read-only scroll frame for an OpenCode opt-in view socket', async () => {
-    const harness = await startOpenCodeWorker('opencode');
+    const harness = await startReadOnlyScrollWorker('opencode');
+    const ws = await openViewSocket(harness);
+
+    writeFileSync(harness.inputLog, '');
+    sendScroll(ws);
+
+    const count = await waitForStableOccurrenceCount(harness.inputLog, WHEEL_UP_HEX, { minimumCount: 1 });
+    expect(count).toBe(1);
+
+    closeSocket(ws);
+    closeWorker(harness.child);
+  }, 25_000);
+
+  it('forwards one legal read-only scroll frame to Pi fullscreen mode', async () => {
+    const harness = await startReadOnlyScrollWorker('pi');
     const ws = await openViewSocket(harness);
 
     writeFileSync(harness.inputLog, '');
@@ -31,7 +45,7 @@ describe('worker read-only terminal remote scroll', () => {
   }, 25_000);
 
   it('bounds repeated read-only scroll frames from one view socket by the session budget', async () => {
-    const harness = await startOpenCodeWorker('opencode');
+    const harness = await startReadOnlyScrollWorker('opencode');
     const ws = await openViewSocket(harness);
 
     writeFileSync(harness.inputLog, '');
@@ -48,7 +62,7 @@ describe('worker read-only terminal remote scroll', () => {
   }, 25_000);
 
   it('shares the read-only scroll budget across multiple view sockets in one session', async () => {
-    const harness = await startOpenCodeWorker('opencode');
+    const harness = await startReadOnlyScrollWorker('opencode');
     const firstWs = await openViewSocket(harness);
     const secondWs = await openViewSocket(harness);
 
@@ -70,7 +84,7 @@ describe('worker read-only terminal remote scroll', () => {
   }, 25_000);
 
   it('keeps rejecting forged read-only input frames on a view socket', async () => {
-    const harness = await startOpenCodeWorker('opencode');
+    const harness = await startReadOnlyScrollWorker('opencode');
     const ws = await openViewSocket(harness);
 
     writeFileSync(harness.inputLog, '');

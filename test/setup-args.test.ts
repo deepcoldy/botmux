@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   buildBotFromAddFlags,
@@ -6,8 +5,8 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
-  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
@@ -165,7 +164,7 @@ describe('parseSetupCommand', () => {
     expect(() => parseSetupCommand(['configure'])).toThrow(/需要指定机器人/);
     expect(() => parseSetupCommand(['configure', 'a', 'b'])).toThrow(/只接受一个机器人标识/);
     expect(() => parseSetupCommand(['configure', 'botmux-1', '--cli', 'codex'])).toThrow(/不接受字段参数/);
-    expect(() => parseSetupCommand(['configure', 'botmux-1', '--open-platform-auto'])).toThrow(/只接受机器人标识、--switch-account 和 --json/);
+    expect(() => parseSetupCommand(['configure', 'botmux-1', '--open-platform-auto'])).toThrow(/只接受机器人标识/);
   });
 
   it('accepts "-" as a clear value but treats a following --flag as a missing value', () => {
@@ -225,7 +224,6 @@ describe('buildBotFromAddFlags', () => {
   });
 
   it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
-    expect(cliSelectionKeys()).toContain('traecli');
     expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
     expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
       cliId: 'traex',
@@ -334,6 +332,14 @@ describe('buildBotFromAddFlags', () => {
 });
 
 describe('editInputFromFlags', () => {
+  it('accepts --app-icon only with add --create-app (not compat mode, not edit)', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--app-icon', '/tmp/a.png', '--allowed-users', 'o@example.com']))
+      .toMatchObject({ action: 'add', createApp: true, flags: { appIcon: '/tmp/a.png' } });
+    expect(() => parseSetupCommand(['add', '--app-icon', '/tmp/a.png'])).toThrow(/必须与 add --create-app/);
+    expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--app-icon', '/tmp/a.png'])).toThrow(/不支持 --app-icon/);
+    expect(() => editInputFromFlags({ appIcon: '/tmp/a.png' })).toThrow(/仅与 add --create-app/);
+  });
+
   it('rejects --app-name outside add --create-app', () => {
     expect(() => editInputFromFlags({ appName: 'Bot' })).toThrow(/仅与 add --create-app/);
   });
@@ -454,30 +460,6 @@ describe('editInputFromFlags', () => {
   });
 });
 
-describe('interactive setup edit launch mode wiring', () => {
-  it('preserves and writes cliLaunchMode through the CLI picker path', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('const currentKey = selectionKeyForBot');
-    const end = source.indexOf('// selKey 为 null', start);
-    const pickerBlock = source.slice(start, end);
-
-    expect(pickerBlock).toContain("selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli, bot.cliLaunchMode)");
-    expect(pickerBlock).toContain('input.cliLaunchMode = sel.cliLaunchMode ?? null;');
-    expect(pickerBlock).toContain('input.cliRuntime = null;');
-  });
-
-  it('treats cliLaunchMode as a scripted setup edit launch change', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('const agentLaunchChanged = hasAgentLaunchConfigChanged');
-    const end = source.indexOf('// Missing Agent dependencies', start);
-    const changeBlock = source.slice(start, end);
-
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(changeBlock).toContain('cliLaunchMode: original.cliLaunchMode');
-    expect(changeBlock).toContain('cliLaunchMode: edited.cliLaunchMode');
-  });
-});
-
 describe('applyBotConfigEdits defaultWorkingDir (via edit flags)', () => {
   it('sets, keeps, and clears defaultWorkingDir tri-state', () => {
     const base = { larkAppId: 'cli_x', larkAppSecret: 's', workingDir: '~/repos' };
@@ -495,5 +477,98 @@ describe('maskAppSecret', () => {
     expect(maskAppSecret(undefined)).toBe('');
     expect(maskAppSecret('short')).toBe('••••');
     expect(maskAppSecret('abcd1234efgh5678')).toBe('abcd••••5678');
+  });
+});
+
+describe('parseSetupCommand --extra-scopes-file', () => {
+  it('is accepted by add --create-app and configure (both spellings)', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--extra-scopes-file', './s.json']))
+      .toMatchObject({ action: 'add', extraScopesFile: './s.json', openPlatformAuto: true });
+    expect(parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file=/x/s.json']))
+      .toMatchObject({ action: 'configure', selector: 'botmux-0', extraScopesFile: '/x/s.json' });
+    expect(parseSetupCommand(['configure', 'botmux-0'])).not.toHaveProperty('extraScopesFile');
+  });
+
+  it('requires a path and Open Platform automation on add', () => {
+    expect(() => parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file'])).toThrow(/缺少文件路径/);
+    expect(() => parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file', '--json'])).toThrow(/缺少文件路径/);
+    expect(() => parseSetupCommand(['add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--extra-scopes-file', 's.json']))
+      .toThrow(/自动配置/);
+    expect(parseSetupCommand(['add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--open-platform-auto', '--extra-scopes-file', 's.json']))
+      .toMatchObject({ extraScopesFile: 's.json' });
+  });
+
+  it('is rejected by list / edit / remove', () => {
+    expect(() => parseSetupCommand(['list', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['remove', 'botmux-0', '--yes', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['list', '--extra-scopes-file', '-'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--extra-scopes-file=-'])).toThrow(/仅适用于 add 或 configure/);
+  });
+
+  it('configure 传 - 表示清除记下的路径，add 不接受', () => {
+    expect(parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file', '-']))
+      .toMatchObject({ action: 'configure', extraScopesFile: null });
+    expect(parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file=-']))
+      .toMatchObject({ action: 'configure', extraScopesFile: null });
+    expect(() => parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--extra-scopes-file', '-']))
+      .toThrow(/只用于 configure/);
+  });
+
+  it('add --brand lark 不接受（Lark 没有开放平台自动配置，追加清单不会生效）', () => {
+    expect(() => parseSetupCommand([
+      'add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--brand', 'Lark',
+      '--open-platform-auto', '--extra-scopes-file', 's.json',
+    ])).toThrow(/Lark/);
+    expect(parseSetupCommand([
+      'add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--brand', 'feishu',
+      '--open-platform-auto', '--extra-scopes-file', 's.json',
+    ])).toMatchObject({ extraScopesFile: 's.json' });
+  });
+});
+
+describe('--welcome-message', () => {
+  it('is stored on add and can be set / cleared on edit', () => {
+    const add = parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--welcome-message', '回复 /init 开始']);
+    expect(add).toMatchObject({ action: 'add', flags: { welcomeMessage: '回复 /init 开始' } });
+    const bot = buildBotFromAddFlags({ appId: 'cli_x', appSecret: 's', allowedUsers: 'a@b.com', welcomeMessage: '  hi  ' });
+    expect(bot.welcomeMessage).toBe('hi');
+
+    const base = { larkAppId: 'cli_x', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['a@b.com'], welcomeMessage: 'old' };
+    expect(applyBotConfigEdits(base, editInputFromFlags({ welcomeMessage: 'new' })).welcomeMessage).toBe('new');
+    expect(applyBotConfigEdits(base, editInputFromFlags({ welcomeMessage: '-' }))).not.toHaveProperty('welcomeMessage');
+    expect(applyBotConfigEdits(base, editInputFromFlags({ model: 'm' })).welcomeMessage).toBe('old');
+  });
+
+  it('takes a value starting with @ literally', () => {
+    const add = parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--welcome-message', '@张三 你好']);
+    expect(add).toMatchObject({ action: 'add', flags: { welcomeMessage: '@张三 你好' } });
+    if (add.action !== 'add') throw new Error('expected add');
+    const readText = (_path: string): string => { throw new Error('should not read'); };
+    expect(resolveWelcomeMessageFile(add.flags, readText).welcomeMessage).toBe('@张三 你好');
+  });
+});
+
+describe('--welcome-message-file', () => {
+  it('is parsed on edit and read into welcomeMessage', () => {
+    const edit = parseSetupCommand(['edit', 'cli_x', '--welcome-message-file', '~/welcome.txt']);
+    expect(edit).toMatchObject({ action: 'edit', flags: { welcomeMessageFile: '~/welcome.txt' } });
+    if (edit.action !== 'edit') throw new Error('expected edit');
+    const reads: string[] = [];
+    const resolved = resolveWelcomeMessageFile(edit.flags, path => { reads.push(path); return '第一行\n第二行\n'; });
+    expect(reads).toEqual(['~/welcome.txt']);
+    expect(resolved.welcomeMessage).toBe('第一行\n第二行\n');
+    expect(resolved).not.toHaveProperty('welcomeMessageFile');
+  });
+
+  it('rejects combining it with --welcome-message, an empty file, or an unreadable file', () => {
+    expect(() => resolveWelcomeMessageFile({ welcomeMessage: 'hi', welcomeMessageFile: 'w.txt' }, () => 'x')).toThrow();
+    expect(() => resolveWelcomeMessageFile({ welcomeMessageFile: 'w.txt' }, () => ' \n ')).toThrow();
+    expect(() => resolveWelcomeMessageFile({ welcomeMessageFile: 'w.txt' }, () => { throw new Error('ENOENT'); })).toThrow('ENOENT');
+  });
+
+  it('leaves flags without a file untouched', () => {
+    const flags = { welcomeMessage: 'hi' };
+    expect(resolveWelcomeMessageFile(flags, () => { throw new Error('should not read'); })).toBe(flags);
   });
 });

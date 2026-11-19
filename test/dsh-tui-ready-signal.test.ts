@@ -16,6 +16,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { ensureDshQuestionBridgePatch } from '../src/adapters/dsh-question-bridge.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { READY_SIGNAL_LOG_MAX_BYTES } from '../src/services/ready-signal-log.js';
@@ -322,10 +323,8 @@ async function runReadyDriver(opts: {
 
 describe('dsh-tui structured readiness', () => {
   it('opts the dsh-tui adapter into the ready hook', () => {
-    // Source-level: importing the CLI adapter registry pulls in every adapter,
-    // which needs the full node_modules tree (not available in every checkout).
-    const source = readFileSync(join(__dirname, '..', 'src', 'adapters', 'cli', 'dsh-tui.ts'), 'utf8');
-    expect(source).toContain('injectsReadyHook: true');
+    // The worker only arms BOTMUX_READY_COMMAND for adapters that declare it.
+    expect(createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui').injectsReadyHook).toBe(true);
   });
 
   it('fires BOTMUX_READY_COMMAND exactly once after the inject record appears', async () => {
@@ -452,8 +451,7 @@ describe('dsh-tui structured readiness', () => {
   });
 
   it('opts the dsh-tui adapter into the structured turn-idle hook', () => {
-    const source = readFileSync(join(__dirname, '..', 'src', 'adapters', 'cli', 'dsh-tui.ts'), 'utf8');
-    expect(source).toContain('injectsTurnIdleHook: true');
+    expect(createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui').injectsTurnIdleHook).toBe(true);
   });
 
   it('reports one turn idle per agent/status idle edge of its own agent', async () => {

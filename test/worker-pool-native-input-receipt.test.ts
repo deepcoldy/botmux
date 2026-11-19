@@ -113,7 +113,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { initWorkerPool, sendWorkerInput, forkWorker, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  admitQueuedActivationTail,
+  forkWorker,
+  initWorkerPool,
+  promoteQueuedActivationTail,
+  sendWorkerInput,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import {
@@ -122,6 +129,8 @@ import {
 } from '../src/services/group-context-delivery-store.js';
 import { commitGroupContextDispatchIntoPayload } from '../src/services/group-context-prompt.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
+import { closeLinkRefRuntime, initializeLinkRefRuntime } from '../src/services/link-ref-runtime.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;
@@ -149,6 +158,89 @@ function makeDs(worker: any): DaemonSession {
 }
 
 async function flush(): Promise<void> { await new Promise(resolve => setTimeout(resolve, 0)); }
+
+describe('TraeX fixed context receipt fencing', () => {
+  it('persists receipts only from the exact current worker generation and native thread', async () => {
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const receipt = {
+      nativeThreadId: 'native-known', roleDigest: 'a'.repeat(64), skillCatalogDigest: 'b'.repeat(64),
+      turnId: 'om_context', status: 'accepted' as const,
+    };
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+    worker.emit('message', {
+      type: 'traex_native_context_receipt', receipt: { ...receipt, nativeThreadId: 'other-thread' },
+    });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt: { ...receipt, status: 'unknown' } });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+  });
+
+  it('accepts the first cold-start receipt before the native id is persisted, then requires an exact match', async () => {
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.cliId = 'traex';
+    delete (ds.session as { cliSessionId?: string }).cliSessionId;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const receipt = {
+      nativeThreadId: 'native-cold', roleDigest: 'a'.repeat(64), skillCatalogDigest: 'b'.repeat(64),
+      turnId: 'om_first_turn', status: 'accepted' as const,
+    };
+    // The worker ACKs the first turn before persistCliSessionId reaches the daemon.
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+
+    ds.session.cliSessionId = 'native-cold';
+    worker.emit('message', {
+      type: 'traex_native_context_receipt',
+      receipt: { ...receipt, turnId: 'om_second_turn', status: 'unknown' },
+    });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toMatchObject({ turnId: 'om_second_turn', status: 'unknown' });
+
+    worker.emit('message', {
+      type: 'traex_native_context_receipt',
+      receipt: { ...receipt, nativeThreadId: 'native-other', turnId: 'om_third_turn' },
+    });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toMatchObject({ turnId: 'om_second_turn' });
+  });
+});
+
+describe('prompt_submitted_input fencing', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('delivers the live generation\'s match and drops a replaced worker\'s or an older generation\'s', async () => {
+    const onPromptSubmittedInput = vi.fn();
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(), onPromptSubmittedInput } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const match = { type: 'prompt_submitted_input', turnId: 'workflow-event:run-1:3' };
+    worker.emit('message', match);
+    await flush();
+    expect(onPromptSubmittedInput).toHaveBeenCalledWith(ds, 'workflow-event:run-1:3', { workerGeneration: ds.session.workerGeneration });
+    onPromptSubmittedInput.mockClear();
+    ds.worker = makeFakeWorker();
+    worker.emit('message', match);
+    await flush();
+    ds.worker = worker;
+    ds.session.workerGeneration = (ds.session.workerGeneration ?? 1) + 1;
+    worker.emit('message', match);
+    await flush();
+    expect(onPromptSubmittedInput).not.toHaveBeenCalled();
+  });
+});
 
 describe('native_input_consumed fencing', () => {
   beforeEach(() => { vi.clearAllMocks(); });
@@ -204,8 +296,13 @@ describe('group background dispatch boundary', () => {
     vi.clearAllMocks();
     dataDir = mkdtempSync(join(tmpdir(), 'worker-pool-dispatch-'));
     config.session.dataDir = dataDir;
+    delete process.env.BOTMUX_LINK_REFS_MODE;
   });
-  afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); });
+  afterEach(() => {
+    closeLinkRefRuntime();
+    delete process.env.BOTMUX_LINK_REFS_MODE;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
 
   const frag = (seq: number, text: string) => `<message seq="${seq}" message_id="om_m${seq}" chat_id="oc_chat" sender_type="user" sender_id="ou_user" msg_type="text" create_time="1"><quote kind="verbatim">${text}</quote></message>`;
   const bundle = (turnId: string, epoch: string, seqs: number[]): PreparedGroupContext => {
@@ -251,6 +348,119 @@ describe('group background dispatch boundary', () => {
     const binding2 = { appId: 'app_test', chatId: 'oc_chat', turnId: 'om_turn_2', sessionId: 'sid-receipt', epoch: epoch2, workerGeneration: 1 };
     expect(confirmGroupContextNativeInput(binding2, { kind: 'claude_transcript_user_record' }, dataDir)).toBe(true);
     expect(getDeliveredGroupContextSeqs('app_test', 'oc_chat', 'sid-receipt', epoch2, dataDir)).toEqual([1, 2]);
+  });
+
+  it('registers only URLs from the group context that actually crosses worker IPC', () => {
+    process.env.BOTMUX_LINK_REFS_MODE = 'enabled';
+    initializeLinkRefRuntime(dataDir);
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.workerGeneration = 1; ds.workerGeneration = 1;
+    const droppedUrl = 'https://context.example.test/already-covered';
+    const keptUrl = 'https://context.example.test/new-for-this-turn';
+    const epoch1 = groupContextEpoch('sid-receipt', 'native-known', 'claude-code', 'om_turn_1');
+    const turnId = 'om_turn_link_ref';
+    const epoch2 = groupContextEpoch('sid-receipt', 'native-known', 'claude-code', turnId);
+    const first = bundle('om_turn_1', epoch1, [1]);
+    first.body = `<shared_group_context trust="untrusted" through_seq="1">\n<policy>p</policy>\n${frag(1, droppedUrl)}\n</shared_group_context>`;
+    first.sources = [{ seq: 1, text: frag(1, droppedUrl) }];
+    writePreparedGroupContext(first, dataDir);
+    const frozen = writePreparedGroupContext({
+      ...bundle(turnId, epoch2, [1, 2]),
+      body: `<shared_group_context trust="untrusted" through_seq="2">\n<policy>p</policy>\n${frag(1, droppedUrl)}\n${frag(2, keptUrl)}\n</shared_group_context>`,
+      sources: [
+        { seq: 1, text: frag(1, droppedUrl) },
+        { seq: 2, text: frag(2, keptUrl) },
+      ],
+    }, dataDir);
+    const binding1 = { appId: 'app_test', chatId: 'oc_chat', turnId: 'om_turn_1', sessionId: 'sid-receipt', epoch: epoch1, workerGeneration: 1 };
+    bindGroupContextDelivery(binding1, dataDir);
+    expect(commitGroupContextDispatchIntoPayload({ content: `${first.body}\nFirst` }, binding1, dataDir)).toBeDefined();
+    expect(confirmGroupContextNativeInput(binding1, { kind: 'claude_transcript_user_record' }, dataDir)).toBe(true);
+
+    const payload = {
+      content: `${frozen.body}\nTask`,
+      linkRefs: {
+        mode: 'disabled' as const,
+        sources: [{ sourceType: 'group_context' as const, kind: 'text' as const, text: frozen.body }],
+      },
+    };
+    expect(sendWorkerInput(ds, payload, turnId)).toBe(true);
+    const sent = worker.send.mock.calls.map((call: any[]) => call[0]).find((message: any) => message?.type === 'message');
+    expect(sent, JSON.stringify(worker.send.mock.calls)).toBeDefined();
+    expect(sent.content).toContain(keptUrl);
+    expect(sent.content).not.toContain(droppedUrl);
+    expect(sent.content.match(/\{\{botmux_link:lr_[0-9a-f]{32}\}\}/g)).toHaveLength(1);
+    expect(payload.content).toBe(sent.content);
+    expect(payload.linkRefs).toEqual({ mode: 'enabled' });
+  });
+
+  it('defers queued-turn LinkRef registration until promotion and reuses it after journal persistence retries', () => {
+    process.env.BOTMUX_LINK_REFS_MODE = 'enabled';
+    initializeLinkRefRuntime(dataDir);
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.workerGeneration = 1; ds.workerGeneration = 1;
+    const droppedUrl = 'https://context.example.test/queued-already-covered';
+    const keptUrl = 'https://context.example.test/queued-new';
+    const firstEpoch = groupContextEpoch('sid-receipt', 'native-known', 'claude-code', 'om_queue_first');
+    const queuedTurnId = 'om_queue_link_ref';
+    const queuedEpoch = groupContextEpoch('sid-receipt', 'native-known', 'claude-code', queuedTurnId);
+    const first = {
+      ...bundle('om_queue_first', firstEpoch, [1]),
+      body: `<shared_group_context trust="untrusted" through_seq="1">\n<policy>p</policy>\n${frag(1, droppedUrl)}\n</shared_group_context>`,
+      sources: [{ seq: 1, text: frag(1, droppedUrl) }],
+    };
+    writePreparedGroupContext(first, dataDir);
+    const frozen = writePreparedGroupContext({
+      ...bundle(queuedTurnId, queuedEpoch, [1, 2]),
+      body: `<shared_group_context trust="untrusted" through_seq="2">\n<policy>p</policy>\n${frag(1, droppedUrl)}\n${frag(2, keptUrl)}\n</shared_group_context>`,
+      sources: [
+        { seq: 1, text: frag(1, droppedUrl) },
+        { seq: 2, text: frag(2, keptUrl) },
+      ],
+    }, dataDir);
+    const firstBinding = {
+      appId: 'app_test', chatId: 'oc_chat', turnId: 'om_queue_first',
+      sessionId: 'sid-receipt', epoch: firstEpoch, workerGeneration: 1,
+    };
+    bindGroupContextDelivery(firstBinding, dataDir);
+    expect(commitGroupContextDispatchIntoPayload({ content: `${first.body}\nFirst` }, firstBinding, dataDir)).toBeDefined();
+    expect(confirmGroupContextNativeInput(firstBinding, { kind: 'claude_transcript_user_record' }, dataDir)).toBe(true);
+
+    admitQueuedActivationTail(ds, {
+      userPrompt: 'queued task',
+      turnId: queuedTurnId,
+      cliInput: {
+        content: `${frozen.body}\nQueued task`,
+        linkRefs: {
+          mode: 'disabled',
+          sources: [{ sourceType: 'group_context', kind: 'text', text: frozen.body }],
+        },
+      },
+    });
+    let failedPromotionContent: string | undefined;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(session => {
+      failedPromotionContent = session.queuedActivationInput?.content;
+      throw new Error('promotion store unavailable');
+    });
+    expect(promoteQueuedActivationTail(ds)).toBe(false);
+    expect(failedPromotionContent).toMatch(/\{\{botmux_link:lr_[0-9a-f]{32}\}\}/);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail?.[0]?.cliInput.linkRefs).toEqual({
+      mode: 'enabled',
+      sources: [{ sourceType: 'group_context', kind: 'text', text: frozen.body }],
+    });
+
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    const sent = worker.send.mock.calls.map((call: any[]) => call[0]).find((message: any) => message?.turnId === queuedTurnId);
+    expect(sent).toBeDefined();
+    expect(sent.content).toBe(failedPromotionContent);
+    expect(sent.content).toContain(keptUrl);
+    expect(sent.content).not.toContain(droppedUrl);
+    expect(sent.content.match(/\{\{botmux_link:lr_[0-9a-f]{32}\}\}/g)).toHaveLength(1);
   });
 
   it('does not record a dispatch for a fork that is deferred before any IPC', async () => {

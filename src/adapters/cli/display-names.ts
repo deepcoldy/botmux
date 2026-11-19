@@ -14,7 +14,6 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'codex': 'Codex',
   'codex-app': 'Codex App',
   'cursor': 'Cursor',
-  'gemini': 'Gemini',
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
@@ -39,6 +38,9 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'mojo': 'Mojo',
   'minimax': 'MiniMax Code',
   'remote-runner': 'Remote Runner',
+  'codem': 'CodeM',
+  'zcode': 'ZCode',
+  'doubao': 'Doubao',
 };
 
 /** Display name for a possibly-unknown id (persisted / runtime-supplied). */

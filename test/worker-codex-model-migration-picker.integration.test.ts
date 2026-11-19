@@ -28,6 +28,11 @@
  * digit picks its row directly, and a bracketed paste while the picker is
  * active is dropped.
  */
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件的 runScenario 往 homedir() 下写 .zshrc 和 .botmux，假 codex 子进程继承 HOME 后往
+// ~/.codex 写 history.jsonl 和 sessions；绕过 setupFiles 的运行（如 0 字节 vitest 配置）里，
+// 这些写入会直接覆盖真实的 ~/.zshrc、追加进真实的 Codex 历史。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -35,8 +40,16 @@ import { join, resolve } from 'node:path';
 import { execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
+import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+
+// 上面列的写入都落在 homedir() 下：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 const productionBackend = tmuxAvailable ? 'tmux' : 'pty';
@@ -112,9 +125,11 @@ const history = opts.history
 const draftRows = opts.draft === 'guided'
   ? '› please pick one:\r\n  1. Try new model\r\n  2. Use existing model'
   : '› 1. Try new model\r\n  2. Use existing model';
+// Preserve the live composer cursor while painting the placeholder and footer.
+// A draft keeps its cursor after the actual text; it must remain protected.
 const skeleton = '\x1b[?2004h\x1b[2J\x1b[H' + banner + history
-  + (opts.draft ? '\r\n' + draftRows : '\r\n\x1b[1m›\x1b[22m \x1b[2mAsk Codex to do anything\x1b[22m')
-  + '\r\n\r\n  gpt-5.5 default · /tmp/work';
+  + (opts.draft ? '\r\n' + draftRows + '\x1b7' : '\r\n\x1b[1m›\x1b[22m \x1b7\x1b[2mAsk Codex to do anything\x1b[22m')
+  + '\r\n\r\n  gpt-5.5 default · /tmp/work\x1b8';
 const row = (n, label) => (selected === n ? '\x1b[7m\x1b[1m› ' : '\x1b[27m\x1b[22m  ') + n + '. ' + label + '\x1b[0m';
 const options = opts.paint === 'stream'
   ? () => '\x1b[7;1H' + row(1, 'Try new model') + '\x1b[8;1H' + row(2, 'Use existing model')
@@ -124,9 +139,9 @@ const picker = () => '\x1b[2J\x1b[2;3HMeet\x1b[2;8HGPT-6\x1b[2;14HSol'
   + '\x1b[4;3HOur\x1b[4;7Hlatest\x1b[4;14HSol\x1b[4;18His\x1b[4;21Hbetter.'
   + options()
   + '\x1b[10;3H\x1b[1menter/esc\x1b[22m\x1b[2m confirm · ^c quit\x1b[0m';
-const composerLine = opts.draft ? draftRows : '› Ask Codex to do anything';
+const composerLine = opts.draft ? draftRows + '\x1b7' : '› \x1b7Ask Codex to do anything';
 const composer = '\x1b[2J\x1b[H  >_ OpenAI Codex (v0.162.1)\r\n     /tmp/work\r\n\r\n' + history
-  + composerLine + '\r\n\r\n  gpt-5.5 default · /tmp/work';
+  + composerLine + '\r\n\r\n  gpt-5.5 default · /tmp/work\x1b8';
 // Output produced by one input event is written at once, so a Down+Enter
 // delivered together yields ONE read holding the picker repaint and the
 // composer that replaced it (the coalesced shape seen under load).
@@ -199,7 +214,10 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
   const botmuxDir = join(homedir(), '.botmux');
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
   chmodSync(botmuxDir, 0o700);
+  // The runner owns this disposable HOME; do not open zsh-newuser-install.
+  writeFileSync(join(homedir(), '.zshrc'), '# isolated worker test\n');
   const root = mkdtempSync(join(backendType === 'tmux' ? '/tmp' : tmpdir(), 'bmx-migration-'));
+  const managedSocket = preferredManagedTmuxSocket(privateTmuxEnv(root));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
   const eventsFile = join(root, 'events');
@@ -227,12 +245,25 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
   try {
     const spawnOptions: SpawnOptions = {
       cwd: resolve('.'),
-      env: {
-        ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      env: privateTmuxEnv(root, {
+        SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
         ...(scenario.workflow ? { BOTMUX_WORKFLOW: '1' } : {}),
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     };
+    if (backendType === 'tmux') {
+      // Managed sessions share one long-lived server in production. Alone on a
+      // private server, the CLI's session takes the server down with it when
+      // the CLI crashes, and a liveness probe caught in the few ms the server
+      // spends exiting reads "server exited unexpectedly" — a connection-level
+      // answer the tmux backend deliberately does not count as death — so the
+      // crash is reported one 9s probe period later: ~22s instead of ~13s,
+      // past waitFor's 20s (CI 2026-10-21, 2026-10-23). A session of the
+      // test's own keeps the server up, so a dead pane always reads as missing
+      // from a live server.
+      execFileSync('tmux', [...tmuxSocketArgs(managedSocket), 'new-session', '-d', '-s', 'test-keepalive', 'sleep 86400'],
+        { env: spawnOptions.env, stdio: 'ignore' });
+    }
     child = spawnNodeTsScript(resolve('src/worker.ts'), [], spawnOptions);
     child.on('message', m => messages.push(m as WorkerToDaemon));
     child.stdout?.on('data', b => logs.push(b.toString()));
@@ -254,16 +285,15 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
       detail,
     });
   } finally {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>(r => child!.once('exit', () => r()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (child) await killProcessTree(child);
     if (existsSync(cliPidFile)) {
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
+      for (const socket of new Set([undefined, managedSocket])) {
+        try { execFileSync('tmux', [...tmuxSocketArgs(socket), 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+      }
     }
     rmSync(root, { recursive: true, force: true });
   }
@@ -384,15 +414,19 @@ it(`never injects picker keys into a composer draft that starts with the menu ro
   60_000,
 );
 
-it(`does not hold input for a composer draft whose guidance text precedes the menu rows (${productionBackend})`,
-  () => runScenario({ backendType: productionBackend, fake: { paint: 'stream', banner: 'skeleton', picker: 'none', history: false, draft: 'guided' } }, async ctx => {
+it.skipIf(!tmuxAvailable)('protects a composer draft whose guidance text precedes the menu rows (tmux)',
+  () => runScenario({ backendType: 'tmux', fake: { paint: 'stream', banner: 'skeleton', picker: 'none', history: false, draft: 'guided' } }, async ctx => {
     await ctx.waitFor(() => ctx.events().includes('started'));
-    await ctx.waitFor(() => committed(ctx, 'om_test'));
-    expect(ctx.composerInput(), ctx.detail()).not.toMatch(/\x1b\[B|\x1bOB|\x1b\[A|\x1bOA/);
+    // Whichever check meets the draft first, the held write keeps re-checking
+    // the box and must keep finding the draft.
+    await ctx.waitFor(() => /Codex input box is not ready yet|Holding opening input|Codex has an existing draft/.test(ctx.logs.join(''))
+      || committed(ctx, 'om_test'));
+    await new Promise(r => setTimeout(r, 6_000));
+    expect(ctx.composerInput(), ctx.detail()).toBe('');
+    expect(committed(ctx, 'om_test'), ctx.detail()).toBe(false);
     expect(ctx.logs.join(''), ctx.detail()).not.toContain('Codex model-migration picker');
     expect(unresolvedNotices(ctx), ctx.detail()).toEqual([]);
-    expect(submissions(ctx), ctx.detail()).toHaveLength(1);
-    expect(submissions(ctx)[0]!.match(new RegExp(FIRST_PROMPT, 'g')), ctx.detail()).toHaveLength(1);
+    expect(submissions(ctx), ctx.detail()).toEqual([]);
   }),
   60_000,
 );

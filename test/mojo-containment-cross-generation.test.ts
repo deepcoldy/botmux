@@ -28,7 +28,6 @@ import {
     acquireContainmentHandle,
     containmentHandles,
     hasUnprovenContainment,
-    inheritContainmentHandles,
     proveContainmentQuiescent,
     recordContainmentHandle,
     releaseContainmentHandle,
@@ -132,11 +131,11 @@ describe.skipIf(!LINUX)('a real escaped descendant survives generation replaceme
         // Generation 2 / a restarted daemon: nothing in memory, only the store.
         // This is the read that used to return "no subtree" and let the close pass.
         expect(hasUnprovenContainment('sess-xgen', dataDir)).toBe(true);
-        const inherited = inheritContainmentHandles('sess-xgen', 2, dataDir);
-        expect(inherited).toHaveLength(1);
+        const stored = containmentHandles('sess-xgen', dataDir);
+        expect(stored).toHaveLength(1);
 
-        // And the inherited handle really does still see the live process.
-        const verdict = proveContainmentQuiescent(inherited[0], { scan: realScan });
+        // And the stored handle really does still see the live process.
+        const verdict = proveContainmentQuiescent(stored[0], { scan: realScan });
         expect(verdict.proven).toBe(false);
         if (!verdict.proven) expect(verdict.residualPids ?? []).toContain(escapedPid);
 

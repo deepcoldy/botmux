@@ -12,6 +12,8 @@ import {
   procStatFieldsAfterComm,
   procStatStartTimeDigits,
 } from '../utils/proc-stat.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
+import { logger } from '../utils/logger.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -58,10 +60,6 @@ export function snapshotProcessIdentities(
   return identities.length > 0 ? identities.sort() : undefined;
 }
 
-function isLoopbackAddress(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-}
-
 function peerSocketInodes(procRoot: string, clientPort: number, serverPort: number): Set<string> | undefined {
   const out = new Set<string>();
   let tableRead = false;
@@ -85,15 +83,151 @@ function peerSocketInodes(procRoot: string, clientPort: number, serverPort: numb
   return tableRead ? out : undefined;
 }
 
+/**
+ * Socket-holder scan over the whole host, time-sliced and shared.
+ *
+ * Mapping a socket inode to its process means reading every process's fd
+ * table: on a busy multi-user host that is ~2k processes and ~100k fds, a few
+ * hundred milliseconds of synchronous syscalls (much more on slower hosts).
+ * Done in one go it froze the daemon's event loop for that long on every
+ * execution-identity request, so health checks, card updates and outbound
+ * requests (the platform credential grant among them) all stalled behind it.
+ *
+ * The scan still has to cover the whole host: the peer must be the ONLY holder
+ * of the socket (an fd passed to or inherited by another process makes the
+ * caller ambiguous), and a registered background job may sit outside every
+ * session's process tree. So instead of narrowing it, the scan
+ *  - yields to the event loop every {@link PEER_SCAN_SLICE_MS} of work;
+ *  - serves every request queued when a pass starts from that one pass
+ *    (a later request waits for the next pass, which re-reads every table);
+ *  - fails closed past {@link PEER_SCAN_BUDGET_MS}.
+ */
+export const PEER_SCAN_SLICE_MS = 4;
+export const PEER_SCAN_BUDGET_MS = 5_000;
+
+interface PeerScanJob {
+  needle: string;
+  /** Start time read at the moment the fd was seen (undefined: unreadable). */
+  holders: Array<{ pid: number; procStart: string | undefined }>;
+  resolve: (holders: PeerScanJob['holders'] | undefined) => void;
+}
+
+interface PeerScanQueue { jobs: PeerScanJob[]; running: boolean }
+const peerScanQueues = new Map<string, PeerScanQueue>();
+
+/** @internal test seam: slice/budget overrides (production uses the defaults). */
+export interface PeerScanTuning { sliceMs?: number; budgetMs?: number; onYield?: () => void }
+
+const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+
+type PeerScanOutcome = 'completed' | 'budget_exceeded' | 'scan_failed';
+
+async function runPeerScanPass(procRoot: string, jobs: PeerScanJob[], tuning: PeerScanTuning): Promise<PeerScanOutcome> {
+  const sliceMs = tuning.sliceMs ?? PEER_SCAN_SLICE_MS;
+  const budgetMs = tuning.budgetMs ?? PEER_SCAN_BUDGET_MS;
+  let entries: string[];
+  try { entries = readdirSync(procRoot); } catch { return 'scan_failed'; }
+  const byNeedle = new Map<string, PeerScanJob[]>();
+  for (const job of jobs) {
+    const list = byNeedle.get(job.needle);
+    if (list) list.push(job); else byNeedle.set(job.needle, [job]);
+  }
+  const started = Date.now();
+  let sliceStart = started;
+  let sinceCheck = 0;
+  /** Yield once the current slice is used up; false when the budget is gone.
+   *  Checked per fd as well as per process: one process can hold tens of
+   *  thousands of fds (seen: 73k), a few hundred ms on its own. */
+  const keepGoing = async (): Promise<boolean> => {
+    if (++sinceCheck < 64 && sliceMs > 0) return true;
+    sinceCheck = 0;
+    if (Date.now() - sliceStart < sliceMs) return true;
+    tuning.onYield?.();
+    await yieldToEventLoop();
+    if (Date.now() - started > budgetMs) return false;
+    sliceStart = Date.now();
+    return true;
+  };
+  for (const entry of entries) {
+    if (!await keepGoing()) return 'budget_exceeded';
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    // One listing per process is a single syscall batch (~50ms for the 73k-fd
+    // outlier above); Bun's Dir.readSync buffers the whole listing too, so a
+    // streamed read would not split it further.
+    let fds: string[];
+    try { fds = readdirSync(join(procRoot, entry, 'fd')); } catch { continue; }
+    let matched: Set<string> | undefined;
+    for (const fd of fds) {
+      if (!await keepGoing()) return 'budget_exceeded';
+      let link: string;
+      try { link = readlinkSync(join(procRoot, entry, 'fd', fd)); } catch { continue; /* raced away */ }
+      if (!byNeedle.has(link) || matched?.has(link)) continue;
+      (matched ??= new Set()).add(link);
+      // Pin the identity now: the scan spans many event-loop turns, and a pid
+      // read only at the end could already belong to a different process.
+      const procStart = readProcStart(pid, procRoot);
+      for (const job of byNeedle.get(link)!) job.holders.push({ pid, procStart });
+    }
+  }
+  return 'completed';
+}
+
+function scanSocketHolders(procRoot: string, inode: string, tuning: PeerScanTuning): Promise<PeerScanJob['holders'] | undefined> {
+  let queue = peerScanQueues.get(procRoot);
+  if (!queue) { queue = { jobs: [], running: false }; peerScanQueues.set(procRoot, queue); }
+  const q = queue;
+  const done = new Promise<PeerScanJob['holders'] | undefined>(resolve => {
+    q.jobs.push({ needle: `socket:[${inode}]`, holders: [], resolve });
+  });
+  if (!q.running) {
+    q.running = true;
+    void (async () => {
+      try {
+        // A pass runs with the tuning of whichever request started it; requests
+        // coalesced into that pass share it. Production callers never pass
+        // scanTuning, so it only differs via the internal test seam.
+        while (q.jobs.length > 0) {
+          const jobs = q.jobs.splice(0);
+          let outcome: PeerScanOutcome = 'scan_failed';
+          try { outcome = await runPeerScanPass(procRoot, jobs, tuning); } catch { outcome = 'scan_failed'; }
+          // One log line per batch, with a distinct reason: a procfs read error
+          // is not a timeout, and N coalesced jobs must not log N identical lines.
+          if (outcome !== 'completed') {
+            const budget = tuning.budgetMs ?? PEER_SCAN_BUDGET_MS;
+            logger.warn(outcome === 'budget_exceeded'
+              ? `[current-actor] socket owner scan exceeded ${budget}ms; refusing ${jobs.length} request(s)`
+              : `[current-actor] socket owner scan failed while reading procfs; refusing ${jobs.length} request(s)`);
+          }
+          for (const job of jobs) job.resolve(outcome === 'completed' ? job.holders : undefined);
+        }
+      } finally {
+        q.running = false;
+        if (q.jobs.length === 0) peerScanQueues.delete(procRoot);
+      }
+    })();
+  }
+  return done;
+}
+
 /** Resolve the process that owns the client half of one live loopback TCP request. */
-export function resolveLoopbackPeerProcesses(input: {
+export async function resolveLoopbackPeerProcesses(input: {
   remoteAddress?: string;
   remotePort?: number;
   localPort?: number;
   procRoot?: string;
-}): LoopbackPeerResolution {
+  /** @internal test seam */
+  scanTuning?: PeerScanTuning;
+}): Promise<LoopbackPeerResolution> {
   const procRoot = input.procRoot ?? '/proc';
-  if (!isLoopbackAddress(input.remoteAddress)) return { ok: false, reason: 'not_loopback' };
+  // First ring: the peer address must be local (default loopback set, plus
+  // BOTMUX_LOOPBACK_PEERS for hosts whose kernel reports a same-machine peer
+  // as a LAN IP). This is NOT the trust boundary by itself: a remote peer can
+  // never produce a client-side row in THIS host's /proc/net/tcp, so the
+  // socket-inode → fd → process lineage resolution below still pins the peer
+  // to a local process. Relaxing the address ring only stops a local peer with
+  // a non-standard reported address from failing before that resolution.
+  if (!isLoopbackPeer(input.remoteAddress)) return { ok: false, reason: 'not_loopback' };
   if (procRoot === '/proc' && process.platform !== 'linux') {
     return { ok: false, reason: 'platform_unsupported' };
   }
@@ -104,40 +238,21 @@ export function resolveLoopbackPeerProcesses(input: {
   const inodes = peerSocketInodes(procRoot, input.remotePort, input.localPort);
   if (!inodes || inodes.size !== 1) return { ok: false, reason: 'peer_unresolved' };
   const inode = [...inodes][0];
-  const needle = `socket:[${inode}]`;
-  let entries: string[];
-  try { entries = readdirSync(procRoot); } catch { return { ok: false, reason: 'peer_unresolved' }; }
-  const peers: ProcessIdentity[] = [];
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    let fds: string[];
-    try { fds = readdirSync(join(procRoot, entry, 'fd')); } catch { continue; }
-    let ownsSocket = false;
-    for (const fd of fds) {
-      try {
-        if (readlinkSync(join(procRoot, entry, 'fd', fd)) === needle) {
-          ownsSocket = true;
-          break;
-        }
-      } catch { /* process/fd raced away */ }
-    }
-    if (!ownsSocket) continue;
-    const procStart = readProcStart(pid, procRoot);
-    if (procStart) peers.push({ pid, procStart });
-  }
-  return peers.length === 1
-    ? { ok: true, peer: peers[0] }
-    : { ok: false, reason: 'peer_unresolved' };
+  const holders = await scanSocketHolders(procRoot, inode, input.scanTuning ?? {});
+  if (!holders) return { ok: false, reason: 'peer_unresolved' };
+  // Exactly one holder, whose start time can be read: anything else is ambiguous.
+  const [holder] = holders;
+  if (holders.length !== 1 || !holder?.procStart) return { ok: false, reason: 'peer_unresolved' };
+  return { ok: true, peer: { pid: holder.pid, procStart: holder.procStart } };
 }
 
 /** Codex keeps its native tool dispatcher alive across turns. It is part of
  * the attested engine, not an old user command. Never recognize it from argv
  * alone: require a direct attested Codex parent and the release sibling exe. */
 function isNativeCodexToolHost(
-  pid: number, parent: number, procRoot: string, trustedRootPids: ReadonlySet<number>,
+  pid: number, parent: number, procRoot: string, trustedRootPids: ReadonlySet<number>, codexCli: boolean,
 ): boolean {
-  if (!trustedRootPids.has(parent)) return false;
+  if (!trustedRootPids.has(parent) && !(codexCli && isNativeCodexProcess(parent, procRoot, trustedRootPids))) return false;
   try {
     const parentExe = readlinkSync(join(procRoot, String(parent), 'exe'));
     const hostExe = readlinkSync(join(procRoot, String(pid), 'exe'));
@@ -151,35 +266,68 @@ function isNativeCodexToolHost(
   }
 }
 
+/** In a Codex session whose CLI root is a launcher above the native Codex
+ * binary, the binary is a pre-existing child of the trusted root and a new tool
+ * descends from it. Only a Codex session's root can have that child: under any
+ * other CLI a direct child named `codex` is an old tool. A root that is itself
+ * the native binary never vouches for a nested codex. The App-mode
+ * `codex app-server` engine is excluded: it must be attested by signed state
+ * before its tools count. */
+function isNativeCodexProcess(
+  pid: number, procRoot: string, trustedRootPids: ReadonlySet<number>,
+): boolean {
+  try {
+    const fields = procStatFieldsAfterComm(readFileSync(join(procRoot, String(pid), 'stat'), 'utf8'));
+    const argv = readFileSync(join(procRoot, String(pid), 'cmdline'), 'utf8').split('\0');
+    const parent = Number(fields?.[1]);
+    return !!fields && trustedRootPids.has(parent)
+      && argv[1] !== 'app-server'
+      && basename(readlinkSync(join(procRoot, String(parent), 'exe'))) !== 'codex'
+      && basename(readlinkSync(join(procRoot, String(pid), 'exe'))) === 'codex';
+  } catch {
+    return false;
+  }
+}
+
 function peerBelongsToCurrentTurn(input: {
   peer: ProcessIdentity;
   trustedRootPids: ReadonlySet<number>;
   procRoot: string;
   preexistingProcessIdentities: ReadonlySet<string>;
+  /** The session runs the Codex CLI. */
+  codexCli: boolean;
+  onRefusal?: (reason: string) => void;
 }): boolean {
-  if (input.procRoot === '/proc' && process.platform !== 'linux') return false;
+  const stop = (reason: string) => { input.onRefusal?.(`lineage walk stopped: ${reason}`); return false; };
+  if (input.procRoot === '/proc' && process.platform !== 'linux') return stop('platform unsupported');
   let pid = input.peer.pid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     if (input.trustedRootPids.has(pid)) return true;
     try {
-      const fields = procStatFieldsAfterComm(readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8'));
-      if (!fields) return false;
+      const stat = readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8');
+      const comm = () => JSON.stringify(stat.slice(stat.indexOf('(') + 1, stat.lastIndexOf(')')));
+      const fields = procStatFieldsAfterComm(stat);
+      if (!fields) return stop(`pid ${pid} has an unparseable stat`);
       const parent = Number(fields[1]);
       const started = fields[PROC_STAT_STARTTIME_INDEX];
-      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return false;
+      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return stop(`pid ${pid} comm ${comm()} has an invalid parent or start time`);
       if (input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
-        // Only traverse the native dispatcher as an ancestor of a new tool.
-        // It cannot itself claim this turn, nor can old tool descendants.
-        if (pid === input.peer.pid
-          || !isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids)
-          || readProcStart(pid, input.procRoot) !== started) return false;
+        // Only traverse the native dispatcher or the native Codex binary as an
+        // ancestor of a new tool. Neither can itself claim this turn, nor can
+        // old tool descendants.
+        if (pid === input.peer.pid) return stop(`pid ${pid} comm ${comm()} is the peer itself and was pre-existing`);
+        if (!isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids, input.codexCli)
+          && !(input.codexCli && isNativeCodexProcess(pid, input.procRoot, input.trustedRootPids))) {
+          return stop(`pid ${pid} comm ${comm()} was pre-existing and is not ${input.codexCli ? 'a native Codex process under a trusted root' : 'the native Codex tool host (the session does not run the Codex CLI)'}`);
+        }
+        if (readProcStart(pid, input.procRoot) !== started) return stop(`pid ${pid} comm ${comm()} changed start time`);
       }
       pid = parent;
     } catch {
-      return false;
+      return stop(`pid ${pid} is unreadable`);
     }
   }
-  return false;
+  return stop(`no trusted root reached, ended at pid ${pid}`);
 }
 
 export type CurrentActorDaemonResult =
@@ -213,6 +361,11 @@ export interface CurrentTurnPeerAttestationInput {
   findSession: (sessionId: string) => DaemonSession | undefined;
   procRoot?: string;
   expectedScheduledTurnId?: string;
+  /** Receives the check that refused the proof; for operator logs only. */
+  onRefusal?: (reason: string) => void;
+  /** Current-actor only: let the daemon's live ownerless-child tool actor
+   * satisfy the human caller requirement without promoting workflow authority. */
+  allowScheduledToolActor?: boolean;
 }
 
 /**
@@ -243,29 +396,46 @@ export function attestCurrentExecutionLoopbackPeer(
   const scheduledCaller = input.expectedScheduledTurnId
     ? ds?.scheduledTurnCallers?.get(input.expectedScheduledTurnId)
     : undefined;
-  if (!ds || ds.session.status !== 'active'
-    || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
-    || !turnId || generation === undefined
-    || !workerPid || !workerProcStart || ds.worker?.killed === true
-    || attestation?.workerGeneration !== generation
-    || ((cliPid === undefined) !== (cliProcStart === undefined))
+  const scheduledToolActor = input.allowScheduledToolActor && turnId
+    ? ds?.scheduledToolActors?.get(turnId)
+    : undefined;
+  const expectedScheduledToolActor = input.allowScheduledToolActor && input.expectedScheduledTurnId
+    ? ds?.scheduledToolActors?.get(input.expectedScheduledTurnId)
+    : undefined;
+  const attestedCallerOpenId = callerOpenId ?? scheduledToolActor?.openId;
+  const expectedScheduledCallerOpenId = scheduledCaller?.requestUserOpenId
+    ?? expectedScheduledToolActor?.openId;
+  const refuse = (reason: string): null => { input.onRefusal?.(reason); return null; };
+  if (!ds) return refuse('no session');
+  if (ds.session.status !== 'active') return refuse('session not active');
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })) return refuse('lark transport disabled');
+  if (!turnId || generation === undefined) return refuse('no live turn');
+  if (!workerPid || !workerProcStart || ds.worker?.killed === true) return refuse('worker not live');
+  if (attestation?.workerGeneration !== generation) {
+    return refuse(`attestation generation mismatch (attested ${attestation?.workerGeneration}, live ${generation})`);
+  }
+  if (((cliPid === undefined) !== (cliProcStart === undefined))
     || ((enginePid === undefined) !== (engineProcStart === undefined))
-    || (cliPid === undefined && enginePid === undefined)
-    || !processIdentities || processIdentities.length === 0
-    || !capability
-    || (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0))
-    || (cliPid !== undefined
-      && readProcStart(cliPid, procRoot) !== cliProcStart)
-    || (enginePid !== undefined
-      && readProcStart(enginePid, procRoot) !== engineProcStart)) {
-    return null;
+    || (cliPid === undefined && enginePid === undefined)) {
+    return refuse('no complete cli or engine attestation');
+  }
+  if (!processIdentities || processIdentities.length === 0) return refuse('no turn snapshot');
+  if (!capability) return refuse('no capability');
+  if (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0)) {
+    return refuse('invalid dispatch attempt');
+  }
+  if (cliPid !== undefined && readProcStart(cliPid, procRoot) !== cliProcStart) {
+    return refuse(`cli pid ${cliPid} start mismatch`);
+  }
+  if (enginePid !== undefined && readProcStart(enginePid, procRoot) !== engineProcStart) {
+    return refuse(`engine pid ${enginePid} start mismatch`);
   }
   if (input.expectedScheduledTurnId
     && (!parseScheduledTurnId(input.expectedScheduledTurnId)
       || turnId !== input.expectedScheduledTurnId
-      || !scheduledCaller
-      || scheduledCaller.requestUserOpenId !== callerOpenId)) {
-    return null;
+      || !expectedScheduledCallerOpenId
+      || expectedScheduledCallerOpenId !== attestedCallerOpenId)) {
+    return refuse('scheduled caller mismatch');
   }
   const preexistingProcessIdentities = new Set(processIdentities);
   // The worker reports both roots over its private IPC channel. Binding each
@@ -277,15 +447,20 @@ export function attestCurrentExecutionLoopbackPeer(
     ...(cliPid !== undefined ? [cliPid] : []),
     ...(enginePid !== undefined ? [enginePid] : []),
   ]);
+  const roots = `trusted roots ${[...trustedRootPids].join(',')}`;
   if (!peerBelongsToCurrentTurn({
-      peer: input.peer, trustedRootPids, procRoot,
-      preexistingProcessIdentities,
-    })
-    || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+    peer: input.peer, trustedRootPids, procRoot,
+    preexistingProcessIdentities,
+    codexCli: (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) === 'codex',
+    onRefusal: reason => input.onRefusal?.(`${reason}; ${roots}`),
+  })) {
     return null;
   }
+  if (readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+    return refuse(`peer pid ${input.peer.pid} start mismatch; ${roots}`);
+  }
   return {
-    ds, turnId, generation, callerOpenId, capability,
+    ds, turnId, generation, callerOpenId: attestedCallerOpenId, capability,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     workerPid, workerProcStart, cliPid, cliProcStart, enginePid, engineProcStart,
     ...(input.expectedScheduledTurnId
@@ -295,8 +470,10 @@ export function attestCurrentExecutionLoopbackPeer(
   };
 }
 
-/** Human identity remains a separate requirement for actor and authorization
- * callers. Machine-triggered executions can prove their lineage without it. */
+/** Human identity remains a separate requirement for actor callers. An
+ * ownerless schedule child may satisfy it only through its exact-turn,
+ * daemon-owned tool-actor entry; that entry is not workflow authority.
+ * Machine-triggered executions can otherwise prove lineage without a human. */
 export function attestCurrentTurnLoopbackPeer(
   input: CurrentTurnPeerAttestationInput,
 ): CurrentTurnPeerAttestation | null {
@@ -309,10 +486,10 @@ export function attestCurrentTurnLoopbackPeer(
  *  one an earlier attestation froze, so an await in between cannot smuggle in a
  *  rotated turn, replaced worker, or changed sender. */
 export function currentTurnPeerAttestationStable(
-  frozen: CurrentTurnPeerAttestation,
+  frozen: CurrentExecutionPeerAttestation,
   input: CurrentTurnPeerAttestationInput,
 ): boolean {
-  const again = attestCurrentTurnLoopbackPeer(input);
+  const again = attestCurrentExecutionLoopbackPeer(input);
   return !!again
     && again.ds === frozen.ds && again.turnId === frozen.turnId
     && again.generation === frozen.generation && again.callerOpenId === frozen.callerOpenId
@@ -339,6 +516,7 @@ export async function resolveDaemonCurrentActor(input: {
   const attestInput = {
     sessionId: input.sessionId, peer: input.peer,
     findSession: input.findSession, procRoot,
+    allowScheduledToolActor: true,
     ...(input.expectedScheduledTurnId
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),

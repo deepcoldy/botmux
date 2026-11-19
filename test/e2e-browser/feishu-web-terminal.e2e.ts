@@ -8,13 +8,7 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   testMessage,
   expectedReplyMarker,
   sendMessage,
@@ -22,10 +16,10 @@ import {
   waitForCardStatus,
   waitForModelTextReply,
   showStreamingOutput,
-  navigateToMessenger,
+  reopenTopic,
   openChat,
-  closeSession,
 } from './helpers.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   describe('feishu web terminal', () => {
@@ -35,25 +29,11 @@ export function registerMidsceneSuites(): void {
     let agent: PlaywrightAgent;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error(
-          'storageState.json not found. Run: pnpm test:e2e-browser:setup',
-        );
-      }
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openChat(page, agent, 'Claude');
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openChat(p, a, 'Claude')));
     }, 90_000);
 
     afterAll(async () => {
-      await closeSession(agent, page);
-      await agent?.destroy();
-      await context?.close();
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: false });
     });
 
     it('web terminal opens from the current streaming card', async () => {
@@ -73,7 +53,7 @@ export function registerMidsceneSuites(): void {
       });
 
       // Show output so the test covers the current display toggle labels.
-      await showStreamingOutput(agent, page);
+      await showStreamingOutput(agent, page, { reopen: reopenTopic(agent, page, msg) });
 
       // Scroll down in thread panel to reveal card buttons below expanded content
       await agent.aiAct('滚动当前话题详情面板到底部，显示流式卡片下方的操作按钮');

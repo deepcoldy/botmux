@@ -6,6 +6,8 @@ type Props = {
   chatId: string;
   appId: string;
   botName: string;
+  /** 可见标题；按 bot 分栏展示时传设置名，缺省显示 botName。 */
+  label?: string;
   settings?: GroupIdleCloseSettings;
   disabled?: boolean;
   onSaved(): Promise<unknown>;
@@ -72,7 +74,7 @@ export function GroupIdleCloseRow(props: Props) {
       <input type="checkbox" role="switch" checked={enabled} disabled={disabled}
         onChange={event => { setEnabled(event.currentTarget.checked); markDirty(); }} />
       <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx"><strong>{props.botName}</strong></span>
+      <span className="toggle-tx"><strong>{props.label ?? props.botName}</strong></span>
     </label>
     <div className="group-idle-close-controls">
       <label htmlFor={`${id}-duration`}>{tr('groups.idleCloseDuration')}</label>

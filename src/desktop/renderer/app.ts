@@ -101,14 +101,23 @@ const desktopShellInjectedCss = `
   .attention-strip {
     margin-top: 0 !important;
   }
+
+  .chrome-body {
+    /* The browser layout gets its left gutter from .workspace's margin-left
+       (sidebar + gap), which is zeroed above; give the content the same gutter
+       the right edge already has so pages do not sit flush on the rail. */
+    padding-left: var(--chrome-x) !important;
+  }
 `;
 const messages: Record<DesktopLocale, Record<string, string>> = {
   zh: {
     'app.subtitle': '飞书 AI CLI 控制台',
     'nav.overview': '总览',
     'nav.sessions': '会话',
+    'nav.decisionBoard': '决策看板',
     'nav.workbench': '驾驶舱',
     'nav.insights': '洞察',
+    'nav.usage': 'Token 用量',
     'nav.workflows': '工作流',
     'nav.groups': '群组',
     'nav.monitoring': '监控看板',
@@ -120,7 +129,8 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'nav.botDefaults': 'Bot 配置',
     'nav.agents': 'Agent',
     'nav.skills': 'Skills',
-    'nav.team': '团队',
+    'nav.customization': '自定义',
+    'nav.feedback': '反馈分析',
     'nav.connectors': 'Webhook',
     'nav.settings': '设置',
     'summary.onlineDaemons': '在线 Daemon',
@@ -193,8 +203,10 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': 'Feishu AI CLI Control',
     'nav.overview': 'Overview',
     'nav.sessions': 'Sessions',
+    'nav.decisionBoard': 'Decision board',
     'nav.workbench': 'Cockpit',
     'nav.insights': 'Insight',
+    'nav.usage': 'Token usage',
     'nav.workflows': 'Workflows',
     'nav.groups': 'Groups',
     'nav.monitoring': 'Monitoring',
@@ -206,7 +218,8 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'nav.botDefaults': 'Bot Profiles',
     'nav.agents': 'Agents',
     'nav.skills': 'Skills',
-    'nav.team': 'Team',
+    'nav.customization': 'Customization',
+    'nav.feedback': 'Feedback',
     'nav.connectors': 'Webhook',
     'nav.settings': 'Settings',
     'summary.onlineDaemons': 'Online daemons',

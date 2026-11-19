@@ -8,7 +8,9 @@ let dir: string; let cfg: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'cfgstore-'));
   cfg = join(dir, 'bots.json');
-  writeFileSync(cfg, JSON.stringify([{ larkAppId: 'a1', allowedUsers: ['ou_x'] }], null, 2), { mode: 0o600 });
+  // The atomic-write guard now also runs the same full parse the daemon loader
+  // uses, so the mechanics fixture must itself be a loadable generation.
+  writeFileSync(cfg, JSON.stringify([{ larkAppId: 'a1', larkAppSecret: 's', allowedUsers: ['ou_x'] }], null, 2), { mode: 0o600 });
 });
 afterEach(() => {
   vi.unstubAllEnvs();

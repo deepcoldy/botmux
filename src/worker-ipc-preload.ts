@@ -1,4 +1,5 @@
 import type { EventEmitter } from 'node:events';
+import { isOrdinaryImTurnId } from './core/ordinary-im-turn.js';
 
 export const WORKER_IPC_HANDLER_READY_EVENT = 'botmux:worker-ipc-handler-ready';
 
@@ -45,18 +46,18 @@ export function waitForWorkerIpcPreloadMessage(
 function ordinaryColdStartTurnId(raw: unknown): string | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const message = raw as Record<string, unknown>;
+  const turnId = typeof message.turnId === 'string' ? message.turnId : undefined;
   if (
     message.type !== 'init'
     || message.adoptMode === true
     || message.dispatchAttempt !== undefined
     || typeof message.prompt !== 'string'
     || message.prompt.length === 0
-    || typeof message.turnId !== 'string'
-    || !message.turnId.startsWith('om_')
+    || !isOrdinaryImTurnId(turnId)
   ) {
     return undefined;
   }
-  return message.turnId;
+  return turnId;
 }
 
 /**
@@ -82,7 +83,12 @@ export function installWorkerIpcPreload(host: IpcHost): void {
     }
     bufferedMessages.push(raw);
     const turnId = ordinaryColdStartTurnId(raw);
-    if (turnId) host.send?.({ type: 'turn_input_received', turnId });
+    // Contract-enabled boots need the worker's single envelope sequencer and
+    // admitted execution identity. Replay after it initializes instead of
+    // publishing an unscoped receipt the daemon necessarily rejects.
+    if (turnId && !(raw as Record<string, unknown>).sessionContract) {
+      host.send?.({ type: 'turn_input_received', turnId });
+    }
   };
 
   host.prependListener('message', bufferMessage);

@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
@@ -13,7 +13,7 @@ import ts from 'typescript';
  * protocol/hostname，脚本照样 exit 0。
  *
  * 这份测试盯的是那条根因修复本身能不能被悄悄拆掉：
- *   ① `tsconfig.scripts.json` 解析出来的**文件集合**必须真的覆盖磁盘上每一个
+ *   ① `tsconfig.typecheck.json` 解析出来的**文件集合**必须真的覆盖磁盘上每一个
  *      `scripts/**\/*.ts(x)`（光断言 include 字符串没用——exclude 或 files 一样能把
  *      文件踢出程序）；
  *   ② 它必须继承生产那套 strict 规则、且不产出编译结果；
@@ -22,7 +22,7 @@ import ts from 'typescript';
 
 const repoRoot = process.cwd();
 const scriptsDir = join(repoRoot, 'scripts');
-const configPath = join(repoRoot, 'tsconfig.scripts.json');
+const configPath = join(repoRoot, 'tsconfig.typecheck.json');
 
 /** 磁盘上所有会被 tsc 处理的脚本源文件（含 fixtures 子目录）。 */
 function scriptSourceFiles(dir: string): string[] {
@@ -41,14 +41,14 @@ function scriptSourceFiles(dir: string): string[] {
 
 function parsedScriptsConfig(): ts.ParsedCommandLine {
   const read = ts.readConfigFile(configPath, path => readFileSync(path, 'utf8'));
-  expect(read.error, `tsconfig.scripts.json 读不出来：${JSON.stringify(read.error)}`).toBeUndefined();
+  expect(read.error, `tsconfig.typecheck.json 读不出来：${JSON.stringify(read.error)}`).toBeUndefined();
   const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, repoRoot, undefined, configPath);
   expect(parsed.errors.filter(error => error.category === ts.DiagnosticCategory.Error)).toEqual([]);
   return parsed;
 }
 
 describe('scripts/ 纳入类型检查', () => {
-  it('tsconfig.scripts.json 的程序覆盖每一个 scripts 源文件', () => {
+  it('tsconfig.typecheck.json 的程序覆盖每一个 scripts 源文件', () => {
     const parsed = parsedScriptsConfig();
     const covered = new Set(parsed.fileNames.map(file => relative(repoRoot, file)));
     const onDisk = scriptSourceFiles(scriptsDir).map(file => relative(repoRoot, file));
@@ -59,10 +59,6 @@ describe('scripts/ 纳入类型检查', () => {
 
     const missing = onDisk.filter(file => !covered.has(file));
     expect(missing, `这些脚本没进类型检查程序：${missing.join(', ')}`).toEqual([]);
-    // 只该覆盖 scripts/，不该顺手把 src/ 或 test/ 拖进来（那是别的配置的职责）。
-    for (const file of covered) {
-      expect(file.startsWith(`scripts${sep}`), `不属于 scripts/ 的文件混进来了：${file}`).toBe(true);
-    }
   });
 
   it('沿用生产的 strict 规则，且只检查不产出', () => {
@@ -78,7 +74,7 @@ describe('scripts/ 纳入类型检查', () => {
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
       scripts: Record<string, string>;
     };
-    expect(pkg.scripts['typecheck:scripts']).toContain('tsconfig.scripts.json');
-    expect(pkg.scripts.build).toContain('typecheck:scripts');
+    expect(pkg.scripts.typecheck).toContain('tsconfig.typecheck.json');
+    expect(pkg.scripts.build).toContain('bun run typecheck &&');
   });
 });

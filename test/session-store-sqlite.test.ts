@@ -10,7 +10,7 @@
  * Run:  bunx vitest run test/session-store-sqlite.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'fs';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'path';
@@ -53,8 +53,12 @@ import {
   applySessionCommandUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
+  listActiveSessionIdsAcrossStores,
   listSessionsStrict,
+  readSessionsByRoots,
+  findActiveSessionIdByCliSessionId,
   SessionStoreSqliteUnavailableError,
+  SessionStoreUnmigratedError,
 } from '../src/services/session-store.js';
 import {
   readPersistedSessionRows,
@@ -179,6 +183,22 @@ describe('first-start JSON import', () => {
     init('appA');
     expect(getSession('s1')?.status).toBe('closed');
     expect(JSON.parse(readFileSync(jsonFp, 'utf-8')).s1.status).toBe('active');
+  });
+
+  it('closeSession removes the session\'s skill manifest and runtime-skills snapshot (sibling sessions untouched)', () => {
+    seedJson('sessions-appA.json', { s1: row('s1'), s2: row('s2') });
+    init('appA');
+    for (const sid of ['s1', 's2']) {
+      mkdirSync(join(tempDir, 'skill-manifests'), { recursive: true });
+      writeFileSync(join(tempDir, 'skill-manifests', `${sid}.json`), '{}');
+      mkdirSync(join(tempDir, 'runtime-skills', sid, 'snapshot', 'deploy'), { recursive: true });
+      writeFileSync(join(tempDir, 'runtime-skills', sid, 'snapshot', 'deploy', 'SKILL.md'), '# Deploy');
+    }
+    closeSession('s1');
+    expect(existsSync(join(tempDir, 'skill-manifests', 's1.json'))).toBe(false);
+    expect(existsSync(join(tempDir, 'runtime-skills', 's1'))).toBe(false);
+    expect(existsSync(join(tempDir, 'skill-manifests', 's2.json'))).toBe(true);
+    expect(existsSync(join(tempDir, 'runtime-skills', 's2', 'snapshot', 'deploy', 'SKILL.md'))).toBe(true);
   });
 
   it('publishes the store atomically: no .db.tmp survives, and stale tmp leftovers are replaced', () => {
@@ -524,5 +544,248 @@ describe('SQLite capability gate', () => {
     expect(copies.matches).toHaveLength(1);
     expect(copies.unreadableStores).toBe(1);
     expect(copies.matches[0]?.title).toBe('other-bot');
+  });
+});
+
+// ─── 跨 bot 共享树清扫的保护集合 ─────────────────────────────────────────────
+
+describe('listActiveSessionIdsAcrossStores', () => {
+  const noKnownBots = () => new Set<string>();
+
+  it('unions the active rows of every bot store and leaves closed rows out', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      a1: row('a1'),
+      aClosed: row('aClosed', { status: 'closed' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      b1: row('b1'),
+      bClosed: row('bClosed', { status: 'closed' }),
+    });
+
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })].sort())
+      .toEqual(['a1', 'b1']);
+  });
+
+  it('is empty before any store exists', () => {
+    expect(listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }).size).toBe(0);
+  });
+
+  it('throws when one store cannot be read instead of returning the rest', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })).toThrow();
+  });
+
+  it('throws while a bot that still exists has not imported its JSON store', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    seedJson('sessions-appA.json', { a1: row('a1') });
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appA']) }))
+      .toThrow(SessionStoreUnmigratedError);
+  });
+
+  it('ignores the leftover JSON store of a bot removed from this machine', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    seedJson('sessions-gone.json', { g1: row('g1') });
+
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appB']) })])
+      .toEqual(['b1']);
+  });
+
+  it('propagates a missing SQLite engine', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    __testOnly_setSqliteUnavailable(true);
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }))
+      .toThrow(SessionStoreSqliteUnavailableError);
+  });
+});
+
+describe('readSessionsByRoots (dispatch task-tree narrow read)', () => {
+  const PROJECTION = ['sessionId', 'larkAppId', 'rootMessageId', 'status'] as const;
+  const project = (sessions: Array<Record<string, unknown>>) =>
+    Object.fromEntries(sessions
+      .filter(s => typeof s.sessionId === 'string')
+      .map(s => [s.sessionId, Object.fromEntries(PROJECTION.map(k => [k, s[k]]))]));
+
+  it('equals the full snapshot restricted to the roots on tree fields, including app-id backfill for column-less rows', () => {
+    // Two stores: active + closed, rows written WITHOUT larkAppId (as older
+    // versions did), plus rows for roots outside the query set.
+    seedPersistedSessionRows(tempDir, 'appA', {
+      aActive: row('aActive', { rootMessageId: 'om_r1', larkAppId: undefined }),
+      aClosed: row('aClosed', { rootMessageId: 'om_r1', status: 'closed', closedAt: '2026-02-01T00:00:00.000Z', larkAppId: undefined }),
+      aTwo: row('aTwo', { rootMessageId: 'om_r2', larkAppId: undefined }),
+      aOther: row('aOther', { rootMessageId: 'om_other', larkAppId: undefined }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      bClosed: row('bClosed', { rootMessageId: 'om_r3', status: 'closed', closedAt: '2026-02-02T00:00:00.000Z' }),
+      bOther: row('bOther', { rootMessageId: 'om_other' }),
+    });
+    const roots = new Set(['om_r1', 'om_r2', 'om_r3']);
+    const narrow = project(readSessionsByRoots(roots, { dataDir: tempDir }));
+    const snapshotSubset = project(
+      [...loadAllSessionsSnapshot({ dataDir: tempDir }).values()]
+        .filter(s => typeof s.rootMessageId === 'string' && roots.has(s.rootMessageId))
+        .map(s => s as unknown as Record<string, unknown>),
+    );
+    expect(narrow).toEqual(snapshotSubset);
+    expect(narrow).toEqual({
+      aActive: { sessionId: 'aActive', larkAppId: 'appA', rootMessageId: 'om_r1', status: 'active' },
+      aClosed: { sessionId: 'aClosed', larkAppId: 'appA', rootMessageId: 'om_r1', status: 'closed' },
+      aTwo: { sessionId: 'aTwo', larkAppId: 'appA', rootMessageId: 'om_r2', status: 'active' },
+      bClosed: { sessionId: 'bClosed', larkAppId: 'appB', rootMessageId: 'om_r3', status: 'closed' },
+    });
+  });
+
+  it('backfills the owning app id for a column-less row served from its own live in-memory store', () => {
+    // Seed before init so the row enters the in-memory map through
+    // readOwnStoreAllRows (which only JSON.parses, no backfill).
+    seedPersistedSessionRows(tempDir, 'appMem', {
+      memChild: row('memChild', { rootMessageId: 'om_m', larkAppId: undefined }),
+    });
+    init('appMem');
+    const [got] = readSessionsByRoots(new Set(['om_m']), { dataDir: tempDir });
+    expect(got).toMatchObject({ sessionId: 'memChild', larkAppId: 'appMem', rootMessageId: 'om_m', status: 'active' });
+  });
+
+  it('returns nothing for an empty root set or unknown roots', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { rootMessageId: 'om_r1' }) });
+    expect(readSessionsByRoots(new Set(), { dataDir: tempDir })).toEqual([]);
+    expect(readSessionsByRoots(new Set(['om_nope']), { dataDir: tempDir })).toEqual([]);
+  });
+});
+
+describe('findActiveSessionIdByCliSessionId (doubao sbox reverse lookup)', () => {
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'propagates an unsearchable peer directory instead of ignoring its duplicate owner',
+    () => {
+      seedPersistedSessionRows(tempDir, 'appA', {
+        s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+      });
+      seedPersistedSessionRows(tempDir, 'appB', {
+        s2: row('s2', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+      });
+      const peer = join(tempDir, 'session-stores', 'appB');
+      chmodSync(peer, 0);
+      try {
+        expect(() => findActiveSessionIdByCliSessionId({
+          cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+        })).toThrow();
+      } finally {
+        chmodSync(peer, 0o700);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32').each(['directory', 'database'])(
+    'propagates a dangling peer %s symlink instead of returning a partial inventory',
+    (kind) => {
+      seedPersistedSessionRows(tempDir, 'appA', {
+        s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+      });
+      const peer = join(tempDir, 'session-stores', 'appB');
+      if (kind === 'database') mkdirSync(peer);
+      symlinkSync(join(tempDir, 'missing'), kind === 'database' ? join(peer, 'sessions.db') : peer);
+      expect(() => findActiveSessionIdByCliSessionId({
+        cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+      })).toThrow();
+    },
+  );
+
+  it('ignores a legitimate peer directory that has not created a database yet', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    mkdirSync(join(tempDir, 'session-stores', 'appPending'));
+    expect(findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toBe('s1');
+  });
+
+  it('ignores a stray non-directory entry (e.g. a Finder .DS_Store) in every strict inventory', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    writeFileSync(join(tempDir, 'session-stores', '.DS_Store'), 'finder metadata');
+    expect(findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toBe('s1');
+    // The same strict listing backs the pre-existing fail-closed inventories.
+    expect([...listActiveSessionIdsAcrossStores(tempDir)]).toEqual(['s1']);
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies.matches.map(s => s.sessionId)).toEqual(['s1']);
+    expect(copies.unreadableStores).toBe(0);
+  });
+
+  it('maps a native id back to its unique active botmux session across stores', () => {
+    seedPersistedSessionRows(tempDir, 'appCaptureA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appCaptureB', {
+      s2: row('s2', { cliId: 'doubao', cliSessionId: '38450000000000002' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBe('s1');
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000002', dataDir: tempDir })).toBe('s2');
+  });
+
+  it('does not match rows of another cliId even with the same native id', () => {
+    seedPersistedSessionRows(tempDir, 'appCodex', {
+      c1: row('c1', { cliId: 'codex', cliSessionId: '38450000000000001' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBeUndefined();
+  });
+
+  it('fails closed when two active doubao sessions share the native id (misbinding)', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      s2: row('s2', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBeUndefined();
+  });
+
+  it('rejects an incomplete active inventory instead of silently dropping a malformed peer', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      s2: row('s2', { sessionId: null, cliId: 'doubao', cliSessionId: '38450000000000001' }),
+    });
+
+    expect(() => findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toThrow(/malformed active session row/);
+  });
+
+  it('propagates an unreadable store directory instead of treating it as an empty inventory', () => {
+    const dataDir = join(tempDir, 'unreadable-inventory');
+    mkdirSync(dataDir);
+    writeFileSync(join(dataDir, 'session-stores'), 'not a directory');
+
+    expect(() => findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir,
+    })).toThrow();
+  });
+
+  it('rejects duplicate active rows even when they contain the same botmux session id', () => {
+    const shared = row('s1', { cliId: 'doubao', cliSessionId: '38450000000000001' });
+    seedPersistedSessionRows(tempDir, 'appA', { s1: shared });
+    seedPersistedSessionRows(tempDir, 'appB', { s1: shared });
+
+    expect(findActiveSessionIdByCliSessionId({
+      cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir,
+    })).toBeUndefined();
+  });
+
+  it('ignores closed rows and unknown or empty ids', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      closed1: row('closed1', { cliId: 'doubao', cliSessionId: '38450000000000001', status: 'closed' }),
+    });
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '38450000000000001', dataDir: tempDir })).toBeUndefined();
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '99999999999999999', dataDir: tempDir })).toBeUndefined();
+    expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '  ', dataDir: tempDir })).toBeUndefined();
   });
 });

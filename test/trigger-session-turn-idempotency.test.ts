@@ -78,6 +78,7 @@ const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injec
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: (...a: any[]) => mockSendWorkerInput(...a),
   getCurrentCliVersion: vi.fn(() => 'test'),
@@ -204,10 +205,15 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     const triggerMeta = { requestId: key, receivedAt: '2026-09-25T07:00:00.000Z', turnIdempotencyKey: key };
     const shape = validateTriggerRequest(buildOrchestratorReportTrigger(decision, triggerMeta));
     expect(shape.ok).toBe(true);
+    if (!shape.ok) return;
+    expect(shape.request.options?.suppressFinalOutput).toBe(true);
+    expect(shape.request.options?.turnIdempotencyKey).toBe(key);
     let lost = true;
+    let acceptedTurnId = '';
     const fetchTarget = vi.fn(async (_path: string, init: RequestInit) => {
       const req = JSON.parse(init.body as string) as TriggerRequest;
       const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      if (result.triggerId) acceptedTurnId = result.triggerId;
       expect(result.ok).toBe(true);
       if (lost) { lost = false; throw new Error('response lost after acceptance'); }
       expect(result.idempotent).toBe(true);
@@ -225,6 +231,7 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     expect(ds.latestAsyncTriggerId).toBe('real-http-request');
     expect(asyncTriggerStore.lookup(SID)).toBeUndefined();
     expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBe(true);
+    expect(ds.suppressedTriggerFinalTurns?.has(acceptedTurnId)).toBe(true);
   });
 
   it('keeps explicit final suppression turn-scoped on an idempotent Lark follow-up', async () => {
@@ -599,14 +606,14 @@ describe('visible handoff dispatch to a reused session', () => {
       expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(false);
     });
 
-  it('leaves an ordinary input without handoff presentation unchanged', async () => {
+  it('gives an ordinary input a turn identity without enabling handoff presentation', async () => {
     mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
     const ds = existingDs({ chatId: 'oc_handoff', worker: { killed: false, send: vi.fn() } as any });
     ds.session.chatId = 'oc_handoff';
     const req = followUpReq(undefined); req.options = undefined;
     const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
     expect(res.ok).toBe(true);
-    expect(mockSendWorkerInput.mock.calls[0][2]).toBeUndefined();
+    expect(mockSendWorkerInput.mock.calls[0][2]).toBe(res.triggerId);
     expect(commitTriggerStreamingCard(ds, res.triggerId, vi.fn())).toBe(false);
   });
 });
@@ -681,11 +688,6 @@ describe('exact trigger presentation keeps the persisted reply destination', () 
       expect(result.ok).toBe(true);
       const input = live ? mockSendWorkerInput.mock.calls[0][2] : mockForkWorker.mock.calls[0][2];
       const turnId = typeof input === 'string' ? input : input?.turnId;
-      if (mode === 'ordinary' && presentation === 'default' && live) {
-        expect(turnId).toBeUndefined();
-        expect(ds.session.replyTargets).toBeUndefined();
-        return;
-      }
       expect(turnId).toBe(result.triggerId);
       const expected = presentation === 'plain' ? { mode: 'plain', chatId: ds.chatId }
         : { mode: 'thread', rootMessageId: 'om_shared' };

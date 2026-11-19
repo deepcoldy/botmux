@@ -23,8 +23,8 @@ import {
   getSessionPersistentBackendType,
   isRiffBackendSession,
   killPersistentBackendTarget,
-  managedTargetsForCliChange,
   probePersistentBackendTarget,
+  probePersistentBackendTargetAfterKill,
   killPersistentSession,
   probePersistentSessions,
   probePersistentBackendTargets,
@@ -91,29 +91,6 @@ describe('shared Herdr persistent target', () => {
     });
   });
 
-  it('returns exact shared agents for CLI-change cleanup and excludes adopted panes', () => {
-    const targets = managedTargetsForCliChange('herdr', [
-      {
-        sessionId: 'abcdef123456',
-        persistentBackendTarget: {
-          backendType: 'herdr',
-          sessionName: 'botmux',
-          agentName: 'botmux-abcdef12',
-        },
-      },
-      {
-        sessionId: 'user-pane',
-        adoptedFrom: { source: 'herdr', herdrSessionName: 'collie', herdrPaneId: 'w3:p1' },
-      },
-    ] as any);
-
-    expect(targets).toEqual([{
-      backendType: 'herdr',
-      sessionName: 'botmux',
-      agentName: 'botmux-abcdef12',
-    }]);
-  });
-
   it('probes and kills only the recorded agent rather than the host session', () => {
     const target = {
       backendType: 'herdr' as const,
@@ -131,6 +108,68 @@ describe('shared Herdr persistent target', () => {
     expect(killAgent).toHaveBeenCalledWith('work', 'botmux-abcdef12');
     expect(killSession).not.toHaveBeenCalled();
     probeAgent.mockRestore();
+    killAgent.mockRestore();
+    killSession.mockRestore();
+  });
+
+  it('allows an agent-less deterministic Herdr host only with its complete owner id', () => {
+    const sessionId = 'abcdef123456';
+    const resolved = resolvePersistentBackendTarget('herdr', sessionId, undefined);
+    expect(resolved).toEqual({
+      backendType: 'herdr',
+      sessionName: 'bmx-abcdef12',
+      sessionId,
+    });
+    const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
+    const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
+    const probeSession = vi.spyOn(HerdrBackend, 'probeSession').mockReturnValue('exists');
+    const probeAgent = vi.spyOn(HerdrBackend, 'probeAgent').mockReturnValue('exists');
+    expect(probePersistentBackendTarget(resolved)).toBe('exists');
+    const batch = probePersistentBackendTargets([resolved]);
+    expect(batch.get(persistentBackendTargetKey(resolved))).toBe('exists');
+    killPersistentBackendTarget(resolved, sessionId);
+
+    expect(probeSession).toHaveBeenCalledTimes(2);
+    expect(probeSession).toHaveBeenNthCalledWith(1, 'bmx-abcdef12');
+    expect(probeSession).toHaveBeenNthCalledWith(2, 'bmx-abcdef12');
+    expect(killSession).toHaveBeenCalledWith('bmx-abcdef12');
+    expect(probeAgent).not.toHaveBeenCalled();
+    expect(killAgent).not.toHaveBeenCalled();
+    probeSession.mockRestore();
+    probeAgent.mockRestore();
+    killAgent.mockRestore();
+    killSession.mockRestore();
+  });
+
+  it('keeps shared/custom/missing-owner/mismatched/blank-agent Herdr targets fail-closed', () => {
+    const sessionId = 'abcdef123456';
+    const targets = [
+      { backendType: 'herdr' as const, sessionName: 'botmux', sessionId },
+      { backendType: 'herdr' as const, sessionName: 'team-shared', sessionId },
+      { backendType: 'herdr' as const, sessionName: 'bmx-abcdef12' },
+      { backendType: 'herdr' as const, sessionName: 'bmx-abcdef12-extra', sessionId },
+      { backendType: 'herdr' as const, sessionName: 'bmx-abcdef12', agentName: '   ', sessionId },
+    ];
+    const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
+    const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
+    const probeSession = vi.spyOn(HerdrBackend, 'probeSession').mockReturnValue('exists');
+    const probeAgent = vi.spyOn(HerdrBackend, 'probeAgent').mockReturnValue('exists');
+
+    for (const target of targets) {
+      expect(probePersistentBackendTarget(target)).toBe('unknown');
+      const batch = probePersistentBackendTargets([target]);
+      expect(batch.get(persistentBackendTargetKey(target))).toBe('unknown');
+      expect(() => killPersistentBackendTarget(target, sessionId)).toThrow(/exact exclusive owner/);
+    }
+    const exclusive = resolvePersistentBackendTarget('herdr', sessionId, undefined);
+    expect(() => killPersistentBackendTarget(exclusive, 'different-owner')).toThrow(/exact exclusive owner/);
+
+    expect(probeAgent).not.toHaveBeenCalled();
+    expect(probeSession).not.toHaveBeenCalled();
+    expect(killAgent).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+    probeAgent.mockRestore();
+    probeSession.mockRestore();
     killAgent.mockRestore();
     killSession.mockRestore();
   });
@@ -267,6 +306,54 @@ describe('persistent post-kill probe policy', () => {
       expect(shouldRejectPersistentPostKillProbe(backendType, probe)).toBe(reject);
     },
   );
+});
+
+describe('probePersistentBackendTargetAfterKill', () => {
+  const target = { backendType: 'tmux', sessionName: 'bmx-abcdef12' } as const;
+  const run = (answers: Array<'exists' | 'missing' | 'unknown'>, attempts?: number) => {
+    const seen: string[] = [];
+    const slept: number[] = [];
+    const result = probePersistentBackendTargetAfterKill(target, {
+      ...(attempts !== undefined ? { attempts } : {}),
+      probe: probed => { seen.push(probed.sessionName); return answers[seen.length - 1] ?? 'unknown'; },
+      sleep: ms => { slept.push(ms); },
+    });
+    return { result, probes: seen.length, slept };
+  };
+
+  it('re-probes an unknown answer until tmux answers for itself', () => {
+    expect(run(['unknown', 'missing'])).toMatchObject({ result: 'missing', probes: 2 });
+    expect(run(['unknown', 'unknown', 'exists'])).toMatchObject({ result: 'exists', probes: 3 });
+  });
+
+  it('returns an authoritative answer at once, without waiting', () => {
+    for (const answer of ['exists', 'missing'] as const) {
+      expect(run([answer, 'missing'])).toEqual({ result: answer, probes: 1, slept: [] });
+    }
+  });
+
+  it('probes once without waiting when no retry is allowed', () => {
+    for (const attempts of [1, 0]) {
+      expect(run(['unknown', 'missing'], attempts)).toEqual({ result: 'unknown', probes: 1, slept: [] });
+    }
+  });
+
+  it('does not wait on a herdr target that is unknown by construction', () => {
+    const probe = vi.fn(() => 'missing' as const);
+    const sleep = vi.fn();
+    const shared = { backendType: 'herdr', sessionName: 'shared-host' } as const;
+    expect(probePersistentBackendTargetAfterKill(shared, { probe, sleep })).toBe('unknown');
+    expect(probe).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('stays unknown once the bounded attempts are used up, waiting between them', () => {
+    const { result, probes, slept } = run(['unknown', 'unknown', 'unknown', 'missing'], 3);
+    expect(result).toBe('unknown');
+    expect(probes).toBe(3);
+    expect(slept).toHaveLength(2);
+    expect(slept[1]!).toBeGreaterThan(slept[0]!);
+  });
 });
 
 describe('killPersistentSession ZMX ownership fence', () => {

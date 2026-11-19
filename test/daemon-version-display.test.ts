@@ -4,7 +4,6 @@ import { describe, expect, it } from 'vitest';
 import {
   INSTALL_RESTART_HINT,
   daemonVersionDiffersFromDisk,
-  formatDaemonVersionRestartHint,
   formatRunningDaemonsRestartSummary,
   groupDaemonVersions,
   isComparableBotmuxVersion,
@@ -28,8 +27,6 @@ describe('daemon version display', () => {
   });
 
   it('shares one operator sentence for the history hint and the version card', () => {
-    expect(formatDaemonVersionRestartHint('3.19.3', '3.20.0'))
-      .toBe('运行中的 daemon v3.19.3 与磁盘 v3.20.0 不一致，运行 botmux restart 应用');
     expect(formatRunningDaemonsRestartSummary(['3.19.3', '3.19.3', '3.18.12', '0.0.0'], '3.20.0'))
       .toBe('运行中的 daemon：1 个 v3.18.12 / 2 个 v3.19.3（磁盘 v3.20.0），运行 botmux restart 应用');
     expect(formatRunningDaemonsRestartSummary(['3.20.0', '0.0.0'], '3.20.0')).toBeUndefined();

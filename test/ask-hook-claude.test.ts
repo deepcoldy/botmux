@@ -54,6 +54,28 @@ describe('Claude Code hook adapter', () => {
       }
     });
 
+    it('透传 options[].description（Claude 把选项详细解释放这里，不能丢）', () => {
+      const payload = {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'AskUserQuestion',
+        tool_input: {
+          questions: [{
+            question: '选哪种发布方式？',
+            multiSelect: false,
+            options: [
+              { label: '灰度', description: '先放 5% 流量观察 30 分钟' },
+              { label: '全量', description: '   ' },
+            ],
+          }],
+        },
+      };
+      const parsed = claude.parseQuestions(payload)!;
+      const opts = parsed.questions[0].options;
+      expect(opts[0].description).toBe('先放 5% 流量观察 30 分钟');
+      // 空白 description 归一为 undefined，老载荷渲染结果不变。
+      expect(opts[1].description).toBeUndefined();
+    });
+
     it('非 AskUserQuestion → null', () => {
       const payload = { hook_event_name: 'PreToolUse', tool_name: 'Bash' };
       expect(claude.parseQuestions(payload)).toBeNull();

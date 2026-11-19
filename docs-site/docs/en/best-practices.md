@@ -1,67 +1,103 @@
 # Best Practices
 
-> Recommended configurations organized by **use case**. For basic usage, see the individual feature pages; for troubleshooting, see [Common pitfalls](/en/pitfalls) and the [FAQ](/en/faq).
+> Recommended setups organized by **use case**; each item is something you can do right away. For feature details see the individual pages; if something goes wrong, start with [Common pitfalls](/en/pitfalls) and the [FAQ](/en/faq).
+
+| I want to… | Read this |
+|------|---------|
+| Let anyone in a group ask the bot (on-call, Q&A) | [Scenario 1 · On-call support](#scenario-1--on-call-support) |
+| Have the bot investigate alerts automatically | [Scenario 2 · Alert operations](#scenario-2--alert-operations) |
+| Code with several bots on my own and have them review each other | [Scenario 3 · Solo development](#scenario-3--solo-development) |
+| Collaborate as a team where everyone has their own bot | [Scenario 4 · Team collaboration](#scenario-4--team-collaboration) |
 
 ## Scenario 1 · On-call support
 
-On-call groups / cross-team consultations / external support — anyone in the group can @ the bot to ask questions.
+For on-call groups, cross-team questions and external support: anyone in the group can @ the bot to ask a question.
 
-- **Use a clean dedicated Devbox**: spin up a separate, clean Devbox just for on-call, so you don't have to worry about on-call / external folks messing up your **personal development environment**.
-- **Configure the on-call bot's role**: use `/role set` (this group) or `/role team set` (cross-group default) to write down its persona and boundaries. You can run **multiple bots mapped to different development directories**, each managing its own area.
-- **Write permissions/boundaries into the default role**: a typical on-call role prompt (paste it after sending `/role set` in the group):
+**Recommended steps:**
+
+1. **Use a dedicated, clean machine** (for example a separate dev box). On-call folks and outside colleagues will have the bot run all kinds of commands; keep them away from your **personal development environment**.
+2. **Bind a project directory**: send `/oncall bind <project directory>` in the group. From then on, anyone who @s the bot lands straight in that directory, with no repo picker. To do this automatically for every new group the bot joins, choose "On-call mode" as the working-directory option in the Dashboard "Bot Config" page and fill in the directory. See [Oncall mode](/en/oncall).
+3. **Turn on the file sandbox**: when the bot is open to semi-trusted people, pick "allowlist isolation" in the [file sandbox](/en/sandbox). However it is prompted, the model then can't read your private keys, tokens or other repositories. botmux also reminds you to enable it when a bot is used by several people without one.
+4. **Write a role**: a role is the bot's long-lived persona and rules. Use `/role set` (this group only) or `/role team set` (this bot's default in every group). A typical on-call role, sent in the group like this (you can start a new line after `/role set` and write several lines):
 
 ```
-As Shen Han's on-call bot, you'll receive questions from users:
-- If a user merely @s you, read the group history first before answering
-- If the user reports a problem on their own machine, don't treat it as a local problem to investigate
-- If some of the user's requests would expose privacy or pose security risks, ask "Shen Han" to confirm first
-- If you need to submit an MR, submit it as "Shen Han"
+/role set
+You are "Example User"'s on-call bot and will receive all kinds of questions:
+- If a user only @s you, read the group history before answering
+- If the user describes a problem on their own machine, don't investigate it as a problem on this machine
+- If a request could expose private data or carries security risk, ask "Example User" to confirm first
+- When you need to open an MR, open it as "Example User"
 ```
 
-- **Investigate in a worktree, clean up afterward**: investigate in a separate git worktree, and remember to delete it when done so you don't pollute the main repository.
-- **The identity for submitting MRs** can also be hard-coded in the default role, to avoid submitting under the wrong person.
-- Configure `/oncall bind <project directory>` for instant Q&A in the group, skipping the repo picker. Layered permissions as a backstop: everyone in the group can ask (`canTalk`), while operations like `/cd` `/restart` `/close` remain owner-only (`allowedUsers`).
+5. **Change code in a separate worktree**: start the topic with `/tw <question>`. The bot first creates a separate git worktree (another working copy of the same repo) and works there, so the main checkout stays clean. After the session closes, the close card shows a "🧹 Clean Up Worktree" button; one click removes it. It won't delete anything with uncommitted changes, unpushed commits or a process still using it, and the branch is kept.
 
-> In the Dashboard's **Roles** panel you can visually configure a role for each bot in each group:
+![The "Clean up worktree" button on the close card](/img/worktree-cleanup-close-card.png)
 
-![Dashboard Roles panel](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780057302792_dash-roles.png)
+**How permissions split:** once on-call is bound, everyone in the group can **talk** to the bot; actions that **change the session**, such as `/cd`, `/restart`, `/close` and card buttons, stay limited to the owner and admins (`allowedUsers`). See [Permissions](/en/permissions).
+
+**Several projects?** Create several bots and `/oncall bind` each one to a different project directory.
+
+> In the Dashboard "Role Management" page you can visually set a role for each bot in each group:
+
+![Dashboard Role Management page](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780057302792_dash-roles.png)
 
 ## Scenario 2 · Alert operations
 
-Monitoring alerts / CI / ticket triggers — let external systems proactively push events to the bot to handle. Two integration approaches; pick by what your alerting pipeline already looks like:
+Let external systems such as monitoring, CI and ticketing push work to the bot. Pick one based on your current alert pipeline:
 
-- **Approach 1 · Webhook push** (Dashboard "Connectors (beta)", see [Connectors (Webhook)](/en/webhook)): let external systems (monitoring alerts, CI, tickets…) trigger the bot to speak in a group or run a workflow via a webhook. You can configure: the bot to trigger, the trigger mode (single-round conversation / workflow), which group to deliver to, the verification method (a **token** in the URL so a single curl can trigger it / an **HMAC signature** for more security), and the **handling instructions** (telling the bot what to do when it receives the event).
-- **Approach 2 · Listen to an existing alert group** (see [Group message listener](/en/bots-json#group-message-listener)): if your monitoring/alerting system **already has its own Lark bot posting alerts into a group**, you don't need a webhook at all — add the bot to that group and enable the listener in the Dashboard "Roles → Message Listener" tab, and every alert starts an investigation session automatically. Use **blacklist mode + check "bot"** to watch a third-party alert bot (e.g. Argos). Note that non-@ / other-bot messages are backfilled by a history poll roughly every 30s, so up to ~30s of latency.
-- **Auto-create a group per alert**: you can configure it to "auto-create a group for every incoming alert and add the bot **and the on-call person together**"; if you set a dedup key, similar alerts are merged into the same group, and if left empty, each alert gets a new group — the on-call person follows up right in the group. Combined with the bot's `autoStartOnGroupJoin` (see [`bots.json` · Proactive start](/en/bots-json#proactive-start)), the bot starts working the moment it's added to the new group, with no manual @.
-- **Different alert bots for different projects**: give each project its own alert bot, each configured with a default role prompt carrying that project's background.
-- **Different on-call directories for different alert bots**: `/oncall bind` each alert bot to the corresponding project directory, so incoming alerts get investigated right in that repository.
-- You can also stack [scheduled tasks](/en/schedule) for **proactive inspection broadcasts**: `/schedule every day at 9:00 check yesterday's alert trends and summarize`, only @ing people when there's an anomaly.
+| Your situation | Recommended approach |
+|---------|---------|
+| The alerting system can call an HTTP URL | **Approach 1 · Webhook push** |
+| Alerts are already posted to a group by some Lark bot | **Approach 2 · Listen to the alert group** |
 
-![Dashboard Connectors (Webhook)](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780057303071_dash-connector.png)
+**Approach 1 · Webhook push** (Dashboard "Webhook" page, see [Connectors (Webhook)](/en/webhook))
+
+Create a connector, choose which bot it triggers and which group it delivers to, and you get a URL you can `curl` right away. You can configure:
+
+- **Trigger mode**: choose "Single turn" when creating it, so the bot responds once to each event (the old "Workflow" type is retired and can't be created).
+- **Verification**: **token** by default (the token is in the URL, so one curl triggers it); switch to an **HMAC signature** for more security.
+- **Handling instructions**: a short paragraph telling the bot what to do with the event, e.g. "judge the severity, @ the relevant on-call, suggest how to investigate".
+- **New group per event**: create a group for every alert and add the bot and its admins, optionally plus extra bots. With a "dedup field" set, alerts with the same value go to the same group; leave it empty for a new group per alert.
+
+**Approach 2 · Listen to an existing alert group** (Dashboard "Message Listener" page, see [Group message listener](/en/bots-json#message-listener))
+
+If a third-party Lark bot already posts alerts into a group, you don't need a webhook: add your bot to that group, turn on the message listener, and every alert gets its own investigation topic right under it.
+
+- Use **blacklist mode** for senders and include the "bot" sender type; this is the most reliable way to watch a third-party alert bot.
+- Messages that don't @ your bot, and messages from other bots, are picked up by a history poll roughly every 30 seconds, so expect **up to about 30 seconds of delay**.
+
+**Going further:**
+
+- **Start on join**: turn on `autoStartOnGroupJoin` in the bot config, and the bot starts working as soon as it's added to a new group (with at least one admin in it), no @ needed. Your app must subscribe to the "bot added to group" event in the Lark developer console; see [`bots.json` · Proactive start](/en/bots-json#proactive-start).
+- **One alert bot per project**: give each bot a role with that project's background and `/oncall bind` it to the matching repo, so alerts are investigated right in that repo.
+- **Scheduled checks**: combine with [scheduled tasks](/en/schedule), e.g. `/schedule every day at 9:00 check yesterday's alert trends and summarize`, and only @ people when something looks off.
+
+![Dashboard Webhook page](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780057303071_dash-connector.png)
 
 ## Scenario 3 · Solo development
 
-One person, multi-bot collaborative development.
+One person, several bots working together.
 
-- **Multiple bots mapped to different CLIs**: create multiple bots each bound to a different CLI (Claude Code / Codex / …), and pick whichever suits the task.
-- **The same CLI can also do multi-bot mutual review**: this can be **different models** reviewing each other, or **multiple bots on the same model** reviewing each other as sub-agents — an extra pair of eyes is more reliable.
-- **Use `/g`(=`/group`) to create groups for collaboration**: create a group with multiple bots developing the same requirement; or use **topic groups with "one topic per requirement"** for naturally isolated context.
-- **Assign a role to each bot for division of labor**: some handle development, others handle review, and combined with `/role` + `/role cap` capability tags, collaboration doesn't clash.
+- **Different bots on different CLIs**: e.g. one on Claude Code and one on Codex; pick whichever suits the task. Supported CLIs are listed in [CLI adapters](/en/adapters).
+- **Review each other**: let bots on different models review each other's work, or several bots on the same CLI. An extra pair of eyes helps.
+- **Create a group in one line with `/g`**: `/g` (short for `/group`) creates a new group and adds several bots at once to work on the same task; see [One-step session groups](/en/group). Or use a topic group with **one topic per task** for naturally isolated context.
+- **Give each bot a job**: some write code, some review. Use `/role` for the persona and `/role cap set <description>` for a "capability label" (other bots see it when picking who to work with). See [Roles & teams](/en/roles).
+- **Share memory across bots (optional, off by default)**: to let bots on different CLIs share the same user and project memory, try the OpenViking shared-memory example. Agents decide on their own when to search, read and save conclusions. It is off by default: a normal install or start never turns it on, and you must explicitly bind it to a chosen single-user bot or local agent. For now it suits a personal dev environment under one OS user. For setup and binding steps, see [OpenViking shared memory](https://github.com/deepcoldy/botmux/blob/master/examples/openviking-memory/README.md).
 
 ![Dashboard new group (selecting multiple bots)](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300986_dash-newgroup.png)
 
-## Scenario 4 · Multi-person collaboration
+## Scenario 4 · Team collaboration
 
-Multiple people on a team, with their own bots working together.
+Everyone on the team has their own bot, and they work together.
 
-- **A Lark limitation**: bots still are not triggered by each other's regular messages; relay requires an explicit `--mention` to the target bot.
-- **Default discovery**: `botmux bots list` discovers bots in the current group through the group bot roster and shows `mentionable`; models also see relay targets in the `<available_bots>` block.
-- **Team feature (recommended)**: in the Dashboard "Teams" section, tag bots under multiple people's names and pull them into a team for **cross-deployment discovery**, then directly select them to create a group and start collaborating.
+- **Keep the Lark limitation in mind**: a bot is not triggered by another bot's regular message. To hand off, use `--mention <target openId>` in `botmux send` to @ the other bot explicitly.
+- **See who's in the group**: `botmux bots list` lists the bots in the current group you can work with, their capability labels and whether they can be @ed (`mentionable`). Models also see relay targets in the `<available_bots>` block of their context.
+- **Let late-joining bots catch up**: an admin sends `@bot /context-sharing on` in the group, and bots managed by the same deployment listen in the background; when one of them is @ed later, it automatically gets the group messages it missed. See [Multi-bot collaboration](/en/multi-bot).
+- **Find teammates' bots on other machines** (requires the central platform): `botmux bots list --scope team` lists bots on the same team running on other people's machines; `botmux create-group --team <team> --agent <appId>` adds them and their owners to a new group. See [Multi-bot collaboration](/en/multi-bot).
 
-![Dashboard Teams · cross-deployment collaboration](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033301213_dash-team.png)
+## General advice (applies to every scenario)
 
-## General advice (applies to all scenarios)
-
-- **Seamless three-way collaboration**: install tmux → sessions persist and context isn't lost on daemon restart; adopt a CLI on your computer into Lark with `/adopt` and continue on your phone; click "🔑 Get operate link" to get a writable Web Terminal when you need to take action.
-- **Always-on + auto-start**: deploy on an always-on dev machine / server, and configure `botmux autostart enable` to auto-recover on restart.
-- **Clean up promptly**: `/close` a session when you're done with it; if they pile up, batch-close them in the Dashboard or run `botmux delete stopped` to clear out zombies.
+- **Persistent sessions**: install tmux (botmux's default backend). The CLI runs inside tmux, so a daemon restart doesn't lose context; see [Tmux persistent sessions](/en/tmux).
+- **Switch between computer and phone**: bring a CLI already running on your computer into Lark with `/adopt` and keep chatting from your phone; when you need to take over, click "🔑 Get Write Link" on the card to open a writable [Web Terminal](/en/web-terminal).
+- **Always on + start at boot**: deploy on an always-on dev box or server and run `botmux autostart enable`, so everything comes back after a reboot.
+- **Clean up regularly**: `/close` a session when you're done. To automate it, turn on "Automatically close inactive sessions" for a group in the Dashboard "Group Management" page; for a backlog, `botmux delete stopped` removes zombie sessions whose process has exited.

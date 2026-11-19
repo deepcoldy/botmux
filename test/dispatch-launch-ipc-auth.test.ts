@@ -16,6 +16,7 @@ import {
   verifyDispatchLaunchIpcRequest,
   type DispatchLaunchIpcClock,
 } from '../src/core/dispatch-launch-ipc-auth.js';
+import { __resetLoopbackPeersCacheForTest } from '../src/utils/loopback-peers.js';
 
 const target = {
   larkAppId: 'cli_target',
@@ -135,6 +136,25 @@ describe('dispatch launch IPC request verifier', () => {
       .toEqual({ ok: false, reason: 'signature_mismatch', httpStatus: 401 });
     await expect(verify(makeRequest({ body: '{}', signedBody: '{"different":true}' }))).resolves
       .toEqual({ ok: false, reason: 'signature_mismatch', httpStatus: 401 });
+  });
+
+  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and then fails on signature, not origin', async () => {
+    const prev = process.env.BOTMUX_LOOPBACK_PEERS;
+    process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.8';
+    __resetLoopbackPeersCacheForTest();
+    try {
+      // Address ring relaxed → request reaches HMAC verification → bad path
+      // yields signature_mismatch (401), never remote_not_loopback (403).
+      await expect(verify(makeRequest({ remoteAddress: '10.0.0.8', signedPath: '/wrong' })))
+        .resolves.toEqual({ ok: false, reason: 'signature_mismatch', httpStatus: 401 });
+      // a still-unconfigured LAN address keeps failing at the address ring
+      await expect(verify(makeRequest({ remoteAddress: '10.0.0.9', signedPath: '/wrong' })))
+        .resolves.toEqual({ ok: false, reason: 'remote_not_loopback', httpStatus: 403 });
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_LOOPBACK_PEERS;
+      else process.env.BOTMUX_LOOPBACK_PEERS = prev;
+      __resetLoopbackPeersCacheForTest();
+    }
   });
 
   it('bounds body bytes and rejects framing ambiguity or invalid UTF-8', async () => {

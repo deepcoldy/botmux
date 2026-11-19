@@ -60,4 +60,35 @@ describe('FeedbackAnalyticsService', () => {
     expect(first.items[0]).toEqual(expect.objectContaining({ contentHash: expect.stringMatching(/^sha256:/), platformMessageId: expect.any(String), botAppId: 'app-a' }));
     service.close();
   });
+
+  it('filters every metric by delivery time and bot, including late webhook failures of both event types', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-cohort-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const destination = { id: 'hook', enabled: true, url: 'https://example.test/hook', eventTypes: ['turn.completed', 'feedback.revised'] as Array<'turn.completed' | 'feedback.revised'>, secretRef: 'test' };
+    const inputs = [
+      ['before', 'app-a', '2026-08-09T23:59:59.999Z'],
+      ['inside', 'app-a', '2026-08-10T00:00:00.000Z'],
+      ['end', 'app-a', '2026-08-11T00:00:00.000Z'],
+      ['other', 'app-b', '2026-08-10T10:00:00.000Z'],
+    ];
+    for (const [turnId, botAppId, createdAt] of inputs) {
+      store.recordTurnTerminal({ botAppId: botAppId!, sessionId: 's', turnId: turnId!, status: 'completed', completedAt: '2026-08-12T00:00:00.000Z' });
+      store.recordTurnDelivery({ botAppId: botAppId!, sessionId: 's', turnId: turnId!, platform: 'lark', platformAppId: botAppId!, platformMessageId: turnId!, content: 'answer', createdAt, cardMode: 'feedback', status: 'delivered', webhookDestinations: [destination] });
+      store.recordFeedback({ platform: 'lark', platformAppId: botAppId!, platformMessageId: turnId!, operatorSubjectId: 'rater', result: 'down', semantic: 'negative', reasonKey: 'wrong', callbackKey: turnId! });
+    }
+    const now = Date.now() + 86400000;
+    const outbox = store.claimFeedbackOutbox({ now, limit: 100, claimToken: 'test' });
+    expect(outbox).toHaveLength(8);
+    for (const item of outbox) store.rescheduleFeedbackOutbox(item.outboxId, 'test', { now, nextAttemptAt: now, error: 'permanent', permanent: true });
+    store.close();
+    const service = new FeedbackAnalyticsService(dataDir);
+    try {
+      const filters = { from: '2026-08-10T00:00:00.000Z', to: '2026-08-11T00:00:00.000Z', botAppId: 'app-a' };
+      expect(service.summary(filters)).toMatchObject({ delivered: 1, ratedDeliveries: 1, ratings: 1, negative: 1, ratingCoverage: 1, outboxFailures: 2 });
+      expect(service.trend(filters)).toEqual([{ bucket: '2026-08-10', positive: 0, negative: 1, progress: 0, ratings: 1 }]);
+      expect(service.reasons(filters)).toEqual([{ reasonKey: 'wrong', count: 1 }]);
+      expect(service.deliveries(filters).items.map(item => item.turnId)).toEqual(['inside']);
+      expect(service.summary({ ...filters, botAppId: undefined })).toMatchObject({ delivered: 2, outboxFailures: 4 });
+    } finally { service.close(); }
+  });
 });

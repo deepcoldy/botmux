@@ -7,6 +7,7 @@ import { toast } from './toast.js';
 import {
   createDocWatch,
   deleteDocWatch,
+  docWatchUrl,
   isPollingMode,
   loadDocWatches,
   outcomeMeta,
@@ -31,18 +32,6 @@ function isDocNativeAnchor(row: DocWatchRow): boolean {
     || row.sessionAnchor === `doc:${row.fileToken}:watch`;
 }
 
-/** 文档链接：path 段与 fileType 不一对一，只对能确定的几种给链接，给错比不给糟。 */
-function docUrl(row: DocWatchRow): string | null {
-  const seg = row.fileType === 'docx' ? 'docx'
-    : row.fileType === 'doc' ? 'docs'
-      : row.fileType === 'sheet' ? 'sheets'
-        : row.fileType === 'bitable' ? 'base'
-          : row.fileType === 'slides' ? 'slides'
-            : row.fileType === 'mindnote' ? 'mindnote'
-              : null;
-  return seg ? `https://feishu.cn/${seg}/${row.fileToken}` : null;
-}
-
 function OutcomeBadge(props: { row: DocWatchRow }) {
   const meta = outcomeMeta(props.row.lastOutcome);
   const title = props.row.lastError ? `${meta.hint}\n\n${props.row.lastError}` : meta.hint;
@@ -61,7 +50,7 @@ function WatchCard(props: {
   onDelete: () => void;
 }) {
   const { row } = props;
-  const href = docUrl(row);
+  const href = docWatchUrl(row);
   const title = row.docTitle?.trim() || row.fileToken;
   const boundToRealChat = !!row.sessionAnchor && !isDocNativeAnchor(row);
   return (

@@ -40,7 +40,7 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
   if (sub === 'resume') {
     return {
       kind: 'invalid',
-      error: 'v2 workflow resume 已下线；历史 run 已不可变，只能查看离线静态归档。v3 blocked run 请使用 `/workflow retry <runId>`。',
+      error: 'v2 workflow resume 已下线；历史 run 已不可变，只能查看离线静态归档。v3 受阻的 run 请点群里阻塞卡片上的「重试」，或让 Agent 运行 `botmux workflow retry <runId>`。',
     };
   }
 

@@ -46,11 +46,6 @@ export function registeredScratchView(sessionId: string): ScratchPathMapping[] |
   return liveViews.get(sessionId);
 }
 
-/** Deterministic Linux merged root for a session given its data dir. */
-export function scratchMergedRootFor(dataDir: string, sessionId: string): string {
-  return join(dataDir, 'sandboxes', sessionId, 'root');
-}
-
 /** Linux convenience: the single full-root mapping. */
 export function scratchLinuxMappings(mergedRoot: string): ScratchPathMapping[] {
   return [{ from: '/', to: mergedRoot }];

@@ -6,8 +6,6 @@ import type { NormalizedVcMeetingItem } from '../src/vc-agent/types.js';
 import {
   getVcMeetingFeedMetadataState,
   ingestVcMeetingFeedMetadata,
-  listVcMeetingFeedMetadataAfter,
-  removeVcMeetingFeedMetadata,
 } from '../src/services/vc-meeting-feed-metadata-store.js';
 
 const key = { listenerAppId: 'listener_app', meetingId: 'meeting_1' };
@@ -87,7 +85,8 @@ describe('vc meeting feed metadata journal', () => {
     expect(newer.accepted[0]?.metadata).toMatchObject({ revision: 2, ingestSeq: 2 });
     expect(stale.stale).toHaveLength(1);
     expect(stale.nextIngestSeq).toBe(3);
-    expect(listVcMeetingFeedMetadataAfter(dataDir, key, 1).map(item => item.revision)).toEqual([2]);
+    expect(Object.values(getVcMeetingFeedMetadataState(dataDir, key).items)
+      .filter(item => item.ingestSeq > 1).map(item => item.revision)).toEqual([2]);
   });
 
   it('maps a post-restart local r1 observation back to the existing durable r2 identity', () => {
@@ -164,11 +163,5 @@ describe('vc meeting feed metadata journal', () => {
 
     expect(() => getVcMeetingFeedMetadataState(dataDir, key)).toThrow(/failed validation/);
     expect(readdirSync(dir).some(name => name.includes('.corrupt.'))).toBe(true);
-  });
-
-  it('removes the complete per-meeting journal explicitly', () => {
-    ingestVcMeetingFeedMetadata(dataDir, key, [chat()], 100);
-    expect(removeVcMeetingFeedMetadata(dataDir, key)).toBe(true);
-    expect(removeVcMeetingFeedMetadata(dataDir, key)).toBe(false);
   });
 });

@@ -33,7 +33,8 @@ import {
   type WorkbenchStorage,
 } from './agent-workbench-storage.js';
 import { buildChatAppLink } from './agent-workbench-chat.js';
-import { t } from './ui.js';
+import { botDisplayName, t } from './ui.js';
+import { useClosedHistorySearch } from './closed-history-search.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
@@ -203,7 +204,9 @@ function sessionOptionId(sessionId: string): string {
 }
 
 function sessionSecondary(session: WorkbenchSessionRow): string {
-  return [session.botName, session.cliId, session.repoName].filter(Boolean).join(' · ') || session.sessionId;
+  // Bot 名按 larkAppId 现查（会话行里的 botName 是快照，可能是改名前的旧名）。
+  const bot = session.botName || session.larkAppId ? botDisplayName(session) : '';
+  return [bot, session.cliId, session.repoName].filter(Boolean).join(' · ') || session.sessionId;
 }
 
 /** Mirrors the 620px breakpoint the stylesheet uses for taller touch rows, so
@@ -224,6 +227,8 @@ function useTouchRowMetrics(): boolean {
 export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JSX.Element {
   const touchRows = useTouchRowMetrics();
   const [query, setQuery] = useState('');
+  // 首屏只带最近的已关闭会话：搜索时去服务端补查更早的已关闭会话（合进 store 后按本地规则过滤）。
+  useClosedHistorySearch(query);
   const [scrollTop, setScrollTop] = useState(0);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const lastScrolledSelectionRef = useRef<string | null>(props.selectedSessionId ?? null);
@@ -506,6 +511,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
             const chatHref = session.feishuChatLink
               || (session.chatId ? buildChatAppLink(session.chatId) : null);
             const kind = workbenchSessionKind(session);
+            // 类型徽标保留单聊；话题操作只取决于会话范围，不取决于聊天类型。
+            const isThread = session.scope === 'thread';
             return (
                 <div
                   key={item.key}
@@ -569,7 +576,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
                       ) : null}
                       {/* 原「定位」语义不变：让 bot 在原话题里 @ owner，用户通过
                           消息通知回到话题；写能力与 30 秒冷却也继续沿用。 */}
-                      {kind === 'thread' && onLocate ? (() => {
+                      {isThread && onLocate ? (() => {
                         const at = locateAt.get(session.sessionId) ?? 0;
                         const elapsed = Date.now() - at;
                         const cooling = at > 0 && elapsed < LOCATE_COOLDOWN_MS;
@@ -597,7 +604,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
                       })() : null}
                       {/* 「跳转」是新增的只读入口，仅在服务端已经拿到原生 `omt_`
                           话题 id 时渲染；不能把 `om_` 路由锚点伪造成原话题链接。 */}
-                      {kind === 'thread' && session.feishuThreadLink ? (
+                      {isThread && session.feishuThreadLink ? (
                         <FeishuChatAnchor
                           className="wb-session-row-action is-jump"
                           href={session.feishuThreadLink}

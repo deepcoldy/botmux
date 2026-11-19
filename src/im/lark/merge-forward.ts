@@ -37,6 +37,7 @@ export async function buildForwardedTree(
   rootMessageId: string,
   numberer: ReturnType<typeof createImgNumberer>,
   maxDepth: number,
+  initialDetail?: { items?: any[] },
 ): Promise<{ nodes: ForwardedNode[]; extraResources: MessageResource[] }> {
   // Pass userCardContent:true so interactive sub-cards return their real v2
   // body (schema/body/elements) instead of the simplified "请升级至最新版本"
@@ -46,15 +47,20 @@ export async function buildForwardedTree(
   // rich cards as the placeholder shell; the per-sub recovery pass below then
   // restores their real bodies for same-tenant subs (cross-tenant subs 232010
   // and stay as the placeholder).
-  let detail: any;
-  try {
+  let detail: any = Array.isArray(initialDetail?.items)
+    && initialDetail.items.some(item => item?.message_id === rootMessageId) ? initialDetail : undefined;
+  if (!detail) try {
     detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: true });
   } catch (err) {
     logger.debug(`[merge_forward] userCardContent:true failed for ${rootMessageId}, falling back to false: ${describeAxiosErr(err)}`);
     detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false });
   }
-  const allItems: any[] = detail?.items ?? [];
+  // Card recovery/DSL unwrapping modifies items during this render. Do not
+  // mutate the caller's prefetched response or another consumer's render.
+  const allItems: any[] = (detail?.items ?? []).map((item: any) => ({ ...item,
+    ...(item.body ? { body: { ...item.body } } : {}) }));
   const extraResources: MessageResource[] = [];
+  const resourcesByKey = new Map<string, MessageResource & { fallbackMessageIds: string[] }>();
 
   // Recover degraded interactive sub-cards. The parent fetch with
   // userCardContent:true above 500s on many merge_forward parents (Lark
@@ -94,7 +100,7 @@ export async function buildForwardedTree(
     childrenByParent.set(parent, list);
   }
 
-  function walk(parentId: string, depth: number): ForwardedNode[] {
+  function walk(parentId: string, depth: number, ancestors: string[] = []): ForwardedNode[] {
     const children = childrenByParent.get(parentId) ?? [];
     const nodes: ForwardedNode[] = [];
     for (const msg of children) {
@@ -120,14 +126,26 @@ export async function buildForwardedTree(
       }
 
       // Resources first so the numberer assigns [图片 N] in attachment order;
-      // text extraction below reuses those numbers. Do NOT override messageId —
-      // Lark requires the parent merge_forward's message_id to download
-      // resources (error 234003 if sub-message ID is used).
-      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '', numberer);
-      extraResources.push(...subResources);
+      // text extraction below reuses those numbers. Keep the outer forward as
+      // the primary download ID: some forwards require it, while others return
+      // 234003 until the owning leaf or enclosing forward ID is used.
+      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '');
+      const fallbackMessageIds = [...new Set([msg.message_id, parentId, ...ancestors])]
+        .filter((id): id is string => typeof id === 'string' && !!id && id !== rootMessageId);
+      for (const resource of subResources) {
+        const key = `${resource.type}:${resource.key}`;
+        const existing = resourcesByKey.get(key);
+        if (existing) {
+          existing.fallbackMessageIds = [...new Set([...existing.fallbackMessageIds, ...fallbackMessageIds])];
+        } else if (numberer.assign(key).isNew) {
+          const collected = { ...resource, fallbackMessageIds };
+          resourcesByKey.set(key, collected);
+          extraResources.push(collected);
+        }
+      }
 
       if (msg.msg_type === 'merge_forward' && depth < maxDepth) {
-        const inner = walk(msg.message_id, depth + 1);
+        const inner = walk(msg.message_id, depth + 1, [parentId, ...ancestors]);
         nodes.push({ senderOpenId, senderType, ...(senderName ? { senderName } : {}), children: inner });
       } else {
         const sub = parseApiMessage(msg, numberer);
@@ -148,10 +166,11 @@ export async function buildForwardedTree(
 export async function expandMergeForward(
   larkAppId: string, messageId: string, parsed: LarkMessage,
   numberer = createImgNumberer(),
+  initialDetail?: { items?: any[] },
 ): Promise<{ extraResources: MessageResource[] }> {
   const MAX_DEPTH = 5;
   try {
-    const { nodes, extraResources } = await buildForwardedTree(larkAppId, messageId, numberer, MAX_DEPTH);
+    const { nodes, extraResources } = await buildForwardedTree(larkAppId, messageId, numberer, MAX_DEPTH, initialDetail);
     if (nodes.length === 0) return { extraResources };
     parsed.content = renderForwardedXml(nodes);
     parsed.msgType = 'merge_forward_expanded';

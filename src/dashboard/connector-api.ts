@@ -5,6 +5,7 @@ import {
   listConnectors,
   newConnectorId,
   upsertConnector,
+  connectorPayloadTrustBlocker,
   type ConnectorDefinition,
 } from '../services/connector-store.js';
 import {
@@ -15,6 +16,7 @@ import {
   createWebhookSecret,
   deleteWebhookSecret,
   generateWebhookSecretPlaintext,
+  getWebhookSecret,
   listWebhookSecretRefs,
   setWebhookSecret,
 } from '../services/webhook-key.js';
@@ -245,9 +247,32 @@ function sameConnectorTarget(
     && sameStringSet(left.allowChats, right.allowChats);
 }
 
+/** Human-readable reasons for normalize errors whose code alone does not tell
+ *  the API caller what to change. */
+const NORMALIZE_ERROR_MESSAGES: Record<string, string> = {
+  trust_payload_requires_turn_target:
+    'promptEnvelope.trustPayload only applies to turn connectors; legacy workflow targets never render a trusted payload.',
+  trust_payload_requires_verification:
+    'promptEnvelope.trustPayload can only be enabled on a connector verified by token or hmac-sha256 with a stored secret: '
+    + 'a trusted payload is executed as instructions, so unauthenticated deliveries must not be able to reach it.',
+};
+
+function normalizeErrorBody(error: string): { ok: false; error: string; message?: string } {
+  const message = NORMALIZE_ERROR_MESSAGES[error];
+  return message ? { ok: false, error, message } : { ok: false, error };
+}
+
 function normalizeConnectorInput(
   raw: unknown,
-  opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
+  opts: {
+    id?: string;
+    prior?: ConnectorDefinition | null;
+    secretRef?: string;
+    /** This request will (re)write the secret after validation (PUT with
+     *  `secret` / `rotateSecret`): count it as present for the trust gate, so
+     *  a trusted connector whose secret went missing can still be repaired. */
+    secretWillBeWritten?: boolean;
+  },
 ): { ok: true; connector: ConnectorDefinition } | { ok: false; error: string } {
   const body = record(raw);
   const c = record(body.connector ?? body);
@@ -348,6 +373,8 @@ function normalizeConnectorInput(
       ...(typeof promptEnvelope.instruction === 'string'
         ? (promptEnvelope.instruction.trim() ? { instruction: promptEnvelope.instruction.trim().slice(0, 8000) } : {})
         : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
+      // Default off; only persisted when on so existing stores stay byte-identical.
+      ...(bool(promptEnvelope.trustPayload, prior?.promptEnvelope.trustPayload === true) ? { trustPayload: true } : {}),
     },
     topicMessage: topicMessage.value,
     ...(bool(c.suppressFinalOutput, prior?.suppressFinalOutput ?? false) ? { suppressFinalOutput: true } : {}),
@@ -387,6 +414,16 @@ function normalizeConnectorInput(
   }
   if (prior?.target.kind === 'workflow' && !sameConnectorTarget(next.target, prior.target)) {
     return { ok: false, error: 'legacy_workflow_connector_target_immutable' };
+  }
+  if (next.promptEnvelope.trustPayload) {
+    // Only turn targets render through the trusted prompt; refuse it elsewhere
+    // rather than show a setting that silently does nothing.
+    if (next.target.kind !== 'turn') return { ok: false, error: 'trust_payload_requires_turn_target' };
+    const blocker = connectorPayloadTrustBlocker(
+      next,
+      opts.secretWillBeWritten === true || !!getWebhookSecret(next.verify.secretRef),
+    );
+    if (blocker) return { ok: false, error: blocker };
   }
   return { ok: true, connector: next };
 }
@@ -482,7 +519,7 @@ export async function handleConnectorApi(
       const normalized = normalizeConnectorInput(body, { secretRef: record.ref });
       if (!normalized.ok) {
         deleteWebhookSecret(record.ref);
-        jsonRes(res, 400, { ok: false, error: normalized.error });
+        jsonRes(res, 400, normalizeErrorBody(normalized.error));
         return true;
       }
       const connector = upsertConnector(normalized.connector);
@@ -518,9 +555,10 @@ export async function handleConnectorApi(
           id,
           prior,
           secretRef: prior.verify.secretRef,
+          secretWillBeWritten: (typeof body.secret === 'string' && !!body.secret) || body.rotateSecret === true,
         });
         if (!preflight.ok) {
-          jsonRes(res, 400, { ok: false, error: preflight.error });
+          jsonRes(res, 400, normalizeErrorBody(preflight.error));
           return true;
         }
         let generatedSecret: string | undefined;
@@ -538,7 +576,7 @@ export async function handleConnectorApi(
         }
         const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
         if (!normalized.ok) {
-          jsonRes(res, 400, { ok: false, error: normalized.error });
+          jsonRes(res, 400, normalizeErrorBody(normalized.error));
           return true;
         }
         const connector = upsertConnector(normalized.connector);

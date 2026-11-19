@@ -16,7 +16,7 @@ import {
   DEFAULT_CONTEXT_COMPACT_THRESHOLD,
 } from '../src/im/lark/card-builder.js';
 import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
-import { cliHasNoRawPassthroughSurface } from '../src/core/passthrough-commands.js';
+import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../src/core/passthrough-commands.js';
 import { setPromptOverrideResolver } from '../src/i18n/index.js';
 import {
   globalConfigPath,
@@ -56,6 +56,20 @@ function headerActions(card: any): any[] {
 
 function findButton(actions: any[], action: string): any {
   return actions.find((a: any) => a.tag === 'button' && a.value?.action === action);
+}
+
+/** The idle auto-compact toggle lives in the titled more-actions panel;
+ *  the button value carries the desired target state. */
+function idleCompactButton(card: any, desired: 'on' | 'off'): any {
+  const panel = card.elements.find((e: any) => e.tag === 'collapsible_panel');
+  const walk = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
+    n,
+    ...(Array.isArray(n.columns) ? walk(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
+    ...(Array.isArray(n.elements) ? walk(n.elements) : []),
+  ]);
+  return walk(panel?.elements ?? [])
+    .filter((n: any) => n?.tag === 'button')
+    .find((b: any) => b.value?.action === 'toggle_idle_compact' && b.value.desired === desired);
 }
 
 function build(opts: {
@@ -138,6 +152,11 @@ describe('buildStreamingCard: stop button (stop_turn)', () => {
 });
 
 describe('buildStreamingCard: compact button (compact_session)', () => {
+  it.each(['idle', 'working'])('renders the MiniMax compact button while %s without requiring usage metrics', status => {
+    const button = findButton(headerActions(build({ cliId: 'minimax', status })), 'compact_session');
+    expect(button).toBeTruthy();
+    expect(button.value).toMatchObject({ session_id: SID, root_id: ROOT, cli_id: 'minimax' });
+  });
   // 判据是「这个 CLI 有没有能收 /compact 的输入通道」，**不是**「有没有上下文百分比」。
   // 旧实现拿 percentUsed 当闸门，而只有 codex（native model_context_window）和 pi
   // （读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里没有任何
@@ -188,7 +207,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
     const offenders: string[] = [];
     for (const cliId of ALL_CLI_IDS) {
       // dsh 是运行时相关的：不传 dshRuntime ⇒ 谓词按 headless runner 判（fail-closed）。
-      if (!cliHasNoRawPassthroughSurface(cliId)) continue;
+      if (cliSupportsCompactAction(cliId)) continue;
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       if (findButton(headerActions(card), 'compact_session')) offenders.push(cliId);
     }
@@ -202,6 +221,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
     }
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
   });
 
   // dsh-tui 是 PTY 驱动的交互式 TUI（与 claude-code 同款交互模型），raw /compact 有效。
@@ -225,6 +245,57 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   it('does not let dshRuntime leak into an unrelated runner CLI', () => {
     const card = build({ status: 'working', cliId: 'mir', dshRuntime: 'tui' });
     expect(findButton(headerActions(card), 'compact_session')).toBeFalsy();
+  });
+});
+
+describe('buildStreamingCard: primary control row narrow-screen layout', () => {
+  /** Every top-level element that carries a primary control (terminal URL, retry, compact, stop,
+   *  takeover, close/disconnect). The 「更多操作」 panel is nested and never matches. */
+  const PRIMARY = new Set(['retry_last_task', 'compact_session', 'stop_turn', 'takeover', 'disconnect', 'close']);
+  const isPrimary = (b: any) => b?.tag === 'button' && (!!b.multi_url || PRIMARY.has(b.value?.action));
+  function primaryModules(card: any): any[] {
+    return card.elements.filter((e: any) =>
+      (e.actions ?? []).some(isPrimary)
+      || (e.columns ?? []).some((c: any) => (c.elements ?? []).some(isPrimary)));
+  }
+  const ids = (mod: any) => mod.actions.map((a: any) => a.value?.action ?? 'url');
+
+  // flow：窄屏按文字宽度横排、放不下才折行（不截断），桌面宽卡排法不变。
+  it.each([
+    ['working', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['analyzing', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['stalled', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['idle', ['url', 'compact_session', 'close']],
+    ['starting', ['url', 'compact_session', 'close']],
+  ] as const)('keeps all primary controls in ONE flow-layout action module while %s', (status, expected) => {
+    const card = build({ status, cliId: 'claude-code' });
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(expected);
+  });
+
+  it('applies the same layout to adopt cards (takeover / disconnect stay in the same module)', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'working' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, true, true, undefined,
+    ));
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(['url', 'compact_session', 'stop_turn', 'takeover', 'disconnect']);
+  });
+
+  it('applies the same layout to the retry-ready limited card', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'limited' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined,
+      { limited: true, kind: 'usage', retryAtMs: 0, retryLabel: '', retryReady: true } as any,
+    ));
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(['url', 'retry_last_task', 'compact_session', 'close']);
   });
 });
 
@@ -391,6 +462,17 @@ describe('buildStreamingCard: signature stability', () => {
 
 
 describe('session reasoning selector', () => {
+  it('shows next-turn scope for a confirmed CLI menu preference while displaying actual current effort', () => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort: 'high',
+      reasoningControl: { choices: ['high', 'max'], selected: 'max', pending: true, nextTurn: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(JSON.stringify(card)).toContain('下一轮生效');
+    expect(JSON.stringify(card)).not.toContain('下次冷启动');
+  });
+
   it.each([undefined, 'unrecognized'])('falls back to the saved choice when reported effort is %s', reasoningEffort => {
     const card = build({ cliId: 'codex', usage: {
       context: null, tokens: null, reasoningEffort,
@@ -416,5 +498,80 @@ describe('session reasoning selector', () => {
   it('does not invent a control without verified runtime support', () => {
     const card = build({ cliId: 'codex', usage: { context: null, tokens: null, reasoningEffort: 'high' } });
     expect(JSON.stringify(card)).not.toContain('set_reasoning_effort');
+  });
+});
+
+describe('buildStreamingCard: Kimi auto-compact on cache expiry toggle (toggle_kimi_expiry_compact)', () => {
+  const usageWith = (enabled: boolean) => ({ context: null, tokens: null, kimiCacheExpiryAutoCompact: { enabled } });
+  const button = (card: any, desired: 'on' | 'off') => {
+    const panel = card.elements.find((e: any) => e.tag === 'collapsible_panel');
+    const walk = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
+      n,
+      ...(Array.isArray(n.columns) ? walk(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
+      ...(Array.isArray(n.elements) ? walk(n.elements) : []),
+    ]);
+    return walk(panel?.elements ?? [])
+      .find((n: any) => n?.tag === 'button' && n.value?.action === 'toggle_kimi_expiry_compact' && n.value.desired === desired);
+  };
+
+  it('renders in the more-actions panel with the current state and the target state', () => {
+    const off = button(build({ status: 'idle', cliId: 'kimi', usage: usageWith(false) }), 'on');
+    expect(off.text.content).toContain('关');
+    expect(off.value.session_id).toBe(SID);
+    const on = button(build({ status: 'idle', cliId: 'kimi', usage: usageWith(true), locale: 'en' }), 'off');
+    expect(on.text.content).toMatch(/cache expiry: on/);
+  });
+
+  it('is not rendered without its snapshot state (non-Kimi or unsupported backend)', () => {
+    const card = build({ status: 'idle', cliId: 'claude-code', usage: { context: null, tokens: null, idleAutoCompact: { enabled: false, minutes: 55 } } });
+    expect(button(card, 'on')).toBeFalsy();
+    expect(button(card, 'off')).toBeFalsy();
+  });
+
+  it('follows the compact button\'s hidden-button setting', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle' as any, 'kimi' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
+    ));
+    expect(button(card, 'on')).toBeFalsy();
+    expect(button(card, 'off')).toBeFalsy();
+  });
+});
+
+describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', () => {
+  const usageWith = (enabled: boolean) => ({ context: null, tokens: null, idleAutoCompact: { enabled, minutes: 55 } });
+
+  it('renders in the more-actions panel, showing the current state and the target state', () => {
+    const off = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) }), 'on');
+    expect(off).toBeDefined();
+    expect(off.text.content).toContain('关');
+    const on = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) }), 'off');
+    expect(on).toBeDefined();
+    expect(on.text.content).toContain('开');
+    // The button carries the session binding the handler needs.
+    const card = build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) });
+    expect(off.value.session_id).toBe(SID);
+  });
+
+  it('localises the label', () => {
+    const button = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' }), 'off');
+    expect(button.text.content).toMatch(/idle/i);
+  });
+
+  it('is not rendered when the snapshot carries no toggle state (unsupported CLI/backend)', () => {
+    const card = build({ status: 'idle', cliId: 'gemini', usage: { context: null, tokens: null } });
+    expect(idleCompactButton(card, 'on')).toBeFalsy();
+    expect(idleCompactButton(card, 'off')).toBeFalsy();
+  });
+
+  it('follows the compact button\'s hidden-button setting', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
+    ));
+    expect(idleCompactButton(card, 'on')).toBeFalsy();
+    expect(idleCompactButton(card, 'off')).toBeFalsy();
   });
 });

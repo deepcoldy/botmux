@@ -1,0 +1,50 @@
+
+  > Legacy TRAE CLI data detected
+  Would you like to migrate detected data to the new TRAE CLI storage?
+  Select what to import:
+  Home
+    [✓] Migrate /tmp/home/.trae/traecli.yaml to /tmp/home/.trae/traecli.toml
+
+  Selected 1 of 1 item(s).
+    1. Proceed with selected
+    2. Skip for now
+    3. Don't ask again for the selected data
+    4. Don't ask again for all migration data
+  Use ↑/↓ to move, space to toggle, 1/2/3/4 to choose, a/n for all/none
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

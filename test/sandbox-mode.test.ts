@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   envSandboxMode,
   normalizeSandboxMode,
   normalizeScratchStorage,
   resolveSandboxMode,
+  resolveSpawnNetworkShape,
   sandboxBoolValue,
   sandboxIsActive,
+  sessionCardSandboxMode,
 } from '../src/adapters/cli/sandbox-mode.js';
+import { sandboxEnabled } from '../src/adapters/backend/sandbox.js';
 
 describe('normalizeSandboxMode', () => {
   it('maps legacy boolean/absent values', () => {
@@ -57,10 +60,44 @@ describe('envSandboxMode (BOTMUX_SANDBOX)', () => {
   });
 });
 
+describe('sandboxEnabled (global BOTMUX_SANDBOX force)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it.each(['1', 'oncall', 'scratch'])('BOTMUX_SANDBOX=%s forces the sandbox', raw => {
+    vi.stubEnv('BOTMUX_SANDBOX', raw);
+    expect(sandboxEnabled()).toBe(true);
+  });
+
+  it.each([undefined, '', '0', 'false'])('BOTMUX_SANDBOX=%s does not force it', raw => {
+    vi.stubEnv('BOTMUX_SANDBOX', raw);
+    expect(sandboxEnabled()).toBe(false);
+  });
+
+  it('treats an invalid value as forced (the worker refuses to spawn with it)', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', 'yes');
+    expect(sandboxEnabled()).toBe(true);
+  });
+});
+
 describe('resolveSandboxMode', () => {
-  it('env override wins', () => {
+  it('an active env value (1 / oncall / scratch) forces that mode on every bot', () => {
     expect(resolveSandboxMode({ configSandbox: 'oncall', envValue: 'scratch' })).toBe('scratch');
-    expect(resolveSandboxMode({ configSandbox: 'scratch', envValue: '0' })).toBe('off');
+    expect(resolveSandboxMode({ configSandbox: false, envValue: '1' })).toBe('oncall');
+    expect(resolveSandboxMode({ configSandbox: 'scratch', envValue: 'oncall' })).toBe('oncall');
+  });
+
+  it('an inactive env value (0 / false / empty / unset) never turns off a bot\'s own sandbox', () => {
+    for (const envValue of ['0', 'false', '', undefined]) {
+      expect(resolveSandboxMode({ configSandbox: true, envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: 'oncall', envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: 'scratch', envValue })).toBe('scratch');
+      expect(resolveSandboxMode({ configSandbox: false, readIsolation: true, envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: false, envValue })).toBe('off');
+    }
+  });
+
+  it('an invalid env value still fails closed even when the bot config is valid', () => {
+    expect(() => resolveSandboxMode({ configSandbox: true, envValue: 'no' })).toThrow(/invalid BOTMUX_SANDBOX/);
   });
 
   it('legacy readIsolation implies oncall', () => {
@@ -88,5 +125,70 @@ describe('normalizeScratchStorage', () => {
     expect(normalizeScratchStorage('disk')).toBe('disk');
     expect(normalizeScratchStorage('tmpfs')).toBe('tmpfs');
     expect(() => normalizeScratchStorage('ram')).toThrow(/invalid scratchStorage/);
+  });
+});
+
+describe('resolveSpawnNetworkShape (identity-model single source)', () => {
+  it('reports no sandbox and shared loopback for off', () => {
+    expect(resolveSpawnNetworkShape({ mode: 'off', sandboxNetwork: false })).toEqual({
+      sandboxEngaged: false, netEnabled: false, loopbackShared: true,
+    });
+    // Frozen network inputs must not matter when no sandbox engages.
+    expect(resolveSpawnNetworkShape({ mode: 'off' })).toEqual({
+      sandboxEngaged: false, netEnabled: false, loopbackShared: true,
+    });
+  });
+
+  it('oncall without policy follows the frozen network switch', () => {
+    expect(resolveSpawnNetworkShape({ mode: 'oncall', sandboxNetwork: true })).toEqual({
+      sandboxEngaged: true, netEnabled: true, loopbackShared: true,
+    });
+    expect(resolveSpawnNetworkShape({ mode: 'oncall', sandboxNetwork: false })).toEqual({
+      sandboxEngaged: true, netEnabled: false, loopbackShared: false,
+    });
+    expect(resolveSpawnNetworkShape({ mode: 'oncall' })).toEqual({
+      sandboxEngaged: true, netEnabled: true, loopbackShared: true,
+    });
+  });
+
+  it('oncall with a slirp policy keeps networking on but cuts host loopback', () => {
+    expect(resolveSpawnNetworkShape({
+      mode: 'oncall', sandboxNetwork: true, sandboxNetworkPolicy: { mode: 'slirp' },
+    })).toEqual({ sandboxEngaged: true, netEnabled: true, loopbackShared: false });
+  });
+
+  it('scratch follows the frozen network switch and ignores policy-shaped input', () => {
+    // networkPolicySupportError rejects policy outside oncall before spawn;
+    // the shape helper itself stays a pure table (scratch + policy is
+    // unreachable, not silently mis-shaped here).
+    expect(resolveSpawnNetworkShape({ mode: 'scratch', sandboxNetwork: false })).toEqual({
+      sandboxEngaged: true, netEnabled: false, loopbackShared: false,
+    });
+    expect(resolveSpawnNetworkShape({ mode: 'scratch', sandboxNetwork: true })).toEqual({
+      sandboxEngaged: true, netEnabled: true, loopbackShared: true,
+    });
+  });
+});
+
+describe('sessionCardSandboxMode (what the session card claims)', () => {
+  it('a session frozen off on a BOTMUX_SANDBOX-forced daemon is shown as the forced mode', () => {
+    expect(sessionCardSandboxMode(false, undefined, '1')).toBe('oncall');
+    expect(sessionCardSandboxMode(undefined, undefined, 'scratch')).toBe('scratch');
+    expect(sessionCardSandboxMode(true, undefined, 'scratch')).toBe('scratch');
+  });
+
+  it('without a force it shows the frozen decision', () => {
+    expect(sessionCardSandboxMode(true, undefined, undefined)).toBe('oncall');
+    expect(sessionCardSandboxMode('scratch', undefined, '0')).toBe('scratch');
+    expect(sessionCardSandboxMode(false, undefined, undefined)).toBe('off');
+  });
+
+  it("the worker's own engaged report wins: a bypassed sandbox is off, an unexplained engaged one is oncall", () => {
+    expect(sessionCardSandboxMode(true, false, '1')).toBe('off');
+    expect(sessionCardSandboxMode(false, true, undefined)).toBe('oncall');
+  });
+
+  it('a typo\'d env value (the worker refuses to start) falls back to the frozen mode instead of throwing', () => {
+    expect(sessionCardSandboxMode(false, undefined, 'yes')).toBe('off');
   });
 });

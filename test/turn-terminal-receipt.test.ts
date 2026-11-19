@@ -3,8 +3,11 @@
  * These tests drive the real worker IPC handler so the receipt cannot regress
  * into a prompt convention that depends on the model emitting visible output.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const botConfig: Record<string, unknown> = {
   larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex',
@@ -14,6 +17,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
   resolveCardKitId: vi.fn(async () => 'card_answer'),
   patchCardStreamElement: vi.fn(async () => {}),
+  insertCardElements: vi.fn(async () => {}),
+  replaceCardElement: vi.fn(async () => {}),
+  deleteCardElement: vi.fn(async () => {}),
   getMessageDetail: vi.fn(async () => ({
     items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
       content: JSON.stringify({ schema: '2.0', body: { elements: [
@@ -41,7 +47,11 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTurnTerminalReceiptCard: vi.fn((kind: string) => JSON.stringify({ kind })),
   buildTurnTerminalFooterPatch: vi.fn((card: string, kind: string) => {
     const footer = JSON.parse(card).body?.elements?.find((e: any) => e.element_id === 'botmux_reply_footer');
-    return footer ? { content: `${footer.content} terminal:${kind}` } : undefined;
+    if (!footer) return undefined;
+    const receipt = ` terminal:${kind}`;
+    return footer.content.endsWith(receipt)
+      ? { content: footer.content, alreadyApplied: true }
+      : { content: `${footer.content}${receipt}`, alreadyApplied: false };
   }),
   getCliDisplayName: vi.fn(() => 'TraeX'),
 }));
@@ -63,10 +73,15 @@ vi.mock('../src/bot-registry.js', () => ({
   resolveUsageDisplay: vi.fn(() => 'footer'),
 }));
 
+// Fresh per run, not a fixed path: a reply-card record left by an earlier run
+// already carries a messageId, so the unified case would PATCH locally where a
+// fresh CI runner POSTs — and that late POST is what this file must wait for.
+const dataDir = mkdtempSync(join(tmpdir(), 'botmux-terminal-receipt-'));
+
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    session: { dataDir: '/tmp/test-terminal-receipt' },
+    session: { get dataDir() { return dataDir; } },
     daemon: { backendType: 'pty', cliId: 'traex' },
   },
 }));
@@ -91,14 +106,38 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import {
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
+  __testOnly_setSuspendBackingVerifier,
   recordTurnExplicitMention,
 } from '../src/core/worker-pool.js';
-import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
+import { beginFinalOutputDelivery, waitForFinalOutputDeliveryDrain } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
-import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement } from '../src/im/lark/client.js';
+import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement, insertCardElements, replaceCardElement } from '../src/im/lark/client.js';
+import { nextStepIdle, noteNextStepTurnStarted } from '../src/core/next-step-suggestion.js';
+import { nextStepIo } from '../src/core/next-step-io.js';
+import { recapIdle } from '../src/core/turn-recap-state.js';
+import { turnRecapIo } from '../src/core/turn-recap-io.js';
+import { extractCotEntries, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { claudeAwaySummaryText, RecapRecorder } from '../src/services/turn-recap.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
+
+const sessions: DaemonSession[] = [];
+
+// Real samples (test/fixtures/turn-recap/README.md): a Claude Code turn's tool
+// calls and an away summary Claude Code wrote into its transcript.
+const recapFixture = (name: string) => readFileSync(resolve('test/fixtures/turn-recap', name), 'utf8').trim().split('\n')
+  .map(line => JSON.parse(line));
+const RECAP_ENTRIES = recapFixture('claude-tool-calls.jsonl').flatMap(record => extractCotEntries(record as TranscriptEvent)) as any[];
+const AWAY_SUMMARY = claudeAwaySummaryText(recapFixture('claude-away-summary.jsonl')[1])!;
+/** What the worker sends just before a completed terminal for a turn that made these calls. */
+function recapInputMsg(turnId: string): WorkerToDaemon {
+  const recorder = new RecapRecorder();
+  recorder.observe(RECAP_ENTRIES);
+  return { type: 'recap_input', turnId, ...recorder.input('/work/app') };
+}
 
 function makeDs(): DaemonSession {
   const fakeWorker = new EventEmitter() as any;
@@ -108,7 +147,7 @@ function makeDs(): DaemonSession {
   fakeWorker.pid = 99999;
   fakeWorker.stdout = new EventEmitter();
   fakeWorker.stderr = new EventEmitter();
-  return {
+  const ds = {
     session: {
       sessionId: 'sid-terminal-receipt',
       rootMessageId: 'om_root',
@@ -133,6 +172,28 @@ function makeDs(): DaemonSession {
     lastMessageAt: Date.now(),
     hasHistory: false,
   } as any;
+  sessions.push(ds);
+  return ds;
+}
+
+/** Invoke the real worker IPC handler exactly as EventEmitter#emit does —
+ * synchronously, back to back, in listener order — but keep each async
+ * listener's promise, so a test waits for the handler instead of a guessed delay. */
+function deliver(ds: DaemonSession, ...msgs: WorkerToDaemon[]): Promise<void> {
+  const worker = ds.worker as unknown as EventEmitter;
+  return Promise.all(msgs.flatMap(msg =>
+    worker.listeners('message').map(listener => listener.call(worker, msg)),
+  )).then(() => undefined);
+}
+
+/** Wait until every deferred receipt pipeline the handler fenced (strip
+ * retries, the interim re-decision) has finished. After the handler has
+ * returned, a strip that was going to be posted has been posted by now.
+ * Only work registered through beginFinalOutputDelivery is covered: the
+ * unified reply-card publication runs outside that fence, so its test waits
+ * for the POST itself — any new unfenced background write needs the same. */
+async function settle(ds: DaemonSession): Promise<void> {
+  expect(await waitForFinalOutputDeliveryDrain(ds, Date.now() + 10_000)).toBe(true);
 }
 
 function bindLarkTurn(ds: DaemonSession, turnId: string, root = 'om_exact_root'): void {
@@ -176,9 +237,16 @@ describe('independent turn terminal receipt', () => {
     } as any);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // A fenced delivery still running here would land in the next test, after
+    // its mockReset, and be counted against that test's assertions.
+    await Promise.all(sessions.splice(0).map(settle));
     vi.useRealTimers();
     vi.clearAllMocks();
+  });
+
+  afterAll(() => {
+    rmSync(dataDir, { recursive: true, force: true });
   });
 
   it('posts one completed strip for an ordinary Lark turn', async () => {
@@ -195,6 +263,32 @@ describe('independent turn terminal receipt', () => {
     expect(call[4]).toBe('om_turn_done');
     expect(call[5]?.replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_exact_root' });
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
+  });
+
+  it('still posts the strip when a suspend is queued for the turn, then carries the suspend out', async () => {
+    // The suspend route queues `botmux suspend` while the session works; the
+    // turn's terminal is where it may run. It must not take the worker before
+    // the terminal's own receipt work has started.
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      const ds = makeDs();
+      ds.initConfig = { backendType: 'tmux' } as any;
+      ds.lastScreenStatus = 'idle';
+      ds.pendingSuspendReason = 'manual_suspend';
+      bindLarkTurn(ds, 'om_turn_queued_suspend');
+      const worker = ds.worker as any;
+      __testOnly_setupWorkerHandlers(ds, worker);
+
+      await deliver(ds, terminalMsg('om_turn_queued_suspend'));
+
+      await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+      expect(buildTurnTerminalReceiptCard).toHaveBeenCalledWith('completed', expect.anything());
+      await vi.waitFor(() => expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' }));
+      expect(ds.worker).toBe(null);
+      expect(ds.pendingSuspendReason).toBeUndefined();
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
   });
 
   it.each(['traex', 'codex'] as const)('patches only the last standard reply footer (%s)', async cliId => {
@@ -227,6 +321,334 @@ describe('independent turn terminal receipt', () => {
     );
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
+
+  it('does not patch a footer that already carries the receipt (a replayed terminal)', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_replayed');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    vi.mocked(getMessageDetail).mockResolvedValueOnce({
+      items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
+        content: JSON.stringify({ schema: '2.0', body: { elements: [
+          { tag: 'markdown', content: 'answer' },
+          { tag: 'markdown', element_id: 'botmux_reply_footer', content: 'brand terminal:completed' },
+        ] } }),
+      } }],
+    } as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_replayed', messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    await deliver(ds, terminalMsg('om_turn_replayed'));
+    await settle(ds);
+    expect(getMessageDetail).toHaveBeenCalledWith('app_test', 'om_answer_card', { userCardContent: true });
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    // ...and it is not mistaken for an unpatchable card that needs a strip.
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('next-step row on the completed reply card (switch on: %s)', async enabled => {
+    if (enabled) botConfig.replyCardNextStep = true;
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_next');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_next', messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    await deliver(ds, terminalMsg('om_turn_next'));
+    await settle(ds);
+    expect(patchCardStreamElement).toHaveBeenCalledTimes(1);
+    await deliver(ds, { type: 'prompt_suggestion', text: 'CI 绿了就合', turnId: 'om_turn_next' });
+    await nextStepIdle(ds);
+    if (!enabled) {
+      expect(insertCardElements).not.toHaveBeenCalled();
+      return;
+    }
+    expect(insertCardElements).toHaveBeenCalledTimes(1);
+    const [app, cardId, placement, elements, sequence, uuid, messageId] = vi.mocked(insertCardElements).mock.calls[0];
+    expect([app, cardId, messageId]).toEqual(['app_test', 'card_answer', 'om_answer_card']);
+    expect(placement).toEqual({ type: 'insert_before', targetElementId: 'botmux_reply_footer' });
+    expect((elements[0] as any).element_id).toBe('botmux_next_step');
+    expect(JSON.stringify(elements[0])).toContain('CI 绿了就合');
+    // Strictly after the footer receipt's fixed CardKit sequence.
+    expect(sequence).toBeGreaterThan(1);
+    expect(uuid).toMatch(/^nxs_[0-9a-f]{40}$/);
+  });
+
+  it.each([true, false])('recap panel on the completed reply card (switch on: %s)', async enabled => {
+    if (enabled) botConfig.replyCardRecap = true;
+    const ds = makeDs();
+    ds.workingDir = '/work/app';
+    bindLarkTurn(ds, 'om_turn_recap');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_recap', messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    // A failed-then-settled turn: its first terminal was ambiguous.
+    await deliver(ds, terminalMsg('om_turn_recap', { status: 'ambiguous' }));
+    await deliver(ds, recapInputMsg('om_turn_recap'), terminalMsg('om_turn_recap'));
+    await settle(ds);
+    await recapIdle(ds);
+    await deliver(ds, { type: 'cli_recap', text: AWAY_SUMMARY, turnId: 'om_turn_recap' });
+    await recapIdle(ds);
+    if (!enabled) {
+      expect(insertCardElements).not.toHaveBeenCalled();
+      expect(replaceCardElement).not.toHaveBeenCalled();
+      return;
+    }
+    // On settle: the turn's facts, read before the terminal dropped its activity.
+    expect(insertCardElements).toHaveBeenCalledTimes(1);
+    const [app, cardId, placement, elements, sequence, uuid, messageId] = vi.mocked(insertCardElements).mock.calls[0];
+    expect([app, cardId, messageId]).toEqual(['app_test', 'card_answer', 'om_answer_card']);
+    expect(placement).toEqual({ type: 'insert_before', targetElementId: 'botmux_reply_footer' });
+    expect(elements[0]).toMatchObject({ tag: 'collapsible_panel', element_id: 'botmux_turn_recap', expanded: false });
+    expect(JSON.stringify(elements[0])).toContain('`src/utils/terminal-cells.ts`');
+    expect(sequence).toBeGreaterThan(1);
+    expect(uuid).toMatch(/^rcp_[0-9a-f]{40}$/);
+    // The CLI's own recap: the same panel, updated in place.
+    expect(replaceCardElement).toHaveBeenCalledTimes(1);
+    const replaced = vi.mocked(replaceCardElement).mock.calls[0];
+    expect(replaced.slice(0, 3)).toEqual(['app_test', 'card_answer', 'botmux_turn_recap']);
+    expect(JSON.stringify(replaced[3])).toContain(AWAY_SUMMARY);
+    expect(replaced[4]).toBeGreaterThan(sequence);
+    expect(replaced[6]).toBe('om_answer_card');
+  });
+
+  it('pairs a model recap request with its worker\'s answer only', async () => {
+    const ds = makeDs();
+    (ds.worker as any).connected = true;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const other = makeDs();
+    __testOnly_setupWorkerHandlers(other, other.worker as any);
+    let answer: string | undefined | null = null;
+    const pending = turnRecapIo.modelRecap(ds, 'PROMPT').then(text => { answer = text; });
+    const request = vi.mocked((ds.worker as any).send).mock.calls.map((call: any[]) => call[0])
+      .find((msg: any) => msg.type === 'recap_request');
+    expect(request).toEqual({ type: 'recap_request', requestId: expect.any(String), prompt: 'PROMPT' });
+    await deliver(ds, { type: 'recap_result', requestId: 'another-request', text: '别的回顾' });
+    await deliver(other, { type: 'recap_result', requestId: request.requestId, text: '另一个会话的回顾' });
+    await Promise.resolve();
+    expect(answer).toBeNull();
+    await deliver(ds, { type: 'recap_result', requestId: request.requestId, text: '已合入。', costUsd: 0.0015, inputTokens: 10724, outputTokens: 839 });
+    await pending;
+    expect(answer).toBe('已合入。');
+  });
+
+  it('makes no model recap call for a sandboxed session or on a host that confines every local CLI\'s credentials', () => {
+    botConfig.replyCardRecapModel = true;
+    const ds = makeDs();
+    const saved = { HOME: process.env.HOME, SESSION_DATA_DIR: process.env.SESSION_DATA_DIR };
+    const home = mkdtempSync(join(tmpdir(), 'recap-model-home-'));
+    process.env.HOME = home;
+    delete process.env.SESSION_DATA_DIR;
+    try {
+      expect(turnRecapIo.modelEnabled(ds)).toBe(true);
+      ds.session.sandbox = true as any;
+      expect(turnRecapIo.modelEnabled(ds)).toBe(false);
+      ds.session.sandbox = undefined;
+      // Device enrollment makes credential isolation mandatory for every local CLI.
+      mkdirSync(join(home, '.botmux', 'device-auth'), { recursive: true });
+      writeFileSync(join(home, '.botmux', 'device-auth', 'device.json'), '{}');
+      expect(turnRecapIo.modelEnabled(ds)).toBe(false);
+    } finally {
+      process.env.HOME = saved.HOME;
+      if (saved.SESSION_DATA_DIR === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = saved.SESSION_DATA_DIR;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('asks no worker that has gone away', async () => {
+    const ds = makeDs();
+    (ds.worker as any).connected = false;
+    await expect(turnRecapIo.modelRecap(ds, 'PROMPT')).resolves.toBeUndefined();
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+  });
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'does not promote an explicit %s card to completed',
+    async responseKind => {
+      const ds = makeDs();
+      bindLarkTurn(ds, `om_turn_${responseKind}`);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      await deliver(ds, {
+        type: 'explicit_reply_observed',
+        turnId: `om_turn_${responseKind}`,
+        messageId: `om_${responseKind}_card`,
+        responseKind,
+        terminalCarrier: 'standard_reply_card',
+      }, terminalMsg(`om_turn_${responseKind}`, {
+        outputDisposition: 'nothing_to_send',
+      }));
+      await settle(ds);
+
+      expect(patchCardStreamElement).not.toHaveBeenCalled();
+      expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+      expect(ds.terminalReceiptTurnIds?.has(`om_turn_${responseKind}`)).not.toBe(true);
+    },
+  );
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'keeps the explicit final carrier when a later %s send is observed',
+    async responseKind => {
+      const ds = makeDs();
+      bindLarkTurn(ds, `om_turn_final_then_${responseKind}`);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId: `om_turn_final_then_${responseKind}`,
+        messageId: 'om_final_card',
+        responseKind: 'final',
+        terminalCarrier: 'standard_reply_card',
+      } satisfies WorkerToDaemon);
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId: `om_turn_final_then_${responseKind}`,
+        messageId: `om_later_${responseKind}_card`,
+        responseKind,
+        terminalCarrier: 'standard_reply_card',
+      } satisfies WorkerToDaemon);
+      (ds.worker as any).emit('message', terminalMsg(`om_turn_final_then_${responseKind}`));
+
+      await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalled());
+      expect(getMessageDetail).toHaveBeenCalledWith(
+        'app_test',
+        'om_final_card',
+        { userCardContent: true },
+      );
+      expect(getMessageDetail).not.toHaveBeenCalledWith(
+        'app_test',
+        `om_later_${responseKind}_card`,
+        expect.anything(),
+      );
+    },
+  );
+
+  it('promotes a later explicit final over an earlier progress carrier', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_progress_then_final');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_progress_then_final',
+      messageId: 'om_progress_card',
+      responseKind: 'progress',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_progress_then_final',
+      messageId: 'om_final_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_progress_then_final'));
+
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalled());
+    expect(getMessageDetail).toHaveBeenCalledWith(
+      'app_test',
+      'om_final_card',
+      { userCardContent: true },
+    );
+    expect(getMessageDetail).not.toHaveBeenCalledWith(
+      'app_test',
+      'om_progress_card',
+      expect.anything(),
+    );
+  });
+
+  it('patches the fallback final card when progress preceded it and the terminal arrives in flight', async () => {
+    const ds = makeDs();
+    const turnId = 'om_turn_progress_then_fallback';
+    bindLarkTurn(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId,
+      messageId: 'om_progress_card',
+      responseKind: 'progress',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+
+    // Hold the transcript fallback delivery AFTER its in-flight registration
+    // but before the Lark round-trip resolves: the fallback final's carrier is
+    // recorded only once this resolves — the exact ordered-IPC window in which
+    // the worker's back-to-back turn_terminal reaches the daemon.
+    let releaseDelivery: ((messageId: string) => void) | undefined;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>(resolve => { releaseDelivery = resolve; }) as any,
+    );
+    (ds.worker as any).emit('message', {
+      type: 'final_output',
+      sessionId: 'sid-terminal-receipt',
+      content: '最终答复正文',
+      lastUuid: 'uuid-fallback-final',
+      turnId,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg(turnId));
+
+    // The card render has an async lead-in; wait until the send actually
+    // starts (the Promise executor assigns releaseDelivery synchronously),
+    // not just for the in-flight drain registration.
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(
+      ds.finalOutputDeliveriesByTurn?.get(turnId)?.size ?? 0,
+    ).toBeGreaterThanOrEqual(1);
+    // While the fallback final is still in flight the interim card is not
+    // promoted and no independent strip is posted.
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    expect(getMessageDetail).not.toHaveBeenCalled();
+    expect(ds.terminalReceiptTurnIds?.has(turnId)).not.toBe(true);
+
+    releaseDelivery!('om_fallback_final_card');
+
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalledWith(
+      'app_test', 'card_answer', 'botmux_reply_footer',
+      { content: 'brand terminal:completed' }, 1,
+      expect.stringMatching(/^trf_[0-9a-f]{47}$/), 'om_fallback_final_card',
+    ));
+    // The interim progress card is never patched, and the sole sessionReply
+    // call is the fallback card delivery itself — no independent strip.
+    expect(getMessageDetail).not.toHaveBeenCalledWith(
+      'app_test', 'om_progress_card', expect.anything(),
+    );
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    // The claim is taken only after the drain, once the final has landed.
+    expect(ds.terminalReceiptTurnIds?.has(turnId)).toBe(true);
+  });
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'keeps an interim-only %s turn footerless when no fallback final lands',
+    async responseKind => {
+      const ds = makeDs();
+      const turnId = `om_turn_${responseKind}_no_fallback`;
+      bindLarkTurn(ds, turnId);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      // A bare completed terminal (no final_output and no nothing-to-send
+      // flag, e.g. the RPC hydration window) must not promote the interim card.
+      await deliver(ds, {
+        type: 'explicit_reply_observed',
+        turnId,
+        messageId: `om_${responseKind}_card`,
+        responseKind,
+        terminalCarrier: 'standard_reply_card',
+      }, terminalMsg(turnId));
+      await settle(ds);
+
+      expect(patchCardStreamElement).not.toHaveBeenCalled();
+      expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+      expect(ds.terminalReceiptTurnIds?.has(turnId)).not.toBe(true);
+    },
+  );
 
   it('treats a suppression sentinel as completed when an explicit body was sent', async () => {
     const ds = makeDs();
@@ -400,9 +822,9 @@ describe('independent turn terminal receipt', () => {
       bindLarkTurn(ds, `om_turn_${status}`);
       __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-      (ds.worker as any).emit('message', terminalMsg(`om_turn_${status}`, { status }));
+      await deliver(ds, terminalMsg(`om_turn_${status}`, { status }));
+      await settle(ds);
 
-      await new Promise(resolve => setTimeout(resolve, 20));
       expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
     },
   );
@@ -413,12 +835,15 @@ describe('independent turn terminal receipt', () => {
     const finishAnswer = beginFinalOutputDelivery(ds, 'om_turn_ordered');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_ordered'));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await deliver(ds, terminalMsg('om_turn_ordered'));
+    // The handler has returned with the strip claimed, yet nothing is posted
+    // while the same turn's answer is still in flight.
+    expect(ds.terminalReceiptTurnIds?.has('om_turn_ordered')).toBe(true);
     expect(sessionReplyMock).not.toHaveBeenCalled();
 
     finishAnswer();
-    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    await settle(ds);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
   });
 
   it('deduplicates duplicate terminal events with one stable provider UUID', async () => {
@@ -439,11 +864,12 @@ describe('independent turn terminal receipt', () => {
     const finishAnswer = beginFinalOutputDelivery(ds, 'om_turn_old');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_old'));
+    const handled = deliver(ds, terminalMsg('om_turn_old'));
     ds.currentTurnId = 'om_turn_new';
     finishAnswer();
 
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await handled;
+    await settle(ds);
     expect(sessionReplyMock).not.toHaveBeenCalled();
     expect(ds.terminalReceiptTurnIds?.has('om_turn_old')).toBe(true);
   });
@@ -458,9 +884,9 @@ describe('independent turn terminal receipt', () => {
     bindLarkTurn(ds, 'om_turn_excluded');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_excluded'));
+    await deliver(ds, terminalMsg('om_turn_excluded'));
+    await settle(ds);
 
-    await new Promise(resolve => setTimeout(resolve, 20));
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
@@ -492,10 +918,72 @@ describe('independent turn terminal receipt', () => {
     bindLarkTurn(ds, 'om_turn_unified');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_unified'));
-
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await deliver(ds, terminalMsg('om_turn_unified'));
+    await settle(ds);
+    // The unified reply card owns the terminal UI and publishes it in the
+    // background (store lock + durable write, then POST). Wait for that POST —
+    // the reply-card transport is the sender that passes a beforeWrite guard;
+    // left running, it lands in the next test after its mockReset.
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledWith(
+      expect.anything(), expect.any(String), 'interactive', 'app_test', 'om_turn_unified',
+      expect.objectContaining({ beforeWrite: expect.any(Function) }),
+    ), { timeout: 5_000, interval: 20 });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+  });
+
+  it('clears a unified card\'s next-step row after the worker was replaced', async () => {
+    Object.assign(botConfig, { cliId: 'codex', replyCardMode: 'unified', replyCardNextStep: true });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    bindLarkTurn(ds, 'om_turn_unified_next');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    await deliver(ds, terminalMsg('om_turn_unified_next'));
+    await settle(ds);
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1), { timeout: 5_000, interval: 20 });
+    await deliver(ds, { type: 'prompt_suggestion', text: '跑一下 bun test', turnId: 'om_turn_unified_next' });
+    await vi.waitFor(async () => {
+      await nextStepIdle(ds);
+      expect(vi.mocked(updateMessage).mock.calls.some(call => String(call[2]).includes('botmux_next_step'))).toBe(true);
+    }, { timeout: 5_000, interval: 20 });
+    // The worker that settled this turn is gone (suspend / restart / crash)
+    // before the next turn starts; the row must still come off.
+    const replacement = new EventEmitter() as any;
+    replacement.killed = false;
+    replacement.send = vi.fn();
+    ds.worker = replacement;
+    vi.mocked(updateMessage).mockClear();
+    noteNextStepTurnStarted(ds, 'om_turn_after_restart', nextStepIo);
+    await nextStepIdle(ds);
+    const patches = vi.mocked(updateMessage).mock.calls.map(call => String(call[2]));
+    expect(patches.length).toBeGreaterThan(0);
+    expect(patches.at(-1)).not.toContain('botmux_next_step');
+  });
+
+  it('renders the recap panel on a unified reply card and updates it with the CLI recap', async () => {
+    Object.assign(botConfig, { cliId: 'codex', replyCardMode: 'unified', replyCardRecap: true });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.workingDir = '/work/app';
+    bindLarkTurn(ds, 'om_turn_unified_recap');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    await deliver(ds, recapInputMsg('om_turn_unified_recap'), terminalMsg('om_turn_unified_recap'));
+    await settle(ds);
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1), { timeout: 5_000, interval: 20 });
+    const patched = () => vi.mocked(updateMessage).mock.calls.map(call => String(call[2]));
+    await vi.waitFor(async () => {
+      await recapIdle(ds);
+      expect(patched().some(card => card.includes('botmux_turn_recap') && card.includes('terminal-cells.ts'))).toBe(true);
+    }, { timeout: 5_000, interval: 20 });
+    // A replayed terminal for the same turn keeps what the panel knows.
+    await deliver(ds, terminalMsg('om_turn_unified_recap'));
+    await settle(ds);
+    await deliver(ds, { type: 'cli_recap', text: AWAY_SUMMARY, turnId: 'om_turn_unified_recap' });
+    await vi.waitFor(async () => {
+      await recapIdle(ds);
+      expect(patched().at(-1)).toContain(AWAY_SUMMARY.slice(0, 30));
+      expect(patched().at(-1)).toContain('terminal-cells.ts');
+    }, { timeout: 5_000, interval: 20 });
   });
 
   it('excludes silent schedules, VC receivers, and turns without a frozen Lark context', async () => {
@@ -503,20 +991,21 @@ describe('independent turn terminal receipt', () => {
     bindLarkTurn(schedule, 'schedule:task:fire');
     armSilentScheduledTurn(schedule, 'schedule:task:fire');
     __testOnly_setupWorkerHandlers(schedule, schedule.worker as any);
-    (schedule.worker as any).emit('message', terminalMsg('schedule:task:fire'));
+    const scheduleHandled = deliver(schedule, terminalMsg('schedule:task:fire'));
 
     const vc = makeDs();
     (vc.session as any).vcMeetingReceiver = true;
     bindLarkTurn(vc, 'om_turn_vc');
     __testOnly_setupWorkerHandlers(vc, vc.worker as any);
-    (vc.worker as any).emit('message', terminalMsg('om_turn_vc'));
+    const vcHandled = deliver(vc, terminalMsg('om_turn_vc'));
 
     const api = makeDs();
     api.currentTurnId = 'trigger-api';
     __testOnly_setupWorkerHandlers(api, api.worker as any);
-    (api.worker as any).emit('message', terminalMsg('trigger-api'));
+    const apiHandled = deliver(api, terminalMsg('trigger-api'));
 
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await Promise.all([scheduleHandled, vcHandled, apiHandled]);
+    await Promise.all([schedule, vc, api].map(settle));
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 

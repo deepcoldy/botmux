@@ -1,76 +1,46 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { withCardRuntimeIdentity } from '../src/core/card-runtime-identity.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 /**
- * Source-lock for the Codex active-runtime wiring (PR #780 review point ①).
- *
- * Codex's live model/effort ride the `active_runtime` IPC channel, published
- * from every `turn_context` record (the reliable per-turn source — the optional
- * `thread_settings_applied` snapshot is absent in many sessions). The
- * `codex_service_tier` handler is therefore scoped to the ⚡ service-tier badge
- * only and must NOT also write ds.activeModel/ds.activeReasoningEffort (that
- * would race the active_runtime writer and could clobber the good value with a
- * stale one). The worker-generation reset still clears those fields alongside
- * codexServiceTier so a respawn's empty window cannot leave a stale runtime tail
- * on the card (review point ②).
+ * Card runtime identity (PR #780 review point ⑤): `snapshot.tokens.model` is
+ * the RAW transcript model and, for relay-style CLIs, an internal routing code
+ * (ark/relay-code) that must never surface on a user card. The card model comes
+ * only from the wired active runtime or the user-configured launch model.
  */
-const workerPool = readFileSync(
-  resolve(__dirname, '../src/core/worker-pool.ts'),
-  'utf8',
-);
-const worker = readFileSync(
-  resolve(__dirname, '../src/worker.ts'),
-  'utf8',
-);
-
-function sliceBetween(source: string, startMarker: string, endMarker: string): string {
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start + startMarker.length);
-  return source.slice(start, end);
+function session(extra: Partial<DaemonSession> = {}, model?: string): DaemonSession {
+  return {
+    larkAppId: 'cli_runtime_identity',
+    session: { sessionId: 'runtime-identity', cliId: 'codex', ...(model ? { model } : {}) },
+    ...extra,
+  } as unknown as DaemonSession;
 }
 
-describe('Codex active-runtime wiring (source lock)', () => {
-  it('the codex_service_tier handler does NOT seed activeModel/effort (that races active_runtime)', () => {
-    const handler = sliceBetween(workerPool, "case 'codex_service_tier':", "case 'screen_update':");
-    expect(handler).toContain("effectiveCliId === 'codex'");
-    // Model/effort must flow through active_runtime, never the tier handler.
-    expect(handler).not.toContain('ds.activeModel = ds.codexServiceTier');
-    expect(handler).not.toContain('ds.activeReasoningEffort = ds.codexServiceTier');
+const rawSnapshot = {
+  context: null,
+  tokens: { in: 10, out: 2, model: 'ark-relay-code-123' },
+} as never;
+
+describe('card runtime identity', () => {
+  it('never surfaces the raw transcript model when no runtime is known', () => {
+    const card = withCardRuntimeIdentity(session(), rawSnapshot, 'codex');
+    expect(card.model).toBeUndefined();
   });
 
-  it('the codex bridge publishes turn_context runtime through active_runtime', () => {
-    // Live ingest + split-live attach both surface Codex model/effort via the
-    // shared publishActiveRuntime path (same channel TRAE uses), reading the
-    // drain's latestModel/latestReasoningEffort (from turn_context).
-    const codexIngest = sliceBetween(worker, "if (structuredBridgeIs('codex')) {\n    const codex = result as CodexDrainResult;", '}');
-    expect(codexIngest).toContain('publishActiveRuntime({');
-    expect(codexIngest).toContain('codex.latestModel');
-    expect(codexIngest).toContain('codex.latestReasoningEffort');
-    // Baseline/attach paths seed via a bounded backward read.
-    expect(worker).toContain('publishActiveRuntime(readLatestCodexRuntime(rolloutPath));');
+  it('prefers the live active runtime, then the configured launch model', () => {
+    expect(withCardRuntimeIdentity(
+      session({ activeModel: 'gpt-5.5', activeReasoningEffort: 'high' }, 'configured-model'),
+      rawSnapshot,
+      'codex',
+    )).toMatchObject({ model: 'gpt-5.5', reasoningEffort: 'high' });
+    expect(withCardRuntimeIdentity(session({}, 'configured-model'), rawSnapshot, 'codex').model)
+      .toBe('configured-model');
   });
-
-  it('the worker-generation reset clears active runtime alongside codexServiceTier', () => {
-    // Both the tier and the active runtime are authority of the exact worker
-    // generation; the reset lives where codexServiceTier is cleared.
-    const reset = sliceBetween(workerPool, 'ds.codexServiceTier = undefined;', 'const handlerSession');
-    expect(reset).toContain('ds.activeModel = undefined;');
-    expect(reset).toContain('ds.activeReasoningEffort = undefined;');
-    expect(reset).toContain('ds.pendingActiveRuntimeCardRefresh = undefined;');
-  });
-
-  it('the streaming usage snapshot never falls back to the raw transcript model', () => {
-    // review point ⑤: snapshot.tokens.model is the RAW transcript model and for
-    // relay-style CLIs is an internal routing code (ark/relay-code) that must
-    // not surface on a user card. Model comes only from wired runtime or the
-    // user-configured launch model.
-    const fn = sliceBetween(
-      workerPool,
-      'export function getDaemonStreamingCardUsageSnapshot(',
-      'import { normalizeBrand }',
-    );
-    expect(fn).not.toContain('snapshot.tokens?.model');
-    expect(fn).toContain('withCardRuntimeIdentity(ds, snapshot, effectiveCliId)');
+  it('shows the current Auto context variant and clears the previous variant on native defaults', () => {
+    const subject = session({ activeModel: 'gpt-6-astra', activeModelBackendVariant: 'max' });
+    subject.session.modelBackendVariant = 'standard';
+    expect(withCardRuntimeIdentity(subject, rawSnapshot, 'traex').modelBackendVariant).toBe('max');
+    subject.activeModelBackendVariant = null;
+    expect(withCardRuntimeIdentity(subject, { ...rawSnapshot, modelBackendVariant: 'max' }, 'traex').modelBackendVariant).toBeUndefined();
   });
 });

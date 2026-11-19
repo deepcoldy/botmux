@@ -202,6 +202,10 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
         previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',
         canManageHost,
         ...(actorScope?.startsWith('on_') ? { principalUnionId: actorScope } : {}),
+        // 平台终端子域默认免登录只读：没有 actor 的非 owner 就是没登录的访客（#2004）。
+        // 老版本平台对已登录的人也不注入 actor，此时两者无法区分 ⇒ 一律按免登录处理
+        // （能看、不能唤醒挂起会话）。这是有意的 fail-closed，不是漏判。
+        ...(!actorScope && platformRole !== 'owner' ? { anonymous: true as const } : {}),
       };
     }
     return {
@@ -216,7 +220,9 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       canManageHost: true,
     };
   }
-  return input.h5 && !input.h5.resultOnly ? {
+  // Path-scoped H5 sessions (owner-bound results, the workflow sidebar) are no
+  // Dashboard identity at all: every other route sees an anonymous request.
+  return input.h5 && !input.h5.resultOnly && !input.h5.workflowViewOnly ? {
     ...input.h5,
     ...(input.h5.unionId ? { principalUnionId: input.h5.unionId } : {}),
     terminalCapability: 'controlled',

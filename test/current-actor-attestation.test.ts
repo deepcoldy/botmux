@@ -1,14 +1,16 @@
-import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  attestCurrentExecutionLoopbackPeer,
   attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from '../src/core/current-actor-attestation.js';
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+import { __resetLoopbackPeersCacheForTest } from '../src/utils/loopback-peers.js';
 
 function procStat(pid: number, ppid: number, start: string): string {
   const tail = ['S', String(ppid), '1', '1', '0', '-1', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', start];
@@ -61,7 +63,7 @@ function activeScheduledSession(): any {
 }
 
 describe('daemon current actor attestation', () => {
-  it('derives the HTTP client pid from the live kernel socket tuple', () => {
+  it('derives the HTTP client pid from the live kernel socket tuple', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-'));
     mkdirSync(join(procRoot, 'net'), { recursive: true });
     writeFileSync(join(procRoot, 'net', 'tcp'), [
@@ -73,7 +75,7 @@ describe('daemon current actor attestation', () => {
     mkdirSync(join(procRoot, '101', 'fd'), { recursive: true });
     symlinkSync('socket:[4242]', join(procRoot, '101', 'fd', '7'));
 
-    expect(resolveLoopbackPeerProcesses({
+    expect(await resolveLoopbackPeerProcesses({
       remoteAddress: '127.0.0.1',
       remotePort: 50_000,
       localPort: 7_951,
@@ -81,10 +83,37 @@ describe('daemon current actor attestation', () => {
     })).toEqual({ ok: true, peer: { pid: 101, procStart: '2000' } });
   });
 
-  it('rejects a non-loopback request before process lookup', () => {
-    expect(resolveLoopbackPeerProcesses({
+  it('rejects a non-loopback request before process lookup', async () => {
+    expect(await resolveLoopbackPeerProcesses({
       remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951,
     })).toEqual({ ok: false, reason: 'not_loopback' });
+  });
+
+  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-env-'));
+    mkdirSync(join(procRoot, 'net'), { recursive: true });
+    // No client-side tuple in this host's tables → a remote peer could never
+    // pass; an env-allowed LOCAL peer that reaches here gets peer_unresolved,
+    // proving the address ring (not the inode ring) was relaxed.
+    writeFileSync(join(procRoot, 'net', 'tcp'), 'sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n');
+    writeFileSync(join(procRoot, 'net', 'tcp6'), '');
+    const prev = process.env.BOTMUX_LOOPBACK_PEERS;
+    process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.1';
+    __resetLoopbackPeersCacheForTest();
+    try {
+      expect(await resolveLoopbackPeerProcesses({
+        remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951, procRoot,
+      })).toEqual({ ok: false, reason: 'peer_unresolved' });
+      expect(await resolveLoopbackPeerProcesses({
+        remoteAddress: '10.0.0.2', remotePort: 50_000, localPort: 7_951, procRoot,
+      })).toEqual({ ok: false, reason: 'not_loopback' });
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_LOOPBACK_PEERS;
+      else process.env.BOTMUX_LOOPBACK_PEERS = prev;
+      __resetLoopbackPeersCacheForTest();
+      unlinkSync(join(procRoot, 'net', 'tcp'));
+      unlinkSync(join(procRoot, 'net', 'tcp6'));
+    }
   });
 
   it('binds a live client descendant to the in-memory turn caller', async () => {
@@ -129,8 +158,87 @@ describe('daemon current actor attestation', () => {
         openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
       }),
       procRoot,
-      expectedScheduledTurnId: SCHEDULED_TURN_ID,
     })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('proves an ownerless schedule child tool actor without creating a workflow caller', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    delete ds.managedTurnOrigin.callerOpenId;
+    ds.scheduledTurnCallers = undefined;
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    const request = () => resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    });
+
+    await expect(request()).resolves.toMatchObject({ ok: true });
+    expect(ds.managedTurnOrigin.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+
+    ds.scheduledToolActors = undefined;
+    await expect(request()).resolves.toEqual({
+      ok: false, error: 'current_actor_unverified',
+    });
+
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => {
+        ds.scheduledToolActors = undefined;
+        return { openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com' };
+      },
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+  });
+
+  it('hides the scheduled tool actor from attestation callers that do not opt in', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    delete ds.managedTurnOrigin.callerOpenId;
+    ds.scheduledTurnCallers = undefined;
+    ds.scheduledToolActors = new Map([[SCHEDULED_TURN_ID, {
+      openId: 'ou_scheduler', unionId: 'on_scheduler',
+    }]]);
+    const base = {
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      procRoot,
+    };
+
+    // Workflow / current-execution / session-auth callers never set the
+    // opt-in: the execution proof stays callerless rather than promoting the
+    // exact-turn tool actor into a human caller, and the turn proof (which
+    // requires an ou_ caller) is refused outright.
+    const silentProof = attestCurrentExecutionLoopbackPeer(base);
+    expect(silentProof?.callerOpenId).toBeUndefined();
+    expect(attestCurrentTurnLoopbackPeer(base)).toBeNull();
+    expect(attestCurrentExecutionLoopbackPeer({
+      ...base, expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    })).toBeNull();
+
+    // Only the two narrow identity routes opt in explicitly.
+    expect(attestCurrentExecutionLoopbackPeer({ ...base, allowScheduledToolActor: true }))
+      .toMatchObject({ callerOpenId: 'ou_scheduler' });
+    expect(attestCurrentTurnLoopbackPeer({ ...base, allowScheduledToolActor: true }))
+      .toMatchObject({ callerOpenId: 'ou_scheduler' });
   });
 
   it('rejects a missing, different, or cleaned-up scheduled turn', async () => {
@@ -296,6 +404,29 @@ describe('daemon current actor attestation', () => {
     expect(resolveIdentity).not.toHaveBeenCalled();
   });
 
+  it('fails closed when a mid-ancestor stat between peer and trusted root is unreadable', async () => {
+    // Lineage: peer 101 -> 102 -> trusted CLI root 100. The walk must not skip
+    // an unreadable hop to "find" the root above it; the peer's own stat stays
+    // readable so this exercises the in-walk catch, not peer resolution.
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 102, 100, '1200');
+    writeProc(procRoot, 101, 102, '1100');
+    const input = {
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '1100' },
+      findSession: () => activeSession(),
+      procRoot,
+    };
+    // Positive control: the same chain is attested while the hop is readable.
+    expect(resolveDaemonCurrentExecution(input)).toMatchObject({
+      schema: 'botmux.current-execution.v1', status: 'verified', sessionId: 's1', turnId: 'om_turn',
+    });
+    rmSync(join(procRoot, '102', 'stat'), { force: true });
+    expect(resolveDaemonCurrentExecution(input)).toBeNull();
+  });
+
   it('rejects a new descendant reached through an old-turn child', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
     writeProc(procRoot, 90, 1, '900');
@@ -347,6 +478,30 @@ describe('daemon current actor attestation', () => {
       expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: 'om_turn' });
       // Incremental auth uses this same proof before creating a user grant.
       expect(attestCurrentTurnLoopbackPeer(input)).toMatchObject({ callerOpenId: 'ou_current', turnId: 'om_turn' });
+    });
+
+    it('requires the App runner to attest its nested app-server before new tools can cross turns', async () => {
+      const { procRoot, ds, check, input } = fixture();
+      writeProc(procRoot, 95, 1, '950');
+      writeProc(procRoot, 100, 95, '1000');
+      symlinkSync('/usr/bin/node', join(procRoot, '95', 'exe'));
+      ds.session.cliId = 'codex';
+      ds.localProcessAttestation.cliPid = 95;
+      ds.localProcessAttestation.cliProcStart = '950';
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('95:950');
+      writeFileSync(join(procRoot, '100', 'cmdline'), 'codex\0app-server\0');
+      // The runner is the CLI entry; the persistent native engine below it
+      // must not be mistaken for a previous-turn tool.
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
+      ds.localProcessAttestation.enginePid = 100;
+      ds.localProcessAttestation.engineProcStart = '1000';
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified' });
+      await expect(check()).resolves.toMatchObject({ ok: true });
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('102:2000');
+      writeProc(procRoot, 103, 102, '3000');
+      await expect(check(103, '3000')).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeProc(procRoot, 100, 95, 'recycled');
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
     });
 
     it.each([
@@ -411,6 +566,119 @@ describe('daemon current actor attestation', () => {
         return { openId: 'ou_current', type: 'user' as const, email: 'current@example.com' };
       });
       await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
+  });
+
+  describe('native Codex behind a launcher root', () => {
+    function launcherFixture() {
+      const procRoot = mkdtempSync(join(tmpdir(), 'actor-codex-launcher-'));
+      writeProc(procRoot, 90, 1, '900');
+      writeProc(procRoot, 99, 1, '990');
+      writeProc(procRoot, 100, 99, '1000');
+      writeProc(procRoot, 101, 100, '1100');
+      writeProc(procRoot, 102, 101, '2000');
+      symlinkSync('/usr/bin/node', join(procRoot, '99', 'exe'));
+      symlinkSync('/release/bin/codex', join(procRoot, '100', 'exe'));
+      symlinkSync('/release/bin/codex-code-mode-host', join(procRoot, '101', 'exe'));
+      writeFileSync(join(procRoot, '100', 'cmdline'), 'codex\0');
+      writeFileSync(join(procRoot, '101', 'cmdline'), 'codex-code-mode-host\0');
+      const ds = activeSession();
+      ds.session.cliId = 'codex';
+      ds.localProcessAttestation.cliPid = 99;
+      ds.localProcessAttestation.cliProcStart = '990';
+      ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '101:1100'];
+      const attest = (pid = 102, procStart = '2000', onRefusal?: (reason: string) => void) =>
+        resolveDaemonCurrentExecution({
+          sessionId: 's1', peer: { pid, procStart }, findSession: () => ds, procRoot, onRefusal,
+        });
+      return { procRoot, ds, attest };
+    }
+
+    it('accepts a new tool below the pre-existing native codex and its host', () => {
+      const { attest } = launcherFixture();
+      expect(attest()).toMatchObject({ status: 'verified', turnId: 'om_turn' });
+    });
+
+    it('does not traverse an old direct child named codex when the session does not run Codex', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      ds.session.cliId = 'claude';
+      rmSync(join(procRoot, '99', 'exe'));
+      symlinkSync('/usr/local/bin/claude', join(procRoot, '99', 'exe'));
+      writeProc(procRoot, 120, 100, '4000');
+      expect(attest(120, '4000')).toBeNull();
+    });
+
+    it('does not let the native codex itself claim the turn', () => {
+      const { attest } = launcherFixture();
+      expect(attest(100, '1000')).toBeNull();
+    });
+
+    it('still refuses a tool below a pre-existing old tool', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      writeProc(procRoot, 103, 100, '1300');
+      writeProc(procRoot, 104, 103, '3000');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('103:1300');
+      expect(attest(104, '3000')).toBeNull();
+    });
+
+    it('refuses a native codex whose parent is not a trusted root', () => {
+      const { procRoot, attest } = launcherFixture();
+      writeProc(procRoot, 98, 1, '980');
+      writeProc(procRoot, 100, 98, '1000');
+      expect(attest()).toBeNull();
+    });
+
+    it('refuses a native codex spawned by a non-root intermediate process under a trusted root', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      // A node launcher (98) is a direct child of the trusted root (99) but is
+      // not itself a root. A native codex (105) it spawned is only traversable
+      // when its OWN parent is a trusted root (isNativeCodexProcess's
+      // trustedRootPids.has(parent) guard); merely having a trusted grandparent
+      // must not let it through.
+      writeProc(procRoot, 98, 99, '980');
+      symlinkSync('/usr/bin/node', join(procRoot, '98', 'exe'));
+      writeProc(procRoot, 105, 98, '1050');
+      symlinkSync('/release/bin/codex', join(procRoot, '105', 'exe'));
+      writeFileSync(join(procRoot, '105', 'cmdline'), 'codex\0');
+      writeProc(procRoot, 106, 105, '3000');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('105:1050');
+      expect(attest(106, '3000')).toBeNull();
+    });
+
+    it('refuses a nested codex below a native codex root and reports the stop', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      ds.localProcessAttestation.cliPid = 100;
+      ds.localProcessAttestation.cliProcStart = '1000';
+      writeProc(procRoot, 110, 100, '1500');
+      writeProc(procRoot, 111, 110, '3000');
+      symlinkSync('/release/bin/codex', join(procRoot, '110', 'exe'));
+      writeFileSync(join(procRoot, '110', 'cmdline'), '/release/bin/codex\0exec\0');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('110:1500');
+      const reasons: string[] = [];
+      expect(attest(111, '3000', r => reasons.push(r))).toBeNull();
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('pid 110 comm "proc 110" was pre-existing');
+      expect(reasons[0]).toContain('trusted roots 100');
+    });
+
+    it('reports which precondition refused the proof', () => {
+      const { ds, attest } = launcherFixture();
+      ds.managedTurnOrigin.capability = undefined;
+      const reasons: string[] = [];
+      expect(attest(102, '2000', r => reasons.push(r))).toBeNull();
+      expect(reasons).toEqual(['no capability']);
+    });
+
+    it('reports where the lineage walk stopped and the trusted roots', () => {
+      const { procRoot, ds, attest } = launcherFixture();
+      writeProc(procRoot, 103, 100, '1300');
+      writeProc(procRoot, 104, 103, '3000');
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('103:1300');
+      const reasons: string[] = [];
+      expect(attest(104, '3000', r => reasons.push(r))).toBeNull();
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('pid 103 comm "proc 103" was pre-existing');
+      expect(reasons[0]).toContain('trusted roots 99');
     });
   });
 

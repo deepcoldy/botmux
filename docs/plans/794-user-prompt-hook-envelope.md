@@ -27,7 +27,7 @@
 |---|---|---|
 | `invisible-hook` | UserPromptSubmit + additionalContext，注入为不可见 system-reminder | claude-code（已实测 stdin 协议，见 §8）；seed 等 claude fork 待 spike 验证 |
 | `visible-context` | 支持 hook 但渲染可见 | codex（openai/codex#16933 修复前）→ 不启用 |
-| `none` | 无 hook 机制 | gemini / cursor / opencode / 其余 |
+| `none` | 无 hook 机制 | cursor / opencode / 其余 |
 
 在 `CliAdapter` 接口加能力位（沿用 `supportsReadIsolation` / `supportsTypeAhead` 既有模式，types.ts:370-392）：
 

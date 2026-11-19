@@ -7,6 +7,15 @@ import {
 } from '../src/services/vc-meeting-listener-output-protocol.js';
 
 describe('VC meeting listener output protocol', () => {
+  it('requires a publish envelope only for an opted-in final summary', () => {
+    expect(vcMeetingListenerOutputProtocolForInstructionVersion('meeting-consumer-v2', true)).toBe('final_summary_v1');
+    expect(vcMeetingListenerOutputProtocolForInstructionVersion('meeting-consumer-v1', true)).toBe('plain');
+    expect(parseVcMeetingListenerOutput('{"decision":"skip"}', true).ok).toBe(false);
+    expect(parseVcMeetingListenerOutput('{"decision":"skip"}', false).ok).toBe(true);
+    expect(parseVcMeetingListenerOutput('{"decision":"publish","content":"Decisions and actions"}', true))
+      .toEqual({ ok: true, decision: 'publish', content: 'Decisions and actions' });
+  });
+
   it('accepts only the minimal skip envelope', () => {
     expect(parseVcMeetingListenerOutput('{"decision":"skip"}')).toEqual({
       ok: true,

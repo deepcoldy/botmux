@@ -3,7 +3,7 @@
  *
  * 跑的是真实的 `handleNewTopic`（只替身飞书外部副作用、下载、fork 这三处），断言一条
  * 消息之后**会话上真的落了什么**：workingDir、title（来源 user）、启动参数里的模型、
- * 持久化的 reasoningEffort；以及拒绝路径真的零副作用。
+ * 持久化的 modelPin/推理强度；以及拒绝路径真的零副作用。
  *
  * 模型那一项刻意断言 `sessionAgentConfig` 的解析结果而不是 `ds.spawnModelOverride`：
  * 前者才是 worker 真正拿去拼启动参数的值，后者只是它的一个输入。
@@ -236,8 +236,9 @@ describe('指令头：一条消息完成开话题、选仓、选模型与首轮�
     expect(ds.session.nativeSessionTitle).toBe('日常运维');
     // 模型：worker 真正拿去拼启动参数的那个值。
     expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
-    // 推理强度：持久化在会话上。
-    expect(ds.session.reasoningEffort).toBe('high');
+    // 显式模型和推理强度共同持久化，worker 解析到相同的启动档位。
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', effort: 'high', source: 'topic-header', setBy: OWNER });
+    expect(sessionAgentConfig(ds, getBot(APP).config).reasoningEffort).toBe('high');
     // 首轮任务进了开场，句尾对本 bot 的 @ 已被剥掉。
     const opening = mocks.forkWorker.mock.calls[0][1];
     const openingText = typeof opening === 'string' ? opening : opening.content;
@@ -287,7 +288,8 @@ describe('指令头：一条消息完成开话题、选仓、选模型与首轮�
     expect(mocks.runAutoWorktreeCommit.mock.calls[0][0]).toMatchObject({ baseDir: botmuxRepo });
     // 模型/标题挂在会话上，等 worktree 建好后由 commitRepoSelection 带进 fork。
     const ds = mocks.runAutoWorktreeCommit.mock.calls[0][0].ds;
-    expect(ds.spawnModelOverride).toBe('sonnet');
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', source: 'topic-header' });
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
     expect(ds.session.title).toBe('日常运维');
   });
 });
@@ -468,7 +470,8 @@ describe('指令头：共用层在非 Claude 的 CLI 上同样生效', () => {
     const ds = forkedSession();
     expect(ds.workingDir).toBe(homelabRepo);
     expect(ds.session.title).toBe('线上排查');
-    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(ds.session.modelPin).toMatchObject({ model: 'gpt-5.6-sol', effort: 'ultra', source: 'topic-header', setBy: OWNER });
+    expect(sessionAgentConfig(ds, getBot(APP).config).reasoningEffort).toBe('ultra');
     // codex 的 ultra 只有部分模型支持——启动参数里要拿到头部钉的模型，而不是 bot 配的。
     expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('gpt-5.6-sol');
   });
@@ -959,7 +962,8 @@ describe('指令头：/repo wt 建 worktree 再开会话', () => {
     expect(ds.session.pendingRepoSetup).toMatchObject({
       mode: 'auto_worktree', baseDir: botmuxRepo, force: true, branch: 'ci/temp_split', worktreePath: expectedWorktreePath,
     });
-    expect(ds.spawnModelOverride).toBe('sonnet');
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', source: 'topic-header' });
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
     expect(ds.session.title).toBe('日常运维');
     expect(ds.scope).toBe('thread');
     expect(sentCardCount()).toBe(0);

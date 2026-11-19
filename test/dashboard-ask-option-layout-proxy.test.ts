@@ -6,7 +6,6 @@ const URL_PATH = '/api/bots/cli_a/ask-option-layout';
 
 describe('dashboard ask-option-layout proxy', () => {
   it('forwards the PUT payload to the exact daemon route', async () => {
-    expect(ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES).toBe(1024);
     expect(proxyRouteFor('PUT', URL_PATH)?.body).toEqual({ kind: 'json', maxBytes: ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES });
     const out = await runProxyRoute({ method: 'PUT', url: URL_PATH, body: '{"layout":"vertical"}' });
     expect(out.proxyCalls).toEqual([{

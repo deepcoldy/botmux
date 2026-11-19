@@ -63,11 +63,19 @@ try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  // 群管理抽屉按 bot 分栏：先切到「机器人设置」并选中 bot，它的设置块才可见。
+  const openBot = async id => {
+    await page.locator('#g-manage-tab-bots').click();
+    await page.locator(`.g-bot-picker-rail [data-bot="${id}"]`).click();
+  };
+  const pane = id => page.locator(`.g-bot-settings[data-bot="${id}"]`);
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  const card = page.locator('[data-group-reply-mode]');
+  // 当前选中 bot 的回复模式块（每个 bot 一块，只有选中的那块可见）。
+  const card = page.locator('[data-group-reply-mode]:visible');
+  await openBot('app-a');
   await card.waitFor();
-  const rowA = card.locator('[data-group-reply-mode-row="app-a"]');
-  const rowB = card.locator('[data-group-reply-mode-row="app-b"]');
+  const rowA = page.locator('[data-group-reply-mode-row="app-a"]');
+  const rowB = page.locator('[data-group-reply-mode-row="app-b"]');
   assert.equal(await rowA.locator('select').inputValue(), 'inherit');
   assert.match(await rowA.locator('.group-reply-mode-source').textContent(), /继承 Bot 默认/);
   assert.equal(await rowB.locator('select').inputValue(), 'new-topic');
@@ -76,6 +84,7 @@ try {
   await rowA.getByRole('status').filter({ hasText: '已保存' }).waitFor();
   assert.deepEqual(await page.evaluate(() => window.fixtureWrites.at(-1)), { path: '/api/groups/oc_demo/reply-mode/app-a', mode: 'shared' });
   await page.reload();
+  await openBot('app-a');
   await card.waitFor();
   assert.equal(await rowA.locator('select').inputValue(), 'shared');
   await card.evaluate(node => node.scrollIntoView({ block: 'start' }));
@@ -98,12 +107,13 @@ try {
   await page.evaluate(() => localStorage.setItem('fixtureTopology', 'topic'));
   await page.setViewportSize({ width: 1100, height: 900 });
   await page.reload();
+  await openBot('app-b');
   await card.waitFor();
-  await page.locator('[data-group-reply-mode][data-topology="topic"]').waitFor();
+  await page.locator('[data-group-reply-mode][data-topology="topic"]:visible').waitFor();
   assert.deepEqual(await rowB.locator('option').evaluateAll(os => os.map(o => o.value)), ['inherit', 'new-topic']);
   assert.equal(await rowA.locator('select').isDisabled(), true);
-  assert.match(await card.locator('p small').textContent(), /话题布局/);
-  await card.evaluate(node => node.scrollIntoView({ block: 'start' }));
+  assert.match(await card.locator('header small').textContent(), /话题布局/);
+  await pane('app-b').locator('[data-group-reply-mode]').evaluate(node => node.scrollIntoView({ block: 'start' }));
   await page.screenshot({ path: join(output, 'topic-layout.png') });
   await rowB.locator('select').selectOption('inherit');
   await rowB.getByRole('status').filter({ hasText: '已保存' }).waitFor();
@@ -112,8 +122,9 @@ try {
   // 单群查询失败：不预判拓扑、文案中性，仍提供完整选项（保存由 daemon strict 闸兜底）。
   await page.evaluate(() => localStorage.setItem('fixtureTopology', 'unknown'));
   await page.reload();
-  await page.locator('[data-group-reply-mode][data-topology="unknown"]').waitFor();
-  assert.match(await card.locator('p small').textContent(), /保存时会校验群类型/);
+  await openBot('app-a');
+  await page.locator('[data-group-reply-mode][data-topology="unknown"]:visible').waitFor();
+  assert.match(await card.locator('header small').textContent(), /保存时会校验群类型/);
   assert.equal(await rowA.locator('option').count(), 5);
   assert.deepEqual(errors, []);
   console.log('通过：继承/覆盖来源展示、选择覆盖并回显、保存失败回滚、改回继承、手机无横向溢出、每个对话框只查一次拓扑、话题布局群仅可清除休眠覆盖、拓扑查询失败时中性降级。');

@@ -1,10 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir, resolveStableBotmuxWrapperPath } from '../src/core/botmux-wrapper.js';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from '../src/core/botmux-wrapper.js';
+import { buildBotWorkerEnv, buildSessionChildEnv, botInjectedEnv } from '../src/core/env-policy.js';
 
 describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {
+  it('keeps a dedicated runtime root across strict worker transport and rejects bot overrides', () => {
+    const root = '/srv/candidate/bin';
+    const worker = buildBotWorkerEnv({ HOME: '/home/u', BOTMUX_WRAPPER_BIN: root }, { mode: 'strict' });
+    expect(resolveBotmuxWrapperBinDir(worker)).toBe(root);
+    expect(resolveBotmuxWrapperBinDir(buildSessionChildEnv(worker, { mode: 'strict' }))).toBe(root);
+    expect(botInjectedEnv({ BOTMUX_WRAPPER_BIN: '/wrong' }).BOTMUX_WRAPPER_BIN).toBeUndefined();
+    expect(resolveBotmuxWrapperBinDir({ HOME: '/home/u', BOTMUX_WRAPPER_BIN: 'relative' })).toBe('/home/u/.botmux/bin');
+  });
   it('core-only → dedicated <SESSION_DATA_DIR>/bin (never shared ~/.botmux/bin)', () => {
     expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', SESSION_DATA_DIR: '/srv/co/data', HOME: '/home/u' }))
       .toBe('/srv/co/data/bin');
@@ -15,39 +24,17 @@ describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isola
   it('core-only WITHOUT SESSION_DATA_DIR falls back to shared (defensive; entrypoint always sets it)', () => {
     expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
   });
-});
 
-describe('resolveStableBotmuxWrapperPath', () => {
-  it('uses the same dedicated wrapper the daemon writes in core-only mode', () => {
-    expect(resolveStableBotmuxWrapperPath({
-      BOTMUX_CORE_ONLY: '1',
-      SESSION_DATA_DIR: '/srv/co/data',
-      HOME: '/home/u',
-    }, 'linux')).toBe('/srv/co/data/bin/botmux');
-  });
-
-  it('does not mistake the MCP gateway override for the daemon-written wrapper', () => {
-    expect(resolveStableBotmuxWrapperPath({
-      HOME: '/home/u',
-      BOTMUX_BIN_PATH: '/opt/custom/gateway',
-    }, 'linux')).toBe('/home/u/.botmux/bin/botmux');
-  });
-
-  it('uses the Windows wrapper filename', () => {
-    expect(resolveStableBotmuxWrapperPath({ HOME: 'C:\\Users\\bot' }, 'win32'))
-      .toMatch(/botmux\.cmd$/);
-  });
-
-  it('canonicalizes a materialized wrapper directory through a symlinked home', () => {
-    if (process.platform === 'win32') return;
+  it('normal fleet resolves a symlinked HOME before putting the wrapper directory on sandbox PATH', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-wrapper-home-'));
-    const realHome = join(root, 'real');
-    const aliasHome = join(root, 'alias');
-    mkdirSync(join(realHome, '.botmux', 'bin'), { recursive: true });
-    symlinkSync(realHome, aliasHome, 'dir');
     try {
-      expect(resolveStableBotmuxWrapperPath({ HOME: aliasHome }, 'linux'))
-        .toBe(join(realpathSync(join(realHome, '.botmux', 'bin')), 'botmux'));
+      const realHome = join(root, 'real-home');
+      const linkedHome = join(root, 'linked-home');
+      mkdirSync(join(realHome, '.botmux', 'bin'), { recursive: true });
+      symlinkSync(realHome, linkedHome, 'dir');
+
+      expect(resolveBotmuxWrapperBinDir({ HOME: linkedHome }))
+        .toBe(join(realpathSync(realHome), '.botmux', 'bin'));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1,0 +1,4 @@
+{
+  "schemaVersion": 1,
+  "commands": [{ "name": "openviking", "description": "Search, read and save shared OpenViking memory" }]
+}

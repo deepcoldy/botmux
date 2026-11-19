@@ -1,4 +1,5 @@
-# Lane: the remaining bot runtimes in their private chats.
+# Lane: the internal bot runtimes in their private chats (installed only on
+# internal machines; the public CLIs run in core-clis).
 cases:
   - name: Aiden basic bot flow
     tags: [bot, smoke]
@@ -8,10 +9,6 @@ cases:
     tags: [bot, smoke]
     steps:
       - feishu.runScenario: { scenario: bot-coco-basic }
-  - name: OpenCode basic bot flow
-    tags: [bot, smoke]
-    steps:
-      - feishu.runScenario: { scenario: bot-opencode-basic }
   - name: Bot reply smoke test
     tags: [bot, smoke]
     steps:

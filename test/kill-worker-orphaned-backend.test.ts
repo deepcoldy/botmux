@@ -100,9 +100,11 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { config } from '../src/config.js';
 import { managedHerdrAgentName } from '../src/adapters/backend/session-backend-selector.js';
+import type { SessionWorkerProcessRuntime } from '../src/core/session-worker-identity.js';
 import {
   killStalePids,
   killWorker,
+  sweepStaleSessionWorkerPids,
   setActiveSessionSafe,
   setActiveSessionIfActive,
   teardownAuthoritativePersistentBackingBeforeClose,
@@ -203,23 +205,27 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
   });
 
   it('signals only the stale worker PID for an existing App Server share', () => {
-    const kill = vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
     const sharedPid = 42_424;
+    const kill = vi.fn();
+    // The recorded worker is still running: same birth identity, worker entry.
+    const runtime: SessionWorkerProcessRuntime = {
+      readIdentity: () => 'boot:4242',
+      readCommandLine: () => '/usr/bin/bun /opt/botmux/dist/worker.js',
+      readSystemdUnit: () => undefined,
+      pidExists: () => true,
+      kill,
+    };
 
-    try {
-      killStalePids([{
-        sessionId: SID,
-        pid: sharedPid,
-        backendType: 'pty',
-        existingAppServerEndpoint: 'unix:///tmp/codex-app-server.sock',
-      } as any]);
+    sweepStaleSessionWorkerPids([{
+      sessionId: SID,
+      pid: sharedPid,
+      pidProcStart: 'boot:4242',
+      backendType: 'pty',
+      existingAppServerEndpoint: 'unix:///tmp/codex-app-server.sock',
+    } as any], undefined, runtime);
 
-      expect(kill).toHaveBeenCalledWith(sharedPid, 0);
-      expect(kill).toHaveBeenCalledWith(sharedPid, 'SIGTERM');
-      expect(kill).not.toHaveBeenCalledWith(-sharedPid, 'SIGTERM');
-    } finally {
-      kill.mockRestore();
-    }
+    expect(kill).toHaveBeenCalledWith(sharedPid, 'SIGTERM');
+    expect(kill).not.toHaveBeenCalledWith(-sharedPid, 'SIGTERM');
   });
 
   it('keeps the complete owning session identity and does not issue a second name-only kill', () => {

@@ -125,9 +125,21 @@ export class Aggregator {
   /** sessionId → owning bot daemon's terminal reverse-proxy port. Used by the
    *  dashboard `/s/*` bridge to route a terminal request to the right daemon's
    *  proxy (each bot daemon runs its own terminal proxy on proxyBasePort+idx).
-   *  undefined when the session is unknown or its daemon's proxy isn't up. */
+   *  undefined when the session is unknown or its daemon's proxy isn't up.
+   *  A dormant in-memory row keeps its proxyPort on purpose: the daemon proxy
+   *  cold-starts the worker on demand (#2062 F1). */
   terminalProxyPortOf(sessionId: string): number | undefined {
     return this.sessions.get(sessionId)?.proxyPort as number | undefined;
+  }
+
+  /** #2062: whether this replica's row for the Session has a live worker.
+   *  Only primary multi-replica routing asks this, to decide whether a local
+   *  terminal can be served without first consulting the shared owner route. */
+  hasLiveTerminalWorker(sessionId: string): boolean {
+    const row = this.sessions.get(sessionId);
+    return row?.status !== 'closed' && row?.status !== 'dormant'
+      && typeof row?.webPort === 'number' && row.webPort > 0
+      && typeof row.proxyPort === 'number' && row.proxyPort > 0;
   }
 
   /** Whether a session row with this id exists at all in the aggregator,

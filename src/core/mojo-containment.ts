@@ -1319,38 +1319,6 @@ export function cgroupHandleLiveMembers(
     return { live, unreadable: false };
 }
 
-/**
- * Hand every outstanding handle of a session to a new worker generation.
- *
- * Inheritance is a UNION and it is unconditional: replacement does not prove
- * anything about the old tree, so the new generation becomes responsible for
- * proving it later. The generation stamp is refreshed for logging while the
- * IDENTITY fields (cgroup path, pid/boot/starttime, nonce) are preserved
- * verbatim — rewriting those would invent a handle that proves nothing about the
- * tree actually left behind.
- *
- * Nothing is removed here, so a crash mid-inheritance is safe: the handles are
- * still recorded under the same session id.
- */
-export function inheritContainmentHandles(
-    sessionId: string,
-    nextGeneration: number,
-    dataDir?: string,
-): ContainmentHandle[] {
-    const path = filePath(dataDir);
-    mkdirSync(dirname(path), { recursive: true });
-    let inherited: ContainmentHandle[] = [];
-    withFileLockSync(path, () => {
-        const data = readStrict(dataDir);
-        const before = data.sessions[sessionId] ?? [];
-        if (before.length === 0) return;
-        inherited = before.map(h => ({ ...h, generation: nextGeneration }));
-        data.sessions[sessionId] = inherited;
-        writeStrict(data, dataDir);
-    });
-    return inherited;
-}
-
 // ── the ONLY source of boundaryProof: true ───────────────────────────────────
 
 /**
@@ -1414,41 +1382,4 @@ export function containmentQuiescence(verdict: QuiescenceVerdict): TurnQuiescenc
     //
     // Proven as far as a weak handle can prove anything — diagnostic only.
     return { kind: 'diagnostic-clean', boundaryProof: false };
-}
-
-/**
- * Strongest quiescence statement available for a session, across ALL of its
- * outstanding handles.
- *
- * Semantics are intentionally pessimistic, because a session is only as contained
- * as its WEAKEST outstanding tree:
- *   - any handle that is not proven  → that handle's non-proof is the answer
- *   - no handles at all              → `diagnostic-clean`; nothing is recorded,
- *     but "nothing recorded" is not a kernel-level boundary proof either
- *   - every handle proven, at least one only diagnostically → `diagnostic-clean`
- *   - every handle proven WITH a boundary proof              → `contained-proven`
- *
- * A store that cannot be read THROWS (via `containmentHandles`), so an
- * unreadable store can never present itself as a clean session.
- */
-export function sessionContainmentQuiescence(
-    sessionId: string,
-    prove: (handle: ContainmentHandle) => QuiescenceVerdict,
-    dataDir?: string,
-): TurnQuiescence {
-    const handles = containmentHandles(sessionId, dataDir);
-    if (handles.length === 0) return { kind: 'diagnostic-clean', boundaryProof: false };
-    // Same authority as the single-handle path on purpose: a session is only as
-    // contained as its weakest tree, and "weakest" is decided by boundary proof,
-    // not by handle kind, so a weak handle aged out by a reboot counts while a
-    // weak handle that merely scanned clean does not.
-    let allProvenBoundary = true;
-    for (const handle of handles) {
-        const verdict = prove(handle);
-        if (!verdict.proven) return containmentQuiescence(verdict);
-        if (!containmentReleaseDecision(verdict).boundaryProof) allProvenBoundary = false;
-    }
-    return allProvenBoundary
-        ? containedProvenQuiescence()
-        : { kind: 'diagnostic-clean', boundaryProof: false };
 }

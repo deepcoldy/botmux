@@ -117,7 +117,63 @@ describe('Riff worker session environment', () => {
     }
   });
 
-  it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
+  it.each(['not-a-url', "http://host/a'b/api/riff-host-tools",
+    'https://user:private-config-secret@host/api/riff-host-tools',
+    'http://host/api/riff-host-tools?token=private-config-secret'])('reports invalid hostToolsUrl before dispatch: %#', async hostToolsUrl => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-preflight-'));
+    let outbound = 0;
+    const server = createServer((req, res) => {
+      if (req.method === 'POST' && (req.url === '/api/task-execute' || req.url === '/api/task-follow-up')) outbound++;
+      res.writeHead(404); res.end();
+    });
+    let child: ChildProcess | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const port = await listen(server);
+      // Exercise the same background probes as host port scanners. These must
+      // not count as Riff task dispatch, regardless of their arrival timing.
+      for (let i = 0; i < 2; i++) {
+        const probe = await fetch(`http://127.0.0.1:${port}/`);
+        expect(probe.status).toBe(404);
+        await probe.text();
+      }
+      const appId = 'cli_riff_preflight', botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'test-secret',
+        cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}` } }]));
+      child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-riff-preflight', LARK_APP_ID: appId, LARK_APP_SECRET: 'test-secret' },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      const logs: string[] = [];
+      child.stdout!.on('data', chunk => logs.push(String(chunk)));
+      child.stderr!.on('data', chunk => logs.push(String(chunk)));
+      const error = new Promise<string>((resolvePromise, reject) => {
+        child!.on('message', (raw: WorkerToDaemon) => { if (raw.type === 'error') resolvePromise(raw.message); });
+        child!.once('error', reject);
+        child!.once('exit', () => reject(new Error(`worker exited before reporting config failure: ${logs.join('')}`)));
+        timeout = setTimeout(() => reject(new Error(`worker error timeout: ${logs.join('')}`)), 15_000);
+      });
+      child.send({ type: 'init', sessionId: 'sid-riff-preflight', chatId: 'oc_test', rootMessageId: 'om_root',
+        workingDir: root, cliId: 'riff', backendType: 'riff', larkAppId: appId, larkAppSecret: 'test-secret',
+        prompt: 'must not be dispatched', turnId: 'turn-preflight',
+        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, jwt: 'test-jwt', hostToolsUrl },
+      } satisfies DaemonToWorker);
+      const message = await error;
+      expect(message).toContain('hostToolsUrl');
+      expect(message).not.toContain('private-config-secret');
+      expect(outbound).toBe(0);
+    } finally {
+      clearTimeout(timeout);
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>(resolvePromise => child!.once('close', () => resolvePromise()));
+        child.kill('SIGKILL'); await closed;
+      }
+      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
+      rmTree(root);
+    }
+  }, 25_000);
+
+  it.each(['om_riff_env', 'ml:om_riff_env'])('forwards reply-card usage and frozen session policies into the remote sandbox (%s)', async rootMessageId => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-env-'));
     const sockets = new Set<Socket>();
     let child: ChildProcess | undefined;
@@ -217,7 +273,7 @@ describe('Riff worker session environment', () => {
         type: 'init',
         sessionId: 'sid-riff-env',
         chatId: 'oc_riff_env',
-        rootMessageId: 'om_riff_env',
+        rootMessageId,
         workingDir: root,
         cliId: 'riff',
         backendType: 'riff',
@@ -234,12 +290,18 @@ describe('Riff worker session environment', () => {
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
             BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
+            // Same stale/forged attempt against the local-address snapshot:
+            // the bot turned hideLocalAddresses on, the raw riff env tries to
+            // turn it off in the remote pane. The host re-freeze must win.
+            BOTMUX_HIDE_LOCAL_ADDRESSES: '0',
+            ...(rootMessageId.startsWith('ml:') ? { BOTMUX_ROOT_MESSAGE_ID: 'om_wrong', BOTMUX_CHAT_ID: 'oc_wrong', BOTMUX_SESSION_SCOPE: 'chat' } : {}),
           },
         },
         prompt: 'verify remote session environment',
         larkAppId: appId,
         larkAppSecret: 'secret',
         ownerOpenId: 'ou_authenticated_owner',
+        hideLocalAddresses: true,
         feedback: {
           enabled: true,
           audience: 'requester',
@@ -271,6 +333,14 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      // The remote `botmux send` cannot read bots.json; it keeps this bot's
+      // local-address policy from the worker's snapshot. The stale
+      // backendConfig.env '0' above must not survive the host re-freeze.
+      expect(request.config?.env?.BOTMUX_HIDE_LOCAL_ADDRESSES).toBe('1');
+      expect(request.config?.env?.BOTMUX_ROOT_MESSAGE_ID).toBe(rootMessageId);
+      expect(request.config?.env?.BOTMUX_CHAT_ID).toBe('oc_riff_env');
+      expect(request.config?.env?.BOTMUX_SESSION_SCOPE).toBe('thread');
+      expect(request.config?.userPrompt).not.toContain('<botmux_host_tools>');
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       // The workflow kill-switch is host-resolved and re-frozen after the merge:

@@ -123,3 +123,8 @@ describe('network policy workflow snapshots', () => {
     expect(() => parseFrozenBotSnapshots({ app_x: { larkAppId: 'app_x', cliId: 'claude-code', workingDir: '/w', sandboxNetworkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'typo' } } } })).toThrow();
   });
 });
+
+
+it('rejects a configured Codex profile before freezing a workflow snapshot', () => {
+  expect(() => botToSnapshot(bot({ cliId: 'codex', codexProfile: 'selected' }))).toThrow('Codex profile');
+});

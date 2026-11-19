@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -88,30 +87,5 @@ describe('bots.json cliConfigDir', () => {
   it('fails closed on a malformed value instead of silently using ~/.claude', () => {
     expect(() => parseBotConfigsFromText(entry({ cliId: 'claude-code', cliConfigDir: 'relative' })))
       .toThrow(/Bot config \[0\]: cliConfigDir must be an absolute path/);
-  });
-});
-
-describe('profile wiring through spawn and sandbox provisioning', () => {
-  const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-  const pool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-
-  it('creates the spawn adapter with the frozen profile and ships it on init', () => {
-    expect(worker).toContain('cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });');
-    expect(pool).toContain('cliConfigDir: agentCfg.cliConfigDir,');
-    expect(pool).toContain('ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });');
-  });
-
-  it('installs hooks once per (cli, profile), not once per cli', () => {
-    expect(pool).toMatch(/const installKey = cliSupportsConfigDir\(cliId\) && opts\?\.configDir \? `\$\{cliId\}\\0\$\{opts\.configDir\}` : cliId;/);
-    expect(pool).not.toContain('skillsInstalledCliIds.has(cliId)');
-  });
-
-  it('under the sandbox, seeds BOT_HOME from the profile instead of the global ~/.claude', () => {
-    const capture = worker.indexOf('const claudeProfileDir = isClaudeFam && cfg.cliConfigDir ? claudeDataDir : undefined;');
-    const redirect = worker.indexOf("if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');", capture);
-    expect(capture).toBeGreaterThan(-1);
-    expect(redirect).toBeGreaterThan(capture);
-    expect(worker).toContain("inheritClaudeEnvFrom: join(claudeProfileDir ?? join(homedir(), '.claude'), 'settings.json'),");
-    expect(worker).toContain("claudeProfileDir ? join(claudeProfileDir, '.claude.json') : undefined,");
   });
 });

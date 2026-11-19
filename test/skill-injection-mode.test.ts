@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-config.js';
 import {
-  DEFAULT_BUILTIN_SKILL_INJECTION,
   resolveSkillInjectionMode,
   globalBuiltinSkillInjectionDefault,
   resolveSkillInjectionModeForApp,
@@ -58,7 +57,6 @@ describe('skill injection-mode resolution', () => {
   });
 
   it('defaults to prompt when nothing is configured', () => {
-    expect(DEFAULT_BUILTIN_SKILL_INJECTION).toBe('prompt');
     expect(globalBuiltinSkillInjectionDefault()).toBe('prompt');
     expect(resolveSkillInjectionMode(undefined)).toBe('prompt');
   });
@@ -132,7 +130,7 @@ describe('skill injection-mode resolution', () => {
 
     it('false for an unrelated dir even if a codex bot wants global', () => {
       writeBots([codexBot({ skillInjection: 'global' })], home);
-      expect(shouldInstallGlobalSkills(join(home, '.gemini', 'skills'))).toBe(false);
+      expect(shouldInstallGlobalSkills(join(home, '.config', 'opencode', 'skills'))).toBe(false);
     });
   });
 });
@@ -144,7 +142,7 @@ describe('resolveSkillInjectionSupport (dashboard control class)', () => {
       expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
     }
     // global skills-dir CLIs → the global|prompt|off knob applies
-    for (const id of ['codex', 'gemini', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
+    for (const id of ['codex', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden

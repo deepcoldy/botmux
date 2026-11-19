@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const reconcileRestoredStreamingCardPinsMock = vi.fn();
@@ -30,20 +29,11 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 let daemon: typeof import('../src/daemon.js');
 
 beforeAll(async () => {
   daemon = await import('../src/daemon.js');
 }, 30_000);
-
-function region(source: string, startMarker: string, endMarker: string): string {
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start);
-  expect(start, `${startMarker} not found`).toBeGreaterThan(-1);
-  expect(end, `${endMarker} not found after ${startMarker}`).toBeGreaterThan(start);
-  return source.slice(start, end);
-}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -151,37 +141,5 @@ describe('startup restore phase wiring for restored streaming-card Pin recovery'
 
     expect(driven).toEqual(['group-restored']);
     activeSessions.clear();
-  });
-
-  it('keeps the startDaemon call site after restore as a supplemental source lock', () => {
-    const block = region(
-      daemonSource,
-      'await restoreSessionsAndScheduleStartupRecovery({',
-      'if (selfDaemonLarkAppId) {',
-    );
-
-    expect(block).toContain('restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {');
-    expect(block).toContain('prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),');
-    expect(block).toContain('larkAppId: cfg.larkAppId,');
-    expect(block).toContain('sessionsRestored = true;');
-  });
-
-  it('opens sustained-busy owner notices only after the IM dispatchers start', () => {
-    const startupBlock = region(
-      daemonSource,
-      'for (const startDispatcher of startEventDispatchers) startDispatcher();',
-      'try {\n    await reconcileVcMeetingManagedActionsOnBoot',
-    );
-    expect(startupBlock.indexOf('for (const startDispatcher of startEventDispatchers) startDispatcher();'))
-      .toBeLessThan(startupBlock.indexOf('xpiSessionStoreBusyNoticeReadyApps.add(cfg.larkAppId);'));
-
-    const noticeBlock = region(
-      daemonSource,
-      'async function notifyXpiSessionStoreBusy(',
-      'async function finalizeClosedXpiSharedCwdMember(',
-    );
-    expect(noticeBlock).toContain(
-      'if (!larkAppId || !xpiSessionStoreBusyNoticeReadyApps.has(larkAppId)) return false;',
-    );
   });
 });

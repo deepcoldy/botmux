@@ -1,7 +1,7 @@
 /**
  * Card lifecycle test (consolidated single test):
  *  1. Card status: 启动中… / 工作中 → 等待输入
- *  2. Toggle button exists
+ *  2. Card controls: the main row, with the low-frequency ones folded under 「更多操作」
  *  3. Screenshot output mode can be shown
  *
  * All assertions reference the specific test message to avoid
@@ -10,25 +10,19 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   testMessage,
   expectedReplyMarker,
   sendMessage,
   waitForStreamingCard,
   waitForCardStatus,
   showStreamingOutput,
+  reopenTopic,
   waitForModelTextReply,
   scrollThreadToBottom,
-  navigateToMessenger,
   openChat,
-  closeSession,
 } from './helpers.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   describe('feishu card lifecycle', () => {
@@ -38,25 +32,11 @@ export function registerMidsceneSuites(): void {
     let agent: PlaywrightAgent;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error(
-          'storageState.json not found. Run: pnpm test:e2e-browser:setup',
-        );
-      }
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openChat(page, agent, 'Claude');
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openChat(p, a, 'Claude')));
     });
 
     afterAll(async () => {
-      await closeSession(agent, page);
-      await agent?.destroy();
-      await context?.close();
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: false });
     });
 
     it('full card lifecycle: active status → toggle → no artifacts → idle', async () => {
@@ -66,13 +46,14 @@ export function registerMidsceneSuites(): void {
       // Wait for bot to respond, open thread panel, handle repo selection
       await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });
 
-      // --- Step 1: Verify current display toggle exists ---
+      // --- Step 1: Verify the card's main row; the output toggle is folded under 更多操作 ---
       await agent.aiAssert(
-        '右侧话题详情面板最底部当前会话的流式卡片里有"📖 显示输出"或"📕 隐藏输出"按钮',
+        '主内容区正在显示的测试话题里，当前会话的流式卡片主行有"打开 Web 终端"和"关闭会话"按钮，' +
+          '按钮下方有可以展开的"更多操作"',
       );
 
-      // --- Step 2: Ensure output is visible in the current screenshot mode ---
-      await showStreamingOutput(agent, page);
+      // --- Step 2: Turn the output on from 更多操作 ---
+      await showStreamingOutput(agent, page, { reopen: reopenTopic(agent, page, msg) });
 
       // Check for ANSI escape codes specifically. CLI output may contain JSON
       // fragments from tool calls, which are expected terminal output.

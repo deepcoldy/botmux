@@ -192,7 +192,7 @@ export function gitHeadSha(dir: string): string {
  *   2. bun run build       (dist/ is gitignored: a pull alone leaves stale code)
  *
  * MUST stay `bun run build`, and MUST NOT go back to pnpm. Since the repo
- * declares `packageManager: bun@<pinned>` (1.4.3 at the time of writing; the
+ * declares `packageManager: bun@<pinned>` (1.4.4 at the time of writing; the
  * pin lives in package.json), a corepack-shimmed `pnpm` REFUSES to run here at
  * all — even `pnpm --version` exits 1 with `Unsupported package manager
  * specification (bun@<pinned>)`, so the whole update aborted before building.
@@ -202,7 +202,7 @@ export function gitHeadSha(dir: string): string {
  * script. Only `bun run <script>` reaches package.json.
  *
  * Bun (not npm) is the right runner even though npm ships with Node: the `build`
- * script itself shells out to `bun run audit:domains` / `typecheck:scripts` /
+ * script itself shells out to `bun run audit:domains` / `typecheck` /
  * `dashboard:bundle`, so bun is required regardless — going through npm would
  * only add a hop while hiding that requirement. This also matches CI and the
  * `bun run build` documented in CLAUDE.md.

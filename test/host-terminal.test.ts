@@ -242,7 +242,11 @@ describe('host-terminal WebSocket auth', () => {
  * 自己的 Cookie、注入本机活跃 cookie，再用 `X-Botmux-Role` 表达真实角色——只比 cookie
  * 的话，任何经平台隧道进来的人都能开出宿主 shell。两条腿各自独立、缺一不可：
  *   ① 同源门按 path 分档：宿主终端只认 management 档，平台分享出去的终端子域 `t-` 不算；
- *   ② 身份门：必须解析成 legacy-dashboard 管理身份，平台注入身份一律拒。
+ *   ② 身份门：必须解析成 legacy-dashboard 管理身份，带角色头的平台注入身份一律拒。
+ *
+ * 平台机器 Dashboard（`m-`）反代故意不注入角色头、只带 actor + scopes（平台侧决定：协管者
+ * 与机器主人等能力），那里进来的人在本机就是 legacy 管理身份——终端页提示文案按这个现状写，
+ * 下面最后一条用例把它钉住。
  */
 describe('host-terminal WS 独立安全边界（不吃 t- 子域、不吃平台注入身份）', () => {
   it('t- Origin + 注入的活跃 cookie + platform owner role → 拒绝', async () => {
@@ -287,6 +291,23 @@ describe('host-terminal WS 独立安全边界（不吃 t- 子域、不吃平台�
       origin: `https://m-${MACHINE_ID}.${PLATFORM_HOST}`,
       cookie: COOKIE,
     })).toBe('open');
+  });
+
+  it('现状：平台机器 Dashboard 反代（m- + actor + scopes、无角色头）的机器主人和协管者 → 放行', async () => {
+    harness = await startHarness();
+    const id = await createShell(harness);
+    bindPlatform();
+    for (const [actor, scopes] of [
+      ['on_machine_owner', 'machines:read,sessions:open,terminal:control,dashboard:manage'],
+      ['on_co_manager', 'machines:read,sessions:open,terminal:control'],
+    ]) {
+      expect(await wsOutcome(wsUrl(harness, id), {
+        origin: `https://m-${MACHINE_ID}.${PLATFORM_HOST}`,
+        cookie: COOKIE,
+        'x-botmux-actor': actor,
+        'x-botmux-scopes': scopes,
+      }), actor).toBe('open');
+    }
   });
 });
 

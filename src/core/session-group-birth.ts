@@ -183,6 +183,7 @@ export async function maybeBirthSessionGroup(
     }
 
     registerSessionGroup(newChatId, {
+      autoTitleBaseName: placeholder,
       ownerOpenId: senderOpenId,
       lastSessionId: '',
       // Persisted provenance — the group's talk/quota identity for its whole life.

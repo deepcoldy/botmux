@@ -116,8 +116,13 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
       return `mcode --session '${cliSessionId.replace(/'/g, "'\\''")}'`;
     },
     writeInput(pty, content, context) {
-      return writeRunnerInput(pty, '::botmux-minimax:', content, undefined, context?.turnId);
+      return writeRunnerInput(pty, '::botmux-minimax:', content, undefined, context?.turnId,
+        undefined, undefined, context?.dispatchAttempt);
     },
+    // The runner only speaks ::botmux-minimax:<base64> frames; even raw
+    // passthrough lines (v3 goal-mode dispatch, typed slash commands) must be
+    // delivered through writeInput's pre-flush/chunk/retry/disposition path.
+    runnerFramedInput: true,
     supportsTypeAhead: false,
     readyPattern: /^›\r?$/m,
     staticBusyPattern: /\[MiniMax Code\] running…/,

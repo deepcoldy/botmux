@@ -129,6 +129,12 @@ describe('开关', () => {
 describe('写入', () => {
   beforeEach(() => setGroupContextSettingsResolver(() => ({ enabled: true, maxContextChars: 1000 })));
 
+  it('stores third-party image-only list events without requiring detail lookup', () => {
+    const content = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_external' }]] });
+    expect(ingestGroupContextEvent(APP, event({ senderType: 'app', appId: 'cli_external', msgType: 'interactive', content }))).toBe('stored');
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')?.resourceRefs.map(ref => ref.key)).toEqual(['img_v3_external']);
+  });
+
   it('excludes explicit runtime cards, then stores only the published body of the same card', () => {
     const card = (purpose: 'runtime' | 'turn-message') => JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
       { tag: 'markdown', element_id: 'botmux_turn_status', content: '💭 **处理中 · 12.0s**' },

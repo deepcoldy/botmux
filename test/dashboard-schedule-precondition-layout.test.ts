@@ -499,6 +499,39 @@ describe('schedule precondition compact editor', () => {
     expect(textContent(form.root.findByProps({ className: 'schedule-precondition-test-result' }))).toBe('');
   });
 
+  it('tests a new task draft in the directory the daemon resolves for its target chat', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: vi.fn().mockResolvedValue({
+        ok: false,
+        result: 'error',
+        errorCode: 'schedule_working_dir_unavailable',
+        error: 'schedule_working_dir_unavailable',
+        durationMs: 0,
+      }),
+    } as unknown as Response);
+    const form = await renderForm(null);
+    form.setEnabled(true);
+    form.setScript('printf 1');
+    expect(form.testButton().props.disabled).toBe(true);
+    form.fillNewRequiredFields();
+
+    await act(async () => {
+      form.testButton().props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]?.body))).toEqual({
+      larkAppId: 'cli_precondition_layout',
+      chatId: 'oc_precondition_layout',
+      source: { kind: 'inline', script: 'printf 1' },
+    });
+    const result = form.root.findByProps({ className: 'schedule-precondition-test-result is-error' });
+    expect(textContent(result)).toContain(tr('schedules.form.errWorkingDirUnavailable'));
+  });
+
   it('shows the complete test error code and exit detail', async () => {
     vi.mocked(fetch).mockResolvedValue({
       ok: true,

@@ -1,7 +1,11 @@
 import type { GroupContextConversationScope } from './group-context-store.js';
 
 export interface GroupContextConversationOptions {
-  scope?: GroupContextConversationScope;
+  /**
+   * 'all'：整群（主群 + 全部话题），给需要通览全群的消费者（群秘书）用；
+   * 其余值按会话边界筛选。缺省按 rootId/threadId 推断 main / thread。
+   */
+  scope?: GroupContextConversationScope | 'all';
   rootId?: string;
   threadId?: string;
 }
@@ -28,6 +32,7 @@ export function selectGroupContextConversation<T extends ConversationMessage>(
   options: GroupContextConversationOptions = {},
   evidence: readonly ConversationMessage[] = messages,
 ): T[] {
+  if (options.scope === 'all') return [...messages];
   const scope = options.scope ?? (options.rootId || options.threadId ? 'thread' : 'main');
   const identities = new Map<string, {
     scope?: GroupContextConversationScope;

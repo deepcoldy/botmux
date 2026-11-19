@@ -44,6 +44,40 @@ function fixture() {
 }
 
 describe('project group mode', () => {
+  it('defaults import notifications off and retains an opted-in policy through legacy writer calls', async () => {
+    const f = fixture();
+    const config = {
+      chatId: f.context.chatId, mode: 'project' as const, coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+    };
+    expect((await writeGroupCollaborationMode(f.dataDir, config)).importedSessionPolicy).toBe('ignore');
+    await writeGroupCollaborationMode(f.dataDir, { ...config, importedSessionPolicy: 'notify' });
+    expect((await writeGroupCollaborationMode(f.dataDir, config)).importedSessionPolicy).toBe('notify');
+    expect((await writeGroupCollaborationMode(f.dataDir, {
+      chatId: config.chatId, mode: 'standard',
+    })).importedSessionPolicy).toBe('notify');
+    expect((await writeGroupCollaborationMode(f.dataDir, config)).importedSessionPolicy).toBe('notify');
+    expect((await writeGroupCollaborationMode(f.dataDir, {
+      ...config, importedSessionPolicy: 'ignore',
+    })).importedSessionPolicy).toBe('ignore');
+  });
+
+  it('rejects invalid import policy without changing persisted config', async () => {
+    const f = fixture();
+    const config = {
+      chatId: f.context.chatId, mode: 'project' as const, coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'], importedSessionPolicy: 'notify' as const,
+    };
+    await writeGroupCollaborationMode(f.dataDir, config);
+    const path = join(f.dataDir, 'group-collaboration-modes.json');
+    const before = readFileSync(path, 'utf8');
+    await expect(writeGroupCollaborationMode(f.dataDir, {
+      ...config, importedSessionPolicy: 'auto-register',
+    } as unknown as Parameters<typeof writeGroupCollaborationMode>[1])).rejects
+      .toThrow('invalid_imported_session_policy');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+
   it('replaces the onboarding guide with a fresh pinned project card when the project starts', async () => {
     const f = fixture();
     await writeGroupCollaborationMode(f.dataDir, {

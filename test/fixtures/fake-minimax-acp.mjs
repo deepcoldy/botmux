@@ -1,5 +1,6 @@
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { once } from 'node:events';
 const log = value => process.env.MCODE_TEST_LOG && appendFileSync(process.env.MCODE_TEST_LOG, JSON.stringify(value) + '\n');
 log({ pid: process.pid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, legacyOwner: process.env.__OWNER_OPEN_ID });
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
@@ -15,6 +16,10 @@ let questionCount = 0;
 let answeredCount = 0;
 const scenario = process.env.MCODE_ACP_SCENARIO;
 const update = u => send({ method: 'session/update', params: { sessionId, update: u } });
+const progressUntilCancelled = () => {
+  let sequence = 0;
+  setInterval(() => update({ sessionUpdate: 'tool_call', title: `progress-${++sequence}`, toolCallId: `tool-${sequence}` }), 25);
+};
 const complete = (text, stopReason = 'end_turn') => {
   update({ sessionUpdate: 'agent_message_chunk', messageId: 'final', content: { type: 'text', text } });
   send({ id: promptId, result: { stopReason } });
@@ -58,19 +63,49 @@ for await (const line of createInterface({ input: process.stdin })) {
       askSequential(); continue;
     }
     if (prompt === 'hang') continue;
+    if (prompt === 'progress-hang') {
+      progressUntilCancelled();
+      continue;
+    }
     if (prompt === 'crash') { process.exit(4); }
     if (prompt === 'invalid-json') { process.stdout.write('invalid json\n'); continue; }
     if (prompt === 'oversize') { process.stdout.write('x'.repeat(8_000_001)); continue; }
-    if (prompt === 'oversize-stderr') { process.stderr.write('x'.repeat(8_000_001)); continue; }
+    if (prompt === 'oversize-stderr') {
+      if (!process.stderr.write('x'.repeat(8_000_001))) await once(process.stderr, 'drain');
+      complete('stderr drained'); continue;
+    }
+    if (['long-stream', 'oversize-content'].includes(prompt)) {
+      // Respect transport backpressure: exercise cumulative traffic without
+      // making the fixture itself retain an unbounded queue.
+      for (let i = 0; i < 100; i++) {
+        const frame = JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId,
+          update: { sessionUpdate: prompt === 'long-stream' ? 'agent_thought_chunk' : 'agent_message_chunk',
+            messageId: 'final', content: { type: 'text', text: '中'.repeat(30_000) } } } }) + '\n';
+        if (!process.stdout.write(frame)) await once(process.stdout, 'drain');
+      }
+      complete('long stream complete'); continue;
+    }
+    if (prompt === 'two-large-answers') {
+      for (const messageId of ['first', 'second']) {
+        for (let i = 0; i < 100; i++) {
+          const text = (messageId === 'first' ? '甲' : '乙\0').repeat(20_000);
+          if (!update({ sessionUpdate: 'agent_message_chunk', messageId, content: { type: 'text', text } })) {
+            await once(process.stdout, 'drain');
+          }
+        }
+        if (messageId === 'first') update({ sessionUpdate: 'tool_call', toolCallId: 'tool-between' });
+      }
+      send({ id: promptId, result: { stopReason: 'end_turn' } }); continue;
+    }
     if (prompt === 'unknown-response') { send({ id: 999, result: {} }); continue; }
     if (prompt === 'foreign-update') {
       send({ method: 'session/update', params: { sessionId: 'foreign', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'foreign' } } } }); continue;
     }
-    if (['ask', 'foreign-ask', 'early-complete', 'permission'].includes(prompt)) {
+    if (['ask', 'foreign-ask', 'early-complete', 'permission', 'permission-hang'].includes(prompt)) {
       if (scenario === 'native-questionnaire') update({ sessionUpdate: 'tool_call', toolCallId: 'questionnaire', title: 'ask_user' });
-      send({ id: 'native-question', method: prompt === 'permission' ? 'session/request_permission' : 'elicitation/create', params: {
+      send({ id: 'native-question', method: prompt.startsWith('permission') ? 'session/request_permission' : 'elicitation/create', params: {
         sessionId: prompt === 'foreign-ask' ? 'foreign' : sessionId,
-        ...(prompt === 'permission' ? { toolCall: { title: 'Write fixture' }, options: [
+        ...(prompt.startsWith('permission') ? { toolCall: { title: 'Write fixture' }, options: [
           { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
         ] } : { mode: 'form', message: 'Choose fixture settings', requestedSchema: { type: 'object', required: ['approach', 'checks'], properties: {
           approach: { type: 'string', title: 'Approach', oneOf: [{ const: 'safe-id', title: 'Safe' }, { const: 'fast-id', title: 'Fast' }] },
@@ -93,5 +128,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     } });
     if (answeredCount === questionCount) complete(`answered:${answeredCount}`);
     else if (id.startsWith('sequential-')) askSequential();
-  } else if (id === 'native-question' && !method) complete(`answer:${JSON.stringify(message.result)}`);
+  } else if (id === 'native-question' && !method) {
+    if (prompt === 'permission-hang') progressUntilCancelled();
+    else complete(`answer:${JSON.stringify(message.result)}`);
+  }
 }

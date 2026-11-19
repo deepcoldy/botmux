@@ -14,6 +14,36 @@ beforeEach(() => {
 const options = { larkAppId: 'cli_group', chatId: 'oc_room', turnId: 'om_next' };
 
 describe('shared group history reaches native inputs', () => {
+  it('attaches explicit LinkRef sidecars for user and group-visible text', () => {
+    const followUp = buildFollowUpCliInput('继续 https://user.example.test/p', 'sid', {
+      ...options,
+      cliId: 'codex',
+      linkRefMode: 'enabled',
+    });
+    const opening = buildNewTopicCliInput(
+      '最终计划 https://user.example.test/open',
+      'sid',
+      'codex',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'zh',
+      undefined,
+      { ...options, linkRefMode: 'enabled' },
+    );
+
+    for (const payload of [followUp, opening]) {
+      expect(payload.linkRefs?.mode).toBe('enabled');
+      expect(payload.linkRefs?.sources).toEqual(expect.arrayContaining([
+        expect.objectContaining({ sourceType: 'user_message', kind: 'text' }),
+        expect.objectContaining({ sourceType: 'group_context', kind: 'text' }),
+      ]));
+    }
+  });
+
   it('omits both legacy history markup and Codex App history entries for an empty incremental turn', () => {
     readBackground.mockReturnValue({ body: '', attachments: [], nativeInputSeqs: [12] });
     const legacy = buildFollowUpCliInput('继续', 'sid', { ...options, cliId: 'codex' });

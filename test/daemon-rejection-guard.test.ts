@@ -159,6 +159,9 @@ describe('daemon wiring', () => {
     // file directly has no buffer cap and no subprocess.
     readFileSync(join(import.meta.dirname, '../src/daemon.ts'), 'utf-8');
 
+  // 源码结构护栏(K3)：daemon 一处漏掉的 .catch 会触发 Node 默认的 unhandledRejection 终止，结束所有在线飞书会话（corrupt-store P1 的
+  // 第三环）。startDaemon 有 index-daemon.ts / index-core-only.ts 两个调用方且会安装 IPC/信号处理，无法在单测里起；只能读源码确认守卫
+  // 在 startDaemon 内、首个 await 之前安装。守卫本身的「记录且不退出」行为由本文件真实子进程用例覆盖。
   it('installs the guard inside startDaemon, not only in one entry file', () => {
     // startDaemon has TWO callers (index-daemon.ts and index-core-only.ts), so
     // guarding a single entry file would leave the other one unprotected.

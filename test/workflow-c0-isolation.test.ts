@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -96,25 +96,63 @@ describe('Slice C0 — chat side-effect isolation', () => {
     expect(out.stderr).not.toMatch(/refused inside workflow/);
   });
 
-  it('allows the botmux-owned Plugin MCP gateway bootstrap in workflow mode', () => {
+  it('allows the botmux-owned Plugin MCP gateway bootstrap in workflow mode', async () => {
     const home = mkdtempSync(join(tmpdir(), 'workflow-c0-mcp-'));
-    try {
-      const out = spawnSync('node', [CLI_PATH, 'mcp', 'serve'], {
-        env: {
-          ...process.env,
-          HOME: home,
-          SESSION_DATA_DIR: join(home, 'data'),
-          BOTMUX_WORKFLOW: '1',
-          BOTMUX_MCP_GATEWAY: '1',
-        },
-        input: '',
-        encoding: 'utf-8',
-        timeout: 3_000,
+    const child = spawn('node', [CLI_PATH, 'mcp', 'serve'], {
+      env: { ...process.env, HOME: home, SESSION_DATA_DIR: join(home, 'data'),
+        BOTMUX_WORKFLOW: '1', BOTMUX_MCP_GATEWAY: '1',
+        BOTMUX_SESSION_ID: undefined, BOTMUX_MCP_GATEWAY_SOCKET: undefined,
+        BOTMUX_MCP_GATEWAY_REQUIRED: undefined },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise<number | null>((resolveExit, reject) => {
+      child.once('error', reject);
+      child.once('close', resolveExit);
+    });
+    // A launch error can precede initialization; keep its exit rejection owned
+    // while the handshake is the active wait.
+    void exited.catch(() => undefined);
+    const initialized = new Promise<any>((resolveInit, reject) => {
+      let pending = '';
+      child.stdout.on('data', chunk => {
+        pending += chunk;
+        let end: number;
+        while ((end = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, end); pending = pending.slice(end + 1);
+          if (!line.trim()) continue;
+          try {
+            const response = JSON.parse(line);
+            if (response.id === 1) resolveInit(response);
+          } catch (error) { reject(error); }
+        }
       });
-      expect(out.error).toBeUndefined();
-      expect(out.status).toBe(0);
-      expect(out.stderr).not.toMatch(/refused inside workflow/);
+      child.once('error', reject);
+      child.once('close', () => reject(new Error(`gateway exited before initialize: ${stderr}`)));
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`gateway bootstrap/EOF timed out: ${stderr}`)), 25_000);
+    });
+    try {
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+        protocolVersion: '2024-11-05', capabilities: {},
+        clientInfo: { name: 'workflow-isolation-test', version: '1' },
+      } }) + '\n');
+      // Readiness is a real protocol response. The old 3s wall included the
+      // complete CLI import and occasionally cut it off on a busy runner.
+      const response = await Promise.race([initialized, deadline]);
+      expect(response.error).toBeUndefined();
+      expect(response.result.protocolVersion).toBe('2024-11-05');
+      expect(response.result.capabilities).toBeDefined();
+      child.stdin.end(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+      expect(await Promise.race([exited, deadline])).toBe(0);
+      expect(stderr).not.toMatch(/refused inside workflow/);
     } finally {
+      if (timer) clearTimeout(timer);
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await exited.catch(() => undefined);
       rmSync(home, { recursive: true, force: true });
     }
   });
@@ -183,17 +221,19 @@ describe('Slice C0 — chat side-effect isolation', () => {
     expect(out.stderr).not.toMatch(/refused inside workflow/);
   });
 
-  // botmux installs three local Claude-family hook clients into
-  // ~/.claude/settings.json — session-ready (SessionStart), hook (generic), and
-  // user-prompt-hook (UserPromptSubmit). They fire from inside a workflow
-  // subagent's own CLI, so all three must be on the read-only allowlist;
-  // user-prompt-hook in particular fires on EVERY prompt, and if the fence
-  // rejects it Claude reports the whole prompt "blocked by hook" and `/goal`
-  // never lands (Bug 4).
+  // botmux installs local Claude-family hook clients into
+  // ~/.claude/settings.json — session-ready (SessionStart), hook (generic),
+  // user-prompt-hook (UserPromptSubmit) and __claude-compaction-v1 (PreCompact).
+  // They fire from inside a workflow subagent's own CLI, so all must be on the
+  // read-only allowlist; user-prompt-hook in particular fires on EVERY prompt,
+  // and if the fence rejects it Claude reports the whole prompt "blocked by
+  // hook" and `/goal` never lands (Bug 4). A refused PreCompact hook exits 2,
+  // which blocks compaction.
   it.each([
     ['session-ready'],
     ['hook'],
     ['user-prompt-hook'],
+    ['__claude-compaction-v1'],
   ])('botmux %s (botmux-installed hook client) is allowed in workflow mode', (cmd) => {
     const out = runCli([cmd], { BOTMUX_WORKFLOW: '1' });
     expect(out.stderr).not.toMatch(/refused inside workflow/);

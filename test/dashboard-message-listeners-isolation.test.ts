@@ -3,6 +3,9 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageListenersPage } from '../src/dashboard/web/message-listeners-page.js';
 
+// Test runs ask for confirmation before posting real replies; accept them here.
+vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: vi.fn(async () => true) }));
+
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const BOT = 'cli_listener';
@@ -105,7 +108,7 @@ describe('message-listener page editor isolation', () => {
 
     // Trial runs use the same scope resolver, but exercise the separate
     // mutating endpoint explicitly: group run must never use the sample chat.
-    await act(async () => { groupPreview.findAllByType('button')[1]!.props.onClick(); await Promise.resolve(); });
+    await act(async () => { groupPreview.findAllByType('button')[1]!.props.onClick(); await Promise.resolve(); await Promise.resolve(); });
     expect(requests.filter(request => request.url.endsWith('/run-preview')).map(request => request.url)).toEqual([
       `/api/message-listeners/${BOT}/${GROUP}/run-preview`,
     ]);

@@ -24,6 +24,8 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
+
 /** Window during which a (ts, nonce) tuple is accepted; mirrors the spec ±60s. */
 export const TS_WINDOW_MS = 60_000;
 
@@ -94,12 +96,14 @@ export function checkSig(wireSig: string, expectedRaw: Buffer): boolean {
   return timingSafeEqual(provided, expectedRaw);
 }
 
-/** All-or-nothing loopback predicate, identical to `auth.ts`'s inline check. */
+/**
+ * All-or-nothing loopback predicate. Delegates to `utils/loopback-peers.ts`,
+ * which keeps the legacy default allow-list (127.0.0.1 / ::1 /
+ * ::ffff:127.0.0.1) and adds opt-in BOTMUX_LOOPBACK_PEERS entries for hosts
+ * whose kernel reports loopback peers as LAN IPs.
+ */
 export function isLoopback(remoteAddr: string | undefined): boolean {
-  if (!remoteAddr) return false;
-  if (remoteAddr === '127.0.0.1' || remoteAddr === '::1') return true;
-  if (remoteAddr.endsWith('::ffff:127.0.0.1')) return true;
-  return false;
+  return isLoopbackPeer(remoteAddr);
 }
 
 /** Persistent (in-memory) nonce store with lazy GC. */

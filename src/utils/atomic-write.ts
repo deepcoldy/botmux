@@ -80,6 +80,14 @@ function tmpPathFor(filePath: string): string {
   return `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
 }
 
+/** Whether a directory entry is an atomic-write intermediate left by
+ *  tmpPathFor (a SIGKILL in the open→rename window). Directory scanners that
+ *  persist per-record JSON files use this to skip half-written siblings
+ *  instead of failing the whole scan on their truncated contents. */
+export function isAtomicWriteTempName(name: string): boolean {
+  return /\.\d+\.[0-9a-f]{8}\.tmp$/.test(name);
+}
+
 function exclusiveCreateFlags(): number {
   // O_NOFOLLOW is a POSIX hardening flag. The random O_EXCL leaf is still
   // race-safe on Windows, where O_NOFOLLOW is not consistently supported.

@@ -13,7 +13,9 @@ describe('Codex per-Bot reasoning effort', () => {
       })),
       { larkAppId: 'codex-max', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-5.6-luna', reasoningEffort: 'max' },
       { larkAppId: 'codex-ultra', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' },
-      { larkAppId: 'codex-invalid-pair', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-5.4', reasoningEffort: 'ultra' },
+      // A verified table row refutes the level at load. A model without a row
+      // keeps it for the launch-time catalogue check (codex-reasoning-live-catalog.test.ts).
+      { larkAppId: 'codex-invalid-pair', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-6-luna', reasoningEffort: 'ultra' },
       {
         larkAppId: 'cli_effort_invalid',
         larkAppSecret: 'secret',
@@ -33,21 +35,24 @@ describe('Codex per-Bot reasoning effort', () => {
     const [config] = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'cli_non_codex_effort',
       larkAppSecret: 'secret',
-      cliId: 'gemini',
+      cliId: 'opencode',
       reasoningEffort: 'high',
     }]));
+    expect(config?.cliId).toBe('opencode');
     expect(config?.reasoningEffort).toBeUndefined();
   });
 
-  it('preserves safe TraeX reasoning effort and rejects unsupported levels', () => {
+  it('preserves valid handwritten TraeX reasoning effort independently of static model support', () => {
     const configs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'traex-medium', larkAppSecret: 'secret', cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'medium' },
       { larkAppId: 'traex-xhigh', larkAppSecret: 'secret', cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'xhigh' },
-      { larkAppId: 'traex-invalid-pair', larkAppSecret: 'secret', cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
+      { larkAppId: 'traex-static-table-lag', larkAppSecret: 'secret', cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
+      { larkAppId: 'traex-invalid-syntax', larkAppSecret: 'secret', cliId: 'traex', reasoningEffort: 'extreme' },
     ]));
     expect(configs.find(config => config.larkAppId === 'traex-medium')?.reasoningEffort).toBe('medium');
     expect(configs.find(config => config.larkAppId === 'traex-xhigh')?.reasoningEffort).toBe('xhigh');
-    expect(configs.find(config => config.larkAppId === 'traex-invalid-pair')?.reasoningEffort).toBeUndefined();
+    expect(configs.find(config => config.larkAppId === 'traex-static-table-lag')?.reasoningEffort).toBe('xhigh');
+    expect(configs.find(config => config.larkAppId === 'traex-invalid-syntax')?.reasoningEffort).toBeUndefined();
   });
 
   it('preserves only valid TraeX backend variants', () => {

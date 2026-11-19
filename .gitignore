@@ -1,9 +1,13 @@
 node_modules
+.worktrees/
 .pnpm-store/
 dist/
 # 编译版单文件二进制（bun build --compile，每个 ~170MB）。CI 与发版都往这里写，
 # `bun run use:here --binary` 也默认在这里找 host-arch 产物。
 dist-bin/
+# Per-run Bun test duration checkpoints and merged CI artifacts.
+/artifacts/bun-shard-*.json
+/artifacts/bun-shards/
 packages/workflow-core/dist/
 packages/workflow-core/.packs/
 data/
@@ -56,3 +60,4 @@ test-bots.json
 
 # tmux 客户端调试日志（曾被误提交）
 tmux-client-*.log
+build/native-desktop/

@@ -69,9 +69,14 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人（daemon 已核实），跨重启保留以保证重发卡片仍带通知。 */
+  mentionedOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
+  customAnswers?: ReadonlyArray<string | null>;
+  customRevision?: number;
   createdAt: number;
+  /** Absolute epoch milliseconds; paired with timeoutMs=0 for no deadline. */
   deadlineAt: number;
   /** Original relative timeout. Host-owned asks defer this clock until the
    *  interaction card is confirmed delivered; ordinary CLI asks start it at
@@ -86,6 +91,7 @@ export interface PersistedAsk {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
+  cardDeliveredAt?: number;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
@@ -131,21 +137,25 @@ export function askKeyFor(
   return humanDecisionKeyFor(larkAppId, sessionId, originKind, requestId);
 }
 
-/** Feishu IM `uuid` dedupe token (≤50 chars) derived from the FULL scoped ask
- *  key — NOT the bare requestId (codex P1-1). Deriving from the scoped key means
- *  a re-send within the same invocation dedupes server-side (same key → same
- *  uuid → Feishu returns the original message_id), while a different session
- *  reusing the same requestId gets a DIFFERENT uuid and so cannot alias the
- *  first session's card. `ask-` + 40 hex = 44 chars, safely under the cap. */
-export function dispatchUuidForKey(askKey: string): string {
-  return humanDecisionDispatchUuidForKey(askKey, 'ask');
+/** Feishu IM `uuid` dedupe token (≤50 chars) for one ask's card, derived from
+ *  the FULL scoped ask key — NOT the bare requestId (codex P1-1) — plus the ask
+ *  instance's askId. The askId is persisted, so every re-send of THIS ask (a
+ *  bounded transient retry, or a re-send after restore) gets the same uuid and
+ *  Feishu returns the original message_id. A different session reusing the same
+ *  requestId gets a DIFFERENT uuid and so cannot alias the first session's card.
+ *  A NEW ask instance under the same key (e.g. a hook that re-registers after
+ *  its earlier ask was invalidated) also gets a different uuid: its buttons carry
+ *  a new askId + nonce, so being deduped onto the old card would leave the user
+ *  a card that can't be answered. `ask-` + 40 hex = 44 chars, under the cap. */
+export function dispatchUuidForAsk(askKey: string, askId: string): string {
+  return humanDecisionDispatchUuidForKey(`${askKey}|${askId}`, 'ask');
 }
 
 export interface AskPersistStore {
   /** Absolute directory this store owns. */
   readonly dir: string;
   /** Create-or-update a record. Best-effort durable (atomic rename + fsync). */
-  put(ask: PersistedAsk): void;
+  put(ask: PersistedAsk, options?: { strict?: boolean }): void;
   /** Remove a record by key. Idempotent (missing file is not an error). */
   remove(askKey: string): void;
   /** Load all valid, unexpired records (reaps corrupt / wrong-version / expired). */
@@ -163,7 +173,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
 
   return {
     dir,
-    put(ask: PersistedAsk): void {
+    put(ask: PersistedAsk, options?: { strict?: boolean }): void {
       try {
         decisions.put(ask);
       } catch (e) {
@@ -179,7 +189,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         // uncaughtException — the daemon installs no trap for that, and explicit
         // records are exempt from disk reaping below, so it would crash-loop on
         // every restart until the disk recovered. Those writes stay best-effort.
-        if (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
+        if (options?.strict || (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered')) throw e;
         // Persistence is a resilience enhancement, never a correctness gate for
         // the live path: a failed write just means this ask won't survive a
         // restart.
@@ -203,6 +213,11 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         const parsed = raw as unknown as PersistedAsk;
         if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
           if (parsed?.askKey) decisions.remove(parsed.askKey);
+          continue;
+        }
+        if ((parsed.timeoutMs === 0 || parsed.deadlineAt === 0)
+          && !(parsed.originKind === 'host_explicit' && parsed.timeoutMs === 0 && parsed.deadlineAt === 0)) {
+          decisions.remove(parsed.askKey);
           continue;
         }
         // Reap rules:

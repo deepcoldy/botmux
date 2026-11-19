@@ -16,7 +16,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -94,11 +94,59 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   delete process.env.BOTS_CONFIG;
   rmSync(tempRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 
 describe('maybeCreateDefaultWorktree', () => {
+  it.each([
+    { cliId: 'claude-code', backendType: 'pty', sandbox: 'oncall' as const },
+    { cliId: 'codex', backendType: 'tmux', sandbox: 'scratch' as const },
+  ])('waits for a checkout hook within the configured budget for $cliId/$backendType', async agent => {
+    const repo = makeRepo('hook-success');
+    const { mod } = await loadWithBot(repo, true, agent);
+    vi.stubEnv('BOTMUX_WORKTREE_CREATE_TIMEOUT_MS', '5000');
+    writeFileSync(join(repo, '.git/hooks/post-checkout'), '#!/bin/sh\nsleep 0.2\ntouch hook-completed\n', { mode: 0o755 });
+
+    const result = await mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh',
+    });
+
+    expect(result.dir).not.toBe(repo);
+    expect(existsSync(join(result.dir, 'hook-completed'))).toBe(true);
+    expect(git(result.dir, 'branch', '--show-current')).toMatch(/^wt\//);
+  });
+
+  it.each([
+    { sandbox: false as const, force: false, outcome: 'fallback' },
+    { sandbox: 'scratch' as const, force: false, outcome: 'fallback' },
+    { sandbox: 'oncall' as const, force: false, outcome: 'fail-closed' },
+    { sandbox: false as const, force: true, outcome: 'explicit-error' },
+  ])('preserves $outcome when a checkout hook exceeds the configured budget', async ({ sandbox, force, outcome }) => {
+    const repo = makeRepo('hook-timeout');
+    const { mod } = await loadWithBot(repo, true, { sandbox });
+    vi.stubEnv('BOTMUX_WORKTREE_CREATE_TIMEOUT_MS', '100');
+    // exec avoids leaving a shell waiting for sleep when Git is terminated.
+    writeFileSync(join(repo, '.git/hooks/post-checkout'), '#!/bin/sh\nexec sleep 0.5\n', { mode: 0o755 });
+    const notices: string[] = [];
+    const pending = mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh', force,
+      notify: message => { notices.push(message); },
+    });
+
+    if (outcome === 'fallback') {
+      expect((await pending).dir).toBe(repo);
+      expect(notices).toHaveLength(2);
+    } else if (outcome === 'fail-closed') {
+      await expect(pending).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+      expect(notices).toHaveLength(1);
+    } else {
+      await expect(pending).rejects.toThrow();
+      expect(notices).toHaveLength(2);
+    }
+  });
+
   it('creates a worktree off a git default dir and notifies creating→created in order', async () => {
     const repo = makeRepo('proj');
     const { mod } = await loadWithBot(repo, true);
@@ -113,6 +161,28 @@ describe('maybeCreateDefaultWorktree', () => {
     // Two notices, in order: the "creating…" heads-up THEN the "created" result.
     expect(notices).toHaveLength(2);
     expect(notices[1]).toContain(r.dir);
+  });
+
+  it('records the worktree it created so the closed card can offer cleanup, but not a reused one', async () => {
+    const repo = makeRepo('recorded');
+    const { mod } = await loadWithBot(repo, false);
+    const { findBotmuxWorktreeFor, deleteBotmuxWorktree } = await import('../src/services/botmux-worktree-store.js');
+    const { config } = await import('../src/config.js');
+    const target = join(tempRoot, 'recorded-shared');
+    const ctx = {
+      isBotDefaultDir: true, locale: 'zh' as const, force: true,
+      worktreePath: target, branch: 'wt/botmux-topic', reuseExisting: true,
+    };
+
+    const first = await mod.maybeCreateDefaultWorktree('app_wt', repo, ctx);
+    expect(findBotmuxWorktreeFor(config.session.dataDir, first.dir)).toMatchObject({
+      dir: target, main: repo, branch: 'wt/botmux-topic', larkAppId: 'app_wt',
+    });
+
+    deleteBotmuxWorktree(config.session.dataDir, target);
+    const second = await mod.maybeCreateDefaultWorktree('app_wt', repo, ctx);
+    expect(second.dir).toBe(target);
+    expect(findBotmuxWorktreeFor(config.session.dataDir, target)).toBeUndefined();
   });
 
   it('does not push for an invalid codex-app + riff backend pair', async () => {

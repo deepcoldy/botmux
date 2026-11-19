@@ -9,10 +9,14 @@ export type CodexBrowserFamily = 'chrome' | 'edge';
 export interface CodexBrowserConfig {
   enabled: true;
   family: CodexBrowserFamily;
+  /** Operator opt-in for ordinary HTTP(S) origin prompts in this bot's browser
+   * sessions. Authentication, transfer and raw-CDP prompts remain separate. */
+  autoApproveOrigins?: true;
   /**
    * Trusted operator override for a Codex Chrome plugin checkout/cache root.
-   * The model never sees or controls this path. When omitted, Botmux discovers
-   * the standard plugin cache below CODEX_HOME (or ~/.codex).
+   * The model never sees or controls this path. When omitted, Botmux picks the
+   * newest complete plugin from the standard cache below CODEX_HOME (or
+   * ~/.codex) and the plugin bundled with the Codex/ChatGPT desktop app.
    */
   pluginRoot?: string;
 }
@@ -41,6 +45,9 @@ export function normalizeCodexBrowserConfig(
   }
 
   let pluginRoot: string | undefined;
+  if (value.autoApproveOrigins !== undefined && typeof value.autoApproveOrigins !== 'boolean') {
+    throw configError(`${label}.autoApproveOrigins`, 'must be a boolean');
+  }
   if (value.pluginRoot !== undefined) {
     if (typeof value.pluginRoot !== 'string' || !value.pluginRoot.trim()) {
       throw configError(`${label}.pluginRoot`, 'must be a non-empty absolute path');
@@ -54,6 +61,7 @@ export function normalizeCodexBrowserConfig(
   return {
     enabled: true,
     family,
+    ...(value.autoApproveOrigins === true ? { autoApproveOrigins: true } : {}),
     ...(pluginRoot ? { pluginRoot } : {}),
   };
 }

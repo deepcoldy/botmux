@@ -1,0 +1,50 @@
+
+  [38;5;75m>_ [1m[39mOpenAI Codex[0;2m[39m[49m (v0.164.0)
+[0m[39m[49m     [2m/tmp/repo
+
+[0m[39m[49m  [1m[38;5;211mTip:[0m[39m[49m Maximize usage with GPT-6.1 Sol. Try it on complex work for near-Astra performance at a lower cost.
+
+
+  [1mHooks
+[0m[39m[49m  [2mLifecycle hooks from config and enabled plugins.
+[0m[39m[49m
+  [38;5;3m⚠ 2 hooks need review before they can run.
+[39m
+  Event                 Installed   Active      Review      Description
+
+[1;7m› PreToolUse            1           0           1           Before a tool executes
+[0m[39m[49m  PermissionRequest     [2m0           0           0           When permission is requested
+[0m[39m[49m  PostToolUse           [2m0           0           0           After a tool executes
+[0m[39m[49m  PreCompact            [2m0           0           0           Before context compaction
+[0m[39m[49m  PostCompact           [2m0           0           0           After context compaction
+[0m[39m[49m  SessionStart          [2m1           0           [0m[38;5;3m[49m1           [2m[39mWhen a new session starts
+[0m[39m[49m  SessionEnd            [2m0           0           0           Right before a session ends
+[0m[39m[49m  UserPromptSubmit      [2m0           0           0           When the user submits a prompt
+[0m[38;5;75m[49m↓
+[39m
+  [1mt[0;2m[39m[49m trust all · [0;1m[39m[49menter[0;2m[39m[49m review · [0;1m[39m[49mesc[0;2m[39m[49m close
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

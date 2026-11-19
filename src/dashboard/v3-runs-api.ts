@@ -26,12 +26,15 @@ import { isValidRunId, listRuns, projectRunById, ptyLogPathFor } from '../workfl
 import { workflowDaemonMutationPath } from '../workflows/v3/daemon-ipc-client.js';
 import { readRunEnvelope, V3_RUN_ENVELOPE_FILE } from '../workflows/v3/run-envelope.js';
 import { readGrillState } from '../workflows/v3/grill-state.js';
+import { isWorkflowDraftDir, workflowDraftRunDir } from '../workflows/v3/draft-store.js';
 
 export type V3RunsApiDeps = {
   /** Root of the v3 run dirs (`~/.botmux/v3-runs` in production). */
   runsDir: string;
   /** Route a mutation to the daemon that owns the immutable run binding. */
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
+  /** Feishu display name for a bot app id, used for the per-node bot label. */
+  botName?: (larkAppId: string) => string | undefined;
 };
 
 /** Cap a single pty-log response so a runaway log can't exhaust the dashboard. */
@@ -68,7 +71,14 @@ export async function handleV3RunsApi(
       jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
       return true;
     }
-    const view = projectRunById(deps.runsDir, runId);
+    // A Dashboard draft (D2) is a run dir without run.json: it is listed by
+    // /api/v3/orchestration/drafts, never projected as an empty run.
+    const draftDir = workflowDraftRunDir(deps.runsDir, runId);
+    if (draftDir && isWorkflowDraftDir(draftDir)) {
+      jsonRes(res, 404, { error: 'unknown_run' });
+      return true;
+    }
+    const view = projectRunById(deps.runsDir, runId, { botName: deps.botName });
     if (!view) {
       jsonRes(res, 404, { error: 'unknown_run' });
       return true;

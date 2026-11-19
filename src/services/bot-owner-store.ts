@@ -79,15 +79,6 @@ export function setBotOwner(
   return true;
 }
 
-/** Remove a bot's owner. Returns true if one existed. */
-export function clearBotOwner(dataDir: string, larkAppId: string): boolean {
-  const data = readFile(dataDir);
-  if (!data[larkAppId]) return false;
-  delete data[larkAppId];
-  writeFileAtomic(dataDir, data);
-  return true;
-}
-
 /** All owners, keyed by larkAppId. */
 export function listBotOwners(dataDir: string): FileShape {
   return readFile(dataDir);

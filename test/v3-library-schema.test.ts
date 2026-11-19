@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
   SAVED_WORKFLOW_METADATA_SCHEMA_VERSION,
   buildSavedWorkflowRevision,
   computeSavedWorkflowGateDigest,
@@ -333,7 +334,7 @@ describe('v3 Saved Workflow library schema', () => {
 
   it('fails loud on a future revision schema instead of guessing', () => {
     const stored = buildSavedWorkflowRevision(payload());
-    const schemaVersion = 3;
+    const schemaVersion = SAVED_WORKFLOW_REVISION_SCHEMA_VERSION + 1;
     const contentHash = computeSavedWorkflowRevisionContentHash(schemaVersion, stored.payload);
     const future = {
       ...stored,

@@ -12,7 +12,7 @@
  * Dedicated lifecycle cases below use a fake child process to cover the real
  * daemon-side detach fence.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -103,6 +103,7 @@ import {
   rollbackRejectedSessionAndGetWinner,
   sendWorkerInput,
   sendWorkerSessionInput,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
 import {
   acquireDeviceIsolationFreeze,
@@ -113,6 +114,9 @@ import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 import type { Session } from '../src/types.js';
 import {
   __testOnly_resetBotTurnMutationGates,
@@ -211,6 +215,16 @@ describe('transferSession', () => {
     expect(forkWorkerSpy).not.toHaveBeenCalled();
     // Source ds must not have been mutated.
     expect(ds.chatId).toBe('oc_source');
+  });
+
+  it('relay moves the same session and preserves explicit pin provenance', async () => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: 'owner', setAt: '2026-11-06T00:00:00Z' };
+    const pin = structuredClone(ds.session.modelPin);
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    expect((await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_topic', 'group', 'thread')).ok).toBe(true);
+    expect(ds.session.modelPin).toEqual(pin);
+    expect(forkWorkerSpy.mock.calls[0][0].session.modelPin).toEqual(pin);
   });
 
   it('DM flat target (p2p, chat scope): rewrites chatType to p2p and anchors on the DM chatId', async () => {

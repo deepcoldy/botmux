@@ -7,6 +7,7 @@ import {
   drainTurnTerminalQueue,
   __testOnly_pendingTurnTerminalCount,
   __testOnly_reopenTurnTerminalAdmission,
+  getTurnTerminalPersistenceHealth,
 } from '../src/services/turn-completion-events.ts';
 import {
   getSkillFeedbackStore,
@@ -26,7 +27,7 @@ afterEach(async () => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-function delivery(store: SkillFeedbackStore, dir: string, over: Partial<Record<string, unknown>> = {}) {
+function delivery(store: Awaited<ReturnType<typeof getSkillFeedbackStore>>, dir: string, over: Partial<Record<string, unknown>> = {}) {
   return store.recordTurnDelivery({
     botAppId: 'app', sessionId: 'sess', turnId: 'turn-1', nativeSessionId: 'ns', dispatchAttempt: 0,
     platform: 'lark', platformAppId: 'app', platformMessageId: 'om_a', chatId: 'oc', topicRootId: 'om_root',
@@ -37,16 +38,55 @@ function delivery(store: SkillFeedbackStore, dir: string, over: Partial<Record<s
 }
 
 describe('turn-terminal nonblocking queue', () => {
+  it('does not count a same-turn status conflict as a persistence failure', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    await store.recordTurnTerminal({ botAppId: 'app', sessionId: 'sess', turnId: 'conflict', status: 'completed' });
+    const errors: unknown[] = [];
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'conflict', status: 'failed' }, maxAttempts: 1,
+      onError: e => errors.push(e),
+    });
+    // The conflict is surfaced (the existing completed row wins), but nothing
+    // was lost: the maintenance health counter must stay clear.
+    expect(String(errors[0])).toContain('turn_terminal_status_conflict');
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
+  });
+  it('counts a genuine busy give-up as failed and clears on the next successful write', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    await delivery(store, dir);
+    // Exhaust the retry budget against a lock held by a second connection.
+    const blocker = await SkillFeedbackStore.open(dir);
+    (blocker as any).db.exec('BEGIN IMMEDIATE;');
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
+      retryBaseMs: 5, maxAttempts: 1,
+    });
+    (blocker as any).db.exec('COMMIT;');
+    blocker.close();
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 1 });
+    // Storage is healthy again: a subsequent successful write clears the tally
+    // so a historical give-up cannot seal every later maintenance window.
+    await delivery(store, dir, { turnId: 'turn-2', platformMessageId: 'om_b' });
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-2', dispatchAttempt: 0, status: 'completed' },
+    });
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
+  });
   it('persists a terminal via the queue and resolves', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     await enqueueTurnTerminal({
       dataDir: dir, botAppId: 'app', sessionId: 'sess',
       terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
     });
     expect(__testOnly_pendingTurnTerminalCount()).toBe(0);
-    const events = store.listTurnCompletionEvents();
+    const events = await store.listTurnCompletionEvents();
     expect(events.length).toBe(1);
     expect(events[0].payload.status).toBe('completed');
   });
@@ -54,12 +94,12 @@ describe('turn-terminal nonblocking queue', () => {
   it('dedupes concurrent enqueues of the same turn into one in-flight item and one event', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     const a = enqueueTurnTerminal({ dataDir: dir, botAppId: 'app', sessionId: 'sess', terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' } });
     const b = enqueueTurnTerminal({ dataDir: dir, botAppId: 'app', sessionId: 'sess', terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' } });
     expect(a).toBe(b); // same promise returned for the duplicate
     await Promise.all([a, b]);
-    expect(store.listTurnCompletionEvents().length).toBe(1);
+    expect((await store.listTurnCompletionEvents()).length).toBe(1);
   });
 
   it('terminal-before-delivery: queue records the terminal, later delivery reconciles it (one event)', async () => {
@@ -67,10 +107,10 @@ describe('turn-terminal nonblocking queue', () => {
     const store = await getSkillFeedbackStore(dir);
     // Terminal first — no delivery yet, so no completion event is emitted at terminal time.
     await enqueueTurnTerminal({ dataDir: dir, botAppId: 'app', sessionId: 'sess', terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' } });
-    expect(store.listTurnCompletionEvents().length).toBe(0);
+    expect((await store.listTurnCompletionEvents()).length).toBe(0);
     // Delivery arrives afterward and reconciles against the recorded terminal.
-    delivery(store, dir);
-    const events = store.listTurnCompletionEvents();
+    await delivery(store, dir);
+    const events = await store.listTurnCompletionEvents();
     expect(events.length).toBe(1);
     expect(events[0].payload.status).toBe('completed');
   });
@@ -78,16 +118,16 @@ describe('turn-terminal nonblocking queue', () => {
   it('delivery-before-terminal: delivery recorded first, queued terminal reconciles it (one event)', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
-    expect(store.listTurnCompletionEvents().length).toBe(0);
+    await delivery(store, dir);
+    expect((await store.listTurnCompletionEvents()).length).toBe(0);
     await enqueueTurnTerminal({ dataDir: dir, botAppId: 'app', sessionId: 'sess', terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' } });
-    expect(store.listTurnCompletionEvents().length).toBe(1);
+    expect((await store.listTurnCompletionEvents()).length).toBe(1);
   });
 
   it('retries on a busy lock held by another connection, then succeeds (does not block inline)', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     // Hold the write lock from a SECOND independent connection to force BUSY.
     const blocker = await SkillFeedbackStore.open(dir);
     (blocker as any).db.exec('BEGIN IMMEDIATE;');
@@ -109,25 +149,25 @@ describe('turn-terminal nonblocking queue', () => {
     (blocker as any).db.exec('COMMIT;');
     await p;
     expect(resolved).toBe(true);
-    expect(store.listTurnCompletionEvents().length).toBe(1);
+    expect((await store.listTurnCompletionEvents()).length).toBe(1);
     blocker.close();
   });
 
   it('drainTurnTerminalQueue awaits in-flight work and reports 0 when drained', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     // Enqueue but do not await — then drain.
     void enqueueTurnTerminal({ dataDir: dir, botAppId: 'app', sessionId: 'sess', terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' } });
     const remaining = await drainTurnTerminalQueue(3000);
     expect(remaining).toBe(0);
-    expect(store.listTurnCompletionEvents().length).toBe(1);
+    expect((await store.listTurnCompletionEvents()).length).toBe(1);
   });
 
   it('drain reports a nonzero count when work cannot finish within the bound', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     const blocker = await SkillFeedbackStore.open(dir);
     (blocker as any).db.exec('BEGIN IMMEDIATE;'); // hold lock so the queued write stays busy
 
@@ -148,7 +188,7 @@ describe('turn-terminal nonblocking queue', () => {
   it('closes admission on drain: a terminal enqueued after drain begins is refused, not silently dropped', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     // Drain with an empty queue closes admission immediately and returns 0.
     const remaining = await drainTurnTerminalQueue(500);
     expect(remaining).toBe(0);
@@ -162,6 +202,7 @@ describe('turn-terminal nonblocking queue', () => {
     });
     expect(__testOnly_pendingTurnTerminalCount()).toBe(0);
     expect(String(errors[0])).toContain('turn_terminal_persist_refused_shutdown');
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
   });
 
   it('retries a transient store-open failure instead of permanently losing the terminal', async () => {
@@ -189,15 +230,15 @@ describe('turn-terminal nonblocking queue', () => {
     expect(__testOnly_pendingTurnTerminalCount()).toBe(0);
     // A delivery + terminal now both exist; the completion event is present.
     const store = await getSkillFeedbackStore(dataDir);
-    delivery(store, dataDir);
-    expect(store.listTurnCompletionEvents().length).toBe(1);
+    await delivery(store, dataDir);
+    expect((await store.listTurnCompletionEvents()).length).toBe(1);
     expect(errors.length).toBeGreaterThan(0); // transient failures were surfaced
   });
 
   it('surfaces a conflict when the same key is re-enqueued with a different status', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
     const errors: unknown[] = [];
     // First enqueue (completed) — hold it in flight by blocking the write lock.
     const blocker = await SkillFeedbackStore.open(dir);
@@ -215,9 +256,15 @@ describe('turn-terminal nonblocking queue', () => {
     });
     expect(second).toBe(first); // dedup still returns the in-flight promise
     expect(String(errors[0])).toContain('turn_terminal_status_conflict_enqueue');
-    (blocker as any).db.exec('COMMIT;');
-    await first;
-    blocker.close();
+    // While the first write is still blocked: the disagreement must not taint
+    // health even before any later success could reset the counter.
+    try {
+      expect(getTurnTerminalPersistenceHealth().failed).toBe(0);
+    } finally {
+      (blocker as any).db.exec('COMMIT;');
+      await first;
+      blocker.close();
+    }
   });
 
   it('shutdown ordering: a terminal enqueued while producers are still up is persisted through drain; only post-drain enqueues are refused', async () => {
@@ -228,7 +275,7 @@ describe('turn-terminal nonblocking queue', () => {
     // fence) is refused — surfaced, not silently dropped.
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    delivery(store, dir);
+    await delivery(store, dir);
 
     // Producer still "up": enqueue lands before drain (not awaited yet).
     const inflight = enqueueTurnTerminal({
@@ -239,7 +286,7 @@ describe('turn-terminal nonblocking queue', () => {
     const remaining = await drainTurnTerminalQueue(3000);
     await inflight;
     expect(remaining).toBe(0);
-    expect(store.listTurnCompletionEvents().length).toBe(1); // persisted, not lost
+    expect((await store.listTurnCompletionEvents()).length).toBe(1); // persisted, not lost
 
     // A late terminal after the fence is refused (would be the bug if silently dropped).
     const errors: unknown[] = [];
@@ -249,6 +296,6 @@ describe('turn-terminal nonblocking queue', () => {
       onError: e => errors.push(e),
     });
     expect(String(errors[0])).toContain('turn_terminal_persist_refused_shutdown');
-    expect(store.listTurnCompletionEvents().length).toBe(1); // turn-2 not persisted (correctly refused)
+    expect((await store.listTurnCompletionEvents()).length).toBe(1); // turn-2 not persisted (correctly refused)
   });
 });

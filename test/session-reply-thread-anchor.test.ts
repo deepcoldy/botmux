@@ -154,6 +154,28 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
   });
 
+  it('honors authenticated explicit chat publication from a thread session', async () => {
+    const ds = seedSharedSession();
+    activeSessions.clear();
+    ds.scope = 'thread'; ds.session.scope = 'thread'; ds.session.rootMessageId = 'om_dispatch';
+    activeSessions.set(sessionKey('om_dispatch', APP), ds);
+    await sessionReply('om_dispatch', 'result', 'interactive', APP, 'turn-report', {
+      sourceSessionId: ds.session.sessionId, placement: 'chat', uuid: 'report-id',
+    });
+    expect(mocks.sendMessage).toHaveBeenCalledWith(APP, CHAT, 'result', 'interactive', 'report-id', expect.any(Object));
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps a restored listener task silent even for a forced source-group publication', async () => {
+    const ds = seedSharedSession();
+    Object.assign(ds.session, { messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' } });
+    expect(await sessionReply(CHAT, 'task result', 'interactive', APP, 'om_source', {
+      sourceSessionId: ds.session.sessionId, placement: 'chat',
+    })).toBe('');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
   it('strict policy permits an available topic and disabling it restores legacy fallback', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
     seedSharedSession();

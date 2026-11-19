@@ -3,7 +3,6 @@
  * 单测环境无 jsdom：mock react-dom 的 createPortal 让侧栏内联渲染，
  * document 给最小 stub（addEventListener 捕获 Esc 处理器）。
  */
-import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -59,10 +58,6 @@ import {
   WorkingDirMock,
   type ModeOption,
 } from '../src/dashboard/web/mode-diagrams.js';
-
-const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
-const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-const diagrams = readFileSync(new URL('../src/dashboard/web/mode-diagrams.tsx', import.meta.url), 'utf8');
 
 function classes(node: ReactTestInstance): string[] {
   const className = node.props && node.props.className;
@@ -202,11 +197,38 @@ describe('ModeOptionGroup example drawer', () => {
     expect(frame.hasAttribute('inert')).toBe(false);
   });
 
-  it('Tab trap filters by runtime tabIndex>=0 and re-homes focus that is in the panel but off the Tab sequence (source)', () => {
-    // 边界：方向键可把焦点移到 tabIndex=-1 的 tab，此时焦点在面板内却不在
-    // 可 Tab 序列，浏览器会继续找而穿出抽屉。实现必须先判「不在 seq 中」统一兜底
-    expect(diagrams).toContain('el.tabIndex >= 0');
-    expect(diagrams).toContain('!active || !seq.includes(active)');
+  it('re-homes Tab from a focused tab that is inside the drawer but off the Tab sequence, and wraps at the ends', () => {
+    // 方向键可把焦点移到 tabIndex=-1 的 tab：焦点在面板内却不在可 Tab 序列里，
+    // 浏览器会继续往后找而穿出抽屉，所以必须按运行时 tabIndex 过滤并统一兜底。
+    const focused: string[] = [];
+    const fakeEl = (name: string, tabIndex: number) => ({
+      name, tabIndex, offsetParent: {}, hasAttribute: () => false, focus: () => { focused.push(name); },
+    });
+    const close = fakeEl('close', 0);
+    const viewingTab = fakeEl('viewing-tab', 0);
+    const otherTab = fakeEl('other-tab', -1);
+    const panel = { querySelectorAll: () => [close, viewingTab, otherTab] };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(ModeOptionGroup<string>, groupProps()), {
+        createNodeMock: el => (el.type === 'aside' ? panel : { focus: () => {} }),
+      });
+    });
+    act(() => findByClass(renderer.root, 'bd-mode-example-trigger')[0].props.onClick());
+    const pressTab = (active: unknown, shiftKey = false) => {
+      (globalThis as Record<string, unknown>).__activeEl = active;
+      focused.length = 0;
+      const preventDefault = vi.fn();
+      dispatch({ key: 'Tab', shiftKey, stopPropagation: () => {}, preventDefault });
+      return { prevented: preventDefault.mock.calls.length > 0, focused: [...focused] };
+    };
+
+    expect(pressTab(otherTab)).toEqual({ prevented: true, focused: ['close'] });
+    expect(pressTab(otherTab, true)).toEqual({ prevented: true, focused: ['viewing-tab'] });
+    expect(pressTab(viewingTab)).toEqual({ prevented: true, focused: ['close'] });
+    expect(pressTab(close, true)).toEqual({ prevented: true, focused: ['viewing-tab'] });
+    expect(pressTab(close)).toEqual({ prevented: false, focused: [] });
+    act(() => renderer.unmount());
   });
 
   it('does not steal focus on parent re-render while open (mount-once effect)', () => {
@@ -291,58 +313,6 @@ describe('mode mock screenshots', () => {
     expect(findByClass(fork, 'bd-mock-topic-b')).toHaveLength(1);
     const shared = render(React.createElement(RegularMock, { mode: 'shared' }));
     expect(findByClass(shared, 'bd-mock-shared-brace')).toHaveLength(1);
-  });
-});
-
-describe('page wiring and CSS', () => {
-  it('uses ModeOptionGroup (not big inline cards) for the four settings', () => {
-    for (const dataInput of ['workingDirMode', 'p2pMode', 'regularGroupMode', 'regularGroupMentionMode']) {
-      expect(page).toContain(`dataInput="${dataInput}"`);
-    }
-    expect(diagrams).toContain('export function ModeOptionGroup');
-    expect(diagrams).not.toContain('ModeCardPicker');
-  });
-
-  it('column counts: p2p 3, regular 2, mention 4, working dir 3; narrow uses container vars', () => {
-    expect(page).toContain('wideCols={3}');
-    expect(page).toContain('wideCols={4}');
-    expect((page.match(/wideCols=\{2\}/g) ?? []).length).toBeGreaterThan(0);
-    expect(css).toContain('container-name: bd-mode-opts');
-    expect(css).toMatch(/@container bd-mode-opts \(max-width:\s*620px\)/);
-    expect(css).toContain('repeat(var(--bd-narrow-cols)');
-  });
-
-  it('example drawer is a 460px right rail on desktop and a <=90dvh bottom sheet on narrow screens', () => {
-    expect(css).toMatch(/\.bd-example-panel\s*\{[^}]*width:\s*460px;/);
-    // 窄屏选择器必须命中「同一元素双 class」（layer 同时带 bot-defaults-page），不能用后代选择器
-    expect(css).toMatch(/@media \(max-width:\s*720px\)[^@]*\.bd-example-layer\.bot-defaults-page\s*\{[^}]*align-items:\s*flex-end;/);
-    expect(css).toMatch(/@media \(max-width:\s*720px\)[^@]*height:\s*90dvh;/);
-  });
-
-  it('close button pads 0 with a non-shrinking SVG; option rows left-align content', () => {
-    expect(css).toMatch(/\.bd-example-close\s*\{[^}]*padding:\s*0;/);
-    expect(css).toMatch(/\.bd-example-close svg\s*\{[^}]*flex:\s*none;/);
-    expect(css).toMatch(/\.bd-mode-opt\s*\{[^}]*justify-content:\s*flex-start;/);
-  });
-
-  it('option name (13px/700, theme text color) is stronger than the 12px/400 short line', () => {
-    expect(css).toMatch(/\.bd-mode-opt-name\s*\{[^}]*color:\s*var\(--text\);[^}]*font-size:\s*13px;[^}]*font-weight:\s*700;/);
-    expect(css).toMatch(/\.bd-mode-opt-short\s*\{[^}]*font-size:\s*12px;[^}]*font-weight:\s*400;/);
-  });
-
-  it('keeps titles at dashboard-standard sizes with no hardcoded dark text color', () => {
-    const start = css.indexOf('紧凑选项组');
-    const end = css.indexOf('高保真迷你飞书聊天', start);
-    const block = css.slice(start, end);
-    expect(block).not.toContain('font-size: 20px;');
-    expect(block).not.toMatch(/\.bd-mode-group-title\s*\{[^}]*font-size:\s*16px;/);
-    expect(block).not.toContain('#16181f');
-  });
-
-  it('dm-to-groups mock lives inside the query container (not on the container element itself)', () => {
-    // 回归：元素不能查询自身容器，否则 @container <360px 纵排永不生效
-    expect(diagrams).not.toContain('bd-mock bd-mock-dm-split');
-    expect(css).toMatch(/@container bd-mode-mock \(max-width:\s*360px\)/);
   });
 });
 

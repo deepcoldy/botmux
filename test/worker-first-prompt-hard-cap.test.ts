@@ -9,7 +9,7 @@
  * cap (worker.ts, `if (forced) cancelFirstFlushSettle();`).
  *
  * test/ready-gate.test.ts only MODELS that timeline (its own `Math.min(release +
- * settle, cap)`) plus a source pin. This file runs the REAL chain instead:
+ * settle, cap)`). This file runs the REAL chain instead:
  * a real worker (src/worker.ts) + PTY backend + the real dsh-tui adapter + the
  * real ready gate / settle / flushPending / adapter writeInput, against a fake
  * CLI that timestamps every input line it receives on the PTY. The assertion is

@@ -7,7 +7,7 @@
  * pure, unit-tested place instead of being duplicated as inline string concat.
  */
 import { realpathSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 
 const BOTMUX_WRAPPER_BASENAME = 'botmux';
@@ -31,6 +31,9 @@ function wrapperFilename(
  *  - core-only (BOTMUX_CORE_ONLY=1): a DEDICATED `<SESSION_DATA_DIR>/bin`, so a
  *    same-HOME fleet's `~/.botmux/bin` is never consulted or clobbered.
  *  - normal fleet: the shared `~/.botmux/bin` (unchanged).
+ *  - an explicit BOTMUX_WRAPPER_BIN: a dedicated runtime's wrapper directory.
+ *    Keeps candidate builds off the shared binary without putting the worker
+ *    in a user namespace that cannot inspect an existing CLI's /proc fds.
  *
  * Env-driven (not config) so it resolves identically in the daemon, a forked
  * worker, and a value baked into a tmux pane script — all of which see the same
@@ -38,27 +41,20 @@ function wrapperFilename(
  * process somehow lacks SESSION_DATA_DIR (defensive; the entrypoint always sets it).
  */
 export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env): string {
-  if (env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR) {
-    return join(env.SESSION_DATA_DIR, 'bin');
+  let binDir: string;
+  const explicit = env.BOTMUX_WRAPPER_BIN?.trim();
+  if (explicit && isAbsolute(explicit)) {
+    binDir = explicit;
+  } else if (env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR) {
+    binDir = join(env.SESSION_DATA_DIR, 'bin');
+  } else {
+    binDir = join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
   }
-  return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
-}
-
-/**
- * Stable daemon-updated wrapper path. Derive it from the same single source of
- * truth used by daemon.writePidFile(), including the dedicated core-only bin.
- * Canonicalize the directory so a symlinked lexical HOME still lands on the path
- * that a full bwrap session actually binds. BOTMUX_BIN_PATH is an MCP gateway
- * override, not a wrapper-write location, and therefore is intentionally ignored.
- */
-export function resolveStableBotmuxWrapperPath(
-  env: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform,
-): string {
-  const lexicalDir = resolveBotmuxWrapperBinDir(env);
-  let canonicalDir = lexicalDir;
-  try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
-  return join(canonicalDir, wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform));
+  try {
+    return realpathSync(binDir);
+  } catch {
+    return binDir;
+  }
 }
 
 export function resolveNativeSubagentRuntimeHookWrapperPath(

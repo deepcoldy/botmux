@@ -63,6 +63,7 @@ function makeClient(opts: {
   const reads: string[] = [];
   const writes: Array<{ appId: string; redirectURL: string[] }> = [];
   const writeCounts = new Map<string, number>();
+  const saved = new Map<string, string[]>();
   const postJson = async (path: string, body?: unknown): Promise<unknown> => {
     const update = path.match(/^\/developers\/v1\/safe_setting\/update\/(.+)$/);
     if (update) {
@@ -72,6 +73,7 @@ function makeClient(opts: {
       writeCounts.set(appId, n + 1);
       const err = (opts.writeErrors ?? {})[appId]?.[n];
       if (err) throw err;
+      saved.set(appId, [...(body as { redirectURL: string[] }).redirectURL]);
       return { code: 0 };
     }
     const read = path.match(/^\/developers\/v1\/safe_setting\/(.+)$/);
@@ -80,7 +82,7 @@ function makeClient(opts: {
       reads.push(appId);
       const readError = (opts.readErrors ?? {})[appId];
       if (readError) throw readError;
-      const current = (opts.existing ?? {})[appId];
+      const current = saved.get(appId) ?? (opts.existing ?? {})[appId];
       if (current === 'unreadable') throw new Error('safe_setting read endpoint missing');
       return { code: 0, data: { allowRefreshToken: true, ipWhiteList: [], redirectURL: current ?? [], safeServerDomain: [] } };
     }
@@ -158,7 +160,7 @@ describe('repairOpenPlatformRedirects', () => {
       appId: 'cli_a',
       redirectURL: [LOOPBACK, 'https://console.example.com/my-own-callback', PLATFORM],
     }]);
-    expect(stub.reads).toEqual(['cli_a', 'cli_b']);
+    expect(stub.reads).toEqual(['cli_a', 'cli_a', 'cli_b']);
   });
 
   it('没有可用登录态 → login_required（且不去碰 console）', async () => {
@@ -555,6 +557,7 @@ describe('repairOpenPlatformRedirects', () => {
     writeStoredCookiesToSessionFile(sessionFile, cookies());
 
     const seen: Array<{ url: string; hasSignal: boolean }> = [];
+    let redirects: string[] = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       seen.push({ url: href, hasSignal: init?.signal instanceof AbortSignal });
@@ -562,8 +565,11 @@ describe('repairOpenPlatformRedirects', () => {
       if (href === 'https://open.feishu.cn/app') {
         return new Response('<script>window.csrfToken="csrf_repair"</script>', { status: 200 });
       }
-      if (href.includes('/safe_setting/update/')) return Response.json({ code: 0 });
-      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      if (href.includes('/safe_setting/update/')) {
+        redirects = JSON.parse(String(init?.body)).redirectURL;
+        return Response.json({ code: 0 });
+      }
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: redirects } });
       throw new Error(`unexpected url: ${href}`);
     }) as typeof fetch;
 
@@ -581,10 +587,47 @@ describe('repairOpenPlatformRedirects', () => {
       'https://open.feishu.cn/app',
       'https://open.feishu.cn/developers/v1/safe_setting/cli_a',
       'https://open.feishu.cn/developers/v1/safe_setting/update/cli_a',
+      'https://open.feishu.cn/developers/v1/safe_setting/cli_a',
     ]);
     expect(seen.every(call => call.hasSignal)).toBe(true);
 
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('整批截止时间仍能取消带有回调配置自身截止时间的写入', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-redirect-repair-combined-signal-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, cookies());
+    let writeSignal: AbortSignal | null | undefined;
+    let writes = 0;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const href = String(input);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home');
+      if (href === 'https://open.feishu.cn/app') return new Response('<script>window.csrfToken="fixture";</script>');
+      if (href.includes('/safe_setting/update/')) {
+        writes++;
+        writeSignal = init?.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          writeSignal!.addEventListener('abort', () => reject(writeSignal!.reason), { once: true });
+        });
+      }
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      throw new Error(`unexpected console call: ${href}`);
+    }) as typeof fetch;
+
+    try {
+      const result = await repairOpenPlatformRedirects({
+        deadlineMs: 200, fetchImpl, sessionFilePath: sessionFile,
+        loadBots: () => [bot('cli_a')], collectWanted: () => [LOOPBACK],
+      });
+
+      expect(result).toMatchObject({ ok: false, reason: 'timeout' });
+      expect(writes).toBe(1);
+      expect(writeSignal?.aborted).toBe(true);
+      expect(isRepairOpenPlatformRedirectsInFlight()).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('超时批次即使之后自己活过来，也一个写请求都提交不出去（代际 fence）', async () => {

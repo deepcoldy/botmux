@@ -37,6 +37,23 @@ function stampElement(el: unknown): void {
     return;
   }
   const node = el as Record<string, unknown>;
+  if (node.tag === 'overflow') {
+    // Overflow menus carry one shared callback `value` for all options; the
+    // picked option arrives separately as action.option.
+    markPayload(node.value);
+  }
+  // Selects are callback controls when they carry a value (v1) or a callback
+  // behavior (v2); a plain informational select without either is left alone.
+  if ((node.tag === 'select_static' || node.tag === 'multi_select_static')
+    && (node.value !== undefined || (Array.isArray(node.behaviors)
+      && node.behaviors.some((b: any) => b?.type === 'callback')))) {
+    markPayload(node.value);
+    if (Array.isArray(node.behaviors)) {
+      for (const b of node.behaviors as any[]) {
+        if (b && typeof b === 'object' && b.type === 'callback') markPayload(b.value);
+      }
+    }
+  }
   if (node.tag === 'button') {
     // Do NOT stamp open_url jump buttons: their link is real, followable
     // content and must keep surfacing in flattened text. A button whose

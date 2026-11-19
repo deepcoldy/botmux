@@ -10,6 +10,7 @@ import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
 import { getSessionPersistentBackendType, persistentBackendTargetForSession } from '../core/persistent-backend.js';
 import { readGlobalConfig, type LocalCliOpenMode } from '../global-config.js';
+import { resolveCliSpawn } from '../core/self-spawn.js';
 
 export const LOCAL_CLI_IDS = [
   'claude-code',
@@ -32,6 +33,8 @@ export const LOCAL_CLI_IDS = [
   'oh-my-pi',
   'kimi',
   'grok',
+  'zcode',
+  'doubao',
 ] as const satisfies readonly CliId[];
 
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
@@ -56,8 +59,11 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'traex': 'traex resume',
   'pi': 'pi --session-id',
   'copilot': 'copilot --resume',
-  'kimi': 'kimi --resume',
+  // Kimi 0.31 has no --resume; -S/--session resumes an existing session_<uuid>.
+  'kimi': 'kimi --session',
   'grok': 'grok --resume',
+  'zcode': 'zcode --resume',
+  'doubao': 'doubao --resume',
 };
 
 type AdoptedMetadata = NonNullable<DaemonSession['adoptedFrom']> | NonNullable<DaemonSession['session']['adoptedFrom']>;
@@ -201,6 +207,16 @@ function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null 
     };
     return decodePath(match[1]) !== null && decodePath(match[2]) !== null ? raw : null;
   }
+  if (cliId === 'pi' && raw.includes(' --session-dir ')) {
+    // A session that keeps its history in its own dir (it ran under the file
+    // sandbox): both values come quoted from the adapter.
+    const quoted = String.raw`'(?:[^']|'\\'')*'`;
+    const match = new RegExp(`^pi --session-id (${quoted}) --session-dir (${quoted})(?![\\s\\S])`).exec(raw);
+    if (!match) return null;
+    const decode = (token: string): string => token.slice(1, -1).split("'\\''").join("'");
+    const dir = decode(match[2]);
+    return decode(match[1]) && isAbsolute(dir) && shellQuote(dir) === match[2] ? raw : null;
+  }
   const prefix = `${RESUME_COMMAND_PREFIXES[cliId]} `;
   if (!raw.startsWith(prefix)) return null;
   const sid = raw.slice(prefix.length).trim();
@@ -267,7 +283,12 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     return fail('missing_attach_target', 'This session has no persistent backend attach target.');
   }
   if (backendType === 'tmux') {
-    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
+    // A session created after the dedicated socket lives on `-L <socketName>`;
+    // older rows (no socketName) stay on the default server.
+    const socket = target.backendType === 'tmux' && target.socketName !== undefined
+      ? ` -L ${shellQuote(target.socketName)}`
+      : '';
+    return { ok: true, command: `tmux${socket} attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
   }
   if (backendType === 'herdr') {
     if (target.backendType === 'herdr' && target.agentName) {
@@ -285,14 +306,13 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
       'unset ZMX_SESSION ZMX_SESSION_PREFIX',
       ...socketEnv,
     ].join('; ');
-    const helper = [
-      shellQuote(process.execPath),
-      shellQuote(CLI_ENTRYPOINT),
+    const attach = resolveCliSpawn(CLI_ENTRYPOINT, [
       '__zmx-attach-managed',
-      shellQuote(target.sessionName),
-      shellQuote(ds.session.sessionId),
-      ...(target.socketDir !== undefined ? [shellQuote(target.socketDir)] : []),
-    ].join(' ');
+      target.sessionName,
+      ds.session.sessionId,
+      ...(target.socketDir !== undefined ? [target.socketDir] : []),
+    ]);
+    const helper = [attach.command, ...attach.args].map(shellQuote).join(' ');
     return {
       ok: true,
       command: `${prelude}; exec ${helper}`,

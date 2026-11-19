@@ -16,7 +16,7 @@
  * Run: bunx vitest run --project e2e test/herdr-backend.e2e.ts
  */
 import { describe, it, expect, afterAll, afterEach, beforeEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
@@ -311,6 +311,41 @@ describe('HerdrBackend (e2e)', () => {
     await waitFor(() => HerdrBackend.listBotmuxSessions().includes(TEST_SESSION), 10_000, 'session listed');
     expect(HerdrBackend.listBotmuxSessions()).toContain(TEST_SESSION);
     backend.destroySession();
+  }, TEST_TIMEOUT);
+
+  it.skipIf(!HerdrBackend.isAvailable())('split placement lands in the configured tab of a running session and closes only its pane', async () => {
+    // Stand-in for a user's own session: started outside Botmux, one workspace
+    // with tabs whose labels share a prefix.
+    spawn('herdr', ['--session', TEST_SESSION, 'server'], { stdio: 'ignore', detached: true, env: process.env }).unref();
+    await waitFor(() => HerdrBackend.hasSession(TEST_SESSION), 10_000, 'host session up');
+    const herdr = (...args: string[]) => JSON.parse(execFileSync('herdr', ['--session', TEST_SESSION, ...args], { encoding: 'utf-8' }));
+    const workspaceId = herdr('workspace', 'create', '--label', 'main', '--cwd', '/tmp', '--no-focus').result.workspace.workspace_id;
+    herdr('tab', 'create', '--workspace', workspaceId, '--label', '30 归档', '--cwd', '/tmp', '--no-focus');
+    const targetTabId = herdr('tab', 'create', '--workspace', workspaceId, '--label', '3 其他', '--cwd', '/tmp', '--no-focus').result.tab.tab_id;
+    const panesIn = (tabId: string) => herdr('pane', 'list').result.panes.filter((p: any) => p.tab_id === tabId);
+    const tabCount = () => herdr('tab', 'list').result.tabs.length;
+    expect(panesIn(targetTabId)).toHaveLength(1);
+
+    const backend = new HerdrBackend(TEST_SESSION, {
+      agentName: 'botmux-e2e-split',
+      ownsSession: false,
+      ownsAgent: true,
+      isCustomHost: true,
+      herdrConfig: { sessionName: TEST_SESSION, placement: 'split', tab: '3', splitDirection: 'right' },
+    });
+    try {
+      backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo SPLIT_OK; sleep 30'], spawnOpts());
+      await waitFor(() => backend.captureCurrentScreen().includes('SPLIT_OK'), 10_000, 'agent output in the split pane');
+
+      expect(panesIn(targetTabId)).toHaveLength(2);
+      expect(tabCount()).toBe(3);
+      expect(herdr('workspace', 'list').result.workspaces).toHaveLength(1);
+    } finally {
+      backend.destroySession();
+    }
+    await waitFor(() => panesIn(targetTabId).length === 1, 10_000, 'split pane closed');
+    expect(tabCount()).toBe(3);
+    expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
   }, TEST_TIMEOUT);
 
   it.skipIf(!HerdrBackend.isAvailable())('onExit fires after the agent process exits', async () => {

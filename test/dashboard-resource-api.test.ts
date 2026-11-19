@@ -31,9 +31,17 @@ describe('handleResourceMonitorApi', () => {
     };
 
     let res = makeRes();
-    expect(await handleResourceMonitorApi({ method: 'GET' } as any, res, new URL('http://x/api/resources/current'), service)).toBe(true);
+    const wsBot = {
+      larkAppId: 'app-a', botName: 'Example',
+      larkConnection: { state: 'reconnecting' as const, since: 1000, attempts: 3, lastInboundAt: null },
+      ipcPort: 7000, resolvedAllowedUsers: ['unused'],
+    };
+    expect(await handleResourceMonitorApi({ method: 'GET' } as any, res, new URL('http://x/api/resources/current'), service, () => [wsBot])).toBe(true);
     expect(res.status).toBe(200);
     expect(JSON.parse(res.body)).toMatchObject({ ok: true, supported: true, intervalMs: 10_000 });
+    expect(JSON.parse(res.body).larkConnections).toEqual([
+      { larkAppId: 'app-a', botName: 'Example', larkConnection: wsBot.larkConnection },
+    ]);
 
     res = makeRes();
     expect(await handleResourceMonitorApi({ method: 'GET' } as any, res, new URL('http://x/api/resources/history?range=24h'), service)).toBe(true);

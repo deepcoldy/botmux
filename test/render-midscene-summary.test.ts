@@ -61,6 +61,28 @@ describe('Midscene CI summary', () => {
     );
   });
 
+  it('points at the run\'s site artifact, because Pages prunes the published report', () => {
+    const runUrl = 'https://github.com/quanru/botmux/actions/runs/44';
+    const base = {
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'success',
+      runUrl,
+      siteArtifactName: 'botmux-midscene-site',
+      summary: {
+        status: 'success',
+        durationMs: 1000,
+        summary: { total: 1, passed: 1, failed: 0, notRun: 0 },
+        projects: [{ name: 'dashboard-smoke', cases: [{ name: 'Dashboard', status: 'success', attempts: [{}] }] }],
+      },
+    };
+
+    const published = renderSummary({ ...base, pagesUrl: 'https://example.test/master-run-44/' });
+    const fallback = published.split('\n').find((line) => line.includes('botmux-midscene-site'));
+    expect(fallback).toContain(`${runUrl}#artifacts`);
+    // Nothing went to Pages, so no link can outlive its report.
+    expect(renderSummary(base)).not.toContain('botmux-midscene-site');
+  });
+
   it('shows why a failed case failed, even without a screenshot', () => {
     expect(failureReason({
       error: { message: 'Node "feishu.openAndSend" failed: Messenger did not load\n    at stack' },

@@ -41,6 +41,45 @@ describe('buildMacScratchProfile — three-stage credential sealing', () => {
     expect(reopen).toBeGreaterThan(sealRead);
   });
 
+  it('keeps only the METADATA of sealed ancestors readable so realpath can reach the session tree', () => {
+    // CODEX_HOME lives at <~/.botmux/data>/sandboxes/<sid>/clone/home/.codex;
+    // canonicalizing it lstat()s every component, ~/.botmux included.
+    const p = join(buildMacScratchProfile({
+      net: true,
+      authorityRootDenies: ['/Users/u/.botmux/data', '/Users/u/.botmux'],
+      writable: ['/Users/u/.botmux/data/sandboxes/s/clone/home', '/Users/u/.botmux/data/sandboxes/s/outbox', '/private/tmp/x'],
+      fileDenyPaths: ['/Users/u/.botmux/bots.json'],
+    }));
+    const ancestors = [
+      '/Users/u/.botmux',
+      '/Users/u/.botmux/data',
+      '/Users/u/.botmux/data/sandboxes',
+      '/Users/u/.botmux/data/sandboxes/s',
+      '/Users/u/.botmux/data/sandboxes/s/clone',
+    ];
+    const seal = Math.max(
+      idx(p, '(deny file-read* (subpath "/Users/u/.botmux"))'),
+      idx(p, '(deny file-read* (subpath "/Users/u/.botmux/data"))'),
+    );
+    for (const dir of ancestors) {
+      const rule = `(allow file-read-metadata (literal "${dir}"))`;
+      expect(p).toContain(rule);
+      expect(p.split(rule)).toHaveLength(2); // once, even though two roots cover it
+      expect(idx(p, rule)).toBeGreaterThan(seal);
+    }
+    // Metadata only: never a content/subtree read grant on a sealed ancestor,
+    // and nothing for paths outside the seal or for the user's HOME itself.
+    for (const dir of ancestors) {
+      expect(p).not.toContain(`(allow file-read* (subpath "${dir}"))`);
+      expect(p).not.toContain(`(allow file-read* (literal "${dir}"))`);
+    }
+    expect(p).not.toContain('(allow file-read-metadata (literal "/Users/u"))');
+    expect(p).not.toContain('(allow file-read-metadata (literal "/private/tmp"))');
+    // Secrets stay sealed: the final file deny still comes last.
+    expect(idx(p, '(deny file-read* (subpath "/Users/u/.botmux/bots.json"))'))
+      .toBeGreaterThan(idx(p, '(allow file-read-metadata (literal "/Users/u/.botmux"))'));
+  });
+
   it('still denies bots.json reads through the farm symlink (final file deny wins)', () => {
     const p = join(buildMacScratchProfile({
       net: true,

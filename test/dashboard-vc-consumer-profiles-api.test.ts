@@ -322,6 +322,7 @@ function makeDeps(over: Partial<VcMeetingConsumerProfilesApiDeps> = {}): VcMeeti
 }
 
 const DEFAULT_POLICY_FIELDS = {
+  inviterManagementEnabled: false,
   // 缺省 = 接收会议事件：VC 对每个连着飞书的 bot 默认可用，enabled:false 才是退出。
   vcEnabled: true,
   vcEligible: true,
@@ -699,5 +700,32 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
       realtimeVoiceEnabled: false,
       effectiveVoiceOutputPolicy: 'deny',
     });
+  });
+});
+
+
+describe('owner opt-in meeting inviter configuration', () => {
+  it('returns false by default and rejects non-boolean writes before applying any mutation', async () => {
+    const deps = makeDeps();
+    const got = await handleVcMeetingConsumerProfilesGet(deps);
+    expect(got.body).toMatchObject({ agentOptions: [{ inviterManagementEnabled: false }] });
+    const result = await handleVcMeetingConsumerProfilesPut(putRequest({ botOutputPolicies: [{
+      appId: 'app_agent', vcEnabled: true, textOutputPolicy: null, voiceOutputPolicy: null,
+      realtimeVoiceEnabled: true, inviterManagementEnabled: 'true',
+    }] }), deps);
+    expect(result.status).toBe(422);
+    expect(deps.updateCatalog).not.toHaveBeenCalled();
+    expect(deps.applyBotOutputPolicy).not.toHaveBeenCalled();
+  });
+  it.each([true, false, undefined])('round-trips explicit opt-in and preserves omitted old-client fields: %s', async enabled => {
+    const deps = makeDeps();
+    const result = await handleVcMeetingConsumerProfilesPut(putRequest({ botOutputPolicies: [{
+      appId: 'app_agent', vcEnabled: true, textOutputPolicy: null, voiceOutputPolicy: null,
+      realtimeVoiceEnabled: true, ...(enabled === undefined ? {} : { inviterManagementEnabled: enabled }),
+    }] }), deps);
+    expect(result.status).toBe(200);
+    const patch = vi.mocked(deps.applyBotOutputPolicy!).mock.calls[0][0];
+    if (enabled === undefined) expect(patch).not.toHaveProperty('inviterManagementEnabled');
+    else expect(patch.inviterManagementEnabled).toBe(enabled);
   });
 });

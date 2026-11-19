@@ -64,8 +64,11 @@ const openCodeAdapter: HookAskAdapter = {
         const rawOpts = q.options ?? [];
         const options = rawOpts.map((opt) => {
           const label = opt.label ?? '';
-          // option 无独立 key 时，用 label 作为 key
-          return { key: label, label };
+          // option 无独立 key 时，用 label 作为 key；透传 OpenCode 的选项说明。
+          const description = typeof opt.description === 'string' && opt.description.trim()
+            ? opt.description
+            : undefined;
+          return description ? { key: label, label, description } : { key: label, label };
         });
         return { prompt: qText, options, multiSelect };
       });
@@ -93,6 +96,7 @@ const openCodeAdapter: HookAskAdapter = {
     answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
     parsed: ParsedAsk,
     comment?: string | null,
+    customAnswers?: ReadonlyArray<string | null>,
   ): string {
     const p = parsed.raw as Record<string, unknown> | undefined;
     const toolInput = (p?.tool_input as { questions?: unknown[] } | undefined);
@@ -103,6 +107,7 @@ const openCodeAdapter: HookAskAdapter = {
       // 结构化路径：answers[i] = 第 i 个 question 选中的 label 数组；
       // 无选中项时若有自定义回复则回落到该文字（替代语义），否则填空哨兵 ['']
       const answers: string[][] = parsed.questions.map((q, i) => {
+        if (customAnswers?.[i]) return [customAnswers[i]!];
         const selectedKeys = answersByQuestion[i];
         if (!selectedKeys || selectedKeys.length === 0) {
           return customText ? [customText] : [''];
@@ -118,6 +123,7 @@ const openCodeAdapter: HookAskAdapter = {
 
     // 旧版：拍平所有答案为 free-text；纯自定义回复时直接用自定义文字
     const flat = answersByQuestion
+      .map((keys, i) => customAnswers?.[i] ? [customAnswers[i]!] : keys)
       .flat()
       .filter((s) => s.length > 0)
       .join(', ');

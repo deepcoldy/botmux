@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/core/cost-calculator.js', () => ({
-  getSessionTokenUsage: vi.fn(() => null),
+  getSessionUsageWithContext: vi.fn(() => ({ snapshot: { context: null, tokens: null, turnTokens: null } })),
 }));
 
 import {

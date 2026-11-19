@@ -10,6 +10,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { config } from '../src/config.js';
+import { codexCleanupArchiveEnabled } from '../src/services/codex-cleanup-archive.js';
 
 const APP_ID = 'cli_config_routes_test';
 
@@ -28,12 +30,16 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-owner-group-follow', LEGACY],
+  ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
   ['/api/bot-env', LEGACY],
   ['/api/bot-max-live-workers', LEGACY],
   ['/api/bot-idle-suspend-minutes', LEGACY],
+  ['/api/bot-archive-codex', LEGACY],
   ['/api/bot-riff', LEGACY],
+  ['/api/bot-herdr', LEGACY],
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
   ['/api/bot-lark-tool-binding', LEGACY],
@@ -42,6 +48,10 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
 const CASES: readonly Case[] = [
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-p2p-mode', '{"p2pMode":"thread"}', 200, { ok: true, p2pMode: 'thread' }, { p2pMode: 'thread' }],
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],
@@ -60,13 +70,25 @@ const CASES: readonly Case[] = [
   ['/api/bot-startup-commands', '{"startupCommands":"/effort high, /foo"}', 200, { ok: true, startupCommands: '/effort high\n/foo' }, { startupCommands: ['/effort high', '/foo'] }],
   ['/api/bot-startup-commands', '{"startupCommands":"   "}', 200, { ok: true, startupCommands: '' }, { startupCommands: undefined }],
   ['/api/bot-custom-passthrough', '{"customPassthroughCommands":"/a /b"}', 200, { ok: true, customPassthroughCommands: '/a /b' }, { customPassthroughCommands: ['/a', '/b'] }],
+  ['/api/bot-custom-passthrough', '{"customPassthroughCommands":"/Ultra Goal"}', 200, { ok: true, customPassthroughCommands: '/ultra-goal' }, { customPassthroughCommands: ['/ultra-goal'] }],
+  ['/api/bot-custom-passthrough', '{"customPassthroughCommands":"/goal ; /export"}', 200, { ok: true, customPassthroughCommands: '/goal /export' }, { customPassthroughCommands: ['/goal', '/export'] }],
   ['/api/bot-custom-passthrough', '{"customPassthroughCommands":""}', 200, { ok: true, customPassthroughCommands: '' }, { customPassthroughCommands: undefined }],
   ['/api/bot-cantalk-daemon-commands', '{"canTalkDaemonCommands":"/status /clear"}', 200, { ok: true, canTalkDaemonCommands: '/status' }, { canTalkDaemonCommands: ['/status'] }],
   ['/api/bot-cantalk-daemon-commands', '{"canTalkDaemonCommands":"nonsense"}', 400, { ok: false, error: 'empty' }],
   ['/api/bot-launch-shell', '{"launchShell":"bash"}', 200, { ok: true, launchShell: 'bash' }, { launchShell: 'bash' }],
   ['/api/bot-launch-shell', '{"launchShell":"  "}', 200, { ok: true, launchShell: '' }, { launchShell: undefined }],
   ['/api/bot-oncall-group', '{"oncallGroup":"x"}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-actor-owner-bindings', '{"botActorOwnerBindings":[{"sourceBotOpenId":"ou_source","sourceBotUnionId":"on_source","ownerUnionId":"on_owner","ownerEmail":"owner@bytedance.com"}]}', 200, {
+    ok: true,
+    botActorOwnerBindings: [{ sourceBotOpenId: 'ou_source', sourceBotUnionId: 'on_source', ownerUnionId: 'on_owner', ownerEmail: 'owner@bytedance.com' }],
+  }, {
+    botActorOwnerBindings: [{ sourceBotOpenId: 'ou_source', sourceBotUnionId: 'on_source', ownerUnionId: 'on_owner', ownerEmail: 'owner@bytedance.com' }],
+  }],
+  ['/api/bot-actor-owner-bindings', '{"botActorOwnerBindings":[{"sourceBotOpenId":"ou_source","sourceBotUnionId":"on_source","ownerUnionId":"on_owner","ownerEmail":"owner@bytedance.com","source":"forged"}]}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":300000}}', 200, { ok: true, noProgressNotify: { enabled: true, timeoutMs: 300000 } }, { noProgressNotify: { enabled: true, timeoutMs: 300000 } }],
+  ['/api/bot-no-progress-notify', '{"noProgressNotify":{"enabled":true,"cliEnabled":true,"timeoutMs":300000}}', 200, { ok: true, noProgressNotify: { enabled: true, cliEnabled: true, timeoutMs: 300000 } }, { noProgressNotify: { enabled: true, cliEnabled: true, timeoutMs: 300000 } }],
+  ['/api/bot-no-progress-notify', '{"noProgressNotify":{"cliEnabled":false}}', 200, { ok: true, noProgressNotify: { enabled: true, cliEnabled: false } }, { noProgressNotify: { enabled: true, cliEnabled: false } }],
+  ['/api/bot-no-progress-notify', '{"noProgressNotify":{"cliEnabled":"yes"}}', 400, { ok: false, error: expect.stringContaining('invalid_no_progress_notify') }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":null}', 200, { ok: true, noProgressNotify: null }, { noProgressNotify: undefined }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":5}}', 400, { ok: false, error: expect.stringContaining('invalid_no_progress_notify') }],
   ['/api/bot-feedback', '{"feedback":"{bad"}', 400, { ok: false, error: 'invalid_json' }],
@@ -82,7 +104,14 @@ const CASES: readonly Case[] = [
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":null}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":"x"}', 400, { ok: false, error: 'invalid_number' }],
   ['/api/bot-idle-suspend-minutes', '{}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
-  ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null }],
+  // 三态覆盖：显式 false 也落盘；null 才删键回到继承；缺键 / 非布尔不当清除。
+  ['/api/bot-archive-codex', '{"archiveCodex":false}', 200, { ok: true, archiveCodex: false }, { archiveCodex: false }],
+  ['/api/bot-archive-codex', '{"archiveCodex":true}', 200, { ok: true, archiveCodex: true }, { archiveCodex: true }],
+  ['/api/bot-archive-codex', '{"archiveCodex":null}', 200, { ok: true, archiveCodex: null }, { archiveCodex: undefined }],
+  ['/api/bot-archive-codex', '{"archiveCodex":"off"}', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-archive-codex', '{}', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-archive-codex', '[]', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null, warnings: [] }],
   ['/api/bot-sandbox-network-policy', '{"policy":1,"x":2}', 400, { ok: false, error: 'policy_required' }],
   // 校验通过后由 applyConfigField 拒绝：reason 原样作为 400 的 error。
   ['/api/bot-sandbox-network-policy', '{"policy":"allow"}', 400, { ok: false, error: 'sandboxNetworkPolicy must be an object' }],
@@ -95,6 +124,22 @@ const CASES: readonly Case[] = [
   ['/api/bot-riff', '{"riff":"   "}', 200, { ok: true, riff: '' }, { riff: undefined }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"sandboxCluster\\":\\"nope\\"}"}', 400, { ok: false, error: 'invalid_sandbox_cluster' }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"ftp://x\\"}"}', 400, { ok: false, error: 'invalid_base_url' }],
+  // herdr：合法值经 normalizeHerdrBackendConfig 归一落盘；非法字段显式拒绝；空串 / 空对象清除。
+  ['/api/bot-herdr', '{"herdr":"{\\"placement\\":\\"tab\\"}"}', 200, { ok: true }, { herdr: { placement: 'tab' } }],
+  ['/api/bot-herdr', '{"herdr":"   "}', 200, { ok: true, herdr: '' }, { herdr: undefined }],
+  ['/api/bot-herdr', '{"herdr":"{}"}', 200, { ok: true, herdr: '' }, { herdr: undefined }],
+  ['/api/bot-herdr', '{"herdr":"{\\"placement\\":\\"nope\\"}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"{\\"session\\":\\"default\\"}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"{\\"chatTypes\\":[\\"group\\",\\"x\\"]}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"[1,2]"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  // 激活条件：无 sessionName/placement 时只填 tab/workspace/splitDirection/chatTypes，
+  // 叠加全局 env 后仍不生效 → 拒绝，杜绝「保存成功但零效果」。
+  ['/api/bot-herdr', '{"herdr":"{\\"tab\\":\\"3\\"}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"{\\"chatTypes\\":[\\"group\\"]}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  // 重复 chatTypes 与 bots.json/env 门一致，去重后接受。
+  ['/api/bot-herdr', '{"herdr":"{\\"sessionName\\":\\"default\\",\\"chatTypes\\":[\\"group\\",\\"group\\"]}"}', 200, { ok: true }, { herdr: { sessionName: 'default', chatTypes: ['group'] } }],
+  // 非字符串 body 不能静默当清除（破坏性字段类型门）。
+  ['/api/bot-herdr', '{"herdr":{"tab":"3"}}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
   ['/api/bot-skills', '{"action":"set","policy":null}', 200, { ok: true, skills: null }],
   ['/api/bot-skills', '{"action":"x"}', 400, { ok: false, error: 'invalid_action' }],
   ['/api/bot-skills', '{"action":"attach"}', 400, { ok: false, error: 'name_required' }],
@@ -113,6 +158,7 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
   let configPath: string;
   let handle: IpcServerHandle | null = null;
   let previousBotsConfig: string | undefined;
+  let previousGlobalConfig: string | undefined;
 
   const persistedBot = () => JSON.parse(readFileSync(configPath, 'utf8'))[0] as Record<string, unknown>;
   const put = (path: string, body?: string) => fetch(`http://127.0.0.1:${handle!.port}${path}`, {
@@ -126,6 +172,10 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     configPath = join(dir, 'bots.json');
     previousBotsConfig = process.env.BOTS_CONFIG;
     process.env.BOTS_CONFIG = configPath;
+    // The network-policy warnings route composes the global sessionEnv layer;
+    // isolate it so results never depend on the developer's live config.json.
+    previousGlobalConfig = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    process.env.BOTMUX_GLOBAL_CONFIG_FILE = join(dir, 'global-config.json');
     writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
     __testOnly_resetBotRegistry();
     loadBotConfigs().forEach((c: any) => registerBot(c));
@@ -134,11 +184,14 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
   });
 
   afterEach(async () => {
+    delete (config.daemon as { herdr?: unknown }).herdr;
     if (handle) await handle.close();
     handle = null;
     setLarkAppId('');
     if (previousBotsConfig === undefined) delete process.env.BOTS_CONFIG;
     else process.env.BOTS_CONFIG = previousBotsConfig;
+    if (previousGlobalConfig === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    else process.env.BOTMUX_GLOBAL_CONFIG_FILE = previousGlobalConfig;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -177,6 +230,56 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     }
   });
 
+  it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy saves with DNS and proxy warnings', async () => {
+    // The bot's own env layer counts: its sessions inherit it.
+    writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty', env: { HTTPS_PROXY: 'http://proxy.example:8080' } }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    const bare = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, sandboxNetworkPolicy: bare, warnings: ['dns_servers_missing', 'proxy_requires_trusted_egress'] });
+    // Saved despite the warnings: the launch env can differ from the daemon's.
+    expect(persistedBot().sandboxNetworkPolicy).toEqual(bare);
+    const ready = { ...bare, dnsServers: ['10.0.0.53'], proxyMode: 'trusted-egress' };
+    const fixed = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: ready }));
+    expect(await fixed.json()).toEqual({ ok: true, sandboxNetworkPolicy: ready, warnings: [] });
+  });
+
+  it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy warns about a proxy in the global sessionEnv layer', async () => {
+    writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty' }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    // Proxy configured only in the global layer (Dashboard global env editor):
+    // every new session inherits it, so the save warning must see it too.
+    writeFileSync(join(dir, 'global-config.json'), JSON.stringify({ sessionEnv: { set: { HTTPS_PROXY: 'http://global-proxy.example:8080' }, unset: [] } }));
+    const bare = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, warnings: ['proxy_requires_trusted_egress'] });
+  });
+
+  it('/api/bot-archive-codex overrides the global archive switch for the next close and is echoed by the defaults GET', async () => {
+    writeFileSync(join(dir, 'global-config.json'), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    const shown = async () => {
+      const res = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      return (await res.json()).archiveCodex;
+    };
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
+    expect(await shown()).toBeNull();
+
+    expect((await put('/api/bot-archive-codex', '{"archiveCodex":false}')).status).toBe(200);
+    // 关闭路径每次开始时取的就是这个判定：Dashboard 保存后无需重启即按本 Bot 的值。
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(false);
+    expect(await shown()).toBe(false);
+
+    expect((await put('/api/bot-archive-codex', '{"archiveCodex":null}')).status).toBe(200);
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
+    expect(await shown()).toBeNull();
+    expect(persistedBot()).not.toHaveProperty('archiveCodex');
+  });
+
   it('/api/bot-env merges and removes keys, then clears an empty merge result', async () => {
     const seed = await put('/api/bot-env', JSON.stringify({
       env: JSON.stringify({ KEEP: 'old', DROP: 'delete', UNTOUCHED: 'same' }),
@@ -199,6 +302,86 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     expect(clear.status).toBe(200);
     expect(await clear.json()).toEqual({ ok: true, env: '', envKeys: [] });
     expect(persistedBot()).not.toHaveProperty('env');
+  });
+
+  it('/api/bot-herdr normalizes a full block, echoes it pretty-printed, then clears', async () => {
+    // 重复 chatTypes 与 bots.json/env 门一致：去重接受，不报错。
+    const dedupBody = JSON.stringify({
+      herdr: JSON.stringify({
+        sessionName: ' default ',  // trim
+        placement: 'split',
+        workspace: '',              // empty after trim → dropped
+        tab: '3',
+        splitDirection: 'right',
+        chatTypes: ['group', 'group'],  // duplicated → deduped
+      }),
+    });
+    const save = await put('/api/bot-herdr', dedupBody);
+    expect(save.status).toBe(200);
+    const savedBody = await save.json();
+    expect(savedBody.ok).toBe(true);
+    expect(JSON.parse(savedBody.herdr)).toEqual({
+      sessionName: 'default',
+      placement: 'split',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    });
+    expect(persistedBot().herdr).toEqual({
+      sessionName: 'default',
+      placement: 'split',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    });
+    // 缺激活字段：只填 tab 被拒且不落盘。
+    const inert = await put('/api/bot-herdr', JSON.stringify({ herdr: JSON.stringify({ tab: '9' }) }));
+    expect(inert.status).toBe(400);
+    expect((await inert.json()).error).toContain('invalid_herdr_config');
+    // 非字符串 body：拒绝，不当清除。
+    const wrongType = await put('/api/bot-herdr', JSON.stringify({ herdr: { tab: '9' } }));
+    expect(wrongType.status).toBe(400);
+    expect(persistedBot().herdr).toBeDefined();
+
+    const clear = await put('/api/bot-herdr', JSON.stringify({ herdr: '' }));
+    expect(clear.status).toBe(200);
+    expect(await clear.json()).toMatchObject({ ok: true, herdr: '' });
+    expect(persistedBot()).not.toHaveProperty('herdr');
+  });
+
+  it('/api/bot-herdr accepts partial bot overrides when the env already activates placement', async () => {
+    // 全局 env 已提供 placement（BOTMUX_HERDR_PLACEMENT），bot 块只覆盖 tab 是
+    // 合法的字段级叠加，不能被「需至少 sessionName/placement」误杀。
+    const daemon = config.daemon as { herdr?: unknown };
+    daemon.herdr = { placement: 'split', chatTypes: ['group'] };
+    try {
+      const save = await put('/api/bot-herdr', JSON.stringify({ herdr: JSON.stringify({ tab: '3' }) }));
+      expect(save.status).toBe(200);
+      expect(JSON.parse((await save.json()).herdr)).toEqual({ tab: '3' });
+      expect(persistedBot().herdr).toEqual({ tab: '3' });
+      // env 只放了非激活字段时，bot 部分覆盖仍不生效 → 拒绝。
+      daemon.herdr = { chatTypes: ['group'] };
+      const inert = await put('/api/bot-herdr', JSON.stringify({ herdr: JSON.stringify({ tab: '3' }) }));
+      expect(inert.status).toBe(400);
+      expect((await inert.json()).error).toContain('invalid_herdr_config');
+    } finally {
+      delete daemon.herdr;
+    }
+  });
+
+  it('customPassthroughCommands stays stable on space-joined refill round-trip', async () => {
+    const save = await put('/api/bot-custom-passthrough', JSON.stringify({ customPassthroughCommands: '/Ultra Goal, /export\n/goal /x y' }));
+    expect(save.status).toBe(200);
+    const saved = await save.json() as { customPassthroughCommands: string };
+    expect(saved.customPassthroughCommands).toBe('/ultra-goal /export /goal /x-y');
+    expect(persistedBot().customPassthroughCommands).toEqual(['/ultra-goal', '/export', '/goal', '/x-y']);
+
+    // 输入框用 space-joined 值回填后再次保存：含空格名字已归一为连字符 token，
+    // 每条都以 `/` 开头，按「空格+下一条 /」切分，结果必须与首次落盘完全一致。
+    const resave = await put('/api/bot-custom-passthrough', JSON.stringify({ customPassthroughCommands: saved.customPassthroughCommands }));
+    expect(resave.status).toBe(200);
+    expect(await resave.json()).toMatchObject({ ok: true, customPassthroughCommands: '/ultra-goal /export /goal /x-y' });
+    expect(persistedBot().customPassthroughCommands).toEqual(['/ultra-goal', '/export', '/goal', '/x-y']);
   });
 
   it('never reaches the spec_missing branch: every field key resolves in the config store', async () => {

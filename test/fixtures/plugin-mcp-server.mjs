@@ -1,6 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   CallToolRequestSchema,
@@ -18,6 +18,11 @@ import {
 
 const serverName = process.argv[2] || 'fixture';
 if (serverName === 'fail') process.exit(17);
+let inheritedSecret = '';
+if (serverName === 'secret-fd' && process.env.BOTMUX_PROTECTED_SECRET_FD === '3') {
+  inheritedSecret = readFileSync(3, 'utf8').trim();
+  closeSync(3);
+}
 
 const server = new Server(
   { name: serverName, version: '1.0.0' },
@@ -43,7 +48,57 @@ server.setRequestHandler(ListToolsRequestSchema, request => {
       };
 });
 
-server.setRequestHandler(CallToolRequestSchema, request => {
+server.setRequestHandler(CallToolRequestSchema, async request => {
+  if (serverName === 'slow') {
+    const delayMs = Number(request.params.arguments?.delayMs ?? 0);
+    if (Number.isFinite(delayMs) && delayMs > 0) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, delayMs));
+    }
+  }
+  if (serverName === 'progress') {
+    // Progress resets the SDK's idle timeout. Keep emitting it long enough to
+    // prove the gateway's maxTotalTimeout remains an absolute upper bound.
+    const token = request.params?._meta?.progressToken;
+    const startedAt = Date.now();
+    for (let tick = 1; Date.now() - startedAt < 1_900; tick += 1) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
+      if (token !== undefined) {
+        await server.notification({
+          method: 'notifications/progress',
+          params: { progressToken: token, progress: tick },
+        });
+      }
+    }
+  }
+  if (serverName === 'link-ref') {
+    const authorizationUrl = 'https://auth.example.test/authorize'
+      + '?code=code-value&token=token-value&signature=sig-value&state=state-value'
+      + '&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback';
+    return {
+      content: [
+        { type: 'text', text: `permission required: ${authorizationUrl}` },
+        {
+          type: 'resource',
+          resource: {
+            uri: 'demo://embedded',
+            mimeType: 'text/plain',
+            text: `documentation ${authorizationUrl}`,
+          },
+        },
+        { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+      ],
+      structuredContent: {
+        authorization: { url: authorizationUrl },
+        documentation_url: authorizationUrl,
+        headers: { Authorization: 'Bearer do-not-register' },
+        access_token: 'https://credential.example.test/secret',
+        excluded: {
+          _meta: { 'botmux/linkRefPolicy': 'exclude' },
+          url: 'https://excluded.example.test/path',
+        },
+      },
+    };
+  }
   if (serverName === 'delivery') {
     const outbound = join(process.env.BOTMUX_PLUGIN_HOME, 'outbound');
     mkdirSync(outbound, { recursive: true });
@@ -60,6 +115,25 @@ server.setRequestHandler(CallToolRequestSchema, request => {
           responseKind: 'final',
         },
       },
+    };
+  }
+  if (serverName === 'secret-fd') {
+    return {
+      content: [{
+        type: 'text',
+        text: `secretFd=${inheritedSecret === 'fd-only-secret'}:`
+          + `secretEnv=${process.env.FIXTURE_SECRET !== undefined}:`
+          + `secretArgv=${process.argv.includes('fd-only-secret')}:`
+          + `meta=${JSON.stringify(request.params._meta ?? {})}`,
+      }],
+    };
+  }
+  if (serverName === 'egress-env') {
+    return {
+      content: [{
+        type: 'text',
+        text: `egress=${process.env.BOTMUX_PROTECTED_EGRESS_SOCKET || ''}`,
+      }],
     };
   }
   return {
@@ -88,7 +162,17 @@ server.setRequestHandler(ListResourceTemplatesRequestSchema, () => ({
 }));
 
 server.setRequestHandler(ReadResourceRequestSchema, request => ({
-  contents: [{ uri: request.params.uri, text: `${serverName}:${request.params.uri}` }],
+  contents: serverName === 'link-ref'
+    ? [{
+        uri: request.params.uri,
+        mimeType: 'application/json',
+        text: JSON.stringify({
+          authorization_url: 'https://auth.example.test/approve'
+            + '?state=resource-state&code=resource-code',
+          password: 'https://credential.example.test/password',
+        }),
+      }]
+    : [{ uri: request.params.uri, text: `${serverName}:${request.params.uri}` }],
 }));
 
 server.setRequestHandler(SubscribeRequestSchema, () => ({}));

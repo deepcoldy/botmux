@@ -1,6 +1,7 @@
 /**
  * Git worktree creation for repo selection — "pick a repo, open it as a
- * fresh worktree". Creates a linked worktree next to the repo, branched off
+ * fresh worktree". Creates a linked worktree next to the repo (or under the
+ * global `worktreeRoot` setting, see {@link worktreeTargetPath}), branched off
  * the remote default branch (origin/master / origin/main), so each session
  * can get an isolated checkout without touching the main one.
  *
@@ -10,11 +11,14 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, lstatSync, mkdirSync, readlinkSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { accessSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, parse, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { expandHomePath } from '../utils/working-dir.js';
+import { readGlobalConfig } from '../global-config.js';
+import { resolveWorktreeCreateTimeoutMs } from '../config.js';
 
 const execFileP = promisify(execFile);
 
@@ -26,6 +30,9 @@ export interface WorktreeCreation {
   /** Ref the branch was created from (e.g. `origin/master`); equals `branch`
    *  when an existing local branch was checked out instead. */
   baseRef: string;
+  /** Set when `reuseExisting` handed back a worktree that was already on disk
+   *  instead of creating one — botmux did not create that directory. */
+  reused?: true;
 }
 
 export interface CreateRepoWorktreeOptions {
@@ -125,9 +132,56 @@ export function slugFromWorktreeText(text: string | undefined | null): string | 
   return slug || undefined;
 }
 
+/**
+ * Where a new worktree directory `dirName` for `repo` goes: next to `repo`,
+ * or, with the global `worktreeRoot` setting pointing at an existing writable
+ * directory (e.g. to keep worktrees off a small system disk), at that same
+ * spot mirrored under the root — `/src/app` gets `<root>/src/<dirName>` — so
+ * clones sharing a name never collide and {@link resolveDeletedWorktreeOrigin}
+ * can map the path back. A directory already sitting next to `repo` under
+ * that name still wins, so free-name probing keeps skipping it and "target
+ * already exists" checks still see it.
+ */
+export function worktreeTargetPath(repo: string, dirName: string): string {
+  const sibling = join(dirname(repo), dirName);
+  const root = usableWorktreeRoot();
+  if (!root || existsSync(sibling)) return sibling;
+  const parent = resolve(dirname(repo));
+  return join(root, relative(parse(parent).root, parent), dirName);
+}
+
+let warnedUnusableRoot: string | undefined;
+
+/**
+ * The configured `worktreeRoot` with symlinks resolved, so lock files and
+ * recorded paths match the realpath cleanup computes; `undefined` when unset
+ * or not an existing writable directory — `mkdir -p` would otherwise quietly
+ * re-create the path of an unmounted disk on the system disk, and a disk
+ * remounted read-only would fail every new worktree.
+ */
+function usableWorktreeRoot(): string | undefined {
+  const configured = readGlobalConfig().worktreeRoot;
+  if (!configured) return undefined;
+  try {
+    const root = realpathSync(expandHomePath(configured));
+    if (statSync(root).isDirectory()) {
+      accessSync(root, fsConstants.W_OK);
+      warnedUnusableRoot = undefined;
+      return root;
+    }
+  } catch {
+    // Missing, unreadable or not writable: same fallback as a non-directory.
+  }
+  if (warnedUnusableRoot !== configured) {
+    warnedUnusableRoot = configured;
+    logger.warn(`[git-worktree] worktreeRoot ${configured} is not an existing writable directory; creating worktrees next to their repo`);
+  }
+  return undefined;
+}
+
 /** A linked worktree resolves to its repo's MAIN checkout (entry 0 of
- *  `git worktree list`), so sibling placement and `<repo>-…` naming follow
- *  the main repo no matter which checkout the caller picked. */
+ *  `git worktree list`), so placement and `<repo>-…` naming follow the main
+ *  repo no matter which checkout the caller picked. */
 async function resolveMainWorktree(dir: string): Promise<string> {
   const out = await tryGit(['worktree', 'list', '--porcelain'], dir);
   const first = out?.split('\n').find(l => l.startsWith('worktree '));
@@ -151,7 +205,28 @@ async function reuseCompatibleWorktree(
     );
   }
   logger.info(`[git-worktree] reusing existing worktree ${worktreePath} on branch ${branch}`);
-  return { path: worktreePath, branch, baseRef: branch };
+  return { path: worktreePath, branch, baseRef: branch, reused: true };
+}
+
+/**
+ * `reuseExisting` lookup: the worktree at `worktreePath`, else the one this
+ * repo already has checked out on `branch` wherever it lives. A deterministic
+ * target (principal lane, forced topic worktree) is recomputed from the
+ * current `worktreeRoot`, so after that setting changes, its earlier
+ * worktree sits under the old root; git allows one worktree per branch, so
+ * the branch finds it.
+ */
+async function reuseWorktreeForBranch(
+  repo: string,
+  worktreePath: string,
+  branch: string,
+): Promise<WorktreeCreation | null> {
+  const atTarget = await reuseCompatibleWorktree(repo, worktreePath, branch);
+  if (atTarget) return atTarget;
+  const listing = await tryGit(['worktree', 'list', '--porcelain'], repo);
+  const registered = listing ? parseWorktreeList(listing).find(wt => wt.branch === branch) : undefined;
+  if (!registered || resolve(registered.path) === resolve(repo)) return null;
+  return reuseCompatibleWorktree(repo, registered.path, branch);
 }
 
 async function addWorktreeOrReuseAfterRace(
@@ -162,11 +237,11 @@ async function addWorktreeOrReuseAfterRace(
   reuseExisting: boolean,
 ): Promise<WorktreeCreation | null> {
   try {
-    await git(args, repo, 60_000);
+    await git(args, repo, resolveWorktreeCreateTimeoutMs());
     return null;
   } catch (error) {
     if (reuseExisting) {
-      const reused = await reuseCompatibleWorktree(repo, worktreePath, branch);
+      const reused = await reuseWorktreeForBranch(repo, worktreePath, branch);
       if (reused) return reused;
     }
     throw error;
@@ -174,8 +249,9 @@ async function addWorktreeOrReuseAfterRace(
 }
 
 /**
- * Create a linked worktree for `repoPath`, as a sibling of the repo's MAIN
- * checkout (a linked-worktree input is resolved back to the main one first).
+ * Create a linked worktree for `repoPath`, placed by {@link worktreeTargetPath}
+ * relative to the repo's MAIN checkout (a linked-worktree input is resolved
+ * back to the main one first).
  *
  * - No `branch` given, `slug` yields a latin slug → auto-pick `wt/<slug>`
  *   (or `-2` etc.), dir `<repo>-wt-<slug>`.
@@ -206,7 +282,6 @@ async function createRepoWorktreeUnlocked(
     }
   }
 
-  const parent = dirname(repo);
   const repoBase = basename(repo);
 
   let branch = opts.branch?.trim() ?? '';
@@ -217,7 +292,7 @@ async function createRepoWorktreeUnlocked(
   // rather than throwing or emitting an opaque hash.
   const slug = branch ? undefined : slugFromWorktreeText(opts.slug);
   if (branch) {
-    wtPath = explicitPath ?? join(parent, `${repoBase}-${dirSuffixForBranch(branch)}`);
+    wtPath = explicitPath ?? worktreeTargetPath(repo, `${repoBase}-${dirSuffixForBranch(branch)}`);
     if (existsSync(wtPath) && !opts.reuseExisting) throw new Error(`worktree target already exists: ${wtPath}`);
   } else if (slug) {
     if (explicitPath) {
@@ -237,7 +312,7 @@ async function createRepoWorktreeUnlocked(
         if (n > 1000) throw new Error(`no free wt/${slug} slot under 1000`);
         const candidateSlug = n === 1 ? slug : `${slug}-${n}`;
         const candidateBranch = `wt/${candidateSlug}`;
-        const candPath = join(parent, `${repoBase}-${dirSuffixForBranch(candidateBranch)}`);
+        const candPath = worktreeTargetPath(repo, `${repoBase}-${dirSuffixForBranch(candidateBranch)}`);
         if (existsSync(candPath) ||
           (await localBranchExists(repo, candidateBranch)) ||
           (await remoteBranchExists(repo, candidateBranch))) continue;
@@ -261,7 +336,7 @@ async function createRepoWorktreeUnlocked(
       let n = 1;
       for (;; n++) {
         if (n > 1000) throw new Error('no free wt/N slot under 1000');
-        const candPath = join(parent, `${repoBase}-wt-${n}`);
+        const candPath = worktreeTargetPath(repo, `${repoBase}-wt-${n}`);
         if (existsSync(candPath) || (await localBranchExists(repo, `wt/${n}`))) continue;
         branch = `wt/${n}`;
         wtPath = candPath;
@@ -271,7 +346,7 @@ async function createRepoWorktreeUnlocked(
   }
 
   if (opts.reuseExisting) {
-    const reused = await reuseCompatibleWorktree(repo, wtPath, branch);
+    const reused = await reuseWorktreeForBranch(repo, wtPath, branch);
     if (reused) return reused;
   }
 
@@ -339,10 +414,19 @@ export async function createRepoWorktreeAndCommit<T>(
 ): Promise<{ creation: WorktreeCreation; result: T }> {
   const run = async () => {
     const creation = await createRepoWorktreeUnlocked(repoPath, opts);
-    if (opts.ignoreRemoteBranch) {
-      await tryGit(['branch', '--unset-upstream'], creation.path, 5_000);
-    }
-    return { creation, result: await commit(creation) };
+    const finish = async () => {
+      if (opts.ignoreRemoteBranch) {
+        await tryGit(['branch', '--unset-upstream'], creation.path, 5_000);
+      }
+      return { creation, result: await commit(creation) };
+    };
+    if (!opts.worktreePath || resolve(creation.path) === resolve(opts.worktreePath)) return finish();
+    // Reused by branch from an earlier root: cleanup locks that real path,
+    // not the requested one, and may have removed it before we got the lock.
+    return withWorktreeTargetLock(creation.path, async () => {
+      if (!existsSync(creation.path)) throw new Error(`reused worktree was removed: ${creation.path}`);
+      return finish();
+    });
   };
   return opts.reuseExisting && opts.worktreePath
     ? withWorktreeTargetLock(opts.worktreePath, run)
@@ -713,10 +797,19 @@ export async function removeRepoWorktree(repo: string, worktreePath: string): Pr
   logger.info(`[git-worktree] removed worktree ${worktreePath}`);
 }
 
+/** `git worktree remove` WITHOUT `--force`: git itself still refuses a worktree
+ *  with modified or untracked files, a locked one, or one holding submodules.
+ *  Ignored content goes with the directory; the branch is always kept. */
+export async function removeCleanWorktree(repo: string, worktreePath: string): Promise<void> {
+  await git(['worktree', 'remove', worktreePath], repo, 30_000);
+  logger.info(`[git-worktree] removed clean worktree ${worktreePath}`);
+}
+
 /**
  * `git check-ref-format --branch` — the ONLY branch-name validity check in the
  * repo. `createRepoWorktree` itself never validates: an illegal name only fails
- * later inside `git worktree add -b` (60s window, after the topic exists). The
+ * later inside `git worktree add -b` (the configured creation budget window,
+ * default 60s, after the topic exists). The
  * topic header's `/repo wt <目标> [分支]` runs this BEFORE opening the topic so a
  * typo fails closed with zero side effects. Needs no repository (any cwd works);
  * a leading `-` is rejected up front because git would parse it as an option.
@@ -728,17 +821,120 @@ export async function isValidBranchName(name: string): Promise<boolean> {
   return (await tryGit(['check-ref-format', '--branch', trimmed], tmpdir())) !== null;
 }
 
+/** Where a linked worktree that is gone from disk came from. */
+export interface DeletedWorktreeOrigin {
+  /** Main checkout the worktree belonged to. */
+  repo: string;
+  /** Branch it had checked out (local, or `origin/<branch>` only). */
+  branch: string;
+}
+
+/** `git worktree list --porcelain` entries as `{ path, branch }` (branch without `refs/heads/`). */
+function parseWorktreeList(listing: string): Array<{ path: string; branch?: string }> {
+  const entries: Array<{ path: string; branch?: string }> = [];
+  for (const line of listing.split('\n')) {
+    if (line.startsWith('worktree ')) entries.push({ path: line.slice('worktree '.length) });
+    else if (line.startsWith('branch refs/heads/') && entries.length > 0) {
+      entries[entries.length - 1]!.branch = line.slice('branch refs/heads/'.length);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Recover the repo and branch of a deleted linked worktree from git alone —
+ * sessions store only the path. {@link createRepoWorktree} names a worktree
+ * `<repo>-<dirSuffixForBranch(branch)>` next to its main checkout, or at that
+ * spot mirrored under `worktreeRoot` ({@link worktreeTargetPath}), so leading
+ * directories are stripped until the path sits next to a main checkout whose
+ * name plus `-` prefixes it (longest prefix first). No setting is consulted,
+ * so a worktree under a since-changed root still resolves. The branch is read
+ * from the worktree's registration when a plain `rm -rf` left it behind, else
+ * matched by suffix among local and `origin/*` branches; `null` when the repo
+ * is unknown or the match is not unique.
+ */
+export async function resolveDeletedWorktreeOrigin(worktreePath: string): Promise<DeletedWorktreeOrigin | null> {
+  const target = resolve(worktreePath);
+  const fsRoot = parse(target).root;
+  const parts = relative(fsRoot, target).split(sep);
+  for (let k = 0; k < parts.length; k++) {
+    const origin = await originNextToMainCheckout(join(fsRoot, ...parts.slice(k)), target);
+    if (origin !== undefined) return origin;
+  }
+  return null;
+}
+
+/**
+ * One placement tried by {@link resolveDeletedWorktreeOrigin}: `placed` is
+ * where the deleted worktree `target` would sit next to its main checkout.
+ * `undefined` when no main checkout sits there.
+ */
+async function originNextToMainCheckout(
+  placed: string,
+  target: string,
+): Promise<DeletedWorktreeOrigin | null | undefined> {
+  const parent = dirname(placed);
+  const base = basename(placed);
+  for (let i = base.lastIndexOf('-'); i > 0; i = base.lastIndexOf('-', i - 1)) {
+    const candidate = join(parent, base.slice(0, i));
+    if (!existsSync(candidate)) continue;
+    const listing = await tryGit(['worktree', 'list', '--porcelain'], candidate, 5_000);
+    if (!listing) continue;
+    const entries = parseWorktreeList(listing);
+    // Only a main checkout owns the naming; a shorter-named linked worktree
+    // of some other branch must not claim the path.
+    if (!entries[0] || resolve(entries[0].path) !== candidate) continue;
+    const registered = entries.find(entry => resolve(entry.path) === target);
+    if (registered?.branch) return { repo: candidate, branch: registered.branch };
+    const suffix = base.slice(i + 1);
+    const refs = await tryGit(
+      ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes/origin'],
+      candidate,
+      5_000,
+    );
+    const branches = new Set<string>();
+    for (const ref of refs?.split('\n') ?? []) {
+      const name = ref.startsWith('refs/heads/')
+        ? ref.slice('refs/heads/'.length)
+        : ref.startsWith('refs/remotes/origin/') ? ref.slice('refs/remotes/origin/'.length) : '';
+      if (name && name !== 'HEAD' && dirSuffixForBranch(name) === suffix) branches.add(name);
+    }
+    return branches.size === 1 ? { repo: candidate, branch: [...branches][0]! } : null;
+  }
+  return undefined;
+}
+
+/**
+ * Re-create a deleted linked worktree at its original path on its original
+ * branch. Committed work comes back; whatever was uncommitted is gone with the
+ * directory. A plain `rm -rf` leaves the worktree registered and `worktree add`
+ * refuses a registered path, so that one registration is removed first
+ * (`prune` would sweep every stale worktree of the repo).
+ */
+export async function restoreDeletedWorktree(
+  origin: DeletedWorktreeOrigin,
+  worktreePath: string,
+): Promise<WorktreeCreation> {
+  const target = resolve(worktreePath);
+  if (existsSync(target)) throw new Error(`worktree target already exists: ${target}`);
+  const listing = await git(['worktree', 'list', '--porcelain'], origin.repo);
+  if (parseWorktreeList(listing).some(entry => resolve(entry.path) === target)) {
+    await git(['worktree', 'remove', '--force', target], origin.repo, 30_000);
+  }
+  return createRepoWorktree(origin.repo, { branch: origin.branch, worktreePath: target });
+}
+
 /**
  * The directory {@link createRepoWorktree} WILL use for an explicit `branch` —
- * `<main checkout's parent>/<repo>-<dirSuffixForBranch(branch)>` (no `wt-`
- * prefix; that is reserved for auto-named worktrees). Exposed so a caller can
- * fail closed on "target already exists" before doing anything else; keep it in
- * lockstep with the explicit-branch arm of `createRepoWorktree`. Throws when
- * `repoPath` is not inside a git work tree.
+ * `<repo>-<dirSuffixForBranch(branch)>` placed by {@link worktreeTargetPath}
+ * (no `wt-` prefix; that is reserved for auto-named worktrees). Exposed so a
+ * caller can fail closed on "target already exists" before doing anything else;
+ * keep it in lockstep with the explicit-branch arm of `createRepoWorktree`.
+ * Throws when `repoPath` is not inside a git work tree.
  */
 export async function resolveWorktreePathForBranch(repoPath: string, branch: string): Promise<string> {
   const startDir = resolve(repoPath);
   await git(['rev-parse', '--git-dir'], startDir);
   const repo = await resolveMainWorktree(startDir);
-  return join(dirname(repo), `${basename(repo)}-${dirSuffixForBranch(branch)}`);
+  return worktreeTargetPath(repo, `${basename(repo)}-${dirSuffixForBranch(branch)}`);
 }

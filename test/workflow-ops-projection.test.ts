@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   eventSeqFromId,
-  extractEventContext,
   isValidRunId,
   listRuns,
   readEventWindow,
@@ -226,14 +225,9 @@ describe('frozen v2 snapshot and event window', () => {
 });
 
 describe('frozen v2 projection helpers', () => {
-  it('keeps event sequence and error context extraction stable', () => {
+  it('keeps event sequence extraction stable', () => {
     expect(eventSeqFromId('run-with-dashes-42')).toBe(42);
     expect(eventSeqFromId('bad')).toBe(0);
-    expect(extractEventContext({
-      nodeId: 'n1',
-      activityId: 'a1',
-      error: { errorCode: 'WorkerCrashed' },
-    })).toEqual({ nodeId: 'n1', activityId: 'a1', errorCode: 'WorkerCrashed' });
   });
 
   it('scrubs terminal bytes and absolute paths without mutating the source', () => {

@@ -2,6 +2,10 @@ import WebSocket, { type RawData } from 'ws';
 import type { RealtimeVoiceTransport } from './types.js';
 
 const DEFAULT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024;
+// ws close() waits for the peer's Close frame (bun 1.4.4 as well as npm ws: up to
+// 30s, then 1006). The daemon awaits close() while stopping a session, so a peer
+// that never answers is cut off after this long instead.
+const CLOSE_HANDSHAKE_TIMEOUT_MS = 3_000;
 
 interface ReceiveWaiter {
   resolve: (data: Buffer | undefined) => void;
@@ -75,8 +79,11 @@ export class WebSocketRealtimeVoiceTransport implements RealtimeVoiceTransport {
       return;
     }
     await new Promise<void>((resolve) => {
-      const done = () => resolve();
-      this.ws.once('close', done);
+      const forceClose = setTimeout(() => this.ws.terminate(), CLOSE_HANDSHAKE_TIMEOUT_MS);
+      this.ws.once('close', () => {
+        clearTimeout(forceClose);
+        resolve();
+      });
       if (this.ws.readyState === WebSocket.CONNECTING) {
         this.ws.terminate();
       } else if (this.ws.readyState === WebSocket.OPEN) {

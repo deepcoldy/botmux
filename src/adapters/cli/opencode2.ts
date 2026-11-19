@@ -58,8 +58,16 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => ['~/.config/opencode/plugins'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass }) {
       const args: string[] = [];
+      // 权限确认放行：V2 的 base policy 里 `read *.env` 默认是 ask，托管态下
+      // 没人看得见 TUI 弹窗，turn 会静默卡死。`--auto` 只放行「本来要 ask」的
+      // 动作，配置里显式 deny 仍然生效；与 copilot `--allow-all-tools`、
+      // claude `--dangerously-skip-permissions` 同一约定，`disableCliBypass`
+      // 显式打开时不注入。
+      if (!disableCliBypass) {
+        args.push('--auto');
+      }
       // 注意：没有 --model —— V2 TUI 顶层不接受该标志（传了直接打帮助退出）。
       const openCodeSessionId = resume
         ? (isOpenCodeSessionId(resumeSessionId) ? resumeSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2'))
@@ -81,6 +89,8 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
       if (!sid) return null;
       return `opencode2 -s ${sid}`;
     },
+
+    resumeFindsOwnSession: true,
 
     /** Resume 目标预检：id 不在 session_v2 表 → false
      *  （worker 落回全新会话并提示），避免 `Session not found` exit 1 被放大成
@@ -142,12 +152,12 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     // TUI; later cycles return to the normal 2s window.
     firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
-    isSessionBusy({ sessionId, cliSessionId }) {
+    isSessionBusy({ sessionId, cliSessionId, isCliProcessAlive }) {
       const sid = isOpenCodeSessionId(cliSessionId)
         ? cliSessionId
         : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
       if (!sid) return false;
-      return isOpenCodeSessionBusy(sid, 'v2');
+      return isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, isCliProcessAlive);
     },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）

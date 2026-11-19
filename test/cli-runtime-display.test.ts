@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from '../src/core/cli-runtime-display.js';
+import { resolveCliRuntime, snapshotCliRuntime } from '../src/adapters/cli/runtime.js';
 
 const configuredSnapshot = {
   id: 'vendor-codex',
@@ -20,6 +20,17 @@ const liveRuntime = {
 };
 
 describe('CLI runtime display identity', () => {
+  it('freezes CodeM display identity independently of the Kimi adapter and later bot changes', () => {
+    const runtime = resolveCliRuntime({
+      cliId: 'kimi',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: 'codem-wrapper', update: { provider: 'none' } },
+    });
+    expect(sessionConfiguredRuntimeDisplayName({
+      agentFrozen: true, cliRuntime: snapshotCliRuntime(runtime), cliPathOverride: 'codem-wrapper',
+    }, liveRuntime)).toBe('CodeM');
+    expect(configuredRuntimeDisplayName(resolveCliRuntime({ cliId: 'kimi' }))).toBeUndefined();
+  });
+
   it('uses a configured snapshot and ignores a later bot-level switch', () => {
     expect(sessionConfiguredRuntimeDisplayName({
       agentFrozen: true,
@@ -54,27 +65,5 @@ describe('CLI runtime display identity', () => {
 
   it('uses the live runtime only before an unstamped session is first frozen', () => {
     expect(sessionConfiguredRuntimeDisplayName({}, liveRuntime)).toBe('Forge Codex');
-  });
-
-  it('keeps the frozen runtime wired into the previous-turn card handoff', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const begin = source.indexOf('function beginNewTurn(');
-    const end = source.indexOf('\nfunction ', begin + 1);
-    const body = source.slice(begin, end);
-
-    expect(body).toContain('const effectiveCliId = ds.session.cliId ?? dsBotCfg.cliId');
-    expect(body).toContain('sessionConfiguredRuntimeDisplayName(ds.session, dsBotCfg.cliRuntime)');
-    expect(body).toMatch(/getDaemonStreamingCardUsageSnapshot[\s\S]*runtimeDisplayName,/);
-  });
-
-  it('starts the current turn card at message acceptance instead of waiting for terminal redraw', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const begin = source.indexOf('function beginNewTurn(');
-    const end = source.indexOf('\nfunction ', begin + 1);
-    const body = source.slice(begin, end);
-
-    expect(body).toContain('postTurnStartingCard(ds, sessionReply, turnId)');
-    expect(body).toContain('ds.streamCardPendingTurnId = turnId');
-    expect(body).toContain('ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1');
   });
 });

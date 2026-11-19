@@ -108,7 +108,13 @@ describe('i18n help.* 对称', () => {
 describe('飞书原生命令面板清单 ↔ 文档', () => {
   // 原生面板的候选清单从 command-schema 推导；它注册到飞书的每一条命令，用户在
   // slash-commands.md 里都必须查得到，否则就是「面板里有、文档里搜不到」。
-  const cliIds = [undefined, ...new Set(COMMANDS.map(spec => spec.cliId).filter(Boolean))] as (string | undefined)[];
+  // cliId 限定项支持数组（如 /effort ∈ [codex-app, codex]）：逐个 cliId 构建目录并求并集，
+  // 确保每个 CLI 面板里的命令都在文档中查得到。
+  const cliIds = [
+    undefined,
+    ...new Set(COMMANDS.flatMap(spec =>
+      Array.isArray(spec.cliId) ? spec.cliId : spec.cliId ? [spec.cliId] : [])),
+  ] as (string | undefined)[];
   const catalogNames = new Set(cliIds.flatMap(cliId => buildAppSlashCommandCatalog({ cliId }).map(c => `/${c.command}`)));
 
   for (const loc of ['en', 'zh'] as const) {

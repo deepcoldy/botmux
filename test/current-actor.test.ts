@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -102,12 +102,26 @@ describe('current actor client contract', () => {
     expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
   });
 
-  it('republishes the opening turn after the live CLI pid is attested', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const start = worker.indexOf('function publishLocalProcessAttestation');
-    const body = worker.slice(start, worker.indexOf('/** Deliver a terminal IPC', start));
-    expect(body).toContain("type: 'local_process_attestation'");
-    expect(body).toContain('if (currentBotmuxTurnId) publishSandboxRelayCapability()');
+  it.skipIf(process.platform !== 'linux')('fails closed when no ancestor carries complete BotMux routing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'actor-env-'));
+    writeProcEnv(root, 20, 10, { PATH: '/usr/bin' });
+    writeProcEnv(root, 10, 1, { PATH: '/usr/bin' });
+    expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
+    // A narrow tool shell alone is not a routing authority.
+    writeProcEnv(root, 20, 10, { BOTMUX: '1', BOTMUX_SESSION_ID: 's1' });
+    expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
+  });
+
+  it.skipIf(process.platform !== 'linux')('fails closed when a mid-chain ancestor env is unreadable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'actor-env-'));
+    writeProcEnv(root, 20, 10, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
+    });
+    writeProcEnv(root, 10, 1, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
+    });
+    rmSync(join(root, '10', 'environ'), { force: true });
+    expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
   });
 
   it('accepts only the machine-readable current command', () => {
