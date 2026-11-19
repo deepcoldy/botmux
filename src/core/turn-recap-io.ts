@@ -123,4 +123,5 @@ export const turnRecapIo: RecapIo = {
   },
   now: () => Date.now(),
   warn: message => logger.warn(message),
+  info: message => logger.info(message),
 };
