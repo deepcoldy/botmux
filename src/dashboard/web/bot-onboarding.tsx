@@ -55,7 +55,7 @@ type OnboardingJob = {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'web' | 'compat' | 'local';
   cliId?: string;
   workingDir?: string;
   addedBotIndex?: number;
@@ -105,6 +105,7 @@ type CliOptionsState = {
 };
 
 type OnboardingFormState = {
+  connection: 'feishu' | 'local';
   appName: string;
   cliId: string;
   dirMode: 'fixed' | 'card';
@@ -131,6 +132,7 @@ function defaultCliOptionsState(): CliOptionsState {
 
 function defaultFormState(): OnboardingFormState {
   return {
+    connection: 'feishu',
     appName: '',
     cliId: DEFAULT_CLI_OPTION.id,
     dirMode: 'fixed',
@@ -142,8 +144,11 @@ function defaultFormState(): OnboardingFormState {
 export function isOnboardingSubmitDisabled(
   submitting: boolean,
   sessionMode: 'checking' | 'reuse' | 'qr',
+  connection: 'feishu' | 'local' = 'feishu',
 ): boolean {
-  return submitting || sessionMode === 'checking';
+  if (submitting) return true;
+  if (connection === 'local') return false;
+  return sessionMode === 'checking';
 }
 
 function caughtErrorText(error: unknown): string {
@@ -175,13 +180,18 @@ function statusText(job: OnboardingJob): string {
   }
   if (job.status === 'waiting_for_platform_scan') return t('botOnboarding.platformScanHint');
   if (job.status === 'needs_owner') return t('botOnboarding.needsOwnerTitle');
-  if (job.status === 'completed') return t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
+  if (job.status === 'completed') {
+    return job.registrationMode === 'local'
+      ? t('botOnboarding.completedLocal', { name: job.appName ?? t('botOnboarding.botFallback') })
+      : t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
+  }
   if (job.status === 'failed') {
     if (job.appId) return t('botOnboarding.partialFailureTitle');
     if (job.error === 'qr_expired') return t('botOnboarding.qrExpiredTitle');
     if (isSessionFailure(job.error)) return t('botOnboarding.authIncompleteTitle');
     return t('botOnboarding.createFailedTitle');
   }
+  if (job.registrationMode === 'local') return t('botOnboarding.startingLocal');
   return t('botOnboarding.starting');
 }
 
@@ -419,6 +429,12 @@ function onboardingOptionLabel<T extends string>(
   return options.find(option => option.value === value)?.label ?? value;
 }
 
+export function onboardingRetryMode(job: {
+  registrationMode?: 'web' | 'compat' | 'local';
+}): 'web' | 'local' {
+  return job.registrationMode === 'local' ? 'local' : 'web';
+}
+
 function OnboardingJobView(props: {
   view: Extract<ViewState, { kind: 'job' }>;
   ownerInput: string;
@@ -426,7 +442,7 @@ function OnboardingJobView(props: {
   onOwnerInputChange(value: string): void;
   onOwnerIdInputChange(value: string): void;
   onSubmitOwner(job: OnboardingJob, owner: string, ownerId: string): void;
-  onRetry(mode: 'web' | 'compat'): void;
+  onRetry(mode: 'web' | 'compat' | 'local'): void;
   onClose(): void;
 }): React.JSX.Element {
   const { job, ownerError } = props.view;
@@ -482,7 +498,9 @@ function OnboardingJobView(props: {
         </form>
       ) : null}
       {job.status === 'completed' ? (
-        <p className="hint-ok">{job.liveStarted ? t('botOnboarding.liveOk') : t('botOnboarding.restartHint')}</p>
+        <p className="hint-ok">{job.registrationMode === 'local'
+          ? (job.liveStarted ? t('botOnboarding.liveOkLocal') : t('botOnboarding.restartHintLocal'))
+          : (job.liveStarted ? t('botOnboarding.liveOk') : t('botOnboarding.restartHint'))}</p>
       ) : null}
       {job.status === 'failed' ? (
         <>
@@ -502,16 +520,22 @@ function OnboardingJobView(props: {
           <div className="actions onboarding-actions">
             <button type="button" onClick={props.onClose}>{t('botOnboarding.close')}</button>
             {!job.appId ? (
-              <>
-                <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
-                <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
-                  {job.error === 'qr_expired'
-                    ? t('botOnboarding.generateQr')
-                    : isSessionFailure(job.error)
-                      ? t('botOnboarding.scanAgain')
-                      : t('botOnboarding.retry')}
+              onboardingRetryMode(job) === 'local' ? (
+                <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('local')}>
+                  {t('botOnboarding.retry')}
                 </button>
-              </>
+              ) : (
+                <>
+                  <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
+                  <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
+                    {job.error === 'qr_expired'
+                      ? t('botOnboarding.generateQr')
+                      : isSessionFailure(job.error)
+                        ? t('botOnboarding.scanAgain')
+                        : t('botOnboarding.retry')}
+                  </button>
+                </>
+              )
             ) : null}
           </div>
         </>
@@ -526,6 +550,7 @@ function OnboardingJobView(props: {
 function OnboardingForm(props: {
   cliState: CliOptionsState;
   form: OnboardingFormState;
+  allowLocal: boolean;
   sessionMode: 'checking' | 'reuse' | 'qr';
   error?: string;
   submitting: boolean;
@@ -573,10 +598,30 @@ function OnboardingForm(props: {
     { value: 'fixed', label: t('botOnboarding.dirModeFixed') },
     { value: 'card', label: t('botOnboarding.dirModeCard') },
   ];
+  const connectionOptions: Array<{ value: OnboardingFormState['connection']; label: string }> = [
+    { value: 'feishu', label: t('botOnboarding.connectionFeishu') },
+    ...(props.allowLocal ? [{ value: 'local' as const, label: t('botOnboarding.connectionLocal') }] : []),
+  ];
+  const local = props.form.connection === 'local' && props.allowLocal;
 
   return (
     <form id="onboarding-form" className="onboarding-form" onSubmit={props.onSubmit}>
-      <div className="onboarding-session" aria-live="polite">
+      <div className="onboarding-field">
+        <span>{t('botOnboarding.connectionLabel')}</span>
+        <DropdownMenu
+          id="ob-connection"
+          className="onboarding-menu"
+          ariaLabel={t('botOnboarding.connectionLabel')}
+          label={onboardingOptionLabel(connectionOptions, local ? 'local' : 'feishu')}
+          value={local ? 'local' : 'feishu'}
+          options={connectionOptions}
+          onChange={connection => props.onFormChange({ ...props.form, connection })}
+        />
+        <small className="onboarding-field-hint">{local
+          ? t('botOnboarding.connectionLocalHint')
+          : t('botOnboarding.connectionFeishuHint')}</small>
+      </div>
+      {local ? null : <div className="onboarding-session" aria-live="polite">
         {props.sessionMode === 'checking' ? (
           <p>{t('botOnboarding.sessionChecking')}</p>
         ) : props.cliState.webSession.status === 'ready' ? (
@@ -612,9 +657,9 @@ function OnboardingForm(props: {
             <small>{t('botOnboarding.sessionScanRequiredHint')}</small>
           </div>
         )}
-      </div>
+      </div>}
       <label className="onboarding-field">
-        <span>{t('botOnboarding.appNameLabel')}</span>
+        <span>{local ? t('botOnboarding.localNameLabel') : t('botOnboarding.appNameLabel')}</span>
         <input
           id="ob-app-name"
           type="text"
@@ -625,7 +670,9 @@ function OnboardingForm(props: {
           spellCheck={false}
           onChange={event => props.onFormChange({ ...props.form, appName: event.currentTarget.value })}
         />
-        <small className="onboarding-field-hint">{t('botOnboarding.appNameHint', { name: props.cliState.suggestedAppName })}</small>
+        <small className="onboarding-field-hint">{local
+          ? t('botOnboarding.localNameHint')
+          : t('botOnboarding.appNameHint', { name: props.cliState.suggestedAppName })}</small>
       </label>
       <div className="onboarding-field">
         <span>{t('botOnboarding.cliLabel')}</span>
@@ -704,11 +751,13 @@ function OnboardingForm(props: {
           // form never blocks the dashboard event loop on shell rc files. It is
           // a useful warning, not an authoritative gate: submit runs the full
           // shell-aware server check and returns cli_not_found when necessary.
-          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode)}
+          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode, local ? 'local' : 'feishu')}
         >
           {props.submitting
-            ? t('botOnboarding.starting')
-            : props.sessionMode === 'reuse'
+            ? (local ? t('botOnboarding.startingLocal') : t('botOnboarding.starting'))
+            : local
+              ? t('botOnboarding.createLocal')
+              : props.sessionMode === 'reuse'
               ? t('botOnboarding.confirmReuse')
               : t('botOnboarding.startScan')}
         </button>
@@ -760,12 +809,12 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     applyJob(body.job as OnboardingJob);
   }, [applyJob]);
 
-  const startPolling = useCallback((id: string) => {
+  const startPolling = useCallback((id: string, registrationMode?: OnboardingJob['registrationMode']) => {
     stopPolling();
     pollTimerRef.current = window.setInterval(() => {
       void pollJob(id).catch(error => {
         stopPolling();
-        setView({ kind: 'job', job: { id, status: 'failed', message: caughtErrorText(error) } });
+        setView({ kind: 'job', job: { id, status: 'failed', message: caughtErrorText(error), registrationMode } });
       });
     }, 1200);
   }, [pollJob, stopPolling]);
@@ -814,12 +863,12 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
   const startOnboarding = useCallback(async (
-    registrationMode: 'web' | 'compat',
+    registrationMode: 'web' | 'compat' | 'local',
     sessionModeOverride?: 'reuse' | 'qr',
   ) => {
     stopPolling();
     setSubmitting(true);
-    setView({ kind: 'job', job: { id: '', status: 'starting' } });
+    setView({ kind: 'job', job: { id: '', status: 'starting', registrationMode } });
     try {
       const effectiveSessionMode = sessionModeOverride ?? (sessionMode === 'reuse' ? 'reuse' : 'qr');
       const expectedIdentity = registrationMode === 'web'
@@ -834,14 +883,14 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          appName: registrationMode === 'web' ? form.appName.trim() || undefined : undefined,
+          appName: registrationMode === 'compat' ? undefined : form.appName.trim() || undefined,
           registrationMode,
           ...(registrationMode === 'web' ? { sessionMode: effectiveSessionMode, expectedIdentity } : {}),
           cliId: form.cliId,
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
-          cloneSourceAppId,
+          ...(registrationMode === 'local' ? {} : { cloneSourceAppId }),
         }),
       });
       const body = await res.json();
@@ -852,9 +901,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       if (!res.ok || !body?.job?.id) throw new Error(body?.error ?? `http_${res.status}`);
       const job = body.job as OnboardingJob;
       applyJob(job);
-      if (!shouldStopPolling(job)) startPolling(job.id);
+      if (!shouldStopPolling(job)) startPolling(job.id, job.registrationMode);
     } catch (error) {
-      setView({ kind: 'job', job: { id: '', status: 'failed', message: caughtErrorText(error) } });
+      setView({ kind: 'job', job: { id: '', status: 'failed', message: caughtErrorText(error), registrationMode } });
     } finally {
       setSubmitting(false);
     }
@@ -862,10 +911,11 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void startOnboarding('web');
-  }, [startOnboarding]);
+    const local = form.connection === 'local' && cloneSourceAppId === undefined;
+    void startOnboarding(local ? 'local' : 'web');
+  }, [form.connection, startOnboarding]);
 
-  const retry = useCallback(async (registrationMode: 'web' | 'compat') => {
+  const retry = useCallback(async (registrationMode: 'web' | 'compat' | 'local') => {
     if (registrationMode === 'compat') {
       const accepted = await confirm({ title: '兼容性确认', message: t('botOnboarding.compatibilityConfirm'), danger: false });
       if (!accepted) return;
@@ -910,6 +960,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         <OnboardingForm
           cliState={cliState}
           form={form}
+          allowLocal={cloneSourceAppId === undefined}
           sessionMode={sessionMode}
           error={view.error}
           submitting={submitting}

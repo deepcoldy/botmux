@@ -58,11 +58,13 @@ type RecordDelta = Omit<UsageTotals, 'totalTokens' | 'records' | 'pricedRecords'
   models?: Array<ModelTokenUsage & { costCny: number | null }>;
 };
 
+type LedgerControlRecord = 'ownership' | 'reset';
+
 /** Four mutually exclusive buckets. v1 Codex/TraeX/Aiden input included caches. */
-function normalizeRecord(raw: unknown): RecordDelta | 'ownership' | null {
+function normalizeRecord(raw: unknown): RecordDelta | LedgerControlRecord | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
-  if (r.kind === 'ownership') return 'ownership';
+  if (r.kind === 'ownership' || r.kind === 'reset') return r.kind;
   if (r.kind !== undefined || (r.v !== 1 && r.v !== 2)
     || typeof r.recordId !== 'string' || !r.recordId || r.recordId.length > 256
     || typeof r.sessionId !== 'string' || !r.sessionId
@@ -173,7 +175,7 @@ export async function queryUsageLedger(queryInput: UsageQuery, options: { ledger
         let raw: unknown;
         try { raw = JSON.parse(line); } catch { report.coverage.invalidRecords++; continue; }
         const delta = normalizeRecord(raw);
-        if (delta === 'ownership') continue;
+        if (delta === 'ownership' || delta === 'reset') continue;
         if (!delta) { report.coverage.invalidRecords++; continue; }
         if (delta.ts < from || delta.ts >= to) continue;
         if (delta.ts > snapshotAt) { report.coverage.futureRecords++; continue; }

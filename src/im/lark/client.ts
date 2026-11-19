@@ -31,7 +31,10 @@ import {
   LARK_CODE_CONTACT_NO_SUCH_USER,
   LARK_CODE_CONTACT_NOT_VISIBLE,
   LARK_CODE_CROSS_APP_OPEN_ID,
+  LARK_CODE_EPHEMERAL_DELETED,
   LARK_CODE_EPHEMERAL_NOT_GROUP,
+  LARK_CODE_MESSAGE_DELETED,
+  LARK_CODE_MESSAGE_RECALL_EXPIRED,
   LARK_CODE_MESSAGE_UPDATE_EXPIRED,
   LARK_CODE_MESSAGE_WITHDRAWN,
   LARK_CODE_USER_SCOPE_MISSING,
@@ -432,12 +435,13 @@ export async function replyMessage(
   replyInThread: boolean = false,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: OutboundMessageOptions,
+  options?: OutboundMessageOptions & { onAttemptStart?: () => void },
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    options?.onAttemptStart?.();
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
     // The source/authority fence follows the awaited destination lookup.
@@ -1290,29 +1294,38 @@ export async function getChatMode(
  * Recall (delete) a message. Returns `true` only when Lark confirms success,
  * `false` on SDK throw or a non-zero response code — so callers that need to
  * know whether the withdraw actually happened (e.g. grant-card withdraw) can
- * fall back instead of assuming success. Fire-and-forget callers can ignore it.
+ * fall back instead of assuming success. Recovery callers can accept an explicit
+ * already-withdrawn response or supply a fallback when the recall window expires.
  */
 export async function deleteMessage(
   larkAppId: string,
   messageId: string,
-  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'> & { acceptWithdrawn?: boolean; onRecallExpired?: () => Promise<void> },
 ): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
-  return executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
+  const outcomeFor = (code: number | undefined) => {
+    if (code === LARK_CODE_MESSAGE_RECALL_EXPIRED) return 'expired';
+    return !!options?.acceptWithdrawn && (code === LARK_CODE_MESSAGE_WITHDRAWN || code === LARK_CODE_MESSAGE_DELETED);
+  };
+  const outcome = await executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
     const c = getBotClient(larkAppId);
     try {
       if (options?.beforeWrite) await options.beforeWrite();
       const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
       if (res && typeof res.code === 'number' && res.code !== 0) {
         logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
-        return false;
+        return outcomeFor(res.code);
       }
       return true;
     } catch (err) {
       logger.debug(`Failed to delete message ${messageId}: ${err}`);
-      return false;
+      return outcomeFor(getLarkErrorCode(err));
     }
   });
+  if (outcome !== 'expired') return outcome;
+  if (!options?.onRecallExpired) return false;
+  await options.onRecallExpired();
+  return true;
 }
 
 export interface LarkPinRecord {
@@ -1478,7 +1491,7 @@ export async function sendEphemeralCard(
  * is a cosmetic issue, not a correctness one, and the caller has already sent the
  * replacement by the time cleanup runs.
  */
-export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+export async function deleteEphemeralCard(larkAppId: string, messageId: string, options?: { acceptWithdrawn?: boolean }): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteEphemeralCard');
   return executeWithLarkGate(larkAppId, 'deleteEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
@@ -1489,11 +1502,13 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
         data: { message_id: messageId },
       });
       if (res && typeof res.code === 'number' && res.code !== 0) {
+        if (options?.acceptWithdrawn && res.code === LARK_CODE_EPHEMERAL_DELETED) return true;
         logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
         return false;
       }
       return true;
     } catch (err) {
+      if (options?.acceptWithdrawn && getLarkErrorCode(err) === LARK_CODE_EPHEMERAL_DELETED) return true;
       logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
       return false;
     }

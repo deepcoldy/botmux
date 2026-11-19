@@ -24,6 +24,7 @@ import { handleOncallGroupAction, handleOncallFormAction, retryPendingOncallHand
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { oncallCreationSource } from '../src/services/oncall-group-client.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 
 const target = { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, typeId: 34, region: 'cn', emailDomain: 'example.test' };
 const source: OncallGroupSource = { appId: 'app', sessionId: 'session', chatId: 'oc_source', rootId: 'om_question',
@@ -183,7 +184,7 @@ describe('uncertain Oncall creation recovery', () => {
     await retryPendingOncallHandoffs('app');
     expect(groups.getRequest(source)?.formClosePending).toBe(false);
     expect(await forms.use('app', draft.id, 'ou_owner', async current => current.closed, { allowClosed: true })).toBe(true);
-    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form'); expect(createCalls()).toHaveLength(1);
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form', expect.objectContaining({ acceptWithdrawn: true })); expect(createCalls()).toHaveLength(1);
   });
 
   it('preserves the no-forwarding option on recovery', async () => {
@@ -201,6 +202,98 @@ describe('uncertain Oncall creation recovery', () => {
     return { forms, draft };
   };
 
+  it.each([0, 25])('retires the classification card when a successful callback was interrupted %s hours ago', async hours => {
+    const { draft } = classified();
+    create = async () => response({ oncall_flow_id: 123, open_chat_id: 'oc_created' });
+    const result = await handleOncallFormAction(event('oncall_group_form_submit', draft), 'app');
+    expect(result.afterAck).toBeTypeOf('function');
+    expect(mocks.withdraw).not.toHaveBeenCalled();
+    // The process stops before the deferred withdrawal runs, possibly beyond the handoff window.
+    groups = new OncallGroupStore(dir);
+    vi.setSystemTime(Date.now() + hours * 60 * 60_000);
+    if (hours) mocks.withdraw.mockImplementationOnce(async (_app, _message, options) => {
+      await options.onRecallExpired();
+      return true;
+    });
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form', expect.objectContaining({ acceptWithdrawn: true }));
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_created', formClosePending: false });
+    expect(createCalls()).toHaveLength(1);
+    expect(lookupCalls()).toHaveLength(0);
+    expect(mocks.merge).toHaveBeenCalledOnce();
+    if (hours) {
+      const [, , raw] = mocks.update.mock.calls.find(([, message]) => message === 'om_form')!;
+      expect(JSON.parse(raw).body.elements.map((element: { tag: string }) => element.tag)).toEqual(['markdown']);
+    } else await result.afterAck();
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+  });
+
+  it.each(['MessageUpdateExpiredError', 'MessageWithdrawnError', 'TOPIC_SEND_BLOCKED'])('settles an interrupted form retirement after recall expiry when the fallback ends with %s', async errorName => {
+    const { draft } = classified();
+    create = async () => response({ oncall_flow_id: 123, open_chat_id: 'oc_created' });
+    await handleOncallFormAction(event('oncall_group_form_submit', draft), 'app');
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: true });
+    // Restart before the deferred withdrawal, after both Lark write windows.
+    groups = new OncallGroupStore(dir);
+    vi.setSystemTime(Date.now() + 15 * 24 * 60 * 60_000);
+    mocks.withdraw.mockImplementation(async (_app, _message, options) => {
+      await options.onRecallExpired();
+      return true;
+    });
+    mocks.update.mockClear();
+    mocks.update.mockImplementation(async (_app, message) => {
+      if (message === draft.messageId) {
+        if (errorName === 'TOPIC_SEND_BLOCKED') throw new TopicSendError(errorName, 'synthetic withdrawn form');
+        const error = new Error(`synthetic ${errorName}`); error.name = errorName; throw error;
+      }
+    });
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(mocks.update.mock.calls.filter(([, message]) => message === draft.messageId)).toHaveLength(1);
+
+    // The persisted terminal state survives another restart and needs no more API calls.
+    groups = new OncallGroupStore(dir);
+    vi.setSystemTime(Date.now() + 31 * 60_000);
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(mocks.update.mock.calls.filter(([, message]) => message === draft.messageId)).toHaveLength(1);
+    expect(createCalls()).toHaveLength(1);
+  });
+
+  it.each(['network', 'TOPIC_SEND_CHECK_FAILED'])('keeps retrying a transient fallback failure (%s) and settles after recovery', async failure => {
+    const { draft } = classified();
+    create = async () => response({ oncall_flow_id: 123, open_chat_id: 'oc_created' });
+    await handleOncallFormAction(event('oncall_group_form_submit', draft), 'app');
+    groups = new OncallGroupStore(dir);
+    vi.setSystemTime(Date.now() + 15 * 24 * 60 * 60_000);
+    mocks.withdraw.mockImplementation(async (_app, _message, options) => {
+      await options.onRecallExpired();
+      return true;
+    });
+    mocks.update.mockClear();
+    mocks.update.mockImplementation(async (_app, message) => {
+      if (message === draft.messageId) {
+        if (failure === 'TOPIC_SEND_CHECK_FAILED') throw new TopicSendError(failure, 'synthetic topic check failure');
+        throw new Error('synthetic connection loss');
+      }
+    });
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: true });
+    expect(groups.pendingHandoffs('app')).toHaveLength(1);
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+
+    mocks.update.mockResolvedValue(undefined);
+    vi.setSystemTime(Date.now() + 31 * 60_000);
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    expect(mocks.withdraw).toHaveBeenCalledTimes(2);
+    expect(mocks.update.mock.calls.filter(([, message]) => message === draft.messageId)).toHaveLength(2);
+    expect(createCalls()).toHaveLength(1);
+  });
+
   it('retires a recovered form that expired after submission, without reopening expired interactions', async () => {
     const { forms, draft } = classified();
     vi.setSystemTime(Date.now() + 24 * 60 * 60_000 - 10_000);
@@ -208,7 +301,7 @@ describe('uncertain Oncall creation recovery', () => {
     vi.setSystemTime(Date.now() + 20_000);
     await retryPendingOncallHandoffs('app');
     expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
-    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form');
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form', expect.objectContaining({ acceptWithdrawn: true }));
     await expect(forms.use('app', draft.id, 'ou_owner', async () => true, { allowClosed: true })).rejects.toThrow();
     expect(groups.pendingHandoffs('app')).toEqual([]); expect(createCalls()).toHaveLength(1);
   });
@@ -228,7 +321,7 @@ describe('uncertain Oncall creation recovery', () => {
     expect(mocks.withdraw).not.toHaveBeenCalled();
     expect(groups.getRequest(source)?.formClosePending).toBe(true);
     await retryPendingOncallHandoffs('app');
-    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form');
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form', expect.objectContaining({ acceptWithdrawn: true }));
     expect(groups.getRequest(source)?.formClosePending).toBe(false);
     expect(createCalls()).toHaveLength(1);
   });
@@ -241,7 +334,7 @@ describe('uncertain Oncall creation recovery', () => {
     groups.recordSource(next);
     await retryPendingOncallHandoffs('app');
     expect(groups.getRequest(next)).toMatchObject({ status: 'succeeded', formClosePending: false });
-    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form');
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', 'om_form', expect.objectContaining({ acceptWithdrawn: true }));
     expect(groups.pendingHandoffs('app')).toEqual([]); expect(createCalls()).toHaveLength(1);
   });
 });

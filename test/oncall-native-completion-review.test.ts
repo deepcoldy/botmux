@@ -30,7 +30,7 @@ beforeEach(() => {
   mocks.merge.mockResolvedValue({ messageId: 'om_receipt', invalidMessageIds: [] });
   mocks.thread.mockResolvedValue({ verifiedThread: true, messages: [{ message_id: 'om_q1', create_time: String(now - 1000) }, { message_id: 'om_a1', create_time: String(now) }] });
   rows = [{ id: 1234, tenant_id: 12, source_location: 'https://oncall.example.test/chat?bm_form=synthetic', originator_user: 'actor', oncall_question_type_id: 34,
-    region: 'cn', stage: 'launch_oncall', chat_id: '123456789', create_time: new Date(now + 1000).toISOString() }];
+    region: 'cn', stage: 'launch_oncall', chat_id: '123456789', oncall_start_time: new Date(now + 1000).toISOString() }];
   fetcher = vi.fn(async (url: string) => json(url.includes('oncall_flow/list') ? rows : 'oc_destination')); vi.stubGlobal('fetch', fetcher);
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });

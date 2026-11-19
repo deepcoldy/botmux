@@ -5,7 +5,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { expandHome } from '../core/working-dir.js';
-import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
+import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, rolloutHeaderCheck } from './codex-transcript.js';
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { getSession } from './session-store.js';
 import { config } from '../config.js';
@@ -57,6 +57,42 @@ export interface ResolvedTranscriptPath {
    *  made, so a reader of such a path re-checks the file it actually opened
    *  (see context-rewind's transcript reads). */
   writableTreeRoot?: string;
+}
+
+/** Continuations share a native thread ID but may live on different dates. */
+export function resolveSessionTranscriptPaths(q: TranscriptPathQuery): string[] {
+  const current = resolveSessionTranscriptPath({ ...q, fresh: true });
+  if (!current) return [];
+  if (q.cliId !== 'codex' && q.cliId !== 'traex') return [current.path];
+  const id = q.cliSessionId;
+  if (!id || !/^[a-f0-9-]{36}$/i.test(id)) return [current.path];
+  const day = dirname(current.path);
+  const month = dirname(day);
+  const year = dirname(month);
+  if (!/^\d{2}$/.test(day.split(sep).pop()!) || !/^\d{2}$/.test(month.split(sep).pop()!)
+    || !/^\d{4}$/.test(year.split(sep).pop()!)) return [current.path];
+  const root = dirname(year);
+  const found = new Set([current.path]);
+  const suffix = new RegExp(`-${id}(?:_[a-f0-9-]{36})?\\.jsonl$`, 'i');
+  const walk = (dir: string, depth: number): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (depth < 3 && entry.isDirectory() && (depth === 0 ? /^\d{4}$/ : /^\d{2}$/).test(entry.name)) {
+        walk(path, depth + 1);
+      } else if (depth === 3 && entry.isFile() && entry.name.startsWith('rollout-')
+        && suffix.test(entry.name)) {
+        const header = rolloutHeaderCheck(path, true);
+        if (header.verified && !header.internal && (!header.sid || header.sid.toLowerCase() === id.toLowerCase())) {
+          found.add(path);
+        }
+      }
+    }
+  };
+  try { walk(root, 0); } catch { return [current.path]; }
+  const ordered = [...found].sort();
+  // The single-path resolver's indexed generation is authoritative. A later-
+  // named sibling cannot be its ancestor and must not poison the current end.
+  return ordered.slice(0, ordered.indexOf(current.path) + 1);
 }
 
 const sessionPathCache = new Map<string, { path: string | null; atMs: number }>();
@@ -515,7 +551,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
           : findTraexSessionIdByBotmuxSessionId(q.sessionId);
         const traexSid = q.cliSessionId || mappedSid || q.sessionId;
         return foundWrap(findTraexRolloutBySessionId(traexSid), v);
-      }, { retryMiss: q.fresh });
+      }, { retryMiss: q.fresh, refreshHit: q.fresh });
       return path ? { path, kind: 'traex' } : null;
     }
     case 'grok': {

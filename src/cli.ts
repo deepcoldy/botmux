@@ -13,6 +13,7 @@ import { buildReplyConsoleUrl } from './core/dashboard-url.js';
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
+ *   botmux setup add --local — persist a local bot with no Feishu app id or secret
  *   botmux clone <bot> [--name <name>] — create a new app, then copy an existing bot's configuration
  *   botmux start [--companion-secret-file <path> --companion-bot <appId>]
  *                         — start daemon and optionally its closed local companion API
@@ -99,7 +100,7 @@ import {
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { sandboxEnabled } from './adapters/backend/sandbox.js';
-import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import { mutateBotsJsonAtomic, writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -134,11 +135,13 @@ import {
   editInputFromFlags,
   isScriptedSetupInvocation,
   maskAppSecret,
+  parseCliRuntimeFlag,
   parseSetupCommand,
   resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
+import { buildLocalBotRecord, findInvalidFleetCredentials, isLocalBotId, reallocateLocalBotId } from './setup/local-bot.js';
 import {
   detectUnusableOwnerEntries,
   normalizeManagedOwnerEntries,
@@ -148,7 +151,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import bundledScopeManifest from './setup/lark-scopes.json' with { type: 'json' };
 import type { CliId } from './adapters/cli/types.js';
-import type { CliLaunchMode } from './core/cli-launch-mode.js';
+import { validateCliLaunchModeConfig, type CliLaunchMode } from './core/cli-launch-mode.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
   validateCodexAppManagedSendOrigin,
@@ -747,12 +750,50 @@ function printInputHelp(title: string, lines: string[]): void {
   }
 }
 
+function normalizeBotsForWrite(bots: any[]): any[] {
+  const normalized = bots.map(bot => normalizeBotConfig(bot));
+  ensureUniqueBotProcessNames(normalized);
+  return normalized;
+}
+
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
 // the same name without passing BOTS_JSON_FILE explicitly each time.
 function writeBotsJsonAtomic(bots: any[]): void {
-  const normalized = bots.map(bot => normalizeBotConfig(bot));
-  ensureUniqueBotProcessNames(normalized);
-  writeBotsAtomic(BOTS_JSON_FILE, normalized);
+  writeBotsAtomic(BOTS_JSON_FILE, normalizeBotsForWrite(bots));
+}
+
+/**
+ * Append a local bot against the latest locked fleet generation. Both scripted
+ * and interactive setup use this path: id allocation and process-name checks
+ * cannot depend on the snapshot that happened to be read before prompting.
+ */
+function appendLocalBotConfigWithLock<T extends {
+  larkAppId?: string;
+  displayName?: string;
+  name?: string;
+}>(bot: T): {
+  bot: T & { larkAppId: string };
+  index: number;
+  migratedEnv: boolean;
+} {
+  return mutateBotsJsonAtomic(BOTS_JSON_FILE, latest => {
+    let existing = latest;
+    let migratedEnv = false;
+    if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
+      const legacy = parseDotEnvToBotConfig();
+      if (legacy.larkAppId && legacy.larkAppSecret) {
+        existing = [legacy];
+        migratedEnv = true;
+      }
+    }
+    const allocated = reallocateLocalBotId(
+      bot,
+      existing.map(entry => String(entry?.larkAppId ?? '')).filter(Boolean),
+    );
+    const index = existing.length;
+    const bots = normalizeBotsForWrite([...existing, allocated]);
+    return { bots, result: { bot: bots[index], index, migratedEnv } };
+  });
 }
 
 /**
@@ -881,6 +922,10 @@ async function finishOpenPlatformSetup(
   } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
+  if (isLocalBotId(appId)) {
+    say('\n本地机器人不关联飞书应用（larkAppId 只是本地身份），已跳过开放平台自动配置。');
+    return { status: 'skipped' };
+  }
   const {
     parseSetupOpenPlatformAutoFlag,
     automateOpenPlatformSetup,
@@ -1132,6 +1177,12 @@ export async function obtainCredentials(
 ): Promise<
   | {
       ok: true;
+      local: true;
+      displayName?: string;
+    }
+  | {
+      ok: true;
+      local?: false;
       appId: string;
       appSecret: string;
       brand: Brand;
@@ -1151,6 +1202,7 @@ export async function obtainCredentials(
         { label: t('setup.credentials.one_scan'), hint: t('setup.credentials.one_scan_hint') },
         { label: t('setup.credentials.pick_existing'), hint: t('setup.credentials.pick_existing_hint') },
         { label: t('setup.credentials.manual'), hint: t('setup.credentials.manual_hint') },
+        { label: '仅本地机器人', hint: '不扫码、不创建飞书应用，也不需要 App ID / Secret' },
       ],
       defaultIndex: 0,
       footer: t('setup.menu.footer_cancel'),
@@ -1305,6 +1357,11 @@ export async function obtainCredentials(
       console.log('   降级到手动输入 AppID/Secret。\n');
     }
 
+    if (method === 3) {
+      const displayName = (await ask(rl, '本地机器人显示名（可留空，将生成 local_bot）: ')).trim();
+      return { ok: true, local: true, ...(displayName ? { displayName } : {}) };
+    }
+
     // 手动输入（method 2；非 TTY 下也是 0/1 失败后的直落兜底）：扫码路径已用
     // tenant_brand 自动识别；手动路径没有这个信号，兜底让用户手选租户类型
     // （决定建应用 / 运行时的域名）。
@@ -1375,8 +1432,10 @@ async function promptBotConfig(
 ): Promise<Record<string, any> | null> {
   const creds = await obtainCredentials(rl, options);
   if (!creds.ok) return null;
+  const localBot = creds.local === true;
 
-  // 凭证立刻验证. 通不过不写 bots.json.
+  // 凭证立刻验证. 通不过不写 bots.json. 本地机器人没有飞书凭证，不走这条。
+  if (!localBot) {
   console.log(`\n${t('setup.credentials.validating')}`);
   const { validateCredentials } = await import('./setup/verify-permissions.js');
   const v = await validateCredentials(creds.appId, creds.appSecret, creds.brand);
@@ -1386,6 +1445,7 @@ async function promptBotConfig(
     return null;
   }
   console.log(`${t('setup.credentials.valid')}\n`);
+  }
 
   // CLI 适配器：可搜索的级联选择器（Aiden / Forge 等分组可进入二级菜单）。
   // 非交互终端自动回退为序号 / ID 文本输入。
@@ -1448,6 +1508,22 @@ async function promptBotConfig(
         break;
       }
     }
+  }
+
+  if (localBot) {
+    const record = buildLocalBotRecord({
+      displayName: creds.displayName,
+      cliId,
+      wrapperCli,
+      cliLaunchMode,
+      workingDir,
+      defaultWorkingDir,
+      existingIds: loadBotsJson().map(b => String(b?.larkAppId ?? '')).filter(Boolean),
+      ...(getDefaultLocale() === 'en' ? { lang: 'en' as const } : {}),
+    });
+    if (!ensureBotWorkingDirsExist(record, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(record)) return null;
+    console.log(`\n本地机器人 ${record.larkAppId} 不关联飞书应用。这个 id 只是稳定的本地身份。`);
+    return normalizeBotConfig(record);
   }
 
   const bot: Record<string, any> = {
@@ -1995,6 +2071,103 @@ export async function cmdSetupScripted(
     return;
   }
 
+  if (cmd.action === 'add' && cmd.local) {
+    let cliChoice: ReturnType<typeof resolveCliSelection>;
+    try {
+      cliChoice = resolveCliSelection((cmd.flags.cli ?? 'claude-code').trim());
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const draft = buildLocalBotRecord({
+      displayName: cmd.flags.name,
+      name: cmd.flags.name,
+      cliId: cliChoice.cliId,
+      wrapperCli: cmd.flags.wrapperCli?.trim() || cliChoice.wrapperCli,
+      cliLaunchMode: cliChoice.cliLaunchMode,
+      cliPathOverride: cmd.flags.cliPath?.trim(),
+      workingDir: cmd.flags.workingDir?.trim(),
+      defaultWorkingDir: cmd.flags.defaultWorkingDir?.trim() || (cmd.flags.workingDir?.trim() ? undefined : '~'),
+      model: cmd.flags.model,
+      backendType: cmd.flags.backend?.trim(),
+      lang: cmd.flags.lang?.trim(),
+      // Provisional only: appendLocalBotConfigWithLock reallocates under the lock.
+      existingIds: [],
+    });
+    let bot = draft;
+    try {
+      if (cmd.flags.cliRuntime?.trim()) {
+        // Shared editor semantics: validate the runtime against cliId/wrapper
+        // and persist its executable as the exact downgrade path shadow.
+        bot = applyBotConfigEdits(draft, {
+          cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
+          cliPathOverride: cmd.flags.cliPath,
+        });
+      }
+      validateCliLaunchModeConfig({
+        cliId: bot.cliId,
+        cliLaunchMode: bot.cliLaunchMode,
+        wrapperCli: bot.wrapperCli,
+        cliRuntime: bot.cliRuntime,
+        cliPathOverride: bot.cliPathOverride,
+      }, 'setup add --local');
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const badDirs = invalidBotDirs(bot);
+    if (badDirs.length > 0) {
+      failSetupScripted(cmd.json, `目录不存在或不是目录: ${badDirs.join(', ')}。请先创建，未写入配置。`);
+      return;
+    }
+    const cliAvailability = checkCliAvailability({
+      cliId: bot.cliId ?? 'claude-code',
+      cliPathOverride: bot.cliPathOverride,
+      wrapperCli: bot.wrapperCli,
+      cliLaunchMode: bot.cliLaunchMode,
+    });
+    if (!cliAvailability.available) {
+      failSetupScripted(cmd.json, `所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}。请先安装或修正 PATH / CLI 路径，未写入配置。`);
+      return;
+    }
+    let appended: { bot: typeof bot; index: number; migratedEnv: boolean };
+    try {
+      appended = appendLocalBotConfigWithLock(bot);
+    } catch (err) {
+      failSetupScripted(cmd.json, `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    bot = appended.bot;
+    if (appended.migratedEnv) {
+      try { renameSync(ENV_FILE, ENV_FILE + '.bak'); } catch { /* config is already durable */ }
+    }
+    const index = appended.index;
+    const live = await ensureBotDaemonStarted(String(bot.larkAppId), { quiet: cmd.json });
+    const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
+    if (cmd.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        action: 'add',
+        localIdentity: true,
+        appId: bot.larkAppId,
+        note: 'larkAppId 是稳定的本地身份，不是飞书 App ID',
+        bot: botJsonView(bot, index),
+        botsFile: BOTS_JSON_FILE,
+        openPlatform: { status: 'skipped' },
+        live,
+        next,
+      }, null, 2));
+    } else {
+      console.log(`✅ 已添加本地机器人 ${botProcessName(bot, index, PM2_NAME)} (${bot.larkAppId})`);
+      console.log('   未创建飞书应用，也未写入 App Secret。这个 id 只是本地身份。');
+      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+      if (live.ok) console.log(`✅ 已自动上线（${live.processName}）`);
+      else if (live.reason === 'fleet_down') console.log('下一步: botmux start（daemon 尚未运行）');
+      else console.log(`⚠️  自动上线失败（${live.message}）。下一步: botmux restart`);
+    }
+    return;
+  }
+
   if (cmd.action === 'add') {
     // 单机器人 .env 老配置：与 TUI「添加新机器人」一致，先迁移进 bots.json 再追加。
     let existing = bots;
@@ -2444,7 +2617,7 @@ export async function cmdSetupScripted(
       failSetupScripted(cmd.json, `AppID ${edited.larkAppId} 已被另一个机器人使用，配置未修改。`);
       return;
     }
-    if (appIdChanged || edited.larkAppSecret !== original.larkAppSecret) {
+    if ((appIdChanged || edited.larkAppSecret !== original.larkAppSecret) && edited.apiOnly !== true) {
       const { validateCredentials } = await import('./setup/verify-permissions.js');
       const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
       if (!v.ok) {
@@ -2535,6 +2708,11 @@ async function cmdClone(argv: string[]): Promise<void> {
     return;
   }
   const source = bots[sourceIndex];
+  if (source.localIdentity === true) {
+    console.error('本地机器人不支持克隆；请改用 setup add --local 新建本地机器人，或使用飞书机器人作为克隆源。');
+    process.exitCode = 1;
+    return;
+  }
   const owners = cloneOwnerEntries(
     source,
     process.env.BOTMUX_LARK_APP_ID,
@@ -2668,7 +2846,7 @@ async function cmdSetup(): Promise<void> {
         // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
         const appIdChanged = edited.larkAppId !== original.larkAppId;
         const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
-        if (appIdChanged || appSecretChanged) {
+        if ((appIdChanged || appSecretChanged) && edited.apiOnly !== true) {
           console.log(`\n${t('setup.credentials.validating')}`);
           const { validateCredentials } = await import('./setup/verify-permissions.js');
           const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
@@ -2730,14 +2908,21 @@ async function cmdSetup(): Promise<void> {
       }
 
       console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-      const newBot = await promptBotConfig(rl);
+      let newBot = await promptBotConfig(rl);
       rl.close();
       if (!newBot) {
         console.log(`\n${t('setup.common.aborted_bots_json_untouched')}`);
         return;
       }
-      writeBotsJsonAtomic([...bots, newBot]);
-      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: bots.length + 1 })}`);
+      let addedIndex = bots.length;
+      if (newBot.localIdentity === true) {
+        const appended = appendLocalBotConfigWithLock(newBot);
+        newBot = appended.bot;
+        addedIndex = appended.index;
+      } else {
+        writeBotsJsonAtomic([...bots, newBot]);
+      }
+      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: addedIndex + 1 })}`);
       console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
       await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
       await printAddBotLiveHint(newBot.larkAppId);
@@ -2783,7 +2968,7 @@ async function cmdSetup(): Promise<void> {
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
     console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-    const newBot = await promptBotConfig(rl);
+    let newBot = await promptBotConfig(rl);
     rl.close();
     if (!newBot) {
       console.log(`\n${t('setup.common.aborted_env_untouched')}`);
@@ -2791,7 +2976,12 @@ async function cmdSetup(): Promise<void> {
     }
 
     // 写新文件成功后才备份 .env. 失败不动两边.
-    writeBotsJsonAtomic([existingBot, newBot]);
+    if (newBot.localIdentity === true) {
+      const appended = appendLocalBotConfigWithLock(newBot);
+      newBot = appended.bot;
+    } else {
+      writeBotsJsonAtomic([existingBot, newBot]);
+    }
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
@@ -2952,24 +3142,12 @@ async function preflightConfiguredBotCredentials() {
   ]);
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
-    const invalid: Array<{ appId: string; reason: string }> = [];
-    for (const b of botsForCheck) {
-      if (blockedBotIds.has(b.larkAppId)) continue;
-      if (!b.larkAppId || !b.larkAppSecret) {
-        invalid.push({ appId: b.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
-        continue;
-      }
-      const v = await validateCredentials(b.larkAppId, b.larkAppSecret, botBrand(b));
-      if (!v.ok) {
-        if (v.error === 'invalid_credentials') {
-          invalid.push({ appId: b.larkAppId, reason: v.message });
-        } else {
-          // network / unknown — 不应该拦下启动, 走 WARN
-          console.warn(`⚠️  [${b.larkAppId}] 启动前凭证验证未成功（${v.error}）: ${v.message}`);
-          console.warn(`   daemon 仍会启动；启动后 dispatcher 会自行重试。`);
-        }
-      }
-    }
+    const invalid = await findInvalidFleetCredentials(botsForCheck, {
+      blockedBotIds,
+      validate: (appId, secret, brand) => validateCredentials(appId, secret, brand),
+      brandOf: botBrand,
+      warn: line => console.warn(line),
+    });
     if (invalid.length > 0) {
       console.error('\n❌ 以下机器人凭证无效，botmux start 中止：\n');
       for (const e of invalid) console.error(`   - ${e.appId}: ${e.reason}`);
@@ -3753,12 +3931,33 @@ async function cmdStatus(): Promise<void> {
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
+  await printTmuxStatusAdvice();
   if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
   warnIfLegacyBotmuxAlive();
   // The pm2 read-only projection print is gone: the fleet-state table above IS
   // the authoritative status now (supervisor-owned), so there is no second
   // registry to reconcile against. Legacy pm2 still gets surfaced by
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
+}
+
+/** tmux below the recommended version, or upgraded but the botmux server
+ *  still on the old one. Advisory only; read-only probes (never boots a server). */
+async function printTmuxStatusAdvice(): Promise<void> {
+  try {
+    // Not loadBotsJson(): that exits the process on a malformed file, and an
+    // advisory line must never turn `status` into a failure.
+    let bots: any[] = [];
+    try { bots = existsSync(BOTS_JSON_FILE) ? parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE) : []; }
+    catch { return; }
+    if (!bots.some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux')) return;
+    const [{ probeTmuxFacts, formatTmuxStatusAdvice }, { preferredManagedTmuxSocket }, { getDefaultLocale }] = await Promise.all([
+      import('./core/tmux-upgrade.js'),
+      import('./adapters/backend/tmux-socket.js'),
+      import('./i18n/index.js'),
+    ]);
+    const advice = formatTmuxStatusAdvice(await probeTmuxFacts(preferredManagedTmuxSocket()), getDefaultLocale());
+    if (advice) console.log(advice);
+  } catch { /* advisory */ }
 }
 
 function printUpgradeHelp(): void {
@@ -6266,8 +6465,9 @@ async function noteTurnFinalOutsideReplyCard(
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
   let hostSecret: string | undefined;
@@ -6300,6 +6500,7 @@ async function postSessionCliIpc(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
@@ -8159,6 +8360,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 定时任务（可在 CLI 会话内自动推断 chat）:
 ${SCHEDULE_HELP_BODY}
+
+飞书主动发送（宿主 shell）:
+  post --bot <cli_...> --chat-id <oc_...> --text <正文>
+                       用指定 Bot 发到群、话题或私聊，详见 botmux post --help
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
@@ -11219,7 +11424,11 @@ function resolveDispatchDispatcherAppId(input: {
   return !dispatcherAppId || dispatcherAppId === input.selfAppId ? undefined : dispatcherAppId;
 }
 
-async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
+async function cmdSend(
+  rest: string[],
+  beginFeedbackEffect?: (relay?: FeedbackSendLeaseRelay) => Promise<void>,
+  preflight?: SendPreflight,
+): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
     console.log(SEND_HELP_BODY);
@@ -12261,12 +12470,24 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       throw error;
     }
   };
+  // A read-isolated CLI can neither read its own birth identity (setuid `ps`)
+  // nor write the data dir, so the feedback send lease falls back to the
+  // origin session's daemon, which takes it on this process's behalf.
+  const feedbackSendLeaseRelay = (): FeedbackSendLeaseRelay | undefined => {
+    const leaseSessionId = originSessionId;
+    const ipcPort = resolveDaemonIpcPort(isolatedAttestationContext?.ipcPortFallback, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (!leaseSessionId || !ipcPort) return undefined;
+    return async (body, signal) => {
+      const response = await postSessionCliIpc(ipcPort, leaseSessionId, FEEDBACK_SEND_LEASE_ROUTE, body, signal);
+      return { ok: response.ok, status: response.status, body: await response.json().catch(() => undefined) };
+    };
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
     await checkSendTopics?.(lookup);
     const origin = await revalidateIsolatedOrigin();
-    beginFeedbackEffect?.();
+    await beginFeedbackEffect?.(feedbackSendLeaseRelay());
     return origin;
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
@@ -19511,8 +19732,8 @@ botmux bots — 机器人协作花名册 / 团队补人
 }
 
 /**
- * `botmux bots list --scope team [--team <id>]` — 跨机发现同团队、已 opt-in（owner
- * 加进 team.bots）的 agent，打平台端点2（machine-auth，Bearer=machineToken）。
+ * `botmux bots list --scope team [--team <id>]` — 跨机发现同团队的 botmux agent
+ * （owner opt-in）与外部机器人（团队成员登记），打平台端点2（machine-auth，Bearer=machineToken）。
  *
  * 与 chat scope 的关键区别 + 硬约束：
  *  - 走 machine-auth，不读飞书群花名册、不需要传输身份 → 沙盒/apiOnly bot 也能查。
@@ -19570,14 +19791,14 @@ async function cmdBotsListTeam(rest: string[]): Promise<void> {
 
   const { teamName, agents } = res.value;
   // 输出对齐 chat scope 的 JSON 形状（scope 标注 + total），字段是平台端点2 的原样透传。
-  // 提醒：发现列表只含**已加入 team.bots** 的 agent（owner 在平台「管理机器人」显式加入）。
+  // 提醒：botmux agent 由 owner opt-in；外部机器人由团队成员登记。
   console.log(JSON.stringify({
     scope: 'team',
     teamId,
     teamName: teamName || teamNameHint || teamId,
     agents,
     total: agents.length,
-    note: '发现列表只含已加入团队（owner 在平台「管理机器人」opt-in）的 agent；specialties/mentionable 为 agent 自报，仅供参考不可信。',
+    note: '发现列表包含 owner 在平台「管理机器人」opt-in 的 botmux agent，以及团队成员登记的外部机器人；specialties/mentionable 为 agent 自报，仅供参考不可信。',
   }, null, jsonOut ? 0 : 2));
 }
 
@@ -21240,7 +21461,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
+  'input-capture', 'send', 'post', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
@@ -21833,13 +22054,22 @@ switch (command) {
     process.exitCode = await runObserveCommand(process.argv.slice(3));
     break;
   }
+  case 'post': {
+    const { cmdPost } = await import('./cli/post-command.js');
+    process.exitCode = await cmdPost(process.argv.slice(3));
+    break;
+  }
   case 'send': {
-    let releaseFeedbackEffect: (() => void) | undefined;
+    let feedbackEffectLease: Promise<() => Promise<void>> | undefined;
     try {
-      await cmdSend(process.argv.slice(3), () => {
-        releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
+      await cmdSend(process.argv.slice(3), async (relay) => {
+        feedbackEffectLease ??= acquireFeedbackSendLeaseWithRelay({
+          acquireLocal: () => acquireFeedbackSendLease(resolveDataDir()),
+          relay,
+        });
+        await feedbackEffectLease;
       }, sendPreflight);
-      releaseFeedbackEffect?.();
+      if (feedbackEffectLease) await (await feedbackEffectLease)();
     }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
@@ -21962,3 +22192,4 @@ switch (command) {
     break;
 }
 import { acquireFeedbackSendLease } from './services/feedback-maintenance.js';
+import { acquireFeedbackSendLeaseWithRelay, FEEDBACK_SEND_LEASE_ROUTE, type FeedbackSendLeaseRelay } from './services/feedback-send-lease-relay.js';

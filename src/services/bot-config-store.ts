@@ -487,6 +487,12 @@ async function applyConfigFieldInternal(
   }
   if (spec.configKey === 'ownerGroupFollow') {
     try { value = normalizeOwnerGroupFollowConfig(value) ?? null; } catch { return { ok: false, reason: 'invalid_owner_group_follow' }; }
+    // This feature always needs Feishu transport. Reject new persisted config
+    // on apiOnly bots, but keep null/false as an escape hatch for cleaning up
+    // values saved before this guard existed.
+    if (bot.config.apiOnly === true && value !== null) {
+      return { ok: false, reason: 'owner_group_follow_api_only' };
+    }
   }
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }

@@ -395,14 +395,20 @@ export class SessionController {
     // input is still queued. Do not reconstruct execution authority from the
     // notification's display-only turnId (or create an input admission for it).
     if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
-      const preliminary = this.gateway.admit(message.type, context, channel);
-      if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
       const current = this.currentRuntime();
       // A turn the CLI starts itself is reported under the binding it was
       // spawned with; an in-process continuation moved that CLI to `current`.
-      if (current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
-        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel)) context.scope.runtime = current;
+      const continuedInto = current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
+        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel) ? current : undefined;
+      // Its start is a fact of the live CLI, never of an earlier runtime: judged
+      // under the spawn binding it would be refused as stale after any rebind
+      // (the relay resolving the real CLI, a new native session id), and a
+      // zero-prompt session would lose where that turn replies.
+      if (continuedInto && message.type === 'terminal_turn_started') context.scope.runtime = continuedInto;
+      const preliminary = this.gateway.admit(message.type, context, channel);
+      if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
+      if (continuedInto) context.scope.runtime = continuedInto;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
       else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
