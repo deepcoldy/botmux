@@ -78,9 +78,10 @@ describe('cross-chat task consent', () => {
     let now = Date.now();
     vi.spyOn(Date, 'now').mockImplementation(() => now);
     let observed: () => void;
+    let originChecks = 0;
     const waiting = new Promise<void>(resolve => { observed = resolve; });
     const pending = confirmDispatchTask({ dataDir: dir, secret: key, binding: record(owner),
-      send: async () => 'om_prompt', checkOrigin: async () => { observed(); } });
+      send: async () => 'om_prompt', checkOrigin: async () => { if (++originChecks >= 3) observed(); } });
     const refusal = pending.then(() => undefined, error => error);
     await waiting;
     // Move the deadline clock while the real polling timer remains live.

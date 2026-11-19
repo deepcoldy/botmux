@@ -598,6 +598,7 @@ describe('target daemon consumes signed message authority', () => {
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
       readTaskBinding, capabilityOn, getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
+      dispatchConsentCardAvailable: async () => true,
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: (_app: string, chat?: string, _user?: string, botUnion?: string, humanUnion?: string) => ({
         allowed: options.talk !== false && (!!chat || options.botAccess !== false)
@@ -1021,6 +1022,16 @@ describe('target daemon consumes signed message authority', () => {
     const body = identityBody('bytedcli', 'om_kickoff');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).not.toContain('revoked-must-not-publish');
+  });
+
+  it('withholds task credentials when its source approval card is withdrawn', async () => {
+    const h = await targetHarness({ member: false, taskConsent: true });
+    h.scopeValues.dispatchConsentCardAvailable = async () => false;
+    bytedcliJwts.set(ALICE, { cloudJwt: 'withdrawn-card-must-not-publish' });
+    await h.run();
+    const body = identityBody('bytedcli', 'om_kickoff');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('withdrawn-card-must-not-publish');
   });
 
   it('re-checks the task decision at publication time, not only at recipient lookup', async () => {

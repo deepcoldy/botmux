@@ -658,6 +658,7 @@ import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
+import { dispatchConsentCardAvailable } from './im/lark/client.js';
 import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
@@ -4587,7 +4588,8 @@ async function checkDelegationRecipient(
   }
   if (taskConsent) {
     const binding = await readTaskBinding(config.session.dataDir,
-      loadOrCreateDispatchReportBindingSecret(config.session.dataDir), taskConsent.rootId);
+      loadOrCreateDispatchReportBindingSecret(config.session.dataDir), taskConsent.rootId,
+      cardId => dispatchConsentCardAvailable(taskConsent.sourceAppId, taskConsent.taskConsent.sourceChatId, cardId));
     if (!binding || binding.attachment || binding.targetSessionId !== taskConsent.sourceSessionId
         || binding.targetLarkAppId !== taskConsent.sourceAppId || binding.targetChatId !== taskConsent.taskConsent.sourceChatId
         || binding.taskOwner?.decision !== 'approved' || binding.taskOwner.consentMessageId !== taskConsent.taskConsent.cardId
@@ -9481,7 +9483,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           if (!binding.taskOwner && ds.session.rootMessageId) {
             binding = await restoreDispatchTaskOwner({ dataDir: config.session.dataDir, secret, binding,
               owner: { openId: authority.openId, receivingAppId: targetApp, receivingChatId: chatId },
-              sourceRootId: ds.session.rootMessageId, firstReply: () => firstDispatchReply(ds.larkAppId, chatId, rootId),
+              sourceRootId: ds.session.rootMessageId, firstReply: () => firstDispatchReply(ds.larkAppId, chatId, rootId, targetApp),
               original: kickoff => resolveDispatchUser({ dataDir: config.session.dataDir, secret, appId: targetApp,
                 chatId, rootId, turnId: kickoff, waitMs: 0 }),
               sourceMessage: id => getMessageDetail(ds.larkAppId, id, { userIdType: 'open_id', userCardContent: false, timeoutMs: 5000 }),
@@ -9496,6 +9498,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
             dataDir: config.session.dataDir, secret, binding, targetName: targetConfig.displayName,
             send: (card, key) => replyMessage(ds.larkAppId, turnId, card, 'interactive', true, key, undefined, sourceWriteOptions),
             checkOrigin: sourceWriteOptions.beforeWrite,
+            isCardAvailable: cardId => dispatchConsentCardAvailable(ds.larkAppId, ds.chatId, cardId),
           });
           if (!evaluateTalk(ds.larkAppId, ds.chatId, authority.openId, undefined, authority.unionId, 'group').allowed
               || !(await findCurrentChatUserMembers(ds.larkAppId, ds.chatId, [authority.openId])).has(authority.openId)) {
@@ -9510,6 +9513,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const delivery = authority && turnId && targetAppIds.length ? {
       dataDir: config.session.dataDir,
       secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+      ...(taskConsent ? {
+        isCardAvailable: (cardId: string) => dispatchConsentCardAvailable(ds.larkAppId, ds.chatId, cardId),
+      } : {}),
       payload: {
         sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
         rootId, chatId, targetAppIds, authority,

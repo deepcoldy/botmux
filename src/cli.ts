@@ -16587,7 +16587,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         throw Object.assign(new Error(`原话题的任务授权待确认。确认后用 --into ${rootId} 继续这条派单。`),
           { code: 'TASK_CONSENT_PENDING', rootId });
       }
-      if (result?.error === 'task_consent_denied') throw new Error('发起人已拒绝或撤销本任务授权。');
+      if (result?.error === 'task_consent_denied') {
+        throw Object.assign(new Error('发起人已拒绝或撤销本任务授权。'),
+          { code: 'TASK_CONSENT_DENIED', rootId });
+      }
       throw new Error(`dispatch delivery failed: ${result?.error ?? response.status}`);
     }
     return result.messageId;
@@ -16857,7 +16860,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
     if (!accepted) process.exitCode = 1;
   } catch (err: any) {
-    if (err?.code === 'TASK_CONSENT_PENDING') {
+    if (err?.code === 'TASK_CONSENT_PENDING' || err?.code === 'TASK_CONSENT_DENIED') {
       console.error(JSON.stringify({ success: false, taskSent: false, errorCode: err.code,
         sourceSessionId: sid, targetAppIds: parsedBotApps.map(item => item.appId),
         chatId: targetChatId, threadRootId: err.rootId, detail: err.message }));

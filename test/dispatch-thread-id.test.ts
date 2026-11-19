@@ -38,6 +38,7 @@ function harness(mode: Mode, options: {
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
   consentPending?: boolean;
+  consentDenied?: boolean;
   taskTreeCardEnabled?: boolean;
   resolveBotApps?: (receiver: string, chatId: string, appIds: string[]) => Promise<unknown>;
 } = {}) {
@@ -78,6 +79,7 @@ function harness(mode: Mode, options: {
   const postCurrentSessionDaemonRoute = vi.fn(async (input: { path: string; body: any }) => {
     if (input.path === '/api/dispatch-user/deliver') {
       if (options.consentPending) return { ok: false, json: async () => ({ ok: false, error: 'task_consent_pending' }) };
+      if (options.consentDenied) return { ok: false, json: async () => ({ ok: false, error: 'task_consent_denied' }) };
       const messageId = await replyMessage('cli_source', input.body.rootId, input.body.content, 'post', true);
       return { ok: true, json: async () => ({ ok: true, messageId }) };
     }
@@ -268,6 +270,25 @@ it.each(['dispatch', 'into'] as const)('%s reports a resumable consent wait with
   expect(JSON.parse(h.stderr.at(-1)!)).toMatchObject({ errorCode: 'TASK_CONSENT_PENDING', taskSent: false, threadRootId: h.root });
   expect(h.persistDispatchLifecycle).not.toHaveBeenCalled();
   expect(h.replyMessage).not.toHaveBeenCalled();
+});
+
+it.each(['dispatch', 'into'] as const)('%s preserves a task consent refusal without reporting transport failure', async mode => {
+  const h = harness(mode, { consentDenied: true, acceptance: 'accepted', taskTreeCardEnabled: true });
+  await h.run();
+  const result = JSON.parse(h.stderr.at(-1)!);
+  expect(result).toMatchObject({
+    success: false, taskSent: false, errorCode: 'TASK_CONSENT_DENIED',
+    sourceSessionId: 'source', targetAppIds: ['cli_target'], chatId: 'oc_chat', threadRootId: h.root,
+  });
+  expect(result).not.toHaveProperty('transportState');
+  expect(result).not.toHaveProperty('acceptanceState');
+  expect(h.stdout).toEqual([]);
+  expect(h.state.process.exitCode).toBe(1);
+  expect(h.persistDispatchLifecycle).not.toHaveBeenCalled();
+  expect(h.replyMessage).not.toHaveBeenCalled();
+  expect(h.request).not.toHaveBeenCalled();
+  expect(h.postCurrentSessionDaemonRoute.mock.calls.map(c => c[0]!.path))
+    .not.toContain(expect.stringContaining('dispatch-tree'));
 });
 
 it.each(['dispatch', 'into'] as const)('%s keeps acceptance timeout independent from thread metadata', async mode => {

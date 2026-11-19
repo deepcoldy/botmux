@@ -86,6 +86,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, assertDispatchTaskApproved,
+    dispatchConsentCardAvailable: async () => true,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };

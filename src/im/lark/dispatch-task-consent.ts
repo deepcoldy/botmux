@@ -7,12 +7,15 @@ import type { CardActionData } from './card-handler.js';
 import { createDispatchReportBinding, verifyDispatchReportBinding, type DispatchReportBindingPayload } from '../../core/dispatch-report-binding.js';
 import { updateDispatchRegistry } from '../../core/dispatch-registry.js';
 import { withFileLock } from '../../utils/file-lock.js';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { deliverPendingDispatchUser, registerPendingDispatchUser } from '../../core/dispatch-user-delegation.js';
 
 export const TASK_CONSENT_ACTION = 'dispatch_task_bytedcli';
 const registryPath = (dataDir: string) => join(dataDir, 'orchestrate-dispatch.json');
 
 type TaskDecision = 'approved' | 'denied';
+type StoredTaskDecision = TaskDecision | 'pending';
+type CardAvailability = (messageId: string) => Promise<boolean>;
 type EffectiveBinding = Omit<DispatchReportBindingPayload, 'taskOwner'> & {
   taskOwner?: NonNullable<DispatchReportBindingPayload['taskOwner']> & { decision?: TaskDecision };
 };
@@ -21,7 +24,7 @@ function decisionPath(dir: string, root: string) {
   if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(root)) throw new Error('invalid dispatch root');
   return join(dispatchTaskDecisionDirectory(dir), root + '.json');
 }
-function decisionSignature(secret: string, root: string, card: string, decision: TaskDecision) {
+function decisionSignature(secret: string, root: string, card: string, decision: StoredTaskDecision) {
   return createHmac('sha256', secret).update(JSON.stringify(['botmux.task-consent.v1', root, card, decision])).digest('base64url');
 }
 async function readJson(path: string) {
@@ -32,25 +35,48 @@ async function readJson(path: string) {
   }
 }
 
-export async function readTaskBinding(dataDir: string, secret: string, root: string): Promise<EffectiveBinding | null> {
+async function readTaskDecision(dataDir: string, secret: string, root: string) {
+  const record = await readJson(decisionPath(dataDir, root));
+  return record?.cardId && ['approved', 'denied', 'pending'].includes(record.decision)
+    && record.signature === decisionSignature(secret, root, record.cardId, record.decision)
+    ? record as { cardId: string; decision: StoredTaskDecision } : undefined;
+}
+
+function writeTaskDecision(dataDir: string, secret: string, root: string, cardId: string, decision: StoredTaskDecision) {
+  atomicWriteFileSync(decisionPath(dataDir, root), JSON.stringify({
+    cardId, decision, signature: decisionSignature(secret, root, cardId, decision),
+  }));
+}
+
+export async function readTaskBinding(
+  dataDir: string, secret: string, root: string, isCardAvailable?: CardAvailability,
+): Promise<EffectiveBinding | null> {
   const entries = await readJson(registryPath(dataDir));
   const binding = verifyDispatchReportBinding(secret, root, entries?.[root]?.reportBinding);
-  if (!binding?.taskOwner?.consentMessageId) return binding;
+  if (!binding?.taskOwner) return binding;
   // The public routing record can be replayed. The actual decision, including
   // terminal revocation, lives outside every worker's filesystem grants.
-  const record = await readJson(decisionPath(dataDir, root));
-  const decision = record?.cardId === binding.taskOwner.consentMessageId
-    && (record.decision === 'approved' || record.decision === 'denied')
-    && record.signature === decisionSignature(secret, root, record.cardId, record.decision) ? record.decision : undefined;
+  let record = await readTaskDecision(dataDir, secret, root);
+  const checkCard = !!isCardAvailable && record?.decision === 'approved'
+    && record.cardId === binding.taskOwner.consentMessageId;
+  const available = !checkCard || await isCardAvailable!(binding.taskOwner.consentMessageId!);
+  // Provider lookup can wait while the person revokes or another caller rotates
+  // the card. Never publish the decision snapshot taken before that wait.
+  if (checkCard) record = await readTaskDecision(dataDir, secret, root);
+  // Replaying an older public route cannot undo a host-recorded revocation.
+  // Approval belongs to one active card; pending rotation invalidates it.
+  const decision = record?.decision === 'denied' ? 'denied'
+    : record?.cardId === binding.taskOwner.consentMessageId && record?.decision === 'approved'
+      && available ? 'approved' : undefined;
   return { ...binding, taskOwner: { ...binding.taskOwner, decision } };
 }
 
 /** Revalidate the exact source task at the signing and provider-write edges. */
 export async function assertDispatchTaskApproved(
-  input: Parameters<typeof registerPendingDispatchUser>[0],
+  input: Parameters<typeof registerPendingDispatchUser>[0] & { isCardAvailable?: CardAvailability },
 ): Promise<void> {
   const p = input.payload;
-  const current = p.rootId ? await readTaskBinding(input.dataDir, input.secret, p.rootId) : null;
+  const current = p.rootId ? await readTaskBinding(input.dataDir, input.secret, p.rootId, input.isCardAvailable) : null;
   const owner = current?.taskOwner;
   if (!p.taskConsent || !current || current.attachment
     || current.targetSessionId !== p.sourceSessionId || current.targetLarkAppId !== p.sourceAppId
@@ -65,14 +91,17 @@ export async function assertDispatchTaskApproved(
 }
 
 export async function deliverApprovedDispatchTask(
-  input: Parameters<typeof registerPendingDispatchUser>[0] & { send: () => Promise<string> },
+  input: Parameters<typeof registerPendingDispatchUser>[0] & {
+    send: () => Promise<string>; isCardAvailable?: CardAvailability;
+  },
 ): Promise<string> {
   const root = input.payload.rootId;
   if (!root) throw new Error('dispatch_task_changed');
+  await assertDispatchTaskApproved(input);
   // Decision and registration have one order. Do not hold this lock while
   // waiting on provider I/O: a human must still be able to revoke promptly.
   const pending = await withFileLock(decisionPath(input.dataDir, root), async () => {
-    await assertDispatchTaskApproved(input);
+    await assertDispatchTaskApproved({ ...input, isCardAvailable: undefined });
     return registerPendingDispatchUser(input);
   });
   return deliverPendingDispatchUser({
@@ -118,23 +147,21 @@ export async function answerDispatchTaskConsent(dataDir: string, secret: string,
   const v = click.action?.value;
   if (v?.action !== TASK_CONSENT_ACTION || !/^om_[A-Za-z0-9_-]{1,128}$/.test(v.root || '')
       || (v.choice !== 'approve' && v.choice !== 'deny')) return false;
-  const current = await readTaskBinding(dataDir, secret, v.root);
-  const owner = current?.taskOwner;
-  if (!owner?.consentMessageId || current?.attachment || current?.targetLarkAppId !== appId
-      || owner.openId !== click.operator?.open_id || current.targetChatId !== click.context?.open_chat_id
-      || owner.consentMessageId !== click.context?.open_message_id) return false;
   await mkdir(dispatchTaskDecisionDirectory(dataDir), { recursive: true, mode: 0o700 });
-  let accepted = false;
-  await updateDispatchRegistry(decisionPath(dataDir, v.root), record => {
+  return withFileLock(decisionPath(dataDir, v.root), async () => {
+    const current = await readTaskBinding(dataDir, secret, v.root);
+    const owner = current?.taskOwner;
+    if (!owner?.consentMessageId || current?.attachment || current?.targetLarkAppId !== appId
+        || owner.openId !== click.operator?.open_id || current.targetChatId !== click.context?.open_chat_id
+        || owner.consentMessageId !== click.context?.open_message_id) return false;
+    const record = await readTaskDecision(dataDir, secret, v.root);
     const decision = v.choice === 'approve' ? 'approved' : 'denied';
-    if ((record.cardId && record.cardId !== owner.consentMessageId)
-        || (record.decision === 'denied' && decision === 'approved')) return;
-    record.cardId = owner.consentMessageId;
-    record.decision = decision;
-    record.signature = decisionSignature(secret, v.root, owner.consentMessageId!, decision);
-    accepted = true;
+    if ((record?.cardId && record.cardId !== owner.consentMessageId
+        && !(decision === 'denied' && record.cardId === 'replacement:' + owner.consentMessageId))
+        || (record?.decision === 'denied' && decision === 'approved')) return false;
+    writeTaskDecision(dataDir, secret, v.root, owner.consentMessageId, decision);
+    return true;
   });
-  return accepted;
 }
 
 /** Persist the exact provider prompt on the host-signed task. Other replicas,
@@ -144,11 +171,38 @@ export async function confirmDispatchTask(input: {
   targetName?: string;
   send: (text: string, uuid: string) => Promise<string>;
   checkOrigin: () => Promise<void>;
+  /** False only for a definitively unavailable original card; lookup errors throw. */
+  isCardAvailable?: CardAvailability;
 }): Promise<string> {
   const { binding } = input;
   const owner = binding.taskOwner!;
-  let messageId = owner.consentMessageId;
-  if (!messageId) {
+  const sameTask = (current: EffectiveBinding | null) => !!current && !current.attachment && !!current.taskOwner
+    && current.targetSessionId === binding.targetSessionId && current.targetChatId === binding.targetChatId
+    && current.targetLarkAppId === binding.targetLarkAppId && current.issuedAt === binding.issuedAt
+    && current.taskOwner.openId === owner.openId && current.taskOwner.receivingAppId === owner.receivingAppId
+    && current.taskOwner.receivingChatId === owner.receivingChatId;
+  const ensureCard = async (): Promise<string> => {
+    let current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
+    if (!sameTask(current)) throw new Error('dispatch_task_changed');
+    if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
+    const previous = current!.taskOwner!.consentMessageId;
+    if (previous && (!input.isCardAvailable || await input.isCardAvailable(previous))) return previous;
+    await mkdir(dispatchTaskDecisionDirectory(input.dataDir), { recursive: true, mode: 0o700 });
+    const changed = await withFileLock(decisionPath(input.dataDir, binding.dispatchRoot), async () => {
+      current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
+      if (!sameTask(current)) throw new Error('dispatch_task_changed');
+      if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
+      if (current!.taskOwner!.consentMessageId !== previous) return true;
+      // Invalidate the old approval before network I/O. A crash or a failed
+      // route update then stays pending, never silently reusing the old card.
+      const record = await readTaskDecision(input.dataDir, input.secret, binding.dispatchRoot);
+      if (previous && (!record || record.cardId === previous)) {
+        writeTaskDecision(input.dataDir, input.secret, binding.dispatchRoot, 'replacement:' + previous, 'pending');
+      }
+      return false;
+    });
+    if (changed) return ensureCard();
+    await input.checkOrigin();
     const text = '是否授权本任务使用你的通用 bytedcli？\n接单机器人 ' + (input.targetName || owner.receivingAppId)
       + '（' + owner.receivingAppId + '）。\n任务：' + binding.sourceName
       + '\n授权范围包括你有权执行的 ByteCloud 读写操作，以及你在原话题对同一任务的后续派单。'
@@ -162,32 +216,52 @@ export async function confirmDispatchTask(input: {
       { tag: 'action', actions: [button('approve', '授权本任务'), button('deny', '拒绝或撤销')] },
     ] });
     const uuid = createHash('sha256').update(JSON.stringify(['dispatch-consent', binding.dispatchRoot, owner.openId,
-      owner.receivingAppId, text])).digest('hex').slice(0, 32);
+      owner.receivingAppId, text, previous ?? null])).digest('hex').slice(0, 32);
     const sent = await input.send(card, uuid);
-    await updateDispatchRegistry(join(input.dataDir, 'orchestrate-dispatch.json'), registry => {
-      const entry = registry[binding.dispatchRoot] as { reportBinding?: unknown } | undefined;
-      const current = verifyDispatchReportBinding(input.secret, binding.dispatchRoot, entry?.reportBinding);
-      if (!entry || !current || !current.taskOwner || current.attachment
-          || current.targetSessionId !== binding.targetSessionId || current.targetChatId !== binding.targetChatId
-          || current.targetLarkAppId !== binding.targetLarkAppId || current.issuedAt !== binding.issuedAt
-          || current.taskOwner.openId !== owner.openId || current.taskOwner.receivingAppId !== owner.receivingAppId
-          || current.taskOwner.receivingChatId !== owner.receivingChatId) throw new Error('dispatch_task_changed');
-      if (current.taskOwner.consentMessageId && current.taskOwner.consentMessageId !== sent) throw new Error('dispatch_consent_race');
-      entry.reportBinding = createDispatchReportBinding(input.secret, {
-        ...current, taskOwner: { ...current.taskOwner, consentMessageId: sent },
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(sent)) throw new Error('dispatch_consent_unavailable');
+    await input.checkOrigin();
+    await withFileLock(decisionPath(input.dataDir, binding.dispatchRoot), async () => {
+      current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
+      if (!sameTask(current)) throw new Error('dispatch_task_changed');
+      if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
+      if (current!.taskOwner!.consentMessageId === sent) return;
+      if (current!.taskOwner!.consentMessageId !== previous) throw new Error('dispatch_consent_race');
+      // Host card identity is written first. Half completion cannot make the
+      // public old card regain approval or permit an old callback to approve.
+      writeTaskDecision(input.dataDir, input.secret, binding.dispatchRoot, sent, 'pending');
+      await updateDispatchRegistry(registryPath(input.dataDir), registry => {
+        const entry = registry[binding.dispatchRoot] as { reportBinding?: unknown } | undefined;
+        const latest = verifyDispatchReportBinding(input.secret, binding.dispatchRoot, entry?.reportBinding);
+        if (!entry || !sameTask(latest) || latest?.taskOwner?.consentMessageId !== previous) {
+          throw new Error('dispatch_consent_race');
+        }
+        entry.reportBinding = createDispatchReportBinding(input.secret, {
+          ...latest!, taskOwner: { ...latest!.taskOwner!, consentMessageId: sent },
+        });
       });
-      messageId = sent;
     });
-  }
-  if (!messageId) throw new Error('dispatch_consent_unavailable');
+    if (!sent) throw new Error('dispatch_consent_unavailable');
+    return sent;
+  };
+  let messageId = await ensureCard();
   const deadline = Date.now() + 90_000;
   do {
     await input.checkOrigin();
     const current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
-    if (!current || current.attachment || current.targetSessionId !== binding.targetSessionId
-        || current.taskOwner?.consentMessageId !== messageId) throw new Error('dispatch_task_changed');
-    if (current.taskOwner.decision === 'approved') return messageId;
-    if (current.taskOwner.decision === 'denied') throw new Error('task_consent_denied');
+    if (!sameTask(current)) throw new Error('dispatch_task_changed');
+    if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
+    if (current!.taskOwner!.consentMessageId !== messageId
+      || input.isCardAvailable && !await input.isCardAvailable(messageId)) {
+      messageId = await ensureCard();
+      continue;
+    }
+    // The card lookup above can wait while the original callback revokes.
+    // Re-read the host decision after it before returning an approval.
+    const settled = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
+    if (!sameTask(settled)) throw new Error('dispatch_task_changed');
+    if (settled!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
+    if (settled!.taskOwner!.consentMessageId !== messageId) continue;
+    if (settled!.taskOwner!.decision === 'approved') return messageId;
     await delay(3000);
   } while (Date.now() < deadline);
   throw new Error('task_consent_pending');
