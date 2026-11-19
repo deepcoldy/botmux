@@ -691,6 +691,50 @@ export function buildInstallArgv(pm: PackageManager, pkg: string, info: Platform
   }
 }
 
+/**
+ * Wrap a privileged command for a NON-interactive caller (the daemon has no
+ * TTY, so a password prompt can never be answered): root runs it as is,
+ * NOPASSWD sudo gets `sudo -n`, anything else is undefined (= tell the owner
+ * the command instead of running it).
+ */
+export function nonInteractivePrivilegedArgv(cmd: string[], info: PlatformInfo): string[] | undefined {
+  return sudoPrefix(cmd, { ...info, hasTty: false });
+}
+
+/**
+ * argv that UPGRADES an already-installed tmux with the package manager that
+ * owns it. Differs from buildInstallArgv on purpose: `brew install` / `dnf
+ * install` are no-ops for an installed package. `aptVersion` pins the exact
+ * Debian version the caller selected (it may live in `*-backports`, which
+ * apt's default pin never picks on its own). Pure; undefined when the
+ * privileged managers cannot run without a password prompt.
+ */
+export function buildTmuxUpgradeArgv(
+  pm: PackageManager,
+  info: PlatformInfo,
+  opts: { aptVersion?: string; condaPrefix?: string; condaBin?: string; minVersion?: string } = {},
+): string[] | undefined {
+  switch (pm) {
+    case 'brew': return ['brew', 'upgrade', 'tmux'];
+    case 'conda': return [
+      opts.condaBin ?? 'conda', 'install', '-y',
+      ...(opts.condaPrefix ? ['-p', opts.condaPrefix] : []),
+      '-c', 'conda-forge',
+      opts.minVersion ? `tmux>=${opts.minVersion}` : 'tmux',
+    ];
+    case 'apt': return nonInteractivePrivilegedArgv(
+      ['apt-get', 'install', '-y', '--no-install-recommends', opts.aptVersion ? `tmux=${opts.aptVersion}` : 'tmux'],
+      info,
+    );
+    case 'dnf': return nonInteractivePrivilegedArgv(['dnf', 'upgrade', '-y', 'tmux'], info);
+    case 'yum': return nonInteractivePrivilegedArgv(['yum', 'update', '-y', 'tmux'], info);
+    case 'pacman': return nonInteractivePrivilegedArgv(['pacman', '-S', '--noconfirm', '--needed', 'tmux'], info);
+    case 'apk': return nonInteractivePrivilegedArgv(['apk', 'add', '--upgrade', 'tmux'], info);
+    case 'zypper': return nonInteractivePrivilegedArgv(['zypper', '--non-interactive', 'update', 'tmux'], info);
+    case 'unknown': return undefined;
+  }
+}
+
 /** apt-get specifically needs an updated package list on minimal images
  *  before the install will find tmux. This is NOT part of buildInstallArgv
  *  (which is pure) — it runs once just before the apt install attempt.

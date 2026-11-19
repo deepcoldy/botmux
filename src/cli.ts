@@ -3931,12 +3931,33 @@ async function cmdStatus(): Promise<void> {
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
+  await printTmuxStatusAdvice();
   if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
   warnIfLegacyBotmuxAlive();
   // The pm2 read-only projection print is gone: the fleet-state table above IS
   // the authoritative status now (supervisor-owned), so there is no second
   // registry to reconcile against. Legacy pm2 still gets surfaced by
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
+}
+
+/** tmux below the recommended version, or upgraded but the botmux server
+ *  still on the old one. Advisory only; read-only probes (never boots a server). */
+async function printTmuxStatusAdvice(): Promise<void> {
+  try {
+    // Not loadBotsJson(): that exits the process on a malformed file, and an
+    // advisory line must never turn `status` into a failure.
+    let bots: any[] = [];
+    try { bots = existsSync(BOTS_JSON_FILE) ? parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE) : []; }
+    catch { return; }
+    if (!bots.some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux')) return;
+    const [{ probeTmuxFacts, formatTmuxStatusAdvice }, { preferredManagedTmuxSocket }, { getDefaultLocale }] = await Promise.all([
+      import('./core/tmux-upgrade.js'),
+      import('./adapters/backend/tmux-socket.js'),
+      import('./i18n/index.js'),
+    ]);
+    const advice = formatTmuxStatusAdvice(await probeTmuxFacts(preferredManagedTmuxSocket()), getDefaultLocale());
+    if (advice) console.log(advice);
+  } catch { /* advisory */ }
 }
 
 function printUpgradeHelp(): void {
