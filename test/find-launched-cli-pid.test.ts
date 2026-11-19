@@ -632,6 +632,40 @@ describe('worker wrapper PID wiring', () => {
     expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { shape: 'birth unreadable at setup', reuseBeforeRun: true, late: false },
+    { shape: 'birth unreadable at setup', reuseBeforeRun: true, late: true },
+    { shape: 'payload slot reused before edge', reuseBeforeRun: false, late: false },
+    { shape: 'payload slot reused before edge', reuseBeforeRun: false, late: true },
+  ])('keeps the direct root when payload birth evidence is missing or changes ($shape, late PID=$late)', ({ shape, reuseBeforeRun, late }) => {
+    const wrapperLaunch = { bin: '/opt/wrapper/launcher', args: ['claude'] };
+    // The wrapper rewrites its comm to the CLI name while argv0 keeps its own
+    // path, so its argv alone would still match the configured wrapper identity.
+    const processStarts: Record<number, string | undefined> = {
+      150: reuseBeforeRun ? undefined : 'birth-150',
+      154: 'birth-154',
+    };
+    const children: Record<number, number[]> = {};
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, wrapperLaunch, processStarts,
+      runningExes: { 150: wrapperLaunch.bin },
+      cmdlines: { 150: ['/opt/wrapper/launcher', 'claude'] },
+      children,
+      childComms: { 150: 'claude', 154: 'claude' },
+      // A pid-reused slot holds a different process by the time edges fire;
+      // descending it would publish a leaf capability outside the payload lineage.
+      // The late-pid backend binds (and captures payload birth) at its 120ms poll.
+      beforeTimers: reuseBeforeRun ? undefined
+        : (scope) => { scope.setTimeout(() => { processStarts[150] = 'reused-birth'; }, late ? 121 : 0); },
+    });
+    children[150] = [154];
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+  });
+
   it.each([false, true])('resolves a real CLI child when a credential-only wrapper shares its comm (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
