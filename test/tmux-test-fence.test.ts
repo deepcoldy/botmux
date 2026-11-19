@@ -5,7 +5,7 @@
  * tmux server is ever contacted here.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { hostTmuxSocketDirs, tmuxFenceShimScript } from './helpers/tmux-fence.js';
@@ -83,6 +83,26 @@ describe.skipIf(!posix)('tmux test fence shim', () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain('refusing host tmux socket');
     expect(r.denied).toContain(`/tmux-${uid}/default`);
+  });
+
+  it('refuses a TMUX_TMPDIR symlinked to a host root before tmux-<uid> exists there', () => {
+    // tmux realpath()s $TMUX_TMPDIR, so a symlink to a host socket root lands
+    // the server in that root. The fence must resolve it the same way even
+    // when <root>/tmux-<uid> does not exist yet (fresh host, nothing to cd into).
+    const hostRoot = join(work, 'host-root');
+    mkdirSync(hostRoot);
+    const link = join(work, 'host-root-link');
+    symlinkSync(hostRoot, link);
+    const hostShim = join(work, 'tmux-host-root');
+    writeFileSync(hostShim, tmuxFenceShimScript(fakeReal, [join(realpathSync(hostRoot), `tmux-${uid}`)], denyLog));
+    chmodSync(hostShim, 0o755);
+    writeFileSync(denyLog, '');
+    const r = spawnSync(hostShim, ['-L', 'x', 'new-session', '-d'], {
+      env: { PATH: process.env.PATH, TMUX_TMPDIR: link }, encoding: 'utf8', cwd: work,
+    });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('refusing host tmux socket');
   });
 });
 

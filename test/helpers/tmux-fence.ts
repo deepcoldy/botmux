@@ -160,9 +160,12 @@ if [ -z "$socket" ]; then
     # tmux resolves $TMUX_TMPDIR as ONE path and silently falls back to /tmp
     # when it does not name an existing directory. A colon separated value is
     # not a list for tmux — the whole string is one path that does not
-    # resolve — so it must land on /tmp here too.
-    if [ -n "$TMUX_TMPDIR" ] && [ -d "$TMUX_TMPDIR" ]; then
-      base=$TMUX_TMPDIR
+    # resolve — so it must land on /tmp here too. tmux also realpath()s the
+    # value, so resolve it the same way: a symlink to a host root must compare
+    # as that root even before tmux-<uid> exists under it.
+    if [ -n "$TMUX_TMPDIR" ] && [ -d "$TMUX_TMPDIR" ] \\
+      && base=$(cd "$TMUX_TMPDIR" 2>/dev/null && pwd -P); then
+      :
     else
       base=/tmp
     fi
