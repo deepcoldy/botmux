@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/usage-ledger.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,9 +18,10 @@ vi.mock('../src/utils/logger.js', () => ({
 
 vi.mock('../src/core/cost-calculator.js', () => ({
   getSessionTokenUsage: vi.fn(() => null),
+  getSessionUsageRecovery: vi.fn(() => null),
 }));
 
-import { getSessionTokenUsage } from '../src/core/cost-calculator.js';
+import { getSessionUsageRecovery, getSessionTokenUsage } from '../src/core/cost-calculator.js';
 import {
   recordSessionUsage,
   anchorSessionUsage,
@@ -79,6 +80,28 @@ afterEach(() => {
 });
 
 describe('recordSessionUsage', () => {
+  it('compares mixed legacy and uncached ledger checkpoints after normalization', () => {
+    const rows = [
+      { totalInputTokens: 150, totalCacheReadTokens: 100 },
+      { totalInputTokens: 60, totalCacheReadTokens: 100, inputTokenSemantics: 'uncached' },
+    ].map(r => ({ sessionId: 'sess-1', cliId: 'codex', epoch: 0,
+      ts: '2026-06-10T10:00:00Z', totalOutputTokens: 0, totalCacheCreateTokens: 0, ...r }));
+    writeFileSync(join(dir, 'usage-2026-06-10.jsonl'), rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+    const rec = recordSessionUsage({ ...baseArgs({ cliId: 'codex' }), ledgerDir: dir,
+      usage: cumulative(70, 0, 100) });
+    expect(rec?.inputTokens).toBe(10);
+  });
+
+  it('keeps the baseline persistence clock separate from the usage date', () => {
+    const occurredAt = new Date('2026-05-01T12:00:00Z');
+    const rec = recordSessionUsage({ ...baseArgs(), ledgerDir: dir,
+      occurredAt, usage: cumulative(100, 0) });
+    expect(rec?.ts).toBe(occurredAt.toISOString());
+    const state = JSON.parse(readFileSync(join(dir, 'state-cli_app.json'), 'utf8'));
+    expect(state.sessions['sess-1'].recordedAt).toBe('2026-06-10T12:00:00.000Z');
+    expect(ledgerLines(dir, '2026-05-01')).toHaveLength(1);
+  });
+
   it('writes the first record with the full cumulative usage as delta', () => {
     const rec = recordSessionUsage({
       ...baseArgs(),
@@ -141,7 +164,7 @@ describe('recordSessionUsage', () => {
     expect(ledgerLines(dir)).toHaveLength(1);
   });
 
-  it('resets the baseline without a record when cumulative usage shrinks', () => {
+  it('resets the baseline with a zero-delta marker when cumulative usage shrinks', () => {
     recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10) });
     // /clear or transcript rotation: cumulative drops — no negative record.
     const shrunk = recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(40, 5) });
@@ -150,7 +173,52 @@ describe('recordSessionUsage', () => {
     // Growth from the new baseline is measured against 40/5, not 100/10.
     const rec = recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(90, 15) });
     expect(rec).toMatchObject({ inputTokens: 50, outputTokens: 10 });
-    expect(ledgerLines(dir)).toHaveLength(2);
+    const rows = ledgerLines(dir);
+    expect(rows.filter(row => row.kind !== 'reset')).toHaveLength(2);
+    expect(rows.find(row => row.kind === 'reset')).toMatchObject({
+      inputTokens: 0, outputTokens: 0, totalInputTokens: 40, totalOutputTokens: 5, epoch: 1,
+    });
+  });
+
+  it('keeps the reset epoch in memory when state persistence fails once', () => {
+    const args = baseArgs({ larkAppId: undefined });
+    recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(100, 10) });
+    const statePath = join(dir, 'state-default.json');
+    const savedState = join(dir, 'state-default.backup.json');
+    renameSync(statePath, savedState);
+    mkdirSync(statePath); // atomic rename over a directory fails with EISDIR/ENOTEMPTY.
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(20, 5) })).toBeNull();
+    rmdirSync(statePath);
+    renameSync(savedState, statePath);
+
+    const recovered = recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(40, 15) });
+    expect(recovered).toMatchObject({ inputTokens: 20, outputTokens: 10, epoch: 1 });
+    expect(ledgerLines(dir).filter(row => row.kind !== 'reset').map(row => row.inputTokens)).toEqual([100, 20]);
+  });
+
+  it('rebuilds the reset baseline from its ledger marker after a failed save and restart', () => {
+    const args = baseArgs({ larkAppId: undefined });
+    recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(100, 10) });
+    const statePath = join(dir, 'state-default.json');
+    const savedState = join(dir, 'state-default.backup.json');
+    renameSync(statePath, savedState);
+    mkdirSync(statePath);
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(20, 5) })).toBeNull();
+    rmdirSync(statePath);
+    renameSync(savedState, statePath);
+    __resetUsageLedgerMemoryForTest(); // restart before any successful state advance
+
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(40, 15) }))
+      .toMatchObject({ inputTokens: 20, outputTokens: 10, epoch: 1 });
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(60, 25) }))
+      .toMatchObject({ inputTokens: 20, outputTokens: 10, epoch: 1 });
+    const rows = ledgerLines(dir);
+    expect(rows.filter(row => row.kind !== 'reset').map(row => row.inputTokens)).toEqual([100, 20, 20]);
+    expect(rows.filter(row => row.kind === 'reset')).toHaveLength(1);
+    expect(rows.find(row => row.kind === 'reset')).toMatchObject({
+      inputTokens: 0, totalInputTokens: 20, totalOutputTokens: 5, epoch: 1,
+    });
+    expect(new Set(rows.map(row => row.recordId)).size).toBe(rows.length);
   });
 
   it('tracks sessions independently', () => {
@@ -601,7 +669,7 @@ describe('daemon-session wrappers', () => {
       cwd: '/live-repo',
       larkAppId: 'cli_app',
       fresh: true,
-    });
+    }, true);
     expect(rec).toMatchObject({
       sessionId: 'sess-1',
       larkAppId: 'cli_app',
@@ -661,6 +729,29 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
     const rec = reconcileUsageForDaemonSession(ds, { ledgerDir: dir });
 
     expect(rec).toMatchObject({ inputTokens: 100, outputTokens: 10 });
+  });
+
+  it('keeps recovered events on their original dates and models and does not replay twice', () => {
+    const codex = { ...ds, session: { ...ds.session, cliId: 'codex' } };
+    const first = cumulative(100, 10, 0, 0, 'model-a');
+    const second = cumulative(150, 15, 0, 0, 'model-a');
+    const third = cumulative(200, 20, 0, 0, 'model-b');
+    vi.mocked(getSessionTokenUsage).mockReturnValue(first);
+    recordUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-01T10:00:00Z') });
+    vi.mocked(getSessionTokenUsage).mockReturnValue(third);
+    vi.mocked(getSessionUsageRecovery).mockReturnValueOnce([
+      { at: new Date('2026-01-01T23:00:00Z'), usage: second },
+      { at: new Date('2026-01-02T01:00:00Z'), usage: third },
+    ]);
+    reconcileUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-03T00:00:00Z') });
+    const rows = readdirSync(dir).filter(f => f.startsWith('usage-')).flatMap(f =>
+      readFileSync(join(dir, f), 'utf8').trim().split('\n').map(line => JSON.parse(line)));
+    expect(rows.map(r => [r.ts, r.model, r.inputTokens])).toEqual([
+      ['2026-01-01T10:00:00.000Z', 'model-a', 100],
+      ['2026-01-01T23:00:00.000Z', 'model-a', 50],
+      ['2026-01-02T01:00:00.000Z', 'model-b', 50],
+    ]);
+    expect(reconcileUsageForDaemonSession(codex, { ledgerDir: dir })).toBeNull();
   });
 
   it('anchors without recording when the session is new to the ledger', () => {

@@ -11,6 +11,7 @@ import {
   RUNTIME_RESERVATION_DEADLINE_MS,
   RUNTIME_RESERVATION_SLOW_LOG_MS,
   RuntimeReservationExpiredError,
+  RuntimeReservationRefusedError,
 } from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
@@ -546,6 +547,7 @@ import {
   readComm,
   readCmdline,
   isNonInteractiveCodexArgv,
+  isClaudeMetadataProbeArgv,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -2124,7 +2126,7 @@ function armRpcStartupDialogDismiss(): void {
  * callbacks capture it and must re-check after every await before touching
  * transcript lifecycle or user-visible state. */
 let workerSessionEventScope: WorkerSessionEventScope | undefined;
-const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>();
+const pendingRuntimeReservations = new Map<string, (mayStart: boolean, refusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal) => void>();
 const contractWriteBackends = new WeakSet<SessionBackend>();
 function hasCurrentSessionRuntime(): boolean { return !workerSessionEventScope || workerSessionEventScope.isCurrentContext(); }
 function fenceContractBackendWrites(): void {
@@ -3374,6 +3376,8 @@ let lastSpawnCodexLauncherActive = false;
  *  getChildPid may return that mutable field rather than the original pane pid. */
 let lastSpawnCodexLauncherPid: number | undefined;
 let codexOwnershipAttestationPending = false;
+/** Re-roots a sandboxed CLI's lineage proof on its live leaf; bound per spawn. */
+let refreshSandboxedCliLeafAttestation: (() => void) | undefined;
 // Configured Codex-compatible executable name of the latest spawn, used to
 // recognise a renamed native binary when deciding whether getChildPid() is
 // already the real leaf. undefined for the official `codex` binary.
@@ -21887,6 +21891,7 @@ function markPromptReady(): void {
   // the real execution root before the first turn can call a BotMux tool;
   // waiting for a rollout/history match would repair ownership only AFTER it.
   if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
+  refreshSandboxedCliLeafAttestation?.();
   // A recognized startup dialog (cli-startup-blocker) is a selector whose ❯
   // matches readyPattern: never a prompt, and not the "real readyPattern seen
   // during the hold" the ready-gate settle trusts below. The first-prompt
@@ -23547,6 +23552,7 @@ async function flushPending(): Promise<void> {
     // Type-ahead and first-prompt timeout paths can bypass markPromptReady.
     // Refresh here too, before dequeuing or publishing the input's authority.
     if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
+    refreshSandboxedCliLeafAttestation?.();
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -26033,6 +26039,10 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      // The daemon found no operation that takes this start over: fail it where
+      // it is seen, so the session reads as not online and the next start is
+      // retried, instead of idling with no CLI.
+      if (outcome === 'unowned' && !superseded) throw new RuntimeReservationRefusedError();
       if (outcome === 'refused' && continuation && !superseded) {
         abandonTraexAutoModelContinuation(continuation, binding.bindingId, 'rejected');
         return spawnCli(cfg, opts);
@@ -31457,26 +31467,32 @@ async function spawnCliBody(
   // BFS-descends through the wrapper by comm). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): boolean => {
     log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
     // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
-    publishLocalProcessAttestation(realPid);
+    return publishLocalProcessAttestation(realPid);
   };
-  // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
-  // reports while this spawn is current (equal to launcherPid unless a relay
-  // sits between the pane and the launcher).
-  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
+  // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
+  // launch payload below any pane relay or owned session-scope supervisor.
+  const resolveBehindWrapper = (launcherPid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
+    // Credential-only bwrap uses the single monitored resolver below; running
+    // both would attest the same leaf twice and rotate live-turn authority twice.
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || credentialOnlyBwrap
+      || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
+    const generation = cliSpawnGeneration;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
-      getChildPid: () => (backend?.getChildPid?.() === panePid ? launcherPid : null),
+      // Herdr/ZMX alias getChildPid() to the mutable cliPid. A failed publication
+      // may already have rewired that field, so only the captured launcher PID +
+      // spawn generation can fence retries without abandoning them after apply.
+      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -31498,6 +31514,75 @@ async function spawnCliBody(
     + (scopePayloadLauncherActive ? 1 : 0);
   const unwrapLaunchLayers = (pid: number): UnwrappedLaunchLayers =>
     unwrapBotmuxLaunchLayers(pid, { relay: relayMayFrontPane });
+  // Under bwrap the payload is the sandbox supervisor and stays the pid for
+  // session discovery. Tool processes descend from the CLI inside it, which
+  // predates every turn, so the lineage proof needs the CLI leaf attested too.
+  // Codex and TRAE rebind ownership to their leaf through their own resolvers.
+  const attestSandboxedCliLeaf = (payloadPid: number): void => {
+    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex') return;
+    const targetCliId = cfg.cliId as CliId;
+    const generation = cliSpawnGeneration;
+    const backendAtSpawn = backend;
+    // Credential-only bwrap + wrapperCli historically rewired discovery/bridge
+    // to the leaf. Preserve that here; full sandboxes keep the outer payload.
+    const rewireOwnership = credentialOnlyBwrap && !sandboxRequested
+      && !!cfg.wrapperCli?.trim() && !!claudeDataDir;
+    const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
+      // One process-table snapshot per BFS, not one synchronous ps per node.
+      childrenOf: snapshotChildPids(),
+      commOf: (pid) => {
+        // Filter at the match position, not after BFS returns its first match:
+        // an unreaped zombie or metadata helper must not hide a live sibling.
+        if (isZombieProcess(pid)) return undefined;
+        const comm = readComm(pid);
+        if (comm && targetCliId === 'claude-code'
+          && cliIdForComm(comm, targetCliId) === targetCliId
+          && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
+        return comm;
+      },
+    });
+    const isDirectLeaf = (lp: number): boolean => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId;
+    let attested: { pid: number; procStart: string; published: boolean } | undefined;
+    // A live, successfully published leaf is never sent twice: every actual
+    // publication rotates the active turn's capability.
+    const isAttested = (pid: number | undefined): boolean => pid !== undefined && attested?.pid === pid
+      && attested.published && !isZombieProcess(pid) && readProcessStartIdentity(pid) === attested.procStart;
+    const attest = (leafPid: number): boolean => {
+      if (isAttested(leafPid)) return true;
+      const procStart = readProcessStartIdentity(leafPid);
+      if (!procStart || isZombieProcess(leafPid)) return false;
+      log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+      const published = rewireOwnership
+        ? applyResolvedCliPid(leafPid, 'Credential-only sandbox CLI leaf', payloadPid)
+        : publishLocalProcessAttestation(leafPid);
+      attested = { pid: leafPid, procStart, published };
+      return published;
+    };
+    // Ready/input edges retain the repair path after the bounded startup poll;
+    // both edges and the poll share the same liveness and deduplication state.
+    refreshSandboxedCliLeafAttestation = () => {
+      // The initial attestation already names a direct CLI payload. Never
+      // replace it with a same-comm subagent discovered on a ready/input edge.
+      if (isDirectLeaf(payloadPid)) return;
+      if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || isAttested(attested?.pid)) return;
+      const leafPid = findLeaf(payloadPid);
+      if (leafPid) attest(leafPid);
+    };
+    const intervalMs = 200;
+    scheduleWrapperRealCliPid(payloadPid, {
+      intervalMs,
+      maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
+      findRealPid: findLeaf,
+      isDirectLeaf,
+      getBackend: () => backend,
+      getChildPid: () => (generation === cliSpawnGeneration ? payloadPid : null),
+      applyRealPid: attest,
+      // A matching comm can be a short-lived wrapper probe. Keep the startup
+      // watcher after success so a dead/zombie/reused PID reopens discovery.
+      isAppliedPidValid: isAttested,
+      schedule: (fn, ms) => { const timer = setTimeout(fn, ms); timer?.unref?.(); },
+    });
+  };
   const bindLaunchPayload = (resolved: UnwrappedLaunchLayers, panePid: number): void => {
     if (resolved.pid !== panePid) {
       // Preserve a deeper wrapper/native CLI resolution that already won; a
@@ -31509,7 +31594,8 @@ async function spawnCliBody(
         bridgeCliPid = resolved.pid;
       }
     }
-    resolveBehindWrapper(resolved.pid, panePid);
+    resolveBehindWrapper(resolved.pid);
+    attestSandboxedCliLeaf(resolved.pid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {
     let resolved = unwrapLaunchLayers(panePid);
@@ -32874,6 +32960,7 @@ function killCli(opts: {
   nativeReasoningClock = undefined;
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
+  refreshSandboxedCliLeafAttestation = undefined;
   if (backend) previousCliEndedAtMs = Date.now();
   inputDeliveryQuarantine?.cancelReceipt?.();
   inputDeliveryQuarantine = null;
@@ -37557,7 +37644,7 @@ async function sendFatalWorkerErrorAndExit(
   fatalWorkerErrorPending = true;
   // No CLI of this start ever existed to take the queued inputs; the daemon's
   // retry of a transient startup failure starts the worker that types them.
-  if (err instanceof RuntimeReservationExpiredError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
+  if (err instanceof RuntimeReservationExpiredError || err instanceof RuntimeReservationRefusedError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
   const pendingAttemptId = pendingLaunchConvergence?.attemptId;
   pendingLaunchConvergence = undefined;
   if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
@@ -38313,7 +38400,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'runtime_contract_reserved': {
       const binding = workerSessionEventScope?.currentBinding();
       if (binding?.bindingId === msg.bindingId) binding.proposedRuntime = msg.runtime;
-      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart);
+      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart, msg.startRefusal);
       break;
     }
     case 'execution_contract_assigned': {

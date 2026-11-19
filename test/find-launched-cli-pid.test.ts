@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isClaudeMetadataProbeArgv, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -53,7 +53,11 @@ const leafFnsSource = transpileModule(workerSource.slice(leafFnsStart, leafFnsEn
   + 'this.__exports.resolveCodexOwnershipPid = resolveCodexOwnershipPid;', {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
 }).outputText;
-function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; findReal: typeof findLaunchedCliPid }) {
+function loadRealLeafFns(deps: {
+  readComm: (pid: number) => string | undefined;
+  findReal: typeof findLaunchedCliPid;
+  snapshotChildPids: () => (pid: number) => number[];
+}) {
   const sandbox: Record<string, unknown> = { __exports: {} };
   runInNewContext(leafFnsSource, {
     ...sandbox,
@@ -64,7 +68,7 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
     cliIdForComm,
     findLaunchedCliPid: deps.findReal,
     CODEX_LEAF_SEARCH_DEPTH,
-    snapshotChildPids: () => () => [],
+    snapshotChildPids: deps.snapshotChildPids,
   });
   return sandbox.__exports as {
     codexProcessIsNativeLeaf: (pid: number, filter?: string) => boolean;
@@ -73,7 +77,7 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
 }
 
 function runWorkerWiring(late: boolean, options: {
-  cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean;
+  cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean; credentialOnlyBwrap?: boolean;
   launchedCliPid?: number | null;
   launchedCliAfterMs?: number;
   beforeTimers?: (scope: Record<string, any>) => void;
@@ -81,6 +85,11 @@ function runWorkerWiring(late: boolean, options: {
   // codex descendant must be discovered), 'codex' a direct native install (no
   // descendant scan may run).
   comm?: string;
+  /** argv of any synthetic process; pane-specific fields below take precedence for pid 100. */
+  cmdlines?: Record<number, string[]>;
+  /** Mutable birth identities and zombie states used by the startup liveness monitor. */
+  processStarts?: Record<number, string | undefined>;
+  zombies?: Record<number, boolean>;
   /** argv of the pane pid (100); defaults to a plain launcher. */
   paneCmdline?: string[];
   /** The pane's argv once it has exec'd (after `execAfterReads` cmdline reads). */
@@ -113,6 +122,9 @@ function runWorkerWiring(late: boolean, options: {
   /** Run the real BFS over the synthetic table (`children` / `childComms`)
    *  with the depth the worker passes, instead of the canned result. */
   realCodexSearch?: boolean;
+  credentialOnlyBwrap?: boolean;
+  /** Pids whose process has exited: their birth token no longer reads back. */
+  exited?: number[];
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
@@ -125,12 +137,23 @@ function runWorkerWiring(late: boolean, options: {
     if (options.realCodexSearch) {
       const [pid, cliId, depth, probes, filter] = args as Parameters<typeof findLaunchedCliPid>;
       return findLaunchedCliPid(pid, cliId, depth, {
-        ...probes, childrenOf: context.getChildPids, commOf: context.readComm,
-        cmdlineOf: () => [], isZombie: () => false,
+        childrenOf: context.getChildPids,
+        commOf: context.readComm,
+        cmdlineOf: (p) => options.cmdlines?.[p] ?? [],
+        isZombie: (p) => options.zombies?.[p] ?? false,
+        ...probes,
       }, filter);
     }
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
   });
+  const childSnapshot = () => {
+    const cache = new Map<number, number[]>();
+    return (pid: number) => {
+      if (!cache.has(pid)) cache.set(pid, [...context.getChildPids(pid)]);
+      return [...cache.get(pid)!];
+    };
+  };
+  const snapshotChildPidsMock = vi.fn(childSnapshot);
   // The pane process's comm: 'node' models the npm launcher (descendant must be
   // discovered); 'codex' a direct native install (no scan may run). Any other
   // pid has no comm. The REAL cliIdForComm + the REAL worker resolve functions
@@ -138,6 +161,7 @@ function runWorkerWiring(late: boolean, options: {
   const realFns = loadRealLeafFns({
     readComm: (pid) => (pid === 100 ? (options.comm ?? 'node') : undefined),
     findReal: findLaunchedCliPidMock as unknown as typeof findLaunchedCliPid,
+    snapshotChildPids: childSnapshot,
   });
   const context = {
     cfg: {
@@ -145,7 +169,7 @@ function runWorkerWiring(late: boolean, options: {
       ...(options.cliRuntime ? { cliRuntime: options.cliRuntime } : {}),
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
-    credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    credentialOnlyBwrap: options.credentialOnlyBwrap ?? false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
     // Module-level spawn counter read by the TRAE leaf-resolve guard; the sliced
     // wiring runs in this VM without worker.ts's declaration, so supply its
     // initial value. It is only read inside the slice, never assigned.
@@ -155,13 +179,15 @@ function runWorkerWiring(late: boolean, options: {
     lastSpawnCodexExecutable: undefined,
     lastSpawnCodexLauncherPid: undefined,
     codexOwnershipAttestationPending: false,
+    refreshSandboxedCliLeafAttestation: undefined as (() => void) | undefined,
     FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
-    CODEX_LEAF_SEARCH_DEPTH, snapshotChildPids: () => () => [],
+    CODEX_LEAF_SEARCH_DEPTH,
+    snapshotChildPids: snapshotChildPidsMock,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
-    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
+    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid, cliIdForComm, isClaudeMetadataProbeArgv,
     sessionScopePayloadPid: vi.fn((pid: number) => {
       scopeProbes++;
       return options.scopePayloadPid !== undefined
@@ -173,7 +199,7 @@ function runWorkerWiring(late: boolean, options: {
     readCmdline: (() => {
       let reads = 0;
       return (pid: number) => {
-        if (pid !== 100) return [];
+        if (pid !== 100) return options.cmdlines?.[pid] ?? [];
         reads++;
         if (options.paneCmdlineAfterExec && reads > (options.execAfterReads ?? 0)) return options.paneCmdlineAfterExec;
         return options.paneCmdline ?? ['launcher'];
@@ -184,6 +210,9 @@ function runWorkerWiring(late: boolean, options: {
       return pid === 100 ? (options.relayChildren ?? [150]) : (options.children?.[pid] ?? []);
     }),
     readComm: (pid: number) => (pid === 100 ? (options.comm ?? 'node') : (options.childComms?.[pid] ?? 'claude')),
+    readProcessStartIdentity: (pid: number) => options.exited?.includes(pid) ? undefined
+      : options.processStarts ? options.processStarts[pid] : `birth-${pid}`,
+    isZombieProcess: (pid: number) => options.zombies?.[pid] ?? false,
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
     effectiveBackendType: options.backendType ?? 'tmux',
@@ -523,6 +552,183 @@ describe('worker wrapper PID wiring', () => {
     expect(result.backend.cliPid).toBe(150);
   });
 
+  it.each([false, true])('attests the Claude Code leaf inside bwrap but keeps the sandbox payload bound (late PID=%s)', late => {
+    // Live chain below the scope supervisor (100): launcher sh 150 → bwrap 151
+    // → bwrap init 152 → claude.exe 153. Tools descend from 153, which predates
+    // every turn, so the lineage proof must root at it.
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
+    });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code', CODEX_LEAF_SEARCH_DEPTH, expect.objectContaining({ childrenOf: expect.any(Function) }));
+    expect(result.snapshotChildPids).toHaveBeenCalledTimes(1);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
+  });
+
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])('never descends from a direct CLI payload on ready/input refresh (credentialOnly=%s, late PID=%s)', (credentialOnly, late) => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: credentialOnly ? 'launcher' : '', claudeDataDir: '/claude',
+      sandboxRequested: !credentialOnly, credentialOnlyBwrap: credentialOnly, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    // runWorkerWiring already exhausted the startup polling budget. Repeated
+    // ready/input edges must still keep the direct root, even beyond that window.
+    result.refreshSandboxedCliLeafAttestation!();
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+  });
+
+  it('re-attests the sandboxed Claude Code leaf on ready/input after a failed publication or a startup helper exits', () => {
+    // 153 is a startup helper (`claude --version`) the launch poll attests; it
+    // exits and the interactive TUI 154 replaces it before an input edge.
+    const children: Record<number, number[]> = { 150: [151], 151: [152], 152: [153] };
+    const exited: number[] = [];
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150, children, exited,
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe', 154: 'claude.exe' },
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 153 && !failedLeaf) { failedLeaf = true; return false; }
+          return true;
+        });
+      },
+    });
+    const leafAttestations = () => result.publishLocalProcessAttestation.mock.calls
+      .map((call: unknown[]) => call[0]).filter((pid: unknown) => pid !== 150);
+    expect(leafAttestations()).toEqual([153, 153]);
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(leafAttestations()).toEqual([153, 153]);
+    exited.push(153);
+    children[152] = [154];
+    result.refreshSandboxedCliLeafAttestation!();
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(leafAttestations()).toEqual([153, 153, 154]);
+  });
+
+  it.each([false, true])('re-attests the interactive Claude leaf after a short-lived matching helper disappears (late PID=%s)', late => {
+    const children: Record<number, number[]> = { 150: [151], 151: [152], 152: [153] };
+    const processStarts: Record<number, string | undefined> = { 153: 'helper-birth', 154: 'tui-birth' };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150, children, processStarts,
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe', 154: 'claude.exe' },
+      beforeTimers: scope => {
+        let helperRetired = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 153 && !helperRetired) {
+            helperRetired = true;
+            delete processStarts[153];
+            children[152] = [154];
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 153)).toHaveLength(1);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(154);
+    expect(result.snapshotChildPids).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])('re-attests the interactive Claude leaf after a matching helper becomes a zombie (late PID=%s)', late => {
+    const children: Record<number, number[]> = { 150: [151], 151: [152], 152: [153] };
+    const zombies: Record<number, boolean> = {};
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150, children, zombies,
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe', 154: 'claude.exe' },
+      beforeTimers: scope => {
+        let helperRetired = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 153 && !helperRetired) {
+            helperRetired = true;
+            zombies[153] = true;
+            // A zombie stays in the process table until reaped. The live TUI
+            // appears beside it and must not be hidden by the first comm match.
+            children[152] = [153, 154];
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 153)).toHaveLength(1);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(154);
+  });
+
+  it.each([false, true])('skips a Claude metadata probe and finds its live interactive sibling (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153, 154] },
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 153: ['claude.exe', '--version'] },
+    });
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(153);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(154);
+  });
+
+  it.each([false, true])('retries sandbox leaf publication after capability publication fails (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 153 && !failedLeaf) { failedLeaf = true; return false; }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 153)).toHaveLength(2);
+  });
+
+  it.each([false, true])('uses one monitored resolver for credential-only bwrap plus wrapperCli (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 153)).toHaveLength(1);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledTimes(1);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code', CODEX_LEAF_SEARCH_DEPTH, expect.objectContaining({ childrenOf: expect.any(Function) }));
+    // Credential-only bwrap historically let wrapper resolution rewire these;
+    // consolidating resolvers must not strand them on the sandbox payload.
+    expect(result.backend.cliPid).toBe(153);
+    expect(result.bridgeCliPid).toBe(153);
+  });
+
+  it.each([false, true])('retries generic wrapper publication after an aliased backend rewires its child PID (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', aliasedChildPid: true,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) { failedLeaf = true; return false; }
+          return true;
+        });
+      },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
+  });
+
   it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {
     const result = runWorkerWiring(late, { wrapperCli: '' });
     // The gate must be ACTIVE for managed Codex even without a sandbox
@@ -704,6 +910,13 @@ describe('worker wrapper PID wiring', () => {
 // real CLI process it forks. The OS-probing is injected so the BFS is tested
 // deterministically. Models the real tree: launcher(aiden,node) → claude child.
 describe('findLaunchedCliPid()', () => {
+  it.each(['--help', '-h', '--version', '-v'])('recognises a bare Claude metadata probe: %s', flag => {
+    expect(isClaudeMetadataProbeArgv(['claude.exe', flag])).toBe(true);
+    expect(isClaudeMetadataProbeArgv(['claude.exe'])).toBe(false);
+    expect(isClaudeMetadataProbeArgv(['claude.exe', '--', flag])).toBe(false);
+    expect(isClaudeMetadataProbeArgv(['claude.exe', '--print', flag])).toBe(false);
+  });
+
   // tree: 100 launcher → [200 claude child, 201 auth-rpc child], 200 → 300 (bash)
   const tree: Record<number, number[]> = { 100: [200, 201], 200: [300], 201: [], 300: [] };
   const comm: Record<number, string> = { 100: 'node', 200: 'claude', 201: 'bytecloud-auth', 300: 'bash' };
@@ -906,5 +1119,33 @@ describe('scheduleWrapperRealCliPid()', () => {
     });
     sch.runAll();
     expect(applied).toEqual([200]);
+  });
+
+  it('retries a failed apply without requiring liveness monitoring', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    let calls = 0;
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 200, getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => { applied.push(p); return ++calls > 1; },
+      schedule: sch.schedule, maxAttempts: 3,
+    });
+    sch.runAll();
+    expect(applied).toEqual([200, 200]);
+  });
+
+  it('reopens discovery when a previously applied pid fails its liveness check', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    let valid = true;
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => (applied.length === 0 ? 200 : 201),
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => { applied.push(p); valid = p === 201; return true; },
+      isAppliedPidValid: () => valid,
+      schedule: sch.schedule, maxAttempts: 3,
+    });
+    sch.runAll();
+    expect(applied).toEqual([200, 201]);
   });
 });

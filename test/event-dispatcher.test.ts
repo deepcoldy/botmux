@@ -9880,6 +9880,7 @@ describe('managed Agent clone owner boundary', () => {
     // 必须在这条上红。新增字段时同步更新这份字面量即可。
     expect([...CLONE_EXCLUDED_KEYS]).toEqual([
       'apiOnly',
+      'localIdentity',
       'name',
       'displayName',
       'messageListeners',
@@ -9990,6 +9991,14 @@ describe('managed Agent clone owner boundary', () => {
     }, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
     expect(target.soloGroupMentionBypass).toBe(false);
     expect(target).not.toHaveProperty('chatSoloGroupMentionBypass');
+  });
+  it('drops a persisted local identity when cloning onto a Feishu target', () => {
+    const target = cloneBotConfig({
+      larkAppId: 'local_source', apiOnly: true, localIdentity: true, cliId: 'codex',
+    }, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+    expect(target).toMatchObject({ larkAppId: 'cli_target', cliId: 'codex' });
+    expect(target).not.toHaveProperty('localIdentity');
+    expect(target).not.toHaveProperty('apiOnly');
   });
 });
 
@@ -14734,7 +14743,7 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
     mockResolveUnionIdFromOpenId.mockResolvedValue(unionId);
     setupBotState({ allowedUsers: ['ou_other_owner'], regularGroupReplyMode: 'new-topic', autoGrantRequestCards: false });
     mockReadFileSync.mockImplementation((path: any) => String(path).endsWith('platform-team-sync.json')
-      ? JSON.stringify({ rev: 'edit-rev', teams: [{ teamId: 'team-edit', groupChatIds: [], bots: [{ appId: MY_APP_ID }], memberUnionIds: [unionId] }] })
+      ? JSON.stringify({ rev: 'edit-rev', schemaVersion: 1, teams: [{ teamId: 'team-edit', groupChatIds: [], bots: [{ appId: MY_APP_ID }], memberUnionIds: [unionId] }] })
       : '[]');
     expect(canTalk(MY_APP_ID, 'chat-edit', USER_OPEN_ID, undefined, unionId, 'group')).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-edit', USER_OPEN_ID)).toBe(false);
@@ -14838,7 +14847,7 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
     const messageId = 'om_edit_union_retry';
     setupBotState({ allowedUsers: ['ou_other_owner'], regularGroupReplyMode: 'new-topic', autoGrantRequestCards: false });
     mockReadFileSync.mockImplementation((path: any) => String(path).endsWith('platform-team-sync.json')
-      ? JSON.stringify({ rev: 'rev-union-retry', teams: [{ teamId: 'team-union', bots: [{ appId: MY_APP_ID }], memberUnionIds: [unionId] }] })
+      ? JSON.stringify({ rev: 'rev-union-retry', schemaVersion: 1, teams: [{ teamId: 'team-union', bots: [{ appId: MY_APP_ID }], memberUnionIds: [unionId] }] })
       : '[]');
     mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
     capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-union-unavailable'));

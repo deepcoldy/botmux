@@ -1,3 +1,4 @@
+import { OwnerGroupFollowStore } from '../../services/owner-group-follow-store.js';
 import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-access.js';
 /**
  * Lark event dispatcher — handles WSClient setup, bot identity probing,
@@ -1674,9 +1675,11 @@ export function isTrustedTeamBotSender(
   larkAppId: string,
   chatId: string | undefined,
   senderUnionId: string | undefined,
+  /** 飞书盖章的 bot sender app_id；仅 external roster 的配对校验需要。 */
+  senderAppId?: string,
 ): boolean {
   return isTeamBot(dataDir, senderUnionId)
-    || isPlatformTeamBotTrustedForReceiver(dataDir, larkAppId, senderUnionId)
+    || isPlatformTeamBotTrustedForReceiver(dataDir, larkAppId, senderUnionId, senderAppId)
     || isTeamGroupChatFor(dataDir, larkAppId, chatId);
 }
 
@@ -1718,8 +1721,9 @@ export function isPlatformTeamBotTrustedForReceiver(
   dataDir: string,
   larkAppId: string,
   senderUnionId: string | undefined,
+  senderAppId?: string,
 ): boolean {
-  return isPlatformTeamBotTrustedBy(dataDir, larkAppId, senderUnionId, isConfiguredOnThisMachine);
+  return isPlatformTeamBotTrustedBy(dataDir, larkAppId, senderUnionId, isConfiguredOnThisMachine, senderAppId);
 }
 
 /** Update the per-bot cross-reference from @mention data in an event.
@@ -2350,10 +2354,12 @@ export function canTalk(
  *   来自平台鉴权的团队成员，非机器自报），不限 chat，故喂真人 union 是安全的。
  * @param chatType  当前会话类型。**仅 p2pOpen 腿读它**；省略时该腿不生效（fail-closed），
  *   所以拿不到 chatType 的调用点保持原语义、不会误放行。
+ * @param senderAppId 飞书盖章的 bot sender app_id。只有 bot 消息入口可传；
+ *   external roster 必须同时匹配 union + appId，真人卡片/Dashboard 调用保持 undefined。
  */
 export function evaluateTalk(
   larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined,
-  senderUnionId?: string, memberUnionId?: string, chatType?: ChatKind,
+  senderUnionId?: string, memberUnionId?: string, chatType?: ChatKind, senderAppId?: string,
 ): TalkEvaluation {
   const bot = getBot(larkAppId);
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
@@ -2402,7 +2408,7 @@ export function evaluateTalk(
   // 稳定 union_id（bot 专属，人不会进这两张表），不看 chatId，不授 operate。
   // 平台 roster 腿按接收 bot 收窄（同队或同机），不是「本机任一团队里有它」——
   // 否则 owner 在 A 队的另一台机器上的 bot，能驱动只在 B 队的本 bot。
-  if (senderUnionId && (isTeamBot(config.session.dataDir, senderUnionId) || isPlatformTeamBotTrustedForReceiver(config.session.dataDir, larkAppId, senderUnionId))) {
+  if (senderUnionId && (isTeamBot(config.session.dataDir, senderUnionId) || isPlatformTeamBotTrustedForReceiver(config.session.dataDir, larkAppId, senderUnionId, senderAppId))) {
     return { allowed: true, reason: 'teamBot' };
   }
   // 平台团队成员（人）：发送者 union_id 与本 bot 同属某平台团队 → talk 免 grant，
@@ -2479,19 +2485,22 @@ async function bindDefaultOncallBeforeTalk(
  *
  * @param senderUnionId 必须是飞书盖章的 bot 发送方 union（`sender_type ∈ app|bot`），
  *   与 evaluateTalk 的 bot-trust 腿同一契约。真人 union 走 memberUnionId，本函数恒不传。
+ * @param senderAppId 同一事件中飞书盖章的 bot sender app_id；external roster 需要它与
+ *   union 一起和名册条目配对，缺失或错配时 union 腿 fail-closed（团队群 chat 腿不受影响）。
  */
 export function evaluateBotTalk(
   larkAppId: string,
   chatId: string | undefined,
   senderOpenId: string | undefined,
   senderUnionId?: string,
+  senderAppId?: string,
 ): TalkEvaluation {
-  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, undefined, undefined, senderAppId);
   if (ev.allowed) return ev;
   // 黑名单否决不可被 bot 独有的团队拉群 chat 维度腿复活：被黑 bot 即使出现在团队
   // 拉群里也照样拒绝（人侧 evaluateTalk 已挡 union 腿，这里挡 chat 腿）。
   if (ev.reason === 'blocked') return ev;
-  return isTrustedTeamBotSender(config.session.dataDir, larkAppId, chatId, senderUnionId)
+  return isTrustedTeamBotSender(config.session.dataDir, larkAppId, chatId, senderUnionId, senderAppId)
     ? { allowed: true, reason: 'teamBot' }
     : ev;
 }
@@ -2502,6 +2511,8 @@ export function evaluateBotTalk(
 export interface AskAnswerActorContext {
   botSender?: boolean;
   senderUnionId?: string;
+  /** botSender 时同一飞书事件的 sender app_id，供 external roster 配对。 */
+  senderAppId?: string;
   memberUnionId?: string;
 }
 
@@ -2530,7 +2541,7 @@ export function evaluateAskAnswerTalk(
   actor?: AskAnswerActorContext,
 ): boolean {
   return actor?.botSender
-    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, actor.senderUnionId).allowed
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, actor.senderUnionId, actor.senderAppId).allowed
     : evaluateTalk(larkAppId, chatId, senderOpenId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed;
 }
 
@@ -2576,11 +2587,39 @@ export function askCustomReplyCandidate(input: {
   return { senderOpenId: input.senderOpenId, chatId: input.chatId, text };
 }
 
+/**
+ * Generic operate gate for humans and bot senders without Lark app_id evidence.
+ * External roster entries are deliberately excluded here: their member-supplied
+ * union must never become an operate credential on card/dashboard human paths.
+ */
 export function canOperate(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId?: string | undefined,
+): boolean {
+  return canOperateInternal(larkAppId, chatId, senderOpenId, senderUnionId, undefined);
+}
+
+/** Operate gate for a Feishu-stamped bot message. External entries additionally
+ * require senderAppId to pair with senderUnionId; non-external behavior is identical
+ * to {@link canOperate}. */
+export function canOperateBotSender(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+  senderAppId: string | undefined,
+): boolean {
+  return canOperateInternal(larkAppId, chatId, senderOpenId, senderUnionId, senderAppId);
+}
+
+function canOperateInternal(
   larkAppId: string,
   _chatId: string | undefined,
   senderOpenId: string | undefined,
-  senderUnionId?: string | undefined,
+  senderUnionId: string | undefined,
+  senderAppId: string | undefined,
 ): boolean {
   const bot = getBot(larkAppId);
   const allowedUsers = bot.resolvedAllowedUsers;
@@ -2601,7 +2640,7 @@ export function canOperate(
   // 是发送方专属、且必须先被团队背书（团队群学习 / 平台 roster）才进表，人不会命中。
   // 平台 roster 与 evaluateTalk 同口径：只认与本 bot 同队、或配置在本机的 bot。
   if (isTeamBot(config.session.dataDir, senderUnionId)) return true;
-  if (isPlatformTeamBotTrustedForReceiver(config.session.dataDir, larkAppId, senderUnionId)) return true;
+  if (isPlatformTeamBotTrustedForReceiver(config.session.dataDir, larkAppId, senderUnionId, senderAppId)) return true;
   // 同机兄弟 bot 互信 operate（与团队 peer 同一口径：union_id 精确对上本机 bots.json 里
   // 登记的兄弟应用），另加「同一个 owner」：对方的管理员都得是本 bot 的管理员，一台机器
   // 托管多人 bot 时别人的 bot 仍只能对话。可在 Bot 配置关掉（trustSameOwnerBots）。
@@ -2650,8 +2689,13 @@ export function canRunDaemonCommand(
   chatType?: 'p2p' | 'group',
   botSender?: boolean,
   larkStampedBotSender?: boolean,
+  /** 飞书盖章的 bot sender app_id，供 external roster 配对；真人入口省略。 */
+  senderAppId?: string,
 ): boolean {
-  if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
+  const operate = botSender
+    ? canOperateBotSender(larkAppId, chatId, senderOpenId, senderUnionId, senderAppId)
+    : canOperate(larkAppId, chatId, senderOpenId, senderUnionId);
+  if (operate) return true;
   if (cmd === '/repo' && larkStampedBotSender === true
     && isVerifiedLocalSiblingBot(config.session.dataDir, larkAppId, senderOpenId, senderUnionId)) {
     return true;
@@ -2662,7 +2706,7 @@ export function canRunDaemonCommand(
   const talkLevelCommand = commandSpec(cmd)?.permission === 'talk';
   if (!triggerUserLogin && !talkLevelCommand && !botConfig.canTalkDaemonCommands?.includes(cmd)) return false;
   return botSender
-    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, senderAppId).allowed
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
 }
 
@@ -5666,7 +5710,7 @@ export function createLarkEventDispatcherRuntime(
             // 回唤它（dispatchHumanMessage 那条才建 session，本分支只发卡后 return）。
             if (autoTopic) {
               await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
-              const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+              const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, sender.sender_id?.app_id);
               if (seedBotTalk.reason === 'sameOwnerBot') {
                 learnSameOwnerSiblingCrossRef(config.session.dataDir, larkAppId, senderOpenId, senderUnionId);
               }
@@ -5728,7 +5772,7 @@ export function createLarkEventDispatcherRuntime(
             senderUnionId,
           }).catch(err => logger.warn(`[grant:${larkAppId}] delegated grant failed: ${err}`));
         }
-        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, sender.sender_id?.app_id);
         if (botTalk.reason === 'sameOwnerBot') {
           learnSameOwnerSiblingCrossRef(config.session.dataDir, larkAppId, senderOpenId, senderUnionId);
         }
@@ -5829,7 +5873,7 @@ export function createLarkEventDispatcherRuntime(
         // retain their existing delivery path and downstream permission gates.
         const deliverBotMessage = async () => {
           if (substituteRoute?.kind === 'trigger') {
-            const currentTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+            const currentTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, sender.sender_id?.app_id);
             if (currentTalk.reason === 'blocked' || (!currentTalk.allowed && !siblingAuthorized)) {
               logger.info(`[substitute:${larkAppId}] sender lost talk access while queued msg=${messageId.substring(0, 12)}`);
               return;
@@ -7293,7 +7337,11 @@ export function createLarkEventDispatcherRuntime(
     // 同步处理且幂等;bot 被移出后关本 bot 在群里的会话则按 event id 去重、放到 ACK 之后跑。
     'im.chat.member.bot.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
-      if (chatId) invalidateChatStats(larkAppId, chatId);
+      if (chatId) {
+        invalidateChatStats(larkAppId, chatId);
+        try { new OwnerGroupFollowStore(config.session.dataDir, larkAppId).removed(chatId); }
+        catch { logger.warn('[owner-group-follow] failed to record bot removal'); }
+      }
       scheduleChatGone('im.chat.member.bot.deleted_v1', data, 'bot_removed');
     },
     // 群解散推给群内每个订阅了它的 bot,各自关自己的会话。

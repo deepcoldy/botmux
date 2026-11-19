@@ -1718,6 +1718,9 @@ export interface LarkMessage {
    *  undefined for events that don't carry it (older formats, API-fetched
    *  messages). */
   senderUnionId?: string;
+  /** Bot sender's Feishu-stamped app_id. Platform external-roster authorization
+   *  pairs this with senderUnionId; human/card/dashboard messages leave it absent. */
+  senderAppId?: string;
   senderType: string;
   /** Server-provided sender display name (works for user AND bot senders).
    *  Only populated on API-fetched messages read with `with_sender_name=true`
@@ -2195,7 +2198,9 @@ type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
   /** One small-model recap of `prompt`, answered by recap_result. */
   | { type: 'recap_request'; requestId: string; prompt: string }
-  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef;
+      /** Set with `mayStart: false` when no lifecycle operation takes the start over. */
+      startRefusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   /** The host refused this binding; the worker returns to its predecessor. */

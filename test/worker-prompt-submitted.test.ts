@@ -2,7 +2,7 @@ import { type ChildProcess } from 'node:child_process';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
@@ -99,7 +99,7 @@ function startWorker(): Harness {
 }
 
 describe('worker prompt_submitted handler', () => {
-  it('flips ready worker to working with clearTurnId, and no-ops when not ready', async () => {
+  it('flips a ready worker to working without the previous turn id', async () => {
     const harness = startWorker();
 
     // 1. Wait until worker finishes initialization and announces ready
@@ -119,7 +119,7 @@ describe('worker prompt_submitted handler', () => {
       'worker to emit prompt_ready',
     );
 
-    const initialScreenUpdates = harness.messages.filter(m => m.type === 'screen_update');
+    const submissionMessageIndex = harness.messages.length;
 
     // 3. Send prompt_submitted while isPromptReady is true
     harness.child.send({ type: 'prompt_submitted' } satisfies DaemonToWorker);
@@ -127,21 +127,51 @@ describe('worker prompt_submitted handler', () => {
     // 4. Worker should publish working state with clearTurnId (turnId: undefined)
     await waitFor(
       harness,
-      () => harness.messages.slice(initialScreenUpdates.length).some(
+      () => harness.messages.slice(submissionMessageIndex).some(
         m => m.type === 'screen_update' && m.status === 'working' && m.turnId === undefined,
       ),
       'worker to publish working state with clearTurnId',
     );
+  });
 
-    const screenUpdateCountAfterFirst = harness.messages.filter(m => m.type === 'screen_update').length;
+  it.each([true, false])('publishes working only for a ready edge (initially ready: %s)', async initiallyReady => {
+    // The live worker's periodic screen sampler can publish independently of
+    // this handler. Exercise the actual IPC case without that timer so a
+    // repeated submission cannot hide among unrelated screen updates.
+    const reset = vi.fn();
+    const publishScreenStatus = vi.fn();
+    const scope = {
+      isPromptReady: initiallyReady,
+      promptReadinessRevision: 0,
+      idleDetector: { reset },
+      publishScreenStatus,
+      log: vi.fn(),
+      writtenInputs: { takeSubmitted: vi.fn() },
+      send: vi.fn(),
+    };
+    const handle = loadWorkerMessageHandler('prompt_submitted', scope);
+    const submission = { type: 'prompt_submitted' } satisfies DaemonToWorker;
 
-    // 5. Send second prompt_submitted while worker is now in working state (not ready)
-    harness.child.send({ type: 'prompt_submitted' } satisfies DaemonToWorker);
-    await delay(300);
+    await handle(submission);
+    expect(scope.isPromptReady).toBe(false);
+    if (initiallyReady) {
+      expect(reset).toHaveBeenCalledTimes(1);
+      // A fingerprint-less submission is a real human direct submit: the working
+      // frame carries directSubmit (see the R10 keep-alive cases below).
+      expect(publishScreenStatus).toHaveBeenCalledExactlyOnceWith('working', {
+        force: true, clearTurnId: true, directSubmit: true,
+      });
+    } else {
+      expect(reset).not.toHaveBeenCalled();
+      expect(publishScreenStatus).not.toHaveBeenCalled();
+    }
 
-    // Should be no-op: no new screen_update emitted
-    const screenUpdateCountAfterSecond = harness.messages.filter(m => m.type === 'screen_update').length;
-    expect(screenUpdateCountAfterSecond).toBe(screenUpdateCountAfterFirst);
+    reset.mockClear();
+    publishScreenStatus.mockClear();
+    await handle(submission);
+    expect(scope.isPromptReady).toBe(false);
+    expect(reset).not.toHaveBeenCalled();
+    expect(publishScreenStatus).not.toHaveBeenCalled();
   });
 
   it('reports the written turn a submitted prompt was, and nothing for another prompt', async () => {

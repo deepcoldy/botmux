@@ -30,6 +30,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-owner-group-follow', LEGACY],
   ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
@@ -47,6 +48,10 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
 const CASES: readonly Case[] = [
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-p2p-mode', '{"p2pMode":"thread"}', 200, { ok: true, p2pMode: 'thread' }, { p2pMode: 'thread' }],
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],
@@ -223,6 +228,36 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     if (status !== 200) {
       expect(persistedBot()).toEqual({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' });
     }
+  });
+
+  it('/api/bot-owner-group-follow rejects new apiOnly config and permits clearing it', async () => {
+    const localAppId = 'local_config_routes_test';
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: localAppId,
+      apiOnly: true,
+      localIdentity: true,
+      cliId: 'riff',
+      ownerGroupFollow: { enabled: true },
+    }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    setLarkAppId(localAppId);
+    const before = readFileSync(configPath, 'utf8');
+
+    const rejected = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true}}');
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ ok: false, error: 'owner_group_follow_api_only' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+
+    const defaults = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+    expect(defaults.status).toBe(200);
+    expect((await defaults.json()).apiOnly).toBe(true);
+
+    const cleared = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}');
+    expect(cleared.status).toBe(200);
+    expect(await cleared.json()).toEqual({ ok: true, ownerGroupFollow: null });
+    expect(persistedBot()).toMatchObject({ larkAppId: localAppId, apiOnly: true, localIdentity: true });
+    expect(persistedBot()).not.toHaveProperty('ownerGroupFollow');
   });
 
   it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy saves with DNS and proxy warnings', async () => {

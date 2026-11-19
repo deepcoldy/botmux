@@ -10478,6 +10478,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
+    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
     botName: getBotName(),
     displayName,
     larkBotName,
@@ -10662,6 +10663,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
     steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
+    ownerGroupFollow: (() => { try { return getBot(cachedLarkAppId).config.ownerGroupFollow ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
     providerRecovery: (() => { try { return getBot(cachedLarkAppId).config.providerRecovery ?? null; } catch { return null; } })(),
@@ -12268,6 +12270,14 @@ botConfigPutRoute<{ launchShell?: unknown }>('/api/bot-launch-shell', 'launchShe
 });
 
 // 管家（决策看板）：`{ steward: {...} | null }`，校验与「等于默认不写盘」同 /config steward。
+botConfigPutRoute<{ ownerGroupFollow?: unknown }>('/api/bot-owner-group-follow', 'ownerGroupFollow', {
+  normalize: (body, spec) => {
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.ownerGroupFollow ?? null));
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, ownerGroupFollow: value ?? null }),
+});
+
 botConfigPutRoute<{ steward?: unknown }>('/api/bot-steward', 'steward', {
   normalize: (body, spec) => {
     const parsed = coerceConfigValue(spec, JSON.stringify(body.steward ?? null));
