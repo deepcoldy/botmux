@@ -135,6 +135,11 @@ export interface BackendOutageDeps<S> {
   /** Whether a server answers on the socket right now. Must not start one. */
   serverUp(socketName: string | undefined): Promise<boolean>;
   eligible(ref: S): RecoveryEligibility;
+  /** A cancelled recovery restart is owned by an external replacement
+   *  generation (cold refork / transfer / another correlated restart). While
+   *  this is true the coordinator waits for its prompt instead of restarting
+   *  it again. The wait is bounded by externalRecoveryGraceMs. */
+  externalRecoveryInFlight?(ref: S): boolean;
   /** Stop automatic restarts for a member that will not be recovered; the
    *  next user message starts it again (same contract as the crash loop).
    *  `keepTerminal`: also keep a diagnostic shell with the last output — only
@@ -171,6 +176,9 @@ export interface BackendOutageTimings {
   memberMaxAttempts: number;
   /** A member that cannot be restarted right now is asked again after this. */
   deferRecheckMs: number;
+  /** A cancelled recovery restart defers to its external replacement for at
+   *  most this long; if no prompt arrives, the coordinator retries itself. */
+  externalRecoveryGraceMs: number;
   /** A session losing its server more than `maxLossesPerWindow` times within
    *  `lossWindowMs` stops being recovered (bounded like the crash loop). */
   lossWindowMs: number;
@@ -194,6 +202,7 @@ export const DEFAULT_BACKEND_OUTAGE_TIMINGS: BackendOutageTimings = {
   maxConcurrentRestarts: 4,
   memberMaxAttempts: 2,
   deferRecheckMs: 5_000,
+  externalRecoveryGraceMs: 45_000,
   lossWindowMs: 10 * 60_000,
   maxLossesPerWindow: 3,
   summarySettleMs: 60_000,
@@ -308,6 +317,13 @@ interface Member<S> {
   canaryCount: number;
   /** A recovery restart was started and has not reported its outcome yet. */
   restartPending: boolean;
+  /** The restart outcome arrived, but its server probe is still settling.
+   *  A canary in this state must not let poll-driven progress choose another
+   *  canary before the first outcome has been classified. */
+  settling: boolean;
+  /** A cancelled restart is owned by an external replacement until this
+   *  deadline (or until its lifecycle finishes / reports a prompt). */
+  externalRecoveryUntil?: number;
   /** When its restart timed out (summary grace). */
   timedOutAt?: number;
 }
@@ -337,6 +353,8 @@ interface Episode<S> {
   summaryTimer?: unknown;
   /** Bumped on every phase decision; async probes from an older one are stale. */
   generation: number;
+  /** One late down observation is being checked against the CURRENT server. */
+  downProbe?: { generation: number };
 }
 
 export class BackendOutageCoordinator<S> {
@@ -349,12 +367,6 @@ export class BackendOutageCoordinator<S> {
 
   constructor(private readonly deps: BackendOutageDeps<S>, timings: Partial<BackendOutageTimings> = {}) {
     this.timings = { ...DEFAULT_BACKEND_OUTAGE_TIMINGS, ...timings };
-  }
-
-  /** Whether an outage of this bot's server on `socketName` is in progress
-   *  (another session already reported losing it). */
-  hasOutage(larkAppId: string, socketName: string | undefined): boolean {
-    return this.episodes.has(episodeKey(larkAppId, socketName));
   }
 
   /** A session's CLI exit was its server being lost. Always absorbed: the
@@ -390,7 +402,9 @@ export class BackendOutageCoordinator<S> {
       member.report = { ...report, turnInFlight: member.report.turnInFlight || report.turnInFlight };
       member.token += 1;
       member.restartPending = false;
+      member.settling = false;
       member.canary = false;
+      member.externalRecoveryUntil = undefined;
       member.state = 'interrupted';
       member.failure = undefined;
       member.failureDetail = undefined;
@@ -398,7 +412,7 @@ export class BackendOutageCoordinator<S> {
     } else {
       member = {
         sessionId, ref, report, state: 'interrupted', attempts: 0, token: 0, notices: [],
-        canary: false, canaryCount: 0, restartPending: false,
+        canary: false, canaryCount: 0, restartPending: false, settling: false,
       };
       episode.members.set(sessionId, member);
       this.membership.set(sessionId, key);
@@ -415,10 +429,12 @@ export class BackendOutageCoordinator<S> {
     }
 
     // The report says what the server looked like when this pane was found
-    // gone: `replaced` = a server answers again; `gone` / `unreachable` =
-    // nobody answers (it died again since we decided it was up).
+    // gone: `replaced` = a server answers again; `gone` / `unreachable` is a
+    // HISTORICAL observation that may reach us after another member already
+    // restored the server. Confirm the current state before starting another
+    // down/backoff period; generation fences the answer against newer events.
     if ((episode.phase === 'up' || episode.phase === 'canary') && report.kind !== 'replaced') {
-      this.serverDown(episode);
+      this.confirmServerDown(episode);
     } else if (episode.phase === 'failed' && episode.timer === undefined) {
       // Budget spent, but give a late member one look at the server.
       this.schedule(episode, 0);
@@ -523,6 +539,7 @@ export class BackendOutageCoordinator<S> {
    */
   private progress(episode: Episode<S>): void {
     if (this.episodes.get(episode.key) !== episode) return;
+    if (episode.downProbe) return; // wait for the current-server confirmation
     if (episode.timer !== undefined) return; // an assessment is due anyway
     if (episode.phase === 'failed') {
       for (const member of episode.members.values()) {
@@ -530,7 +547,7 @@ export class BackendOutageCoordinator<S> {
       }
     } else if (episode.phase === 'canary') {
       // The canary itself may have been lost, failed or recovered elsewhere.
-      if (![...episode.members.values()].some(m => m.canary && m.restartPending)) {
+      if (![...episode.members.values()].some(m => m.canary && (m.restartPending || m.settling))) {
         this.schedule(episode, 0);
         return;
       }
@@ -548,8 +565,10 @@ export class BackendOutageCoordinator<S> {
     const exhausted = episode.phase === 'failed';
     const up = await this.serverUp(episode);
     if (this.episodes.get(episode.key) !== episode || episode.generation !== generation || episode.timer !== undefined) return;
-    if (up) episode.phase = 'up';
-    else if (!exhausted) {
+    if (up) {
+      episode.phase = 'up';
+      episode.generation += 1; // invalidate settlements based on an older server state
+    } else if (!exhausted) {
       this.startCanary(episode);
       return;
     }
@@ -571,6 +590,10 @@ export class BackendOutageCoordinator<S> {
           continue;
         }
         if (eligibility === 'later') {
+          deferred = true;
+          continue;
+        }
+        if (this.waitsForExternalRecovery(member)) {
           deferred = true;
           continue;
         }
@@ -601,7 +624,7 @@ export class BackendOutageCoordinator<S> {
   /** While the canary runs, ask the server whether it is back: the others can
    *  start as soon as it is, without waiting for the canary's CLI. */
   private pollServer(episode: Episode<S>): void {
-    if (episode.phase !== 'canary' || episode.pollTimer !== undefined) return;
+    if (episode.phase !== 'canary' || episode.pollTimer !== undefined || episode.downProbe) return;
     const generation = episode.generation;
     episode.pollTimer = this.deps.setTimeout(() => {
       episode.pollTimer = undefined;
@@ -612,6 +635,8 @@ export class BackendOutageCoordinator<S> {
         if (up) {
           this.deps.log(`tmux ${serverLabel(episode.socketName)} answers again; restarting the remaining sessions`);
           episode.phase = 'up';
+          episode.generation += 1; // a newer decision than any pending settlement
+          this.stopPolling(episode);
         }
         this.progress(episode);
       })();
@@ -634,6 +659,10 @@ export class BackendOutageCoordinator<S> {
         deferred = true;
         continue;
       }
+      if (this.waitsForExternalRecovery(member)) {
+        deferred = true;
+        continue;
+      }
       this.startRestart(member);
     }
     // Only deferred members are left and nothing will settle to wake us up.
@@ -644,6 +673,8 @@ export class BackendOutageCoordinator<S> {
     member.state = 'recovering';
     member.attempts += 1;
     member.restartPending = true;
+    member.settling = false;
+    member.externalRecoveryUntil = undefined;
     member.failure = undefined;
     const token = ++member.token;
     this.renderCard(member);
@@ -667,16 +698,64 @@ export class BackendOutageCoordinator<S> {
     if (member.token !== token || member.state !== 'recovering' || !member.restartPending) return;
     const episode = this.episodes.get(this.membership.get(member.sessionId) ?? '');
     if (!episode || episode.members.get(member.sessionId) !== member) return;
-    member.restartPending = false;
+    const generation = episode.generation;
     const wasCanary = member.canary;
-    member.canary = false;
+    member.restartPending = false;
+    member.settling = true;
+
+    if (status === 'cancelled') {
+      // Cancellation transfers ownership to another lifecycle generation. Do
+      // not spend a CLI attempt or immediately restart that replacement. If
+      // it never reaches a prompt, the bounded fallback below re-owns recovery.
+      member.settling = false;
+      member.canary = false;
+      member.attempts = Math.max(0, member.attempts - 1);
+      member.state = 'interrupted';
+      member.externalRecoveryUntil = this.deps.now() + this.timings.externalRecoveryGraceMs;
+      this.renderCard(member);
+      this.progress(episode);
+      return;
+    }
     if (status === 'succeeded') {
+      member.settling = false;
       this.markRecovered(episode, member);
       return;
     }
+
     const up = await this.serverUp(episode);
     // A re-loss, a prompt edge or the episode closing won meanwhile.
     if (member.token !== token || member.state !== 'recovering' || this.episodes.get(episode.key) !== episode) return;
+    member.settling = false;
+    member.canary = false;
+    if (episode.generation !== generation) {
+      // Only the PROBE is stale; the restart's terminal status still has to be
+      // settled. Reclassify it against the current phase instead of blindly
+      // returning the member to interrupted (which would bypass timed_out and
+      // the per-member attempt budget).
+      if (episode.phase === 'failed') {
+        this.fail(member, 'server_unavailable');
+      } else if (episode.phase === 'waiting' || episode.phase === 'canary') {
+        member.state = 'interrupted';
+        member.attempts = Math.max(0, member.attempts - 1);
+        this.renderCard(member);
+      } else if (status === 'timed_out') {
+        this.fail(member, 'timed_out', { giveUp: false });
+        member.timedOutAt = this.deps.now();
+      } else {
+        const eligibility = this.deps.eligible(member.ref);
+        if (eligibility === 'never') {
+          this.stop(member);
+        } else if (member.attempts < this.timings.memberMaxAttempts) {
+          member.token += 1;
+          member.state = 'interrupted';
+          this.renderCard(member);
+        } else {
+          this.fail(member, 'cli_failed');
+        }
+      }
+      this.progress(episode);
+      return;
+    }
     if (!up) {
       if (episode.phase === 'failed') {
         this.fail(member, 'server_unavailable');
@@ -688,7 +767,11 @@ export class BackendOutageCoordinator<S> {
         this.serverDown(episode);
       }
     } else {
-      if (wasCanary && episode.phase === 'canary') episode.phase = 'up';
+      if (wasCanary && episode.phase === 'canary') {
+        episode.phase = 'up';
+        episode.generation += 1;
+        this.stopPolling(episode);
+      }
       const eligibility = this.deps.eligible(member.ref);
       if (status === 'timed_out') {
         // Not ready in time, not proven dead either: never kill a CLI that
@@ -711,7 +794,9 @@ export class BackendOutageCoordinator<S> {
   private markRecovered(episode: Episode<S>, member: Member<S>): void {
     member.token += 1;
     member.restartPending = false;
+    member.settling = false;
     member.canary = false;
+    member.externalRecoveryUntil = undefined;
     member.state = 'recovered';
     member.failure = undefined;
     member.failureDetail = undefined;
@@ -720,9 +805,38 @@ export class BackendOutageCoordinator<S> {
     if (episode.phase === 'canary') {
       this.deps.log(`tmux ${serverLabel(episode.socketName)} is back (session ${member.sessionId.slice(0, 8)} recovered)`);
       episode.phase = 'up';
+      episode.generation += 1;
       this.stopPolling(episode);
     }
     this.progress(episode);
+  }
+
+  /** A report's down verdict is historical by the time it reaches us. Probe
+   *  the current server before charging another retry; concurrent late reports
+   *  share this one decision, and a newer phase decision invalidates the answer. */
+  private confirmServerDown(episode: Episode<S>): void {
+    if (episode.downProbe) return;
+    const probe = { generation: episode.generation };
+    episode.downProbe = probe;
+    void (async () => {
+      const up = await this.serverUp(episode);
+      if (episode.downProbe === probe) episode.downProbe = undefined;
+      if (this.episodes.get(episode.key) !== episode) return;
+      if (probe.generation === episode.generation && !up) this.serverDown(episode);
+      this.progress(episode);
+    })();
+  }
+
+  /** True while a cancelled member's external replacement still owns recovery.
+   *  Without daemon-specific evidence, cancellation itself is enough to wait
+   *  for the bounded grace rather than risk restarting a healthy replacement. */
+  private waitsForExternalRecovery(member: Member<S>): boolean {
+    const until = member.externalRecoveryUntil;
+    if (until === undefined) return false;
+    const external = this.deps.externalRecoveryInFlight?.(member.ref) ?? true;
+    if (this.deps.now() < until && external) return true;
+    member.externalRecoveryUntil = undefined;
+    return false;
   }
 
   /** The server is down: back off and try again, once per down period. */
@@ -747,7 +861,9 @@ export class BackendOutageCoordinator<S> {
   private fail(member: Member<S>, reason: OutageFailureReason, opts: { giveUp?: boolean } = {}): void {
     member.token += 1;
     member.restartPending = false;
+    member.settling = false;
     member.canary = false;
+    member.externalRecoveryUntil = undefined;
     member.state = 'failed';
     member.failure = reason;
     this.renderCard(member);
@@ -765,7 +881,9 @@ export class BackendOutageCoordinator<S> {
   private stop(member: Member<S>): void {
     member.token += 1;
     member.restartPending = false;
+    member.settling = false;
     member.canary = false;
+    member.externalRecoveryUntil = undefined;
     member.state = 'stopped';
     // A closed topic needs no further card; only correct one already posted.
     if (this.cards.has(member.sessionId)) this.renderCard(member);

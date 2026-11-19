@@ -115,6 +115,8 @@ import {
   __testOnly_resetBackendOutage,
   restartCounts,
   setActiveSessionsRegistry,
+  isSessionLifecycleInFlight,
+  retireWorkerProcessOnly,
 } from '../src/core/worker-pool.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -393,5 +395,84 @@ describe('daemon: a lost tmux server is one backend outage', () => {
     expect(restartCounts.get(ds.session.sessionId)?.count).toBe(1);
     expect(restartsOf(worker)).toHaveLength(1);
     expect(repliesTo(ds.session.sessionId)).toEqual([]);
+  });
+
+  for (const kind of ['worker-less', 'cold-resume', 'parked'] as const) {
+    it(`a ${kind} row does not corroborate a clean empty-server exit`, async () => {
+      const [a, b, ...others] = sessions;
+      for (const other of others) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+      if (kind === 'worker-less') b!.ds.worker = null;
+      if (kind === 'cold-resume') b!.ds.session.suspendedColdResume = true;
+      if (kind === 'parked') b!.ds.crashDiagnosticParked = true;
+      a!.worker.emit('message', { ...lostServer, code: 0 });
+      await flush();
+      expect(restartCounts.get(a!.ds.session.sessionId)?.count).toBe(1);
+      expect(restartsOf(a!.worker)).toHaveLength(1);
+      expect(repliesTo(a!.ds.session.sessionId)).toEqual([]);
+    });
+  }
+
+  it('an old episode alone does not corroborate a clean exit after its other members go cold', async () => {
+    __testOnly_resetBackendOutage({ serverUp: async () => serverUp }, { gatherMs: 30, serverBackoffMs: [30, 30], summarySettleMs: 1_000 });
+    const [a, b, ...others] = sessions;
+    serverUp = true;
+    for (const other of others) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+    a!.worker.emit('message', lostServer);
+    b!.worker.emit('message', lostServer);
+    await waitFor(() => restartsOf(a!.worker).length === 1 && restartsOf(b!.worker).length === 1, 'initial outage restarts');
+    for (const member of [a!, b!]) {
+      member.worker.emit('message', {
+        type: 'restart_result', attemptId: restartsOf(member.worker)[0].attemptId, status: 'succeeded', category: 'prompt_ready',
+      });
+    }
+    await flush();
+    b!.ds.worker = null;
+    b!.ds.session.suspendedColdResume = true;
+    a!.worker.emit('message', { ...lostServer, code: 0 });
+    await flush();
+    expect(restartCounts.get(a!.ds.session.sessionId)?.count).toBe(1);
+    expect(restartsOf(a!.worker)).toHaveLength(2);
+  });
+
+  it('a cancelled recovery does not restart a replacement that is ready but not prompt-ready', async () => {
+    const [{ ds, worker }, ...others] = sessions;
+    for (const other of others.slice(1)) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+    serverUp = true;
+    worker.emit('message', lostServer);
+    await waitFor(() => restartsOf(worker).length === 1, 'outage restart');
+
+    retireWorkerProcessOnly(ds, 'test replacement');
+    const replacement = makeFakeWorker();
+    ds.worker = replacement;
+    ds.workerReady = true; // process-level ready landed…
+    ds.cliReady = false; // …but the CLI prompt has not arrived yet
+    __testOnly_setupWorkerHandlers(ds, replacement);
+    worker.emit('exit', null, null); // release the old retirement marker
+    await flush();
+    await new Promise(r => setTimeout(r, 80));
+    expect(restartsOf(replacement)).toEqual([]);
+
+    replacement.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(restartsOf(replacement)).toEqual([]);
+    expect(ds.cliReady).toBe(true);
+  });
+
+  it('prompt-ready after a parked outage retry releases the lifecycle fence', async () => {
+    const [{ ds, worker }, ...others] = sessions;
+    for (const other of others.slice(1)) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+    serverUp = true;
+    worker.emit('message', lostServer);
+    await waitFor(() => restartsOf(worker).length === 1, 'first restart');
+    worker.emit('message', { type: 'restart_result', attemptId: restartsOf(worker)[0].attemptId, status: 'failed' });
+    await waitFor(() => restartsOf(worker).length === 2, 'second restart');
+    worker.emit('message', { type: 'restart_result', attemptId: restartsOf(worker)[1].attemptId, status: 'failed' });
+    await waitFor(() => ds.crashDiagnosticParked === true, 'parked worker');
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(ds.cliReady).toBe(true);
+    expect(ds.workerReady).toBe(true);
+    expect(ds.crashDiagnosticParked).toBeUndefined();
+    expect(isSessionLifecycleInFlight(ds)).toBe(false);
   });
 });

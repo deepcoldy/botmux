@@ -73,6 +73,8 @@ function harness(opts: {
   server?: { serverUp: boolean };
   /** Called as a restart starts (e.g. its new-session brings the server up). */
   onRestart?: (id: string) => void;
+  serverUpFn?: () => Promise<boolean>;
+  externalRecoveryInFlight?: (id: string) => boolean;
 } = {}) {
   const clock = opts.clock ?? new ManualClock();
   const state = opts.server ?? { serverUp: opts.serverUp ?? false };
@@ -99,9 +101,10 @@ function harness(opts: {
     },
     serverUp: async () => {
       probes.push(clock.now);
-      return state.serverUp;
+      return opts.serverUpFn ? opts.serverUpFn() : state.serverUp;
     },
     eligible: ref => ref.eligibility,
+    externalRecoveryInFlight: ref => opts.externalRecoveryInFlight?.(ref.id) ?? true,
     giveUp: (ref, o) => { giveUps.push({ sessionId: ref.id, keepTerminal: o.keepTerminal }); },
     render: (ref, view) => {
       lastView.set(ref.id, view);
@@ -556,6 +559,164 @@ describe('BackendOutageCoordinator', () => {
     const all = [...a.restarts, ...b.restarts];
     expect(all).toHaveLength(4);
     expect(all.filter(r => !r.serverWasUp)).toHaveLength(1);
+  });
+
+  it('re-probes late down reports instead of spending recovery budget on a healthy server', async () => {
+    const h = harness({ serverUp: true, timings: { gatherMs: 0, serverBackoffMs: [1, 1, 1, 1] } });
+    h.lose('s1');
+    await h.clock.advance(0);
+    h.settleRestart('s1', 'succeeded');
+    await h.clock.advance(0);
+
+    // Each verdict was latched before the preceding restoration but arrives
+    // only after it. The member still needs its own restart; the server does
+    // not need another down/backoff period.
+    for (const [index, id] of ['s2', 's3', 's4', 's5', 's6'].entries()) {
+      h.lose(id, { kind: index % 2 === 0 ? 'gone' : 'unreachable' });
+      await h.clock.advance(1);
+      expect(h.restarts).toHaveLength(index + 2);
+      h.settleRestart(id, 'succeeded');
+      await h.clock.advance(0);
+    }
+    for (const id of IDS) expect(h.view(id)).toMatchObject({ state: 'recovered', serverRetries: 0 });
+    expect(h.giveUps).toEqual([]);
+  });
+
+  it('holds canary progress while its restart settlement probe is in flight', async () => {
+    const probes: Array<{ promise: Promise<boolean>; resolve: (up: boolean) => void }> = [];
+    const h = harness({
+      timings: { gatherMs: 0 },
+      serverUpFn: () => {
+        let resolve!: (up: boolean) => void;
+        const promise = new Promise<boolean>(r => { resolve = r; });
+        probes.push({ promise, resolve });
+        return promise;
+      },
+    });
+    h.lose('s1');
+    h.lose('s2');
+    await h.clock.advance(0);
+    probes[0]!.resolve(false);
+    await h.clock.advance(0);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s1']);
+
+    h.settleRestart('s1', 'failed');
+    await h.clock.advance(2_000);
+    probes[2]!.resolve(false); // poll returns before the settlement probe
+    await h.clock.advance(0);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s1']);
+
+    probes[1]!.resolve(true);
+    await h.clock.advance(0);
+    // The old settlement may retry ITS OWN failed CLI on the healthy server;
+    // it must not create a second canary or apply a stale phase transition.
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s1', 's1', 's2']);
+    expect(h.view('s2').state).toBe('recovering');
+  });
+
+  it('a newer poll-up decision invalidates a stale settlement-down result', async () => {
+    const probes: Array<{ promise: Promise<boolean>; resolve: (up: boolean) => void }> = [];
+    const h = harness({
+      timings: { gatherMs: 0 },
+      serverUpFn: () => {
+        let resolve!: (up: boolean) => void;
+        const promise = new Promise<boolean>(r => { resolve = r; });
+        probes.push({ promise, resolve });
+        return promise;
+      },
+    });
+    h.lose('s1');
+    await h.clock.advance(0);
+    probes[0]!.resolve(false);
+    await h.clock.advance(0);
+    h.settleRestart('s1', 'failed');
+    await h.clock.advance(2_000);
+    probes[2]!.resolve(true); // newer observation: the server is back
+    await h.clock.advance(0);
+    probes[1]!.resolve(false); // stale settlement must not pull it down again
+    await h.clock.advance(0);
+    expect(h.view('s1').serverRetries).toBe(0);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s1', 's1']);
+  });
+
+  it('a stale settlement still preserves timed_out semantics after a newer poll-up', async () => {
+    const probes: Array<{ promise: Promise<boolean>; resolve: (up: boolean) => void }> = [];
+    const h = harness({
+      timings: { gatherMs: 0 },
+      serverUpFn: () => {
+        let resolve!: (up: boolean) => void;
+        const promise = new Promise<boolean>(r => { resolve = r; });
+        probes.push({ promise, resolve });
+        return promise;
+      },
+    });
+    h.lose('s1');
+    await h.clock.advance(0);
+    probes[0]!.resolve(false);
+    await h.clock.advance(0);
+    h.settleRestart('s1', 'timed_out');
+    await h.clock.advance(2_000);
+    probes[2]!.resolve(true);
+    await h.clock.advance(0);
+    probes[1]!.resolve(false);
+    await h.clock.advance(0);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.view('s1')).toMatchObject({ state: 'failed', failure: 'timed_out' });
+    expect(h.giveUps).toEqual([]);
+    h.coordinator.onPromptReady('s1');
+    await h.clock.advance(0);
+    expect(h.view('s1').state).toBe('recovered');
+  });
+
+  it('a stale settlement cannot bypass the member attempt budget after a newer poll-up', async () => {
+    const probes: Array<{ promise: Promise<boolean>; resolve: (up: boolean) => void }> = [];
+    const h = harness({
+      timings: { gatherMs: 0, memberMaxAttempts: 1 },
+      serverUpFn: () => {
+        let resolve!: (up: boolean) => void;
+        const promise = new Promise<boolean>(r => { resolve = r; });
+        probes.push({ promise, resolve });
+        return promise;
+      },
+    });
+    h.lose('s1');
+    await h.clock.advance(0);
+    probes[0]!.resolve(false);
+    await h.clock.advance(0);
+    h.settleRestart('s1', 'failed');
+    await h.clock.advance(2_000);
+    probes[2]!.resolve(true);
+    await h.clock.advance(0);
+    probes[1]!.resolve(false);
+    await h.clock.advance(0);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.view('s1')).toMatchObject({ state: 'failed', failure: 'cli_failed' });
+    expect(h.giveUps).toEqual([{ sessionId: 's1', keepTerminal: true }]);
+  });
+
+  it('a cancelled restart defers to the replacement generation, then recovers without another restart', async () => {
+    const h = harness({ serverUp: true, timings: { gatherMs: 0, deferRecheckMs: 100, externalRecoveryGraceMs: 1_000 } });
+    h.lose('s1');
+    await h.clock.advance(0);
+    h.settleRestart('s1', 'cancelled');
+    await h.clock.advance(0);
+    expect(h.restarts).toHaveLength(1);
+
+    h.coordinator.onPromptReady('s1');
+    await h.clock.advance(1_100);
+    expect(h.view('s1').state).toBe('recovered');
+    expect(h.restarts).toHaveLength(1);
+  });
+
+  it('a cancelled restart has a bounded fallback when no replacement becomes ready', async () => {
+    const h = harness({ serverUp: true, timings: { gatherMs: 0, deferRecheckMs: 100, externalRecoveryGraceMs: 1_000 } });
+    h.lose('s1');
+    await h.clock.advance(0);
+    h.settleRestart('s1', 'cancelled');
+    await h.clock.advance(999);
+    expect(h.restarts).toHaveLength(1);
+    await h.clock.advance(101);
+    expect(h.restarts).toHaveLength(2);
   });
 
   it('maps the daemon facts about a session to whether it may be restarted', () => {

@@ -16,7 +16,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
@@ -57,7 +57,7 @@ describe.skipIf(!realTmux)('a managed tmux pane refuses input once its CLI died'
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'tmux-inputoff-'));
-    for (const key of ['TMUX_TMPDIR', 'SHELL', 'TMUX', 'TMUX_PANE']) saved[key] = process.env[key];
+    for (const key of ['TMUX_TMPDIR', 'SHELL', 'TMUX', 'TMUX_PANE', 'PATH']) saved[key] = process.env[key];
     process.env.TMUX_TMPDIR = dir;
     process.env.SHELL = '/bin/sh';
     delete process.env.TMUX;
@@ -106,5 +106,58 @@ describe.skipIf(!realTmux)('a managed tmux pane refuses input once its CLI died'
     });
     expect(await waitForCorpse('bmx-inputoff-old')).toBe('1:1');
     pasteIntoCorpseLeavesServerUp('bmx-inputoff-old');
+  }, 40_000);
+
+  it('switches input off immediately for a corpse that predates reattach backfill', async () => {
+    // The old build left a corpse BEFORE the new worker arrives. A pane-died
+    // hook alone cannot retroactively secure it: the attach client can paste
+    // during the option/probe window and take down the whole server.
+    expect(tmux('new-session', '-d', '-s', 'bmx-inputoff-predead', 'exit 3',
+      ';', 'set-option', '-t', 'bmx-inputoff-predead', 'remain-on-exit', 'on').status).toBe(0);
+    expect(await waitForCorpse('bmx-inputoff-predead')).toBe('1:0');
+    const backend = new TmuxPipeBackend('bmx-inputoff-predead', { ownsSession: true, isReattach: true, socketName: socket });
+    backends.push(backend);
+    // Isolate the option-application boundary from the later corpse reaping;
+    // this is the exact production method spawn() calls before readPaneDeath().
+    (backend as unknown as { applySessionOptions(): void }).applySessionOptions();
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-inputoff-predead', '#{pane_dead}:#{pane_input_off}').stdout).trim()).toBe('1:1');
+    pasteIntoCorpseLeavesServerUp('bmx-inputoff-predead');
+  }, 40_000);
+
+  it('secures a pre-dead pane before ANY probe in the public reattach spawn path', async () => {
+    const name = 'bmx-inputoff-concurrent';
+    expect(tmux('new-session', '-d', '-s', name, 'exit 3',
+      ';', 'set-option', '-t', name, 'remain-on-exit', 'on').status).toBe(0);
+    expect(await waitForCorpse(name)).toBe('1:0');
+    spawnSync(realTmux!, ['-L', socket, 'load-buffer', '-'], { input: 'x\ny', env: { ...process.env }, timeout: 5_000 });
+
+    // Hit the real server-version probe and paste AT THAT POINT, before the
+    // probe can return. This catches an unsafe ordering even when the final
+    // corpse is eventually reaped and the later state happens to look correct.
+    const shimDir = join(dir, 'shim');
+    mkdirSync(shimDir, { recursive: true });
+    const marker = join(dir, 'version-probe-hit');
+    const shim = join(shimDir, 'tmux');
+    writeFileSync(shim, `#!/bin/sh
+case " $* " in
+  *"display-message -p #{version}"*)
+    touch ${marker}
+    ${realTmux} -L ${socket} paste-buffer -t ${name} -p
+    ;;
+esac
+exec ${realTmux} "$@"
+`);
+    chmodSync(shim, 0o755);
+    process.env.PATH = `${shimDir}:${process.env.PATH}`;
+    const before = String(tmux('display-message', '-p', '-t', 'keepalive', '#{pid}').stdout).trim();
+    const backend = new TmuxPipeBackend(name, { ownsSession: true, isReattach: true, socketName: socket });
+    backends.push(backend);
+    const workdir = mkdtempSync(join(dir, 'cwd-'));
+    backend.spawn('/bin/sh', ['-c', 'exit 0'], {
+      cwd: workdir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: workdir,
+    });
+    expect(existsSync(marker)).toBe(true);
+    expect(tmux('has-session', '-t', 'keepalive').status).toBe(0);
+    expect(String(tmux('display-message', '-p', '-t', 'keepalive', '#{pid}').stdout).trim()).toBe(before);
   }, 40_000);
 });

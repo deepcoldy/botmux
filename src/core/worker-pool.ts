@@ -9209,6 +9209,20 @@ function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
       current: !activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds,
       transferring: isSessionTransferring(ds),
     }),
+    externalRecoveryInFlight: ds => {
+      if (ds.session.status !== 'active' || ds.session.suspendedColdResume || ds.crashDiagnosticParked) return false;
+      // A cancelled outage restart may be superseded by a refork, transfer or
+      // another correlated restart. The readiness flags cover the short gap
+      // after the old worker's retirement releases and before the replacement
+      // reports process-ready, as well as the later process-ready → CLI-prompt
+      // window; the grace in the coordinator bounds the wait if no replacement
+      // actually exists.
+      return isSessionTransferring(ds)
+        || lifecycleRetiringWorkers.has(ds)
+        || restartCoordinator.activeAttemptId(ds.session.sessionId) !== undefined
+        || ds.workerReady === false
+        || ds.cliReady === false;
+    },
     giveUp: (ds, { keepTerminal }) => {
       ds.managedTurnOrigin = undefined;
       if (ds.worker && !ds.worker.killed) {
@@ -9253,23 +9267,33 @@ function managedTmuxSocketOf(ds: DaemonSession): string | undefined | null {
   return target?.backendType === 'tmux' ? target.socketName : null;
 }
 
+/** Pre-loss evidence that another managed backend could have kept this tmux
+ *  server non-empty. A persisted registry row alone is not evidence: suspended
+ *  cold-resume and worker-less sessions have no pane. Parked workers are also
+ *  excluded conservatively (terminal:false has no diagnostic shell); ambiguity
+ *  then stays on the ordinary CLI-exit path. */
+function hasLiveManagedBackendForGone(ds: DaemonSession): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed || worker.connected === false || worker.exitCode != null || worker.signalCode != null) return false;
+  return !ds.session.suspendedColdResume && !ds.crashDiagnosticParked;
+}
+
 /**
  * Whether a `gone` server (nobody listens on the socket) is a real loss of a
  * shared server. tmux shuts an EMPTY server down cleanly, so a lone session
  * whose own CLI exited 0 leaves the very same `gone` behind. A server that
  * still held another session of ours cannot have ended that way: if another
- * active session of this daemon lives on the socket — or one has already
- * reported the loss — the server was lost with sessions in it. Otherwise the
- * exit is treated as the CLI's own (ordinary crash handling, which also
- * restarts it).
+ * active session with a live managed backend lives on the socket, the server
+ * was lost with sessions in it. Otherwise the exit is treated as the CLI's own
+ * (ordinary crash handling, which also restarts it). An old outage's existence
+ * alone is NOT current evidence: its members may since have gone cold too.
  */
 function goneServerCorroborated(ds: DaemonSession, socketName: string | undefined): boolean {
-  if (backendOutage.hasOutage(ds.larkAppId, socketName)) return true;
   if (!activeSessionsRegistry) return false;
   for (const other of activeSessionsRegistry.values()) {
     if (other === ds || other.session.status !== 'active') continue;
     const socket = managedTmuxSocketOf(other);
-    if (socket !== null && (socket ?? '') === (socketName ?? '')) return true;
+    if (socket !== null && (socket ?? '') === (socketName ?? '') && hasLiveManagedBackendForGone(other)) return true;
   }
   return false;
 }
@@ -22287,6 +22311,14 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
+        if (ds.crashDiagnosticParked) {
+          // The next-message retry respawns INSIDE the existing worker, so no
+          // process-level ready or attempt-correlated restart_result will
+          // release the fence lowered by parkCrashDiagnosticWorker. Its first
+          // prompt is the authoritative successful recovery edge.
+          ds.workerReady = true;
+          ds.crashDiagnosticParked = undefined;
+        }
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
         backendOutage.onPromptReady(ds.session.sessionId);
         // 到了 prompt 不等于恢复健康：CLI 可能每收到一条（被重投的）输入就退出，

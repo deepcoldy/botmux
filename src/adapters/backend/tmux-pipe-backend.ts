@@ -1084,6 +1084,12 @@ export class TmuxPipeBackend implements SessionBackend {
 
   /** Prepare the reader before a managed CLI can emit its startup bytes. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    if (!this.createSession && this.ownsSession && this._isReattach) {
+      // A pre-upgrade corpse must refuse input BEFORE identity, global-env or
+      // version probes can wait on the server. All of those windows are long
+      // enough for an attached client to paste and crash tmux <= 3.3a.
+      this.secureDeadPaneInputOff();
+    }
     const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
     if (this.ownsSession && !this.createSession && instanceIdentity) {
       // Fence managed reattachment before options or pipe-pane can touch the
@@ -2706,6 +2712,17 @@ export class TmuxPipeBackend implements SessionBackend {
     this.launchFile = null;
   }
 
+  /** Atomically disable input if this pane was already dead. A pane-died hook
+   *  cannot retroactively secure a corpse left by an older build. */
+  private secureDeadPaneInputOff(): void {
+    try {
+      execFileSync('tmux', [
+        ...this.tmuxArgs,
+        'if-shell', '-F', '-t', this.paneTarget, '#{pane_dead}', 'select-pane -d',
+      ], { stdio: 'ignore', env: tmuxEnv(), timeout: 5000 });
+    } catch { /* later lifecycle/death probes remain the fallback */ }
+  }
+
   /**
    * Apply idempotent per-session tmux options.
    *
@@ -2717,17 +2734,20 @@ export class TmuxPipeBackend implements SessionBackend {
    * backfilling options onto a session an older build created) has no prior
    * resolution, so it omits the argument and asks the server once here.
    */
-  private applySessionOptions(
-    version: TmuxVersion | null = serverTmuxVersion(this.tmuxArgs, resolveTmuxVersionAtSessionBoundary()),
-  ): void {
+  private applySessionOptions(version?: TmuxVersion | null): void {
     const t = shellescape(this.paneTarget);
     const env = tmuxEnv();
     try {
+      // Also secure the corpse here, before the reattach version probe below;
+      // spawn() repeats this before its even earlier identity/scrub probes.
+      this.secureDeadPaneInputOff();
+      const resolvedVersion = version === undefined
+        ? serverTmuxVersion(this.tmuxArgs, resolveTmuxVersionAtSessionBoundary())
+        : version;
       // Fresh sessions set this atomically with new-session. Reattached
       // sessions need it too, before any best-effort cosmetic option can fail.
-      // `version` already reflects the RUNNING server (default arg above);
-      // the binary on PATH can be newer than the server on this socket.
-      const remainOnExit = remainOnExitMode(version);
+      // The resolved version reflects the RUNNING server, not the PATH binary.
+      const remainOnExit = remainOnExitMode(resolvedVersion);
       // A timed-out client may already have applied the option server-side.
       this.legacyRetention = remainOnExit === 'on';
       execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit ${remainOnExit}`, { stdio: 'ignore', env, timeout: 5000 });
@@ -2755,7 +2775,7 @@ export class TmuxPipeBackend implements SessionBackend {
       // window-size largest exists since tmux 3.1; older builds reject the
       // option (and the shared try/catch would then skip the remain-on-exit
       // reapply below). Unknown version: keep trying.
-      if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+      if (resolvedVersion === null || tmuxVersionAtLeast(resolvedVersion, 3, 1)) {
         execSync(`${this.tmuxCmd} set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
       }
     } catch { /* session may not be ready yet — benign */ }
