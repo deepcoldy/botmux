@@ -375,8 +375,10 @@ import { DEFAULT_LONG_TASK_REMINDER } from '../services/long-task-reminder-polic
 import { updateLongTaskReminderConfig } from '../services/long-task-reminder-config-store.js';
 import {
   selectIdleSuspendCandidates,
+  suspendSelectedIdleCandidatesAfterTurnDrain,
   sweepIdleWorkersByAgeAfterTurnDrain,
 } from './idle-worker-sweeper.js';
+import { parseTmuxSwitchSuspendRequest, selectTmuxSwitchCandidates } from './tmux-switch-candidates.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -3476,6 +3478,44 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   }
 
   return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+});
+
+/**
+ * tmux upgrade: suspend (or, with dryRun, only count) THIS daemon's idle tmux
+ * sessions on the server being replaced, so it can empty out and be recreated
+ * from the upgraded binary. Driven by the primary daemon's tmux-upgrade card /
+ * idle-switch monitor, which fans this out to every online daemon.
+ *
+ * Execution goes through the same bot-turn mutation gate and per-candidate
+ * re-check as the maintenance idle sweep: a session that starts a turn while
+ * earlier candidates are being suspended is skipped, never interrupted. A busy
+ * gate answers 409 so the caller counts this daemon as not done.
+ */
+ipcRoute('POST', '/api/tmux-upgrade/suspend-idle', async (req, res) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  const request = parseTmuxSwitchSuspendRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+  const socketName = request.socketName ?? undefined;
+  const candidates = selectTmuxSwitchCandidates(registry, { socketName, olderThanMs: request.olderThanMs });
+  if (request.dryRun) return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: 0 });
+  if (candidates.length === 0) return jsonRes(res, 200, { ok: true, candidates: 0, affected: 0 });
+  const runtimeAppIds = new Set([...registry.values()].map(ds => ds.larkAppId).filter(Boolean));
+  const larkAppId = cachedLarkAppId || (runtimeAppIds.size === 1 ? [...runtimeAppIds][0] : undefined);
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
+  const selected = new Set(candidates.map(c => c.sessionId));
+  const result = await suspendSelectedIdleCandidatesAfterTurnDrain(larkAppId, registry, selected, {
+    olderThanMs: request.olderThanMs,
+    reason: 'tmux_upgrade_switch',
+  });
+  if (result === null) return jsonRes(res, 409, { ok: false, error: 'mutation_gate_busy' });
+  for (const failure of result.failures) {
+    logger.info(`[tmux-upgrade] not suspended ${failure.candidate.sessionId.slice(0, 8)}: ${failure.error}`);
+  }
+  logger.info(`[tmux-upgrade] suspended ${result.suspended.length}/${candidates.length} idle tmux session(s) for the server switch`);
+  return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: result.suspended.length });
 });
 
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，

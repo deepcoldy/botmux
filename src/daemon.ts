@@ -288,7 +288,25 @@ import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, PrincipalLaneQueuedTurn, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
-import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
+import { refreshTmuxVersion, scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
+import { detectPlatform } from './setup/detect-platform.js';
+import {
+  defaultTmuxUpgradeProbe,
+  executeTmuxUpgrade,
+  planTmuxUpgrade,
+  readDebianCodename,
+  spawnUpgradeCommand,
+} from './setup/tmux-upgrade-plan.js';
+import {
+  fanOutTmuxSwitchSuspend,
+  killTmuxServer,
+  probeTmuxFacts,
+  retireEmptyTmuxServer,
+  startTmuxUpgradeMonitor,
+} from './core/tmux-upgrade.js';
+import { preferredManagedTmuxSocket } from './adapters/backend/tmux-socket.js';
+import { isBotAdmin } from './im/lark/grant-owner.js';
+import { readProcessStartIdentity } from './utils/process-identity.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { missingCliExecutableAfterRetry } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
@@ -36821,6 +36839,45 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       targets: configuredCodexUpdateTargets,
       sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
       log: (m) => logger.info(`[cli-update] ${m}`),
+    });
+    // tmux below TMUX_RECOMMENDED_MIN → owner DM with one-click upgrade and an
+    // owner-chosen server switch. Host-wide like the Codex monitor above.
+    startTmuxUpgradeMonitor({
+      dataDir: config.session.dataDir,
+      larkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      isAdmin: (appId, openId) => isBotAdmin(appId, openId),
+      locale: () => localeForBot(cfg.larkAppId),
+      now: () => Date.now(),
+      tmuxBackendInUse: () => loadBotConfigs().some(b => (b.backendType ?? config.daemon.backendType) === 'tmux'),
+      socketName: () => preferredManagedTmuxSocket(),
+      probeFacts: probeTmuxFacts,
+      plan: (locale) => planTmuxUpgrade(defaultTmuxUpgradeProbe(detectPlatform()), {
+        locale,
+        debianCodename: readDebianCodename(() => readFileSync('/etc/os-release', 'utf8')),
+      }),
+      executeUpgrade: (plan, onLine, onSpawn) => {
+        const platform = detectPlatform();
+        return executeTmuxUpgrade(plan, {
+          platform,
+          run: spawnUpgradeCommand,
+          onLine,
+          onSpawn,
+          aptCandidates: () => defaultTmuxUpgradeProbe(platform).packageCandidates('apt'),
+        });
+      },
+      onBinaryChanged: () => { refreshTmuxVersion(); },
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive'),
+      updateCard: (messageId, card) => updateMessage(cfg.larkAppId, messageId, card),
+      isUpdateExpired: error => error instanceof MessageUpdateExpiredError
+        || error instanceof MessageWithdrawnError
+        || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+      fanOutSuspend: fanOutTmuxSwitchSuspend,
+      killServer: killTmuxServer,
+      retireEmptyServer: retireEmptyTmuxServer,
+      sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+      processStart: readProcessStartIdentity,
+      log: (m) => logger.info(`[tmux-upgrade] ${m}`),
     });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
