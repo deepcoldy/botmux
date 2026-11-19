@@ -186,14 +186,13 @@ export async function confirmDispatchTask(input: {
     if (!sameTask(current)) throw new Error('dispatch_task_changed');
     if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
     const previous = current!.taskOwner!.consentMessageId;
-    // A half-finished rotation (process exit, failed card send, registry
-    // write failure) leaves a pending decision whose card differs from the
-    // routed one. When the old card becomes readable again, the early return
-    // would strand the task: neither card accepts a callback and no replacement
-    // is ever sent. Finish the rotation instead.
-    const inflight = await readTaskDecision(input.dataDir, input.secret, binding.dispatchRoot);
-    if (previous && (!inflight || inflight.cardId === previous)
-        && (!input.isCardAvailable || await input.isCardAvailable(previous))) return previous;
+    if (previous && (!input.isCardAvailable || await input.isCardAvailable(previous))) {
+      // The availability lookup is a provider wait: another caller can strand a
+      // rotation during it. Re-read after the wait so the early return cannot
+      // snapshot a decision that has since gone inflight.
+      const inflight = await readTaskDecision(input.dataDir, input.secret, binding.dispatchRoot);
+      if (!inflight || inflight.cardId === previous) return previous;
+    }
     await mkdir(dispatchTaskDecisionDirectory(input.dataDir), { recursive: true, mode: 0o700 });
     const changed = await withFileLock(decisionPath(input.dataDir, binding.dispatchRoot), async () => {
       current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
@@ -257,8 +256,13 @@ export async function confirmDispatchTask(input: {
     const current = await readTaskBinding(input.dataDir, input.secret, binding.dispatchRoot);
     if (!sameTask(current)) throw new Error('dispatch_task_changed');
     if (current!.taskOwner!.decision === 'denied') throw new Error('task_consent_denied');
+    const inflightRecord = await readTaskDecision(input.dataDir, input.secret, binding.dispatchRoot);
     if (current!.taskOwner!.consentMessageId !== messageId
+      || (inflightRecord && inflightRecord.cardId !== messageId)
       || input.isCardAvailable && !await input.isCardAvailable(messageId)) {
+      // A concurrent waiter may have stranded a rotation while this loop slept:
+      // the routed card stays the same and readable, but the decision file now
+      // names a different pending card. ensureCard finishes that rotation.
       messageId = await ensureCard();
       continue;
     }

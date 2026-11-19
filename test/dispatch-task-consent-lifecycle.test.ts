@@ -236,4 +236,38 @@ describe('source task consent card lifecycle', () => {
       consentMessageId: 'om_new', decision: 'approved',
     });
   });
+
+  it('recovers when a concurrent waiter strands a rotation during the availability wait', async () => {
+    const binding = record();
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let releaseGate!: () => void;
+    const aAtGate = new Promise<void>(resolve => { releaseGate = resolve; });
+    let finishB!: () => void;
+    const bDone = new Promise<void>(resolve => { finishB = resolve; });
+    let aSends = 0;
+    let bSends = 0;
+    const common = { dataDir: dir, secret, binding };
+    // A waits inside the card-availability lookup; B's failed rotation leaves a
+    // replacement pending while A is awaiting. A must not keep the stale snapshot.
+    const a = outcome(confirmDispatchTask({ ...common,
+      isCardAvailable: async (id: string) => { if (id === 'om_old') { releaseGate(); await bDone; } return true; },
+      send: async () => { aSends++; return 'om_newA'; },
+      checkOrigin: async () => { now += 100_000; } }));
+    await aAtGate;
+    const b = outcome(confirmDispatchTask({ ...common,
+      isCardAvailable: async () => false,
+      send: async () => { bSends++; throw new Error('injected send failure'); },
+      checkOrigin: async () => {} }));
+    expect(await b).toEqual({ error: 'injected send failure' });
+    finishB();
+    expect(await a).toEqual({ error: 'task_consent_pending' });
+    // The fix makes A finish the stranded rotation instead of timing out cardless.
+    expect(bSends).toBe(1);
+    expect(aSends).toBe(1);
+    expect(await decide('om_newA', 'approve')).toBe(true);
+    expect((await readTaskBinding(dir, secret, 'om_task'))?.taskOwner).toMatchObject({
+      consentMessageId: 'om_newA', decision: 'approved',
+    });
+  });
 });
