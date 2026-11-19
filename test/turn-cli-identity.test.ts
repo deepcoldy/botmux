@@ -67,6 +67,8 @@ const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('.
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
+const { renewExpiringBytedcliIdentities, trackedBytedcliRenewalCount, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
+const { renewBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
 const { capabilityOn, parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
@@ -86,6 +88,8 @@ beforeEach(() => {
   larkHomes.clear();
   pendingChallenges.clear();
   resolveLarkCliHomeForTurn.mockClear();
+  forgetBytedcliIdentityRenewals();
+  vi.mocked(renewBytedcliJwts).mockReset().mockResolvedValue(null);
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -1032,6 +1036,29 @@ describe('target daemon consumes signed message authority', () => {
     const body = identityBody('bytedcli', 'om_kickoff');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).not.toContain('withdrawn-card-must-not-publish');
+  });
+
+  it('keeps renewing a task turn after a transient recipient validation failure', async () => {
+    const h = await targetHarness({ member: false, taskConsent: true });
+    const expiringJwt = [
+      Buffer.from('{"alg":"none"}').toString('base64url'),
+      Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 60 })).toString('base64url'),
+      'sig',
+    ].join('.');
+    bytedcliJwts.set(ALICE, { cloudJwt: expiringJwt });
+    await h.run();
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+    // The first renewal sweep meets a transient platform failure. A false
+    // result here would permanently drop the renewal entry; a throw keeps it.
+    h.resolveTargetAppOpenId.mockResolvedValueOnce({ status: 'transient' });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renewBytedcliJwts).not.toHaveBeenCalled();
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+    // Once the platform recovers, the retained entry renews on the next sweep.
+    const fresh = 'fresh-cloud-jwt-after-transient';
+    vi.mocked(renewBytedcliJwts).mockResolvedValueOnce({ cloudJwt: fresh });
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(identityBody('bytedcli', 'om_kickoff')).toContain(fresh);
   });
 
   it('re-checks the task decision at publication time, not only at recipient lookup', async () => {

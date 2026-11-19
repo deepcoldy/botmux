@@ -338,7 +338,17 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
       if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
     }
   }
-  if (!identity || (user.taskAuthorized && !await user.taskAuthorized())) return denyDelegated(tool, args, user);
+  let taskHolds = true;
+  if (user.taskAuthorized) {
+    try {
+      taskHolds = await user.taskAuthorized();
+    } catch {
+      // Transient validation unavailability fails closed at publication; the
+      // renewal sweep treats the same throw as retryable rather than dropping.
+      taskHolds = false;
+    }
+  }
+  if (!identity || !taskHolds) return denyDelegated(tool, args, user);
   const stamped = withMeegoStore({
     ...identity,
     ...(args.turnId ? { turnId: args.turnId } : {}),

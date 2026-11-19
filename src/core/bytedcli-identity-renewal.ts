@@ -105,13 +105,42 @@ export async function renewExpiringBytedcliIdentities(
     if (expiresAt === undefined || expiresAt - now() > renewBeforeMs) continue;
     inFlight.add(key);
     try {
-      if (entry.taskAuthorized && !await entry.taskAuthorized()) { entries.delete(key); continue; }
+      if (entry.taskAuthorized) {
+        let holds: boolean;
+        try {
+          holds = await entry.taskAuthorized();
+        } catch (error) {
+          // Transient validation unavailability is not a revocation: keep the
+          // entry so a later sweep can renew once the platform recovers.
+          logger.warn(`[bytedcli-renewal] task authorization check unavailable for ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+        if (!holds) {
+          // A republished turn owns this key now; a stale entry must not delete it.
+          if (entries.get(key) !== entry) continue;
+          entries.delete(key);
+          continue;
+        }
+      }
       const jwts = await renewBytedcliJwts(entry.credentialOpenId);
       if (!jwts) {
         logger.warn(`[bytedcli-renewal] could not renew ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}; keeping current tokens`);
         continue;
       }
-      if (entry.taskAuthorized && !await entry.taskAuthorized()) { entries.delete(key); continue; }
+      if (entry.taskAuthorized) {
+        let holds: boolean;
+        try {
+          holds = await entry.taskAuthorized();
+        } catch (error) {
+          logger.warn(`[bytedcli-renewal] task authorization check unavailable for ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+        if (!holds) {
+          if (entries.get(key) !== entry) continue;
+          entries.delete(key);
+          continue;
+        }
+      }
       // The turn may have ended or been republished while the CLI ran.
       if (entries.get(key) !== entry) continue;
       if (!stillPublished(entry)) { entries.delete(key); continue; }

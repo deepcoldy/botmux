@@ -254,6 +254,34 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect(await read()).toBeUndefined();
   });
 
+  it('keeps a task denial sticky after the owner joins the target chat', async () => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: 'ou_alice' },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      // The human has since become a member of the execution chat. Membership
+      // must not reopen a consent they explicitly refused for this task.
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
   it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {
     const h = harness();
     h.ds.chatId = 'oc_target';

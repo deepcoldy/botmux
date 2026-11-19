@@ -4998,10 +4998,16 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
         // Re-checked on every use (dashboard-ipc-server): the run attempt can
         // end, or the handoff be withdrawn, while this turn still runs.
         ...(workflow ? { recheck: () => workflowDelegationRefusalFor(ds, turnId, delegation) } : {}),
-        ...(taskConsent ? { taskAuthorized: async () =>
-          identityStorageModelForDaemonSession(ds) === 'proven'
-            && !!(await checkDelegationRecipient(ds, taskConsent.authority, taskConsent)).openId
-            && identityStorageModelForDaemonSession(ds) === 'proven' } : {}),
+        ...(taskConsent ? { taskAuthorized: async () => {
+          if (identityStorageModelForDaemonSession(ds) !== 'proven') return false;
+          const result = await checkDelegationRecipient(ds, taskConsent.authority, taskConsent);
+          // A transient platform failure must not be mistaken for a revocation:
+          // the renewal sweep keeps the entry and retries instead of dropping it.
+          if (result.denied === 'target_validation_unavailable') {
+            throw new Error('task_authorization_validation_unavailable');
+          }
+          return identityStorageModelForDaemonSession(ds) === 'proven' && !!result.openId;
+        } } : {}),
       };
     }
   } catch (error) {
@@ -9496,6 +9502,13 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       if (binding?.targetLarkAppId === ds.larkAppId && binding.targetSessionId === ds.session.sessionId
           && binding.targetChatId === ds.chatId && binding.targetScope === 'thread' && !binding.attachment
           && targetConfig && capabilityOn(targetConfig.triggerUserAuth, 'bytecloud')) {
+        // An explicit refusal is sticky for this task owner. Joining the target
+        // chat later must not reopen it through the ordinary member delegation.
+        const sticky = binding.taskOwner;
+        if (sticky?.decision === 'denied' && sticky.openId === authority.openId
+            && sticky.receivingAppId === targetApp && sticky.receivingChatId === chatId) {
+          return jsonRes(res, 409, { ok: false, error: 'task_consent_denied', dispatchRoot: rootId });
+        }
         const members = await findCurrentChatUserMembers(ds.larkAppId, chatId, [authority.openId]);
         if (!members.has(authority.openId)) {
           if (!binding.taskOwner && ds.session.rootMessageId) {
