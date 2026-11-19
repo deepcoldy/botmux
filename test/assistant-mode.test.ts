@@ -2,11 +2,12 @@
  * 个人助理模式：纯函数 + 归属表。
  * Run: bun run test -- test/assistant-mode.test.ts ; bun test test/assistant-mode.test.ts
  */
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  removeTopLevelSymlinks,
   ASSISTANT_NO_REFRESH_TOKEN,
   assistantAttachmentsBucket,
   assistantUserHome,
@@ -160,5 +161,24 @@ describe('resolveAssistantOwnerOpenId — store wins over session-group owner', 
   });
   it('without a record the session-group creator still owns it', () => {
     expect(resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: A })).toBe(A);
+  });
+});
+
+describe('removeTopLevelSymlinks — owner-planted links in USER_HOME/claude', () => {
+  it('unlinks top-level symlinks, keeps real files and dirs, reports what it removed', () => {
+    const d = join(tmp, 'claude'); mkdirSync(d);
+    writeFileSync(join(d, 'settings.json'), '{}');
+    mkdirSync(join(d, 'projects'));
+    writeFileSync(join(tmp, 'shared-cred.json'), 'SHARED');
+    symlinkSync(join(tmp, 'shared-cred.json'), join(d, '.credentials.json'));
+    symlinkSync(tmp, join(d, 'statsig'));
+    expect(removeTopLevelSymlinks(d).sort()).toEqual(['.credentials.json', 'statsig']);
+    expect(readdirSync(d).sort()).toEqual(['projects', 'settings.json']);
+    expect(readFileSync(join(tmp, 'shared-cred.json'), 'utf-8')).toBe('SHARED');
+  });
+  it('missing dir → nothing; the dir itself being a symlink → throws (caller refuses spawn)', () => {
+    expect(removeTopLevelSymlinks(join(tmp, 'nope'))).toEqual([]);
+    mkdirSync(join(tmp, 'real')); symlinkSync(join(tmp, 'real'), join(tmp, 'claude'));
+    expect(() => removeTopLevelSymlinks(join(tmp, 'claude'))).toThrow(/symlink/);
   });
 });

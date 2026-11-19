@@ -2143,10 +2143,10 @@ describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
     // 助理模式不授角色库：worker 传 undefined（这里 ctx 默认就没有 roleLibrarySubtree）。
   });
 
-  it('denies the bot-wide sessions.db (it stores last user prompts) but still lets botmux send read send-cred.json', () => {
+  it('denies the bot-wide sessions.db (last user prompts) and send-cred.json (plaintext app secret)', () => {
     const p = buildFsPolicy(ownerCtx(A));
     expect(accessForPath(p.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
-    expect(accessForPath(p.rules, `${botHome}/send-cred.json`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${botHome}/send-cred.json`).access).toBe('deny');
     expect(accessForPath(p.rules, `${botHome}/claude/.credentials.json`).access).toBe('deny');
     // 非助理模式保持原样：sessions.db 只读、send-cred 随 BOT_HOME rw。
     const q = buildFsPolicy(ctx());

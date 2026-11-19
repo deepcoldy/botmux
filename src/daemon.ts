@@ -23052,6 +23052,12 @@ type AssistantSpawn =
   | { kind: 'owner'; openId: string; workDir: string }
   | { kind: 'unclaimed' };
 
+/** 只要 owner（附件分桶用）；模式关 / 未认领 → undefined。 */
+function assistantOwnerForChat(larkAppId: string, chatId: string, chatType: 'group' | 'p2p', senderOpenId: string | undefined): string | undefined {
+  const r = resolveAssistantSpawn(larkAppId, chatId, chatType, senderOpenId);
+  return r.kind === 'owner' ? r.openId : undefined;
+}
+
 function resolveAssistantSpawn(
   larkAppId: string,
   chatId: string,
@@ -23108,26 +23114,27 @@ async function handleAssistantOwnerLeft(larkAppId: string, chatId: string, userO
   // 之后 resolveAssistantOwnerOpenId 以这条 left 记录为准（表优先于 session-group）。
   if (!stored) setAssistantOwner(config.session.dataDir, larkAppId, chatId, owner, 'session-group');
   markAssistantOwnerLeft(config.session.dataDir, larkAppId, chatId);
-  const stopped = stopAssistantSessionsOfChat(larkAppId, chatId, 'assistant_owner_left');
-  logger.info(`[assistant-mode:${larkAppId}] owner ${owner.slice(0, 12)}… left ${chatId.slice(0, 12)}…; stopped ${stopped} session(s)`);
+  const n = stopAssistantSessionsOfChat(larkAppId, chatId, 'assistant_owner_left');
+  logger.info(`[assistant-mode:${larkAppId}] owner ${owner.slice(0, 12)}… left ${chatId.slice(0, 12)}…; suspended ${n.suspended}, closing ${n.closing}`);
   assistantNoticeAt.delete(`${larkAppId}:${chatId}`);
   await notifyAssistantUnclaimed(larkAppId, chatId, ASSISTANT_OWNER_LEFT_TEXT);
 }
 
-/** 停掉某群（或整个 bot，chatId 为空）的活 worker：先 suspend；suspend 被受保护状态
- *  （Codex App dispatch、迁移中等）拒绝时直接 kill——不能把「挂起失败」当成已停服，
- *  活着的 worker 还握着旧 owner 的目录授权。 */
-function stopAssistantSessionsOfChat(larkAppId: string, chatId: string | undefined, reason: string): number {
-  let stopped = 0;
-  for (const ds of activeSessions.values()) {
+/** 停掉某群（或整个 bot，chatId 为空）的活 worker：先 suspend（可恢复）；suspend 被拒
+ *  （不可挂起的后端 riff/mojo/remote-runner、受保护状态）时走 closeSession——它按各后端
+ *  自己的关闭协议收尾，而 killWorker 对未 prepare 的远端 worker 是空操作。不能把「挂起
+ *  失败」当成已停服，活着的 worker 还握着旧 owner 的目录授权。返回 {suspended, closing}。 */
+function stopAssistantSessionsOfChat(larkAppId: string, chatId: string | undefined, reason: string): { suspended: number; closing: number } {
+  const n = { suspended: 0, closing: 0 };
+  for (const ds of [...activeSessions.values()]) {
     if (ds.larkAppId !== larkAppId || (chatId !== undefined && ds.chatId !== chatId)) continue;
     if (!ds.worker || ds.worker.killed) continue;
-    if (suspendWorker(ds, reason)) { stopped++; continue; }
-    try { killWorker(ds); stopped++; } catch (e) {
-      logger.warn(`[assistant-mode:${larkAppId}] kill ${ds.session.sessionId.slice(0, 8)} failed: ${(e as Error).message}`);
-    }
+    if (suspendWorker(ds, reason)) { n.suspended++; continue; }
+    n.closing++;
+    void closeSessionHelper(ds.session.sessionId, { awaitWorkerExit: false }).catch(err =>
+      logger.warn(`[assistant-mode:${larkAppId}] close ${ds.session.sessionId.slice(0, 8)} failed: ${(err as Error).message}`));
   }
-  return stopped;
+  return n;
 }
 
 /** 归属变更（claim / admin 改绑）：退役该群里 owner 不是新主人的会话，新主人下一条消息
@@ -23147,8 +23154,8 @@ function onAssistantOwnerChanged(larkAppId: string, chatId: string, newOwner: st
 // 归属变更 / 即时开模式的副作用都在 daemon 侧退役会话（im 层与 config 层没有 activeSessions）。
 setAssistantOwnerChangedListener(onAssistantOwnerChanged);
 setAssistantModeEnabledHook((larkAppId) => {
-  const stopped = stopAssistantSessionsOfChat(larkAppId, undefined, 'assistant_mode_enabled');
-  logger.info(`[assistant-mode:${larkAppId}] enabled; stopped ${stopped} live worker(s) — sessions without an owner retire on their next message`);
+  const n = stopAssistantSessionsOfChat(larkAppId, undefined, 'assistant_mode_enabled');
+  logger.info(`[assistant-mode:${larkAppId}] enabled; suspended ${n.suspended}, closing ${n.closing} live worker(s) — sessions without an owner retire on their next message`);
 });
 
 function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
@@ -29502,6 +29509,9 @@ async function handleBotAdded(
       try {
         setAssistantOwner(config.session.dataDir, larkAppId, chatId, operatorOpenId, 'bot-added');
         logger.info(`[assistant-mode:${larkAppId}] ${chatId.substring(0, 12)} owner ← ${operatorOpenId.substring(0, 12)}… (bot-added)`);
+        // bot 被移出再由别人拉回：上一任 owner 的会话可能还活着（chat-scope 会话会被后续消息
+        // 直接复用，归属闸只在 fork 时跑），与 claim / 改绑同一条退役流程。
+        onAssistantOwnerChanged(larkAppId, chatId, operatorOpenId);
       } catch (e) {
         logger.warn(`[assistant-mode:${larkAppId}] record owner failed: ${(e as Error).message}`);
       }
@@ -31362,7 +31372,10 @@ async function handleThreadReplyAdmitted(
   if (prepared) {
     attachments = prepared.attachments;
   } else {
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId, ds?.session.assistantOwnerOpenId);
+    // 没有活会话（下面会自动建）时按当前归属解析 owner，附件才落进新会话读得到的 owner 桶。
+    const attachmentOwner = ds?.session.assistantOwnerOpenId
+      ?? assistantOwnerForChat(effectiveAppId, ctxChatId ?? data?.message?.chat_id ?? '', ctxChatType, inboundSenderOpenId);
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId, attachmentOwner);
     attachments = downloaded.attachments;
     if (workflowHandoff) attachments = [...attachments, ...workflowNodeDaemon.stageInbound(workflowHandoff, parsed.messageId)];
     if (attachments.length > 0) {

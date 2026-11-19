@@ -160,7 +160,7 @@ import { hostAuthorityPaths } from './services/project-authority-paths.js';
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
-import { assistantAttachmentsBucket, assistantUserHome, assistantWorkDir, isValidAssistantOpenId, stripRefreshToken, syncAssistantTemplate } from './core/assistant-mode.js';
+import { assistantAttachmentsBucket, assistantUserHome, assistantWorkDir, isValidAssistantOpenId, removeTopLevelSymlinks, stripRefreshToken, syncAssistantTemplate } from './core/assistant-mode.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
@@ -3114,7 +3114,12 @@ function provisionIsolatedBotHome(
       const fresh = claudeCredFromSource
         ? null
         : claudeProfileDir ? readClaudeCredFile(join(claudeProfileDir, '.credentials.json')) : freshestClaudeCred();
-      if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), stripRefreshTokenInCopy ? stripRefreshToken(fresh) : fresh);
+      if (fresh) {
+        const credBody = stripRefreshTokenInCopy ? stripRefreshToken(fresh) : fresh;
+        // 助理模式：cdir 对 owner 可写，不跟任何叶子链接（O_NOFOLLOW 临时文件 + rename）。
+        if (stripRefreshTokenInCopy) writeFileAtomic0600(join(cdir, '.credentials.json'), credBody.endsWith('\n') ? credBody : `${credBody}\n`);
+        else writeCredIfChanged(join(cdir, '.credentials.json'), credBody);
+      }
       else if (claudeCredFromSource) { /* copied by the caller from credentialsSourceDir */ }
       else if (
         !existsSync(join(cdir, '.credentials.json'))
@@ -28546,6 +28551,11 @@ async function spawnCliBody(
       mkdirSync(expectedWork, { recursive: true, mode: 0o700 });
       for (const p of [ownBotHome!, assistantUserHomeDir, expectedWork]) {
         if (lstatSync(p).isSymbolicLink()) refuse(`${p} is a symlink`);
+      }
+      // provisioning 往 claude/ codex/ 写凭证与配置，先清掉 owner 预埋的顶层链接（见 removeTopLevelSymlinks）。
+      for (const sub of ['claude', 'codex']) {
+        const removed = removeTopLevelSymlinks(join(assistantUserHomeDir, sub));
+        if (removed.length) log(`[assistant-mode] removed planted symlinks in ${sub}/: ${removed.join(', ')}`);
       }
     } catch (e) {
       if ((e as Error).message.startsWith('[assistant-mode]')) throw e;

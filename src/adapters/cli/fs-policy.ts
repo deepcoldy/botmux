@@ -108,8 +108,9 @@ export interface FsPolicyContext {
   /** 个人助理模式开关。开了之后：① 不授整 bot 的 `session-stores/<appId>`（sessions.db
    *  里存着每个会话最近一条用户输入，不是纯元数据；CLI 走 daemon IPC 解析会话）；② 不给
    *  lark-cli 自己的 appsecret 密文 + 主密钥（拿到就能自己换 tenant token，绕过「bot 身份
-   *  默认关」的 IPC 闸）；③ 真 BOT_HOME 的 `send-cred.json` 只读放行（它在 users/ 之外，
-   *  `botmux send` 要读它注册本 bot）。 */
+   *  默认关」的 IPC 闸）；③ 真 BOT_HOME 的 `send-cred.json` 也**不**放行——它存着明文
+   *  larkAppSecret，与 ② 同一个洞。沙盒内 `botmux send` 走 outbox relay 不需要它；
+   *  `history` / `quoted` / `list` 在助理沙盒里因此不可用（它们要直连飞书或读会话库）。 */
   assistantMode?: boolean;
   /** This bot's OWN role-library subtree (`<roleLibraryRoot>/<appId>`) — readWrite.
    *  Optional: absent when the subtree does not exist (bot never used roles) or
@@ -973,11 +974,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     push([
       `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
     ], 'readOnly', 'internal');
-  } else {
-    // 助理模式：sessions.db 不授（见 ctx.assistantMode 注释）；send-cred 在真 BOT_HOME，
-    // 而 ctx.botHome 已是 owner 的 USER_HOME，单独只读放行这一个文件。
-    push([`${ctx.botmuxHome}/bots/${ctx.currentAppId}/send-cred.json`], 'readOnly', 'internal');
   }
+  // 助理模式：sessions.db 与真 BOT_HOME（含 send-cred.json）都不授，见 ctx.assistantMode。
   // Own upload bucket — readWRITE: `botmux quoted` / downloadResources writes the
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the

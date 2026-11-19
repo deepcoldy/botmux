@@ -104,6 +104,28 @@ export interface AssistantOwnerRecord {
 }
 
 /**
+ * 冷启动前清掉 owner 可写目录（USER_HOME/claude、USER_HOME/codex）顶层的符号链接。
+ * worker 在宿主上跑、不受沙盒约束：provisioning 要往这些目录写 `.credentials.json` /
+ * `settings.json` / `.claude.json` / `config.toml`，owner 要是把同名文件链到共享的
+ * `~/.claude/...`，宿主就替他把（去 RT 的）凭证或 hooks 写进全机共享文件。目录本身是
+ * 链接 → 抛错（调用方拒绝 spawn）。返回被删掉的条目名。
+ */
+export function removeTopLevelSymlinks(dir: string): string[] {
+  let st;
+  try { st = lstatSync(dir); } catch { return []; }
+  if (st.isSymbolicLink()) throw new Error(`${dir} is a symlink`);
+  if (!st.isDirectory()) return [];
+  const removed: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    try {
+      if (lstatSync(p).isSymbolicLink()) { unlinkSync(p); removed.push(name); }
+    } catch { /* 并发消失 → 忽略 */ }
+  }
+  return removed;
+}
+
+/**
  * 会话归属判定（纯函数）。返回 owner open_id；`null` = 群未认领 / owner 已退，
  * 调用方不得 spawn。私聊永远归发消息的人。群：**归属表优先**——表里有记录就以表为准
  * （`left` 记录 = 待认领，哪怕是 /group 会话群的建群人退了群也停服）；没记录时会话群
