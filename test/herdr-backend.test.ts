@@ -2603,6 +2603,27 @@ describe('HERDR CLI process identity', () => {
     expect(herdrCall('process-info')).toEqual(['--session', SESSION, 'pane', 'process-info', '--pane', 'exact-pane']);
     be.kill();
   });
+  it('re-reads foreground launch identity independently of cliPid rewrites', () => {
+    let processes: any[] = [];
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: processes } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    expect(be.getChildPid()).toBeNull();
+    processes = [{ pid: 21, argv: ['/bin/claude'] }];
+    expect(be.getChildPid()).toBe(21);
+    expect(be.getStablePanePid()).toBe(21);
+    be.cliPid = 22;
+    processes = [{ pid: 30, argv: ['/bin/claude'] }];
+    expect(be.getChildPid()).toBe(22);
+    expect(be.getStablePanePid()).toBe(30);
+    processes = [];
+    expect(be.getStablePanePid()).toBeNull();
+    processes = [{ pid: 30, argv: ['/bin/claude'] }];
+    expect(be.getStablePanePid()).toBe(30);
+    be.kill();
+  });
 });
 
 

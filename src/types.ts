@@ -2971,15 +2971,40 @@ export type WorkerToDaemonBase =
       /** Provider-neutral recovery hint. Only an explicit true authorizes the
        * daemon's bounded ordinary-turn continuation policy. */
       retryable?: boolean;
-      /** Positive silence evidence. Only set to 'nothing_to_send' when the
-       *  worker's bridge gate deliberately suppressed this turn as genuine
-       *  silence (the model terminated with a bare nothing-to-send sentinel and
-       *  no `botmux send`). It is the ONLY signal a durable/async caller may use
-       *  to settle a turn as completed-with-empty-output. Absent on every other
-       *  `completed` terminal — including the RPC-hydration timeout path, which
-       *  emits `completed` with no final_output after fs-lag and must NOT be
-       *  read as silence (that would mask a real, still-arriving answer). */
-      outputDisposition?: 'nothing_to_send';
+      /** Positive no-output evidence, keyed by cause. Consumers must treat an
+       *  unknown value exactly like an ABSENT one (settle only on the exact
+       *  value you positively know), so new members stay backward-safe for
+       *  older daemons.
+       *  - 'nothing_to_send': the worker's bridge gate deliberately suppressed
+       *    this turn as genuine silence (the model terminated with a bare
+       *    nothing-to-send sentinel and no `botmux send`). It is the ONLY signal
+       *    that lets a durable/async caller settle the turn as
+       *    completed-with-empty-output.
+       *  - 'boundary_unobserved': the claude transcript bridge popped a real
+       *    (non-local) turn at a screen-idle boundary WITHOUT observing any
+       *    transcript terminal (`!terminalObserved`: neither an assistant
+       *    stop_reason/API-error record nor a next-turn-start compatibility
+       *    boundary), WITHOUT emitting `final_output` / observing an explicit
+       *    final `botmux send`, and WITHOUT silence evidence. The dominant
+       *    cause is the CLI dying mid-turn (killed/crashed): the frozen pane
+       *    then looks idle to the screen detector, so this boundary is a
+       *    heuristic, not proof the model finished. An HTTP async/wait caller
+       *    must settle this fail-closed — no output was ever observed; the
+       *    claude bridge guarantees `final_output` precedes this terminal, so
+       *    no answer can still arrive.
+       *  - 'explicit_final_delivered': the claude transcript bridge popped a
+       *    real (non-local) turn without transcript terminal evidence, but an
+       *    explicit final `botmux send` marker proves the answer was delivered
+       *    over IM and no `final_output` was emitted (the HTTP channel has no
+       *    captured content). HTTP wait/async callers settle
+       *    completed-with-empty-output — the turn is delivered, just not over
+       *    the HTTP transport. Rides the terminal so a restarted daemon still
+       *    converges instead of leaving the trigger `running`.
+       *  Absent on every other `completed` terminal — including the
+       *  RPC-hydration timeout path, which emits `completed` with no
+       *  final_output after fs-lag and must NOT be read as silence or as a dead
+       *  turn (that would mask a real, still-arriving answer). */
+      outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered';
       /** Wall-clock epoch ms at which the CLI turn actually reached its native
        *  terminal. Absent when the emitter cannot vouch for a real instant, in
        *  which case the recorder falls back to its own write time (which is NOT

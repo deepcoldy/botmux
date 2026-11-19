@@ -95,6 +95,33 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.controller.ingest(reading(3), s.worker)).toMatchObject({ kind: 'reject' });
   });
 
+  it('admits current close receipts while closing without admitting runtime input or stale workers', () => {
+    const s = fixture();
+    s.controller.beginControl('close');
+    for (const type of ['close_result', 'close_abort_result']) {
+      expect(s.controller.gateway.admit(type, s.context(1), s.worker).kind).toBe('worker');
+      expect(s.controller.gateway.admit(type, s.context(2, {}), s.worker).kind).toBe('worker');
+    }
+    expect(s.controller.gateway.admit('prompt_ready', s.context(3), s.worker).kind).toBe('reject');
+    s.controller.bindWorker(2);
+    expect(s.controller.gateway.admit('close_result', s.context(4), s.worker).kind).toBe('reject');
+  });
+
+  it('binds only the current close operation to a remote control runtime and keeps input fenced', () => {
+    const s = fixture();
+    const { operation } = s.controller.beginControl('close');
+    const producer = s.controller.bindWorker(2).worker;
+    const identity = { backend: 'remote-runner', physicalId: 'control-provider', proof: 'opaque' as const };
+    s.controller.reserveBinding('control', producer);
+    const bound = s.controller.bindRuntime('control', producer, identity, operation.operationId);
+    expect(bound.phase).not.toBe('retiring');
+    expect(s.store.read(s.ref)?.activeRuntime).toEqual(bound.ref);
+    expect(s.controller.allowsInput()).toBe(false);
+    expect(s.ds.workerReady).toBe(false);
+    s.controller.reserveBinding('stale-control', producer);
+    expect(s.controller.bindRuntime('stale-control', producer, { ...identity, physicalId: 'stale' }, 'old-close').phase).toBe('retiring');
+  });
+
   // The worker's input-queue report describes the worker's own queue: a
   // callback started under a runtime that was re-bound in process since then
   // still reports the live queue, and it is reported only when it changes.

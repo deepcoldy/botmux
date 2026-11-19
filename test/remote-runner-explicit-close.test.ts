@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -58,9 +58,13 @@ import {
   __testOnly_setupWorkerHandlers,
   __testOnly_wakeRemoteRunnerWorkerForExplicitClose,
   closeSession,
+  findActiveBySessionId,
   initWorkerPool,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
+import type { DaemonToWorker } from '../src/types.js';
+import { controllerForSession } from '../src/core/session-controller.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 let dataDir: string;
@@ -131,6 +135,14 @@ function createFixture(liveWorker: boolean): {
   return { ds, worker };
 }
 
+function canonicalFixture(online = true, liveWorker = true) {
+  const fixture = createFixture(liveWorker);
+  const controller = controllerForSession(fixture.ds, true)!;
+  const bootstrap = controller.bindWorker(fixture.ds.workerGeneration ?? 0);
+  if (online) controller.store.apply(controller.ref, { type: 'worker_online', worker: bootstrap.worker });
+  return { ...fixture, controller, bootstrap };
+}
+
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-remote-close-'));
   previousDataDir = config.session.dataDir;
@@ -154,6 +166,90 @@ afterEach(() => {
 });
 
 describe('remote runner explicit close', () => {
+  it('closes a handshaken canonical worker while input readiness is fenced', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ds, worker, controller } = canonicalFixture();
+      expect(ds.workerReady).toBe(true);
+      const closing = closeSession(ds.session.sessionId);
+      expect(ds.workerReady).toBe(false);
+      expect(controller.allowsInput()).toBe(false);
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(closing).resolves.toMatchObject({ ok: true, outcome: 'closed' });
+      expect(worker!.send.mock.calls.some(([message]) => message.type === 'close')).toBe(true);
+      expect(controller.store.read(controller.ref)?.lifecycle).toBe('closed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['idle', 'dormant', 'active'] as const)('closes a real %s canonical worker through provider cancel ACK', async mode => {
+    const { ds } = createFixture(false);
+    const commandsPath = join(dataDir, 'commands.jsonl');
+    const provider = join(dataDir, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const emit = event => process.stdout.write(JSON.stringify({ protocol: 'botmux.remote-runner', version: 1, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') emit({ type: 'hello', requestId: command.requestId, provider: 'test-provider', capabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status'] });
+  if (command.type === 'resume') emit({ type: 'ready', requestId: command.requestId, state: command.state });
+  if (command.type === 'turn') emit({ type: 'status', requestId: command.requestId, status: 'busy' });
+  if (command.type === 'cancel') emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+});
+`);
+    chmodSync(provider, 0o755);
+    const controller = controllerForSession(ds, true)!;
+    const operation = mode === 'dormant' ? controller.beginControl('close').operation : undefined;
+    if (operation) controller.controlStarted(operation.operationId);
+    const bootstrap = controller.bindWorker(1);
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    const init = {
+      type: 'init', sessionId: ds.session.sessionId, chatId: ds.chatId,
+      rootMessageId: ds.session.rootMessageId, workingDir: dataDir,
+      cliId: 'remote-runner', cliPathOverride: provider, backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'test-provider', operationTimeoutMs: 1000 },
+      remoteBackendState: ds.session.remoteBackendState, prompt: '',
+      larkAppId: 'app', larkAppSecret: 'test', sessionContract: bootstrap,
+      ...(operation ? { sessionCommand: { version: 2 as const, operationId: operation.operationId } } : {}),
+    } satisfies DaemonToWorker;
+    ds.initConfig = init;
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'), env: { ...process.env, SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: join(dataDir, 'bots.json'), BOTMUX_SESSION_ID: ds.session.sessionId,
+        LARK_APP_ID: 'app', LARK_APP_SECRET: 'test' },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    ds.worker = child;
+    const logs: string[] = [];
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', message => logs.push(JSON.stringify(message)));
+    __testOnly_setupWorkerHandlers(ds, child, undefined, 1);
+    try {
+      child.send(init);
+      await vi.waitFor(() => expect(controller.store.read(controller.ref)?.workerOnline, logs.join('')).toBe(true), { timeout: 15_000 });
+      if (mode === 'active') {
+        controller.admitInput('active-turn', 1);
+        child.send({ type: 'message', content: 'keep running', turnId: 'active-turn', dispatchAttempt: 1 });
+        await vi.waitFor(() => expect(readFileSync(commandsPath, 'utf8')).toContain('"type":"turn"'));
+      }
+      const result = await closeSession(ds.session.sessionId);
+      expect(result, logs.join('\n')).toMatchObject({ ok: true, outcome: 'closed' });
+      const commands = readFileSync(commandsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(commands.map(command => command.type)).toContain('cancel');
+      expect(commands.map(command => command.type)).not.toContain('start');
+      if (mode !== 'active') expect(commands.map(command => command.type)).not.toContain('turn');
+      expect(findActiveBySessionId(ds.session.sessionId)).toBeUndefined();
+      expect(controller.store.read(controller.ref)?.lifecycle).toBe('closed');
+      expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  });
+
   it('uses prepare/commit before publishing a live remote session closed', async () => {
     const { ds, worker } = createFixture(true);
 
@@ -196,6 +292,7 @@ describe('remote runner explicit close', () => {
       alreadyClosed: false,
       error: 'remote_runner_worker_missing',
       retryable: true,
+      effect: 'not_dispatched',
     });
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
   });
@@ -341,7 +438,7 @@ describe('remote runner explicit close', () => {
   });
 
   it('keeps a provider-proven retryable close active without latching a fence', async () => {
-    const { ds, worker } = createFixture(true);
+    const { ds, worker, controller } = canonicalFixture();
     worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {
       if (message.type === 'close' && message.requestId) {
         queueMicrotask(() => worker!.emit('message', {
@@ -367,11 +464,145 @@ describe('remote runner explicit close', () => {
       alreadyClosed: false,
       error: 'remote_runner_worker_close_failed',
       retryable: true,
+      effect: 'rejected',
       recovery: 'retryable',
     });
+    expect(controller.store.read(controller.ref)?.lifecycle).toBe('active');
+    expect(controller.allowsInput()).toBe(true);
     expect(ds.remoteCloseState).toBeUndefined();
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
   });
+
+  it('restores canonical admission after a proven pre-dispatch failure', async () => {
+    const { ds, controller } = canonicalFixture(false, false);
+    __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: false, effect: 'not_dispatched', retryable: true,
+    });
+    expect(controller.store.read(controller.ref)).toMatchObject({ lifecycle: 'active' });
+    expect(controller.allowsInput()).toBe(true);
+    expect(ds.remoteCloseState).toBeUndefined();
+  });
+
+  it('reconciles a historical uncertain close only after a current worker ACK', async () => {
+    const { ds, controller } = canonicalFixture();
+    const { operation } = controller.beginControl('close');
+    controller.controlStarted(operation.operationId);
+    controller.controlResult(operation.operationId, 'uncertain', undefined, 'remote_runner_worker_missing');
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({ ok: true });
+    expect(controller.store.read(controller.ref)?.lifecycle).toBe('closed');
+    expect(controller.operation(operation.operationId)?.phase).toBe('confirmed');
+  });
+
+  it('waits for the real handshake while closing and never opens input', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ds, worker, controller, bootstrap } = canonicalFixture(false);
+      const closing = closeSession(ds.session.sessionId);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(worker!.send.mock.calls.some(([message]) => message.type === 'close')).toBe(false);
+      controller.store.apply(controller.ref, { type: 'worker_online', worker: bootstrap.worker });
+      expect(ds.workerReady).toBe(false);
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(closing).resolves.toMatchObject({ ok: true });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['worker', 'generation', 'session', 'operation'] as const)(
+    'rejects changed %s ownership while waiting for handshake', async change => {
+      vi.useFakeTimers();
+      try {
+        const { ds, worker, controller, bootstrap } = canonicalFixture(false);
+        const closing = closeSession(ds.session.sessionId);
+        await vi.advanceTimersByTimeAsync(100);
+        if (change === 'worker') ds.worker = createFakeWorker() as never;
+        if (change === 'generation') ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+        if (change === 'session') ds.session = { ...ds.session, sessionId: 'replacement' };
+        if (change === 'operation') {
+          controller.controlResult(controller.operation()!.operationId, 'failed_before_effect');
+          controller.beginControl('suspend');
+        }
+        controller.store.apply(controller.ref, { type: 'worker_online', worker: bootstrap.worker });
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(closing).resolves.toMatchObject({ ok: false });
+        expect(worker!.send.mock.calls.some(([message]) => message.type === 'close')).toBe(false);
+      } finally { vi.useRealTimers(); }
+    },
+  );
+
+  it('keeps a missing close ACK uncertain and preserves that evidence on retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ds, worker, controller } = canonicalFixture();
+      worker!.send.mockImplementation(() => true);
+      const closing = closeSession(ds.session.sessionId);
+      await vi.advanceTimersByTimeAsync(35_100);
+      await expect(closing).resolves.toMatchObject({ ok: false, effect: 'unknown', recovery: 'uncertain' });
+      expect(controller.store.read(controller.ref)?.lifecycle).toBe('closing');
+      expect(controller.operation()?.phase).toBe('uncertain');
+      expect(controller.allowsInput()).toBe(false);
+      // A retry with no worker is not proof the previous cancel never ran.
+      ds.worker = null;
+      ds.remoteCloseState = undefined;
+      __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
+      await closeSession(ds.session.sessionId);
+      expect(controller.operation()?.phase).toBe('uncertain');
+      expect(controller.allowsInput()).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps a close left applying by a daemon crash fenced when the retry fails before dispatch', async () => {
+    // The earlier daemon persisted the close as applying and died before any
+    // result: its cancel may already have reached the provider.
+    const first = canonicalFixture();
+    const { operation } = first.controller.beginControl('close');
+    first.controller.controlStarted(operation.operationId);
+    // Restart: a fresh DaemonSession over the same durable contract, no worker.
+    const ds = { ...first.ds, worker: null, remoteCloseState: undefined,
+      initConfig: { backendType: 'remote-runner' } } as unknown as DaemonSession;
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    const controller = controllerForSession(ds, true)!;
+    __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({ ok: false, effect: 'not_dispatched' });
+    expect(controller.store.read(controller.ref)?.lifecycle).toBe('closing');
+    expect(controller.operation(operation.operationId)?.phase).toBe('uncertain');
+    expect(controller.allowsInput()).toBe(false);
+  });
+
+  it.each([
+    { kind: 'cancel', phase: 'uncertain' },
+    { kind: 'cancel', phase: 'applying' },
+    { kind: 'suspend', phase: 'uncertain' },
+    { kind: 'restart', phase: 'uncertain' },
+    { kind: 'restart', phase: 'applying' },
+  ] as const)(
+    'keeps input fenced when a close supersedes an unsettled $kind ($phase) and then fails before dispatch',
+    async ({ kind, phase }) => {
+      const { ds, controller } = canonicalFixture();
+      // An unsettled non-close operation owns the session; input is fenced.
+      const prior = controller.beginControl(kind).operation;
+      controller.controlStarted(prior.operationId);
+      if (phase === 'uncertain') {
+        controller.controlResult(prior.operationId, 'uncertain', undefined, 'lost ack');
+      }
+      expect(controller.allowsInput()).toBe(false);
+      // No live worker: the superseding close must wake a control worker, and
+      // the wake fails before any cancel is dispatched.
+      ds.worker = null;
+      ds.remoteCloseState = undefined;
+      __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
+      await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({ ok: false, effect: 'not_dispatched' });
+      // The close cannot prove the superseded operation had no effect, so it
+      // must stay uncertain and keep the session fenced rather than reverting
+      // lifecycle to active / reopening input.
+      const state = controller.store.read(controller.ref);
+      expect(state?.lifecycle).toBe('closing');
+      expect(state?.activeOperationId).toBeTruthy();
+      expect(controller.operation()?.phase).toBe('uncertain');
+      expect(controller.operation(prior.operationId)?.phase).toBe('uncertain');
+      expect(controller.allowsInput()).toBe(false);
+    },
+  );
 
   it('uses an empty, non-deferred resume fork for the control-only wake', async () => {
     const { ds } = createFixture(false);
@@ -424,6 +655,7 @@ describe('remote runner explicit close', () => {
       alreadyClosed: false,
       error: 'remote_runner_worker_missing',
       retryable: true,
+      effect: 'not_dispatched',
     });
     expect(ds.remoteCloseState).toBeUndefined();
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
