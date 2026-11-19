@@ -984,6 +984,20 @@ export class HerdrBackend implements SessionBackend {
 
   getChildPid(): number | null {
     if (this.cliPid) return this.cliPid;
+    const pid = this.readForegroundLaunchPid();
+    if (pid !== null) this.cliPid = pid;
+    return this.cliPid ?? null;
+  }
+
+  getStablePanePid(): number | null {
+    // Re-read the same foreground launch identity that supplied the worker's
+    // original panePid, but never consult the cliPid later refined by wrapper
+    // discovery. A transient initial failure can therefore recover to the same
+    // identity; a real foreground replacement fails the retry fence.
+    return this.readForegroundLaunchPid();
+  }
+
+  private readForegroundLaunchPid(): number | null {
     if (!this.paneId || !this.cliExecutable || this.exited) return null;
     // HERDR owns the process, so it is not a child of the worker. Resolve
     // the exact pane's foreground CLI for the worker's procStart-bound marker.
@@ -997,9 +1011,7 @@ export class HerdrBackend implements SessionBackend {
         && basename(executable) === this.cliExecutable
         && Number.isSafeInteger(p.pid) && p.pid > 1 && p.pid !== info.shell_pid;
     });
-    if (candidates.length !== 1) return null;
-    this.cliPid = candidates[0].pid;
-    return this.cliPid ?? null;
+    return candidates.length === 1 ? candidates[0].pid : null;
   }
 
   getAttachInfo() {

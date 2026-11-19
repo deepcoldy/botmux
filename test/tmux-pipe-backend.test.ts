@@ -1135,6 +1135,17 @@ describe('TmuxPipeBackend.getChildPid', () => {
     expect(cmd).toContain('#{pane_pid}');
     expect(cmd).not.toContain('list-panes');
   });
+  it('re-reads the stable pane pid independently of cliPid rewrites', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockClear();
+    mockedExecSync.mockReturnValue('45678\n' as any);
+    expect(be.getStablePanePid()).toBe(45678);
+    be.cliPid = 999;
+    expect(be.getChildPid()).toBe(45678);
+    mockedExecSync.mockReturnValue('56789\n' as any);
+    expect(be.getStablePanePid()).toBe(56789);
+  });
 });
 
 describe('TmuxPipeBackend.captureCurrentScreen', () => {

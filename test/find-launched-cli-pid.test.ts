@@ -9,6 +9,7 @@ import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS } from '../src/utils/codex-app-control.js';
 import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from '../src/core/traex-leaf-pid.js';
+import { zmxStablePanePidFromProbe } from '../src/adapters/backend/zmx-backend.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
 function makeScheduler() {
@@ -119,18 +120,45 @@ function runWorkerWiring(late: boolean, options: {
   /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
    *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
   aliasedChildPid?: boolean;
+  /** Stable backing-pane identity, independent of cliPid rewrites. */
+  stablePanePid?: number | null;
+  /** Model a backend without the optional stable-pane accessor (worker falls back to getChildPid). */
+  stablePaneAccessor?: boolean;
+  /** ZMX launch=100 vs PTY-root=10 shape, with a controllable list-probe answer. */
+  zmxStablePane?: { probeOk: boolean; rootPid: number | null; backingPid: number };
   /** Run the real BFS over the synthetic table (`children` / `childComms`)
    *  with the depth the worker passes, instead of the canned result. */
   realCodexSearch?: boolean;
-  credentialOnlyBwrap?: boolean;
   /** Pids whose process has exited: their birth token no longer reads back. */
   exited?: number[];
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
-  const backend: { cliPid: number; getChildPid: () => number } = {
+  const backend: {
+    cliPid: number;
+    getChildPid: () => number;
+    getStablePanePid?: () => number | null;
+  } = {
     cliPid: 100,
     getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
+    ...(options.stablePaneAccessor === false ? {} : {
+      getStablePanePid: () => {
+        const zmx = options.zmxStablePane;
+        if (zmx) {
+          const probeOk = zmx.probeOk;
+          // Consume a synthetic one-shot failure at the actual accessor call,
+          // so both synchronous and late-PID binding exercise initial recovery.
+          zmx.probeOk = true;
+          return zmxStablePanePidFromProbe(probeOk ? {
+            ok: true as const,
+            sessions: zmx.rootPid === null ? [] : ['zmx'],
+            unhealthySessions: [],
+            raw: zmx.rootPid === null ? '' : `  name=zmx\tpid=${zmx.rootPid}\tclients=1\tcmd=/bin/sh\n`,
+          } : { ok: false }, 'zmx', zmx.backingPid);
+        }
+        return options.stablePanePid === undefined ? 100 : options.stablePanePid;
+      },
+    }),
   };
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ...args: unknown[]) {
     if (scheduler.now() < (options.launchedCliAfterMs ?? 0)) return null;
@@ -716,6 +744,81 @@ describe('worker wrapper PID wiring', () => {
   it.each([false, true])('retries generic wrapper publication after an aliased backend rewires its child PID (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', aliasedChildPid: true,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) { failedLeaf = true; return false; }
+          return true;
+        });
+      },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
+  });
+
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])('stops wrapper retries when the stable pane changes after a failed publication (accessor=%s, late PID=%s)', (useStableAccessor, late) => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude',
+      stablePaneAccessor: useStableAccessor,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) {
+            failedLeaf = true;
+            if (useStableAccessor) scope.backend.getStablePanePid = () => 300;
+            else scope.backend.getChildPid = () => 300;
+            return false;
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(1);
+  });
+
+  it.each([false, true])('recovers wrapper retries when the initial stable-pane probe is temporarily unavailable (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', stablePanePid: null,
+      beforeTimers: scope => {
+        scope.backend.getStablePanePid = () => 100;
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) { failedLeaf = true; return false; }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
+  });
+
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])('keeps ZMX wrapper discovery alive across an initial list-probe failure (fail first=%s, late PID=%s)', (failFirst, late) => {
+    const zmxStablePane = { probeOk: false, rootPid: 10 as number | null, backingPid: 10 };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude',
+      aliasedChildPid: true, zmxStablePane,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (failFirst && pid === 200 && !failedLeaf) { failedLeaf = true; return false; }
+          return true;
+        });
+      },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200))
+      .toHaveLength(failFirst ? 2 : 1);
+  });
+
+  it.each([false, true])('keeps aliased wrapper retries alive when the stable pane differs from the launcher (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude',
+      aliasedChildPid: true, stablePanePid: 10,
       beforeTimers: scope => {
         let failedLeaf = false;
         scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
