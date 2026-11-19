@@ -22,6 +22,8 @@
  *   • grantDelegateBots         — 委托授权的外部 bot 显式名单（ou_ open_id / cli_ app_id）：
  *                                 名单里的 bot @ 本 bot 时点名的人自动获本群对话授权。
  *                                 同机 Bot 之外的第二条委托来源；默认空，空名单不写盘。
+ *   • scheduleCreateByTalkers   — 允许只能对话的真人在对话里为自己创建定时任务（默认关，
+ *                                 只落显式 true；边界见 core/schedule-talker.ts）。
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot } from '../bot-registry.js';
@@ -45,6 +47,8 @@ export interface BotGrantPrefs {
   trustSameOwnerBots: boolean;
   /** 委托授权的外部 bot 显式名单（ou_ / cli_）。空数组 = 未配置（默认）。 */
   grantDelegateBots: string[];
+  /** 允许只能对话的真人为自己创建定时任务。默认 false。 */
+  scheduleCreateByTalkers: boolean;
 }
 
 /** grantDelegateBots 条目归一化：trim、丢空白项、去重（与 bot-registry 解析同口径）。 */
@@ -73,6 +77,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
         : null,
       trustSameOwnerBots: c.trustSameOwnerBots !== false,
       grantDelegateBots: c.grantDelegateBots ?? [],
+      scheduleCreateByTalkers: c.scheduleCreateByTalkers === true,
     };
   } catch {
     return {
@@ -84,6 +89,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
       grantDefaultDurationMs: null,
       trustSameOwnerBots: true,
       grantDelegateBots: [],
+      scheduleCreateByTalkers: false,
     };
   }
 }
@@ -99,6 +105,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
  *   • grantDefaultDurationMs=null → 删 key（恢复产品默认 1 小时）；合法有限时长 → 写入
  *   • trustSameOwnerBots=true → 删 key（默认开启）；false → 显式写 false
  *   • grantDelegateBots=[] → 删 key（空名单不写盘）；非空 → 归一化（trim/去空白/去重）后写入
+ *   • scheduleCreateByTalkers=false → 删 key（缺省即关闭）；true → 显式写 true
  * 返回写后解析出的完整 prefs。
  */
 export async function updateBotGrantPrefs(
@@ -160,6 +167,10 @@ export async function updateBotGrantPrefs(
       if (list.length > 0) entry.grantDelegateBots = list;
       else delete entry.grantDelegateBots;
     }
+    if (patch.scheduleCreateByTalkers !== undefined) {
+      if (patch.scheduleCreateByTalkers) entry.scheduleCreateByTalkers = true;
+      else delete entry.scheduleCreateByTalkers;
+    }
     return {
       write: true,
       result: {
@@ -175,6 +186,7 @@ export async function updateBotGrantPrefs(
         grantDelegateBots: Array.isArray(entry.grantDelegateBots)
           ? normalizeDelegateBots(entry.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string'))
           : [],
+        scheduleCreateByTalkers: entry.scheduleCreateByTalkers === true,
       },
     };
   });
@@ -223,6 +235,11 @@ export async function updateBotGrantPrefs(
       ? r.result.grantDelegateBots
       : undefined;
   }
+  if (patch.scheduleCreateByTalkers !== undefined) {
+    // Read live by the schedule routes and by every fire of a talker task, so
+    // turning it off stops those tasks without a restart.
+    bot.config.scheduleCreateByTalkers = patch.scheduleCreateByTalkers || undefined;
+  }
   logger.info(
     `[grant-prefs:${larkAppId}] restrictGrantCommands=${r.result.restrictGrantCommands} ` +
     `autoGrantRequestCards=${r.result.autoGrantRequestCards} ` +
@@ -231,7 +248,8 @@ export async function updateBotGrantPrefs(
     `messageQuotaDefaultLimit=${r.result.messageQuotaDefaultLimit ?? 'built-in'} ` +
     `grantDefaultDurationMs=${r.result.grantDefaultDurationMs ?? 'default'} ` +
     `trustSameOwnerBots=${r.result.trustSameOwnerBots} ` +
-    `grantDelegateBots=${r.result.grantDelegateBots.length > 0 ? r.result.grantDelegateBots.join('/') : 'none'}`,
+    `grantDelegateBots=${r.result.grantDelegateBots.length > 0 ? r.result.grantDelegateBots.join('/') : 'none'} ` +
+    `scheduleCreateByTalkers=${r.result.scheduleCreateByTalkers}`,
   );
   return { ok: true, prefs: r.result };
 }

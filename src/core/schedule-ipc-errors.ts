@@ -40,6 +40,24 @@ const SCHEDULE_IPC_ERROR_TEXT: Record<string, string> = {
   schedule_run_as_invalid: '--run-as 需要本 bot 应用下的 open_id（ou_ 开头）或飞书邮箱。',
   schedule_run_as_unresolved: '无法解析 --run-as 用户的 union_id；确认 open_id 属于本 bot 应用，或邮箱对本 bot 可见。',
   schedule_run_as_not_allowed: '--run-as 用户当前不能操作本 bot（不在允许名单内），定时任务未创建。',
+  schedule_delegation_operator_denied:
+    '当前发起人不是本 bot 管理员（或不是目标群成员），不能在对话里创建定时任务；'
+    + '管理员可在 Dashboard「授权与额度」开启「允许能对话的用户为自己创建定时任务」。定时任务未创建。',
+  schedule_talker_create_disabled:
+    '创建期间本 bot 关闭了「允许能对话的用户为自己创建定时任务」；定时任务未创建。',
+  schedule_talker_identity_unresolved:
+    '无法确认发起人的飞书身份（union_id），不能为非管理员创建定时任务；请稍后重试。定时任务未创建。',
+  schedule_talker_scope_invalid:
+    '非管理员创建的定时任务只能投到当前会话（顶层或当前话题），不支持跨群、新话题、跟随话题、本地投递、'
+    + 'until-done 或通知设置。定时任务未创建。',
+  schedule_talker_root_mismatch:
+    '非管理员创建的定时任务只能绑定当前话题；请在目标话题里创建。定时任务未创建。',
+  schedule_talker_root_forbidden:
+    '顶层执行的定时任务不能再指定话题根消息。定时任务未创建。',
+  schedule_talker_operator_denied:
+    '发起人当前不能在目标群对话或已不是群成员，不能创建定时任务。定时任务未创建。',
+  schedule_talker_task_limit:
+    '你在本 bot 的定时任务已达上限（启用或暂停中的都算）；请先删除不再需要的任务。定时任务未创建。',
   silent_message_listener:
     '来源群已设置静默执行，不能把定时任务投到来源群；任务需要定时发往其他群时请显式指定 --chat-id。定时任务未创建。',
 };

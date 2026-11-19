@@ -128,3 +128,41 @@
 
 配置仅属于同一宿主信任域；跨部署不共享签名存储时不适用。PR 不修改实际团队授权
 或重启服务。上线时应先在隔离测试群验证机器人触发、report 后再次派单、精确清理和撤权。
+
+## 对话用户自建定时任务（`scheduleCreateByTalkers`）
+
+默认情况下，会话内 `botmux schedule add` 的 direct 路径只认本 Bot 管理员
+（`getDashboardAdminOpenIds`），其余真人返回 `schedule_delegation_operator_denied`。
+面向全公司的业务 Bot（p2pOpen / defaultOncall，普通同事只有 talk 权限）里，这让管理员成为
+「帮我每天 9 点发个汇总」类需求的瓶颈，而把人加进 allowedUsers 又会连带给出全部 canOperate。
+
+Bot 级开关 `scheduleCreateByTalkers`（Dashboard「授权与额度」同步；默认关）开启后，
+`directHuman` 且非管理员、但通过 `evaluateTalk` 的调用方也可以创建定时任务，边界如下
+（实现见 `core/schedule-talker.ts`）：
+
+- **任务归发起人本人**：`owner = { openId, unionId }` 即发起人，authority 记录为 `direct`，
+  `runScopes=[]`、`selfManage=false`，task 带 `ownerAccess: 'talk'` 标记（只从宿主 authority
+  记录读取，不信 CLI 可写的 schedules.json 投影）。
+- **只能投到当前会话**：`task.chatId === ds.chatId`，`executionPosition` 只允许 `top-level`
+  或当前话题（`rootMessageId` 必须等于本轮话题根）；不接受 `new-topic`、`follow-active`、
+  `topicTitle`、`deliver=local`、多群、until-done、notify。工作目录边界沿用
+  `capabilityScheduleWorkingDir`。
+- **配额**：每轮最多 1 个（复用 `directTurn.maxTasksPerTurn`，删除不退额度）；每人每 Bot
+  最多 `scheduleTalkerMaxTasks`（1–100，缺省 5）个存活（active/paused）任务。
+- **到点复核（fail-closed）**：每次执行进入队列前、以及发布 scheduled turn 身份时，都重新
+  检查：开关仍开、authority 控制人与 task owner 一致且无 claim、`union_id` 仍解析回同一
+  `open_id`、本人仍可在目标群 `canTalk`、群聊时仍是群成员。任一不满足即拒跑，**不**发认领卡
+  （认领卡会把任务交给管理员接手，与「不借到别人权限」相悖）。关闭开关 = 所有此类任务停止触发，
+  再打开即恢复。
+- **管理**：`SCHEDULE_MANAGED_MUTATE_ROUTE` 对非管理员只放行 authority 控制人 == 本人、
+  任务所在群 == 当前会话、开关仍开 的任务（update/remove/pause/resume/run 都可）；管理员行为不变。
+  talker 任务自己的 scheduled turn 不能 `pause/remove self`（`authorizeScheduleSelfManage` 仍要求
+  管理员），也不能创建 one-shot 子任务、不能驾驭 v3 workflow（owner gate 仍是管理员）。
+- **执行身份**：与本人直接发消息一致——开了 `triggerUserAuth` 时 scheduled turn 以本人身份发布
+  工具凭据；没开时用 Bot 自己的工具。开关的帮助文案明示这一点。
+- **判定「真人直接发起」**：沿用 `scheduleCallerForTurn` 的 `senderType === 'user'
+  && !source && requestLarkAppId === ds.larkAppId`，定时轮次（`source: 'schedule_creator'`）、
+  bot 轮次、Remote Runner provider actor 都不算 talker。
+
+bot→bot 委托链路（`--delegate schedule:create`、`scheduleDelegation.*`）完全不受影响，仍只认管理员。
+

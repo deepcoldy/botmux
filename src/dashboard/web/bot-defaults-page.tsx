@@ -10268,6 +10268,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [ownerDm, setOwnerDm] = useState(props.bot.grantRequestToOwnerDm === true);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
   const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
+  const [talkerSchedules, setTalkerSchedules] = useState(props.bot.scheduleCreateByTalkers === true);
   const [trustSameOwner, setTrustSameOwner] = useState(props.bot.trustSameOwnerBots !== false);
   const [delegateBots, setDelegateBots] = useState<string[]>(props.bot.grantDelegateBots ?? []);
   const [delegateBotsInput, setDelegateBotsInput] = useState((props.bot.grantDelegateBots ?? []).join(', '));
@@ -10298,6 +10299,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }, [props.bot.p2pOpen]);
 
   useEffect(() => {
+    setTalkerSchedules(props.bot.scheduleCreateByTalkers === true);
+  }, [props.bot.scheduleCreateByTalkers]);
+
+  useEffect(() => {
     setTrustSameOwner(props.bot.trustSameOwnerBots !== false);
   }, [props.bot.trustSameOwnerBots]);
 
@@ -10325,6 +10330,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       grantRequestToOwnerDm?: boolean;
       restrictGrantCommands?: boolean;
       p2pOpen?: boolean;
+      scheduleCreateByTalkers?: boolean;
       trustSameOwnerBots?: boolean;
       grantDelegateBots?: string[];
       grantDefaultDurationMs?: number | null;
@@ -10351,6 +10357,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         setOwnerDm(body.grantRequestToOwnerDm === true);
         setRestrict(body.restrictGrantCommands === true);
         setP2pOpen(body.p2pOpen === true);
+        setTalkerSchedules(body.scheduleCreateByTalkers === true);
         setTrustSameOwner(body.trustSameOwnerBots !== false);
         setDelegateBots(nextDelegateBots);
         setDuration(nextDuration);
@@ -10365,6 +10372,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           grantRequestToOwnerDm: body.grantRequestToOwnerDm === true,
           restrictGrantCommands: body.restrictGrantCommands === true,
           p2pOpen: body.p2pOpen === true,
+          scheduleCreateByTalkers: body.scheduleCreateByTalkers === true,
           trustSameOwnerBots: body.trustSameOwnerBots !== false,
           grantDelegateBots: nextDelegateBots,
           grantDefaultDurationMs: nextDuration,
@@ -10516,6 +10524,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = p2pOpen;
             setP2pOpen(checked);
             void savePatch({ p2pOpen: checked }, 'p2pOpen', () => setP2pOpen(previous));
+          }}
+        />
+        <ToggleRow
+          checked={talkerSchedules}
+          disabled={busy !== null}
+          dataAction="toggle-schedule-create-by-talkers"
+          title={tr('botDefaults.scheduleCreateByTalkers')}
+          help={tr('botDefaults.scheduleCreateByTalkersHelp')}
+          onChange={checked => {
+            const previous = talkerSchedules;
+            setTalkerSchedules(checked);
+            void savePatch({ scheduleCreateByTalkers: checked }, 'talkerSchedules', () => setTalkerSchedules(previous));
           }}
         />
         <ToggleRow

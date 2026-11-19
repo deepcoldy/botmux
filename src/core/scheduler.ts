@@ -1314,6 +1314,8 @@ export function addTask(params: {
    *  daemon-initiated turns authenticate workflow commands as that person (see
    *  scheduled-turn-provenance); an ownerless task runs with no user identity. */
   owner: ScheduleOwner;
+  /** See ScheduledTask.ownerAccess: the creator held talk-only access. */
+  ownerAccess?: 'talk';
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -1418,6 +1420,7 @@ export function addTask(params: {
     creatorRootMessageId: params.creatorRootMessageId,
     creatorLarkAppId: params.creatorLarkAppId,
     owner: params.owner,
+    ownerAccess: params.owner.kind === 'human' && params.ownerAccess === 'talk' ? 'talk' : undefined,
     nextRunAt,
     repeat: params.repeat,
     // Delivery shape is now expressed by scope/rootMessageId. Persist only the

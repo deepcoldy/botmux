@@ -1896,6 +1896,14 @@ export interface ScheduledTask {
    *  which is what keeps identity-bound tools fail-closed instead of silently
    *  running as the bot. */
   ownerUnionId?: string;
+  /** `'talk'` = the creator could only talk to the bot (not an administrator)
+   *  when the task was created under the bot's `scheduleCreateByTalkers`
+   *  policy. Such a task is re-admitted through core/schedule-talker at every
+   *  fire (switch still on, creator still resolves, still may talk there, still
+   *  a member) and may only be managed by its creator or an administrator.
+   *  Absent = created by an administrator / the host terminal (historical
+   *  behavior). Decisions read it from the host authority record only. */
+  ownerAccess?: 'talk';
   /** A person who took over this task's run-as identity from the claim card
    *  (posted when trigger-user auth is on and the task has no usable identity).
    *  Written only by the daemon, from the Lark-verified card-callback operator,
