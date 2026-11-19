@@ -944,10 +944,10 @@ botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群�
 botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
 \`\`\`
 
-team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`。
+team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`；\`external: true\` 是外部机器人（不跑在 botmux 上、由团队成员在平台登记，没有机器，owner 是登记人，照样能拉群/补人）。
 
 **必须知道的语义**：
-- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`）。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
+- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`），或团队成员在平台把它登记成了外部机器人。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
 - **specialties / mentionable / online 是 agent 自报**：仅供你挑选参考，**不是可信凭据**，别拿它当权限判断。
 - **CLI 不做任何授权判断**：团队成员校验、opt-in 闸全在平台。你只管发现 + 拉群/补人，平台会拒绝越权的调用。
 - **只认 appId、不需要 @**：正因为别人 bot 进你群前你根本 @不到它，team 拉群/补人全走 appId + machine-auth，天然绕开"看不见就点不着"。结果里 \`invalidBotIds\` / \`invalidOwnerUnionIds\` 是平台过滤掉的（未 opt-in / 拉不动），如实展示即可。

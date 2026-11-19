@@ -589,6 +589,7 @@ export function parseEventMessage(
     parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
     senderUnionId: sender.sender_id?.union_id,
+    senderAppId: sender.sender_id?.app_id,
     senderType: sender.sender_type,
     msgType: message.message_type,
     ...(message.message_type === 'post' ? { rawPostContent: message.content } : {}),

@@ -1718,6 +1718,9 @@ export interface LarkMessage {
    *  undefined for events that don't carry it (older formats, API-fetched
    *  messages). */
   senderUnionId?: string;
+  /** Bot sender's Feishu-stamped app_id. Platform external-roster authorization
+   *  pairs this with senderUnionId; human/card/dashboard messages leave it absent. */
+  senderAppId?: string;
   senderType: string;
   /** Server-provided sender display name (works for user AND bot senders).
    *  Only populated on API-fetched messages read with `with_sender_name=true`
