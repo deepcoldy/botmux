@@ -2198,7 +2198,9 @@ type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
   /** One small-model recap of `prompt`, answered by recap_result. */
   | { type: 'recap_request'; requestId: string; prompt: string }
-  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef;
+      /** Set with `mayStart: false` when no lifecycle operation takes the start over. */
+      startRefusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   /** The host refused this binding; the worker returns to its predecessor. */
@@ -2620,6 +2622,13 @@ export type WorkerToDaemonBase =
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
   | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
+  /** Provenance-only signal for a Web Terminal / sandbox hook direct-submit.
+   *  Sent unconditionally when the submit hook fires, even when the worker has
+   *  no prompt_ready (the exact stuck-after-terminal case this card fix
+   *  targets): it opens the daemon's live-work episode without depending on a
+   *  ready→working screen edge, so a later working frame is never mistaken for
+   *  stale residue. Carries no status and never repaints the card by itself. */
+  | { type: 'direct_submit_started' }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
@@ -2766,6 +2775,13 @@ export type WorkerToDaemonBase =
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'goal_update'; goal: import('./services/native-goal-state.js').NativeGoalState | null; turnId?: string; dispatchAttempt?: number; signature?: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      /** Set ONLY on the working frame a Web Terminal / sandbox hook
+       *  direct-submit publishes via the worker's clearTurnId path: real new
+       *  work that belongs to no managed turn. It explicitly reopens the card
+       *  to working after a post-terminal idle correction. A prompt-cache
+       *  keep-alive also clears the turn id but never sets this, so it cannot
+       *  flip a settled card back to working. Omitted everywhere else. */
+      directSubmit?: boolean;
       /** The main turn has ended but this many background tasks it launched are
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
        *  otherwise. Never changes the reported status; the card shows it and the

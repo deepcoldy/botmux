@@ -1,3 +1,4 @@
+import { normalizeOwnerGroupFollowConfig, notifyOwnerGroupFollowChanged } from './owner-group-follow-policy.js';
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { parseInviteConfig } from './invite-config.js';
@@ -60,11 +61,15 @@ import {
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import {
+  cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
   reasoningEffortsForCliModel,
+  type ReasoningCatalog,
 } from './codex-reasoning-effort.js';
+import { loadBotCodexReasoningCatalog } from './codex-bot-reasoning-catalog.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
 import { botOneShotEnv } from '../core/session-env-resolve.js';
@@ -177,6 +182,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoInviteOwnerOnGroupAdd', configKey: 'autoInviteOwnerOnGroupAdd', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: 'bot 被拉进新群时自动把 owner 拉进群 on|off（默认 on）；off 适用于告警/oncall 批量事件群' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
+  { key: 'ownerGroupFollow', configKey: 'ownerGroupFollow', kind: 'json', effect: 'immediate', clearable: true, hint: '主人进新群时自动邀请本机器人，默认关闭；JSON {"enabled":true,"excludeChatIds":["oc_…"],"pollIntervalSeconds":60}。仅使用主人本人的用户授权，首次扫描只建立基线；被移出后不再补拉；unset 关闭' },
   { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则","autoJoinNewGroups":false,"autoJoinSoloGroups":true,"closeHints":true,"decisionCards":false,"taskHints":true}；默认关闭；autoJoinNewGroups=拉新群时带上管家，默认开，只在关掉时写 false；autoJoinSoloGroups=只有你和一个 bot 的新群也带，默认关；closeHints=后台巡检提示可以关 / 可以推进 / 过了复查时间的事项（只提示不改状态），默认关；decisionCards=待拍板时往管家群发拍板卡片，默认开，只在关掉时写 false；taskHints=关联群里一轮交付、举手或中断时提醒管家（只提示不改状态），默认关，只在打开时写 true；unset 关闭（看板数据保留）' },
   { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
   { key: 'chatManagerSharedTopic', configKey: 'chatManagerSharedTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '群负责人免 @ 接的顶层消息也开话题 on|off（默认 off）：仅在共享回复模式（/reply-mode shared）的普通群生效，回复挂到那条消息下面、和 @ 本 bot 一样，仍是群级同一个会话；需同时开 chatManagerEnabled' },
@@ -478,6 +484,9 @@ async function applyConfigFieldInternal(
     try { value = normalizeFeedbackPresentation(value); }
     catch (error) { return { ok: false, reason: `invalid_feedback_presentation: ${error instanceof Error ? error.message : String(error)}` }; }
   }
+  if (spec.configKey === 'ownerGroupFollow') {
+    try { value = normalizeOwnerGroupFollowConfig(value) ?? null; } catch { return { ok: false, reason: 'invalid_owner_group_follow' }; }
+  }
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
@@ -528,6 +537,29 @@ async function applyConfigFieldInternal(
         reason: `service_tier_${tierCheck.error}`,
       };
     }
+  }
+  // A write that sets the Codex model/effort pair is judged against the live
+  // catalogue of the bot's runtime, the one the Dashboard offers levels from.
+  // Probed outside the bots.json lock, like the service-tier check above.
+  const effortPairWrite = spec.configKey === 'reasoningEffort' || spec.configKey === 'model'
+    || spec.configKey === 'cliId' || spec.kind === 'cli';
+  const pairEffort = spec.configKey === 'reasoningEffort'
+    ? isCodexReasoningEffort(effective) ? effective : undefined
+    : bot.config.reasoningEffort;
+  let reasoningCatalog: ReasoningCatalog | null = null;
+  if (effortPairWrite && pairEffort && isCodexReasoningCliId(nextCliId)) {
+    const nextSelection = spec.kind === 'cli' && typeof effective === 'string'
+      ? resolveCliSelection(effective)
+      : undefined;
+    const sameCli = nextCliId === bot.config.cliId;
+    reasoningCatalog = await loadBotCodexReasoningCatalog({
+      ...bot.config,
+      cliId: nextCliId,
+      wrapperCli: nextSelection ? nextSelection.wrapperCli : bot.config.wrapperCli,
+      // A runtime path configured for another CLI is not a Codex binary.
+      cliRuntime: sameCli ? bot.config.cliRuntime : undefined,
+      cliPathOverride: sameCli ? bot.config.cliPathOverride : undefined,
+    });
   }
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
@@ -610,8 +642,11 @@ async function applyConfigFieldInternal(
         && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
       return { write: false, result: 'reasoning_effort_not_supported' };
     }
+    // Re-saving an unrelated field must not reject a pair config load keeps.
     if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
-        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+        && !(effortPairWrite
+          ? cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort, reasoningCatalog)
+          : cliModelMayKeepReasoningEffort(nextCliId, nextModel, nextReasoningEffort))) {
       return { write: false, result: 'reasoning_effort_not_supported_by_model' };
     }
     const currentServiceTier = isCodexServiceTier(entry.serviceTier)
@@ -750,6 +785,9 @@ async function applyConfigFieldInternal(
     } catch (error) {
       logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+  if (spec.configKey === 'ownerGroupFollow') {
+    try { notifyOwnerGroupFollowChanged(larkAppId); } catch { logger.warn('[owner-group-follow] config reconciliation failed'); }
   }
   if (spec.configKey === 'displayName') {
     try { displayNameRefresher?.(); } catch { /* best effort */ }
@@ -1193,6 +1231,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'inviteConfig') return { ok: true, value: parseInviteConfig(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
+        if (spec.configKey === 'ownerGroupFollow') return { ok: true, value: normalizeOwnerGroupFollowConfig(parsed) ?? null };
         if (spec.configKey === 'steward') {
           const steward = normalizeStewardConfig(parsed);
           return steward.ok ? { ok: true, value: steward.value } : { ok: false, reason: `invalid_steward: ${steward.reason}` };

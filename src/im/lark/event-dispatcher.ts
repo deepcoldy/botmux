@@ -1,3 +1,4 @@
+import { OwnerGroupFollowStore } from '../../services/owner-group-follow-store.js';
 import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-access.js';
 /**
  * Lark event dispatcher — handles WSClient setup, bot identity probing,
@@ -7336,7 +7337,11 @@ export function createLarkEventDispatcherRuntime(
     // 同步处理且幂等;bot 被移出后关本 bot 在群里的会话则按 event id 去重、放到 ACK 之后跑。
     'im.chat.member.bot.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
-      if (chatId) invalidateChatStats(larkAppId, chatId);
+      if (chatId) {
+        invalidateChatStats(larkAppId, chatId);
+        try { new OwnerGroupFollowStore(config.session.dataDir, larkAppId).removed(chatId); }
+        catch { logger.warn('[owner-group-follow] failed to record bot removal'); }
+      }
       scheduleChatGone('im.chat.member.bot.deleted_v1', data, 'bot_removed');
     },
     // 群解散推给群内每个订阅了它的 bot,各自关自己的会话。

@@ -124,7 +124,8 @@ vi.mock('../src/utils/timezone.js', () => ({ scheduleTimeZone: vi.fn() }));
 
 // vi.mock factories are hoisted above imports, so the shared fakes must be
 // created with vi.hoisted to be referenceable inside the factories.
-const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState, backendState } = vi.hoisted(() => ({
+const { sendWorkerInput, forkWorker, rememberLastCliInput, suspendWorker, killWorker, rewindState, backendState, pruneRuns } = vi.hoisted(() => ({
+  pruneRuns: [] as Promise<void>[],
   suspendWorker: vi.fn<(ds: any, reason?: string) => boolean>(),
   killWorker: vi.fn<(ds: any) => void>(),
   rewindState: { jsonl: '' as string, truncateError: '' as string, treeRoot: '' as string },
@@ -307,14 +308,27 @@ vi.mock('../src/core/context-rewind.js', async (importOriginal) => {
   };
 });
 vi.mock('../src/core/shared-adopt.js', () => ({ isSharedAdoptSession: vi.fn(() => false) }));
+// The real backup pruning, each run collected so a test can await it.
+vi.mock('../src/core/rewind-backup-retention.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/rewind-backup-retention.js')>();
+  return {
+    ...actual,
+    pruneRewindBackupsBeside: (...args: Parameters<typeof actual.pruneRewindBackupsBeside>) => {
+      const pruning = actual.pruneRewindBackupsBeside(...args);
+      pruneRuns.push(pruning);
+      return pruning;
+    },
+  };
+});
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { rewindBackupDirForSession, rewindBackupSuffix } from '../src/core/rewind-backup-retention.js';
 import { handleCommand, resetPendingRewindPreviewsForTest } from '../src/core/command-handler.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
@@ -408,9 +422,10 @@ beforeEach(() => {
   backendState.killThrows = false;
   suspendWorker.mockImplementation((ds: any) => { ds.worker = null; return true; });
 });
-afterEach(() => {
+afterEach(async () => {
   // Only the writers this file spawned; one still blocked in open() is killed.
   for (const w of fifoWriters.splice(0)) if (w.exitCode === null && w.signalCode === null) w.kill('SIGKILL');
+  await Promise.allSettled(pruneRuns.splice(0));
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   rewindState.jsonl = '';
   rewindState.truncateError = '';
@@ -843,5 +858,111 @@ describe('/rewind command', () => {
     expect(lastReply(deps)).toContain('1–10');
     await run(deps, '/rewind 10');
     expect(lastReply(deps)).toContain('回复 `/rewind 10 confirm` 执行');
+  });
+
+  describe('回退备份的保留（#3572）', () => {
+    const DAY = 24 * 60 * 60_000;
+    /** A backup a cut of `transcriptPath` made `ageMs` ago, last written then. */
+    const seedBackup = (dir: string, transcriptPath: string, ageMs: number, kind: 'full' | 'removed' = 'full') => {
+      const at = Date.now() - ageMs;
+      const path = join(dir, `${basename(transcriptPath)}${rewindBackupSuffix(at, kind)}`);
+      writeFileSync(path, 'old backup');
+      utimesSync(path, at / 1000, at / 1000);
+      return path;
+    };
+
+    it('确认回退之后清理会话记录旁边的旧备份：过期的删掉，新的和未过期的留下，别的文件不动', async () => {
+      rewindState.jsonl = transcript();
+      const dir = dirname(rewindState.jsonl);
+      const expired = seedBackup(dir, rewindState.jsonl, 30 * DAY);
+      const expiredRemoved = seedBackup(dir, rewindState.jsonl, 8 * DAY, 'removed');
+      const young = seedBackup(dir, rewindState.jsonl, 2 * DAY);
+      const stranger = join(dir, 'notes.bak');
+      writeFileSync(stranger, 'keep');
+      utimesSync(stranger, (Date.now() - 30 * DAY) / 1000, (Date.now() - 30 * DAY) / 1000);
+      const deps = makeDeps(makeDs());
+      await run(deps, '/rewind 1');
+      // A preview cuts nothing and prunes nothing.
+      expect(pruneRuns).toHaveLength(0);
+      await run(deps, '/rewind 1 confirm');
+      expect(lastReply(deps)).toContain('已回退');
+      expect(pruneRuns).toHaveLength(1);
+      await Promise.all(pruneRuns);
+      expect(existsSync(expired)).toBe(false);
+      expect(existsSync(expiredRemoved)).toBe(false);
+      const left = readdirSync(dir);
+      const backup = left.find(name => name.endsWith('.bak') && name !== basename(young) && name !== 'notes.bak')!;
+      // The new backup holds what the confirm cut.
+      expect(lastReply(deps)).toContain(join(dir, backup));
+      expect(readFileSync(join(dir, backup), 'utf8')).toContain('"uC"');
+      expect(left.sort()).toEqual(['native.jsonl', basename(young), backup, 'notes.bak'].sort());
+    });
+
+    it('剪切一落地就登记会话记录旁边的目录（周期清扫找得到）；回执发出之前不清理', async () => {
+      rewindState.jsonl = transcript();
+      const dir = dirname(rewindState.jsonl);
+      const expired = seedBackup(dir, rewindState.jsonl, 30 * DAY);
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-data-'));
+      dirs.push(dataDir);
+      (config.session as any).dataDir = dataDir;
+      const deps = makeDeps(makeDs());
+      await run(deps, '/rewind 1');
+      // The done receipt hangs (a slow Lark API).
+      let releaseReceipt!: () => void;
+      deps.sessionReply.mockImplementation(async (...args: unknown[]) => {
+        if (String(args[1]).includes('已回退')) await new Promise<void>(resolve => { releaseReceipt = resolve; });
+        return 'reply-msg-id';
+      });
+      const confirming = run(deps, '/rewind 1 confirm');
+      await vi.waitFor(() => expect(readdirSync(join(dataDir, 'rewind-backup-places'))).toHaveLength(1));
+      const [marker] = readdirSync(join(dataDir, 'rewind-backup-places'));
+      expect(readFileSync(join(dataDir, 'rewind-backup-places', marker!), 'utf8')).toBe(dir);
+      await vi.waitFor(() => expect(releaseReceipt).toBeTypeOf('function'));
+      expect(pruneRuns).toHaveLength(0);
+      expect(existsSync(expired)).toBe(true);
+      releaseReceipt();
+      await confirming;
+      await Promise.all(pruneRuns);
+      expect(pruneRuns).toHaveLength(1);
+      expect(existsSync(expired)).toBe(false);
+    });
+
+    it('会话记录在 CLI 可写的树里：清理 daemon 数据目录里这个会话的备份目录', async () => {
+      rewindState.jsonl = transcript();
+      rewindState.treeRoot = dirname(dirname(rewindState.jsonl));
+      const ds = makeDs();
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-data-'));
+      dirs.push(dataDir);
+      (config.session as any).dataDir = dataDir;
+      const backupDir = rewindBackupDirForSession(dataDir, ds.session.sessionId);
+      mkdirSync(backupDir, { recursive: true });
+      const expired = seedBackup(backupDir, rewindState.jsonl, 30 * DAY, 'removed');
+      const otherSession = rewindBackupDirForSession(dataDir, 'sess-other');
+      mkdirSync(otherSession, { recursive: true });
+      const otherExpired = seedBackup(otherSession, rewindState.jsonl, 30 * DAY);
+      const deps = makeDeps(ds);
+      await run(deps, '/rewind 1');
+      await run(deps, '/rewind 1 confirm');
+      expect(lastReply(deps)).toContain('已回退');
+      await Promise.all(pruneRuns);
+      expect(existsSync(expired)).toBe(false);
+      const left = readdirSync(backupDir);
+      expect(left).toHaveLength(1);
+      expect(lastReply(deps)).toContain(join(backupDir, left[0]!));
+      // Another session's directory is the periodic sweep's business.
+      expect(existsSync(otherExpired)).toBe(true);
+    });
+
+    it('回退没做成（预览后会话记录又多了一轮）：不清理', async () => {
+      rewindState.jsonl = transcript();
+      const expired = seedBackup(dirname(rewindState.jsonl), rewindState.jsonl, 30 * DAY);
+      const deps = makeDeps(makeDs());
+      await run(deps, '/rewind 1');
+      appendFileSync(rewindState.jsonl, line(userTurn('D', 'uD')) + line(assistant('d')));
+      await run(deps, '/rewind 1 confirm');
+      expect(lastReply(deps)).toContain('找不到原来选中的那一轮');
+      expect(pruneRuns).toHaveLength(0);
+      expect(existsSync(expired)).toBe(true);
+    });
   });
 });

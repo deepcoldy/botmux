@@ -15,6 +15,7 @@ import {
   withOpenTranscript,
 } from '../src/core/context-rewind.js';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { rewindBackupSuffix } from '../src/core/rewind-backup-retention.js';
 
 const dirs: string[] = [];
 
@@ -412,6 +413,41 @@ describe('rewindClaudeTranscript 文件安全', () => {
     expect(statSync(path).size).toBe(before);
     expect(readFileSync(victim, 'utf8')).toBe(victimBefore);
     expect(existsSync(victim)).toBe(true);
+  });
+
+  it('备份目录在调用方建好之后、写备份之前被清掉（清空目录的周期清扫）：重建目录照常回退', () => {
+    const { root, path } = treeFixture();
+    const backupDir = join(mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-')), 'sess-1');
+    dirs.push(dirname(backupDir));
+    mkdirSync(backupDir);
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    const result = rewindClaudeTranscript(path, latest!.offset, Date.UTC(2026, 10, 18), {
+      writableTreeRoot: root,
+      backupDir,
+      beforeBackup: () => rmSync(backupDir, { recursive: true }),
+    });
+    expect(dirname(result.backupPath)).toBe(backupDir);
+    expect(readFileSync(result.backupPath, 'utf8')).toContain('第二轮');
+    expect(statSync(path).size).toBe(latest!.offset);
+  });
+
+  it('备份写完、截断之前备份不在了（被删掉、换成别的文件、或被挪走）：拒绝截断，也不删换进来的文件', () => {
+    for (const takeAway of ['removed', 'replaced', 'moved'] as const) {
+      const path = fixture([userTurn('a', 'u1'), assistant, userTurn('b', 'u2'), assistant]);
+      const before = readFileSync(path, 'utf8');
+      const now = Date.UTC(2026, 10, 18, 12, 0, 0);
+      const backupPath = `${path}${rewindBackupSuffix(now, 'full')}`;
+      const [latest] = scanClaudeTranscriptCheckpoints(path);
+      expect(() => rewindClaudeTranscript(path, latest!.offset, now, {
+        beforeCut: () => {
+          if (takeAway === 'moved') return renameSync(backupPath, `${backupPath}.moved`);
+          rmSync(backupPath);
+          if (takeAway === 'replaced') writeFileSync(backupPath, 'someone else');
+        },
+      })).toThrow(/went away before the cut/);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+      if (takeAway === 'replaced') expect(readFileSync(backupPath, 'utf8')).toBe('someone else');
+    }
   });
 
   it('源路径在描述符校验后被换成软链：备份与截断仍钉在原 inode，不读链接目标', () => {
