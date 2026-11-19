@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isClaudeMetadataProbeArgv, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, createElapsedDeadline, findLaunchedCliPid, isClaudeMetadataProbeArgv, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -17,13 +17,14 @@ function makeScheduler() {
   const queue: Array<{ fn: () => void; at: number }> = [];
   return {
     now: () => now,
+    advance: (ms: number) => { now += ms; },
     schedule: (fn: () => void, ms = 0) => { queue.push({ fn, at: now + ms }); },
     runAll: (max = 1_000) => {
       let n = 0;
       while (queue.length && n++ < max) {
         queue.sort((a, b) => a.at - b.at);
         const next = queue.shift()!;
-        now = next.at;
+        now = Math.max(now, next.at);
         next.fn();
       }
     },
@@ -120,8 +121,13 @@ function runWorkerWiring(late: boolean, options: {
   /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
    *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
   aliasedChildPid?: boolean;
+  /** Optional synchronous cost and override result for getChildPid(). */
+  childPidProbeMs?: number;
+  childPidResult?: number | null;
   /** Stable backing-pane identity, independent of cliPid rewrites. */
   stablePanePid?: number | null;
+  /** Synchronous time consumed by each stable-pane probe. */
+  stablePaneProbeMs?: number;
   /** Model a backend without the optional stable-pane accessor (worker falls back to getChildPid). */
   stablePaneAccessor?: boolean;
   /** ZMX launch=100 vs PTY-root=10 shape, with a controllable list-probe answer. */
@@ -136,13 +142,18 @@ function runWorkerWiring(late: boolean, options: {
   let scopeProbes = 0;
   const backend: {
     cliPid: number;
-    getChildPid: () => number;
+    getChildPid: () => number | null;
     getStablePanePid?: () => number | null;
   } = {
     cliPid: 100,
-    getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
+    getChildPid: () => {
+      scheduler.advance(options.childPidProbeMs ?? 0);
+      if (options.childPidResult !== undefined) return options.childPidResult;
+      return options.aliasedChildPid ? backend.cliPid : 100;
+    },
     ...(options.stablePaneAccessor === false ? {} : {
       getStablePanePid: () => {
+        scheduler.advance(options.stablePaneProbeMs ?? 0);
         const zmx = options.zmxStablePane;
         if (zmx) {
           const probeOk = zmx.probeOk;
@@ -215,7 +226,10 @@ function runWorkerWiring(late: boolean, options: {
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
-    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid, cliIdForComm, isClaudeMetadataProbeArgv,
+    findLaunchedCliPid: findLaunchedCliPidMock, cliIdForComm, isClaudeMetadataProbeArgv,
+    scheduleWrapperRealCliPid: (pid: number, deps: Parameters<typeof scheduleWrapperRealCliPid>[1]) =>
+      scheduleWrapperRealCliPid(pid, { ...deps, now: scheduler.now }),
+    createElapsedDeadline: (maxElapsedMs: number | undefined) => createElapsedDeadline(maxElapsedMs, scheduler.now),
     sessionScopePayloadPid: vi.fn((pid: number) => {
       scopeProbes++;
       return options.scopePayloadPid !== undefined
@@ -246,7 +260,7 @@ function runWorkerWiring(late: boolean, options: {
     effectiveBackendType: options.backendType ?? 'tmux',
     actuallyReattachedPersistent: options.reattached ?? false,
     publishLocalProcessAttestation: vi.fn(() => true), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
-    setTimeout: scheduler.schedule, log: vi.fn(),
+    setTimeout: scheduler.schedule, advanceTime: scheduler.advance, log: vi.fn(),
   };
   // The REAL layer walk and TRAE leaf resolver, probing the same synthetic
   // process table.
@@ -757,6 +771,66 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
   });
 
+  it.each([false, true])('bounds Herdr wrapper retries by wall clock including synchronous pane probes (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude',
+      backendType: 'herdr', aliasedChildPid: true,
+      stablePaneProbeMs: 5_000, launchedCliPid: null,
+    });
+    // Without the Herdr opt-in, attempt-only retries would perform 30 probes and
+    // advance this fake clock by roughly 156s. Allow either side of the first
+    // discovery boundary so the production budget can be tuned without pinning
+    // an exact attempt count, while still rejecting the attempt-only 156s loop.
+    expect(result.findLaunchedCliPid.mock.calls.length).toBeGreaterThan(0);
+    expect(result.findLaunchedCliPid.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(result.elapsedMs).toBeLessThan(20_000);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+  });
+
+  it('bounds Herdr late-PID probing by wall clock while a non-Herdr backend stays attempt-only', () => {
+    const run = (backendType: string) => runWorkerWiring(true, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', backendType,
+      childPidProbeMs: 5_000, childPidResult: null, launchedCliPid: null,
+    });
+    const herdr = run('herdr');
+    expect(herdr.elapsedMs).toBeLessThan(20_000);
+    expect(herdr.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(herdr.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+
+    const tmux = run('tmux');
+    expect(tmux.elapsedMs).toBeGreaterThan(100_000);
+    expect(tmux.elapsedMs).toBeGreaterThan(herdr.elapsedMs);
+    expect(tmux.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it('does not call getChildPid when the first Herdr late-PID tick starts after its budget', () => {
+    let probes = 0;
+    const result = runWorkerWiring(true, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', backendType: 'herdr',
+      launchedCliPid: null,
+      beforeTimers: scope => {
+        scope.advanceTime(7_000);
+        scope.backend.getChildPid = () => { probes++; return null; };
+      },
+    });
+    expect(probes).toBe(0);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalled();
+  });
+
+  it('does not publish a Herdr late PID whose synchronous probe returns after the budget', () => {
+    const delayedStartMs = 5_500;
+    const probeMs = 5_000;
+    const result = runWorkerWiring(true, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', backendType: 'herdr',
+      childPidProbeMs: probeMs, childPidResult: 100,
+      beforeTimers: scope => { scope.advanceTime(delayedStartMs); },
+    });
+    expect(result.elapsedMs).toBe(delayedStartMs + probeMs);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalled();
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
   it.each([
     [false, false], [false, true], [true, false], [true, true],
   ])('stops wrapper retries when the stable pane changes after a failed publication (accessor=%s, late PID=%s)', (useStableAccessor, late) => {
@@ -1250,5 +1324,77 @@ describe('scheduleWrapperRealCliPid()', () => {
     });
     sch.runAll();
     expect(applied).toEqual([200, 201]);
+  });
+
+  it('does not probe when a delayed tick starts after the opt-in wall-clock budget', () => {
+    const sch = makeScheduler();
+    const getChildPid = vi.fn(() => 100);
+    const findRealPid = vi.fn(() => 200);
+    scheduleWrapperRealCliPid(100, {
+      findRealPid, getBackend: () => backendA, getChildPid,
+      applyRealPid: () => { throw new Error('must not publish'); },
+      schedule: sch.schedule, now: sch.now, maxElapsedMs: 100,
+    });
+    sch.runAll();
+    expect(getChildPid).not.toHaveBeenCalled();
+    expect(findRealPid).not.toHaveBeenCalled();
+    expect(sch.pending()).toBe(0);
+  });
+
+  it('does not publish a discovery that returns after the opt-in wall-clock budget', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => { sch.advance(101); return 200; },
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (pid) => { applied.push(pid); },
+      schedule: sch.schedule, now: sch.now, intervalMs: 0, maxElapsedMs: 100,
+    });
+    sch.runAll();
+    expect(applied).toEqual([]);
+    expect(sch.pending()).toBe(0);
+  });
+
+  it('does not queue another timer when an in-flight publication crosses the budget', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 200,
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (pid) => { applied.push(pid); sch.advance(101); return false; },
+      schedule: sch.schedule, now: sch.now, intervalMs: 0, maxAttempts: 3, maxElapsedMs: 100,
+    });
+    sch.runAll(1);
+    expect(applied).toEqual([200]);
+    expect(sch.pending()).toBe(0);
+  });
+
+  it('allows a fast tick exactly at the opt-in deadline', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 200,
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (pid) => { applied.push(pid); },
+      schedule: sch.schedule, now: sch.now, maxElapsedMs: 200,
+    });
+    sch.runAll();
+    expect(applied).toEqual([200]);
+    expect(sch.pending()).toBe(0);
+  });
+
+  it('keeps attempt-only retries when no wall-clock budget is provided', () => {
+    const sch = makeScheduler();
+    let discoveries = 0;
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => { discoveries++; return null; },
+      getBackend: () => backendA,
+      getChildPid: () => { sch.advance(5_000); return 100; },
+      applyRealPid: () => { throw new Error('must not publish'); },
+      schedule: sch.schedule, now: sch.now, intervalMs: 0, maxAttempts: 2,
+    });
+    sch.runAll();
+    expect(discoveries).toBe(2);
+    expect(sch.pending()).toBe(0);
   });
 });

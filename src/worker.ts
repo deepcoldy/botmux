@@ -541,6 +541,7 @@ import { cliUnavailableMessageAfterRetry, createAdapterAfterMissingCliWait } fro
 import {
   findLaunchedCliPid,
   findCliProcess,
+  createElapsedDeadline,
   scheduleWrapperRealCliPid,
   snapshotChildPids,
   CODEX_LEAF_SEARCH_DEPTH,
@@ -31535,6 +31536,10 @@ async function spawnCliBody(
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     return publishLocalProcessAttestation(realPid);
   };
+  // Herdr's PID probes are synchronous CLI calls with a 5s timeout. Share one
+  // opt-in budget value between the late-PID and wrapper resolvers; other
+  // backends keep their existing attempt-only behavior.
+  const herdrPidRetryMaxElapsedMs = effectiveBackendType === 'herdr' ? 6_000 : undefined;
   // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
   // launch payload below any pane relay or owned session-scope supervisor.
   const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
@@ -31557,6 +31562,7 @@ async function spawnCliBody(
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
+      maxElapsedMs: herdrPidRetryMaxElapsedMs,
       // Herdr/ZMX alias getChildPid() to the mutable cliPid, so retry validity
       // uses their independent stable pane identity instead. Backends without
       // the accessor retain the original current-child observation as fallback.
@@ -31841,11 +31847,15 @@ async function spawnCliBody(
     let attempts = 0;
     const latePidBackend = backend;
     const latePidGeneration = cliSpawnGeneration;
+    const latePidExpired = createElapsedDeadline(herdrPidRetryMaxElapsedMs);
     const resolveCliPidLate = () => {
-      if (!backend) return;
+      if (!backend || latePidExpired()) return;
       if (cfg.cliId === 'traex'
         && (backend !== latePidBackend || cliSpawnGeneration !== latePidGeneration)) return;
       const pid = backend.getChildPid?.();
+      // A slow Herdr probe can cross the budget before returning a PID. Do not
+      // publish markers, rewire ownership, or arm another timer past the fence.
+      if (latePidExpired()) return;
       if (pid) {
         publishLocalProcessAttestation(pid);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
@@ -31882,7 +31892,7 @@ async function spawnCliBody(
         observeAntigravityCliSessionId(pid, 'async');
         return;
       }
-      if (++attempts < 25) setTimeout(resolveCliPidLate, 120); // ~3s budget
+      if (++attempts < 25 && !latePidExpired()) setTimeout(resolveCliPidLate, 120); // ~3s attempt budget
     };
     setTimeout(resolveCliPidLate, 120);
   }

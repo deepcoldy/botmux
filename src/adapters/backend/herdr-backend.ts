@@ -1007,6 +1007,11 @@ export class HerdrBackend implements SessionBackend {
 
   private readForegroundLaunchPid(): number | null {
     const probe = this.probeForegroundLaunchPid();
+    // getChildPid() runs before the worker captures its stable-pane baseline.
+    // Seed the same last-known identity here so a failure during that baseline
+    // capture (or the first retry tick) can freeze the PID already observed by
+    // the production call order instead of stopping with an empty cache.
+    if (probe.ok) this.lastKnownStablePanePid = probe.pid;
     return probe.ok ? probe.pid : null;
   }
 

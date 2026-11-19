@@ -745,6 +745,22 @@ export interface WrapperRealPidResolveDeps {
   isDirectLeaf?: (launcherPid: number) => boolean;
   intervalMs?: number;
   maxAttempts?: number;
+  /** Optional wall-clock budget measured from scheduling, including time spent
+   * inside synchronous probes and discovery. Undefined preserves attempt-only
+   * retries. An in-flight synchronous callback may finish, but once the budget
+   * is exceeded no further discovery, publication or timer is started. */
+  maxElapsedMs?: number;
+  /** Clock paired with maxElapsedMs; injectable alongside the timer scheduler. */
+  now?: () => number;
+}
+
+/** Create an opt-in elapsed-time fence shared by PID retry loops. The budget
+ * starts at creation and uses `>` so a fast tick exactly at the deadline can
+ * finish. Undefined disables time-based expiry and preserves attempt-only
+ * behavior. An in-flight synchronous callback is never interrupted. */
+export function createElapsedDeadline(maxElapsedMs: number | undefined, now: () => number = Date.now): () => boolean {
+  const startedAt = now();
+  return () => maxElapsedMs !== undefined && now() - startedAt > maxElapsedMs;
 }
 
 /**
@@ -763,19 +779,26 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   const backendAtSpawn = deps.getBackend();
   const intervalMs = deps.intervalMs ?? 200;
   const maxAttempts = deps.maxAttempts ?? 30;
+  const expired = createElapsedDeadline(deps.maxElapsedMs, deps.now);
   let attempts = 0;
   let appliedPid: number | undefined;
   const retry = () => {
-    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+    attempts++;
+    if (attempts < maxAttempts && !expired()) deps.schedule(tick, intervalMs);
   };
   const tick = () => {
+    if (expired()) return;
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
     if (deps.isDirectLeaf?.(launcherPid)) return;
     if (appliedPid !== undefined) {
       if (deps.isAppliedPidValid?.(appliedPid)) { retry(); return; }
       appliedPid = undefined;
     }
+    // A synchronous stable-pane probe can consume most of the budget. Do not
+    // start (or publish) discovery after it returns past the deadline.
+    if (expired()) return;
     const realPid = deps.findRealPid(launcherPid);
+    if (expired()) return;
     if (realPid && realPid !== launcherPid) {
       const applied = deps.applyRealPid(realPid);
       if (applied !== false && deps.isAppliedPidValid) appliedPid = realPid;
