@@ -12,10 +12,19 @@ const SCRIPT = join(ROOT, 'scripts/ci-net-retry.mjs');
 // 样本是真实输出：两条来自 #3193 的 CI 现场日志，其余是 bun 1.4.4 / npm 11 / pnpm 9.5.0 /
 // electron install.js / curl 对着本地故障注入 registry（504、断开连接、404）时的报错原文。
 const APT_DNS = "E: Failed to fetch mirror+file:/etc/apt/apt-mirrors.txt/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb Temporary failure resolving 'azure.archive.ubuntu.com'";
+const APT_429 = [
+  'Err:6 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease',
+  '  429  Too Many Requests [IP: 13.107.246.40 443]',
+  'Reading package lists...',
+  'E: Failed to fetch https://packages.microsoft.com/ubuntu/24.04/prod/dists/noble/InRelease  429  Too Many Requests [IP: 13.107.246.40 443]',
+  'E: Some index files failed to download. They have been ignored, or old ones used instead.',
+].join('\n');
 const DOCKER_CDN_RESET = 'docker: failed to copy: httpReadSeeker: failed open: failed to do request: Get "https://cdn01.quay.io/quayio-production-s3/layer": read tcp 10.1.0.101:49806->23.67.33.92:443: read: connection reset by peer';
 const TRANSIENT: Record<string, string> = {
   'Docker 镜像 CDN 重置连接（#3500 CI 原始日志）': DOCKER_CDN_RESET,
   'apt 临时 DNS 失败（#3348 CI 原始日志）': APT_DNS,
+  'apt 镜像 429 限流（#3573 network-boundary 日志）': APT_429,
+  'apt 502 网关错误': 'Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  502  Bad Gateway [IP: 1.2.3.4 80]',
   'electron postinstall 504（#3193 现场一）':
     'bun install v1.4.3 (c6da4a4d3)\nHTTPError: Response code 504 (Gateway Time-out)\n    at Request._onResponseBase (/home/runner/work/botmux/botmux/node_modules/got/dist/source/core/index.js:913:31)\nerror: postinstall script from "electron" exited with 1',
   'setup-bun 下载 504（#3193 现场二）': 'Unexpected HTTP response: 504\nWaiting 18 seconds before trying again\n##[error]Error: Unexpected HTTP response: 504',
@@ -121,6 +130,18 @@ describe('runWithRetry', () => {
     await expect(runWithRetry('sudo', args, h.deps)).resolves.toBe(recovers ? 0 : 100);
     expect(h.calls).toEqual(Array.from({ length: recovers ? 2 : 5 }, () => ['sudo', ...args]));
     expect(h.sleeps).toEqual(recovers ? [10_000] : [...RETRY_DELAYS_MS]);
+  });
+
+  it.each([true, false])('apt 429 限流有界重试，恢复=%s', async (recovers) => {
+    const failed = { code: 100, output: APT_429 };
+    const h = harness(recovers ? [failed, { code: 0, output: '' }] : [failed]);
+    const args = ['apt-get', '-o', 'APT::Update::Error-Mode=any', 'update'];
+    await expect(runWithRetry('sudo', args, h.deps)).resolves.toBe(recovers ? 0 : 100);
+    expect(h.calls).toHaveLength(recovers ? 2 : 5);
+  });
+
+  it('apt 429 与 404 同现时仍按确定性失败处理', () => {
+    expect(classifyFailure(`${APT_429}\nE: Failed to fetch https://example.invalid/pkg  404  Not Found`).kind).toBe('deterministic');
   });
 
   it.each([

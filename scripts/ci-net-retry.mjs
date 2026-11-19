@@ -49,6 +49,9 @@ export const TRANSIENT = Object.freeze([
   /\bconnection reset by peer\b/i,
   // apt 的临时 DNS 失败；不包含一般 Could not resolve。
   /\bTemporary failure resolving\s+['"]/,
+  // apt：镜像限流 / 网关错误，状态码与原因短语之间是两个空格：
+  //   Err:6 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease\n  429  Too Many Requests [IP: … 443]
+  /\b(?:408\s+Request Time-?out|429\s+Too Many Requests|50[0234]\s+(?:Bad Gateway|Service (?:Temporarily )?Unavailable|Gateway Time-?out|Internal Server Error))\b/,
 ]);
 
 export const DETERMINISTIC = Object.freeze([
