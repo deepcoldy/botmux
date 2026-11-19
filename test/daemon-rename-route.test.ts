@@ -1064,12 +1064,14 @@ describe('/rename production routing — must not pre-create a session (review P
         for (const parent of [undefined, 'om_unrelated']) {
           const id = parent ? 'om_bad_quote' : 'om_unquoted';
           const data = makeEventData(id, 'ordinary input', scope === 'thread' ? h.root : undefined);
+          if (scope === 'thread') data.message.thread_id = 'omt_async_ask';
           if (parent) data.message.parent_id = parent;
           await handleThreadReply(data, ctx(id));
           expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: h.root })).toHaveLength(2);
         }
         expect(repliedText()).toContain('多张待答卡片');
         const quoted = makeEventData('om_quote_card', 'my voice', scope === 'thread' ? h.root : undefined);
+        if (scope === 'thread') quoted.message.thread_id = 'omt_async_ask';
         quoted.message.parent_id = h.cards[0].cardMessageId ?? 'om_async_card_1';
         await handleThreadReply(quoted, ctx('om_quote_card'));
         expect((await one).status).toBe(200);

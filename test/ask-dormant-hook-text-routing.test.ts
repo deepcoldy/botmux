@@ -106,8 +106,7 @@ function wireBroker(): void {
 }
 
 function hookAsk(): CreateAskInput {
-  // Chat-scope session (the incident's shape): the ask anchors the whole chat,
-  // so every plain message in it is a text-answer candidate.
+  // Chat-scope ask: only plain messages outside other topics are candidates.
   return {
     larkAppId: APP,
     chatId: CHAT,
@@ -257,5 +256,108 @@ describe('hook ask that is still waiting (unchanged behaviour)', () => {
 
     expect(await waiting).toMatchObject({ kind: 'answered', comment: '取消后重新部署吧' });
     expect(workerStrings(send)).not.toContain('取消后重新部署吧');
+  });
+
+  it('私聊连续会话中，回复旧消息仍可回答当前 ask', async () => {
+    const { ds, send } = seedChatSession();
+    ds.chatType = 'p2p';
+    const waiting = registerAsk({ ...hookAsk(), chatType: 'p2p' });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    const event = makeEventData('om_dm_answer', '继续等');
+    event.message.chat_type = 'p2p';
+    event.message.root_id = 'om_old_dm';
+    event.message.thread_id = 'omt_old_dm';
+    await handleThreadReply(event, { ...makeCtx('om_dm_answer'), chatType: 'p2p' });
+    expect(settled).toHaveLength(1);
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '继续等' });
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+
+describe('群级 ask 与同群话题隔离（真实消息路由）', () => {
+  function seedTopic(root: string): ReturnType<typeof seedChatSession> {
+    const seeded = seedChatSession();
+    activeSessions.delete(sessionKey(CHAT, APP));
+    seeded.ds.scope = 'thread';
+    seeded.ds.session.rootMessageId = root;
+    seeded.ds.session.sessionId = 'sess-topic';
+    activeSessions.set(sessionKey(root, APP), seeded.ds);
+    return seeded;
+  }
+
+  function topicEvent(messageId: string, text: string, root: string): any {
+    const event = makeEventData(messageId, text);
+    event.message.root_id = root;
+    event.message.thread_id = 'omt_topic';
+    return event;
+  }
+
+  it('折叠到群会话的话题消息不结算群外层 ask', async () => {
+    const { send } = seedChatSession();
+    registerAsk({ ...hookAsk(), originKind: 'explicit' });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    const text = '另一个话题的工作指令';
+    await handleThreadReply(topicEvent('om_folded', text, 'om_other_topic'), {
+      ...makeCtx('om_folded'), replyRootId: 'om_other_topic', regularGroupTopLevel: false,
+    });
+    expect(settled).toHaveLength(0);
+    expect(workerStrings(send)).toContain(text);
+  });
+
+  it('群会话的 ask 发在话题内时，只接收同一话题的文字', async () => {
+    const { send } = seedChatSession();
+    const waiting = registerAsk({ ...hookAsk(), originKind: 'explicit', cardRootMessageId: 'om_ask_topic' });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    await handleThreadReply(topicEvent('om_other', '其它话题指令', 'om_other_topic'), {
+      ...makeCtx('om_other'), replyRootId: 'om_other_topic',
+    });
+    expect(settled).toHaveLength(0);
+    expect(workerStrings(send)).toContain('其它话题指令');
+
+    await handleThreadReply(topicEvent('om_same', '同话题答案', 'om_ask_topic'), {
+      ...makeCtx('om_same'), replyRootId: 'om_ask_topic',
+    });
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '同话题答案' });
+    expect(workerStrings(send)).not.toContain('同话题答案');
+  });
+
+  it.each(['explicit', 'hook'])('%s 群级 ask 等待时，话题指令仍送到该话题的 CLI', async originKind => {
+    const root = 'om_topic';
+    const { send } = seedTopic(root);
+    const waiting = registerAsk({ ...hookAsk(), originKind });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    const text = '请参考项目列表里的项目周期组件';
+    await handleThreadReply(topicEvent('om_topic_message', text, root), {
+      ...makeCtx('om_topic_message'), scope: 'thread', anchor: root, replyRootId: root,
+    });
+
+    expect(workerStrings(send)).toContain(text);
+    expect(settled).toHaveLength(0);
+    expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor: root })).toBeUndefined();
+    expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT })).toBeDefined();
+
+    const group = seedChatSession();
+    await handleThreadReply(makeEventData('om_group_answer', '继续等'), makeCtx('om_group_answer'));
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '继续等' });
+    expect(workerStrings(group.send)).not.toContain('继续等');
+  });
+
+  it('群级 ask 先登记时，话题回复只结算该话题的 ask', async () => {
+    const root = 'om_topic';
+    const { send } = seedTopic(root);
+    registerAsk({ ...hookAsk(), originKind: 'explicit' });
+    const topicWaiting = registerAsk({ ...hookAsk(), rootMessageId: root, sessionId: 'sess-topic',
+      requestId: 'topic-request', originKind: 'explicit' });
+    await vi.waitFor(() => expect(cards).toHaveLength(2));
+
+    await handleThreadReply(topicEvent('om_topic_answer', '话题内的答案', root), {
+      ...makeCtx('om_topic_answer'), scope: 'thread', anchor: root, replyRootId: root,
+    });
+
+    expect(await topicWaiting).toMatchObject({ kind: 'answered', comment: '话题内的答案' });
+    expect(settled).toHaveLength(1);
+    expect(settled[0]!.ask.askId).toBe(cards[1]!.askId);
+    expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT })?.askId).toBe(cards[0]!.askId);
+    expect(workerStrings(send)).not.toContain('话题内的答案');
   });
 });

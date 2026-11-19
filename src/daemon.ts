@@ -11319,14 +11319,14 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   };
-  // chat-scope 的 ask 身份仍是 root=null（文字答复按 chatId 锚点命中），独立卡片只是跟着发起
-  // turn 冻结的话题落点。嵌进回复卡的 ask 由回复卡决定位置；异步提问的提示与答复 turn
-  // 都按 root=null 发，卡片不单独搬走。
+  // chat-scope 的调用身份仍是 root=null；冻结提问话题供发卡与文字隔离使用。
+  // 内嵌 ask 也保留该位置，避免共用会话时吞掉其它话题的输入。异步 ask 沿用
+  // 自身绑定的原生话题，不覆盖其卡片落点。
   const askTurnTarget = askSession?.session.scope === 'chat' && typeof body.originTurnId === 'string'
     ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
-  const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
+  const cardRoot = asyncInput || askTurnTarget?.mode !== 'thread'
     ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
-  // 点名核验查通讯录，结果随重连可能变化，所以和卡片落点一样只作展示、不进调用身份。
+  // 点名核验查通讯录，结果随重连可能变化，不进调用身份。
   // 文档 ask 私聊发给作者，确认回执不发卡，都不点名。
   const requestedMention = documentDelivery || body.acknowledge === true ? undefined : boundAsk.mentionedOpenId;
   const mentionedOpenId = await verifiedAskMention(requestedMention, {
@@ -29812,10 +29812,16 @@ async function handleThreadReplyAdmitted(
     isWorkflowGrillTrigger: !!threadGrill,
   });
   if (askCandidate) {
-    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    // A shared/chat session can receive messages from several native topics.
+    // Match the original IM position before that routing fold, not just its session anchor.
+    // Direct-message sessions keep their existing continuous-chat routing semantics.
+    const askAnchor = { larkAppId, chatId: askCandidate.chatId, anchor,
+      ...((ctxChatType ?? data?.message?.chat_type) === 'p2p' ? {}
+        : { messageRootId: parsed.threadId ? (parsed.rootId || parsed.messageId) : null }) };
+    const candidates = listPendingAsksByAnchor(askAnchor);
     const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
     const ambiguous = candidates.length > 1 && candidates.some(ask => ask.originKind === CODEX_ASYNC_ASK_ORIGIN);
-    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
+    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor(askAnchor));
     if (ambiguous && !quoted) {
       await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
     }
