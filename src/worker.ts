@@ -31482,13 +31482,34 @@ async function spawnCliBody(
       || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
+    const readPaneRootPid = (): number | null | undefined => {
+      const current = backend;
+      if (current?.getPaneRootPid) return current.getPaneRootPid();
+      // Legacy accessors cannot distinguish a transient miss from an exited pane;
+      // treat both as unknown and let the bounded lifecycle fences stop retries.
+      return current?.getChildPid?.() ?? undefined;
+    };
+    let paneRootBaseline = readPaneRootPid();
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
-      // Herdr/ZMX alias getChildPid() to the mutable cliPid. A failed publication
-      // may already have rewired that field, so only the captured launcher PID +
-      // spawn generation can fence retries without abandoning them after apply.
-      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
+      // The pane root is independent of the mutable cliPid: our own rewire may
+      // change that alias and must not stop a failed publication retry, while an
+      // external pane replacement must stop the old tree before exit callbacks
+      // have advanced the backend instance or spawn generation. An unknown probe
+      // skips only this tick; an authoritative missing root stops permanently.
+      getChildPid: () => {
+        if (generation !== cliSpawnGeneration) return null;
+        const currentRoot = readPaneRootPid();
+        if (currentRoot === null) return null;
+        if (currentRoot === undefined) return undefined;
+        if (paneRootBaseline === undefined) {
+          paneRootBaseline = currentRoot;
+          return launcherPid;
+        }
+        return currentRoot === paneRootBaseline ? launcherPid : null;
+      },
+      retryOnUnknownChildPid: true,
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });

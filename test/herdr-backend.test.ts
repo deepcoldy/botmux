@@ -2603,6 +2603,34 @@ describe('HERDR CLI process identity', () => {
     expect(herdrCall('process-info')).toEqual(['--session', SESSION, 'pane', 'process-info', '--pane', 'exact-pane']);
     be.kill();
   });
+
+  it('reads the live pane root independently of a refined cliPid', () => {
+    let shellPid = 10;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: shellPid, foreground_processes: [] } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliPid: 21 });
+    expect(be.getChildPid()).toBe(21);
+    expect(be.getPaneRootPid()).toBe(10);
+    shellPid = 30;
+    expect(be.getPaneRootPid()).toBe(30);
+    be.kill();
+  });
+
+  it('reports a failed pane-root probe as unknown and observes its recovery', () => {
+    let fail = true;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (fail) throw new Error('temporary process-info failure');
+      return JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: [] } } });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane' });
+    expect(be.getPaneRootPid()).toBeUndefined();
+    fail = false;
+    expect(be.getPaneRootPid()).toBe(10);
+    be.kill();
+  });
 });
 
 

@@ -1089,6 +1089,18 @@ export class ZmxBackend implements SessionBackend {
     return pid;
   }
 
+  getPaneRootPid(): number | null | undefined {
+    if (this.exited) return null;
+    // Query live state instead of the cached cliPid/launchPid, which wrapper
+    // resolution may already have refined before an exit callback catches up.
+    const probe = ZmxBackend.probeSessions();
+    if (!probe.ok) return undefined;
+    if (!probe.sessions.includes(this.sessionName)) {
+      return probe.unhealthySessions.includes(this.sessionName) ? undefined : null;
+    }
+    return sessionDetailsFromSnapshot(probe, this.sessionName)?.pid ?? undefined;
+  }
+
   /** Best-effort plain-text terminal snapshot supplied by ZMX history. */
   captureCurrentScreen(): string {
     return this.hasSnapshot ? this.snapshotCache : '';

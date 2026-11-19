@@ -376,6 +376,29 @@ describe('zmx backend pure helpers', () => {
     expect(findSessionPid('bmx-abcd1234')).toBe(4242);
   });
 
+  it('reads the live pane root independently of a refined cliPid', () => {
+    const be = new ZmxBackend('bmx-abcd1234');
+    be.cliPid = 200;
+    const mockRoot = (pid: number) => {
+      execFileSyncMock.mockReturnValueOnce('bmx-abcd1234\n' as never);
+      execFileSyncMock.mockReturnValueOnce(`  name=bmx-abcd1234\tpid=${pid}\tclients=1\tcmd=claude\n` as never);
+    };
+    mockRoot(4242);
+    expect(be.getPaneRootPid()).toBe(4242);
+    mockRoot(4343);
+    expect(be.getPaneRootPid()).toBe(4343);
+    expect(be.cliPid).toBe(200);
+  });
+
+  it('reports a failed pane-root probe as unknown and observes its recovery', () => {
+    const be = new ZmxBackend('bmx-abcd1234');
+    execFileSyncMock.mockImplementationOnce(() => { throw new Error('temporary zmx list failure'); });
+    expect(be.getPaneRootPid()).toBeUndefined();
+    execFileSyncMock.mockReturnValueOnce('bmx-abcd1234\n' as never);
+    execFileSyncMock.mockReturnValueOnce('  name=bmx-abcd1234\tpid=4242\tclients=1\tcmd=claude\n' as never);
+    expect(be.getPaneRootPid()).toBe(4242);
+  });
+
   it('parses healthy and unhealthy rows from the full list', () => {
     expect(parseZmxList(
       '  name=bmx-abcd1234\tpid=42\tclients=1\n' +

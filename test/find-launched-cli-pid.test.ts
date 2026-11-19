@@ -119,18 +119,20 @@ function runWorkerWiring(late: boolean, options: {
   /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
    *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
   aliasedChildPid?: boolean;
+  /** Stable pane root, independent of the backend's mutable cliPid alias. */
+  paneRoot?: { pid: number | null | undefined };
   /** Run the real BFS over the synthetic table (`children` / `childComms`)
    *  with the depth the worker passes, instead of the canned result. */
   realCodexSearch?: boolean;
-  credentialOnlyBwrap?: boolean;
   /** Pids whose process has exited: their birth token no longer reads back. */
   exited?: number[];
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
-  const backend: { cliPid: number; getChildPid: () => number } = {
+  const backend: { cliPid: number; getChildPid: () => number; getPaneRootPid: () => number | null | undefined } = {
     cliPid: 100,
     getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
+    getPaneRootPid: () => options.paneRoot ? options.paneRoot.pid : 100,
   };
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ...args: unknown[]) {
     if (scheduler.now() < (options.launchedCliAfterMs ?? 0)) return null;
@@ -711,6 +713,69 @@ describe('worker wrapper PID wiring', () => {
     // consolidating resolvers must not strand them on the sandbox payload.
     expect(result.backend.cliPid).toBe(153);
     expect(result.bridgeCliPid).toBe(153);
+  });
+
+  it.each([false, true])('stops generic wrapper retries when the pane root changes after a failed publication (late PID=%s)', late => {
+    const paneRoot = { pid: 100 };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', aliasedChildPid: false, paneRoot,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) {
+            failedLeaf = true;
+            // The exit callback has not advanced backend/generation yet, but the
+            // backing pane root is already new. The old tree must not publish again.
+            paneRoot.pid = 300;
+            return false;
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(1);
+  });
+
+  it.each([false, true])('fails closed without applying when the pane root is authoritatively missing (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', paneRoot: { pid: null },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+  });
+
+  it.each([false, true])('retries an initially unknown pane root until it becomes available (late PID=%s)', late => {
+    const paneRoot: { pid: number | undefined } = { pid: undefined };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', paneRoot,
+      beforeTimers: scope => {
+        scope.setTimeout(() => { paneRoot.pid = 100; }, 500);
+      },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(500);
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(1);
+  });
+
+  it.each([false, true])('retries a failed publication through a transient pane-root probe failure (late PID=%s)', late => {
+    const paneRoot: { pid: number | undefined } = { pid: 100 };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', paneRoot,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) {
+            failedLeaf = true;
+            paneRoot.pid = undefined;
+            scope.setTimeout(() => { paneRoot.pid = 100; }, 400);
+            return false;
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(400);
   });
 
   it.each([false, true])('retries generic wrapper publication after an aliased backend rewires its child PID (late PID=%s)', late => {

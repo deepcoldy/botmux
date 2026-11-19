@@ -728,6 +728,9 @@ export interface WrapperRealPidResolveDeps {
   getBackend: () => unknown;
   /** Backend's current child pid (the launcher while unchanged). */
   getChildPid: () => number | null | undefined;
+  /** When true, an undefined child pid is a transient probe unknown: skip this
+   *  tick but keep the bounded retry alive. Null remains an authoritative stop. */
+  retryOnUnknownChildPid?: boolean;
   /** Apply the resolved real pid. Return false when publication failed and
    * should be retried; void preserves the legacy stop-after-success behavior. */
   applyRealPid: (realPid: number) => unknown;
@@ -769,7 +772,11 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
     if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
   };
   const tick = () => {
-    if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
+    const currentBackend = deps.getBackend();
+    if (!currentBackend || currentBackend !== backendAtSpawn) return;
+    const currentChildPid = deps.getChildPid();
+    if (currentChildPid === undefined && deps.retryOnUnknownChildPid) { retry(); return; }
+    if (!launcherRetryStillValid(currentBackend, backendAtSpawn, currentChildPid, launcherPid)) return;
     if (deps.isDirectLeaf?.(launcherPid)) return;
     if (appliedPid !== undefined) {
       if (deps.isAppliedPidValid?.(appliedPid)) { retry(); return; }

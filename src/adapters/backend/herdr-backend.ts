@@ -1002,6 +1002,18 @@ export class HerdrBackend implements SessionBackend {
     return this.cliPid ?? null;
   }
 
+  getPaneRootPid(): number | null | undefined {
+    if (this.exited) return null;
+    if (!this.paneId) return undefined;
+    // Deliberately bypass cliPid: wrapper resolution may refine it to a leaf.
+    // shell_pid is the backing pane root and remains stable across that rewire.
+    const info = jsonCommand(herdrSessionArgs(this.sessionName, [
+      'pane', 'process-info', '--pane', this.paneId,
+    ]))?.result?.process_info;
+    const pid = Number(info?.shell_pid);
+    return Number.isSafeInteger(pid) && pid > 1 ? pid : undefined;
+  }
+
   getAttachInfo() {
     return null;
   }

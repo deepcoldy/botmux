@@ -351,6 +351,11 @@ export interface SessionBackend {
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
+  /** Current root PID of the backing pane, independent of a worker-refined
+   *  cliPid. Wrapper retry fences use this to detect an external pane replacement
+   *  without mistaking their own cliPid rebinding for a lifecycle change.
+   *  Null means authoritatively missing; undefined means transiently unknown. */
+  getPaneRootPid?(): number | null | undefined;
   captureCurrentScreen?(): string;
   /**
    * Escape sequence re-asserting the pane's live input modes (mouse tracking,
