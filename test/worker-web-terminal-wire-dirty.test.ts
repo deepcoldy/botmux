@@ -304,4 +304,24 @@ describe('unconfirmed Web terminal wire state', () => {
     expect(h.scope.injectionFlushing).toBe(false);
     expect(h.scope.webTerminalInputWireDirty()).toBe(false);
   });
+
+  it('restores the shifted injection when the wire turns dirty inside the write prepare callback', async () => {
+    const h = makeInjectionHarness();
+    const original = { ...h.item };
+    // All outer gates pass on a clean wire; the dirty generation starts only
+    // once the fenced write invokes its prepare callback, i.e. after shift().
+    h.scope.sendRawCommandLineWithRecoveryFence = vi.fn(async (
+      _target: unknown, _command: string, beforeWrite?: () => void,
+    ) => { beforeWrite && (h.markDirty(), beforeWrite()); });
+    await h.inject();
+    // The write path was entered (this timing is past every outer gate)...
+    expect(h.scope.sendRawCommandLineWithRecoveryFence).toHaveBeenCalledTimes(1);
+    // ...but the prepare callback refused, so the shifted item must be
+    // restored instead of being silently consumed on an uncertain wire.
+    expect(h.scope.pendingInjections).toEqual([original]);
+    expect(h.scope.pendingInjections[0]).toBe(h.item);
+    expect(h.scope.awaitPtyQuiescence).not.toHaveBeenCalled();
+    expect(h.scope.injectionFlushing).toBe(false);
+    expect(h.scope.webTerminalInputWireDirty()).toBe(true);
+  });
 });
