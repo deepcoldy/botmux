@@ -25,6 +25,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
+import { managedTmuxBinDirIfInstalled } from './tmux-managed-path.js';
 import {
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
@@ -375,10 +376,10 @@ const TMUX_PATH_EXTRAS = [
   '/sbin',
 ];
 
-function withTmuxSearchPath(pathValue: string | undefined): string {
+function withTmuxSearchPath(pathValue: string | undefined, preferred?: string): string {
   const seen = new Set<string>();
   const merged: string[] = [];
-  for (const part of [...(pathValue?.split(':') ?? []), ...TMUX_PATH_EXTRAS]) {
+  for (const part of [...(preferred ? [preferred] : []), ...(pathValue?.split(':') ?? []), ...TMUX_PATH_EXTRAS]) {
     if (!part || seen.has(part)) continue;
     seen.add(part);
     merged.push(part);
@@ -402,7 +403,11 @@ export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
   }
   return {
     ...rest,
-    PATH: withTmuxSearchPath(rest.PATH),
+    // botmux's own prebuilt tmux (installed only by the one-click upgrade on a
+    // host whose tmux no package manager owns) wins over whatever else is on
+    // PATH, so every botmux tmux call — daemon, workers, the next server —
+    // agrees on one binary. The user's own tmux is never touched.
+    PATH: withTmuxSearchPath(rest.PATH, managedTmuxBinDirIfInstalled(undefined, env)),
   };
 }
 

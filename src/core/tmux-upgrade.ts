@@ -335,7 +335,19 @@ export function isTmuxUpgradeAction(action: unknown): action is string {
 
 function planView(plan: TmuxUpgradePlan): TmuxUpgradePlanView {
   return plan.auto
-    ? { auto: true, display: plan.display, tmuxPath: plan.tmuxPath, ...(plan.candidate ? { candidate: plan.candidate } : {}) }
+    ? {
+        auto: true,
+        display: plan.display,
+        tmuxPath: plan.tmuxPath,
+        ...(plan.candidate ? { candidate: plan.candidate } : {}),
+        ...(plan.prebuilt ? {
+          prebuilt: {
+            release: plan.prebuilt.release,
+            dir: join(plan.prebuilt.root, 'current', 'bin', 'tmux'),
+            ...(plan.prebuilt.keepPath ? { keepPath: plan.prebuilt.keepPath } : {}),
+          },
+        } : {}),
+      }
     : {
         auto: false,
         reason: plan.reason,
@@ -343,7 +355,24 @@ function planView(plan: TmuxUpgradePlan): TmuxUpgradePlanView {
         ...(plan.manualCommand ? { manualCommand: plan.manualCommand } : {}),
         ...(plan.hint ? { hint: plan.hint } : {}),
         ...(plan.candidate ? { candidate: plan.candidate } : {}),
+        ...(plan.prebuiltUnavailable ? { prebuiltUnavailable: plan.prebuiltUnavailable } : {}),
       };
+}
+
+/** Owner-facing wording for a failed upgrade run. */
+function upgradeErrorText(execution: TmuxUpgradeExecution, min: string, locale: Locale): string {
+  const detail = execution.error ?? '';
+  switch (execution.failure) {
+    case 'no_candidate': return t('tmux_upgrade.error.no_candidate', { min, detail }, locale);
+    case 'timed_out': return t('tmux_upgrade.error.timeout', { detail }, locale);
+    case 'libs_missing':
+      return t('tmux_upgrade.error.prebuilt_libs', { libs: (execution.missingLibraries ?? []).join(', ') || detail }, locale);
+    case 'checksum_mismatch': return t('tmux_upgrade.error.prebuilt_checksum', { detail }, locale);
+    case 'download_failed': return t('tmux_upgrade.error.prebuilt_download', { detail }, locale);
+    case 'verify_failed': return t('tmux_upgrade.error.prebuilt_verify', { detail }, locale);
+    case 'foreign': return t('tmux_upgrade.error.prebuilt_foreign', { detail }, locale);
+    default: return t('tmux_upgrade.error.command', { detail }, locale);
+  }
 }
 
 /** Strip terminal control sequences; keep the tail short enough for a card. */
@@ -1052,11 +1081,7 @@ export class TmuxUpgradeAdvisor {
             final = this.afterBinary(facts, locale);
           } else {
             const error = !execution.ok
-              ? execution.failure === 'no_candidate'
-                ? t('tmux_upgrade.error.no_candidate', { min: this.rec.version, detail: execution.error ?? '' }, locale)
-                : execution.failure === 'timed_out'
-                  ? t('tmux_upgrade.error.timeout', { detail: execution.error ?? '' }, locale)
-                  : t('tmux_upgrade.error.command', { detail: execution.error ?? '' }, locale)
+              ? upgradeErrorText(execution, this.rec.version, locale)
               : t('tmux_upgrade.error.still_old', { client: facts.client ?? '?', min: this.rec.version }, locale);
             this.deps.log(`upgrade did not reach ${this.rec.version}: ${error}`);
             final = { ...this.baseModel(facts, 'upgrade_failed', locale), plan: planView(plan), log: [...log], error };

@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import type { PlatformInfo } from '../src/setup/detect-platform.js';
 import { TMUX_RECOMMENDED_MIN, parseTmuxRelease } from '../src/setup/tmux-recommended.js';
+import { TMUX_PREBUILT_CANDIDATES } from '../src/setup/tmux-prebuilt.js';
 import {
   executeTmuxUpgrade,
   isSafePackageVersion,
@@ -378,5 +379,107 @@ describe('spawnUpgradeCommand', () => {
     });
     expect(r.code).toBeNull();
     expect(r.error).toBeTruthy();
+  });
+});
+
+describe('botmux\'s own prebuilt tmux as the fallback route', () => {
+  const ROOT = '/home/u/.botmux/tools/tmux';
+  const supported = {
+    ok: true as const,
+    arch: 'x64' as const,
+    glibc: '2.36',
+    candidates: TMUX_PREBUILT_CANDIDATES.filter(c => c.arch === 'x64'),
+  };
+  const prebuiltProbe = (over: Partial<TmuxUpgradeProbe> = {}) => probe({
+    managedRoot: ROOT,
+    managedState: () => ({ state: 'absent' }),
+    prebuiltSupport: async () => supported,
+    ...over,
+  });
+
+  it('a hand-placed tmux no package manager owns → install botmux\'s own copy, keep the user\'s', async () => {
+    const plan = await planTmuxUpgrade(prebuiltProbe({
+      resolveTmux: () => ({ path: '/home/u/.local/bin/tmux', realPath: '/home/u/.local/bin/tmux' }),
+    }));
+    expect(plan).toMatchObject({
+      auto: true,
+      owner: { kind: 'botmux', root: ROOT },
+      prebuilt: { release: supported.candidates[0]!.release, root: ROOT, keepPath: '/home/u/.local/bin/tmux' },
+    });
+  });
+
+  it('no sudo, or a package source stuck below the recommendation → the same fallback', async () => {
+    expect(await planTmuxUpgrade(prebuiltProbe({ platform: platform({ isRoot: false, passwordlessSudo: false }) })))
+      .toMatchObject({ auto: true, owner: { kind: 'botmux' } });
+    expect(await planTmuxUpgrade(prebuiltProbe({ packageCandidates: () => [{ packageVersion: `${BELOW}-3`, release: BELOW }] })))
+      .toMatchObject({ auto: true, owner: { kind: 'botmux' } });
+  });
+
+  it('a working package-manager route always wins over the prebuilt one', async () => {
+    const prebuiltSupport = vi.fn(async () => supported);
+    expect(await planTmuxUpgrade(prebuiltProbe({ prebuiltSupport })))
+      .toMatchObject({ auto: true, owner: { kind: 'system', pm: 'apt' } });
+    expect(prebuiltSupport).not.toHaveBeenCalled();
+  });
+
+  it('a host that cannot run it keeps the manual plan and says why', async () => {
+    const plan = await planTmuxUpgrade(prebuiltProbe({
+      resolveTmux: () => ({ path: '/home/u/.local/bin/tmux', realPath: '/home/u/.local/bin/tmux' }),
+      prebuiltSupport: async () => ({ ok: false, reason: 'glibc', detail: '2.31' }),
+    }));
+    expect(plan).toMatchObject({ auto: false, reason: 'unmanaged_binary', prebuiltUnavailable: { reason: 'glibc', detail: '2.31' } });
+  });
+
+  it('a modified botmux tmux directory is never offered for overwrite', async () => {
+    const plan = await planTmuxUpgrade(prebuiltProbe({
+      resolveTmux: () => ({ path: '/home/u/.local/bin/tmux', realPath: '/home/u/.local/bin/tmux' }),
+      managedState: () => ({ state: 'foreign', reason: 'executable does not match its manifest' }),
+    }));
+    expect(plan).toMatchObject({ auto: false, prebuiltUnavailable: { reason: 'managed_modified' } });
+  });
+
+  it('when botmux\'s own copy is the one running: replace it only if provably ours', async () => {
+    const inRoot = { path: `${ROOT}/current/bin/tmux`, realPath: `${ROOT}/releases/x/bin/tmux` };
+    expect(await planTmuxUpgrade(prebuiltProbe({
+      resolveTmux: () => inRoot,
+      managedState: () => ({ state: 'valid', releaseDir: `${ROOT}/releases/x`, binPath: inRoot.realPath, manifest: {} as any }),
+    }))).toMatchObject({ auto: true, owner: { kind: 'botmux', root: ROOT } });
+    expect(await planTmuxUpgrade(prebuiltProbe({
+      resolveTmux: () => inRoot,
+      managedState: () => ({ state: 'foreign', reason: 'modified' }),
+    }))).toMatchObject({ auto: false, reason: 'managed_modified' });
+  });
+
+  it('executing a botmux-owner plan runs the prebuilt installer, nothing else', async () => {
+    const run = vi.fn();
+    const installPrebuilt = vi.fn(async (onLine: (l: string) => void) => {
+      onLine('download https://snapshot.debian.org/…');
+      return { ok: true as const, release: '3.5a', binPath: `${ROOT}/releases/x/bin/tmux`, source: 'https://snapshot.debian.org/x.deb' };
+    });
+    const lines: string[] = [];
+    const plan = { auto: true as const, owner: { kind: 'botmux' as const, root: ROOT }, tmuxPath: '/home/u/.local/bin/tmux', display: 'x.deb' };
+    expect(await executeTmuxUpgrade(plan, { platform: platform(), run, onLine: l => lines.push(l), installPrebuilt }))
+      .toMatchObject({ ok: true, selected: '3.5a', ran: ['https://snapshot.debian.org/x.deb'] });
+    expect(run).not.toHaveBeenCalled();
+    expect(lines).toContain('download https://snapshot.debian.org/…');
+
+    const failing = vi.fn(async () => ({ ok: false as const, failure: 'libs_missing' as const, error: 'missing x', missingLibraries: ['libjemalloc.so.2'] }));
+    expect(await executeTmuxUpgrade(plan, { platform: platform(), run, onLine: () => {}, installPrebuilt: failing }))
+      .toMatchObject({ ok: false, failure: 'libs_missing', missingLibraries: ['libjemalloc.so.2'] });
+    expect(await executeTmuxUpgrade(plan, { platform: platform(), run, onLine: () => {} }))
+      .toMatchObject({ ok: false, failure: 'unsupported' });
+  });
+});
+
+describe('planner — botmux\'s own copy behind a symlinked HOME', () => {
+  it('compares canonical paths, so botmux\'s copy is never called "yours"', async () => {
+    const plan = await planTmuxUpgrade(probe({
+      managedRoot: '/home/u/.botmux/tools/tmux',
+      realpath: () => '/data/u/.botmux/tools/tmux',
+      resolveTmux: () => ({ path: '/home/u/.botmux/tools/tmux/current/bin/tmux', realPath: '/data/u/.botmux/tools/tmux/releases/x/bin/tmux' }),
+      managedState: () => ({ state: 'foreign', reason: 'modified' }),
+      prebuiltSupport: async () => ({ ok: false, reason: 'glibc', detail: '2.31' }),
+    }));
+    expect(plan).toMatchObject({ auto: false, reason: 'managed_modified' });
   });
 });
