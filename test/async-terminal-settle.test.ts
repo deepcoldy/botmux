@@ -545,6 +545,39 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     ));
     expect(recordCompletedMock).not.toHaveBeenCalled();
   });
+
+  it('keeps the worker-exit convergence stamp when the durable strict write throws', async () => {
+    // EIO/ENOSPC on the durable write: the in-memory projection still fails so
+    // this daemon's polling terminates, but the convergence stamp must survive
+    // — deleting it would leave a restarted daemon with a durable `pending`
+    // record and no backstop, so the trigger polls `running` forever.
+    recordTerminalFailureStrictMock.mockImplementationOnce(() => { throw new Error('EIO'); });
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['turn-eio', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([['turn-eio', {
+      ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1,
+    } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-eio', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await vi.waitFor(() => expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(
+      'sid-async-settle', 'turn-eio', expect.any(Number), 'app_test', 'turn_ended_unobserved',
+    ));
+    // Live polling still terminates on the in-memory failed projection.
+    expect(ds.asyncTriggerResults!.get('turn-eio')).toMatchObject({
+      status: 'failed',
+      errorCode: 'trigger_failed',
+      terminalErrorCode: 'turn_ended_unobserved',
+    });
+    // The stamp is retained: worker-exit convergence / a terminal replay still
+    // owns the durable terminalization.
+    expect(ds.idempotentAsyncTurns!.has('turn-eio')).toBe(true);
+    // The late-output fallthrough guard still armed despite the write failure.
+    expect(ds.settledHttpTerminalTurns?.has('turn-eio')).toBe(true);
+  });
 });
 
 describe('a failed terminal\'s raw error and screen tail (daemon turn_terminal handler)', () => {

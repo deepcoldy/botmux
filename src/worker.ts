@@ -11,6 +11,7 @@ import {
   RUNTIME_RESERVATION_DEADLINE_MS,
   RUNTIME_RESERVATION_SLOW_LOG_MS,
   RuntimeReservationExpiredError,
+  RuntimeReservationRefusedError,
 } from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
@@ -2124,7 +2125,7 @@ function armRpcStartupDialogDismiss(): void {
  * callbacks capture it and must re-check after every await before touching
  * transcript lifecycle or user-visible state. */
 let workerSessionEventScope: WorkerSessionEventScope | undefined;
-const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>();
+const pendingRuntimeReservations = new Map<string, (mayStart: boolean, refusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal) => void>();
 const contractWriteBackends = new WeakSet<SessionBackend>();
 function hasCurrentSessionRuntime(): boolean { return !workerSessionEventScope || workerSessionEventScope.isCurrentContext(); }
 function fenceContractBackendWrites(): void {
@@ -13088,16 +13089,21 @@ function emitReadyTurns(opts: {
     // Output disposition, positive evidence only:
     //  - genuine silence (bare nothing-to-send sentinel, no `botmux send`) →
     //    'nothing_to_send'; a durable/async caller may settle completed-empty.
-    //  - NO explicit transcript terminal at all (`terminalOutcome` undefined:
-    //    no assistant stop_reason record, no API-error record) and not silence →
-    //    'boundary_unobserved'. The turn was popped at a screen-idle boundary
-    //    that proves nothing: the dominant cause is the CLI dying mid-turn
-    //    (killed/crashed — a frozen pane still matches the idle detector), so
-    //    claiming plain `completed` here would let the daemon leave a pending
-    //    async trigger `running` forever (residual headless state) while the
-    //    session auto-restarts into an idle REPL. The label lets the daemon
-    //    settle fail-closed instead. A turn with a real terminal outcome keeps
-    //    the label absent.
+    //  - NO transcript terminal evidence at all (`terminalObserved` false:
+    //    neither an assistant stop_reason/API-error record nor a next-turn-start
+    //    compatibility boundary) and not silence → 'boundary_unobserved'. The
+    //    turn was popped at a screen-idle boundary that proves nothing: the
+    //    dominant cause is the CLI dying mid-turn (killed/crashed — a frozen
+    //    pane still matches the idle detector), so claiming plain `completed`
+    //    here would let the daemon leave a pending async trigger `running`
+    //    forever (residual headless state) while the session auto-restarts into
+    //    an idle REPL. The label lets the daemon settle fail-closed instead.
+    //    Gate on terminalObserved, NOT on an undefined terminalOutcome: a
+    //    marker-less older JSONL variant closes the previous turn via the NEXT
+    //    user record (bridge queue sets terminalObserved=true without a
+    //    terminalOutcome) — that is positive proof the turn ended, so it must
+    //    keep the label absent. A turn carrying a real terminal outcome is
+    //    terminalObserved by construction and is unaffected.
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
@@ -13105,7 +13111,7 @@ function emitReadyTurns(opts: {
       turn.dispatchAttempt,
       nothingToSendTurns.has(turn)
         ? 'nothing_to_send'
-        : !outcome
+        : !turn.terminalObserved
           ? 'boundary_unobserved'
           : undefined,
       undefined,
@@ -26046,6 +26052,10 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      // The daemon found no operation that takes this start over: fail it where
+      // it is seen, so the session reads as not online and the next start is
+      // retried, instead of idling with no CLI.
+      if (outcome === 'unowned' && !superseded) throw new RuntimeReservationRefusedError();
       if (outcome === 'refused' && continuation && !superseded) {
         abandonTraexAutoModelContinuation(continuation, binding.bindingId, 'rejected');
         return spawnCli(cfg, opts);
@@ -37570,7 +37580,7 @@ async function sendFatalWorkerErrorAndExit(
   fatalWorkerErrorPending = true;
   // No CLI of this start ever existed to take the queued inputs; the daemon's
   // retry of a transient startup failure starts the worker that types them.
-  if (err instanceof RuntimeReservationExpiredError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
+  if (err instanceof RuntimeReservationExpiredError || err instanceof RuntimeReservationRefusedError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
   const pendingAttemptId = pendingLaunchConvergence?.attemptId;
   pendingLaunchConvergence = undefined;
   if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
@@ -38326,7 +38336,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'runtime_contract_reserved': {
       const binding = workerSessionEventScope?.currentBinding();
       if (binding?.bindingId === msg.bindingId) binding.proposedRuntime = msg.runtime;
-      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart);
+      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart, msg.startRefusal);
       break;
     }
     case 'execution_contract_assigned': {

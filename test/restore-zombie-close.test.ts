@@ -1047,7 +1047,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     );
     expect(HerdrBackend.probeSession).not.toHaveBeenCalled();
     expect(closeSession).not.toHaveBeenCalled();
-    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: s }), '', true, { reattachLiveBackend: true });
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: s }), '', true, expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
   });
 
   it('isolates a collision-loser close refusal and continues restoring later rows', async () => {
@@ -1069,7 +1069,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       expect.objectContaining({ session: expect.objectContaining({ sessionId: survivor.sessionId }) }),
       '',
       true,
-      { reattachLiveBackend: true },
+      expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }),
     );
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('ownership probe unavailable'));
   });
@@ -1158,7 +1158,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(2);
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true, { reattachLiveBackend: true });
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true, expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
     expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
     expect(closeSession).not.toHaveBeenCalled();
   });
@@ -1246,7 +1246,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     });
     const restored = map.get(sessionKey('om_cli_mismatch_pending', 'app_test'));
     expect(restored).toBeDefined();
-    expect(forkWorker).toHaveBeenCalledWith(restored, '', true, { reattachLiveBackend: true });
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true, expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
   });
 
   it('isolates a failed ZMX mismatch teardown and continues closing later sessions', async () => {
@@ -1504,7 +1504,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     wp.registry = map;
     await restoreActiveSessions(map);
     expect(vi.mocked(forkWorker).mock.calls.find(([ds]) => ds.session.sessionId === alive.sessionId)?.[3])
-      .toEqual({ reattachLiveBackend: true });
+      .toEqual(expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
 
     vi.mocked(forkWorker).mockClear();
     probe.result = 'missing';
@@ -1521,7 +1521,8 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     await restoreActiveSessions(map2);
     const call = vi.mocked(forkWorker).mock.calls.find(([ds]) => ds.session.sessionId === coldSpawn.sessionId);
     expect(call).toBeDefined();
-    expect(call![3]).toBeUndefined();
+    expect(call![3]).toMatchObject({ memoryNoticeAudience: 'owner-only' });
+    expect(call![3]?.reattachLiveBackend).toBeUndefined();
   });
 
   // ── blocker #3d: a sandbox session persisted as adopt must be CONVERTED to a
@@ -1596,7 +1597,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(restored.session.lastCodexAppInput).toEqual(expected);
     expect(restored.lastUserPrompt).toBe('第 20 轮用户原文');
     expect(restored.lastCliInput).toContain('第 20 轮用户原文');
-    expect(forkWorker).toHaveBeenCalledWith(restored, '', true, { reattachLiveBackend: true });
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true, expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
     expect(sessionStore.getSession(s.sessionId)?.lastCodexAppInput).toEqual(expected);
   });
 
@@ -1632,7 +1633,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const canonical = map.get(sessionKey('om_pending_collision', 'app_test'))!;
     expect(canonical.session.sessionId).toBe(first.sessionId);
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true, { reattachLiveBackend: true });
+    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true, expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
   });
 });
 
@@ -2176,7 +2177,7 @@ describe('restoreActiveSessions — deployment interrupted Codex turn', () => {
     checkpoint(); probe.result = 'exists';
     const active = new Map<string, DaemonSession>(); wp.registry = active;
     await restoreActiveSessions(active);
-    expect(forkWorker).toHaveBeenCalledWith(expect.anything(), '', true, { reattachLiveBackend: true });
+    expect(forkWorker).toHaveBeenCalledWith(expect.anything(), '', true, expect.objectContaining({ reattachLiveBackend: true, memoryNoticeAudience: 'owner-only' }));
   });
   it('does not act when backend existence is unknown', async () => {
     checkpoint(); probe.result = 'unknown';

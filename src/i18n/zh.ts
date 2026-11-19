@@ -23,6 +23,8 @@ export const messages: Record<string, string> = {
   'cmd.cli.unknown': '未知 CLI：{input}',
   'cmd.cli.ambiguous': '「{input}」对应多个 CLI，没有替你选。请改发其中一个：{choices}',
   'cmd.cli.choice': '/cli {cliId}（{name}）',
+  'worker.memory_admission_unavailable': '⚠️ 服务暂时无法执行，请稍后重试。',
+  'worker.memory_admission_owner_alert': '⚠️ {botName} 主机内存保护已阻止启动\n受影响会话：{count}\n可用内存：{available}；保留余量：{reserve}\n内存 full PSI avg10：{psi}%；门槛：{psiLimit}%\n原因：{reason}\n请检查主机进程的内存占用和并发量；资源恢复后重试。',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
   'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',

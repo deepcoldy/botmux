@@ -34,6 +34,7 @@ import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-polic
 import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler, recordMessageListenerTurnTerminal } from './core/message-listener-auto-close.js';
+import { resolveWorkerAdmissionOwner, WorkerAdmissionOwnerAlerts } from './core/worker-admission-owner-alert.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
 import {
   REPORT_SOURCE_REPLY_ROUTE,
@@ -34066,8 +34067,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
   });
   // Initialise worker pool with daemon callbacks
+  const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts({
+    dataDir: config.session.dataDir,
+    ownerForApp: appId => resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId }),
+    botForApp: appId => ({ name: getBot(appId).botName ?? appId, locale: localeForBot(appId) }),
+    send: (appId, owner, content) => sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 }),
+    onError: message => logger.warn(`[memory-admission] ${message}`),
+  });
   initWorkerPool({
     larkAppId: cfg.larkAppId,
+    onMemoryAdmissionBlocked: (ds, decision) =>
+      memoryAdmissionOwnerAlerts.report(ds.larkAppId, ds.session.sessionId, decision),
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
@@ -37058,6 +37068,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (result.worker) remoteRetiredWorkers.push(result.worker);
     }
 
+    memoryAdmissionOwnerAlerts.dispose();
     scheduler.stopScheduler();
 
     // Settle live CoT thinking bubbles as「因重启中断」BEFORE tearing anything

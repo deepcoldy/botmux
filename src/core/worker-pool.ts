@@ -1,6 +1,7 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
+import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import { handleResumeFallbackReport } from '../services/resume-fallback-notice.js';
 import {
@@ -78,7 +79,7 @@ import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-confi
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } from './retired-runtime-exit.js';
 import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
-import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
+import { checkWorkerAdmission, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
 import { reclaimIdleWorkersForAdmissionAfterTurnDrain, unsettledReplyHoldUntil } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
@@ -1318,6 +1319,8 @@ export interface WorkerSessionReplyOptions {
 export interface WorkerPoolCallbacks {
   /** Exact store-owning app, including boot with no live sessions. */
   larkAppId?: string;
+  /** Host memory diagnostics go to the bot owner, independently of turn replies. */
+  onMemoryAdmissionBlocked?: (ds: DaemonSession, decision: WorkerAdmissionDecision) => void;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
   /** Host-owned return path for zero-injection sub-bots. */
   onZeroPromptFinal?: (ds: DaemonSession, input: {
@@ -5522,6 +5525,48 @@ export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boo
   return identity?.turnId !== undefined && identity.turnId !== turnId;
 }
 
+const deferredUnifiedReplyTurns = new WeakMap<DaemonSession, Set<string>>();
+
+/** Unified-reply placeholder waits while another turn still owns the terminal.
+ * No capture identity (fresh session) and an identity that already names this
+ * turn both post immediately. Do not reuse {@link streamingCardTurnQueued}:
+ * its waiting-exact-turn clause stays true for every turn id. */
+export function unifiedReplyTurnNotCapturing(ds: DaemonSession, turnId: string): boolean {
+  const identity = currentCaptureIdentity(ds);
+  return identity?.turnId !== undefined && identity.turnId !== turnId;
+}
+
+function rememberDeferredUnifiedReply(ds: DaemonSession, turnId: string): void {
+  let pending = deferredUnifiedReplyTurns.get(ds);
+  if (!pending) {
+    pending = new Set();
+    deferredUnifiedReplyTurns.set(ds, pending);
+  }
+  pending.add(turnId);
+  while (pending.size > 32) {
+    const oldest = pending.values().next().value;
+    if (oldest === undefined) break;
+    pending.delete(oldest);
+  }
+}
+
+function forgetDeferredUnifiedReply(ds: DaemonSession, turnId: string): void {
+  const pending = deferredUnifiedReplyTurns.get(ds);
+  if (!pending) return;
+  pending.delete(turnId);
+  if (pending.size === 0) deferredUnifiedReplyTurns.delete(ds);
+}
+
+/** Deferred turn the worker is now capturing. A turn that never becomes the
+ * capture identity is never posted, so an unused type-ahead leaves no card. */
+export function takeReadyUnifiedReply(ds: DaemonSession): string | undefined {
+  const pending = deferredUnifiedReplyTurns.get(ds);
+  const turnId = currentCaptureIdentity(ds)?.turnId;
+  if (!pending || !turnId || !pending.has(turnId) || unifiedReplyTurnNotCapturing(ds, turnId)) return undefined;
+  forgetDeferredUnifiedReply(ds, turnId);
+  return turnId;
+}
+
 /** Image for the card's presentation layer. A waiting card may show the live
  * predecessor frame only through the explicit in-memory preview slot; it is
  * never promoted into this turn's currentImageKey. */
@@ -7033,15 +7078,18 @@ export async function postTurnStartingCard(
   if (remoteRetirementAdmissionPhase(ds)) return false;
   let replyPost: Promise<boolean> = Promise.resolve(false);
   if (replyCardModeFor(ds, turnId) !== 'legacy') {
-    // Reserve the turn before the CLI can call `botmux send`. Its reply uses
-    // the same durable record even while the first card POST is in flight.
-    replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
-      { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
-      .then(result => !!result).catch(error => {
-        logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      });
+    if (unifiedReplyTurnNotCapturing(ds, turnId)) {
+      // beginNewTurn admits a follow-up while the previous turn still owns the
+      // terminal. Posting the 「正在处理你的请求…」 card now leaves it stuck when
+      // the follow-up is only queued. Release it from capture_identity once
+      // this turn is the producer; a turn that never captures is not posted.
+      rememberDeferredUnifiedReply(ds, turnId);
+    } else {
+      forgetDeferredUnifiedReply(ds, turnId);
+      // Reserve the turn before the CLI can call `botmux send`. Its reply uses
+      // the same durable record even while the first card POST is in flight.
+      replyPost = postUnifiedReplyPlaceholder(ds, sessionReply, turnId);
+    }
   }
   // The optional terminal card owns streamCardId/pending independently of the
   // durable reply card. Start both before awaiting either to preserve the
@@ -7052,6 +7100,33 @@ export async function postTurnStartingCard(
   trackStartingCardPublication(ds, statusPost);
   const [replyPosted, statusPosted] = await Promise.all([replyPost, statusPost]);
   return replyPosted || statusPosted;
+}
+
+function postUnifiedReplyPlaceholder(
+  ds: DaemonSession,
+  sessionReply: Parameters<typeof postTurnStartingCard>[1],
+  turnId: string,
+  eventKind: 'refresh' | 'start' = 'refresh',
+): Promise<boolean> {
+  return updateTurnReplyCard(ds, turnId, { kind: eventKind },
+    (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
+    { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
+    .then(result => !!result).catch(error => {
+      logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    });
+}
+
+/** Post a placeholder that was held back until this turn became the capture
+ * identity. Use `start` because the queue-commit's working edge may have been
+ * held back too. Returns false when nothing was waiting or this turn is not it. */
+export function releaseDeferredUnifiedReplyCard(
+  ds: DaemonSession,
+  sessionReply: Parameters<typeof postTurnStartingCard>[1],
+): Promise<boolean> {
+  const turnId = takeReadyUnifiedReply(ds);
+  if (!turnId || replyCardModeFor(ds, turnId) === 'legacy') return Promise.resolve(false);
+  return trackStartingCardPublication(ds, postUnifiedReplyPlaceholder(ds, sessionReply, turnId, 'start'));
 }
 
 async function postTurnStartingStatusCard(
@@ -17479,6 +17554,8 @@ export interface WorkerAdmissionBlockedNotice {
   turnId?: string;
 }
 export type ForkWorkerOptions = {
+  /** Background recovery must never post host diagnostics into old conversations. */
+  memoryNoticeAudience?: 'owner-only';
   deploymentContinuation?: import('../services/deployment-continuation.js').DeploymentContinuation;
   onAdmission?: (admission: WorkerForkAdmission) => void;
   /** Replace the direct provider reply when the caller owns a durable output lane. */
@@ -17977,7 +18054,7 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -18355,7 +18432,7 @@ function forkWorkerPrepared(
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
       // Deliberately do not replay opts.deploymentContinuation: a deferred
       // device-isolation spawn cannot carry an earlier claim into a new owner.
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -18527,15 +18604,16 @@ function forkWorkerPrepared(
     const notifyBlocked = (decision: WorkerAdmissionDecision, reclaimed: number): void => {
       const reason = decision.reasons.join('; ');
       logger.warn(`[${tag(ds)}] Worker admission blocked by memory pressure: ${reason}`);
-      const reclamationNote = reclaimed > 0
-        ? ` Automatically suspended ${reclaimed} idle session${reclaimed === 1 ? '' : 's'} `
-          + `to free memory, but available memory is still below the reserve.`
-        : '';
-      const retry = `Memory pressure is critical: ${reason}. `
-        + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
-        + `(reserve ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)}, `
-        + `PSI limit ${decision.policy.maxMemoryFullAvg10.toFixed(2)}%).${reclamationNote}`;
+      if (reclaimed > 0) logger.info(`[${tag(ds)}] Memory admission reclaimed ${reclaimed} idle session(s)`);
+      try { cb.onMemoryAdmissionBlocked?.(ds, decision); }
+      catch (error) { logger.warn(`[${tag(ds)}] Failed to report memory admission to owner: ${String(error)}`); }
+      // A blank re-attach has no current request. Never borrow its previous
+      // reply target, even if a persisted queued turn is being recovered.
+      if (opts.memoryNoticeAudience === 'owner-only') return;
+      // A missing turn id does not prove a background fork: voice-card actions
+      // and terminal/dashboard wakes rely on the session's current reply target.
       const blockedTurnId = fallbackTurnId(ds, initTurnId);
+      const retry = tr('worker.memory_admission_unavailable', undefined, botLocale(botCfg));
       if (opts.onAdmissionBlocked) {
         opts.onAdmissionBlocked({
           content: retry,
@@ -20948,12 +21026,18 @@ function setupWorkerHandlers(
             `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
-        } else if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
-          // The waiting turn has become the terminal producer. Repaint even
-          // when the worker remains working→working and no status edge would
-          // otherwise wake the card: this immediately removes the predecessor
-          // preview, before the first screenshot from the new turn arrives.
-          reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
+        } else {
+          if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
+            // The waiting turn has become the terminal producer. Repaint even
+            // when the worker remains working→working and no status edge would
+            // otherwise wake the card: this immediately removes the predecessor
+            // preview, before the first screenshot from the new turn arrives.
+            reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
+          }
+          // Type-ahead follow-ups defer their unified placeholder until the
+          // worker actually captures this turn. A newer identity leaves the
+          // still-queued turn unposted.
+          void releaseDeferredUnifiedReplyCard(ds, cb.sessionReply);
         }
         break;
       }
@@ -21278,9 +21362,15 @@ function setupWorkerHandlers(
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
-          void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
+          if (replyCardModeFor(ds, msg.turnId) !== 'legacy' && unifiedReplyTurnNotCapturing(ds, msg.turnId)) {
+            // Queue ownership is not terminal ownership. In particular, do not
+            // let the start event bypass the deferred admission placeholder.
+            rememberDeferredUnifiedReply(ds, msg.turnId);
+          } else {
+            void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
+              (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+              { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
+          }
         }
         break;
       }
@@ -24990,18 +25080,28 @@ function setupWorkerHandlers(
                   // trigger-result reads that proof instead.
                   ds.asyncTriggerResults?.delete(msg.turnId);
                 }
+                // Release the worker-exit convergence stamp ONLY after the
+                // durable terminal write landed. On a throw (EIO/ENOSPC) the
+                // in-memory failed projection still terminates this daemon's
+                // polling, but the durable record stays `pending`: deleting the
+                // stamp would leave a restarted daemon with no backstop — the
+                // trigger polls `running` forever. Keeping it lets
+                // convergeIdempotentAsyncTurnOnWorkerExit write the
+                // dispatch_unknown terminal (and fail-close the session if that
+                // write also fails); a replayed turn_terminal retries this
+                // strict write first.
+                ds.idempotentAsyncTurns?.delete(msg.turnId);
               } catch (err) {
                 // The live failed projection still terminates current-daemon
-                // polling. Keep it when durable persistence is unavailable and
-                // report the lost restart guarantee explicitly (mirrors the
-                // failure gate above).
+                // polling. Keep the convergence stamp and report the lost
+                // restart guarantee explicitly (the worker-exit backstop or a
+                // terminal replay must still converge the durable record).
                 logger.error(
                   `[${t}] Failed to persist async unobserved-terminal for `
-                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained): `
                   + `${err instanceof Error ? err.message : String(err)}`,
                 );
               }
-              ds.idempotentAsyncTurns?.delete(msg.turnId);
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
                 + `failed (${TURN_ENDED_UNOBSERVED})`,
@@ -25803,11 +25903,15 @@ function setupWorkerHandlers(
           await sessionController.flushPrimary();
           const state = sessionController.store.read(sessionController.ref)!;
           if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
+          const mayStart = sessionController.bindingMayStart(msg.bindingId)
+            && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
+            && (!state.activeOperationId || state.activeOperationId === msg.operationId);
+          const startRefusal = mayStart ? undefined : runtimeStartRefusal({ mayStart, lifecycle: state.lifecycle,
+            activeOperationId: state.activeOperationId, workerIsLiveOwner: ds.worker === worker && ds.session.status === 'active' });
+          if (startRefusal) logger.warn(`[${t}] Refused runtime reservation ${msg.bindingId}: contract ${state.lifecycle} with no lifecycle operation, but this worker is the live owner of an active session`);
           worker.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId,
             runtime: sessionController.store.binding(sessionController.ref, msg.bindingId)?.ref,
-            mayStart: sessionController.bindingMayStart(msg.bindingId)
-              && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
-              && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
+            mayStart, ...(startRefusal ? { startRefusal } : {}) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
           // A refused reservation (e.g. a TraeX continuation the contract could

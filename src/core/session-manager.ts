@@ -3893,7 +3893,9 @@ export async function restoreActiveSessions(
             dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
           }
         : true;
-      if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
+      if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, {
+        reattachLiveBackend: true, memoryNoticeAudience: 'owner-only',
+      });
       else {
         const candidate = deploymentContinuationCandidate(ds.session);
         if (candidate && !recoverExactNonCodex) {
@@ -3916,10 +3918,11 @@ export async function restoreActiveSessions(
           try {
             forkWorker(ds, '', { resume: true, onIpcDispatchAttempted: () => { ipcAttempted = true; } }, {
               deploymentContinuation: claimed,
+              memoryNoticeAudience: 'owner-only',
               onAdmission: admission => { if (admission === 'rejected') releaseUndispatchedClaim(); },
             });
           } catch (error) { releaseUndispatchedClaim(); throw error; }
-        } else forkWorker(ds, prompt, resume);
+        } else forkWorker(ds, prompt, resume, { memoryNoticeAudience: 'owner-only' });
       }
     },
     RECOVERY_FORK_BATCH_SIZE,
