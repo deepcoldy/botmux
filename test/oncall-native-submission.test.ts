@@ -46,9 +46,9 @@ beforeEach(() => {
     { message_id: 'om_after', create_time: String(started + 3000) },
   ] });
   rows = [];
-  fetcher = vi.fn(async (url: string) => json(url.includes('/workflow/') ? { tenant_id: 12, type_id: 34, config: '[{"base":{"key":"field","type":"input"}}]' }
+  fetcher = vi.fn(async (url: string, init?: RequestInit) => json(url.includes('/workflow/') ? { tenant_id: 12, type_id: 34, config: '[{"base":{"key":"field","type":"input"}}]' }
     : url.includes('/tools/') ? { lark_dialog_url: `https://applink.feishu.cn/client/web_url/open?url=${encodeURIComponent('https://oncall.example.test/chat?tenant=12')}` }
-      : url.includes('/oncall_flow/list') ? rows : url.includes('/chat_id_to_open_chat_id') ? 'oc_destination' : { region: { cn: [category] } }));
+      : url.includes('/oncall_flow/list') ? queriedRows(init) : url.includes('/chat_id_to_open_chat_id') ? 'oc_destination' : { region: { cn: [category] } }));
   vi.stubGlobal('fetch', fetcher);
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
@@ -61,21 +61,29 @@ async function open() {
 function submitted(d: any) {
   rows = [{ id: 1234, tenant_id: 12, source_location: d.nativeSubmission.attempts[0]!.sourceLocation, originator_user: 'actor',
     oncall_question_type_id: 34, region: 'cn', stage: 'launch_oncall', chat_id: '1234567890123',
-    create_time: new Date(started + 2000).toISOString() }]; vi.setSystemTime(started + 5000);
+    create_time: new Date(started - 45_000).toISOString(), oncall_start_time: new Date(started + 2000).toISOString() }];
+  vi.setSystemTime(started + 5000);
+}
+
+function queriedRows(init?: RequestInit) {
+  const lowerBound = JSON.parse(String(init?.body)).filter_fields.find((filter: { operator: string }) => filter.operator === 'greater_or_equals');
+  if (!lowerBound) return rows;
+  const cutoff = Date.parse(`${lowerBound.value.replace(' ', 'T')}+08:00`);
+  return rows.filter(row => Date.parse(row[lowerBound.field]) >= cutoff);
 }
 const current = (d: any) => new OncallFormStore(dir).use('app', d.id, 'ou_actor', async value => ({ ...value }), { allowClosed: true });
 
 describe('native submission completion', () => {
-  it('adopts the submitted group, updates every answer and forwards all rounds and attachments once', async () => {
+  it('adopts a group from an earlier platform draft and forwards the conversation through launch time once', async () => {
     const d = await open(); submitted(d);
     const page = new URL(new URL(d.nativeFormLink!).searchParams.get('url')!);
     expect([...page.searchParams.keys()][0]).toBe('bm_form'); expect(page.searchParams.get('bm_form')).toBe(d.id);
     expect(d.nativeSubmission.attempts[0]!.sourceLocation).toContain(d.id);
     await retryPendingOncallHandoffs('app');
     const request = new OncallGroupStore(dir).getRequest(source)!;
-    expect(request).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination', forwardMode: 'merge',
+    expect(request).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination', forwardMode: 'merge', submittedAtMs: started + 2000,
       messageIdsSnapshot: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'], forwarded: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'] });
-    expect(mocks.merge).toHaveBeenCalledOnce(); expect(mocks.withdraw).toHaveBeenCalledWith('app', d.messageId);
+    expect(mocks.merge).toHaveBeenCalledOnce(); expect(mocks.withdraw).toHaveBeenCalledWith('app', d.messageId, expect.objectContaining({ acceptWithdrawn: true }));
     for (const id of ['om_a1', 'om_a2']) {
       const raw = mocks.update.mock.calls.filter(([, message]) => message === id).at(-1)![2];
       const button = JSON.parse(raw).body.elements.at(-1).columns.at(-1).elements[0];
@@ -123,9 +131,12 @@ describe('native submission completion', () => {
       action: { value: { action: 'oncall_group_form_cancel', draftId: d.id, version: d.version } } } as any, 'app');
     await retryPendingOncallHandoffs('app'); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
-  it.each(['stale', 'future'])('rejects a %s platform ticket outside the preparation window without adoption', async kind => {
+  it.each(['stale', 'future', 'missing'])('does not adopt a platform ticket with a %s launch time', async kind => {
     const d = await open(); submitted(d);
-    rows[0].create_time = new Date(kind === 'stale' ? started - 60_000 : started + 500_000).toISOString();
+    rows[0].oncall_start_time = kind === 'missing' ? null
+      : new Date(kind === 'stale' ? started - 60_000 : started + 500_000).toISOString();
+    // Exercise local validation even if the platform returns a row outside the filter.
+    fetcher.mockImplementation(async (url: string) => json(url.includes('/oncall_flow/list') ? rows : 'oc_destination'));
     await retryPendingOncallHandoffs('app');
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
@@ -165,7 +176,7 @@ describe('platform completion protocol', () => {
     const call = fetcher.mock.calls.find(([url]) => url.includes('/oncall_flow/list'))!;
     const payload = JSON.parse((call[1] as any).body);
     expect(payload).toMatchObject({ current_page: 1, page_size: 100, filter_fields: expect.arrayContaining([
-      { field: 'create_time', value: '2026-01-01 08:00:00', operator: 'greater_or_equals' },
+      { field: 'oncall_start_time', value: '2026-01-01 08:00:00', operator: 'greater_or_equals' },
       { field: 'originator_user', value: 'actor', operator: 'equals' },
     ]) });
   });
@@ -176,7 +187,7 @@ describe('platform completion protocol', () => {
       import { readNativeOncallResult } from './src/services/oncall-platform.js';
       const rows = [{ id: 1234, tenant_id: 12, source_location: 'https://oncall.example.test/chat?bm_form=tz-form',
         originator_user: 'actor', oncall_question_type_id: 34, region: 'cn', stage: 'launch_oncall',
-        chat_id: '123456789', create_time: '2026-01-01 08:00:02' }];
+        chat_id: '123456789', oncall_start_time: '2026-01-01 08:00:02' }];
       const fetcher = async url => new Response(JSON.stringify({ code: 0,
         data: url.includes('chat_id_to_open_chat_id') ? 'oc_destination' : rows }));
       const result = await readNativeOncallResult(
@@ -186,6 +197,6 @@ describe('platform completion protocol', () => {
     `;
     const run = spawnSyncTsEvalWithRepoImports(source, { cwd: process.cwd(), env: { ...process.env, TZ: 'UTC' }, encoding: 'utf8', timeout: 30_000 });
     expect(run.status, String(run.stderr)).toBe(0);
-    expect(JSON.parse(String(run.stdout)).createdAtMs).toBe(Date.parse('2026-01-01T00:00:02.000Z'));
+    expect(JSON.parse(String(run.stdout)).launchedAtMs).toBe(Date.parse('2026-01-01T00:00:02.000Z'));
   });
 });

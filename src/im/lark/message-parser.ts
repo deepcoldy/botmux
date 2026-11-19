@@ -1841,6 +1841,9 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   // host-overload alert + codex notifier cards
   'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',
   'codex_notifier_continue', 'codex_notifier_open_app',
+  // tmux upgrade owner card
+  'tmux_upgrade_run', 'tmux_upgrade_switch_now', 'tmux_upgrade_switch_idle',
+  'tmux_upgrade_switch_idle_cancel', 'tmux_upgrade_noop',
 ]);
 
 /** True when the button is one of botmux's own callback buttons. Primary

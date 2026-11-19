@@ -44,7 +44,7 @@ import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
 import { statuslineHookCommand } from '../src/adapters/hook-command.js';
-import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
+import { createAntigravityAdapter, resolveShadowedAntigravityStatusLine, supportsAntigravityStatusline } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
@@ -3241,6 +3241,74 @@ describe('antigravity buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
     expect(args).not.toContain('sess-7');
     expect(args).not.toContain('--session-id');
+  });
+
+  it('injects ephemeral --settings statusLine with stack_with_default for agy >= 1.5.8', () => {
+    for (const cliVersion of ['1.5.8', '1.5.12', '2.0.0', '1.5.8+build.1']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
+      const idx = args.indexOf('--settings');
+      expect(idx, `cliVersion=${cliVersion}`).toBeGreaterThanOrEqual(0);
+      expect(JSON.parse(args[idx + 1]!)).toEqual({
+        statusLine: {
+          type: 'command',
+          enabled: true,
+          command: statuslineHookCommand(),
+          stack_with_default: true,
+        },
+      });
+    }
+    // disableCliBypass keeps --settings (statusLine only, no bypass flag)
+    const noBypass = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true, cliVersion: '1.5.12' });
+    expect(noBypass).not.toContain('--dangerously-skip-permissions');
+    expect(noBypass).toContain('--settings');
+  });
+
+  it.each([undefined, '', 'unknown', '1.0.8', '1.5.4', '1.5.7', '1.5.8-beta.1'])(
+    'omits --settings when cliVersion is missing, older, or pre-release (%j)',
+    cliVersion => {
+      expect(supportsAntigravityStatusline(cliVersion)).toBe(false);
+      const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
+      expect(args).not.toContain('--settings');
+    },
+  );
+});
+
+describe('resolveShadowedAntigravityStatusLine', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  const makeSettings = (content: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'bmx-agy-sl-'));
+    dirs.push(dir);
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, content, 'utf-8');
+    return file;
+  };
+
+  it('returns the user statusLine command (including UTF-8 BOM files)', () => {
+    const plain = makeSettings(JSON.stringify({ statusLine: { type: 'command', enabled: true, command: 'bash ~/.gemini/sl.sh' } }));
+    expect(resolveShadowedAntigravityStatusLine({ userSettingsPath: plain })).toEqual({ command: 'bash ~/.gemini/sl.sh' });
+    const withBom = makeSettings('\uFEFF' + JSON.stringify({ statusLine: { command: 'my-sl' } }));
+    expect(resolveShadowedAntigravityStatusLine({ userSettingsPath: withBom })).toEqual({ command: 'my-sl' });
+  });
+
+  it('returns {} when disabled, non-command, blank, corrupt, or missing', () => {
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'command', enabled: false, command: 'my-sl' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'builtin', command: 'my-sl' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'command', command: '   ' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings('{corrupt'),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: join(tmpdir(), 'definitely-missing-agy-settings-99999.json'),
+    })).toEqual({});
   });
 });
 

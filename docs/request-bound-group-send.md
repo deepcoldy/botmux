@@ -22,7 +22,7 @@ The JSON body itself is capped at 64KiB before it is parsed.
 | `409 outcome_unknown` | A previous attempt may have sent but cannot be reconciled any more. Never re-sent; use a new `requestId` only if a duplicate is acceptable. |
 | `413 body_too_large` | Body exceeded 64KiB. Nothing sent. |
 | `502 send_failed` (`retryable:true`) | Ambiguous provider error (timeout, 5xx, rate limit). Retry the **same** `requestId` within 50 minutes; the Lark `uuid` is reused, so Lark returns the original message instead of a second one. |
-| `502 send_failed` (`retryable:false`) | Definite rejection (not in the chat `230002`, content too long `230025`, missing scope `99991672`, and the same class as `230001` / `230011` / `230022`). Nothing was created. Retrying until the window ends only yields `outcome_unknown`. |
+| `502 send_failed` (`retryable:false`) | Definite rejection (not in the chat `230002`, content too long `230025`, missing scope `99991672`, and the same class as `230001` / `230011` / `230022`). A definitive first-attempt rejection keeps its original content digest and failure in a compactable record. Replaying the same content returns this failure. Changing the content returns `409 request_conflict`. If an earlier attempt might already have been accepted, a later rejection yields `outcome_unknown` instead. |
 | `503 store_full` (`retryable:false`) | The live file is full of unresolved attempts, so nothing can be compacted. Neither file is written. Pending records are not deleted. |
 | `503 store_unavailable` (`retryable:true`) | Dedupe store unreadable or unwritable. Retry the **same** `requestId`. Do not mint a new one: if the failure was the save *after* the provider accepted, a new id posts a second visible message. The response does not include the filesystem error. |
 
@@ -33,16 +33,19 @@ dedupe window is ~1 hour). A record that is missing `uuid` / `firstAttemptAt`,
 or whose `uuid` is not that derived value, fails closed and nothing is sent.
 The live file holds at most 2000 records and is the only file rewritten on
 replay or on the post-provider `sent` save. Admitting a new `requestId` past
-that cap compacts the oldest sent records (`firstAttemptAt`), at least 200 at
+that cap compacts the oldest sent or definitively rejected records (first attempt time for sends, rejection time for failures), at least 200 at
 a time, into `<dataDir>/group-sends-<appId>-archive.json`: upsert by key,
 fsync the archive, and only then remove those keys from the live file. So the
 archive is rewritten once per 200 new `requestId`s, not on every send once the
 live file is full. The archive stores the
 full record (so both `requestId` → `messageId` and `messageId` → `requestId`
-still resolve) and keeps at most 20,000 records, dropping the oldest `sentAt`.
-The same key in both files is a single forward answer, and the live record
-wins. Reverse read-back scans every entry in both files, so an older message
-id still reports its `requestId` after the live row has moved on. Pending
+still resolve) and keeps at most 20,000 records, dropping the oldest completion time.
+Definitive rejections carry a completion timestamp and retain their digest.
+V1 group daemons read these rows as expired attempts and refuse to send them
+again. On downgrade they report `outcome_unknown` for the original text and
+cannot compact rejected live rows. Upgrading restores rejection replay and
+compaction. The live record wins when the same key is in both files. Reverse read-back scans every entry in both files, so an older message
+id still reports its `requestId` after the live row has moved on. Unresolved
 records are never compacted; a new `requestId` is refused once they fill the
 live cap. A `requestId` evicted from the archive is outside that retention and
 retries as a new send.

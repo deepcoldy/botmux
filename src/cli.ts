@@ -3931,12 +3931,33 @@ async function cmdStatus(): Promise<void> {
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
+  await printTmuxStatusAdvice();
   if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
   warnIfLegacyBotmuxAlive();
   // The pm2 read-only projection print is gone: the fleet-state table above IS
   // the authoritative status now (supervisor-owned), so there is no second
   // registry to reconcile against. Legacy pm2 still gets surfaced by
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
+}
+
+/** tmux below the recommended version, or upgraded but the botmux server
+ *  still on the old one. Advisory only; read-only probes (never boots a server). */
+async function printTmuxStatusAdvice(): Promise<void> {
+  try {
+    // Not loadBotsJson(): that exits the process on a malformed file, and an
+    // advisory line must never turn `status` into a failure.
+    let bots: any[] = [];
+    try { bots = existsSync(BOTS_JSON_FILE) ? parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE) : []; }
+    catch { return; }
+    if (!bots.some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux')) return;
+    const [{ probeTmuxFacts, formatTmuxStatusAdvice }, { preferredManagedTmuxSocket }, { getDefaultLocale }] = await Promise.all([
+      import('./core/tmux-upgrade.js'),
+      import('./adapters/backend/tmux-socket.js'),
+      import('./i18n/index.js'),
+    ]);
+    const advice = formatTmuxStatusAdvice(await probeTmuxFacts(preferredManagedTmuxSocket()), getDefaultLocale());
+    if (advice) console.log(advice);
+  } catch { /* advisory */ }
 }
 
 function printUpgradeHelp(): void {
@@ -6444,8 +6465,9 @@ async function noteTurnFinalOutsideReplyCard(
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
   let hostSecret: string | undefined;
@@ -6478,6 +6500,7 @@ async function postSessionCliIpc(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
@@ -8337,6 +8360,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 定时任务（可在 CLI 会话内自动推断 chat）:
 ${SCHEDULE_HELP_BODY}
+
+飞书主动发送（宿主 shell）:
+  post --bot <cli_...> --chat-id <oc_...> --text <正文>
+                       用指定 Bot 发到群、话题或私聊，详见 botmux post --help
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
@@ -11397,7 +11424,11 @@ function resolveDispatchDispatcherAppId(input: {
   return !dispatcherAppId || dispatcherAppId === input.selfAppId ? undefined : dispatcherAppId;
 }
 
-async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
+async function cmdSend(
+  rest: string[],
+  beginFeedbackEffect?: (relay?: FeedbackSendLeaseRelay) => Promise<void>,
+  preflight?: SendPreflight,
+): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
     console.log(SEND_HELP_BODY);
@@ -12439,12 +12470,24 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       throw error;
     }
   };
+  // A read-isolated CLI can neither read its own birth identity (setuid `ps`)
+  // nor write the data dir, so the feedback send lease falls back to the
+  // origin session's daemon, which takes it on this process's behalf.
+  const feedbackSendLeaseRelay = (): FeedbackSendLeaseRelay | undefined => {
+    const leaseSessionId = originSessionId;
+    const ipcPort = resolveDaemonIpcPort(isolatedAttestationContext?.ipcPortFallback, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (!leaseSessionId || !ipcPort) return undefined;
+    return async (body, signal) => {
+      const response = await postSessionCliIpc(ipcPort, leaseSessionId, FEEDBACK_SEND_LEASE_ROUTE, body, signal);
+      return { ok: response.ok, status: response.status, body: await response.json().catch(() => undefined) };
+    };
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
     await checkSendTopics?.(lookup);
     const origin = await revalidateIsolatedOrigin();
-    beginFeedbackEffect?.();
+    await beginFeedbackEffect?.(feedbackSendLeaseRelay());
     return origin;
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
@@ -21433,7 +21476,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
+  'input-capture', 'send', 'post', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
@@ -22026,13 +22069,22 @@ switch (command) {
     process.exitCode = await runObserveCommand(process.argv.slice(3));
     break;
   }
+  case 'post': {
+    const { cmdPost } = await import('./cli/post-command.js');
+    process.exitCode = await cmdPost(process.argv.slice(3));
+    break;
+  }
   case 'send': {
-    let releaseFeedbackEffect: (() => void) | undefined;
+    let feedbackEffectLease: Promise<() => Promise<void>> | undefined;
     try {
-      await cmdSend(process.argv.slice(3), () => {
-        releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
+      await cmdSend(process.argv.slice(3), async (relay) => {
+        feedbackEffectLease ??= acquireFeedbackSendLeaseWithRelay({
+          acquireLocal: () => acquireFeedbackSendLease(resolveDataDir()),
+          relay,
+        });
+        await feedbackEffectLease;
       }, sendPreflight);
-      releaseFeedbackEffect?.();
+      if (feedbackEffectLease) await (await feedbackEffectLease)();
     }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
@@ -22155,3 +22207,4 @@ switch (command) {
     break;
 }
 import { acquireFeedbackSendLease } from './services/feedback-maintenance.js';
+import { acquireFeedbackSendLeaseWithRelay, FEEDBACK_SEND_LEASE_ROUTE, type FeedbackSendLeaseRelay } from './services/feedback-send-lease-relay.js';
