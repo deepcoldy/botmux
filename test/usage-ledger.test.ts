@@ -746,6 +746,8 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
     reconcileUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-03T00:00:00Z') });
     const rows = readdirSync(dir).filter(f => f.startsWith('usage-')).flatMap(f =>
       readFileSync(join(dir, f), 'utf8').trim().split('\n').map(line => JSON.parse(line)));
+    // readdir order is filesystem-dependent; ledger assertions are chronological.
+    rows.sort((a, b) => a.ts.localeCompare(b.ts));
     expect(rows.map(r => [r.ts, r.model, r.inputTokens])).toEqual([
       ['2026-01-01T10:00:00.000Z', 'model-a', 100],
       ['2026-01-01T23:00:00.000Z', 'model-a', 50],
