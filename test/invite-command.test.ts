@@ -43,6 +43,7 @@ import { tryHandleInviteCommand, parseInviteArgs, readBotsInfoEntries } from '..
 import { isCommandTargetOnly } from '../src/im/lark/mention-targets.js';
 import { getBot, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 import { localeForBot, t } from '../src/i18n/index.js';
 
 const OWNER = 'ou_owner';
@@ -68,10 +69,10 @@ function writeBotsInfo(entries: Array<{ larkAppId: string; botName?: unknown }>)
   writeFileSync(join(tmpDir, 'bots-info.json'), JSON.stringify(entries));
 }
 function writePlatformSync(bots: Array<{ appId: string; name?: string; unionId?: string }>) {
-  writeFileSync(join(tmpDir, 'platform-team-sync.json'), JSON.stringify({
-    rev: 'r1', updatedAt: Date.now(),
+  applyPlatformTeamSync(tmpDir, {
+    rev: 'r1',
     teams: [{ teamId: 't1', teamName: '大厅', groupChatIds: [], memberUnionIds: [], bots }],
-  }));
+  });
 }
 function writeHostedFederations(bots: Array<{ larkAppId: string; botName: string }>) {
   writeFileSync(join(tmpDir, 'federations.json'), JSON.stringify({ version: 1, teams: {

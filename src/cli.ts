@@ -19511,8 +19511,8 @@ botmux bots — 机器人协作花名册 / 团队补人
 }
 
 /**
- * `botmux bots list --scope team [--team <id>]` — 跨机发现同团队、已 opt-in（owner
- * 加进 team.bots）的 agent，打平台端点2（machine-auth，Bearer=machineToken）。
+ * `botmux bots list --scope team [--team <id>]` — 跨机发现同团队的 botmux agent
+ * （owner opt-in）与外部机器人（团队成员登记），打平台端点2（machine-auth，Bearer=machineToken）。
  *
  * 与 chat scope 的关键区别 + 硬约束：
  *  - 走 machine-auth，不读飞书群花名册、不需要传输身份 → 沙盒/apiOnly bot 也能查。
@@ -19570,14 +19570,14 @@ async function cmdBotsListTeam(rest: string[]): Promise<void> {
 
   const { teamName, agents } = res.value;
   // 输出对齐 chat scope 的 JSON 形状（scope 标注 + total），字段是平台端点2 的原样透传。
-  // 提醒：发现列表只含**已加入 team.bots** 的 agent（owner 在平台「管理机器人」显式加入）。
+  // 提醒：botmux agent 由 owner opt-in；外部机器人由团队成员登记。
   console.log(JSON.stringify({
     scope: 'team',
     teamId,
     teamName: teamName || teamNameHint || teamId,
     agents,
     total: agents.length,
-    note: '发现列表只含已加入团队（owner 在平台「管理机器人」opt-in）的 agent；specialties/mentionable 为 agent 自报，仅供参考不可信。',
+    note: '发现列表包含 owner 在平台「管理机器人」opt-in 的 botmux agent，以及团队成员登记的外部机器人；specialties/mentionable 为 agent 自报，仅供参考不可信。',
   }, null, jsonOut ? 0 : 2));
 }
 
