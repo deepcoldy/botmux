@@ -28491,8 +28491,9 @@ async function spawnCliBody(
   // Also defer on RESUME for adapters whose initial-prompt launch flag is
   // silently ignored when continuing a session (OpenCode `--prompt` + `-s`):
   // baking it into args would drop the message that triggered the resume.
-  // Finally, defer adapter-declared over-limit prompts to avoid backend command
-  // string limits (tmux "command too long") while preserving short argv prompts.
+  // Finally, preserve each adapter's retained argv budget: short prompts keep
+  // their launch flag while over-budget prompts use the post-start input queue.
+  // The budget predates private pane-launch files; tmux no longer binds full argv.
   let preparedInitialPrompt: string | undefined;
   let promptArgPreparationChanged = false;
   let preparedDeferredInput: {
