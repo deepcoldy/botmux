@@ -7292,28 +7292,44 @@ function reconcilePublishedStartingCardTerminal(ds: DaemonSession, turnId: strin
   const terminalStatus = ds.lastTurnTerminalStatus;
   if (!terminalStatus || !startingCardTurnTerminalCurrent(ds, turnId)) return false;
   const terminalAttempt = ds.lastTurnTerminalDispatchAttempt;
-  cancelPostTerminalStatusSettle(ds);
-  postTerminalCardSettles.delete(ds);
+  // A fresh starting publication is already complete. Clear its pending marker
+  // before attempting the correction, and only cancel the original settle once
+  // the replacement was accepted. On rejection, restore both so the normal
+  // post-terminal path can still deliver the idle state later.
+  const pending = ds.streamCardPending;
+  const pendingTurnId = ds.streamCardPendingTurnId;
+  ds.streamCardPending = false;
+  ds.streamCardPendingTurnId = undefined;
+  let accepted = false;
   if (terminalStatus === 'completed') {
     // The late starting render is itself proof of a busy display. Do not require
     // a worker frame to have populated lastScreenStatus before correcting it.
-    settleStaleBusyCardStatus(ds, turnId, 'late-starting-publication', false, undefined, true);
-    return true;
+    accepted = settleStaleBusyCardStatus(ds, turnId, 'late-starting-publication', false, undefined, true);
+  } else {
+    if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
+      ds.failedIdleTurnId = turnId;
+      ds.completedIdleTurnId = undefined;
+    }
+    accepted = scheduleCardPatch(ds, buildStreamingCardJson(ds, terminalStatus === 'cancelled' ? 'interrupted' : 'idle'), turnId, {
+      owns: () => startingCardTurnTerminalCurrent(ds, turnId)
+        && ds.lastTurnTerminalStatus === terminalStatus
+        && ds.lastTurnTerminalDispatchAttempt === terminalAttempt,
+    });
   }
-  // A late starting publication must not erase an already-accepted non-completed
-  // terminal either. Preserve the existing display vocabulary instead of using
-  // the completed-only idle settle: cancellation is interrupted; failure and
-  // ambiguity use idle with the established failed label. Execution state and
-  // the ordinary post-terminal sweep semantics are deliberately untouched.
-  if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
-    ds.failedIdleTurnId = turnId;
-    ds.completedIdleTurnId = undefined;
+  if (accepted) {
+    cancelPostTerminalStatusSettle(ds);
+    postTerminalCardSettles.delete(ds);
+  } else {
+    ds.streamCardPending = pending;
+    ds.streamCardPendingTurnId = pendingTurnId;
+    if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
+      ds.failedIdleTurnId = undefined;
+    }
   }
-  scheduleCardPatch(ds, buildStreamingCardJson(ds, terminalStatus === 'cancelled' ? 'interrupted' : 'idle'), turnId, {
-    owns: () => startingCardTurnTerminalCurrent(ds, turnId)
-      && ds.lastTurnTerminalStatus === terminalStatus
-      && ds.lastTurnTerminalDispatchAttempt === terminalAttempt,
-  });
+  // accepted only controls cancellation of the ORIGINAL settle. It must not
+  // decide whether this terminalized publication gets a NEW watchdog: current
+  // terminal evidence is sufficient to suppress re-arming even when live work
+  // rejects the idle correction itself.
   return true;
 }
 
@@ -8038,11 +8054,18 @@ function streamCardAttemptHighWaterStillCurrent(
   atCapture: DaemonSession['turnDispatchAttemptHighWater'],
   turnId: string | undefined,
   allowFirstAttemptForTurn: boolean,
+  firstAttemptForTurn: { current?: DaemonSession['turnDispatchAttemptHighWater'] },
 ): boolean {
   const current = ds.turnDispatchAttemptHighWater;
   if (current === atCapture) return true;
   if (!allowFirstAttemptForTurn || !turnId || current?.turnId !== turnId) return false;
-  return atCapture?.turnId !== turnId;
+  // A known attempt at capture is never a first attempt for this turn.
+  if (atCapture?.turnId === turnId) return false;
+  if (firstAttemptForTurn.current) return firstAttemptForTurn.current === current;
+  // The first numeric attempt for this turn completes the publication identity;
+  // latch it so a SECOND same-turn transition can never inherit that allowance.
+  firstAttemptForTurn.current = current;
+  return true;
 }
 
 /** An enqueued render belongs to the captured card and route. Closing a
@@ -8063,6 +8086,7 @@ function captureStreamingCardPatchFence(
   const generation = ds.workerGeneration ?? session.workerGeneration;
   const currentTurnId = ds.currentTurnId;
   const attemptHighWater = ds.turnDispatchAttemptHighWater;
+  const firstAttemptForTurn: { current?: DaemonSession['turnDispatchAttemptHighWater'] } = {};
   const runtimeKey = activeSessionKey(ds);
   return () => ds.session === session && ds.session.sessionId === sessionId && ds.session.status === status
     && ds.larkAppId === appId && ds.chatId === chatId && sessionAnchorId(ds) === anchor
@@ -8076,7 +8100,7 @@ function captureStreamingCardPatchFence(
         && (ds.workerGeneration ?? ds.session.workerGeneration) === generation
         && ds.currentTurnId === currentTurnId
         && streamCardAttemptHighWaterStillCurrent(
-          ds, attemptHighWater, turnId, opts?.allowFirstAttemptForTurn === true));
+          ds, attemptHighWater, turnId, opts?.allowFirstAttemptForTurn === true, firstAttemptForTurn));
 }
 
 /**
@@ -8505,6 +8529,7 @@ export function killWorker(
     return;
   }
   restartCoordinator.cancelSession(ds.session.sessionId);
+  resetStartingCardHealth(ds);
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // The CLI process dies with this worker — no prompt is ready any more.
@@ -8592,6 +8617,7 @@ export function killWorker(
  */
 export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
+  resetStartingCardHealth(ds);
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
@@ -8623,6 +8649,7 @@ function clearTransferWorkerState(
   reason: string,
 ): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
+  resetStartingCardHealth(ds);
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // The transfer detaches this worker/CLI pair; the replacement must re-prove
@@ -12301,6 +12328,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   armWorkerKillBackstop(w, tag(ds));
 
   ds.worker = null;
+  resetStartingCardHealth(ds);
   ds.workerReady = false;
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;

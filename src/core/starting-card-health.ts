@@ -55,6 +55,7 @@ export function startingCardHealthStalledStatus(
   turnId?: string,
 ): 'stalled' | undefined {
   const entry = degraded.get(ds);
+  if (ds.session.suspendedColdResume || ds.crashDiagnosticParked) return undefined;
   if (!entry || !identityStillCurrent(ds, entry)) return undefined;
   if (turnId !== undefined && turnId !== entry.turnId) return undefined;
   return 'stalled';

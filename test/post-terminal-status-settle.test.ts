@@ -1570,5 +1570,91 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(45_000);
     expect(patchedStatuses()).toEqual([]);
   });
+
+  it('does not replace a cold-suspended idle card with a delivered stalled state', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(lastPatchedStatus()).toBe('stalled');
+
+    ds.lastScreenStatus = 'idle';
+    ds.session.suspendedColdResume = true;
+    ds.worker = null;
+    scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', status: 'idle' }), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle');
+  });
+
+  it('settles a completed terminal that arrives while a fresh-ready POST is pending', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_completed');
+    await vi.advanceTimersByTimeAsync(47_000);
+    expect(patchedStatuses()).toContain('idle');
+  });
+
+  it('does not re-arm a terminalized starting publication when new live work rejects the idle correction', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(0);
+    // Direct user work after the terminal is still live work, so the correction
+    // is rejected. It must not cause the old publication to re-arm its watchdog.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_completed_with_live_work');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it('rejects the restored starting write after a second same-turn attempt transition', async () => {
+    let releaseRestore!: () => void;
+    let beforeWrite!: () => Promise<void>;
+    updateMessageMock.mockImplementationOnce((...args: any[]) => {
+      beforeWrite = args[3].beforeWrite;
+      return new Promise<void>(resolve => { releaseRestore = resolve; });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    noteTurnDispatchAttempt(ds, 'turn-previous', 7);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: TURN, dispatchAttempt: 1,
+    });
+    await expect(async () => { await beforeWrite(); }).rejects.toThrow();
+  });
 });
 
