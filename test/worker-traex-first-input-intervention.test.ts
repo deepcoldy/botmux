@@ -169,6 +169,15 @@ describe('Web startup protocol activity and recovery', () => {
     expect(h.scope.webTerminalSubmitGeneration).toBe(0);
   });
 
+  it('holds first-input admission while a web socket still buffers an undecided prefix', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    expect(h.pending()).toBe(false);
+    await h.input.accept('\x1b');
+    expect(h.input.pending).toBe(true);
+    expect(h.pending()).toBe(true);
+  });
+
   it('continues sampling a late initialized composer after one no-op human key', async () => {
     const h = makeStartupSampler();
     h.sample(h.scope.backend);
