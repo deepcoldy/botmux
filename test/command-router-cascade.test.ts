@@ -80,6 +80,24 @@ describe('MULTILINE_COMMANDS 豁免（§9 补测）', () => {
   });
 });
 
+describe('/g 多行只在本条带任务开工时成立（入口按条放行）', () => {
+  const base: SlashRouteInput = {
+    text: '', context: 'new-topic', phase: 'none',
+    passthrough: PT, coldStartPassthrough: new Set(['/goal']), senderIsBot: false, acceptSlashFromBots: true,
+  };
+  it('缺省仍是讨论文本，入口放进 multilineCommands 后才是一条 /g', async () => {
+    const { parseSlashCommandInvocation } = await import('../src/core/command-router.js');
+    const text = '/g 修复价格\n第二行细节';
+    expect(parseSlashCommandInvocation(text)).toBeNull();
+    expect(classifySlash({ ...base, text })).toEqual({ kind: 'forward', reason: 'discussion' });
+    const groupNames = new Set(['/group', '/g']);
+    expect(parseSlashCommandInvocation(text, undefined, groupNames)).toEqual({ cmd: '/g', content: text });
+    expect(classifySlash({ ...base, text, multilineCommands: groupNames })).toMatchObject({ kind: 'daemon', cmd: '/g', content: text });
+    // 命令清单形状照旧是讨论文本，按条放行也不改这一点。
+    expect(parseSlashCommandInvocation('/g 任务\n/清单', undefined, groupNames)).toBeNull();
+  });
+});
+
 describe('Codex App / CLI /effort routing', () => {
   const input: SlashRouteInput = {
     text: '/effort high', context: 'thread', phase: 'none',
