@@ -284,6 +284,92 @@ process.stdin.on('data', chunk => {
   return { sid, transcript, messages, logs };
 }
 
+/**
+ * Worker for the explicit-final-send side channel:
+ *  - after accepting the prompt the fake writes ONLY the user transcript row,
+ *    then appends a real final `botmux send` marker to the worker's
+ *    turn-sends journal (the same file `botmux send` writes in production),
+ *  - no assistant terminal record and no final_output are ever produced,
+ *  - the idle prompt is redrawn so the bridge pops the turn at a screen-idle
+ *    boundary.
+ * The worker must label that terminal `explicit_final_delivered`: the answer
+ * is proven delivered over IM, but the HTTP channel has no captured content.
+ */
+function startExplicitSendWorker() {
+  root = mkdtempSync(join(tmpdir(), 'botmux-explicit-send-'));
+  const workDir = join(root, 'work');
+  const dataDir = join(root, 'data');
+  mkdirSync(workDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  const cliSessionId = 'deadbeef-1234-4678-9abc-def012345694';
+  const projectDir = join(root, '.claude', 'projects', realpathSync(workDir).replace(/[^A-Za-z0-9-]/g, '-'));
+  mkdirSync(projectDir, { recursive: true });
+  const transcript = join(projectDir, `${cliSessionId}.jsonl`);
+  writeFileSync(transcript, [
+    { type: 'permission-mode', permissionMode: 'bypassPermissions', sessionId: cliSessionId },
+  ].map(row => `${JSON.stringify(row)}\n`).join(''));
+  const fakeClaude = join(root, 'fake-claude');
+  writeFileSync(fakeClaude, `#!/usr/bin/env node
+import('node:fs').then(fs => {
+const T = ${JSON.stringify(transcript)};
+const DATA = ${JSON.stringify(dataDir)};
+const put = row => fs.appendFileSync(T, JSON.stringify({ timestamp: new Date().toISOString(), ...row }) + '\\n');
+process.stdout.write('❯ ');
+let typed = '';
+process.stdin.on('data', chunk => {
+  typed += chunk.toString();
+  if (!/[\\r\\n]$/.test(typed)) return;
+  if (typed.includes('\\x1b[200~') && !typed.includes('\\x1b[201~')) return;
+  const prompt = typed.replace(/\\x1b\\[20[01]~/g, '').trim();
+  typed = '';
+  put({ type: 'user', uuid: 'u1', message: { role: 'user', content: prompt } });
+  // Simulate a final botmux send: append the same marker the real CLI
+  // writes, attributed to this exact turn via BOTMUX_TURN_ID. The pty
+  // backend does not refresh spawn-time env per turn, so fall back to the
+  // fixed turn id the test dispatches.
+  setTimeout(() => {
+    try {
+      const sid = process.env.BOTMUX_SESSION_ID;
+      // Use the test's fixed turn id: the spawned pty inherits the host's
+      // BOTMUX_TURN_ID, which is unrelated to this synthetic turn.
+      const turnId = 'om_explicit_im';
+      const dir = DATA + '/turn-sends';
+      fs.mkdirSync(dir, { recursive: true });
+      const fp = dir + '/' + sid + '.jsonl';
+      fs.appendFileSync(fp, JSON.stringify({
+        sentAtMs: Date.now(), sessionId: sid, turnId, messageId: 'om_explicit_send',
+        deliveryKind: 'current_session_send', responseKind: 'final',
+      }) + '\\n');
+    } catch (e) { process.stderr.write('PROBE_FAKE_MARKER_ERR ' + (e && e.message) + '\\n'); }
+  }, 300);
+  // Redraw idle with no transcript terminal for this turn.
+  setTimeout(() => process.stdout.write('\\r\\n❯ '), 1500);
+});
+});
+`);
+  chmodSync(fakeClaude, 0o755);
+  const messages: WorkerToDaemon[] = [];
+  const logs: string[] = [];
+  const sid = `sid-explicit-send-${randomUUID()}`;
+  child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+    cwd: resolve('.'),
+    env: {
+      ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+      BOTMUX_SESSION_ID: sid, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test-only',
+    },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  child.on('message', raw => messages.push(raw as WorkerToDaemon));
+  child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+  child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+  child.send({
+    type: 'init', sessionId: sid, chatId: 'oc_test', rootMessageId: 'om_root',
+    workingDir: workDir, cliId: 'claude-code', cliPathOverride: fakeClaude, cliSessionId,
+    backendType: 'pty', prompt: '', resume: true, larkAppId: 'app_test', larkAppSecret: 'test-only', locale: 'zh',
+  } satisfies DaemonToWorker);
+  return { sid, transcript, messages, logs, markerPath: join(dataDir, 'turn-sends', `${sid}.jsonl`) };
+}
+
 describe('claude bridge terminal at a screen-idle boundary without transcript terminal (real worker)', () => {
   it('labels the no-terminal pop boundary_unobserved and emits no final_output', async () => {
     const w = startWorker({ beforePrompt: [] });
@@ -384,5 +470,55 @@ describe('claude bridge terminal at a screen-idle boundary without transcript te
     // Output was observed and delivered as final_output, so the no-output
     // `boundary_unobserved` label must stay absent even with terminalObserved=false.
     expect(terminal!.outputDisposition).toBeUndefined();
+  }, 90_000);
+
+  it('labels an explicit final botmux send without final_output and settles HTTP results completed-empty', async () => {
+    const w = startExplicitSendWorker();
+    const turnId = 'om_explicit_im';
+    const messages = await runTurn(w, turnId);
+
+    // The worker observed the real final marker, but never emitted final_output.
+    expect(messages.some(msg => msg.type === 'explicit_reply_observed'
+      && msg.turnId === turnId && msg.responseKind === 'final')).toBe(true);
+    expect(messages.filter(msg => msg.type === 'final_output' && msg.turnId === turnId)).toEqual([]);
+    const [terminal] = terminalsOf(messages, turnId);
+    expect(terminal).toMatchObject({
+      status: 'completed',
+      outputDisposition: 'explicit_final_delivered',
+    });
+
+    // End-to-end daemon settlement: a pending async trigger completes with
+    // empty captured content instead of polling `running` forever.
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const worker = new EventEmitter() as any;
+    Object.assign(worker, { killed: false, send: vi.fn(), kill: vi.fn(), pid: 99999, stdout: new EventEmitter(), stderr: new EventEmitter() });
+    const ds = {
+      session: {
+        sessionId: w.sid, rootMessageId: 'om_root', chatId: 'oc_test', title: 'fixture', status: 'active',
+        createdAt: Date.now(), updatedAt: Date.now(), pid: null, chatType: 'group', cliId: 'claude-code',
+      },
+      worker, workerPort: 0, workerToken: 'tok', larkAppId: 'app_test', chatId: 'oc_test', chatType: 'group',
+      spawnedAt: Date.now(), cliVersion: '1', lastMessageAt: Date.now(), hasHistory: false, currentTurnId: turnId,
+      asyncTriggerResults: new Map([[turnId, { status: 'pending', createdAt: Date.now() }]]),
+      latestAsyncTriggerId: turnId,
+    } as unknown as DaemonSession;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    for (const msg of messages) {
+      if (msg.type !== 'thinking_update' && msg.type !== 'final_output'
+        && msg.type !== 'turn_terminal' && msg.type !== 'explicit_reply_observed') continue;
+      worker.emit('message', msg);
+      await new Promise(done => setTimeout(done, 20));
+    }
+    await new Promise(done => setTimeout(done, 200));
+    expect(ds.asyncTriggerResults!.get(turnId)).toMatchObject({
+      status: 'completed',
+      content: '',
+    });
   }, 90_000);
 });

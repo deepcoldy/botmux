@@ -24984,6 +24984,92 @@ function setupWorkerHandlers(
         // shape deliberately does NOT carry this label, a bare `completed`
         // still settles nothing, and Feishu turns have no HTTP waiter/async
         // sink so they are unaffected.
+        // HTTP settle-on-EXPLICIT-FINAL-DELIVERED: the model's answer went out
+        // over IM via a final `botmux send`, so the turn IS delivered even
+        // though the HTTP transport captured no final_output. Without this
+        // branch the bare completed terminal (the worker correctly withholds
+        // boundary_unobserved because output WAS observed) would leave Wait
+        // callers on wait_timeout and async triggers polling `running` forever.
+        // Settlement mirrors the nothing_to_send completed-empty contract:
+        // resolve/record completed with empty content, durable so a restarted
+        // daemon reads `completed` rather than `running`.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'explicit_final_delivered'
+          && !ds.session.vcMeetingReceiver) {
+          const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+          if (waitPromise) {
+            nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
+            ds.pendingWaitPromises?.delete(msg.turnId);
+            waitPromise.resolve('');
+            logger.info(
+              `[${t}] Settled Wait Mode HTTP turn ${msg.turnId.substring(0, 8)} `
+              + 'completed-empty (explicit final delivered over IM)',
+            );
+          }
+          const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+          const asyncSink = !!asyncResult
+            || (virtualDeliverySinkForChatId(ds.chatId) === 'http_async'
+              && !msg.turnId.startsWith('local-')
+              && !msg.turnId.startsWith('scheduled-'));
+          if (asyncSink) {
+            nonLarkFailureHandled = true;
+            if (asyncResult?.status === 'completed' || asyncResult?.status === 'failed'
+              || asyncResult?.status === 'interrupted') {
+              // An earlier stronger settlement (captured final_output, provider
+              // failure, caller interrupt) always wins; just release the stamp.
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Ignored explicit-final terminal for already-${asyncResult.status} async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else {
+              const completedAt = Date.now();
+              if (asyncResult?.status === 'pending') {
+                asyncResult.status = 'completed';
+                asyncResult.content = '';
+                asyncResult.completedAt = completedAt;
+              }
+              rememberHttpTerminal(ds, msg.turnId);
+              try {
+                asyncTriggerStore.recordCompleted(
+                  ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId,
+                );
+                ds.idempotentAsyncTurns?.delete(msg.turnId);
+              } catch (err) {
+                // Durable completed write failed: same fail-close contract as
+                // the unobserved-terminal path — close the session row so a
+                // restarted resolver returns `failed` instead of `running`.
+                logger.error(
+                  `[${t}] Failed to persist explicit-final completion for `
+                  + `${msg.turnId.substring(0, 8)} (fail-closing session): `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+                void Promise.resolve()
+                  .then(() => requireCallbacks().closeSession(ds))
+                  .then((closed) => {
+                    if (closed === false) {
+                      logger.error(
+                        `[${t}] Fail-close after explicit-final write failure was refused `
+                        + `for ${msg.turnId.substring(0, 8)}; session retained for retry`,
+                      );
+                    }
+                  })
+                  .catch((closeErr) => {
+                    logger.error(
+                      `[${t}] Fail-close after explicit-final write failure threw; `
+                      + `close state is UNPROVEN for ${msg.turnId.substring(0, 8)}: `
+                      + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+                    );
+                  });
+              }
+              logger.info(
+                `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
+                + 'completed-empty (explicit final delivered over IM)',
+              );
+            }
+          }
+        }
         if (msg.status === 'completed'
           && msg.outputDisposition === 'boundary_unobserved'
           && !ds.session.vcMeetingReceiver) {

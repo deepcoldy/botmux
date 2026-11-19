@@ -703,6 +703,125 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     await new Promise(r => setTimeout(r, 20));
     expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
   });
+
+  it('settles an async trigger completed-empty when the answer was explicitly delivered over IM', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['turn-im', { status: 'pending', createdAt: Date.now() } as any]]);
+    ds.idempotentAsyncTurns = new Map([['turn-im', {
+      ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1,
+    } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-im', {
+      outputDisposition: 'explicit_final_delivered',
+    }));
+
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('turn-im')?.status).toBe('completed'));
+    expect(ds.asyncTriggerResults!.get('turn-im')).toMatchObject({
+      status: 'completed',
+      content: '',
+    });
+    expect(recordCompletedMock).toHaveBeenCalledWith(
+      'sid-async-settle', 'turn-im', '', expect.any(Number), 'app_test',
+    );
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
+    // Convergence stamp released after the durable completion landed.
+    expect(ds.idempotentAsyncTurns!.has('turn-im')).toBe(false);
+    // The late-output guard is armed, and the turn is not failed.
+    expect(ds.settledHttpTerminalTurns?.has('turn-im')).toBe(true);
+  });
+
+  it('resolves a Wait Mode turn (empty content) on explicit IM delivery instead of waiting for timeout', async () => {
+    const ds = makeDs();
+    let settled: unknown;
+    ds.pendingWaitPromises = new Map([['turn-wait', {
+      createdAt: Date.now(),
+      resolve: (text: string) => { settled = { resolved: text }; },
+      reject: (err: Error) => { settled = { rejected: err.message }; },
+    } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-wait', {
+      outputDisposition: 'explicit_final_delivered',
+    }));
+
+    await vi.waitFor(() => expect(settled).toBeDefined());
+    expect(settled).toEqual({ resolved: '' });
+    expect(ds.pendingWaitPromises!.has('turn-wait')).toBe(false);
+  });
+
+  it('does not overwrite an earlier completed/failed/interrupted result on explicit IM delivery', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([
+      ['turn-done', { status: 'completed', content: 'captured answer', completedAt: Date.now() } as any],
+      ['turn-failed', { status: 'failed', errorCode: 'trigger_failed', terminalErrorCode: 'provider_x' } as any],
+      ['turn-interrupted', { status: 'interrupted', interruptedAt: Date.now() } as any],
+    ]);
+    ds.idempotentAsyncTurns = new Map([
+      ['turn-done', { ownerLarkAppId: 'app_test', key: 'k1', kind: 'turn', workerGeneration: 1 } as any],
+      ['turn-failed', { ownerLarkAppId: 'app_test', key: 'k2', kind: 'turn', workerGeneration: 1 } as any],
+      ['turn-interrupted', { ownerLarkAppId: 'app_test', key: 'k3', kind: 'turn', workerGeneration: 1 } as any],
+    ]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    for (const turnId of ['turn-done', 'turn-failed', 'turn-interrupted']) {
+      (ds.worker as any).emit('message', terminalMsg(turnId, {
+        outputDisposition: 'explicit_final_delivered',
+      }));
+    }
+    await new Promise(r => setTimeout(r, 30));
+
+    expect(ds.asyncTriggerResults!.get('turn-done')).toMatchObject({
+      status: 'completed', content: 'captured answer',
+    });
+    expect(ds.asyncTriggerResults!.get('turn-failed')).toMatchObject({
+      status: 'failed', terminalErrorCode: 'provider_x',
+    });
+    expect(ds.asyncTriggerResults!.get('turn-interrupted')?.status).toBe('interrupted');
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores synthesised local/scheduled turns for explicit IM delivery on restarted virtual sessions', async () => {
+    const ds = makeDs();
+    ds.chatId = 'http_async_fixture';
+    ds.asyncTriggerResults = new Map();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('local-headless-1', {
+      outputDisposition: 'explicit_final_delivered',
+    }));
+    (ds.worker as any).emit('message', terminalMsg('scheduled-hidden-1', {
+      outputDisposition: 'explicit_final_delivered',
+    }));
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+
+  it('fail-closes the session when the explicit-delivery durable completion write throws', async () => {
+    const closeSession = vi.fn(async () => true);
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    } as any);
+    recordCompletedMock.mockImplementationOnce(() => { throw new Error('EIO'); });
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['turn-eio-im', { status: 'pending' } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-eio-im', {
+      outputDisposition: 'explicit_final_delivered',
+    }));
+
+    await vi.waitFor(() => expect(recordCompletedMock).toHaveBeenCalledWith(
+      'sid-async-settle', 'turn-eio-im', '', expect.any(Number), 'app_test',
+    ));
+    await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith(ds));
+    // In-memory projection still completes for this daemon's pollers.
+    expect(ds.asyncTriggerResults!.get('turn-eio-im')?.status).toBe('completed');
+  });
 });
 
 describe('a failed terminal\'s raw error and screen tail (daemon turn_terminal handler)', () => {

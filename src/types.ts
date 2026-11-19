@@ -2989,11 +2989,19 @@ export type WorkerToDaemonBase =
        *    must settle this fail-closed — no output was ever observed; the
        *    claude bridge guarantees `final_output` precedes this terminal, so
        *    no answer can still arrive.
+       *  - 'explicit_final_delivered': the claude transcript bridge popped a
+       *    real (non-local) turn without transcript terminal evidence, but an
+       *    explicit final `botmux send` marker proves the answer was delivered
+       *    over IM and no `final_output` was emitted (the HTTP channel has no
+       *    captured content). HTTP wait/async callers settle
+       *    completed-with-empty-output — the turn is delivered, just not over
+       *    the HTTP transport. Rides the terminal so a restarted daemon still
+       *    converges instead of leaving the trigger `running`.
        *  Absent on every other `completed` terminal — including the
        *  RPC-hydration timeout path, which emits `completed` with no
        *  final_output after fs-lag and must NOT be read as silence or as a dead
        *  turn (that would mask a real, still-arriving answer). */
-      outputDisposition?: 'nothing_to_send' | 'boundary_unobserved';
+      outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered';
       /** Wall-clock epoch ms at which the CLI turn actually reached its native
        *  terminal. Absent when the emitter cannot vouch for a real instant, in
        *  which case the recorder falls back to its own write time (which is NOT

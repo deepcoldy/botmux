@@ -12794,6 +12794,13 @@ function emitReadyTurns(opts: {
   // explicit final `botmux send`, or already-sent fallback suppression). Such
   // turns must never carry `outputDisposition: 'boundary_unobserved'`.
   const observedOutputTurns = new Set<(typeof ready)[number]>();
+  // Subset of observedOutputTurns whose delivery proof is an explicit final
+  // `botmux send` marker with NO emitted final_output: the answer reached the
+  // user over IM, but the HTTP channel has no captured content. The terminal
+  // carries `explicit_final_delivered` so wait/async callers still settle.
+  const finalMarkerTurns = new Set<(typeof ready)[number]>();
+  // Turns that actually emitted a final_output IPC in loop 1.
+  const emittedFinalOutputTurns = new Set<(typeof ready)[number]>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -12847,7 +12854,10 @@ function emitReadyTurns(opts: {
     const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
       turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
     );
-    if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) observedOutputTurns.add(turn);
+    if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) {
+      observedOutputTurns.add(turn);
+      finalMarkerTurns.add(turn);
+    }
     notifyExplicitRepliesObserved(
       turn.turnId,
       explicitReplyMarkers,
@@ -12986,6 +12996,7 @@ function emitReadyTurns(opts: {
       continue;
     }
     observedOutputTurns.add(turn);
+    emittedFinalOutputTurns.add(turn);
     send({
       type: 'final_output',
       content: deliveredText,
@@ -13100,6 +13111,12 @@ function emitReadyTurns(opts: {
     // Output disposition, positive no-output evidence only:
     //  - genuine silence (bare nothing-to-send sentinel, no `botmux send`) →
     //    'nothing_to_send'; a durable/async caller may settle completed-empty.
+    //  - real (non-local) turn whose answer was delivered explicitly over IM via
+    //    a final `botmux send` marker but which emitted NO final_output, popped
+    //    without transcript terminal evidence → 'explicit_final_delivered'.
+    //    The HTTP channel has no captured content, yet the turn IS delivered:
+    //    wait/async callers settle completed-empty instead of hanging, and the
+    //    label rides the terminal so a restarted daemon still converges.
     //  - real (non-local) turn popped at a screen-idle boundary with NO
     //    transcript terminal evidence at all (`terminalObserved` false:
     //    neither an assistant stop_reason/API-error record nor a next-turn-start
@@ -13117,9 +13134,14 @@ function emitReadyTurns(opts: {
       ? 'nothing_to_send'
       : !turn.isLocal
         && !turn.terminalObserved
-        && !observedOutputTurns.has(turn)
-        ? 'boundary_unobserved'
-        : undefined;
+        && finalMarkerTurns.has(turn)
+        && !emittedFinalOutputTurns.has(turn)
+        ? 'explicit_final_delivered'
+        : !turn.isLocal
+          && !turn.terminalObserved
+          && !observedOutputTurns.has(turn)
+          ? 'boundary_unobserved'
+          : undefined;
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
@@ -36720,7 +36742,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved',
+  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered',
   retryable?: boolean,
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
