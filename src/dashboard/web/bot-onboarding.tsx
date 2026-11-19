@@ -429,6 +429,12 @@ function onboardingOptionLabel<T extends string>(
   return options.find(option => option.value === value)?.label ?? value;
 }
 
+export function onboardingRetryMode(job: {
+  registrationMode?: 'web' | 'compat' | 'local';
+}): 'web' | 'local' {
+  return job.registrationMode === 'local' ? 'local' : 'web';
+}
+
 function OnboardingJobView(props: {
   view: Extract<ViewState, { kind: 'job' }>;
   ownerInput: string;
@@ -436,7 +442,7 @@ function OnboardingJobView(props: {
   onOwnerInputChange(value: string): void;
   onOwnerIdInputChange(value: string): void;
   onSubmitOwner(job: OnboardingJob, owner: string, ownerId: string): void;
-  onRetry(mode: 'web' | 'compat'): void;
+  onRetry(mode: 'web' | 'compat' | 'local'): void;
   onClose(): void;
 }): React.JSX.Element {
   const { job, ownerError } = props.view;
@@ -514,16 +520,22 @@ function OnboardingJobView(props: {
           <div className="actions onboarding-actions">
             <button type="button" onClick={props.onClose}>{t('botOnboarding.close')}</button>
             {!job.appId ? (
-              <>
-                <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
-                <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
-                  {job.error === 'qr_expired'
-                    ? t('botOnboarding.generateQr')
-                    : isSessionFailure(job.error)
-                      ? t('botOnboarding.scanAgain')
-                      : t('botOnboarding.retry')}
+              onboardingRetryMode(job) === 'local' ? (
+                <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('local')}>
+                  {t('botOnboarding.retry')}
                 </button>
-              </>
+              ) : (
+                <>
+                  <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
+                  <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
+                    {job.error === 'qr_expired'
+                      ? t('botOnboarding.generateQr')
+                      : isSessionFailure(job.error)
+                        ? t('botOnboarding.scanAgain')
+                        : t('botOnboarding.retry')}
+                  </button>
+                </>
+              )
             ) : null}
           </div>
         </>
@@ -797,12 +809,12 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     applyJob(body.job as OnboardingJob);
   }, [applyJob]);
 
-  const startPolling = useCallback((id: string) => {
+  const startPolling = useCallback((id: string, registrationMode?: OnboardingJob['registrationMode']) => {
     stopPolling();
     pollTimerRef.current = window.setInterval(() => {
       void pollJob(id).catch(error => {
         stopPolling();
-        setView({ kind: 'job', job: { id, status: 'failed', message: caughtErrorText(error) } });
+        setView({ kind: 'job', job: { id, status: 'failed', message: caughtErrorText(error), registrationMode } });
       });
     }, 1200);
   }, [pollJob, stopPolling]);
@@ -889,9 +901,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       if (!res.ok || !body?.job?.id) throw new Error(body?.error ?? `http_${res.status}`);
       const job = body.job as OnboardingJob;
       applyJob(job);
-      if (!shouldStopPolling(job)) startPolling(job.id);
+      if (!shouldStopPolling(job)) startPolling(job.id, job.registrationMode);
     } catch (error) {
-      setView({ kind: 'job', job: { id: '', status: 'failed', message: caughtErrorText(error) } });
+      setView({ kind: 'job', job: { id: '', status: 'failed', message: caughtErrorText(error), registrationMode } });
     } finally {
       setSubmitting(false);
     }
@@ -903,7 +915,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     void startOnboarding(local ? 'local' : 'web');
   }, [form.connection, startOnboarding]);
 
-  const retry = useCallback(async (registrationMode: 'web' | 'compat') => {
+  const retry = useCallback(async (registrationMode: 'web' | 'compat' | 'local') => {
     if (registrationMode === 'compat') {
       const accepted = await confirm({ title: '兼容性确认', message: t('botOnboarding.compatibilityConfirm'), danger: false });
       if (!accepted) return;

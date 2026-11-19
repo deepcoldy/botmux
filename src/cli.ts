@@ -100,7 +100,7 @@ import {
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { sandboxEnabled } from './adapters/backend/sandbox.js';
-import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import { mutateBotsJsonAtomic, writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -135,12 +135,13 @@ import {
   editInputFromFlags,
   isScriptedSetupInvocation,
   maskAppSecret,
+  parseCliRuntimeFlag,
   parseSetupCommand,
   resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
-import { buildLocalBotRecord, findInvalidFleetCredentials, isLocalBotId } from './setup/local-bot.js';
+import { buildLocalBotRecord, findInvalidFleetCredentials, isLocalBotId, reallocateLocalBotId } from './setup/local-bot.js';
 import {
   detectUnusableOwnerEntries,
   normalizeManagedOwnerEntries,
@@ -150,7 +151,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import bundledScopeManifest from './setup/lark-scopes.json' with { type: 'json' };
 import type { CliId } from './adapters/cli/types.js';
-import type { CliLaunchMode } from './core/cli-launch-mode.js';
+import { validateCliLaunchModeConfig, type CliLaunchMode } from './core/cli-launch-mode.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
   validateCodexAppManagedSendOrigin,
@@ -749,12 +750,50 @@ function printInputHelp(title: string, lines: string[]): void {
   }
 }
 
+function normalizeBotsForWrite(bots: any[]): any[] {
+  const normalized = bots.map(bot => normalizeBotConfig(bot));
+  ensureUniqueBotProcessNames(normalized);
+  return normalized;
+}
+
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
 // the same name without passing BOTS_JSON_FILE explicitly each time.
 function writeBotsJsonAtomic(bots: any[]): void {
-  const normalized = bots.map(bot => normalizeBotConfig(bot));
-  ensureUniqueBotProcessNames(normalized);
-  writeBotsAtomic(BOTS_JSON_FILE, normalized);
+  writeBotsAtomic(BOTS_JSON_FILE, normalizeBotsForWrite(bots));
+}
+
+/**
+ * Append a local bot against the latest locked fleet generation. Both scripted
+ * and interactive setup use this path: id allocation and process-name checks
+ * cannot depend on the snapshot that happened to be read before prompting.
+ */
+function appendLocalBotConfigWithLock<T extends {
+  larkAppId?: string;
+  displayName?: string;
+  name?: string;
+}>(bot: T): {
+  bot: T & { larkAppId: string };
+  index: number;
+  migratedEnv: boolean;
+} {
+  return mutateBotsJsonAtomic(BOTS_JSON_FILE, latest => {
+    let existing = latest;
+    let migratedEnv = false;
+    if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
+      const legacy = parseDotEnvToBotConfig();
+      if (legacy.larkAppId && legacy.larkAppSecret) {
+        existing = [legacy];
+        migratedEnv = true;
+      }
+    }
+    const allocated = reallocateLocalBotId(
+      bot,
+      existing.map(entry => String(entry?.larkAppId ?? '')).filter(Boolean),
+    );
+    const index = existing.length;
+    const bots = normalizeBotsForWrite([...existing, allocated]);
+    return { bots, result: { bot: bots[index], index, migratedEnv } };
+  });
 }
 
 /**
@@ -2033,15 +2072,6 @@ export async function cmdSetupScripted(
   }
 
   if (cmd.action === 'add' && cmd.local) {
-    let existing = bots;
-    let migratedEnv = false;
-    if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
-      const legacy = parseDotEnvToBotConfig();
-      if (legacy.larkAppId && legacy.larkAppSecret) {
-        existing = [legacy];
-        migratedEnv = true;
-      }
-    }
     let cliChoice: ReturnType<typeof resolveCliSelection>;
     try {
       cliChoice = resolveCliSelection((cmd.flags.cli ?? 'claude-code').trim());
@@ -2061,17 +2091,29 @@ export async function cmdSetupScripted(
       model: cmd.flags.model,
       backendType: cmd.flags.backend?.trim(),
       lang: cmd.flags.lang?.trim(),
-      existingIds: existing.map(b => String(b?.larkAppId ?? '')).filter(Boolean),
+      // Provisional only: appendLocalBotConfigWithLock reallocates under the lock.
+      existingIds: [],
     });
     let bot = draft;
-    if (cmd.flags.cliRuntime?.trim()) {
-      try {
-        const { normalizeCliRuntimeConfig } = await import('./adapters/cli/runtime.js');
-        bot = { ...draft, cliRuntime: normalizeCliRuntimeConfig(JSON.parse(cmd.flags.cliRuntime), '--cli-runtime') };
-      } catch (err) {
-        failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
-        return;
+    try {
+      if (cmd.flags.cliRuntime?.trim()) {
+        // Shared editor semantics: validate the runtime against cliId/wrapper
+        // and persist its executable as the exact downgrade path shadow.
+        bot = applyBotConfigEdits(draft, {
+          cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
+          cliPathOverride: cmd.flags.cliPath,
+        });
       }
+      validateCliLaunchModeConfig({
+        cliId: bot.cliId,
+        cliLaunchMode: bot.cliLaunchMode,
+        wrapperCli: bot.wrapperCli,
+        cliRuntime: bot.cliRuntime,
+        cliPathOverride: bot.cliPathOverride,
+      }, 'setup add --local');
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
     }
     const badDirs = invalidBotDirs(bot);
     if (badDirs.length > 0) {
@@ -2088,16 +2130,18 @@ export async function cmdSetupScripted(
       failSetupScripted(cmd.json, `所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}。请先安装或修正 PATH / CLI 路径，未写入配置。`);
       return;
     }
+    let appended: { bot: typeof bot; index: number; migratedEnv: boolean };
     try {
-      writeBotsJsonAtomic([...existing, bot]);
+      appended = appendLocalBotConfigWithLock(bot);
     } catch (err) {
       failSetupScripted(cmd.json, `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    if (migratedEnv) {
-      try { renameSync(ENV_FILE, ENV_FILE + '.bak'); } catch { migratedEnv = false; }
+    bot = appended.bot;
+    if (appended.migratedEnv) {
+      try { renameSync(ENV_FILE, ENV_FILE + '.bak'); } catch { /* config is already durable */ }
     }
-    const index = existing.length;
+    const index = appended.index;
     const live = await ensureBotDaemonStarted(String(bot.larkAppId), { quiet: cmd.json });
     const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
     if (cmd.json) {
@@ -2664,6 +2708,11 @@ async function cmdClone(argv: string[]): Promise<void> {
     return;
   }
   const source = bots[sourceIndex];
+  if (source.localIdentity === true) {
+    console.error('本地机器人不支持克隆；请改用 setup add --local 新建本地机器人，或使用飞书机器人作为克隆源。');
+    process.exitCode = 1;
+    return;
+  }
   const owners = cloneOwnerEntries(
     source,
     process.env.BOTMUX_LARK_APP_ID,
@@ -2859,14 +2908,21 @@ async function cmdSetup(): Promise<void> {
       }
 
       console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-      const newBot = await promptBotConfig(rl);
+      let newBot = await promptBotConfig(rl);
       rl.close();
       if (!newBot) {
         console.log(`\n${t('setup.common.aborted_bots_json_untouched')}`);
         return;
       }
-      writeBotsJsonAtomic([...bots, newBot]);
-      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: bots.length + 1 })}`);
+      let addedIndex = bots.length;
+      if (newBot.localIdentity === true) {
+        const appended = appendLocalBotConfigWithLock(newBot);
+        newBot = appended.bot;
+        addedIndex = appended.index;
+      } else {
+        writeBotsJsonAtomic([...bots, newBot]);
+      }
+      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: addedIndex + 1 })}`);
       console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
       await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
       await printAddBotLiveHint(newBot.larkAppId);
@@ -2912,7 +2968,7 @@ async function cmdSetup(): Promise<void> {
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
     console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-    const newBot = await promptBotConfig(rl);
+    let newBot = await promptBotConfig(rl);
     rl.close();
     if (!newBot) {
       console.log(`\n${t('setup.common.aborted_env_untouched')}`);
@@ -2920,7 +2976,12 @@ async function cmdSetup(): Promise<void> {
     }
 
     // 写新文件成功后才备份 .env. 失败不动两边.
-    writeBotsJsonAtomic([existingBot, newBot]);
+    if (newBot.localIdentity === true) {
+      const appended = appendLocalBotConfigWithLock(newBot);
+      newBot = appended.bot;
+    } else {
+      writeBotsJsonAtomic([existingBot, newBot]);
+    }
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);

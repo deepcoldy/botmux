@@ -258,7 +258,7 @@ function parseBotFieldFlags(
 /** Parse only the JSON envelope here; structural validation remains centralized
  * in applyBotConfigEdits -> normalizeCliRuntimeConfig so add/edit/TUI callers
  * cannot drift onto different runtime rules. */
-function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
+export function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
   if (raw === undefined) return undefined;
   const value = raw.trim();
   if (value === '-') return null;
@@ -269,6 +269,7 @@ function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null |
   } catch (err) {
     throw new Error(`--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
+  if (parsed === null) throw new Error('--cli-runtime 必须是 JSON 对象或 -');
   return parsed as CliRuntimeConfig;
 }
 

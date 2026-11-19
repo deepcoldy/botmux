@@ -9880,6 +9880,7 @@ describe('managed Agent clone owner boundary', () => {
     // 必须在这条上红。新增字段时同步更新这份字面量即可。
     expect([...CLONE_EXCLUDED_KEYS]).toEqual([
       'apiOnly',
+      'localIdentity',
       'name',
       'displayName',
       'messageListeners',
@@ -9990,6 +9991,14 @@ describe('managed Agent clone owner boundary', () => {
     }, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
     expect(target.soloGroupMentionBypass).toBe(false);
     expect(target).not.toHaveProperty('chatSoloGroupMentionBypass');
+  });
+  it('drops a persisted local identity when cloning onto a Feishu target', () => {
+    const target = cloneBotConfig({
+      larkAppId: 'local_source', apiOnly: true, localIdentity: true, cliId: 'codex',
+    }, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+    expect(target).toMatchObject({ larkAppId: 'cli_target', cliId: 'codex' });
+    expect(target).not.toHaveProperty('localIdentity');
+    expect(target).not.toHaveProperty('apiOnly');
   });
 });
 

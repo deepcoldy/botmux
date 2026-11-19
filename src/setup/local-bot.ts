@@ -33,6 +33,18 @@ export function allocateLocalBotId(displayName: string | undefined, taken: Itera
   throw new Error('无法分配本地机器人 id');
 }
 
+/** Re-run allocation against the locked, latest fleet snapshot before an append. */
+export function reallocateLocalBotId<T extends {
+  larkAppId?: string;
+  displayName?: string;
+  name?: string;
+}>(record: T, taken: Iterable<string>): T & { larkAppId: string } {
+  return {
+    ...record,
+    larkAppId: allocateLocalBotId(record.displayName ?? record.name, taken),
+  };
+}
+
 export interface LocalBotDraft {
   displayName?: string;
   cliId: CliId;

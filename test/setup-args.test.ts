@@ -433,6 +433,11 @@ describe('editInputFromFlags', () => {
     expect(editInputFromFlags({ cliRuntime: '-' })).toEqual({ cliRuntime: null });
   });
 
+  it('rejects JSON null as an add/edit runtime instead of treating it as a clear', () => {
+    expect(() => editInputFromFlags({ cliRuntime: 'null' })).toThrow(/--cli-runtime 必须是 JSON 对象或 -/);
+    expect(editInputFromFlags({ cliRuntime: '-' })).toEqual({ cliRuntime: null });
+  });
+
   it('clears a stored runtime when an edit switches to a non-Codex CLI', () => {
     const base = {
       larkAppId: 'cli_x',
@@ -473,6 +478,18 @@ describe('editInputFromFlags', () => {
     expect(updated.cliId).toBe('traex');
     expect(updated.cliLaunchMode).toBe('forge-traex');
     expect(updated.cliPathOverride).toBeUndefined();
+  });
+});
+
+describe('local identity edit guard shared by scripted and interactive setup', () => {
+  it('rejects changing or clearing the id while allowing other edits', () => {
+    const local = { larkAppId: 'local_lab', apiOnly: true, localIdentity: true, cliId: 'riff' };
+    expect(() => applyBotConfigEdits(local, editInputFromFlags({ appId: 'cli_changed' })))
+      .toThrow(/本地机器人 id 不可修改/);
+    expect(() => applyBotConfigEdits(local, editInputFromFlags({ appId: '-' })))
+      .toThrow(/本地机器人 id 不可修改/);
+    const edited = applyBotConfigEdits(local, editInputFromFlags({ appId: 'local_lab', model: 'next' }));
+    expect(edited).toMatchObject({ larkAppId: 'local_lab', apiOnly: true, localIdentity: true, model: 'next' });
   });
 });
 
