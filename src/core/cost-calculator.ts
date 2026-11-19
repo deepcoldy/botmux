@@ -1602,13 +1602,19 @@ export function getSessionUsageRecovery(
     let previousAt: number | null = null;
     let checkpoint: typeof cursor;
     let invalid = false;
+    let remainingScanBytes = MAX_USAGE_TRANSCRIPT_BYTES;
+    const seenCheckpoints = new Set<string>();
     for (const path of paths) {
       const st = statSync(path);
       if (resume && (st.dev !== resume.dev || st.ino !== resume.ino)) return null;
+      const fromOffset = resume?.offset ?? 0;
+      const scanBytes = Math.max(0, st.size - fromOffset);
+      if (scanBytes > remainingScanBytes) return null;
+      remainingScanBytes -= scanBytes;
       const priorSegmentEnd = anchored ? previousAt : null;
       // Model context belongs to this segment. A prior segment cannot supply it.
       aggregate.model = resume?.model ?? '';
-      const scan = scanJsonlFromOffset(path, resume?.offset ?? 0, { endOffset: st.size, onLine(line, offset) {
+      const scan = scanJsonlFromOffset(path, fromOffset, { endOffset: st.size, onLine(line, offset) {
         if (invalid || !line.trim()) return;
         if (resume && offset === resume.offset && line !== resume.line) { invalid = true; return; }
         let entry: any;
@@ -1620,11 +1626,22 @@ export function getSessionUsageRecovery(
         usage.model = firstNonEmptyString(entry.payload.context?.model, aggregate.model) ?? '';
         const ms = entryTimestampMs(entry);
         if (!anchored) {
+          seenCheckpoints.add(usage.nativeCheckpoint);
           anchored = equal(usage, previous)
             && (!previous.nativeCheckpoint || usage.nativeCheckpoint === previous.nativeCheckpoint);
           if (anchored) previousAt = ms;
           return;
         }
+        if (seenCheckpoints.has(usage.nativeCheckpoint)) {
+          // A continuation may replay history across counter resets. Native row
+          // identity, not cumulative totals, distinguishes replay from new usage.
+          // Keep the cursor with the newest physical copy of the current point.
+          if (equal(usage, last) && usage.nativeCheckpoint === last.nativeCheckpoint) {
+            checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
+          }
+          return;
+        }
+        seenCheckpoints.add(usage.nativeCheckpoint);
         if (ms !== null && priorSegmentEnd !== null && ms <= priorSegmentEnd
           && fields.every(k => usage[k] <= last[k])) return;
         if (equal(usage, last)) {
@@ -1632,7 +1649,7 @@ export function getSessionUsageRecovery(
           checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
           return;
         }
-        if (ms === null || !usage.model || (previousAt !== null && ms < previousAt)) {
+        if (ms === null || (previousAt !== null && ms < previousAt)) {
           invalid = true; return;
         }
         const reset = fields.some(k => usage[k] < last[k]);
@@ -1646,7 +1663,9 @@ export function getSessionUsageRecovery(
         last = usage;
         previousAt = ms;
       } });
-      if (!scan || scan.pendingTail.trim() || invalid) return null;
+      // A trailing partial record is not durable. It cannot veto an interval
+      // whose final current checkpoint is proved by complete records below.
+      if (!scan || invalid) return null;
     }
     if (!anchored || !equal(last, current)
       || (current.nativeCheckpoint && last.nativeCheckpoint !== current.nativeCheckpoint)) return null;

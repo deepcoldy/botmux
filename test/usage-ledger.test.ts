@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/usage-ledger.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -164,7 +164,7 @@ describe('recordSessionUsage', () => {
     expect(ledgerLines(dir)).toHaveLength(1);
   });
 
-  it('resets the baseline without a record when cumulative usage shrinks', () => {
+  it('resets the baseline with a zero-delta marker when cumulative usage shrinks', () => {
     recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10) });
     // /clear or transcript rotation: cumulative drops — no negative record.
     const shrunk = recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(40, 5) });
@@ -173,7 +173,52 @@ describe('recordSessionUsage', () => {
     // Growth from the new baseline is measured against 40/5, not 100/10.
     const rec = recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(90, 15) });
     expect(rec).toMatchObject({ inputTokens: 50, outputTokens: 10 });
-    expect(ledgerLines(dir)).toHaveLength(2);
+    const rows = ledgerLines(dir);
+    expect(rows.filter(row => row.kind !== 'reset')).toHaveLength(2);
+    expect(rows.find(row => row.kind === 'reset')).toMatchObject({
+      inputTokens: 0, outputTokens: 0, totalInputTokens: 40, totalOutputTokens: 5, epoch: 1,
+    });
+  });
+
+  it('keeps the reset epoch in memory when state persistence fails once', () => {
+    const args = baseArgs({ larkAppId: undefined });
+    recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(100, 10) });
+    const statePath = join(dir, 'state-default.json');
+    const savedState = join(dir, 'state-default.backup.json');
+    renameSync(statePath, savedState);
+    mkdirSync(statePath); // atomic rename over a directory fails with EISDIR/ENOTEMPTY.
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(20, 5) })).toBeNull();
+    rmdirSync(statePath);
+    renameSync(savedState, statePath);
+
+    const recovered = recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(40, 15) });
+    expect(recovered).toMatchObject({ inputTokens: 20, outputTokens: 10, epoch: 1 });
+    expect(ledgerLines(dir).filter(row => row.kind !== 'reset').map(row => row.inputTokens)).toEqual([100, 20]);
+  });
+
+  it('rebuilds the reset baseline from its ledger marker after a failed save and restart', () => {
+    const args = baseArgs({ larkAppId: undefined });
+    recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(100, 10) });
+    const statePath = join(dir, 'state-default.json');
+    const savedState = join(dir, 'state-default.backup.json');
+    renameSync(statePath, savedState);
+    mkdirSync(statePath);
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(20, 5) })).toBeNull();
+    rmdirSync(statePath);
+    renameSync(savedState, statePath);
+    __resetUsageLedgerMemoryForTest(); // restart before any successful state advance
+
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(40, 15) }))
+      .toMatchObject({ inputTokens: 20, outputTokens: 10, epoch: 1 });
+    expect(recordSessionUsage({ ...args, ledgerDir: dir, usage: cumulative(60, 25) }))
+      .toMatchObject({ inputTokens: 20, outputTokens: 10, epoch: 1 });
+    const rows = ledgerLines(dir);
+    expect(rows.filter(row => row.kind !== 'reset').map(row => row.inputTokens)).toEqual([100, 20, 20]);
+    expect(rows.filter(row => row.kind === 'reset')).toHaveLength(1);
+    expect(rows.find(row => row.kind === 'reset')).toMatchObject({
+      inputTokens: 0, totalInputTokens: 20, totalOutputTokens: 5, epoch: 1,
+    });
+    expect(new Set(rows.map(row => row.recordId)).size).toBe(rows.length);
   });
 
   it('tracks sessions independently', () => {

@@ -89,7 +89,10 @@ export function resolveSessionTranscriptPaths(q: TranscriptPathQuery): string[] 
     }
   };
   try { walk(root, 0); } catch { return [current.path]; }
-  return [...found].sort();
+  const ordered = [...found].sort();
+  // The single-path resolver's indexed generation is authoritative. A later-
+  // named sibling cannot be its ancestor and must not poison the current end.
+  return ordered.slice(0, ordered.indexOf(current.path) + 1);
 }
 
 const sessionPathCache = new Map<string, { path: string | null; atMs: number }>();

@@ -142,6 +142,7 @@ import {
   getSessionUsageSnapshot,
   getSessionTokenUsage,
   getSessionUsageRecovery,
+  MAX_USAGE_TRANSCRIPT_BYTES,
   __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
@@ -1563,5 +1564,36 @@ describe('usage recovery checkpoints', () => {
       checkpoint(100, '2026-01-02T10:00:00Z'), checkpoint(200, '2026-01-01T23:00:00Z'), '',
     ].join('\n'));
     expect(getSessionUsageRecovery(query, snapshot(100), snapshot(200))).toBeNull();
+  });
+
+  it('fails closed before recovery exceeds the shared transcript scan budget', () => {
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/tmp/recovery.jsonl');
+    const query = { cliId: 'codex' as const, sessionId: 'bot', cliSessionId: 'native' };
+    const checkpoint = (input: number, timestamp: string) => JSON.stringify({ timestamp,
+      type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: {
+        input_tokens: input, output_tokens: 0, cached_input_tokens: 0,
+      } } } });
+    const snapshot = (input: number) => ({ in: input, out: 0, inputTokens: input, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreateTokens: 0, model: 'a', turns: 0 });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue([
+      JSON.stringify({ type: 'turn_context', payload: { model: 'a' } }),
+      checkpoint(100, '2026-01-01T10:00:00Z'),
+      checkpoint(150, '2026-01-01T11:00:00Z'), '',
+    ].join('\n'));
+    const defaultStat = vi.mocked(statSync).getMockImplementation()!;
+    try {
+      vi.mocked(statSync).mockImplementation((path: any) => {
+        const stat = defaultStat(path);
+        return path === '/tmp/recovery.jsonl'
+          ? { ...stat, size: MAX_USAGE_TRANSCRIPT_BYTES + 1 } as any
+          : stat;
+      });
+      // The small in-memory fixture would recover 50 if the scanner were allowed
+      // to run; the enlarged stat proves the byte guard fails before that work.
+      expect(getSessionUsageRecovery(query, snapshot(100), snapshot(150))).toBeNull();
+    } finally {
+      vi.mocked(statSync).mockImplementation(defaultStat);
+    }
   });
 });

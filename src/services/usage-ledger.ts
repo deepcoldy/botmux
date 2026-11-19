@@ -35,8 +35,9 @@ export interface UsageLedgerRecord {
   inputTokenSemantics: 'uncached';
   /** 'ownership' marks a zero-delta marker written at session spawn so
    *  consumers can exclude the session from native parsers BEFORE its first
-   *  positive delta lands; absent for normal usage records. */
-  kind?: 'ownership';
+   *  positive delta lands; 'reset' durably records a new baseline epoch with
+   *  zero usage deltas. Neither is a billable event. */
+  kind?: 'ownership' | 'reset';
   recordId: string;
   ts: string;
   nativeCheckpoint?: string;
@@ -393,9 +394,40 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       // The epoch bump keeps a later identical totals transition from reusing
       // a pre-reset recordId.
       baseline.epoch = prevEpoch + 1;
+      const resetRecord: UsageLedgerRecord = {
+        v: 2,
+        inputTokenSemantics: 'uncached',
+        kind: 'reset',
+        recordId: deterministicRecordId(args.sessionId, baseline.epoch, prev, cur),
+        ts: occurredAt.toISOString(),
+        ...(cur.nativeCheckpoint ? { nativeCheckpoint: cur.nativeCheckpoint } : {}),
+        epoch: baseline.epoch,
+        ...(args.larkAppId ? { larkAppId: args.larkAppId } : {}),
+        sessionId: args.sessionId,
+        ...(args.cliId ? { cliId: args.cliId } : {}),
+        ...(args.cliSessionId ? { cliSessionId: args.cliSessionId } : {}),
+        ...(args.chatId ? { chatId: args.chatId } : {}),
+        ...(args.title ? { title: args.title } : {}),
+        ...(args.workingDir ? { workingDir: args.workingDir } : {}),
+        ...(args.callerOpenId ? { callerOpenId: args.callerOpenId } : {}),
+        model: cur.model,
+        ...(models ? { modelTotals: models } : {}),
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        totalInputTokens: cur.inputTokens,
+        totalOutputTokens: cur.outputTokens,
+        totalCacheReadTokens: cur.cacheReadTokens,
+        totalCacheCreateTokens: cur.cacheCreateTokens,
+      };
+      // A state-file failure or a crash before saveState must not erase the new
+      // epoch: baselineFromLedger replays this zero-delta control event after
+      // restart. It never reaches the budget sink or counts as usage.
+      appendFileSync(ledgerFilePath(dir, occurredAt), JSON.stringify(resetRecord) + '\n');
+      sessionBaselineMemory.set(baselineMemoryKey(dir, args.larkAppId, args.sessionId), baseline);
       state.sessions[args.sessionId] = baseline;
       saveState(dir, args.larkAppId, state, now);
-      sessionBaselineMemory.set(baselineMemoryKey(dir, args.larkAppId, args.sessionId), baseline);
       return null;
     }
     if (deltaInput === 0 && deltaOutput === 0 && deltaCacheRead === 0 && deltaCacheCreate === 0) {

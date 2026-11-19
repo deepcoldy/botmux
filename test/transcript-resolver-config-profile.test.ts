@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 
 // A session launched on a Claude config profile (Session.cliConfigDir) wrote its
 // transcript under that profile; usage / insight readers must look there, and
@@ -38,6 +39,39 @@ it('excludes a falsely named continuation with a foreign native session header',
     vi.unstubAllEnvs();
     __resetTranscriptResolverCacheForTest();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('bounds continuation candidates at the indexed active generation for Codex and TraeX', () => {
+  const sid = '11111111-1111-4111-8111-111111111111';
+  for (const cliId of ['codex', 'traex'] as const) {
+    const root = mkdtempSync(join(tmpdir(), `botmux-active-generation-${cliId}-`));
+    try {
+      const home = cliId === 'codex' ? root : join(root, 'cli');
+      vi.stubEnv(cliId === 'codex' ? 'CODEX_HOME' : 'TRAE_HOME', cliId === 'codex' ? home : root);
+      const day = join(home, 'sessions', '2026', '01', '01');
+      mkdirSync(day, { recursive: true });
+      const write = (hour: string, generation?: string) => {
+        const path = join(day, `rollout-2026-01-01T${hour}-00-00-${sid}${generation ? `_${generation}` : ''}.jsonl`);
+        writeFileSync(path, JSON.stringify({ type: 'session_meta', payload: { id: sid } }) + '\n');
+        return path;
+      };
+      const predecessor = write('09');
+      const active = write('10', '22222222-2222-4222-8222-222222222222');
+      write('11', '33333333-3333-4333-8333-333333333333'); // later, inactive generation
+      const db = openDatabaseSyncNow(join(home, 'state_5.sqlite'));
+      expect(db).not.toBeNull();
+      db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)');
+      db!.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(sid, active);
+      db!.close();
+
+      expect(resolveSessionTranscriptPaths({ cliId, sessionId: `recovery-${cliId}`, cliSessionId: sid }))
+        .toEqual([predecessor, active]);
+    } finally {
+      vi.unstubAllEnvs();
+      __resetTranscriptResolverCacheForTest();
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 
