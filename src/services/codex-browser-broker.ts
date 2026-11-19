@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { findMissingAskEnv } from '../core/ask-args.js';
 import type { CodexBrowserFamily } from '../core/codex-browser-config.js';
 import { CodexBrowserAuthenticatedFetch } from './codex-browser-authenticated-fetch.js';
+import { CodexBrowserNodeService } from './codex-browser-node-service.js';
 
 type Json = Record<string, any>;
 
@@ -230,6 +231,8 @@ interface BrowserAgent {
 interface BrowserPluginModules {
   setupBrowserRuntime(): Promise<BrowserAgent>;
   handleRpc(request: { method: string; params?: unknown }): Promise<unknown>;
+  handleTurnEnded?(event: unknown): Promise<void>;
+  close?(): Promise<void>;
 }
 
 interface BrowserTurnEndedHandler {
@@ -285,7 +288,7 @@ export interface DynamicToolCallResponse {
   success: boolean;
 }
 
-const TOOL_TIMEOUT_MS = 660_000;
+export const TOOL_TIMEOUT_MS = 660_000;
 const MAX_TEXT_RESULT_BYTES = 512 * 1024;
 const MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024;
 const MAX_OPERATION_TIMEOUT_MS = 60_000;
@@ -622,15 +625,21 @@ async function connectNativePipe(path: string): Promise<Socket> {
 }
 
 async function loadBrowserPluginModules(root: string): Promise<BrowserPluginModules> {
-  const service = await import(pathToFileURL(join(root, 'scripts/browser-service.mjs')).href) as {
+  // The bundled service requires Node's WASI reactor API; Bun currently lacks
+  // getImportObject/initialize. Keep the public typed tool unchanged while
+  // hosting the trusted service in one owner-scoped Node process.
+  const nodeService = process.versions.bun
+    ? new CodexBrowserNodeService(root, () => (globalThis as Json).nodeRepl) : undefined;
+  const service = nodeService ?? await import(pathToFileURL(join(root, 'scripts/browser-service.mjs')).href) as {
     handleRpc(request: { method: string; params?: unknown }): Promise<unknown>;
   };
   const client = await import(pathToFileURL(join(root, 'scripts/browser-client.mjs')).href) as {
     setupBrowserRuntime(): Promise<BrowserAgent>;
   };
   return {
-    handleRpc: service.handleRpc,
+    handleRpc: nodeService ? request => nodeService.handleRpc(request) : service.handleRpc,
     setupBrowserRuntime: client.setupBrowserRuntime,
+    ...(nodeService ? { handleTurnEnded: (event: unknown) => nodeService.handleTurnEnded(event), close: () => nodeService.close() } : {}),
   };
 }
 
@@ -653,6 +662,9 @@ export class CodexBrowserBroker {
   private previousNodeRepl: unknown;
   private runtimeShim?: Json;
   private authenticatedFetch?: CodexBrowserAuthenticatedFetch;
+  private pluginModules?: BrowserPluginModules;
+  /** Shared teardown for the browser initialization being invalidated. */
+  private invalidation?: { init: Promise<BrowserBinding>; done: Promise<void> };
 
   constructor(private readonly opts: CodexBrowserBrokerOptions) {}
 
@@ -670,9 +682,18 @@ export class CodexBrowserBroker {
     }
   }
 
-  /** Bridge the owning app-server's terminal turn notification into the
-   * lifecycle contract expected by the bundled browser runtime. */
+  /** Serializes turn-ended work because the app-server fires these without
+   *  awaiting (void ...catch): local handlers and the Node worker batch must
+   *  run in event order even when notifications arrive back to back. */
+  private turnEndedTail: Promise<void> = Promise.resolve();
+
   async handleTurnEnded(turnId: string): Promise<void> {
+    const run = this.turnEndedTail.then(() => this.runTurnEnded(turnId));
+    this.turnEndedTail = run.catch(() => {});
+    return run;
+  }
+
+  private async runTurnEnded(turnId: string): Promise<void> {
     const event = { session_id: this.opts.sessionId, turn_id: turnId };
     const results = await Promise.allSettled([...this.turnEndedHandlers].map(handler => {
       const timeoutMs = typeof handler.timeoutMs === 'number'
@@ -685,6 +706,13 @@ export class CodexBrowserBroker {
         timeoutMs,
       );
     }));
+    if (this.pluginModules?.handleTurnEnded) {
+      // The Node worker enforces each plugin handler's own timeoutMs (4s
+      // default) on its side; the service's per-request watchdog still bounds
+      // the whole call. A fixed 4s wrapper here would discard a handler that
+      // legitimately configured a longer timeout.
+      results.push(...await Promise.allSettled([this.pluginModules.handleTurnEnded(event)]));
+    }
     const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (failure) throw failure.reason;
   }
@@ -703,22 +731,56 @@ export class CodexBrowserBroker {
       const message = error instanceof Error ? error.message : String(error);
       if (this.browser === browser && this.browserGeneration === generation
         // Error-text contract with the bundled Codex chrome plugin
-        // (scripts/browser-client.mjs): only these two prefixes prove the
+        // (scripts/browser-client.mjs) and the owner-scoped Node host: these prefixes prove the
         // binding/transport is dead. The match is anchored at message start, so
         // if the plugin ever wraps its errors with a leading context string,
         // invalidation silently stops — update both sides together.
-        && /^(?:Browser is not available:|native pipe closed before response\b)/i.test(message)) {
+        && /^(?:Browser is not available:|native pipe closed before response\b|Debugger unattached\b|Browser Node runtime (?:exited|is unavailable)\b)/i.test(message)) {
         // Rediscover on the next explicit call. Never replay an operation that
         // may have run, or discard a newer binding for an older call's error.
-        this.browserGeneration++;
-        this.browser = undefined;
-        this.init = undefined;
-        this.claimedTabs.clear();
-        this.requiresFreshTabClaim = true;
+        if (this.isDeadRuntimeError(message)) {
+          await this.invalidateDeadRuntime();
+        } else {
+          this.browserGeneration++;
+          this.browser = undefined;
+          this.init = undefined;
+          this.claimedTabs.clear();
+          this.requiresFreshTabClaim = true;
+        }
         throw new Error(`${message}. Browser connection changed; call list_tabs and claim_tab again before using an existing tab. The failed operation was not replayed.`);
       }
       throw error;
     }
+  }
+
+  private isDeadRuntimeError(message: string): boolean {
+    return /^Browser Node runtime (?:exited|is unavailable)\b/i.test(message);
+  }
+
+  /** Callers sharing a failed init await one cleanup. Retire the dead binding
+   * even if close rejects, so the next explicit operation can rebuild it. */
+  private async invalidateDeadRuntime(init = this.init): Promise<void> {
+    if (!init || this.init !== init) return;
+    if (this.invalidation?.init === init) return this.invalidation.done;
+    const modules = this.pluginModules;
+    const done = Promise.resolve().then(() => modules?.close?.()).finally(() => {
+      if (this.invalidation?.done === done) this.invalidation = undefined;
+      // Judge takeover by the actual runtime identity, not by init: an
+      // ordinary disconnect on the same generation clears this.init without
+      // replacing agent/modules, and must not skip retiring this dead runtime.
+      // Only a genuinely rebuilt runtime (a new modules object) is protected.
+      if (this.pluginModules !== modules) return;
+      this.pluginModules = undefined;
+      this.agent = undefined;
+      this.turnEndedHandlers.clear();
+      this.browserGeneration++;
+      this.browser = undefined;
+      this.init = undefined;
+      this.claimedTabs.clear();
+      this.requiresFreshTabClaim = true;
+    });
+    this.invalidation = { init, done };
+    return done;
   }
 
   private async executeWithBrowser(
@@ -1224,6 +1286,16 @@ export class CodexBrowserBroker {
       this.browser = await init;
       return this.browser;
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isDeadRuntimeError(message)) {
+        // agent.browsers.get() runs outside execute()'s operation guard, so a
+        // dead Node runtime must be torn down here as well; otherwise the stale
+        // agent and its exited child would be reused on every later operation.
+        // Passing init makes concurrent failures of the same discovery share
+        // one teardown instead of each erasing a later rebuild.
+        await this.invalidateDeadRuntime(init);
+        throw new Error(`${message}. Browser connection changed; call list_tabs and claim_tab again before using an existing tab. The failed operation was not replayed.`);
+      }
       // Extension/native-host availability can change after the first tool
       // call (for example when the user enables or reconnects the extension).
       // Do not permanently cache that transient discovery failure: the next
@@ -1244,15 +1316,16 @@ export class CodexBrowserBroker {
       const modules = this.opts.modules ?? await loadBrowserPluginModules(
         resolveCodexBrowserPluginRoot(this.opts.pluginRoot),
       );
+      this.pluginModules = modules;
       if (!this.runtimeShim) {
         this.previousNodeRepl = (globalThis as Json).nodeRepl;
         const nodeRepl = this.createRuntimeShim();
         (globalThis as Json).nodeRepl = nodeRepl;
-        nodeRepl.rpc = async (name: string, request: { method: string; params?: unknown }) => {
-          if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);
-          return modules.handleRpc(request);
-        };
       }
+      this.runtimeShim!.rpc = async (name: string, request: { method: string; params?: unknown }) => {
+        if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);
+        return modules.handleRpc(request);
+      };
       if (metadata) this.updateTurnMetadata(metadata.threadId, metadata.turnId);
       const previousHandlers = new Set(this.turnEndedHandlers);
       try {
@@ -1263,6 +1336,8 @@ export class CodexBrowserBroker {
         for (const handler of this.turnEndedHandlers) {
           if (!previousHandlers.has(handler)) this.turnEndedHandlers.delete(handler);
         }
+        await modules.close?.();
+        if (this.pluginModules === modules) this.pluginModules = undefined;
         throw error;
       }
     }
@@ -1418,12 +1493,12 @@ export class CodexBrowserBroker {
   }
 
   /** Test/process cleanup; production runner teardown exits the process. */
-  close(): Promise<void> {
+  async close(): Promise<void> {
     this.turnEndedHandlers.clear();
     if ((globalThis as Json).nodeRepl === this.runtimeShim) {
       if (this.previousNodeRepl === undefined) delete (globalThis as Json).nodeRepl;
       else (globalThis as Json).nodeRepl = this.previousNodeRepl;
     }
-    return this.authenticatedFetch?.close() ?? Promise.resolve();
+    await Promise.all([this.pluginModules?.close?.(), this.authenticatedFetch?.close()]);
   }
 }

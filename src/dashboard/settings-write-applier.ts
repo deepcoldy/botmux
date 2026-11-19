@@ -64,6 +64,7 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   reapOrphanTmuxServers: boolean;
   tmuxOrphanSessionSweep: boolean;
   tmuxOrphanSessionBareWrapperKill: boolean;
@@ -73,6 +74,7 @@ export interface ResolvedDashboardSettingsView {
   cardBrandLabel: boolean;
   /** Whether the turn initiator may press the safe keys on a stuck card. Default ON. */
   stuckCardInitiatorKeys: boolean;
+  modelQueueNotify?: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -279,6 +281,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
+  | 'invalid_terminalEffortWriteback'
   | 'invalid_reapOrphanTmuxServers'
   | 'invalid_tmuxOrphanSessionSweep'
   | 'invalid_tmuxOrphanSessionBareWrapperKill'
@@ -286,6 +289,7 @@ export type ApplySettingsWriteError =
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
   | 'invalid_stuckCardInitiatorKeys'
+  | 'invalid_modelQueueNotify'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -555,6 +559,10 @@ export async function applySettingsWrite(
     }
     patch.codexRpcInput = obj.codexRpcInput;
   }
+  if ('terminalEffortWriteback' in obj) {
+    if (typeof obj.terminalEffortWriteback !== 'boolean') return { ok: false, error: 'invalid_terminalEffortWriteback' };
+    patch.terminalEffortWriteback = obj.terminalEffortWriteback;
+  }
   if ('autoUpgradeCodexSessions' in obj) {
     if (typeof obj.autoUpgradeCodexSessions !== 'boolean') {
       return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
@@ -605,6 +613,12 @@ export async function applySettingsWrite(
     // (mergeDashboardConfig drops undefined), so the file never pins the
     // default and a future default change still reaches untouched installs.
     patch.stuckCardInitiatorKeys = obj.stuckCardInitiatorKeys ? undefined : false;
+  }
+  if ('modelQueueNotify' in obj) {
+    if (typeof obj.modelQueueNotify !== 'boolean') {
+      return { ok: false, error: 'invalid_modelQueueNotify' };
+    }
+    patch.modelQueueNotify = obj.modelQueueNotify;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {

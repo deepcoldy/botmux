@@ -43,7 +43,7 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });
 
-  it('cursor is always-on and antigravity stays zero-prompt-only', () => {
+  it('cursor is always-on and antigravity bridges adopt or managed zero-prompt', () => {
     // Plan B (#932): an ordinary botmux-spawned cursor gets the same
     // send-marker-gated transcript harvest as codex.
     expect(isStructuredBridgeFallbackActive('cursor')).toBe(true);
@@ -53,10 +53,10 @@ describe('structured-bridge-clis', () => {
     expect(isStructuredBridgeFallbackActive('antigravity')).toBe(false);
     expect(isStructuredBridgeFallbackActive('antigravity', false, true)).toBe(true);
     expect(isStructuredBridgeFallbackActive('antigravity', false, false)).toBe(false);
-    // antigravity has no /adopt bridge — adopt must win over the zero-prompt
-    // flag rather than silently routing an adopted pane through the spawn path.
-    expect(isStructuredBridgeFallbackActive('antigravity', true, true)).toBe(false);
-    expect(isStructuredBridgeFallbackActive('antigravity', true, false)).toBe(false);
+    expect(isStructuredBridgeFallbackActive('antigravity', true, true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('antigravity', true, false)).toBe(true);
+    expect(isStructuredBridgeAdoptCli('antigravity')).toBe(true);
+    expect(isStructuredBridgeAdoptInputCli('antigravity')).toBe(false);
     expect(isStructuredBridgeFallbackActive('grok')).toBe(true);
     expect(isStructuredBridgeFallbackActive('hermes')).toBe(true);
   });

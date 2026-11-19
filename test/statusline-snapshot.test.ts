@@ -39,6 +39,22 @@ afterEach(() => {
 });
 
 describe('parseStatuslinePayload', () => {
+  it.each(['low', 'medium', 'high', 'xhigh', 'max'] as const)('keeps native effort.level=%s through disk', level => {
+    const snap = parseStatuslinePayload({ ...SAMPLE, effort: { level } }, NOW)!;
+    expect(snap.reasoningEffort).toBe(level);
+    writeStatuslineSnapshot(dataDir, 'effort', snap);
+    expect(readStatuslineSnapshot(dataDir, 'effort', { now: NOW })?.reasoningEffort).toBe(level);
+  });
+
+  it.each([undefined, null, 'high', {}, { level: 'ultracode' }, { level: 'default' }, { level: 3 }])(
+    'omits absent or unsupported native effort without discarding model/quota (%j)', effort => {
+      const snap = parseStatuslinePayload({ ...SAMPLE, effort }, NOW)!;
+      expect(snap.reasoningEffort).toBeUndefined();
+      expect(snap.model).toBe(SAMPLE.model.id);
+      expect(snap.contextPercent).toBe(23.4);
+    },
+  );
+
   it('maps every field; resets_at seconds → ms', () => {
     const s = parseStatuslinePayload(SAMPLE, NOW)!;
     expect(s).toEqual({

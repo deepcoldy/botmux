@@ -1,3 +1,4 @@
+import { appliedReasoningSelectionFromRecord, type AppliedReasoningSelection } from './native-reasoning-observation.js';
 /**
  * Reader for TRAE CLI (traex / traecli) per-session rollout JSONL.
  *
@@ -1027,9 +1028,11 @@ export function drainTraexRollout(
   };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
+  let latestReasoningSelection: AppliedReasoningSelection | undefined;
   for (const { entry: obj, offset: lineStart, displayIndex } of completeTraexRolloutRecords(
     completeText, start, sourceSessionId,
   )) {
+    latestReasoningSelection = appliedReasoningSelectionFromRecord(obj) ?? latestReasoningSelection;
     const runtime = runtimeFromTurnContext(obj);
     latestModel = runtime?.model ?? latestModel;
     latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
@@ -1380,6 +1383,7 @@ export function drainTraexRollout(
     events,
     newOffset,
     pendingTail,
+    ...(latestReasoningSelection ? { latestReasoningSelection } : {}),
     ...(latestModel ? { latestModel } : {}),
     ...(latestReasoningEffort ? { latestReasoningEffort } : {}),
     ...(latestGoal !== undefined ? { latestGoal } : {}),

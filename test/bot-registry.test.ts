@@ -384,7 +384,10 @@ describe('parseBotConfigsFromText — brand', () => {
     const [valid] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', sessionOwnerReminder: reminder },
     ]));
-    expect(valid.sessionOwnerReminder).toEqual(reminder);
+    expect(valid.sessionOwnerReminder).toEqual({
+      ...reminder,
+      quietHours: { enabled: false, start: '22:00', end: '09:00' },
+    });
 
     const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'b', larkAppSecret: 's', sessionOwnerReminder: { ...reminder, intervalMinutes: 0 } },

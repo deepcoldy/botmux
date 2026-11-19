@@ -6,7 +6,7 @@ const mode = process.env.AGY_TEST_MODE;
 const sessionId = 'native-agy-test-session';
 const configs = { models: { currentModelId: 'gemini-test', availableModels: [{ modelId: 'gemini-test-high', name: 'Gemini Test High' }] }, configOptions: [
   { id: 'model', category: 'model', currentValue: 'gemini-test', options: [{ value: 'gemini-test' }] },
-  { id: 'effort', category: 'thought_level', currentValue: 'low', options: [{ value: 'high' }] },
+  { id: 'effort', category: 'thought_level', currentValue: 'low', options: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }] },
 ] };
 /** Emit a complete NDJSON frame, including UTF-8 split across transport chunks. */
 function send(message) {
@@ -49,7 +49,12 @@ createInterface({ input: process.stdin }).on('line', line => {
   else if (['session/set_config_option', 'session/set_model'].includes(request.method)) {
     if (request.method === 'session/set_model') {
       configs.models.currentModelId = request.params.modelId;
-    } else configs.configOptions.find(option => option.id === request.params.configId).currentValue = request.params.value;
+    } else if (request.params.configId === 'effort') {
+      if (mode === 'effort-denied') { send({ id: request.id, error: { code: -32602 } }); return; }
+      configs.configOptions[1].currentValue = mode === 'effort-override' ? 'medium' : request.params.value;
+    } else {
+      configs.configOptions.find(option => option.id === request.params.configId).currentValue = request.params.value;
+    }
     send({ id: request.id, result: configs });
   }
   else if (request.method === 'session/prompt') {
@@ -60,6 +65,9 @@ createInterface({ input: process.stdin }).on('line', line => {
     const update = value => send({ method: 'session/update', params: {
       sessionId: mode === 'foreign-update' ? 'foreign-session' : request.params.sessionId, update: value,
     } });
+    if (mode === 'effort-clear') update({ sessionUpdate: 'config_option_update', configOptions: [
+      { id: 'effort', category: 'thought_level', currentValue: null },
+    ] });
     if (mode === 'runtime') update({ sessionUpdate: 'config_option_update', configOptions: [
       { id: 'model', category: 'model', currentValue: 'gemini-runtime-updated' },
       { id: 'effort', category: 'thought_level', currentValue: 'medium' },

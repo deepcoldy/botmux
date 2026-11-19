@@ -1293,6 +1293,19 @@ describe('codex-app buildArgs', () => {
     expect(args).not.toContain('--strict-resume');
   });
 
+  it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
+    const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(direct).not.toContain('--codex-reasoning-catalog');
+
+    const blind = adapter.buildArgs({
+      sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123',
+      allowCodexReasoningCatalog: false,
+    });
+    const index = blind.indexOf('--codex-reasoning-catalog');
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(blind[index + 1]).toBe('off');
+  });
+
   it('requires strict thread resume for a quiet maintenance restore without injecting a prompt', () => {
     const normal = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123' });
     const quiet = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123', quietResume: true });

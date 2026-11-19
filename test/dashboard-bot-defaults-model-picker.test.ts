@@ -16,6 +16,7 @@ import {
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { BotOnboardingDialog } from '../src/dashboard/web/bot-onboarding.js';
 import { ModelPickerField } from '../src/dashboard/web/field-controls.js';
+import { CodexProfilePicker } from '../src/dashboard/web/codex-profile-picker.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -99,6 +100,141 @@ describe('BotAgentSection runtime catalog hydration', () => {
       if (renderer) act(() => renderer.unmount());
       (globalThis as any).fetch = previousFetch;
     }
+  });
+});
+
+describe('BotAgentSection Codex reasoning levels from the live catalogue', () => {
+  const SIX = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const FUTURE = 'gpt-6.3-sol'; // a model released after the static table
+
+  async function renderWithCatalog(bot: Record<string, unknown>) {
+    const previousFetch = globalThis.fetch;
+    let answer!: (body: unknown, status?: number) => void;
+    (globalThis as any).fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('/api/cli-options/models')) {
+        return new Promise(resolve => {
+          answer = (body, status = 200) => resolve({ ok: status === 200, status, json: async () => body });
+        });
+      }
+      if (String(url).includes('/api/cli-options/availability')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'unknown' }) };
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_codex_catalog_effort', cliId: 'codex', agentSelectionKey: 'codex', ...bot } as BotDefaultsRow,
+        sessionFallback: 'codex',
+        cliState: { options: [
+          { id: 'codex', label: 'Codex', modelChoices: [FUTURE] },
+          { id: 'codex-app', label: 'Codex App', modelChoices: [FUTURE] },
+        ], ttadkModelDefault: '', ttadkModelSuggestions: [] },
+        patchBot: () => undefined,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const effort = () => renderer.root.findByProps({ dataInput: 'agentReasoningEffort' }).props as {
+      value: string; options: Array<{ value: string }>;
+    };
+    return {
+      effort,
+      levels: () => effort().options.map(option => option.value).filter(Boolean),
+      answer: async (body: unknown, status?: number) => {
+        await act(async () => { answer(body, status); await Promise.resolve(); await Promise.resolve(); });
+      },
+      pickModel: (next: string) => act(() => renderer.root.findByProps({ id: 'bd-menu-agentModel' }).props.onChange(next)),
+      pickProfile: (next: string) => act(() => renderer.root.findByType(CodexProfilePicker).props.onChange(next)),
+      pickCli: (next: string) => act(() => renderer.root.findByProps({ dataInput: 'agentCliId' }).props.onChange(next)),
+      pickCustomRuntime: () => act(() => renderer.root.findByProps({ 'data-action': 'runtime-custom' }).props.onClick()),
+      done: () => { act(() => renderer.unmount()); (globalThis as any).fetch = previousFetch; },
+    };
+  }
+
+  it('keeps a saved catalogue-only level while the catalogue loads, then offers it', async () => {
+    const view = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      expect(view.effort().value).toBe('max');
+      await view.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(view.levels()).toEqual(SIX);
+      expect(view.effort().value).toBe('max');
+    } finally { view.done(); }
+  });
+
+  it.each([
+    ['the catalogue has no word on the model', { models: [FUTURE], source: 'live' }, 200],
+    ['the probe fell back to static choices', { models: [FUTURE], source: 'static' }, 200],
+    ['the probe failed', { error: 'boom' }, 500],
+  ])('keeps the saved pair selectable when %s, and clears it for another model', async (_case, body, status) => {
+    const view = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await view.answer(body, status);
+      expect(view.levels()).toEqual(SIX.slice(0, 5));
+      expect(view.effort().value).toBe('max');
+      view.pickModel('gpt-6.4-sol');
+      expect(view.levels()).toEqual(SIX.slice(0, 4));
+      expect(view.effort().value).toBe('');
+    } finally { view.done(); }
+  });
+
+  it('waits for the catalogue before judging a level on a model picked while it loads', async () => {
+    const view = await renderWithCatalog({ model: 'gpt-6.1-sol', reasoningEffort: 'max' });
+    try {
+      view.pickModel(FUTURE);
+      expect(view.effort().value).toBe('max');
+      await view.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(view.levels()).toEqual(SIX);
+      expect(view.effort().value).toBe('max');
+    } finally { view.done(); }
+  });
+
+  it('stops keeping the saved pair once a profile, runtime or another CLI picks a different catalogue', async () => {
+    const profiled = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await profiled.answer({ models: [FUTURE], source: 'live' });
+      expect(profiled.effort().value).toBe('max');
+      profiled.pickProfile('work');
+      expect(profiled.levels()).toEqual(SIX.slice(0, 4));
+      expect(profiled.effort().value).toBe('');
+    } finally { profiled.done(); }
+    const runtimeEdited = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await runtimeEdited.answer({ models: [FUTURE], source: 'live' });
+      runtimeEdited.pickCustomRuntime();
+      expect(runtimeEdited.levels()).toEqual(SIX.slice(0, 4));
+      expect(runtimeEdited.effort().value).toBe('');
+    } finally { runtimeEdited.done(); }
+    const switched = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await switched.answer({ models: [FUTURE], source: 'live' });
+      switched.pickCli('codex-app');
+      await switched.answer({ models: [FUTURE], source: 'live' });
+      expect(switched.levels()).toEqual(SIX.slice(0, 4));
+      expect(switched.effort().value).toBe('');
+    } finally { switched.done(); }
+  });
+
+  it('clears a saved level the live catalogue answers against', async () => {
+    const view = await renderWithCatalog({ model: FUTURE, reasoningEffort: 'max' });
+    try {
+      await view.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX.slice(0, 4) } });
+      expect(view.levels()).toEqual(SIX.slice(0, 4));
+      expect(view.effort().value).toBe('');
+    } finally { view.done(); }
+  });
+
+  it('matches the catalogue slug case-insensitively and ignores it under a Codex profile', async () => {
+    const plain = await renderWithCatalog({ model: 'GPT-6.3-Sol' });
+    try {
+      await plain.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(plain.levels()).toEqual(SIX);
+    } finally { plain.done(); }
+    const profiled = await renderWithCatalog({ model: FUTURE, codexProfile: 'work' });
+    try {
+      await profiled.answer({ models: [FUTURE], source: 'live', reasoningEffortsByModel: { [FUTURE]: SIX } });
+      expect(profiled.levels()).toEqual(SIX.slice(0, 4));
+    } finally { profiled.done(); }
   });
 });
 

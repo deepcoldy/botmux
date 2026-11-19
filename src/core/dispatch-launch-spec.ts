@@ -1,6 +1,6 @@
 import type { BackendType } from '../adapters/backend/types.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { cliModelSupportsReasoningEffort, isCodexReasoningEffort, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { cliLaunchAcceptsReasoningEffort, isCodexReasoningEffort, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from './launch-model-capability.js';
 
 export async function resolveDispatchLaunchSpec(input: {
@@ -24,7 +24,10 @@ export async function resolveDispatchLaunchSpec(input: {
   if (!catalog?.includes(effectiveModel)) return { ok: false, error: `目标 Bot 的实时 model catalog 不包含 ${effectiveModel}。` };
   const requestedEffort = effort as CodexReasoningEffort | undefined;
   const effectiveEffort = requestedEffort ?? input.target.reasoningEffort;
-  if (effectiveEffort && input.target.cliId !== 'traex' && !cliModelSupportsReasoningEffort(input.target.cliId, effectiveModel, effectiveEffort)) {
+  // The target's own saved pair passed config load; judge it by the same keep-rule.
+  const inheritedPair = !requestedEffort && effectiveModel === input.target.model?.trim();
+  if (effectiveEffort && input.target.cliId !== 'traex'
+      && !cliLaunchAcceptsReasoningEffort(input.target.cliId, effectiveModel, effectiveEffort, inheritedPair)) {
     return { ok: false, error: `模型 ${effectiveModel} 不支持 reasoning effort ${effectiveEffort}。` };
   }
   return {
