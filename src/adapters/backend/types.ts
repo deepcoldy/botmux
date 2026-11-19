@@ -357,9 +357,10 @@ export interface SessionBackend {
    * getChildPid(), this must not follow that mutable ownership PID. Backends
    * participating in wrapper PID resolution must implement it whenever
    * getChildPid() can alias `cliPid`; others may use the worker's getChildPid()
-   * fallback. Null means the identity is unavailable.
+   * fallback. Null means authoritatively missing; undefined means a transient
+   * probe unknown and must not be treated as proof of pane replacement.
    */
-  getStablePanePid?(): number | null;
+  getStablePanePid?(): number | null | undefined;
   captureCurrentScreen?(): string;
   /**
    * Escape sequence re-asserting the pane's live input modes (mouse tracking,

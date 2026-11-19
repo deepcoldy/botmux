@@ -122,10 +122,12 @@ function runWorkerWiring(late: boolean, options: {
   aliasedChildPid?: boolean;
   /** Stable backing-pane identity, independent of cliPid rewrites. */
   stablePanePid?: number | null;
+  /** Mutable tri-state probe result used for recovery and authoritative-missing cases. */
+  stablePaneProbe?: { pid: number | null | undefined };
   /** Model a backend without the optional stable-pane accessor (worker falls back to getChildPid). */
   stablePaneAccessor?: boolean;
   /** ZMX launch=100 vs PTY-root=10 shape, with a controllable list-probe answer. */
-  zmxStablePane?: { probeOk: boolean; rootPid: number | null; backingPid: number };
+  zmxStablePane?: { probeOk: boolean; rootPid: number | null; backingPid: number | null };
   /** Run the real BFS over the synthetic table (`children` / `childComms`)
    *  with the depth the worker passes, instead of the canned result. */
   realCodexSearch?: boolean;
@@ -137,7 +139,7 @@ function runWorkerWiring(late: boolean, options: {
   const backend: {
     cliPid: number;
     getChildPid: () => number;
-    getStablePanePid?: () => number | null;
+    getStablePanePid?: () => number | null | undefined;
   } = {
     cliPid: 100,
     getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
@@ -156,7 +158,8 @@ function runWorkerWiring(late: boolean, options: {
             raw: zmx.rootPid === null ? '' : `  name=zmx\tpid=${zmx.rootPid}\tclients=1\tcmd=/bin/sh\n`,
           } : { ok: false }, 'zmx', zmx.backingPid);
         }
-        return options.stablePanePid === undefined ? 100 : options.stablePanePid;
+        return options.stablePaneProbe ? options.stablePaneProbe.pid
+          : options.stablePanePid === undefined ? 100 : options.stablePanePid;
       },
     }),
   };
@@ -780,10 +783,11 @@ describe('worker wrapper PID wiring', () => {
   });
 
   it.each([false, true])('recovers wrapper retries when the initial stable-pane probe is temporarily unavailable (late PID=%s)', late => {
+    const stablePaneProbe: { pid: number | undefined } = { pid: undefined };
     const result = runWorkerWiring(late, {
-      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', stablePanePid: null,
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', stablePaneProbe,
       beforeTimers: scope => {
-        scope.backend.getStablePanePid = () => 100;
+        scope.setTimeout(() => { stablePaneProbe.pid = 100; }, 500);
         let failedLeaf = false;
         scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
           if (pid === 200 && !failedLeaf) { failedLeaf = true; return false; }
@@ -791,7 +795,51 @@ describe('worker wrapper PID wiring', () => {
         });
       },
     });
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(500);
     expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
+  });
+
+  it.each([false, true])('stops when the first valid stable pane after initial unknown is a replacement (late PID=%s)', late => {
+    const stablePaneProbe: { pid: number | undefined } = { pid: undefined };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', stablePaneProbe,
+      beforeTimers: scope => {
+        scope.setTimeout(() => { stablePaneProbe.pid = 300; }, 500);
+      },
+    });
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(500);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+    expect(result.backend.cliPid).not.toBe(200);
+  });
+
+  it.each([false, true])('retries a failed publication through a transient stable-pane probe failure (late PID=%s)', late => {
+    const stablePaneProbe: { pid: number | undefined } = { pid: 100 };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', stablePaneProbe,
+      beforeTimers: scope => {
+        let failedLeaf = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 200 && !failedLeaf) {
+            failedLeaf = true;
+            stablePaneProbe.pid = undefined;
+            scope.setTimeout(() => { stablePaneProbe.pid = 100; }, 400);
+            return false;
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200)).toHaveLength(2);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(400);
+  });
+
+  it.each([false, true])('fails closed without applying when the stable pane is authoritatively missing (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', stablePaneProbe: { pid: null },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
   });
 
   it.each([
@@ -813,6 +861,17 @@ describe('worker wrapper PID wiring', () => {
     expect(result.bridgeCliPid).toBe(200);
     expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 200))
       .toHaveLength(failFirst ? 2 : 1);
+  });
+
+  it.each([false, true])('accepts a recovered ZMX backing root that differs from the launcher (late PID=%s)', late => {
+    const zmxStablePane = { probeOk: false, rootPid: 10 as number | null, backingPid: null };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude',
+      aliasedChildPid: true, zmxStablePane, children: { 10: [100] },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenCalledWith(200);
   });
 
   it.each([false, true])('keeps aliased wrapper retries alive when the stable pane differs from the launcher (late PID=%s)', late => {

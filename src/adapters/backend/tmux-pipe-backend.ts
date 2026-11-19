@@ -1663,10 +1663,11 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   getChildPid(): number | null {
-    return this.getStablePanePid();
+    return this.getStablePanePid() ?? null;
   }
 
-  getStablePanePid(): number | null {
+  getStablePanePid(): number | null | undefined {
+    if (this.exited) return null;
     try {
       const out = execSync(
         `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{pane_pid}'`,
@@ -1678,9 +1679,9 @@ export class TmuxPipeBackend implements SessionBackend {
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000, env: tmuxEnv() },
       ).trim();
       const pid = parseInt(out, 10);
-      return pid > 0 ? pid : null;
+      return pid > 0 ? pid : undefined;
     } catch {
-      return null;
+      return undefined;
     }
   }
 

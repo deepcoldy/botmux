@@ -25,6 +25,7 @@ import {
   tmuxKeyToBytes,
   zmxControlEnv,
   zmxFreshSessionEnv,
+  zmxStablePanePidFromProbe,
   ZmxBackend,
 } from '../src/adapters/backend/zmx-backend.js';
 import {
@@ -374,6 +375,17 @@ describe('zmx backend pure helpers', () => {
     );
 
     expect(findSessionPid('bmx-abcd1234')).toBe(4242);
+  });
+
+  it('distinguishes transient ZMX probe failures from an authoritative missing pane', () => {
+    expect(zmxStablePanePidFromProbe({ ok: false }, 'zmx', 4242)).toBe(4242);
+    expect(zmxStablePanePidFromProbe({ ok: false }, 'zmx', null)).toBeUndefined();
+    expect(zmxStablePanePidFromProbe({ ok: true, sessions: [], unhealthySessions: ['zmx'], raw: '' }, 'zmx', 4242)).toBe(4242);
+    expect(zmxStablePanePidFromProbe({ ok: true, sessions: [], unhealthySessions: ['zmx'], raw: '' }, 'zmx', null)).toBeUndefined();
+    expect(zmxStablePanePidFromProbe({ ok: true, sessions: [], unhealthySessions: [], raw: '' }, 'zmx', 4242)).toBeNull();
+    expect(zmxStablePanePidFromProbe({
+      ok: true, sessions: ['zmx'], unhealthySessions: [], raw: '  name=zmx\tpid=4242\tclients=1\tcmd=claude\n',
+    }, 'zmx', null)).toBe(4242);
   });
 
   it('parses healthy and unhealthy rows from the full list', () => {

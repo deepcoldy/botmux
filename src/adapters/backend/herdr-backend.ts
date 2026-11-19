@@ -989,12 +989,13 @@ export class HerdrBackend implements SessionBackend {
     return this.cliPid ?? null;
   }
 
-  getStablePanePid(): number | null {
+  getStablePanePid(): number | null | undefined {
+    if (this.exited) return null;
     // Re-read the same foreground launch identity that supplied the worker's
     // original panePid, but never consult the cliPid later refined by wrapper
-    // discovery. A transient initial failure can therefore recover to the same
-    // identity; a real foreground replacement fails the retry fence.
-    return this.readForegroundLaunchPid();
+    // discovery. A missing/ambiguous foreground answer is a transient unknown,
+    // not proof of replacement; only an exited pane is authoritative missing.
+    return this.readForegroundLaunchPid() ?? undefined;
   }
 
   private readForegroundLaunchPid(): number | null {

@@ -1089,7 +1089,7 @@ export class ZmxBackend implements SessionBackend {
     return pid;
   }
 
-  getStablePanePid(): number | null {
+  getStablePanePid(): number | null | undefined {
     // Read the current PTY root independently of cliPid so a same-name session
     // replacement fails the wrapper retry fence even before history/tail
     // observers deliver their exit callback.
@@ -2693,11 +2693,12 @@ export function zmxStablePanePidFromProbe(
   probe: ZmxSessionProbeResult | { ok: false },
   sessionName: string,
   lastKnownBackingPid: number | null,
-): number | null {
-  // A transport/control-plane failure is not evidence that the pane changed.
-  // Preserve the frozen identity in that case; only an answered session list
-  // may clear it or replace it with a new PTY root.
-  if (!probe.ok) return lastKnownBackingPid;
+): number | null | undefined {
+  // A transport/control-plane failure or an unhealthy session is not evidence
+  // that the pane changed. Preserve an already proven frozen root; without one,
+  // report unknown so the worker retries instead of treating this as missing.
+  if (!probe.ok || probe.unhealthySessions.includes(sessionName)) return lastKnownBackingPid ?? undefined;
+  // Only a healthy answered list that omits the session proves it missing.
   return sessionDetailsFromSnapshot(probe, sessionName)?.pid ?? null;
 }
 

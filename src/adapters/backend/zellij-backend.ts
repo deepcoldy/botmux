@@ -323,10 +323,12 @@ export class ZellijBackend implements SessionBackend {
     return this.resolvedCliPid;
   }
 
-  getStablePanePid(): number | null {
+  getStablePanePid(): number | null | undefined {
     // resolvedCliPid is private launch state; worker rewrites only the parallel
-    // public cliPid field used for transcript/ownership discovery.
-    return this.getChildPid();
+    // public cliPid field used for transcript/ownership discovery. A not-yet-
+    // resolved PID is unknown, not proof that the pane disappeared.
+    if (this.intentionalExit) return null;
+    return this.getChildPid() ?? undefined;
   }
 
   /** Detach only — kills the pty client, leaves the zellij session running. */

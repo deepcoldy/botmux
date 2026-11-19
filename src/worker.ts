@@ -31547,22 +31547,57 @@ async function spawnCliBody(
     const generation = cliSpawnGeneration;
     const readStablePanePid = (): number | null | undefined => {
       const current = backend;
-      return current?.getStablePanePid ? current.getStablePanePid() : current?.getChildPid?.();
+      if (current?.getStablePanePid) return current.getStablePanePid();
+      // Legacy accessors cannot distinguish a transient miss from an exited pane;
+      // treat both as unknown and let the bounded lifecycle fences stop retries.
+      return current?.getChildPid?.() ?? undefined;
     };
     // A backing/shell PID need not equal the foreground launcher PID. Capture
     // the backend's own stable identity rather than comparing it with panePid;
     // wrapper rewrites of cliPid leave it unchanged, while a replaced pane fails
     // the fence even before the exit callback advances the spawn generation.
-    const stablePanePid = readStablePanePid() ?? panePid;
+    let stablePanePid = readStablePanePid();
+    const stableRootContainsLauncher = (rootPid: number): boolean => {
+      if (rootPid === panePid || rootPid === launcherPid) return true;
+      // The first valid root after an unknown window cannot self-certify that it
+      // still owns the captured launcher. Require live process-tree evidence;
+      // this also covers ZMX's legitimate root != launcher shape.
+      const childrenOf = snapshotChildPids();
+      const seen = new Set<number>([rootPid]);
+      let frontier = [rootPid];
+      for (let depth = 0; depth < CODEX_LEAF_SEARCH_DEPTH && frontier.length > 0; depth++) {
+        const next: number[] = [];
+        for (const pid of frontier) {
+          for (const child of childrenOf(pid)) {
+            if (child === launcherPid) return true;
+            if (seen.has(child)) continue;
+            seen.add(child);
+            next.push(child);
+          }
+        }
+        frontier = next;
+      }
+      return false;
+    };
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
       // Herdr/ZMX alias getChildPid() to the mutable cliPid, so retry validity
-      // uses their independent stable pane identity instead. Backends without
-      // the accessor retain the original current-child observation as fallback.
-      getChildPid: () => generation === cliSpawnGeneration && readStablePanePid() === stablePanePid
-        ? launcherPid
-        : null,
+      // uses their independent stable pane identity instead. Unknown probes skip
+      // only this tick; an authoritative missing pane stops the old tree.
+      getChildPid: () => {
+        if (generation !== cliSpawnGeneration) return null;
+        const currentPanePid = readStablePanePid();
+        if (currentPanePid === null) return null;
+        if (currentPanePid === undefined) return undefined;
+        if (stablePanePid === undefined) {
+          if (!stableRootContainsLauncher(currentPanePid)) return null;
+          stablePanePid = currentPanePid;
+          return launcherPid;
+        }
+        return currentPanePid === stablePanePid ? launcherPid : null;
+      },
+      retryOnUnknownChildPid: true,
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });

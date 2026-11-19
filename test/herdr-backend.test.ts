@@ -2619,8 +2619,25 @@ describe('HERDR CLI process identity', () => {
     expect(be.getChildPid()).toBe(22);
     expect(be.getStablePanePid()).toBe(30);
     processes = [];
-    expect(be.getStablePanePid()).toBeNull();
+    expect(be.getStablePanePid()).toBeUndefined();
     processes = [{ pid: 30, argv: ['/bin/claude'] }];
+    expect(be.getStablePanePid()).toBe(30);
+    Object.assign(be, { exited: true });
+    expect(be.getStablePanePid()).toBeNull();
+    be.kill();
+  });
+  it('reports a failed stable-pane probe as unknown and observes its recovery', () => {
+    let fail = true;
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => {
+      if (fail) throw new Error('temporary process-info failure');
+      return JSON.stringify({ result: { process_info: {
+        shell_pid: 10, foreground_processes: [{ pid: 30, argv: ['/bin/claude'] }],
+      } } });
+    } }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: 'claude' });
+    expect(be.getStablePanePid()).toBeUndefined();
+    fail = false;
     expect(be.getStablePanePid()).toBe(30);
     be.kill();
   });
