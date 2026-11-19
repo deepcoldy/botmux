@@ -98,6 +98,15 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     // which reports `clear` + `idle` before `working`; that idle must not
     // complete the turn just submitted.
     programStatusSubmitAwaitsBusy: true,
+    // Kimi Code ≥0.34 replaces its composer with a "cache expired" menu when a
+    // message is submitted after a long idle (the message is parked) and right
+    // after resuming a long-idle session (nothing is parked; a pasted message
+    // is swallowed and its Enter picks the highlighted row). OSC 7501 reports
+    // nothing for it. Recognising the page holds queued input off it, keeps a
+    // parked turn from ending on the quiet screen, and raises the stuck card —
+    // or presses "Compact and continue" for a session that opted in
+    // (core/kimi-cache-expiry.ts).
+    stuckPageFamily: 'kimi',
     completionPattern: undefined,
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,

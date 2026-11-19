@@ -6,7 +6,24 @@ import { resolveUserToken } from '../utils/user-token.js';
 import { AsyncSerialQueue } from '../utils/async-serial-queue.js';
 
 const writes = new AsyncSerialQueue();
-const LABELS = new Set(['p0', 'p1', 'pending', 'watching']);
+const LEGACY_LABELS = new Set(['p0', 'p1', 'pending', 'watching']);
+const INVALID_LABEL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\ufeff]/u;
+
+const validLabelName = (name: unknown): name is string => typeof name === 'string'
+  && name.length > 0 && name === name.trim() && Array.from(name).length <= 50 && !INVALID_LABEL.test(name);
+
+/** Validate a generic, bounded scope (or null for all normal groups) before credential or network access. */
+export function isFeedGroupSelection(label: unknown, managedLabels: unknown): managedLabels is string[] | null {
+  if (managedLabels === null) return label === null || validLabelName(label);
+  return Array.isArray(managedLabels) && managedLabels.length <= 50
+    && managedLabels.every(validLabelName) && new Set(managedLabels).size === managedLabels.length
+    && (label === null || (validLabelName(label) && managedLabels.includes(label)));
+}
+
+/** Keep the legacy contract only when the caller does not request a scoped operation. */
+function validSelection(label: string | null, managedLabels?: string[] | null): boolean {
+  return managedLabels === undefined ? label === null || LEGACY_LABELS.has(label) : isFeedGroupSelection(label, managedLabels);
+}
 type FeedGroup = { id: string; name: string };
 
 /** Dependencies separate the group operation from credentials and real network requests. */
@@ -39,9 +56,24 @@ async function groups(api: ChatFeedGroupApi): Promise<FeedGroup[]> {
   throw new Error('incomplete_feed_group_directory');
 }
 
-/** Add the target first, then remove this chat from every other manageable label. */
-export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: string, label: string | null): Promise<void> {
-  if (!/^oc_[a-zA-Z0-9_-]+$/.test(chatId) || (label !== null && !LABELS.has(label))) throw new Error('invalid_chat_label');
+/** Accept removal's already-absent result only for the exact requested chat. */
+function assertItemResult(data: Record<string, unknown>, chatId: string, removing = false): void {
+  if (!Array.isArray(data.failed_items) || data.failed_items.length === 0) return;
+  const alreadyAbsent = removing && data.failed_items.every((failure: unknown) => {
+    if (!failure || typeof failure !== 'object') return false;
+    const entry = failure as Record<string, unknown>;
+    if (entry.error_code !== 230005 || !entry.item || typeof entry.item !== 'object') return false;
+    const item = entry.item as Record<string, unknown>;
+    return item.feed_id === chatId && item.feed_type === 'chat';
+  });
+  if (!alreadyAbsent) throw new Error('feed_group_item_failed');
+}
+
+/** Add the target first, then remove this chat only from the supplied scope (null/undefined: all normal groups). */
+export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: string, label: string | null, managedLabels?: string[] | null): Promise<void> {
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(chatId) || !validSelection(label, managedLabels)) throw new Error('invalid_chat_label');
+  if (managedLabels?.length === 0) return;
+  const scope = managedLabels == null ? undefined : new Set(managedLabels);
   const directory = await groups(api);
   let target = directory.find(group => group.name === label)?.id;
   if (directory.filter(group => group.name === label).length > 1) throw new Error('ambiguous_feed_group');
@@ -51,18 +83,18 @@ export async function replaceChatFeedGroups(api: ChatFeedGroupApi, chatId: strin
     target = created.group_id;
   }
   const item = { items: [{ feed_id: chatId, feed_type: 'chat' }] };
-  if (target) await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(target)}/batch_add_item`, item);
+  if (target) assertItemResult(await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(target)}/batch_add_item`, item), chatId);
   for (const group of directory) {
-    if (group.id !== target) await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(group.id)}/batch_remove_item`, item);
+    if (group.id !== target && (scope === undefined || scope.has(group.name))) assertItemResult(await api.request(`/open-apis/im/v1/groups/${encodeURIComponent(group.id)}/batch_remove_item`, item), chatId, true);
   }
 }
 
 /** Resolve only the command sender's app-scoped OAuth; never borrow the Bot owner's identity. */
-export async function setChatFeedGroup(appId: string, chatId: string, actorOpenId: string, label: string | null, clientSignal?: AbortSignal) {
+export async function setChatFeedGroup(appId: string, chatId: string, actorOpenId: string, label: string | null, clientSignal?: AbortSignal, managedLabels?: string[] | null) {
   if (!/^ou_[a-zA-Z0-9]+$/.test(actorOpenId) || !canOperate(appId, chatId, actorOpenId)) {
     return { ok: false as const, error: 'permission_denied' };
   }
-  if (!/^oc_[a-zA-Z0-9_-]+$/.test(chatId) || (label !== null && !LABELS.has(label))) return { ok: false as const, error: 'invalid_chat_label' };
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(chatId) || !validSelection(label, managedLabels)) return { ok: false as const, error: 'invalid_chat_label' };
   return writes.run(async () => {
     try {
       const signal = clientSignal ? AbortSignal.any([clientSignal, AbortSignal.timeout(8_000)]) : AbortSignal.timeout(8_000);
@@ -87,10 +119,9 @@ export async function setChatFeedGroup(appId: string, chatId: string, actorOpenI
           const data = envelope.data ?? {};
           if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid_feed_group_response');
           const record = data as Record<string, unknown>;
-          if (Array.isArray(record.failed_items) && record.failed_items.length) throw new Error('feed_group_item_failed');
           return record;
         },
-      }, chatId, label);
+      }, chatId, label, managedLabels);
       return { ok: true as const, chatId, label };
     } catch {
       // The request can have changed some associations before timing out.

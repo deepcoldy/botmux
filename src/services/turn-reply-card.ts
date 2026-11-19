@@ -11,7 +11,7 @@ import type { AskResult, PendingAsk } from '../core/ask-types.js';
 export type ReplyCardMode = 'legacy' | 'unified';
 /** CLI capability only; session and transport exclusions remain runtime gates. */
 export function supportsUnifiedReplyCardCli(cliId: string | undefined): boolean {
-  return cliId !== undefined && ['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'].includes(cliId);
+  return cliId !== undefined && ['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi', 'doubao'].includes(cliId);
 }
 /** Retain quiet delivery only for persisted turns accepted by older versions. */
 export type TurnReplyCardMode = ReplyCardMode | 'final-only';
@@ -42,6 +42,16 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   nativeCot?: boolean;
   /** Durable release: retries/recovery never create another thinking display. */
   nativeCotReady?: boolean;
+  /** Set with nativeCotReady: the native thinking display really exists, so it
+   * (not an early answer card) carries passive progress. Absent → card fallback.
+   * Cleared for good once the daemon sees that display retired mid-turn. */
+  nativeCotVisible?: boolean;
+  /** That hand-back happened: the card owns progress for the rest of the turn,
+   * so native thinking is not resumed if the channel is switched on again. */
+  nativeCotHandedBack?: boolean;
+  /** This turn's final went out as a separate message in the same chat (for
+   * example to notify others), so a completed turn needs no summary card. */
+  externalFinal?: boolean;
   chatId: string;
   rootId: string;
   phase: ReplyCardPhase;
@@ -77,6 +87,10 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   displayRetired?: boolean;
   overflowMessageId?: string;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
+  /** The CLI's next-input suggestion shown on a completed turn's card. */
+  nextStep?: import('../im/lark/next-step-card.js').NextStepButton;
+  /** The「本轮回顾」panel body shown on a completed turn's card. */
+  recap?: { markdown: string };
 }
 
 export type TurnReplyCardEvent =
@@ -89,6 +103,10 @@ export type TurnReplyCardEvent =
   | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
   | { kind: 'display_retired'; notice: string }
   | { kind: 'refresh' }
+  /** Set or clear the next-step row; valid after the terminal edge too. */
+  | { kind: 'next_step'; nextStep?: import('../im/lark/next-step-card.js').NextStepButton }
+  /** Set or clear the「本轮回顾」panel; valid after the terminal edge too. */
+  | { kind: 'recap'; markdown?: string }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
@@ -100,8 +118,12 @@ export interface TurnReplyCardTransport {
   send(content: string, uuid: string): Promise<string>;
   patch(messageId: string, content: string): Promise<void>;
   beforeEffect(): void | Promise<void>;
-  /** Runs under the publication lock, before the first answer POST. */
-  beforeCreate?(): void | Promise<void>;
+  /** Runs under the publication lock, before the first answer POST. Resolves
+   * true only when the native thinking display is live for this turn. */
+  beforeCreate?(): void | boolean | Promise<void | boolean>;
+  /** Daemon only (it owns the display state): whether native thinking still
+   * carries this turn. A retired display hands progress back to the card. */
+  nativeThinkingLive?(): boolean;
   isWithdrawn(error: unknown): boolean;
   /** A full answer that does not fit is delivered once as a native file. */
   sendOverflow?(text: string, uuid: string): Promise<string>;
@@ -187,6 +209,22 @@ export class TurnReplyCardStore {
     });
   }
 
+  /** Record that this turn's final was delivered as a separate message in the
+   * card's chat. Persistence only: no provider I/O, no card creation. A turn
+   * without a reply-card record, a different destination or an answer already
+   * on the card is left untouched. Returns whether the record was marked. */
+  async noteExternalFinal(key: TurnReplyCardKey, chatId: string): Promise<boolean> {
+    if (!this.read(key)) return false;
+    return withFileLock(this.path(key), async () => {
+      const record = this.read(key);
+      if (!record || record.chatId !== chatId || record.finalCard || record.withdrawn) return false;
+      if (record.externalFinal) return true;
+      record.externalFinal = true;
+      this.write(key, record);
+      return true;
+    }, { maxWaitMs: 8_000 });
+  }
+
   async update(key: TurnReplyCardKey, inputEvent: TurnReplyCardEvent | (() => TurnReplyCardEvent), io: TurnReplyCardTransport): Promise<{
     messageId?: string; delivered: boolean; card?: string; record: TurnReplyCardRecord;
   }> {
@@ -265,6 +303,12 @@ export class TurnReplyCardStore {
             delete record.disconnected;
           }
         }
+      } else if (event.kind === 'next_step') {
+        if (event.nextStep) record.nextStep = event.nextStep;
+        else delete record.nextStep;
+      } else if (event.kind === 'recap') {
+        if (event.markdown) record.recap = { markdown: event.markdown };
+        else delete record.recap;
       } else if (event.kind === 'terminal') {
         for (const entry of record.asks ?? []) {
           if (!entry.result && (!event.disconnected || event.orphanAskIds?.includes(entry.ask.askId))) {
@@ -331,19 +375,59 @@ export class TurnReplyCardStore {
 
       if (!record.messageId && record.nativeCot && !record.nativeCotReady) {
         if (!io.beforeCreate) throw new Error('Native thinking publication requires its ordering barrier');
-        await io.beforeCreate();
+        const nativeVisible = await io.beforeCreate();
         await io.beforeEffect();
         record.nativeCotReady = true;
+        if (nativeVisible === true) record.nativeCotVisible = true;
         this.write(key, record);
       }
 
       const render = () => {
         const visibleRecord = hideUndeliveredFinal && !record.finalDelivered ? { ...record, finalCard: undefined } : record;
-        const body = io.render(visibleRecord.displayRetired && visibleRecord.finalCard && visibleRecord.phase === 'ambiguous'
-          ? { ...visibleRecord, phase: 'completed' } : visibleRecord);
-        return record.omitImages ? omitReplyCardImages(body) : body;
+        const shown: TurnReplyCardRecord = visibleRecord.displayRetired && visibleRecord.finalCard && visibleRecord.phase === 'ambiguous'
+          ? { ...visibleRecord, phase: 'completed' } : visibleRecord;
+        const finish = (body: string) => record.omitImages ? omitReplyCardImages(body) : body;
+        const body = finish(io.render(shown));
+        // The「本轮回顾」panel and the「下一步」row are optional chrome, sized
+        // before the transport adds its own (the on-call control): when only
+        // they make the card too big, leave them off (the panel first) rather
+        // than move the answer into an attachment.
+        const fits = (candidate: string) => turnReplyCardRequestBytes(candidate, record.chatId) <= TURN_REPLY_CARD_MAX_BYTES;
+        if ((!shown.nextStep && !shown.recap) || fits(body)) return body;
+        if (shown.recap) {
+          const withoutPanel = finish(io.render({ ...shown, recap: undefined }));
+          if (!shown.nextStep || fits(withoutPanel)) return withoutPanel;
+        }
+        return finish(io.render({ ...shown, recap: undefined, nextStep: undefined }));
       };
+      // The display can retire before this turn ends (a newer turn replaced
+      // it, a push failed, the channel was switched off, or a restart lost it).
+      // Persist the hand-back so CLI senders, which cannot see the daemon's
+      // display state, publish progress on the card again. Once the turn has
+      // ended there is no progress left to hand back.
+      if (record.nativeCotVisible && !replyCardIsTerminal(record) && io.nativeThinkingLive && !io.nativeThinkingLive()) {
+        delete record.nativeCotVisible;
+        record.nativeCotHandedBack = true;
+        this.write(key, record);
+      }
       let card = render();
+      // A live native thinking display already carries passive progress. An
+      // answer card is needed for a final, an error, an actionable Ask/Oncall
+      // control, or a completed turn whose final did not go out separately.
+      // Without a confirmed display the card keeps its fallback role. An
+      // existing card and an uncertain POST keep their publication protocol.
+      if (record.nativeCot && record.nativeCotVisible && !record.messageId && !record.pendingCreate && !record.finalCard
+        && !io.forceVisible && !['failed', 'cancelled', 'ambiguous'].includes(record.phase)
+        && !(record.asks ?? []).some(entry => !entry.result && !entry.ask.settled)) {
+        if (record.phase === 'completed') {
+          if (record.externalFinal) return { delivered: false, record };
+        } else {
+          const elements = JSON.parse(card).body?.elements ?? [];
+          const hasOncallControl = elements.some((element: any) => element.element_id === 'botmux_oncall_group'
+            || element.columns?.some((column: any) => column.element_id === 'botmux_oncall_group_column'));
+          if (!hasOncallControl) return { delivered: false, record };
+        }
+      }
       const completeRecordNeedsFile = replyCardIsTerminal(record) && !record.disconnected && !record.finalCard
         && Buffer.byteLength(record.progress.join('\n\n'), 'utf8') > 6000;
       if (turnReplyCardRequestBytes(card, record.chatId) > TURN_REPLY_CARD_MAX_BYTES || completeRecordNeedsFile) {

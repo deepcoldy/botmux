@@ -58,16 +58,17 @@ describe('F3 identity decision wiring (source structure guard)', () => {
   it('records the published model at every actual publication site (N1/N2 flip baseline)', () => {
     // The flip detector compares against the model REALLY published, not the
     // previous report: after a daemon restart an accept-time single publish
-    // exists while no report does. Four daemon sites publish turn identity
-    // (scheduled turn, delegated scheduled turn, per-turn refresh, and the
-    // withdrawal of a stopped workflow handoff); all must run through the
+    // exists while no report does. Five daemon sites publish turn identity
+    // (scheduled turn, anonymous delegated scheduled turn, the ownerless
+    // schedule child's exact-turn controller tool actor, per-turn refresh, and
+    // the withdrawal of a stopped workflow handoff); all must run through the
     // recording helper, and the helper must record.
     const helper = daemonSource
       .slice(daemonSource.indexOf('function identityModelForPublication'))
       .split(/\n}\n/)[0];
     expect(helper).toContain('ds.lastPublishedIdentityModel = model');
     const publishSites = daemonSource.match(/storageModel: identityModelForPublication\(ds\)/g) ?? [];
-    expect(publishSites).toHaveLength(4);
+    expect(publishSites).toHaveLength(5);
     // And no site may still bypass the recorder with the bare accessor.
     expect(daemonSource).not.toContain(
       'storageModel: identityStorageModelForDaemonSession(ds)',

@@ -12,6 +12,7 @@ import {
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as idleSweeper from '../src/core/idle-worker-sweeper.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 
 let handle: IpcServerHandle | null = null;
 const HOST_SECRET = 'idle-suspend-test-secret';
@@ -72,7 +73,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
-      ok: true, sessionId: 's-susp', suspended: false, reason: 'deferred',
+      ok: true, sessionId: 's-susp', suspended: false, reason: 'deferred', waitingFor: ['turn'],
     });
     // 关键回归：正在产出的那一轮回复不能被切断。
     expect(suspendSpy).not.toHaveBeenCalled();
@@ -114,10 +115,32 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
     const res = await postSuspend('s-susp');
 
     expect(await res.json()).toEqual({
-      ok: true, sessionId: 's-susp', suspended: false, reason: 'deferred',
+      ok: true, sessionId: 's-susp', suspended: false, reason: 'deferred', waitingFor: ['input'],
     });
     expect(suspendSpy).not.toHaveBeenCalled();
     expect(ds.pendingSuspendReason).toBe('manual_suspend');
+  });
+
+  // 屏幕已空闲，但上一轮的回复还在写飞书：立即挂起会让这次投递在归属核对处放弃。
+  // 和排队兜现、自动回收用同一套等待，并把等待上限告诉调用方。
+  it('queues while the reply to the last turn is still being delivered', async () => {
+    const ds = activeSession({ lastScreenStatus: 'idle' });
+    const finishDelivery = beginFinalOutputDelivery(ds, 'om_answered');
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
+
+    const body = await (await postSuspend('s-susp')).json();
+
+    expect(body).toEqual({
+      ok: true, sessionId: 's-susp', suspended: false, reason: 'deferred',
+      waitingFor: ['reply'], replyHoldUntil: expect.any(Number),
+    });
+    expect(body.replyHoldUntil).toBeGreaterThan(Date.now());
+    expect(suspendSpy).not.toHaveBeenCalled();
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
+    // 收尾：这里的 worker 是假的，不走兑现。
+    ds.pendingSuspendReason = undefined;
+    finishDelivery();
   });
 
   // 幂等分支必须排在排队检查之前：worker 早就没了要如实回 no_live_worker，

@@ -267,7 +267,7 @@ These commands only read state; they change nothing.
 
 | Command | Description |
 |------|------|
-| `botmux observe [--session <id>] [--lark-app <appId>]` | Query session and worker state live through the daemon (JSON). If it can't get an answer it shows unknown and never reads a cache |
+| `botmux observe [--session <id>] [--lark-app <appId>] [--include-task] [--active\|--since <duration>]` | Query session and worker state live through the daemon (JSON). If it can't get an answer it shows unknown and never reads a cache. `--include-task` adds each session's task status (needs you / working / delivered / unfinished / idle / closed, the same judgement as the Dashboard board); `--active` lists only sessions that are not closed and are running or had a message in the last 24 hours, `--since 6h` changes the window to 6 hours |
 | `botmux execution current --json` | Check which bot, session, turn, and worker the current process belongs to |
 | `botmux actor current --json` | Return the daemon-verified enterprise email of this turn's sender, plus the current group ID and turn ID (no open_id). Refused when not run inside a session process |
 
@@ -282,6 +282,7 @@ These commands only read state; they change nothing.
 | `botmux goal run <goal>` | Run one goal headless from the command line; `--json` prints the result | [Workflow](/en/workflow) |
 | `botmux create-group --bot <name> [--bot ...]` | Create a Lark group with one or more bots | [Multi-bot](/en/multi-bot) |
 | `botmux board ...` | Decision board (steward bot sessions only) | [Decision Board](/en/decision-board) |
+| `botmux owner-board boards\|list\|show\|decide --bot <appId>` | Let other local tools read a steward's decision board and submit decisions for you (JSON) | [Decision Board](/en/decision-board) |
 | `botmux whiteboard ...` | Local project whiteboard | [Whiteboard](/en/whiteboard) |
 
 For how the AI discovers and uses these commands, see [Skill + CLI](/en/skill-cli).
@@ -335,3 +336,21 @@ A session runs only on the replica that owns it, while Lark callbacks and browse
   - Cookies, Authorization, and other login credentials are never forwarded.
 - **What works across replicas**: only terminal links in Lark cards, which carry their own credential. The terminal embedded in the Dashboard, the touch-screen dynamic link, and takeover with write access must reach the owning replica directly (e.g. session-sticky load balancing); otherwise they return 403.
 - Deployments without primary mode are unaffected.
+
+## Evidence retrieval: index first, then selected details
+
+```bash
+botmux history --scope chat --view index --limit 50
+botmux history --view index --query "queue" --type text,interactive --since "2026-11-14T00:00:00+08:00"
+botmux quoted om_example_one om_example_two --no-download
+```
+
+The default full history and single-message quoted JSON remain compatible. Index mode avoids card/forward expansion and returns previews of up to 240 characters plus resource counts. `--no-download` preserves resource metadata without downloading attachment bytes. Batch quoted accepts up to 20 IDs, deduplicates them, preserves successful input order, and returns `messages`/`errors`; partial failure exits with code 1 while retaining successful results.
+
+Filters apply only within the fetched `--limit` window. `--since` is inclusive and `--until` exclusive; use ISO timestamps with a timezone. The `retrieval` block reports counts, filters, deferred details and detail failures. An index candidate marked `queryMatch=deferred` requires a detail read to verify the keyword. Index mode cannot be combined with `--with-card-json`. Message requests are coalesced only within one invocation, separately by app and representation; the next invocation reads afresh. Both commands support `--help`.
+
+## Worker Memory Protection
+
+`botmux worker-budget status` shows available memory, the reserve, the memory PSI limit, and whether worker startup is allowed. Background recovery failures are logged and batched into a DM to the bot owner. A rejected current request receives only a brief unavailable status in its conversation.
+
+Owner DMs are batched per bot over 2 seconds and count distinct affected sessions. Each bot/owner pair attempts at most one DM every 5 minutes, with a cooldown that survives daemon restarts. Failed sends also enter cooldown; a later rejection can trigger another attempt after it expires. An unresolved owner is logged. If the cooldown cannot be persisted, deduplication falls back to the current process. These notifications are independent of the optional Dashboard host overload monitor.

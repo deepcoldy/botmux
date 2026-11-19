@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.214.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Hit shift+tab to cycle between Workspace Edit, Auto Mode, and Full Access.
+
+
+▍ ask me
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Submit with unanswered questions?
+  1 unanswered question
+
+  ❯ 1. Proceed  Submit with 1 unanswered question.
+    2. Go back  Return to the first unanswered question.
+
+  enter confirm  |  esc go back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

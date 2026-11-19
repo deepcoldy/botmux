@@ -137,7 +137,7 @@ Personas plus capability tags are the foundation of [multi-bot collaboration](/e
 
 ## Teams: collaborating across machines
 
-The Dashboard used to have a "Team" page; it has been removed. To work with bots on **other people's machines**, your machine needs to be connected to the central platform and be in the same team. Then use the command line:
+The Dashboard used to have a "Team" page; it has been removed. To work with bots on **other people's machines**, your machine needs to be connected to the [central platform](/en/platform) and be in the same team. Then use the command line:
 
 - `botmux bots list --scope team`: list bots that have joined your team.
 - `botmux create-group --team <team> --agent <appId>`: pull them and their owners into a new group.

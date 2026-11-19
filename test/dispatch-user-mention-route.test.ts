@@ -9,12 +9,13 @@ import { tmpdir } from 'node:os';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  authorityForDispatch, dispatchCallerFromReply, resolveDispatchUser, registerPendingDispatchUser,
+  authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, resolveDispatchUser, registerPendingDispatchUser,
   readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage,
   dispatchUserStorePath,
 } from '../src/core/dispatch-user-delegation.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
-import { delegatesOnMention } from '../src/services/trigger-user-auth.js';
+import { delegatesOnMention, dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
+import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 function routeHandler(routeConstant: string): string {
@@ -82,9 +83,9 @@ function harness(options: {
       options.delegatedUserAllowed === false ? undefined : user.openId),
     getBot: () => ({ config: { larkAppId: appId,
       triggerUserAuth: 'triggerUserAuth' in options ? options.triggerUserAuth : { enabled: true, tools: ['bytedcli'] } } }),
-    delegatesOnMention,
+    delegatesOnMention, dispatchOnlyToolsForTurn,
     loadBotConfigsCached: () => (options.localBots ?? ['cli_source', 'cli_target', 'cli_third']).map(larkAppId => ({ larkAppId })),
-    authorityForDispatch, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
     resolveUnionIdFromOpenId: vi.fn(async () => 'on_alice'),
     registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser,
     handoffMessageMatches, readHandoffMessage, getMessageDetail,
@@ -108,6 +109,89 @@ const receive = (input: { turnId?: string; rootId?: string; appId?: string; chat
 const store = () => JSON.parse(readFileSync(dispatchUserStorePath(dataDir), 'utf8'));
 
 describe('mention handoff: prepare', () => {
+  const scoped = { enabled: true, tools: ['lark-cli'], dispatchOnly: {
+    tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_chat'],
+  } };
+  it('signs scoped tools when a direct human mentions the allowed local bot', async () => {
+    const h = harness({ triggerUserAuth: scoped });
+    const prepared = await h.prepare();
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['lark-cli', 'bytedcli']);
+  });
+  it('signs scoped tools for an exact recorded human mention after the active turn was cleared', async () => {
+    const h = harness({ triggerUserAuth: scoped });
+    h.ds.activeInteractiveTurn = undefined;
+    h.ds.session.replyTargets = { om_human: { senderOpenId: 'ou_alice',
+      participants: [{ openId: 'ou_alice', isBot: false }] } };
+    h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+    const prepared = await h.prepare();
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['lark-cli', 'bytedcli']);
+  });
+  it('hands off dispatch-only tools when the source bot governs no CLI tools', async () => {
+    const h = harness({ triggerUserAuth: { ...scoped, tools: [] } });
+    const prepared = await h.prepare();
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['bytedcli']);
+  });
+  it('does not add scoped tools when the same chat is outside the chatIds allowlist', async () => {
+    const h = harness({ triggerUserAuth: scoped });
+    h.ds.chatId = 'oc_other_group';
+    const prepared = await h.prepare({ chatId: 'oc_other_group' });
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['lark-cli']);
+  });
+  it('keeps scoped tools for a local target when another mentioned bot is not on this machine', async () => {
+    const h = harness({ triggerUserAuth: scoped, localBots: ['cli_source', 'cli_target'] });
+    const prepared = await h.prepare({ targetAppIds: ['cli_target', 'cli_remote'] });
+    expect(prepared.value.delegated).toBe(true);
+    expect(prepared.value.targetAppIds).toEqual(['cli_target']);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['lark-cli', 'bytedcli']);
+  });
+  it('reports no_delegatable_tool when a direct human policy signs no tool for the target', async () => {
+    const h = harness({ triggerUserAuth: { enabled: true, tools: [],
+      dispatchOnly: { tools: ['bytedcli'], targetAppIds: ['cli_elsewhere'], chatIds: ['oc_chat'] } } });
+    const prepared = await h.prepare();
+    expect(prepared).toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_delegatable_tool' } });
+    expect(() => store()).toThrow();
+  });
+  it.each(['bot', 'scheduled', 'other-target', 'mixed-target', 'recovery', 'inherited'])(
+    'does not add scoped tools to a %s mention', async scenario => {
+      const h = harness({ triggerUserAuth: scoped });
+      if (scenario === 'bot') h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+      if (scenario === 'scheduled') h.ds.activeInteractiveTurn.caller = { ...human, source: 'schedule_creator' };
+      if (scenario === 'recovery') h.ds.session.failedTurnRecovery = {
+        turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' },
+      };
+      if (scenario === 'inherited') h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+        appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli'],
+      } }));
+      const prepared = await h.prepare(scenario === 'other-target' ? { targetAppIds: ['cli_third'] }
+        : scenario === 'mixed-target' ? { targetAppIds: ['cli_target', 'cli_third'] } : {});
+      if (scenario === 'bot' || scenario === 'scheduled' || scenario === 'recovery') {
+        expect(prepared.value.delegated).toBe(false);
+      } else {
+        expect(prepared.value.delegated).toBe(true);
+        expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+          .toEqual(['lark-cli']);
+      }
+    });
+  it('forwards a signed bytedcli grant through a bot with empty own tools', async () => {
+    const h = harness({ triggerUserAuth: { enabled: true, tools: [], dispatchOnly: scoped.dispatchOnly } });
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+    h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+      appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+    } }));
+    const prepared = await h.prepare();
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['bytedcli']);
+  });
   it('signs the direct human of this turn for the local target bot', async () => {
     const h = harness();
     const prepared = await h.prepare();

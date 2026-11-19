@@ -123,6 +123,7 @@ export function renderSummary({
   testOutcome,
   runUrl,
   pagesUrl,
+  siteArtifactName,
   feishuOutcome,
   skippedCases = [],
   evidenceCases = [],
@@ -195,6 +196,14 @@ export function renderSummary({
 
   if (reportAvailable && pagesUrl) {
     lines.push(`[Open the published Midscene HTML report](${pagesUrl})`, '');
+    // Pages keeps only the newest reports (deploy-report prunes the rest) and
+    // this summary outlives them: without this note its links just 404.
+    if (siteArtifactName && artifactUrl) {
+      lines.push(
+        `> GitHub Pages keeps only the most recent reports, so the report links on this page return 404 once later runs replace this one. The same site stays in [this run's artifacts](${artifactUrl}) as \`${siteArtifactName}\` until they expire: unzip it and serve the folder (for example \`python3 -m http.server\`) to browse it.`,
+        '',
+      );
+    }
   }
 
   if (feishuOutcome === 'cancelled') {
@@ -291,6 +300,7 @@ async function main() {
     testOutcome: missingResults.length > 0 ? 'failure' : testOutcome,
     runUrl,
     pagesUrl: options['pages-url'],
+    siteArtifactName: options['site-artifact-name'],
     feishuOutcome: options['feishu-outcome'],
     skippedCases,
     evidenceCases: siteManifest?.cases ?? [],

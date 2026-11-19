@@ -67,6 +67,7 @@ function add(overrides: Partial<Parameters<typeof scheduler.addTask>[0]> = {}): 
   return scheduler.addTask({
     name: 'follow up', schedule: '30m', prompt: 'after the PR merges, switch the fleet',
     workingDir: '/repo', chatId: 'oc_chat', larkAppId: APP,
+    owner: { kind: 'ownerless' },
     ...overrides,
   });
 }

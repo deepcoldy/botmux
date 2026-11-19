@@ -3,7 +3,7 @@
  * startTranscriptImagePurge, wired to the real planning/purge modules and a
  * real transcript, with the worker's restart machinery stubbed.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -21,6 +21,7 @@ import {
   runPurgeMaintenance,
 } from '../src/services/image-purge-recovery.js';
 import { waitForProcessQuiescence } from '../src/services/process-quiescence.js';
+import { pinClaudeProjectsRoot } from '../src/services/claude-projects-root.js';
 
 const SID = '85b23608-1234-4abc-9def-0123456789ab';
 
@@ -58,12 +59,21 @@ type RestartOpts = {
   onRespawnSettled?: (result: 'spawned' | 'failed' | 'superseded') => void;
 };
 
-function setup(transcript: string, overrides: Record<string, unknown> = {}) {
+function setup(
+  transcript: string,
+  overrides: Record<string, unknown> = {},
+  /** Runs after the CLI was launched (root pinned), before the click. */
+  afterLaunch?: (paths: { root: string; config: string }) => void,
+) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-worker-purge-'));
   roots.push(root);
-  const jsonl = join(root, 'claude', 'projects', 'cwd-key', `${SID}.jsonl`);
+  const config = join(root, 'claude');
+  const jsonl = join(config, 'projects', 'cwd-key', `${SID}.jsonl`);
   mkdirSync(dirname(jsonl), { recursive: true });
   writeFileSync(jsonl, transcript);
+  // What the worker resolved when it launched the CLI on this config dir.
+  const claudeProjectsRoot = pinClaudeProjectsRoot(config);
+  afterLaunch?.({ root, config });
   const send = vi.fn();
   const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => {});
   const scope: Record<string, unknown> = {
@@ -72,6 +82,7 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}) {
     log: () => {},
     rejectOrdinaryImTurn: vi.fn(),
     bridgeJsonlPath: jsonl,
+    claudeProjectsRoot,
     backend: { getChildPid: () => 4242 },
     lastInitConfig: { cliId: 'claude-code' },
     isRemoteBackendType: () => false,
@@ -181,6 +192,33 @@ describe('startTranscriptImagePurge', () => {
     expect(enqueue).not.toHaveBeenCalled();
     expect(notices()).toEqual(['worker.purge_images_exit_unproven']);
     expect(rejections()).toEqual([{ type: 'turn_input_rejected', turnId: 'retry-1', reason: PURGE_IMAGES_NOT_APPLIED }]);
+  });
+
+  it('declines when `projects` was swapped for a link after launch, and leaves the link target alone', () => {
+    const tiny = transcriptWith(1, 1);
+    let outsideDir = '';
+    const { restartCliProcess, notices, rejections } = setup(tiny, {}, ({ root, config }) => {
+      // The same layout elsewhere, then `projects` replaced by a link to it.
+      outsideDir = join(root, 'elsewhere', 'cwd-key');
+      mkdirSync(outsideDir, { recursive: true });
+      writeFileSync(join(outsideDir, `${SID}.jsonl`), tiny);
+      renameSync(join(config, 'projects'), join(config, 'projects.aside'));
+      symlinkSync(join(root, 'elsewhere'), join(config, 'projects'));
+    });
+    expect(restartCliProcess).not.toHaveBeenCalled();
+    expect(notices()).toEqual(['worker.purge_images_failed']);
+    expect(rejections()).toEqual([{ type: 'turn_input_rejected', turnId: 'retry-1', reason: PURGE_IMAGES_NOT_APPLIED }]);
+    expect(readFileSync(join(outsideDir, `${SID}.jsonl`), 'utf8')).toBe(tiny);
+    expect(readdirSync(outsideDir)).toEqual([`${SID}.jsonl`]);
+  });
+
+  it('declines when no projects root was resolved at launch', () => {
+    const tiny = transcriptWith(1, 1);
+    const { jsonl, restartCliProcess, notices, rejections } = setup(tiny, { claudeProjectsRoot: undefined });
+    expect(restartCliProcess).not.toHaveBeenCalled();
+    expect(notices()).toEqual(['worker.purge_images_failed']);
+    expect(rejections()).toHaveLength(1);
+    expect(readFileSync(jsonl, 'utf8')).toBe(tiny);
   });
 
   it('only rejects the continuation when the restart dies before the purge runs', () => {

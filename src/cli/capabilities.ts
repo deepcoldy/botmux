@@ -18,6 +18,7 @@ export interface BotmuxCapabilitiesDocument {
     completion_proposal_v1: true;
     ask_form_v1: true;
     riff_host_tools_v1: true;
+    dispatch_only_user_auth_v1: true;
   };
 }
 
@@ -56,6 +57,7 @@ export function botmuxCapabilities(): BotmuxCapabilitiesDocument {
       completion_proposal_v1: true,
       ask_form_v1: true,
       riff_host_tools_v1: true,
+      dispatch_only_user_auth_v1: true,
     },
   };
 }

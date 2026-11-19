@@ -61,6 +61,11 @@ export function outputSnapshot(appId: string, output: WorkerFinalOutput, now = D
     delete canonical.codexAppSettlement.durationMs;
   }
   delete canonical.usage;
+  // Display-only: a live emit and the journal-restored re-emit of the same
+  // reply must stay one output; the first one persisted is what is delivered.
+  delete canonical.restoredTurn;
+  delete canonical.replyModel;
+  delete canonical.replyReasoningEffort;
   if (canonical.codexAppSettlement) { canonical.lastUuid = ""; canonical.content = ""; delete canonical.suppressDelivery; }
   delete canonical.durationMs;
   delete canonical.executionStartedAtMs;

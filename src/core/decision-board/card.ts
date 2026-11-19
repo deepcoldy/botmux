@@ -16,6 +16,7 @@ import {
   BOARD_STATE_LABELS,
   DECISION_CARD_MAX_OPTIONS,
   stewardDecisionCardsOn,
+  type BatchSource,
   type BoardBatch,
   type BoardDecision,
   type BoardItem,
@@ -30,6 +31,8 @@ export const DECISION_CARD_ACTION_PREFIX = 'board_card_';
 export const DECISION_CARD_ACTION_PICK = 'board_card_pick';
 /** 只交说明，不选选项。 */
 export const DECISION_CARD_ACTION_NOTE = 'board_card_note';
+/** Close only: deliberately outside the decision form and batch submission path. */
+export const DECISION_CARD_ACTION_CLOSE = 'board_card_close_in_chat';
 /** 卡片表单里说明输入框的字段名（回调的 form_value 里取）。 */
 export const DECISION_CARD_NOTE_FIELD = 'board_note';
 
@@ -49,9 +52,9 @@ export interface CardDecisionStatus {
   batch: BoardBatch;
   choiceLabel?: string;
   /** 这次决定覆盖了哪些较早批次（以及它们的来源）。 */
-  supersedes: Array<{ id: number; source: 'web' | 'card' }>;
+  supersedes: Array<{ id: number; source: BatchSource }>;
   /** 这次决定后来被哪个批次覆盖（以及来源）。 */
-  supersededBy?: { id: number; source: 'web' | 'card' };
+  supersededBy?: { id: number; source: BatchSource };
   /** 决定之后选项改过（同一个选项键可能换了意思）：不显示现在的选项原文。 */
   optionsChanged?: boolean;
 }
@@ -74,9 +77,14 @@ export interface DecisionCardInput {
 
 type Mode = 'open' | 'too_many' | 'not_deciding' | 'ended';
 
+/** 决定是在哪里做的：卡片上不加前缀，其余写明出处。 */
+const ZH_VIA: Record<BatchSource, string> = { web: '网页上', card: '', local: '本机客户端' };
+const EN_VIA: Record<BatchSource, string> = { web: ' on the web', card: '', local: ' from a local client' };
+
 const TEXT = {
   zh: {
     decide: '待拍板',
+    closed: '已关闭，无需再拍板',
     summary: '现状',
     question: '要你定',
     recommend: '推荐',
@@ -90,15 +98,15 @@ const TEXT = {
     noLink: (seq: number) => `到 Dashboard 的决策看板 #${seq} 处理。`,
     explainers: (n: number) => `📎 附了 ${n} 个图文说明（说明页 / 视频），去看板上查看`,
     footer: '只有看板 owner 能点；同一项在卡片和网页上都提交时，以后提交的为准。',
-    chose: (label: string, web: boolean) => web ? `网页上已选 **${label}**` : `已选 **${label}**`,
-    noteSubmitted: (web: boolean) => web ? '网页上已提交说明' : '已提交说明',
+    chose: (label: string, via: BatchSource) => `${ZH_VIA[via]}已选 **${label}**`,
+    noteSubmitted: (via: BatchSource) => `${ZH_VIA[via]}已提交说明`,
     delivered: (id: number) => `已交给管家（批次 #${id}）`,
     delivering: (id: number) => `正在交给管家…（批次 #${id}）`,
     failed: (id: number, why: string) => `交给管家失败（批次 #${id}）：${why}。去看板「最近提交」里重新投递。`,
     handled: (id: number) => `管家已处理（批次 #${id}）`,
     supersedes: (ids: string) => `覆盖了${ids} 的决定，以这次为准。`,
-    supersededBy: (id: number, web: boolean) => `${web ? '网页上' : '卡片上'}随后又提交了批次 #${id}，以后提交的为准。`,
-    batchRef: (id: number, web: boolean) => `${web ? '网页' : '卡片'}批次 #${id}`,
+    supersededBy: (id: number, via: BatchSource) => `${via === 'card' ? '卡片上' : ZH_VIA[via]}随后又提交了批次 #${id}，以后提交的为准。`,
+    batchRef: (id: number, via: BatchSource) => `${{ web: '网页', card: '卡片', local: '本机客户端' }[via]}批次 #${id}`,
     sep: '、',
     optionsChanged: '（之后选项改过）',
     disabled: '这个管家已关闭「飞书卡片拍板」，去看板上处理。',
@@ -107,6 +115,7 @@ const TEXT = {
   },
   en: {
     decide: 'Decision needed',
+    closed: 'Closed; no further decision needed',
     summary: 'Status',
     question: 'Question',
     recommend: 'recommended',
@@ -120,15 +129,15 @@ const TEXT = {
     noLink: (seq: number) => `Open item #${seq} in the Dashboard decision board.`,
     explainers: (n: number) => `📎 ${n} explainer${n === 1 ? '' : 's'} attached (page / video); view on the board`,
     footer: 'Only the board owner can click. If both the card and the web page submit, the later one wins.',
-    chose: (label: string, web: boolean) => web ? `Picked **${label}** on the web` : `Picked **${label}**`,
-    noteSubmitted: (web: boolean) => web ? 'Note submitted on the web' : 'Note submitted',
+    chose: (label: string, via: BatchSource) => `Picked **${label}**${EN_VIA[via]}`,
+    noteSubmitted: (via: BatchSource) => `Note submitted${EN_VIA[via]}`,
     delivered: (id: number) => `sent to the steward (batch #${id})`,
     delivering: (id: number) => `sending to the steward… (batch #${id})`,
     failed: (id: number, why: string) => `delivery failed (batch #${id}): ${why}. Re-deliver it under "Recent submissions" on the board.`,
     handled: (id: number) => `handled by the steward (batch #${id})`,
     supersedes: (ids: string) => `Supersedes the decision in ${ids}; this one counts.`,
-    supersededBy: (id: number, web: boolean) => `Batch #${id} was submitted later ${web ? 'on the web' : 'from the card'}; the later one wins.`,
-    batchRef: (id: number, web: boolean) => `${web ? 'web' : 'card'} batch #${id}`,
+    supersededBy: (id: number, via: BatchSource) => `Batch #${id} was submitted later ${via === 'card' ? 'from the card' : EN_VIA[via].trim()}; the later one wins.`,
+    batchRef: (id: number, via: BatchSource) => `${via} batch #${id}`,
     sep: ', ',
     optionsChanged: ' (options changed since)',
     disabled: 'Decision cards are off for this steward; use the board.',
@@ -166,13 +175,13 @@ function cardMode(item: BoardItem): Mode {
 function statusLine(status: CardDecisionStatus, locale: Locale): string {
   const L = TEXT[locale === 'en' ? 'en' : 'zh'];
   const { decision, batch } = status;
-  const web = batch.source !== 'card';
+  const via: BatchSource = batch.source ?? 'web';
   // 选项后来改过时只写选项键：现在的原文可能已经不是 owner 当时选的意思。
   const head = decision.choice
     ? status.optionsChanged
-      ? `${L.chose(md(decision.choice), web)}${L.optionsChanged}`
-      : L.chose(md(oneLine(`${decision.choice}${status.choiceLabel ? ` ${clip(status.choiceLabel, 60)}` : ''}`)), web)
-    : L.noteSubmitted(web);
+      ? `${L.chose(md(decision.choice), via)}${L.optionsChanged}`
+      : L.chose(md(oneLine(`${decision.choice}${status.choiceLabel ? ` ${clip(status.choiceLabel, 60)}` : ''}`)), via)
+    : L.noteSubmitted(via);
   const state = decision.handledAt
     ? L.handled(batch.id)
     : batch.delivery === 'delivered'
@@ -182,9 +191,9 @@ function statusLine(status: CardDecisionStatus, locale: Locale): string {
         : L.delivering(batch.id);
   const lines = [`${head}${locale === 'en' ? ', ' : '，'}${state}`];
   if (status.supersedes.length) {
-    lines.push(L.supersedes(status.supersedes.map(s => L.batchRef(s.id, s.source !== 'card')).join(L.sep)));
+    lines.push(L.supersedes(status.supersedes.map(s => L.batchRef(s.id, s.source)).join(L.sep)));
   }
-  if (status.supersededBy) lines.push(L.supersededBy(status.supersededBy.id, status.supersededBy.source !== 'card'));
+  if (status.supersededBy) lines.push(L.supersededBy(status.supersededBy.id, status.supersededBy.source));
   return lines.join('\n');
 }
 
@@ -197,6 +206,26 @@ function linkButton(links: DecisionCardInput['links'], locale: Locale): Record<s
     behaviors: [links.appLink
       ? { type: 'open_url', default_url: links.url, pc_url: links.appLink, android_url: links.url, ios_url: links.url }
       : { type: 'open_url', default_url: links.url }],
+  };
+}
+
+function closeButton(input: DecisionCardInput): Record<string, unknown> {
+  const en = input.locale === 'en';
+  const { item } = input;
+  const ask = decisionAskKey(item);
+  return {
+    tag: 'button', type: 'default', width: 'fill',
+    text: { tag: 'plain_text', content: en ? 'Close item' : '关闭此项' },
+    confirm: {
+      title: { tag: 'plain_text', content: en ? 'Close this item?' : '关闭此项？' },
+      text: { tag: 'plain_text', content: en
+        ? 'Closing removes this item from pending decisions and clears its draft, without sending any option or note to the session. Use it when it was decided elsewhere, needs no decision, or will not be done. Earlier submissions are not recalled.'
+        : '关闭后此项不再待拍板并清空草稿，不会向会话发送任何选项或说明。适用于已在别处定了、不再需要决策或不做了；此前的提交不会撤回。' },
+    },
+    behaviors: [{ type: 'callback', value: {
+      action: DECISION_CARD_ACTION_CLOSE, app: input.appId, seq: String(item.seq), ask, rev: String(item.rev),
+      card_nonce: `close:${item.seq}:${item.rev}:${ask}`,
+    } }],
   };
 }
 
@@ -221,6 +250,7 @@ function linkOnlyCard(input: DecisionCardInput, template: string, notice: string
   body.push(notice);
   if (!input.links.url) body.push(L.noLink(item.seq));
   const elements: unknown[] = [{ tag: 'markdown', content: body.join('\n') }];
+  if (!input.retired && item.state === 'decide') elements.push(closeButton(input));
   const btn = linkButton(input.links, input.locale);
   if (btn) elements.push(btn);
   const suffix = input.locale === 'en' ? ` (${label})` : `（${label}）`;
@@ -278,6 +308,7 @@ function openCard(input: DecisionCardInput): Record<string, unknown> {
     },
   ];
   elements.push({ tag: 'form', name: `board_form_${item.seq}`, elements: formElements });
+  if (!input.retired && item.state === 'decide') elements.push(closeButton(input));
   const btn = linkButton(input.links, input.locale);
   if (btn) elements.push(btn);
   else elements.push({ tag: 'markdown', content: L.noLink(item.seq) });
@@ -291,7 +322,7 @@ export function buildDecisionCard(input: DecisionCardInput): Record<string, unkn
   if (input.retired) return linkOnlyCard(input, 'grey', L[input.retired]);
   const mode = cardMode(input.item);
   const stateLabel = BOARD_STATE_LABELS[input.locale === 'en' ? 'en' : 'zh'][input.item.state];
-  if (mode === 'ended') return linkOnlyCard(input, 'grey', L.notDeciding(stateLabel));
+  if (mode === 'ended') return linkOnlyCard(input, 'grey', input.item.state === 'closed' ? L.closed : L.notDeciding(stateLabel));
   if (mode === 'not_deciding') return linkOnlyCard(input, 'blue', L.notDeciding(stateLabel));
   if (mode === 'too_many') return linkOnlyCard(input, 'orange', L.tooMany(input.item.options.length));
   const card = openCard(input);
@@ -365,7 +396,7 @@ export class DecisionCards {
     const batch = store.getBatch(app, decision.batchId);
     if (!batch) return undefined;
     if (item.state === 'decide' && batch.createdAt < item.stateAt) return undefined;
-    const sourceOf = (id: number): 'web' | 'card' => (store.getBatch(app, id)?.source === 'card' ? 'card' : 'web');
+    const sourceOf = (id: number): BatchSource => store.getBatch(app, id)?.source ?? 'web';
     const option = item.options.find(o => o.key === decision.choice);
     // 没记指纹的旧决定按「没改过」处理（与之前的显示一致）。
     const optionsChanged = !!decision.askKey && decision.askKey !== decisionAskKey(item);

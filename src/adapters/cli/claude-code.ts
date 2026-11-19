@@ -1,3 +1,4 @@
+import { claudePromptSuggestion } from '../../utils/claude-prompt-suggestion.js';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -803,6 +804,26 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
   return [...out];
 }
 
+/** The conversation a live Claude process itself declares, for its runtime
+ *  identity: its own pid-state record (the source a write's session id comes
+ *  from), held to the stricter standard an identity needs. The record must name
+ *  this pid and carry a start time equal to the live process's, so a recycled
+ *  pid's leftover never counts; a platform where that cannot be checked gets
+ *  nothing. Any session file the process holds open must be that same
+ *  conversation: a pre-2.1.305 record keeps its spawn-time id across `/clear`,
+ *  and an answer that disagrees with what the process has open is no answer. */
+export function readClaudeLiveSessionId(pid: number, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
+  if (!parsed || typeof parsed !== 'object' || parsed.pid !== pid) return undefined;
+  if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return undefined;
+  const live = readProcStarttime(pid);
+  if (typeof parsed.procStart !== 'string' || live === null || parsed.procStart !== live) return undefined;
+  const open = findOpenClaudeSessionIds(pid, dataDir);
+  if (open.some(sid => sid !== parsed.sessionId)) return undefined;
+  return parsed.sessionId;
+}
+
 /** Fingerprint search that fans out from the pinned project dir to every
  *  sibling under `~/.claude/projects/`. Used as the writeInput fallback
  *  when the pinned `claudeJsonlPath` doesn't contain the submit marker —
@@ -1072,6 +1093,9 @@ export interface ClaudeFamilyVariant {
    *  own leave it undefined, so `reasoningEffort` is silently ignored for
    *  them rather than producing an unknown-flag launch. */
   readonly supportsEffortFlag?: boolean;
+  /** Offers the optional「本轮回顾」model recap (CLAUDE_RECAP_MODEL). Only
+   *  Claude Code itself, whose print-mode flags it was verified against. */
+  readonly recapModel?: boolean;
   /** Env the user must prefix to `resumeBin` to resume by hand. Only set when the
    *  data root is a non-default profile a bare binary would not resolve on its own
    *  (relay/seed pin their own default, so they need none). */
@@ -1116,6 +1140,7 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     supportsProgramStatus: true,
     // Claude Code 2.1.x accepts `--effort low|medium|high|xhigh|max`.
     supportsEffortFlag: true,
+    recapModel: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
@@ -1127,6 +1152,29 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');
 }
+
+/**
+ * The optional「本轮回顾」model recap on Claude Code: print mode on the haiku
+ * alias, no tools, no MCP servers, no hooks (user and plugin hooks would
+ * otherwise run for this throwaway session), nothing persisted, low effort.
+ * User settings still load, so the session's own auth applies. CLAUDE.md and
+ * auto memory stay out (they would multiply the input: a 16k-character turn
+ * record measured 10.7k input tokens without them, 38.7k with this
+ * repository's), and so does prompt caching (the call is never repeated, so a
+ * cache write only costs more).
+ */
+export const CLAUDE_RECAP_MODEL: NonNullable<CliAdapter['recapModel']> = {
+  args: systemPrompt => [
+    '-p', '--no-session-persistence', '--model', 'haiku', '--effort', 'low',
+    '--tools', '', '--strict-mcp-config', '--settings', JSON.stringify({ disableAllHooks: true }),
+    '--output-format', 'json', '--system-prompt', systemPrompt,
+  ],
+  env: {
+    CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1',
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+    DISABLE_PROMPT_CACHING: '1',
+  },
+};
 
 export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: string): CliAdapter {
   // resolvedBin is resolved lazily on first read (memoised) so merely
@@ -1142,6 +1190,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    // Every Claude-family variant runs the same TUI and input box.
+    promptSuggestion: claudePromptSuggestion,
+    ...(variant.recapModel ? { recapModel: CLAUDE_RECAP_MODEL } : {}),
     supportsProgramStatus: variant.supportsProgramStatus,
     reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
@@ -1216,7 +1267,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1347,7 +1398,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, cliId: 'claude-code' }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
       return args;
     },
 
@@ -1713,7 +1764,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `/effort` 不在此处——它是全局 PASSTHROUGH_COMMANDS 的成员（所有 CLI 尽力透传，
     // 且刻意不带冷启动语义）。这里只保留 `/goal`：它是「开启一段目标工作」的命令，需要
     // 空 topic 冷启动能力（isInitialSessionPassthrough 只认 adapter 层的这个字段）。
-    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    defaultPassthroughCommands: ['claude-code', 'seed', 'relay'].includes(variant.id) ? ['/goal'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.
     buildSessionRenameCommand: variant.id === 'claude-code'

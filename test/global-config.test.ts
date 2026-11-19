@@ -8,6 +8,7 @@ import {
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
+  globalTerminalEffortWritebackConfigLive,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
   isMultiTopicOrchestrationEnabled,
@@ -57,6 +58,39 @@ describe('global dashboard config', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('defaults terminal effort writeback off and preserves unrelated keys when toggled', () => {
+    expect(readGlobalConfig().dashboard?.terminalEffortWriteback === true).toBe(false);
+    mergeGlobalConfig({ dashboard: { publicReadOnly: false, noVisibleOutputHint: true } });
+    const enabled = mergeDashboardConfig({ terminalEffortWriteback: true });
+    expect(enabled).toMatchObject({ terminalEffortWriteback: true, terminalEffortWritebackEpoch: 1,
+      publicReadOnly: false, noVisibleOutputHint: true });
+    expect(enabled.terminalEffortWritebackEnabledAtMs).toBeGreaterThan(0);
+    mergeDashboardConfig({ terminalEffortWriteback: false });
+    const again = mergeDashboardConfig({ terminalEffortWriteback: true });
+    expect(again.terminalEffortWritebackEpoch).toBe(3);
+    expect(mergeDashboardConfig({ terminalEffortWriteback: true }).terminalEffortWritebackEpoch).toBe(3);
+    expect(globalTerminalEffortWritebackConfigLive()).toMatchObject({ enabled: true, epoch: 3 });
+    mergeDashboardConfig({ terminalEffortWriteback: false });
+    mergeDashboardConfig({ terminalEffortWriteback: true });
+    expect(globalTerminalEffortWritebackConfigLive()).toMatchObject({ enabled: true, epoch: 5 });
+  });
+
+  it('round-trips model queue notification while preserving other dashboard preferences', () => {
+    expect(readGlobalConfig().dashboard?.modelQueueNotify === true).toBe(false);
+    mergeDashboardConfig({ publicReadOnly: true, modelQueueNotify: true });
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toMatchObject({ publicReadOnly: true, modelQueueNotify: true });
+    mergeDashboardConfig({ modelQueueNotify: false });
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toMatchObject({ publicReadOnly: true, modelQueueNotify: false });
+  });
+
+  it('ignores non-boolean model queue notification on disk and keeps the default off', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { modelQueueNotify: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard?.modelQueueNotify === true).toBe(false);
   });
 
   it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
@@ -763,18 +797,19 @@ describe('global dashboard config', () => {
     const disk = () => JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
     writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh' }));
     // Turning things off on a host that never had them leaves the file as it was.
-    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false, botGrants: [] });
+    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false,
+      childOneShotEnabled: false, botGrants: [] });
     expect(disk()).toEqual({ lang: 'zh' });
 
-    writeScheduleBotGrantConfig({ createEnabled: true, botGrants: [grant] });
-    expect(disk().scheduleDelegation).toEqual({ createEnabled: true,
+    writeScheduleBotGrantConfig({ createEnabled: true, childOneShotEnabled: true, botGrants: [grant] });
+    expect(disk().scheduleDelegation).toEqual({ createEnabled: true, childOneShotEnabled: true,
       botGrants: [{ ...grant, targetAppIds: ['cli_target'] }] });
 
     // Hand-edited keys this entry does not own survive every write.
     writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: {
       ...disk().scheduleDelegation, runEnabled: false, runScopes: ['bytedcli'], futureKey: 1 } }));
     writeScheduleBotGrantConfig({ selfManageEnabled: true });
-    writeScheduleBotGrantConfig({ createEnabled: false, botGrants: [] });
+    writeScheduleBotGrantConfig({ createEnabled: false, childOneShotEnabled: false, botGrants: [] });
     expect(disk().scheduleDelegation).toEqual({ selfManageEnabled: true, runEnabled: false,
       runScopes: ['bytedcli'], futureKey: 1 });
 
@@ -789,7 +824,9 @@ describe('global dashboard config', () => {
       scheduleDelegation: { createEnabled: true, runEnabled: false,
         defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
         maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
-        selfManageEnabled: true, ignored: true },
+        selfManageEnabled: true, childOneShotEnabled: true,
+        childOneShotMaxDelayMinutes: 99_999,
+        childOneShotMaxTasksPerTurn: 99, ignored: true },
     }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().scheduleDelegation).toEqual({
@@ -799,6 +836,21 @@ describe('global dashboard config', () => {
       maxTasksPerTurn: 128,
       runScopes: ['bytedcli'],
       selfManageEnabled: true,
+      childOneShotEnabled: true,
+      childOneShotMaxDelayMinutes: 7 * 24 * 60,
+      childOneShotMaxTasksPerTurn: 16,
+    });
+  });
+
+  it('uses conservative defaults for enabled scheduled one-shot children', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { childOneShotEnabled: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toMatchObject({
+      childOneShotEnabled: true,
+      childOneShotMaxDelayMinutes: 24 * 60,
+      childOneShotMaxTasksPerTurn: 1,
     });
   });
 

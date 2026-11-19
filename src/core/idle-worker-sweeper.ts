@@ -1,11 +1,14 @@
 import type { DaemonSession } from './types.js';
 import {
+  cliReportsTurnTerminals,
   hasPendingOrdinaryImInput,
   hasUnacceptedCliInput,
   hasUnsettledAcceptedInput,
   isSessionTransferring,
+  latestUnsettledAcceptedInput,
   suspendWorker,
 } from './worker-pool.js';
+import { oldestFinalOutputDeliveryStartedAt } from './final-output-delivery-drain.js';
 import {
   getSessionPersistentBackendType,
   isSuspendableBackendType,
@@ -33,6 +36,26 @@ export const IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS = 1_000;
 export const ADMISSION_RECLAIM_MAX_SUSPEND = 4;
 export const ADMISSION_RECLAIM_REASON = 'admission_memory';
 export const IDLE_TTL_REASON = 'idle_ttl';
+/**
+ * How long the automatic reclaims (count cap, idle TTL, admission rescue) wait
+ * for an idle session's last accepted turn to report its terminal. The worker
+ * reports it once the transcript bridge has handed the answer over (or decided
+ * none is due); normally within 1–2 s of the idle edge. A turn whose terminal
+ * never comes (the bridge lost it, the CLI died mid-turn) must not keep the
+ * session live, and 2 min is far beyond any terminal that is still coming.
+ * Clocked from the later of the idle edge and the turn's acceptance.
+ */
+export const UNSETTLED_TURN_RECLAIM_GRACE_MS = 120_000;
+/**
+ * How long the automatic reclaims wait for an answer the daemon is still
+ * delivering to Lark, clocked from the start of that delivery. A delivery is up
+ * to three attempts (immediate, +5 s, +15 s) of a few Lark calls each (reply,
+ * card patch, overflow or image uploads), and every call may wait out three
+ * rate-limit retries of up to 32 s (api-gate). The requests themselves carry no
+ * timeout, so a stuck one needs this bound; 10 min covers six calls each
+ * spending the whole retry budget.
+ */
+export const FINAL_DELIVERY_RECLAIM_GRACE_MS = 600_000;
 
 export interface IdleWorkerSweepOptions {
   /**
@@ -430,6 +453,79 @@ export function suspendSelectedIdleCandidatesAfterTurnDrain(
   ).then(result => result.acquired ? result.value : null);
 }
 
+interface UnsettledTurnHold {
+  /** What is still outstanding. */
+  waitingOn: 'final_delivery' | 'turn_terminal';
+  /** When the wait began; the hold ends at `since + graceMs`. */
+  since: number;
+  graceMs: number;
+}
+
+/**
+ * Why reclaiming this session now could lose the reply to its last turn:
+ *  - the daemon is still delivering a final answer: a suspend makes the
+ *    delivery's ownership re-check fail before its next Lark write, and the
+ *    answer is dropped; or
+ *  - the worker accepted the latest input and its turn has no terminal yet,
+ *    while the session already looks idle: the transcript bridge may not have
+ *    handed the answer over, and a suspend stops it. Only for a CLI this
+ *    daemon has seen report a turn terminal; for others none ever comes.
+ * Once neither holds, the answer is out or known not to be needed (the worker
+ * reports a terminal only after handing the answer over or suppressing it,
+ * e.g. after an explicit `botmux send`). Each wait is bounded, so a stuck
+ * delivery or bridge cannot keep the session live.
+ */
+function unsettledTurnHold(ds: DaemonSession): UnsettledTurnHold | undefined {
+  const deliverySince = oldestFinalOutputDeliveryStartedAt(ds);
+  if (deliverySince !== undefined) {
+    return { waitingOn: 'final_delivery', since: deliverySince, graceMs: FINAL_DELIVERY_RECLAIM_GRACE_MS };
+  }
+  if (!cliReportsTurnTerminals(ds)) return undefined;
+  const latest = latestUnsettledAcceptedInput(ds);
+  if (!latest) return undefined;
+  // A turn that never showed as working keeps an old idle edge.
+  return {
+    waitingOn: 'turn_terminal',
+    since: Math.max(ds.idleSinceAt ?? 0, latest.at),
+    graceMs: UNSETTLED_TURN_RECLAIM_GRACE_MS,
+  };
+}
+
+/** Holds already logged, so repeated sweeps log a hold and its expiry once. */
+const loggedUnsettledHold = new WeakMap<DaemonSession, string>();
+
+/**
+ * When an automatic reclaim or a queued suspend of this session may go ahead
+ * as far as its last reply is concerned: `undefined` when nothing holds it,
+ * else the time the current hold ends (its bound; it ends sooner when the
+ * reply settles).
+ */
+export function unsettledReplyHoldUntil(ds: DaemonSession, now: number = Date.now()): number | undefined {
+  const hold = unsettledTurnHold(ds);
+  if (!hold) return undefined;
+  const until = hold.since + hold.graceMs;
+  return now < until ? until : undefined;
+}
+
+function holdsReclaimForUnsettledTurn(ds: DaemonSession, now: number): boolean {
+  const hold = unsettledTurnHold(ds);
+  if (!hold) return false;
+  const expired = now - hold.since >= hold.graceMs;
+  const logKey = `${hold.waitingOn}:${hold.since}:${expired}`;
+  if (loggedUnsettledHold.get(ds) !== logKey) {
+    loggedUnsettledHold.set(ds, logKey);
+    if (expired) {
+      logger.warn(
+        `[idle-worker-sweeper] session=${ds.session.sessionId} still waiting on ${hold.waitingOn} `
+        + `after ${Math.round((now - hold.since) / 1000)}s; no longer holding reclaim`,
+      );
+    } else {
+      logger.info(`[idle-worker-sweeper] holding reclaim of session=${ds.session.sessionId}: waiting on ${hold.waitingOn}`);
+    }
+  }
+  return !expired;
+}
+
 /**
  * Shared candidate guards for every reclaim policy (count cap, idle TTL,
  * admission rescue). A live worker is eligible only when:
@@ -439,10 +535,15 @@ export function suspendSelectedIdleCandidatesAfterTurnDrain(
  *    pty/riff/mojo are skipped), and
  *  - it is currently idle (never cut off an in-flight reply), and
  *  - no background task it launched is still running, and
- *  - no input delivered to it is still waiting for its CLI to take it.
+ *  - no input delivered to it is still waiting for its CLI to take it, and
+ *  - no answer of its last turn is still on its way to the group (bounded,
+ *    see {@link unsettledTurnHold}).
  * Ordered least-recently-messaged first so all policies evict LRU.
  */
-function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
+function suspendableIdleCandidates(
+  activeSessions: Map<string, DaemonSession>,
+  now: number = Date.now(),
+): DaemonSession[] {
   return liveWorkers(activeSessions)
     // Never suspend an adopted session. forkAdoptWorker stamps its
     // initConfig.backendType as tmux/herdr/zellij/zmx (so it would otherwise pass
@@ -466,19 +567,23 @@ function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): 
     // session shows its prompt while the message that woke it is still queued
     // or being typed, and suspending then destroys it with the CLI.
     .filter(ds => !hasUnacceptedCliInput(ds))
+    // The input landed, but the turn it started has not settled (output side
+    // of the guard above): its answer would be lost with the worker.
+    .filter(ds => !holdsReclaimForUnsettledTurn(ds, now))
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 }
 
 function isCurrentSuspendableIdleCandidate(
   activeSessions: Map<string, DaemonSession>,
   candidate: DaemonSession,
+  now: number = Date.now(),
 ): boolean {
   // Require the exact generation object selected before the async boundary.
   // A replacement generation with the same durable session id is new work and
   // must wait for a later sweep instead of inheriting this candidate snapshot.
   // Reuse the selector itself so later guard additions cannot drift between
   // initial selection and the pre-kill recheck.
-  return suspendableIdleCandidates(activeSessions).includes(candidate);
+  return suspendableIdleCandidates(activeSessions, now).includes(candidate);
 }
 
 function idleTtlExpiredNow(ds: DaemonSession, opts: IdleWorkerSweepOptions): boolean {
@@ -553,7 +658,7 @@ export function sweepIdleWorkers(
 
   const suspended: IdleWorkerSweepResult[] = [];
   let liveCount = running.length;
-  for (const ds of suspendableIdleCandidates(activeSessions)) {
+  for (const ds of suspendableIdleCandidates(activeSessions, now)) {
     const isTtl = ttlExpired.has(ds.session.sessionId);
     // TTL victims suspend regardless of the cap; a non-TTL candidate only
     // fills the count backfill while still over cap (TTL suspensions lower
@@ -586,11 +691,11 @@ export async function sweepIdleWorkersAsync(
   const initiallyTtlDue = ttlEnabled && initialRunning.some(ds => idleTtlExpiredNow(ds, opts));
   if (!initiallyOverCap && !initiallyTtlDue) return [];
 
-  const candidates = suspendableIdleCandidates(activeSessions);
+  const candidates = suspendableIdleCandidates(activeSessions, opts.now ?? Date.now());
   const suspended: IdleWorkerSweepResult[] = [];
   for (const candidate of candidates) {
     await yieldBetweenCandidates();
-    if (!isCurrentSuspendableIdleCandidate(activeSessions, candidate)) continue;
+    if (!isCurrentSuspendableIdleCandidate(activeSessions, candidate, opts.now ?? Date.now())) continue;
 
     const isTtl = idleTtlExpiredNow(candidate, opts);
     const isOverCap = cap > 0 && liveWorkers(activeSessions).length > cap;
@@ -648,6 +753,33 @@ export async function reclaimIdleWorkersForAdmissionAsync(
     });
   }
   return suspended;
+}
+
+/**
+ * Coalesce sweep triggers (spawn and idle edges, settled turns, the periodic
+ * timer): while one sweep runs, further triggers collapse into a single rerun
+ * after it. A trigger cannot simply be dropped: it may come after the running
+ * sweep took its candidate list (a held session whose turn just settled), and
+ * that session would otherwise wait for the next periodic tick. `run` must
+ * not reject.
+ */
+export function coalesceSweepTriggers<S>(run: (source: S) => Promise<void>): (source: S) => void {
+  let running = false;
+  let rerun: { source: S } | undefined;
+  const trigger = (source: S): void => {
+    if (running) {
+      rerun ??= { source };
+      return;
+    }
+    running = true;
+    void run(source).finally(() => {
+      running = false;
+      const next = rerun;
+      rerun = undefined;
+      if (next) trigger(next.source);
+    });
+  };
+  return trigger;
 }
 
 /**

@@ -126,7 +126,6 @@ describe('canRunDaemonCommand gate', () => {
     bot.config.triggerUserAuth = {
       enabled: true,
       tools: ['bytedcli'],
-      fallback: 'bot-identity',
     };
 
     expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
@@ -140,7 +139,6 @@ describe('canRunDaemonCommand gate', () => {
     bot.config.triggerUserAuth = {
       enabled: false,
       tools: ['bytedcli'],
-      fallback: 'bot-identity',
     };
 
     expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
@@ -153,7 +151,6 @@ describe('canRunDaemonCommand gate', () => {
     bot.config.triggerUserAuth = {
       enabled: true,
       tools: ['bytedcli'],
-      fallback: 'bot-identity',
     };
 
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/restart')).toBe(false);

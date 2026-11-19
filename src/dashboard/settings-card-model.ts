@@ -26,6 +26,7 @@ export interface DashboardSettingsInput {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
+  modelQueueNotify?: boolean;
   maintenance: MaintenanceCfgInput;
   localDevInstall: boolean;
   /** Defaults to supported when absent for older dashboard payloads. */
@@ -44,6 +45,7 @@ export type SettingsToggleKey =
   | 'publicReadOnly'
   | 'openTerminalInFeishu'
   | 'enableLocalCliOpen'
+  | 'modelQueueNotify'
   | 'autoUpdate'
   | 'autoRestart';
 
@@ -123,6 +125,13 @@ export function composeSections(
     key: 'cards',
     titleKey: 'settings.sectionCards',
     toggles: [
+      {
+        key: 'modelQueueNotify',
+        labelKey: 'settings.modelQueueNotify',
+        hintKey: 'settings.modelQueueNotifyHelp',
+        enabled: settings.modelQueueNotify === true,
+        state: { enabled: canWrite },
+      },
       {
         key: 'openTerminalInFeishu',
         labelKey: 'settings.openTerminalInFeishu',

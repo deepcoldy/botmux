@@ -379,6 +379,25 @@ describe('Codex App final transaction fencing', () => {
     });
   });
 
+  it('rejects a decoded chunk larger than the configured chunk bound', () => {
+    const assembler = new CodexAppControlFinalAssembler(10, 2);
+    expect(assembler.accept('final-start', { id: 'chunk-bound', total: 1 })).toEqual({ status: 'accepted' });
+    expect(assembler.accept('final-chunk', {
+      id: 'chunk-bound', index: 0, data: Buffer.from('abc').toString('base64'),
+    })).toMatchObject({ status: 'reject' });
+  });
+
+  it('rejects cumulative decoded bytes above the configured final bound', () => {
+    const assembler = new CodexAppControlFinalAssembler(3, 2);
+    expect(assembler.accept('final-start', { id: 'byte-bound', total: 2 })).toEqual({ status: 'accepted' });
+    expect(assembler.accept('final-chunk', {
+      id: 'byte-bound', index: 0, data: Buffer.from('ab').toString('base64'),
+    })).toEqual({ status: 'accepted' });
+    expect(assembler.accept('final-chunk', {
+      id: 'byte-bound', index: 1, data: Buffer.from('cd').toString('base64'),
+    })).toMatchObject({ status: 'reject' });
+  });
+
   it.each([
     ['out-of-order chunk', [
       ['final-start', { id: 'turn:3', total: 2 }],

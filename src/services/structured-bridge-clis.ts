@@ -9,10 +9,9 @@
  *     its agent-transcript JSONL, and the send-marker gate in
  *     bridge-fallback-gate.ts suppresses the transcript emit when the model
  *     did send — exactly like the other structured CLIs.
- *   - ZERO_PROMPT: CLIs whose bridge exists ONLY for zero-prompt spawns —
- *     antigravity has no /adopt bridge at all; its brain transcript.jsonl is
- *     drained just for final-reply harvest when the model cannot be taught a
- *     send command.
+ *   - ZERO_PROMPT: CLIs whose spawned sessions only harvest in zero-prompt
+ *     mode. Antigravity also harvests replies to messages sent to an adopted
+ *     process, which did not receive Botmux's send instructions when it started.
  *
  * File-path resolution for JSONL-style bridges lives in
  * `resolveFileBridgePath` (same module family, worker-facing). Hermes/MTR
@@ -63,6 +62,7 @@ export const STRUCTURED_BRIDGE_ADOPT_CLI_IDS = [
   'pi',
   'grok',
   'cursor',
+  'antigravity',
 ] as const satisfies readonly CliId[];
 
 const ALWAYS_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS);
@@ -75,7 +75,7 @@ const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
  *  that can be distilled to the user → assistant_final shape:
  *
  *   - antigravity: `brain/<id>/.system_generated/logs/transcript.jsonl`
- *     (`drainAntigravityTranscript`). No /adopt path exists for it today.
+ *     (`drainAntigravityTranscript`). Adopted processes use the same reader.
  *
  *  cursor USED to be listed here; it now rides the ALWAYS fallback (#932) —
  *  its send-marker gate makes zero-prompt vs ordinary mode irrelevant.
@@ -130,8 +130,7 @@ export function isStructuredBridgeLifecycleBlockingCli(cliId: string | undefined
 }
 
 /** Worker `codexBridgeFallbackActive` — the ALWAYS CLIs (including cursor, in
- *  every mode), plus antigravity only under zero-prompt (it has no /adopt
- *  bridge — never active in adopt mode even if both flags are passed). */
+ *  every mode), plus Antigravity in adopt mode or under zero-prompt. */
 export function isStructuredBridgeFallbackActive(
   cliId: string | undefined,
   adoptMode?: boolean,
@@ -141,7 +140,7 @@ export function isStructuredBridgeFallbackActive(
 ): boolean {
   if (!cliId) return false;
   if (ALWAYS_SET.has(cliId)) return true;
-  if (cliId === 'antigravity') return adoptMode !== true && zeroPrompt === true;
+  if (cliId === 'antigravity') return adoptMode === true || zeroPrompt === true;
   return false;
 }
 

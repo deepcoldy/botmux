@@ -219,10 +219,15 @@ describe('native worker card publication', () => {
 
 
 describe('Web Terminal button on a default LAN host', () => {
+  // A bot that hides local addresses drops a direct-port link without a read
+  // capability (the transport would refuse the card); a bot with the default
+  // (off) keeps the button, as before the policy existed.
   it.each([
-    ['keeps', { viewToken: 'v'.repeat(43), cardViewToken: 'c'.repeat(43) }],
-    ['drops only', {}],
-  ] as const)('%s the button when the worker reports %o', async (verdict, capabilities) => {
+    ['keeps', { viewToken: 'v'.repeat(43), cardViewToken: 'c'.repeat(43) }, true],
+    ['drops only', {}, true],
+    ['keeps', {}, false],
+  ] as const)('%s the button when the worker reports %o (hideLocalAddresses=%s)', async (verdict, capabilities, hideLocalAddresses) => {
+    getBot(APP).config.hideLocalAddresses = hideLocalAddresses || undefined;
     prepareStatusCard();
     const worker = Object.assign(new EventEmitter(), {
       killed: false, send: vi.fn(), kill: vi.fn(), pid: 12345,
@@ -240,7 +245,8 @@ describe('Web Terminal button on a default LAN host', () => {
     await Promise.allSettled(pending);
     expect(ds.streamCardId).toBe('om_sent');
     const card = JSON.stringify(mocks.reply.mock.calls[0][0]);
-    if (verdict === 'keeps') expect(card).toContain(`:9999?viewToken=${'c'.repeat(43)}`);
+    if (verdict === 'keeps' && 'cardViewToken' in capabilities) expect(card).toContain(`:9999?viewToken=${'c'.repeat(43)}`);
+    else if (verdict === 'keeps') expect(card).toContain(':9999');
     else expect(card).not.toContain(':9999');
   });
 });

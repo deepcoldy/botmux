@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
 import { toScheduleDetailDto } from '../src/dashboard/schedule-card-model.js';
+import { scheduleSupportLines } from '../src/core/schedule-followup.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildSchedulesCard,
@@ -386,6 +387,29 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(json).toContain('定时任务详情');
     expect(json).toContain('my schedule');
     expect(json).toContain('sch_detail_123');
+  });
+
+  it('renders the follow-up support summary without repeating a row label', () => {
+    // An expired until-done task whose last dispatch was `ok`: the raw status
+    // must not sit next to the summary's own last-result row, and the summary's
+    // position line must not repeat the card's execution-position row.
+    const raw = task({
+      id: 'sch_followup', executionPosition: 'topic', scope: 'thread', rootMessageId: 'om_q', lastStatus: 'ok',
+      untilDone: { status: 'expired', attempts: 3, deadline: '2026-06-10T00:00:00Z', expiredAt: '2026-06-10T00:00:00Z' },
+      notify: ['failing', 'expired'], ownerOpenId: 'ou_creator',
+      runStats: { dispatched: 3, skipped: 0, failed: 1, missed: 0, consecutiveFailures: 1 },
+    });
+    for (const locale of ['zh', 'en'] as const) {
+      const card = JSON.parse(buildSchedulesDetailCard(toScheduleDetailDto(raw, { nowMs: NOW }), { ...baseOpts, locale }));
+      const rows = (card.elements as any[])
+        .flatMap((e: any) => String(e.content ?? e.text?.content ?? '').split('\n'))
+        .map(r => /^<font color="grey">(.*)<\/font>$/.exec(r)?.[1]?.replace(/\\/g, ''))
+        .filter((r): r is string => !!r);
+      const labels = rows.map(r => r.split(/[:：]/)[0]!.trim());
+      expect(labels.length).toBeGreaterThan(8);
+      expect(new Set(labels).size).toBe(labels.length);
+      for (const line of scheduleSupportLines(raw, locale).slice(1)) expect(rows).toContain(line);
+    }
   });
 
   it('renders pause + resume + execution-position + back buttons', () => {

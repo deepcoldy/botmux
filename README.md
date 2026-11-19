@@ -42,11 +42,13 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 
 ## 5 分钟接入
 
-> 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动创建 / 粘贴凭证也是 setup 中的可选路径）。
+> 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动粘贴凭证也是可选路径）。不需要飞书时用 `botmux setup add --local`，或在 Dashboard「添加机器人」里选「仅本地」。写进 `bots.json` 的 `local_*` id 只是本机身份，不是飞书 App ID。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
+botmux setup add --local --name 研究室 --cli codex --default-working-dir ~ --json
+                             # 只创建本地机器人：不扫码、不绑定飞书 App ID / Secret
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
@@ -81,6 +83,17 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 - **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
 
 更多特性：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [最终回答三态反馈](docs/feedback-capability-current-implementation.md) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体展示](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
+
+## 中心化平台（开源，可自托管）
+
+单机用 botmux 不需要任何中心服务。机器多了、要在外网打开、或者想和团队一起用时，可以自己部署开源的 **[Botmux Platform](https://github.com/botmux-ai/botmux-platform)**（MIT），用飞书登录，把各台机器上的 botmux 汇总到一个网站：
+
+- **随处打开**：每台机器主动向平台建立出站隧道，不用开入站端口；在网页上就能打开任意一台机器的 Dashboard 和 Web 终端，飞书单点登录。
+- **机器总览**：在线状态、daemon 版本、一键升级，可以给机器加协管者。
+- **团队协作**：团队与飞书协作群、Issue 看板，还能找到同团队、在别人机器上的机器人拉进群一起干活。
+- **个人凭据库**：在平台授权一次飞书，平台按需给已绑定的机器发短期凭据，机器人就能以你的身份调用 lark-cli。
+
+接入一台机器：在平台网页点「绑定新机器」，把给出的 `botmux bind <绑定凭证>` 拿到这台机器的终端执行。部署方式见 [平台仓库](https://github.com/botmux-ai/botmux-platform)，接入与使用见 [中心化平台文档](https://deepcoldy.github.io/botmux/platform)，也可以先看 [3 分钟讲解视频](https://github.com/user-attachments/assets/52136d9e-841e-4e52-a297-8dcad561c7dc)。
 
 ## 按 Bot 设置零注入
 

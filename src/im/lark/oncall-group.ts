@@ -3,37 +3,26 @@ import { readOncallPresetOptions } from '../../services/oncall-preset-options.js
 import { getBot } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { OncallGroupStore, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
+import { OncallGroupStore, oncallForwardingPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
 import { oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
-import { createOncallGroup, loadOncallGroupTarget, oncallUsername, OncallGroupApiError } from '../../services/oncall-group-client.js';
+import { createOncallGroup, loadOncallGroupTarget, OncallGroupApiError, ONCALL_GROUP_CREATE_TIMEOUT_MS } from '../../services/oncall-group-client.js';
 import { getMessageDetail, replyMessage } from './client.js';
-import { createNativeOncallLink, readOncallChoices, validateOncallSelection } from '../../services/oncall-platform.js';
-import { OncallFormStore, type OncallFormDraft } from '../../services/oncall-form-store.js';
+import { createNativeOncallLink, readNativeOncallResult, readNativeOncallResultCandidates, readOncallChoices, readOncallGroupResult, requiresNativeOncallForm, validateOncallSelection } from '../../services/oncall-platform.js';
+import { OncallFormStore, type OncallFormDraft, type OncallNativeSubmissionAttempt } from '../../services/oncall-form-store.js';
 import { buildOncallFormCard } from './oncall-form-card.js';
 import { createHash } from 'node:crypto';
 import { withFileLock } from '../../utils/file-lock.js';
 import { join } from 'node:path';
-import { resolveSender } from './identity-cache.js';
+import { resolveOncallUsername } from './oncall-identity.js';
 import { parseApiMessage } from './message-parser.js';
 import { chatAppLink } from './lark-hosts.js';
 import type { CardActionData } from './card-handler.js';
 import { extractLarkBusinessCode, LARK_CODE_FORWARD_RESTRICTED } from './lark-errors.js';
 
-export function buildOncallGroupColumn(options: { href?: string; status?: string; disabled?: boolean; retryForward?: boolean; handoffStatus?: string; confirmText?: string } = {}): Record<string, any> {
-  return { tag: 'column', element_id: 'botmux_oncall_group_column', width: 'auto', direction: 'horizontal',
-    horizontal_spacing: '8px', vertical_align: 'center', padding: '0px', elements: [{
-      tag: 'button', text: { tag: 'plain_text', content: options.status ?? '转人工' }, type: 'default', size: 'small',
-      ...(options.href && options.status ? { icon: { tag: 'standard_icon', token: 'chat_outlined', color: 'grey' } } : {}),
-      ...(options.disabled ? { disabled: true } : {}),
-      ...(options.confirmText ? { confirm: { title: { tag: 'plain_text', content: '确认发起人工 Oncall？' }, text: { tag: 'plain_text', content: options.confirmText } } } : {}),
-      behaviors: options.href ? [{ type: 'open_url', default_url: options.href }]
-        : [{ type: 'callback', value: { action: 'oncall_group_create' } }],
-    }, ...(options.handoffStatus ? [{ tag: 'markdown', text_size: 'notation', content: `<font color='grey'>${options.handoffStatus}</font>` }] : []),
-    ...(options.retryForward ? [{ tag: 'button', type: 'default', size: 'small', text: { tag: 'plain_text', content: '重试转交' },
-      behaviors: [{ type: 'callback', value: { action: 'oncall_group_forward' } }] }] : [])] };
-}
+import { buildOncallGroupColumn } from './oncall-card-actions.js';
+export { buildOncallGroupColumn } from './oncall-card-actions.js';
 
-export interface OncallCardContext { appId: string; sessionId: string; questionId: string; phase: 'first' | 'final'; nativeLink?: string; messageId?: string }
+export interface OncallCardContext { appId: string; sessionId?: string; questionId: string; phase: 'first' | 'final'; nativeLink?: string; messageId?: string }
 
 export function stripOncallGroupButton(raw: string): string {
   const card = JSON.parse(raw);
@@ -52,9 +41,9 @@ export function attachOncallGroupButton(raw: string, policy: OncallGroupPolicy |
     const store = new OncallGroupStore(config.session.dataDir);
     const request = store.getRequest({ ...context, chatId, messageId: '', answer: '' });
     if (chatType === 'p2p' || (!oncallGroupEnabled(policy, chatId) && request?.status !== 'succeeded')) return raw;
-    const turnNumber = store.registerTurn(context.appId, context.sessionId, context.questionId, { chatId });
+    const turnNumber = context.sessionId ? store.registerTurn(context.appId, context.sessionId, context.questionId, { chatId }) : 1;
     if (request?.status === 'succeeded' && request.openChatId) options = {
-      href: chatAppLink(request.openChatId, getBot(context.appId).config.brand), status: '进入人工 Oncall 群',
+      href: request.inviteLink, joinGroup: true, status: '进入人工 Oncall 群',
       retryForward: request.forwardMode !== 'none' && request.handoffError !== 'restricted_merge'
         && (request.conversationScopePending === true || pendingOncallMessageIds(request).length > 0),
       handoffStatus: request.forwardMode === 'none' ? undefined
@@ -67,10 +56,15 @@ export function attachOncallGroupButton(raw: string, policy: OncallGroupPolicy |
         || ((policy?.button?.timing ?? 'final') === 'final' && context.phase !== 'final')) return raw;
       if (request && request.status !== 'failed') options = { disabled: true,
         status: request.status === 'pending' ? '正在发起人工 Oncall' : '建群结果待确认' };
-      else if (policy?.flowMode === 'classify' && (policy.formDisplay ?? 'native') === 'native' && context.nativeLink) options.href = context.nativeLink;
+      else if (policy?.flowMode === 'classify' && (policy.formDisplay ?? 'native') === 'native' && context.nativeLink) {
+        try {
+          const page = new URL(new URL(context.nativeLink).searchParams.get('url') ?? '');
+          if (page.searchParams.get('tenant') === String(loadOncallGroupTarget(config.session.dataDir, context.appId).tenantId)) options.href = context.nativeLink;
+        } catch { /* Rebuild unavailable or outdated links through the original button. */ }
+      }
     }
   } else if (chatType === 'p2p' || !oncallGroupEnabled(policy, chatId)) return raw;
-  if ((policy?.flowMode ?? 'direct') === 'direct' && !options.href && !options.disabled) {
+  if ((policy?.flowMode ?? 'direct') === 'direct' && !options.href && !options.joinGroup && !options.disabled) {
     let destination = '使用管理员预设的业务线、区域和问题分类。';
     if (context) {
       try {
@@ -111,7 +105,7 @@ export function recordOncallGroupDelivery(dataDir: string, { card, ...source }: 
   try {
     const store = new OncallGroupStore(dataDir);
     if (source.sessionId && !oncallGroupEnabled(getBot(source.appId).config.oncallGroup, source.chatId) && !store.getRequest(source)) return;
-    store.recordSource(source.sessionId ? { ...source, cardJson: JSON.stringify(card) } : source);
+    store.recordSource({ ...source, cardJson: JSON.stringify(card) });
   }
   catch { logger.warn('[oncall-group] Could not index the delivered card; the answer must not be resent'); }
 }
@@ -120,17 +114,54 @@ export function recordOncallGroupDelivery(dataDir: string, { card, ...source }: 
  * session state, including cards from earlier turns. */
 export function reconcileOncallReplyCard(appId: string, messageId: string, card: Record<string, any>): Record<string, any> {
   const source = new OncallGroupStore(config.session.dataDir).findSource(appId, messageId);
-  if (!source?.sessionId) return card;
+  if (!source) return card;
   const raw = JSON.stringify(card);
   return JSON.parse(attachOncallGroupButton(raw, getBot(appId).config.oncallGroup, source.chatId, 'group', {
     appId, sessionId: source.sessionId, questionId: source.questionId, phase: 'final', nativeLink: source.nativeLink, messageId,
   }));
 }
 
+/** Cards that already received the invitation as a reply because they cannot be
+ * updated. In memory: after a restart one more reply is harmless. */
+const oncallInviteReplies = new Set<string>();
+
 export async function handleOncallGroupAction(data: CardActionData, appId: string): Promise<any> {
   const store = new OncallGroupStore(config.session.dataDir);
   let source: OncallGroupSource | undefined;
   try { source = store.findSource(appId, data.context?.open_message_id ?? ''); } catch { /* invalid source is rejected below */ }
+  if (data.action?.value?.action === 'oncall_group_join') {
+    if (!source || (data.context?.open_chat_id && data.context.open_chat_id !== source.chatId)
+      || !data.operator?.open_id?.startsWith('ou_') || store.getRequest(source)?.status !== 'succeeded') {
+      return oncallError(new Error('人工群入口已失效，请从原结果卡进入'));
+    }
+    const replyKey = JSON.stringify([config.session.dataDir, appId, source.messageId]);
+    if (oncallInviteReplies.has(replyKey) && store.getRequest(source)?.inviteLink) {
+      return { toast: { type: 'info', content: '入群邀请已回复在本卡下方，请点击该链接进入人工群' } };
+    }
+    try {
+      await prepareOncallGroupInvite(source);
+      return {
+        toast: { type: 'success', content: '入群邀请已就绪，请再次点击进入人工群' },
+        afterAck: async () => {
+          // Callback completion can restore the old view if this patch precedes its ACK.
+          // A clicked card that can no longer change still has to deliver the link.
+          let replyWithLink = !source.cardJson && !source.sessionId;
+          try {
+            await refreshOncallSessionCard(source, { onExpired: messageId => { if (messageId === source.messageId) replyWithLink = true; } });
+          } finally {
+            const link = store.getRequest(source)?.inviteLink;
+            // The in-flight dedupe ends at ACK, so repeated or concurrent clicks reach here.
+            if (replyWithLink && link && !oncallInviteReplies.has(replyKey)) {
+              if (oncallInviteReplies.size >= 10_000) oncallInviteReplies.clear();
+              oncallInviteReplies.add(replyKey);
+              try { await replyMessage(appId, source.messageId, `人工 Oncall 群入群邀请：${link}`, 'text', true); }
+              catch (error) { oncallInviteReplies.delete(replyKey); throw error; }
+            }
+          }
+        },
+      };
+    } catch { return oncallError(new Error('人工群入群邀请暂不可用，请联系管理员将机器人加入人工群并允许分享群')); }
+  }
   const bot = getBot(appId).config;
   const policySnapshot = JSON.stringify(bot.oncallGroup);
   if (!source || !oncallGroupEnabled(bot.oncallGroup, source.chatId)
@@ -154,14 +185,25 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
   }
   if (bot.oncallGroup?.flowMode === 'classify' && (!existingRequest || existingRequest.status === 'failed')) {
     try {
-      if (['private_card', 'thread_card'].includes(bot.oncallGroup.formDisplay ?? 'native')) return await openOncallForm(source, data.operator.open_id);
+      if (['private_card', 'thread_card'].includes(bot.oncallGroup.formDisplay ?? 'native')) return await openOncallForm(source, data.operator);
+      const targetSnapshot = JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId));
       const href = await prepareNativeOncallCard(appId, source.chatId, source.questionId);
       if (!href) throw new Error('原生提单入口暂不可用，请检查连接配置');
-      await replyMessage(appId, source.messageId, JSON.stringify({ schema: '2.0', body: { elements: [
-        { tag: 'markdown', content: '在飞书内完成分类和提单。平台结果尚未自动关联当前会话。' },
-        { tag: 'column_set', columns: [buildOncallGroupColumn({ href })] },
-      ] } }), 'interactive', true);
-      return { toast: { type: 'info', content: '原生提单入口已就绪' } };
+      const original = source;
+      const beforeWrite = () => {
+        if (JSON.stringify(getBot(appId).config.oncallGroup) !== policySnapshot
+          || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== targetSnapshot) throw new Error('配置已变更，请重新打开入口');
+        const current = store.findSource(appId, original.messageId);
+        if (!current || current.questionId !== original.questionId || current.chatId !== original.chatId) throw new Error('原回答卡已失效');
+        const request = store.getRequest(current);
+        if (request && request.status !== 'failed') throw new Error('此会话已有请求，请从原回答卡继续');
+      };
+      return { toast: { type: 'info', content: '请点击原回答卡的转人工按钮打开飞书侧栏' }, afterAck: async () => {
+        beforeWrite();
+        const current = { ...store.findSource(appId, original.messageId)!, nativeLink: href };
+        store.recordSource(current);
+        await refreshOncallSessionCard(current, { prepareInvite: false, beforeWrite });
+      } };
     } catch (error) { return oncallError(error); }
   }
   let text: string;
@@ -173,8 +215,7 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
       if (!target.typeId || !target.region) throw new Error('直接建群需要配置固定区域和分类');
       const secret = deployment.ONCALL_SERVICE_SECRET?.trim();
       if (!secret) throw new Error('Oncall 服务账号凭据尚未配置，请联系机器人管理员设置 ONCALL_SERVICE_SECRET');
-      const sender = await resolveSender(appId, data.operator.open_id, 'user');
-      const username = oncallUsername(sender?.email, target);
+      const username = await resolveOncallUsername(appId, data.operator, target, deployment);
       let question = '';
       if (source.questionId.startsWith('om_')) {
         try {
@@ -191,20 +232,23 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
       if (!oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId)
         || JSON.stringify(getBot(appId).config.oncallGroup) !== policySnapshot
         || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新发起');
-      if (store.claim(source, source.sessionId ? data.operator.open_id : undefined, snapshot)) {
+      if (store.claim(source, data.operator.open_id, snapshot, { target, username, region: target.region, typeId: target.typeId })) {
         const attemptId = store.getRequest(source)?.attemptId;
         try {
-          const created = await createOncallGroup(target, secret, username, message);
+          const created = await createOncallGroup(target, secret, username, message, fetch, undefined, attemptId);
           store.finish(source, { status: 'succeeded', ...created }, attemptId);
           if (source.sessionId) await forwardOncallConversation(source);
         } catch (error) {
+          logOncallCreationFailure(error, store.getRequest(source)?.submittedAtMs);
           store.finish(source, { status: error instanceof OncallGroupApiError && !error.uncertain ? 'failed' : 'unknown' }, attemptId);
           if (error instanceof OncallGroupApiError) throw error;
         }
       }
       result = store.getRequest(source);
     }
-    text = result?.status === 'succeeded' && result.openChatId ? `Oncall 群：${chatAppLink(result.openChatId, bot.brand)}`
+    if (result?.status === 'succeeded') await prepareOncallGroupInvite(source).catch(() => {});
+    const invite = store.getRequest(source)?.inviteLink;
+    text = result?.status === 'succeeded' && result.openChatId ? `Oncall 群：${invite ?? chatAppLink(result.openChatId, bot.brand)}`
       : result?.status === 'failed' ? '拉起 Oncall 群失败，可再次点击重试'
         : '建群请求已提交，暂未确认结果，请勿重复创建；若长时间无结果，请联系管理员核对';
   } catch (error) {
@@ -212,7 +256,10 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
     text = error instanceof Error ? error.message : 'Oncall 建群暂不可用';
   }
   if (source.sessionId) await refreshOncallSessionCard(source).catch(() => logger.warn('[oncall-group] Latest card refresh pending'));
-  else await replyMessage(appId, source.messageId, text, 'text', true);
+  else {
+    if (store.getRequest(source)?.status === 'succeeded') await refreshOncallSessionCard(source).catch(() => {});
+    await replyMessage(appId, source.messageId, text, 'text', true);
+  }
 }
 
 const nativeLinks = new Map<string, Promise<string | undefined>>();
@@ -261,7 +308,15 @@ function oncallError(error: unknown): any {
   return { toast: { type: 'error', content: error instanceof Error ? error.message : 'Oncall 暂不可用，请重试' } };
 }
 
-async function openOncallForm(source: OncallGroupSource, ownerOpenId: string): Promise<any> {
+function logOncallCreationFailure(error: unknown, submittedAtMs = Date.now()): void {
+  const reason = error instanceof OncallGroupApiError ? error.reason : 'unknown';
+  const status = error instanceof OncallGroupApiError ? error.status : undefined;
+  // Never log gateway bodies, user data, or credentials from the original error.
+  logger.warn(`[oncall-group] Create outcome reason=${reason} http=${status ?? 'none'} elapsedMs=${Date.now() - submittedAtMs}`);
+}
+
+async function openOncallForm(source: OncallGroupSource, operator: NonNullable<CardActionData['operator']>): Promise<any> {
+  const ownerOpenId = operator.open_id!;
   const client = await import('./client.js');
   const visibility = getBot(source.appId).config.oncallGroup?.formDisplay === 'thread_card' ? 'thread' : 'private';
   const policySnapshot = JSON.stringify(getBot(source.appId).config.oncallGroup);
@@ -274,8 +329,7 @@ async function openOncallForm(source: OncallGroupSource, ownerOpenId: string): P
   const deployment = readOncallDeploymentEnv();
   const target = loadOncallGroupTarget(config.session.dataDir, source.appId, deployment);
   const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
-  const sender = await resolveSender(source.appId, ownerOpenId, 'user');
-  const username = oncallUsername(sender?.email, target);
+  const username = await resolveOncallUsername(source.appId, operator, target, deployment);
   const choices = await readOncallChoices(target, secret, username);
   const region = Object.keys(choices.regions)[0] ?? '';
   const detail = await getMessageDetail(source.appId, source.questionId);
@@ -287,18 +341,66 @@ async function openOncallForm(source: OncallGroupSource, ownerOpenId: string): P
     if (JSON.stringify(getBot(source.appId).config.oncallGroup) !== policySnapshot) throw new Error('转人工配置已变更，请重新打开');
     if (current.targetFingerprint !== JSON.stringify(target)) throw new Error('业务目标已变更，请先取消旧表单后重新打开');
     if ((current.visibility ?? 'private') !== visibility) throw new Error('展示方式已变更，请先取消旧表单后重新打开');
+    if (!current.nativeEntry) await prepareSelectedNativeForm(current, username);
+    if (JSON.stringify(getBot(source.appId).config.oncallGroup) !== policySnapshot) throw new Error('转人工配置已变更，请重新打开');
+    assertOncallFormCurrent(current);
     if (current.messageId) {
-      if (visibility === 'thread') await client.updateMessage(source.appId, current.messageId, buildOncallFormCard(current));
+      if (visibility === 'thread' || current.nativeEntry) await writeOncallFormDraft(current, persist);
       return;
     }
     if (visibility === 'thread') {
       if (current.publishStartedAtMs && Date.now() - current.publishStartedAtMs > 55 * 60_000) throw new Error('分类卡片投递结果待核对，请管理员处理');
       current.publishStartedAtMs ??= Date.now();
       persist();
-      current.messageId = await replyMessage(source.appId, source.messageId, buildOncallFormCard(current), 'interactive', true, current.id);
-    } else current.messageId = await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, buildOncallFormCard(current));
+      current.messageId = current.nativeFormLink
+        ? await replyMessage(source.appId, source.messageId, buildOncallFormCard(current), 'interactive', true, current.id, undefined, { beforeWrite: () => assertOncallFormCurrent(current) })
+        : await replyMessage(source.appId, source.messageId, buildOncallFormCard(current), 'interactive', true, current.id);
+    } else current.messageId = current.nativeFormLink
+      ? await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, buildOncallFormCard(current), { beforeWrite: () => assertOncallFormCurrent(current) })
+      : await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, buildOncallFormCard(current));
   });
   return { toast: { type: 'info', content: visibility === 'thread' ? '请选择分类并确认转人工，仅你可操作本卡片' : '表单已展示，仅你可见' } };
+}
+
+function recordNativeSubmissionAttempt(draft: OncallFormDraft, attempt: OncallNativeSubmissionAttempt): void {
+  const attempts = draft.nativeSubmission?.attempts ?? [];
+  const duplicate = attempts.some(item => item.sourceLocation === attempt.sourceLocation
+    && item.username === attempt.username && item.typeId === attempt.typeId && item.region === attempt.region
+    && item.policyFingerprint === attempt.policyFingerprint && item.forwardMode === attempt.forwardMode);
+  if (duplicate) return;
+  // Never mutate a published snapshot. The immutable update also lets the
+  // caller's previousDraft rollback restore the exact prior collection.
+  draft.nativeSubmission = { ...(draft.nativeSubmission ?? {}), attempts: [...attempts, attempt] };
+}
+
+/** Prepare the selected form before rendering its confirmation button. */
+async function prepareSelectedNativeForm(draft: OncallFormDraft, username = draft.oncallUsername,
+  loadUsername?: () => Promise<string>): Promise<void> {
+  const category = draft.choices.regions[draft.region]?.find(item => item.id === draft.typeId);
+  if (!category || category.type_action !== 'create_chat') { delete draft.nativeFormLink; return; }
+  const deployment = readOncallDeploymentEnv();
+  const target = loadOncallGroupTarget(config.session.dataDir, draft.appId, deployment);
+  const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
+  const policySnapshot = JSON.stringify(getBot(draft.appId).config.oncallGroup);
+  let nativeFormLink: string | undefined;
+  const requiresNative = await requiresNativeOncallForm(target, secret, category);
+  if (requiresNative) username = username ?? await loadUsername?.();
+  if (requiresNative && !username) throw new Error('无法确认 Oncall 提单人，请重新打开表单');
+  if (requiresNative) {
+    nativeFormLink = await createNativeOncallLink(target, secret, '', draft.description, getBot(draft.appId).config.brand, fetch,
+      { region: draft.region, typeId: category.id, priority: draft.priority, formId: draft.id });
+  }
+  if (JSON.stringify(getBot(draft.appId).config.oncallGroup) !== policySnapshot
+    || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, draft.appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
+  if (username) draft.oncallUsername = username;
+  if (nativeFormLink && username) {
+    draft.nativeFormLink = nativeFormLink;
+    recordNativeSubmissionAttempt(draft, {
+      sourceLocation: new URL(nativeFormLink).searchParams.get('url')!.slice(0, 200), username,
+      preparedAtMs: Date.now(), policyFingerprint: policySnapshot, forwardMode: getBot(draft.appId).config.oncallGroup?.forwardMode ?? 'individual',
+      typeId: category.id, region: draft.region,
+    });
+  } else delete draft.nativeFormLink;
 }
 
 function classifiedCardPolicy(policy: OncallGroupPolicy | undefined, draft: OncallFormDraft): boolean {
@@ -306,20 +408,95 @@ function classifiedCardPolicy(policy: OncallGroupPolicy | undefined, draft: Onca
     && policy.formDisplay === (draft.visibility === 'thread' ? 'thread_card' : 'private_card');
 }
 
-async function closeOncallForm(draft: OncallFormDraft, created: boolean): Promise<void> {
-  if (!draft.messageId) return;
+async function closeOncallForm(draft: OncallFormDraft, created: boolean, owns: () => boolean = () => true): Promise<void> {
+  const messageId = draft.messageId;
+  if (!messageId) return;
   const client = await import('./client.js');
-  if (draft.visibility !== 'thread') { await client.deleteEphemeralCard(draft.appId, draft.messageId); return; }
+  if (!owns()) return;
+  if (draft.visibility !== 'thread') {
+    if (!created) await client.deleteEphemeralCard(draft.appId, messageId);
+    else if (!await client.deleteEphemeralCard(draft.appId, messageId, { acceptWithdrawn: true })) {
+      throw new Error('分类表单收起失败，请重试');
+    }
+    return;
+  }
+  const replaceWithStatus = (content: string) => client.updateMessage(draft.appId, messageId, JSON.stringify({
+    schema: '2.0', body: { elements: [{ tag: 'markdown', element_id: 'botmux_oncall_form_state', content }] },
+  }));
   if (created) {
     // Keep the result card as the sole group entry. Confirm that it was
     // refreshed before withdrawing the now-obsolete classification form.
     await refreshOncallSessionCard(draft.source);
-    if (!await client.deleteMessage(draft.appId, draft.messageId)) throw new Error('分类表单收起失败，请重试');
+    if (!owns()) return;
+    const retired = await client.deleteMessage(draft.appId, messageId, {
+      acceptWithdrawn: true,
+      onRecallExpired: async () => {
+        if (!owns()) return;
+        try {
+          await replaceWithStatus('已发起人工 Oncall，请从原回答卡进入。');
+        } catch (error) {
+          // Once both write windows have expired no retry can ever retire the
+          // immutable form. Settle the durable cleanup instead of retrying
+          // forever; a concurrently withdrawn form is already retired too.
+          const unchangeable = oncallCardUnchangeable(error);
+          if (unchangeable === 'expired') {
+            logger.warn(`[oncall-group] Classification form ${messageId} is immutable after recall/edit expiry; settling cleanup`);
+            return;
+          }
+          if (unchangeable === 'gone') return;
+          throw error;
+        }
+      },
+    });
+    if (!retired) throw new Error('分类表单收起失败，请重试');
     return;
   }
-  await client.updateMessage(draft.appId, draft.messageId, JSON.stringify({ schema: '2.0', body: { elements: [
-    { tag: 'markdown', element_id: 'botmux_oncall_form_state', content: '已取消本次转人工' },
-  ] } }));
+  await replaceWithStatus(draft.nativeEntry || draft.nativeFormLink ? '已收起本次表单入口；平台已提交的工单不受影响' : '已取消本次转人工');
+}
+
+function assertOncallFormCurrent(latest: OncallFormDraft): void {
+  const groups = new OncallGroupStore(config.session.dataDir);
+  const policy = getBot(latest.appId).config.oncallGroup;
+  const currentRequest = groups.getRequest(latest.source);
+  if (!classifiedCardPolicy(policy, latest)
+    || (latest.targetFingerprint && latest.targetFingerprint !== JSON.stringify(loadOncallGroupTarget(config.session.dataDir, latest.appId)))
+    || (latest.nativeEntry && latest.nativeEntry.policyFingerprint !== JSON.stringify(policy))
+    || (currentRequest && currentRequest.status !== 'failed')) {
+    throw new Error('表单配置或请求状态已变更，请重新打开入口');
+  }
+}
+
+/** Called only while the draft lock is held, including every SDK retry. */
+async function writeOncallFormDraft(latest: OncallFormDraft, persist: () => void, owns: () => boolean = () => true): Promise<void> {
+  const store = new OncallGroupStore(config.session.dataDir);
+  const request = store.getRequest(latest.source);
+  if (latest.closed) {
+    const submittedForm = request?.status === 'succeeded' && request.creation?.formId === latest.id;
+    if (submittedForm && request.formClosePending === false) return;
+    await closeOncallForm(latest, request?.status === 'succeeded', owns);
+    if (submittedForm && request.formClosePending && owns()) {
+      store.finish(latest.source, { status: 'succeeded', formClosePending: false }, request.attemptId);
+    }
+    return;
+  }
+  const beforeWrite = () => assertOncallFormCurrent(latest);
+  beforeWrite();
+  const client = await import('./client.js');
+  const card = buildOncallFormCard(latest);
+  if (latest.visibility === 'thread') {
+    if (!latest.messageId) throw new Error('分类卡片尚未发布');
+    await client.updateMessage(latest.appId, latest.messageId, card, { beforeWrite });
+  } else {
+    const priorId = latest.messageId;
+    latest.messageId = await client.sendEphemeralCard(latest.appId, latest.source.chatId, latest.ownerOpenId, card, { beforeWrite });
+    persist();
+    if (priorId) await client.deleteEphemeralCard(latest.appId, priorId);
+  }
+}
+
+/** A late ACK reads the current draft; it never replays a captured card. */
+export async function refreshOncallFormCard(appId: string, draftId: string, owner: string): Promise<void> {
+  await new OncallFormStore(config.session.dataDir).use(appId, draftId, owner, writeOncallFormDraft, { allowClosed: true });
 }
 
 export async function handleOncallFormAction(data: CardActionData, appId: string): Promise<any> {
@@ -337,20 +514,23 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         if (draft.visibility !== 'thread') throw new Error('此表单已失效');
         const created = store.getRequest(source)?.status === 'succeeded';
         return { toast: { type: 'info', content: created ? '此会话已有人工群' : '本次转人工已取消' },
-          afterAck: () => closeOncallForm(draft, created) };
+          afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
       }
       const client = await import('./client.js');
       if (value.action === 'oncall_group_form_cancel') {
+        const request = store.getRequest(source);
+        if (request && request.status !== 'failed') return { toast: { type: 'info', content: '建群请求已提交，请从原回答卡查看结果，勿重复创建' } };
         draft.closed = true;
+        delete draft.nativeSubmission;
         persist();
         if (draft.visibility !== 'thread') await closeOncallForm(draft, false);
-        return { toast: { type: 'info', content: '已取消，尚未提交工单' },
-          ...(draft.visibility === 'thread' ? { afterAck: () => closeOncallForm(draft, false) } : {}) };
+        return { toast: { type: 'info', content: draft.nativeEntry || draft.nativeFormLink ? '已收起本次入口，平台工单不受影响' : '已取消，尚未提交工单' },
+          ...(draft.visibility === 'thread' ? { afterAck: () => refreshOncallFormCard(appId, draft.id, owner) } : {}) };
       }
       if (value.version !== draft.version) {
         if (draft.visibility === 'thread' && Number.isSafeInteger(value.version) && value.version < draft.version && draft.messageId) {
           return { toast: { type: 'info', content: '已恢复当前分类选择，请基于最新卡片继续' },
-            deferredCard: { type: 'raw', data: JSON.parse(buildOncallFormCard(draft)) } };
+            afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
         }
         throw new Error('请使用最新的分类卡片');
       }
@@ -363,6 +543,8 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         await refreshOncallSessionCard(source);
         return { toast: { type: 'info', content: old.status === 'succeeded' ? '此会话已有人工群，请从结果卡进入' : '已有请求待确认，请勿重复提交' } };
       }
+      if (draft.nativeEntry) return { toast: { type: 'info', content: '此分类已转由平台表单填写，请从当前卡片继续' },
+        afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
       const previousDraft = { ...draft };
       const option = typeof data.action?.option === 'string' ? data.action.option : undefined;
       if (value.action === 'oncall_group_form_region') {
@@ -380,37 +562,62 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         const deployment = readOncallDeploymentEnv();
         const target = loadOncallGroupTarget(config.session.dataDir, appId, deployment);
         const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
-        const sender = await resolveSender(appId, owner, 'user');
-        const username = oncallUsername(sender?.email, target);
+        const username = await resolveOncallUsername(appId, data.operator, target, deployment);
         if (!draft.typeId || !draft.region) throw new Error('请完成问题区域和分类选择');
-        await validateOncallSelection(target, secret, username, draft.region, draft.typeId);
+        const selection = await validateOncallSelection(target, secret, username, draft.region, draft.typeId);
         // Selection may have loaded while another process claimed this question.
         const currentPolicy = getBot(appId).config.oncallGroup;
+        const currentPolicySnapshot = JSON.stringify(currentPolicy);
         if (!classifiedCardPolicy(currentPolicy, draft)
           || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
+        if (selection.requiresNativeForm) {
+          const nativeLink = await createNativeOncallLink(target, secret, '', draft.description, bot.brand, fetch,
+            { region: draft.region, typeId: selection.id, priority: draft.priority, formId: draft.id });
+          if (JSON.stringify(getBot(appId).config.oncallGroup) !== currentPolicySnapshot
+            || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
+          const concurrentRequest = store.getRequest(source);
+          if (concurrentRequest && concurrentRequest.status !== 'failed') {
+            return { toast: { type: 'info', content: '此会话已有请求，请从结果卡继续' } };
+          }
+          draft.nativeEntry = { href: nativeLink, categoryName: selection.name, policyFingerprint: currentPolicySnapshot };
+          draft.oncallUsername = username;
+          recordNativeSubmissionAttempt(draft, {
+            sourceLocation: new URL(nativeLink).searchParams.get('url')!.slice(0, 200), username,
+            preparedAtMs: Date.now(), policyFingerprint: currentPolicySnapshot, forwardMode: currentPolicy?.forwardMode ?? 'individual',
+            typeId: selection.id, region: draft.region,
+          });
+          draft.targetFingerprint = JSON.stringify(target);
+          draft.version++;
+          persist();
+          return { toast: { type: 'info', content: '请从当前分类卡打开人工 Oncall 表单，补充信息并提交' },
+            afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
+        }
         const snapshot = await snapshotOncallConversation(source);
-        if (JSON.stringify(getBot(appId).config.oncallGroup) !== JSON.stringify(currentPolicy)
+        if (JSON.stringify(getBot(appId).config.oncallGroup) !== currentPolicySnapshot
           || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
-        if (!store.claim(source, owner, snapshot)) return { toast: { type: 'info', content: '此会话已有请求，请勿重复提交' } };
+        if (!store.claim(source, owner, snapshot, { target, username, region: draft.region, typeId: draft.typeId, formId: draft.id })) {
+          return { toast: { type: 'info', content: '此会话已有请求，请勿重复提交' } };
+        }
         const attemptId = store.getRequest(source)?.attemptId;
         try {
           const result = await createOncallGroup(target, secret, username, draft.description, fetch,
-            { region: draft.region, typeId: draft.typeId, priority: draft.priority });
-          store.finish(source, { status: 'succeeded', ...result }, attemptId);
+            { region: draft.region, typeId: draft.typeId, priority: draft.priority }, attemptId);
+          store.finish(source, { status: 'succeeded', ...result, formClosePending: true }, attemptId);
           draft.closed = true;
           persist();
           await refreshOncallSessionCard(source).catch(() => {});
           await forwardOncallConversation(source);
           await refreshOncallSessionCard(source).catch(() => {});
-          if (draft.visibility !== 'thread') await closeOncallForm(draft, true);
+          if (draft.visibility !== 'thread') await writeOncallFormDraft(draft, persist);
           const request = store.getRequest(source);
           const noForward = request?.forwardMode === 'none';
           const complete = !!request && (noForward || (!request.conversationScopePending && request.handoffError !== 'restricted_merge' && pendingOncallMessageIds(request).length === 0));
           return { toast: { type: complete ? 'success' : 'warning', content: noForward ? '人工 Oncall 已发起，未自动转交对话'
             : request?.handoffError === 'restricted_merge' ? 'Oncall 群已创建，对话含受限消息，无法合并转交'
               : complete ? '人工 Oncall 已发起，对话交接已完成' : 'Oncall 群已创建，部分对话尚待转交，请查看最新回复卡' },
-            ...(draft.visibility === 'thread' ? { afterAck: () => closeOncallForm(draft, true) } : {}) };
+            ...(draft.visibility === 'thread' ? { afterAck: () => refreshOncallFormCard(appId, draft.id, owner) } : {}) };
         } catch (error) {
+          logOncallCreationFailure(error, store.getRequest(source)?.submittedAtMs);
           if (store.getRequest(source)?.status !== 'succeeded') store.finish(source, {
             status: error instanceof OncallGroupApiError && !error.uncertain ? 'failed' : 'unknown',
           }, attemptId);
@@ -418,6 +625,14 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
           throw error;
         }
       } else throw new Error('未知表单操作');
+      try {
+        await prepareSelectedNativeForm(draft, draft.oncallUsername, async () => {
+          const deployment = readOncallDeploymentEnv();
+          const target = loadOncallGroupTarget(config.session.dataDir, appId, deployment);
+          return resolveOncallUsername(appId, data.operator, target, deployment);
+        });
+      }
+      catch (error) { for (const key of Object.keys(draft)) delete (draft as any)[key]; Object.assign(draft, previousDraft); throw error; }
       // Ephemeral cards cannot be PATCHed. Publish the replacement first and
       // then retire the old card; version checks reject every stale callback.
       const priorId = draft.messageId;
@@ -427,9 +642,11 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         // Lark applies callback completion after PATCH and can restore the old card.
         // Persist first; the dispatcher publishes this card after acknowledging.
         return { toast: { type: 'info', content: '已更新分类选择' },
-          deferredCard: { type: 'raw', data: JSON.parse(buildOncallFormCard(draft)) } };
+          afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
       }
-      try { draft.messageId = await client.sendEphemeralCard(appId, source.chatId, owner, buildOncallFormCard(draft)); }
+      try { draft.messageId = draft.nativeFormLink
+        ? await client.sendEphemeralCard(appId, source.chatId, owner, buildOncallFormCard(draft), { beforeWrite: () => assertOncallFormCurrent(draft) })
+        : await client.sendEphemeralCard(appId, source.chatId, owner, buildOncallFormCard(draft)); }
       catch (error) { for (const key of Object.keys(draft)) delete (draft as any)[key]; Object.assign(draft, previousDraft); throw error; }
       if (priorId) await client.deleteEphemeralCard(appId, priorId);
       return { toast: { type: 'info', content: '已保存选择，仅你可见' } };
@@ -437,8 +654,38 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
   } catch (error) { return oncallError(error); }
 }
 
-export async function refreshOncallSessionCard(source: OncallGroupSource): Promise<void> {
+/** One permanent invitation per created group; failures never recreate a ticket. */
+export async function prepareOncallGroupInvite(source: OncallGroupSource): Promise<void> {
   const groups = new OncallGroupStore(config.session.dataDir);
+  await withFileLock(join(config.session.dataDir, 'oncall-groups', `invite-${groups.handoffKey(source)}`), async () => {
+    const request = groups.getRequest(source);
+    if (request?.status !== 'succeeded' || !request.openChatId || request.inviteLink) return;
+    const { getChatInviteLink } = await import('./client.js');
+    const inviteLink = await getChatInviteLink(source.appId, request.openChatId);
+    groups.finish(source, { status: 'succeeded', openChatId: request.openChatId, inviteLink }, request.attemptId);
+  });
+}
+
+/** Cards that can never be updated again: withdrawn (also as recorded by the
+ * reply-card store, or blocked under the stop topic policy) or past Lark's edit window. */
+function oncallCardUnchangeable(error: unknown): 'expired' | 'gone' | undefined {
+  if (!(error instanceof Error)) return undefined;
+  if (error.name === 'MessageUpdateExpiredError') return 'expired';
+  if (error.name === 'MessageWithdrawnError' || error.name === 'ReplyCardWithdrawnError') return 'gone';
+  return error.name === 'TopicSendError' && (error as { code?: string }).code === 'TOPIC_SEND_BLOCKED' ? 'gone' : undefined;
+}
+
+export async function refreshOncallSessionCard(source: OncallGroupSource, options: {
+  /** The reconcile loop prepares invitations itself, under its own backoff. */
+  prepareInvite?: boolean;
+  /** Called for each card that is past Lark's edit window. */
+  onExpired?: (messageId: string) => void;
+  beforeWrite?: () => void;
+} = {}): Promise<void> {
+  const groups = new OncallGroupStore(config.session.dataDir);
+  if (options.prepareInvite !== false) {
+    await prepareOncallGroupInvite(source).catch(() => logger.warn('[oncall-group] Native group invitation is unavailable; retrying with the existing group'));
+  }
   const beforeRefresh = groups.getRequest(source);
   const { TurnReplyCardStore } = await import('../../services/turn-reply-card.js');
   const client = await import('./client.js');
@@ -448,28 +695,33 @@ export async function refreshOncallSessionCard(source: OncallGroupSource): Promi
   for (const carrier of carriers) {
     const key = carrier.sessionId ? { larkAppId: carrier.appId, sessionId: carrier.sessionId,
       turnId: carrier.questionId, dispatchAttempt: carrier.dispatchAttempt } : undefined;
-    const context: OncallCardContext | undefined = carrier.sessionId ? { appId: carrier.appId, sessionId: carrier.sessionId,
-      questionId: carrier.questionId, phase: 'final', nativeLink: carrier.nativeLink, messageId: carrier.messageId } : undefined;
+    const context: OncallCardContext = { appId: carrier.appId, sessionId: carrier.sessionId,
+      questionId: carrier.questionId, phase: 'final', nativeLink: carrier.nativeLink, messageId: carrier.messageId };
     const compose = (raw: string) => attachOncallGroupButton(raw, getBot(carrier.appId).config.oncallGroup, carrier.chatId, 'group', context);
+    const patch = (id: string, card: string) => options.beforeWrite
+      ? client.updateMessage(carrier.appId, id, card, { beforeWrite: options.beforeWrite }) : client.updateMessage(carrier.appId, id, card);
     const record = key ? cards.read(key) : undefined;
     try {
       if (key && record?.messageId === carrier.messageId) {
         const { buildTurnReplyCard, replyCardPresentation } = await import('./turn-reply-card.js');
         await cards.update(key, { kind: 'refresh' }, {
           beforeEffect: () => {
+            options.beforeWrite?.();
             const current = groups.findSource(carrier.appId, carrier.messageId);
             if (current?.chatId !== carrier.chatId || current.questionId !== carrier.questionId) throw new Error('Reply card question changed');
           },
           send: async () => { throw new Error('An Oncall refresh cannot create a reply card'); },
-          patch: (id, card) => client.updateMessage(carrier.appId, id, card),
+          patch,
           isWithdrawn: () => false,
           render: state => compose(buildTurnReplyCard(state, { ...replyCardPresentation(getBot(carrier.appId).config, carrier.chatId), canStop: false })),
         });
       } else if (carrier.cardJson) {
-        await client.updateMessage(carrier.appId, carrier.messageId, compose(carrier.cardJson));
+        await patch(carrier.messageId, compose(carrier.cardJson));
       }
     } catch (error) {
-      if (!(error instanceof Error && error.name === 'MessageWithdrawnError')) failures.push(error);
+      const unchangeable = oncallCardUnchangeable(error);
+      if (!unchangeable) failures.push(error);
+      else if (unchangeable === 'expired') options.onExpired?.(carrier.messageId);
     }
   }
   if (failures.length) throw new AggregateError(failures, '部分结果卡的人工入口更新失败，将重试');
@@ -609,15 +861,187 @@ export async function forwardOncallConversation(source: OncallGroupSource, owns:
   }, { maxWaitMs: 60_000 });
 }
 
-export async function retryPendingOncallHandoffs(appId: string, owns: () => boolean = () => true): Promise<void> {
+const ONCALL_HANDOFF_WINDOW_MS = 24 * 60 * 60_000;
+const ONCALL_REPAIR_RETRY_MAX_MS = 30 * 60_000;
+/** A late bot join gives no other signal in a no-forwarding handoff. */
+const ONCALL_ACTIVE_REPAIR_RETRY_MAX_MS = 2 * 60_000;
+interface OncallRepairRetry { failures: number; nextAtMs: number; state: string }
+/** Per app, per created group: the request state at the last failed repair and
+ * when the same state may be retried. In memory, so a restart retries once. */
+const oncallRepairRetries = new Map<string, Map<string, OncallRepairRetry>>();
+
+async function reconcileOncallCreation(source: OncallGroupSource, owns: () => boolean): Promise<void> {
   const store = new OncallGroupStore(config.session.dataDir);
-  for (const source of store.pendingHandoffs(appId)) {
+  await withFileLock(join(config.session.dataDir, 'oncall-groups', `creation-${store.handoffKey(source)}`), async () => {
+    const request = store.getRequest(source);
+    if (!request?.creation || !request.attemptId || !['pending', 'unknown'].includes(request.status)) return;
+    // Let the ordinary callback finish first. Only a stranded pending claim needs lookup.
+    if (request.status === 'pending' && Date.now() - (request.submittedAtMs ?? 0) < ONCALL_GROUP_CREATE_TIMEOUT_MS + 5_000) return;
+    const allowed = () => owns() && oncallGroupEnabled(getBot(source.appId).config.oncallGroup, source.chatId)
+      && JSON.stringify(loadOncallGroupTarget(config.session.dataDir, source.appId)) === JSON.stringify(request.creation!.target);
+    if (!allowed()) return;
+    const secret = readOncallDeploymentEnv().ONCALL_SERVICE_SECRET?.trim() ?? '';
+    const result = await readOncallGroupResult(request.creation, secret, request.attemptId);
+    if (!result || !allowed()) return;
+    const current = store.getRequest(source);
+    if (current?.attemptId !== request.attemptId || !['pending', 'unknown'].includes(current.status)
+      || JSON.stringify(current.creation) !== JSON.stringify(request.creation)) return;
+    store.finish(source, { status: 'succeeded', ...result, formClosePending: !!request.creation.formId }, request.attemptId);
+  }, { maxWaitMs: 1000 });
+}
+
+async function closeRecoveredOncallForm(source: OncallGroupSource, owns: () => boolean): Promise<void> {
+  const store = new OncallGroupStore(config.session.dataDir);
+  const request = store.getRequest(source);
+  if (!request?.formClosePending || !request.creation?.formId || !request.operatorOpenId) return;
+  // Interaction expiry must not discard cleanup owed by an already submitted request.
+  await new OncallFormStore(config.session.dataDir).use(source.appId, request.creation.formId, request.operatorOpenId, async (draft, persist) => {
+    const current = store.getRequest(source);
+    if (!owns() || !current || current.attemptId !== request.attemptId || current.status !== 'succeeded' || !current.formClosePending) return;
+    if (draft.source.chatId !== source.chatId || draft.source.sessionId !== source.sessionId
+      || draft.source.questionId !== current.questionId || draft.source.messageId !== current.sourceMessageId) throw new Error('恢复请求与分类表单不匹配');
+    draft.closed = true;
+    persist();
+    await writeOncallFormDraft(draft, persist, owns);
+  }, { allowClosed: true, allowExpired: true });
+}
+
+const nativeSubmissionChecks = new Map<string, number>();
+
+/** Recover platform submissions into the same durable handoff used by ordinary categories. */
+export async function reconcileNativeOncallSubmissions(appId: string, owns: () => boolean = () => true): Promise<void> {
+  const forms = new OncallFormStore(config.session.dataDir);
+  const groups = new OncallGroupStore(config.session.dataDir);
+  const pending = forms.pendingNativeSubmissions(appId);
+  const keys = new Set(pending.map(draft => JSON.stringify([config.session.dataDir, appId, draft.id])));
+  for (const key of nativeSubmissionChecks.keys()) {
+    const parts = JSON.parse(key);
+    if (parts[0] === config.session.dataDir && parts[1] === appId && !keys.has(key)) nativeSubmissionChecks.delete(key);
+  }
+  for (const candidate of pending) {
     if (!owns()) return;
-    if (!oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId)) continue;
-    const before = JSON.stringify(store.getRequest(source));
+    const key = JSON.stringify([config.session.dataDir, appId, candidate.id]);
+    if (Date.now() < (nativeSubmissionChecks.get(key) ?? 0)) continue;
+    nativeSubmissionChecks.set(key, Date.now() + 15_000);
     try {
-      await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
-      if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) await refreshOncallSessionCard(source);
-    } catch { logger.warn('[oncall-group] Handoff reconciliation will retry; no new group is created'); }
+      await forms.use(appId, candidate.id, candidate.ownerOpenId, async (draft, persist) => {
+        const submission = draft.nativeSubmission;
+        if (!submission?.attempts.length || submission.completed) return;
+        const target = loadOncallGroupTarget(config.session.dataDir, appId);
+        const assertCurrent = (attempt?: OncallNativeSubmissionAttempt) => {
+          const policySnapshot = JSON.stringify(getBot(appId).config.oncallGroup);
+          if (!owns() || !classifiedCardPolicy(getBot(appId).config.oncallGroup, draft)
+            || (attempt && policySnapshot !== attempt.policyFingerprint)
+            || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== draft.targetFingerprint) {
+            throw new Error('原生提单配置已变化，暂不关联或转交');
+          }
+        };
+        assertCurrent();
+        const policySnapshot = JSON.stringify(getBot(appId).config.oncallGroup);
+        const eligibleAttempts = submission.attempts.filter(item => item.policyFingerprint === policySnapshot);
+        if (!eligibleAttempts.length) throw new Error('原生提单配置已变化，暂不关联或转交');
+        const request = groups.getRequest(draft.source);
+        let completionAttempt = eligibleAttempts.at(-1)!;
+        if (!request || request.status === 'failed') {
+          if (draft.closed) return;
+          const secret = readOncallDeploymentEnv().ONCALL_SERVICE_SECRET?.trim() ?? '';
+          const candidates = eligibleAttempts.length === 1
+            ? await readNativeOncallResult(target, secret, eligibleAttempts[0]!)
+              .then(result => result ? [{ attempt: eligibleAttempts[0]!, result }] : [])
+            : await readNativeOncallResultCandidates(target, secret, eligibleAttempts);
+          if (!candidates.length) return;
+          const valid = candidates.filter(({ attempt, result }) => result.launchedAtMs >= Math.floor(attempt.preparedAtMs / 1000) * 1000
+            && result.launchedAtMs <= Date.now());
+          if (!valid.length) throw new Error('提单时间与原生表单不匹配');
+          // Candidates share the one verified platform order. Prefer the latest
+          // published selection whose preparation window contains its submit time.
+          const chosen = valid.sort((a, b) => b.attempt.preparedAtMs - a.attempt.preparedAtMs)[0]!;
+          completionAttempt = chosen.attempt;
+          assertCurrent(chosen.attempt);
+          const snapshot = await snapshotOncallConversation(draft.source, {
+            cutoffMs: chosen.result.launchedAtMs, forwardMode: chosen.attempt.forwardMode,
+          });
+          assertCurrent(chosen.attempt);
+          const { flowId, openChatId } = chosen.result;
+          if (!groups.adoptNativeGroup(draft.source, draft.ownerOpenId, { flowId, openChatId }, snapshot)) return;
+        } else if (request.status !== 'succeeded') return;
+        // Adoption is atomic. If PATCH/withdraw fails, the next pass retires the
+        // form from the existing request; it never creates or reclaims a ticket.
+        draft.closed = true;
+        persist();
+        assertCurrent(completionAttempt);
+        await writeOncallFormDraft(draft, persist, owns);
+        assertCurrent(completionAttempt);
+        submission.completed = true;
+        persist();
+        nativeSubmissionChecks.delete(key);
+      }, { allowClosed: true });
+    } catch {
+      nativeSubmissionChecks.set(key, Date.now() + 60_000);
+      logger.warn('[oncall-group] Native submission reconciliation will retry; no new ticket is created');
+    }
+  }
+}
+
+export async function retryPendingOncallHandoffs(appId: string, owns: () => boolean = () => true): Promise<void> {
+  await reconcileNativeOncallSubmissions(appId, owns);
+  const store = new OncallGroupStore(config.session.dataDir);
+  const pending = store.pendingHandoffs(appId);
+  const retries = oncallRepairRetries.get(appId) ?? new Map<string, OncallRepairRetry>();
+  oncallRepairRetries.set(appId, retries);
+  const pendingKeys = new Set(pending.map(source => store.handoffKey(source)));
+  for (const key of retries.keys()) if (!pendingKeys.has(key)) retries.delete(key);
+  for (const source of pending) {
+    if (!owns()) return;
+    const key = store.handoffKey(source);
+    let before = JSON.stringify(store.getRequest(source));
+    const handoffOpen = Date.now() - (store.getRequest(source)?.submittedAtMs ?? 0) < ONCALL_HANDOFF_WINDOW_MS;
+    // A lasting invitation failure (no share permission, bot left the group) or,
+    // for old groups, a lasting card failure must not repeat every cycle. Any
+    // change to the request (bot joined, receipt, a click repaired the invite)
+    // retries at once. Forwarding inside the handoff window keeps its 5 s cycle.
+    const retry = retries.get(key);
+    let waiting = !!retry && retry.state === before && Date.now() < retry.nextAtMs;
+    if (store.getRequest(source)?.status !== 'succeeded') {
+      if (waiting) continue;
+      // An overlapping tick must not start a second lookup while this one awaits I/O.
+      retries.set(key, { failures: 0, state: before, nextAtMs: Infinity });
+      let failed = false;
+      try { await reconcileOncallCreation(source, owns); }
+      catch { failed = true; logger.warn('[oncall-group] Create result reconciliation will retry; no new group is created'); }
+      if (store.getRequest(source)?.status !== 'succeeded') {
+        retries.set(key, { failures: 0, state: JSON.stringify(store.getRequest(source)), nextAtMs: Date.now() + (failed ? 60_000 : 15_000) });
+        continue;
+      }
+      retries.delete(key);
+      before = JSON.stringify(store.getRequest(source));
+      waiting = false;
+    }
+    if (!owns()) return;
+    if (waiting && !handoffOpen) continue;
+    let inviteFailed = false;
+    let refreshFailed = false;
+    try {
+      if (!waiting) await prepareOncallGroupInvite(source).catch(() => { inviteFailed = true; });
+      // Backfill old invite buttons without re-opening the expired handoff window,
+      // and check membership only when conversation forwarding is still owed.
+      const current = store.getRequest(source);
+      if (handoffOpen && current && oncallForwardingPending(current)) {
+        await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
+      }
+      if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) {
+        await refreshOncallSessionCard(source, { prepareInvite: false }).catch(error => { refreshFailed = true; throw error; });
+      }
+      if (owns()) await closeRecoveredOncallForm(source, owns).catch(error => { refreshFailed = true; throw error; });
+    } catch {
+      logger.warn('[oncall-group] Handoff reconciliation will retry; no new group is created');
+    }
+    if (inviteFailed || (refreshFailed && !handoffOpen)) {
+      const failures = (retry?.failures ?? 0) + 1;
+      const maxWaitMs = handoffOpen && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId)
+        ? ONCALL_ACTIVE_REPAIR_RETRY_MAX_MS : ONCALL_REPAIR_RETRY_MAX_MS;
+      retries.set(key, { failures, state: JSON.stringify(store.getRequest(source)),
+        nextAtMs: Date.now() + Math.min(maxWaitMs, 5_000 * 2 ** failures) });
+    } else if (!waiting) retries.delete(key);
   }
 }

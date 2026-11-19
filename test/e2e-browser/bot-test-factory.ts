@@ -38,6 +38,7 @@ import {
   waitForModelTextReply,
   scrollThreadToBottom,
   closeSession,
+  reopenTopic,
   type BotName,
 } from './helpers.js';
 import { publishLabeledPageVideo } from './e2e-video.js';
@@ -120,7 +121,7 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       // The ACK bubble is now the last item. showStreamingOutput scrolls the
       // streaming card itself into view; scrolling to the thread bottom
       // hides that card behind the bubble.
-      await showStreamingOutput(agent, page);
+      await showStreamingOutput(agent, page, { reopen: reopenTopic(agent, page, msg) });
     }, timeoutMs);
   });
 }

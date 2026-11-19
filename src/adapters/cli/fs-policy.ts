@@ -1363,14 +1363,39 @@ export interface SymlinkProbe {
  * narrowed by a baseline candidate). A dangling baseline link is dropped —
  * nothing to expose. Only a link whose PARENT is already canonical is
  * rebuilt; deeper aliasing is left untouched (as before). Pure given `io`.
+ *
+ * A SYSTEM directory (a top-level baseline entry: `/opt`, `/usr`, `/etc`)
+ * carries its grant over to the real path only when that path is a relocated
+ * copy of the same directory — same last path component (`/opt ->
+ * /data00/opt`). Then the target holds exactly what `/opt` holds on any other
+ * host and binding it grants nothing extra. Anything else — `/opt -> /data00`
+ * (a whole data disk, the stock devbox layout), a differently named dir, `/` —
+ * is NOT a system tree: the baseline knows nothing about what else lives
+ * there (projects, logs, other users' checkouts), so granting it would turn
+ * "the toolchain dir is readable" into "that whole disk is readable". Such a
+ * link is recreated WITHOUT its grant (`withheld`): parts of the target that
+ * another rule grants (workingDir, CLI/runtime dirs, user sandboxPaths — all
+ * canonical, and rules lexically under the link are still moved) stay
+ * reachable under both names, the rest is denied by default. Home-level
+ * entries (`~/.cache`, …) keep the plain relocation: they are per-user
+ * tool/cache dirs, commonly moved to a data disk as a dedicated dir under
+ * another name, and withholding a readWrite cache would break the CLI.
  */
 export function relocateSymlinkedBaselineRules(
   rules: readonly FsRule[],
   io: SymlinkProbe,
-): { rules: FsRule[]; symlinks: { path: string; target: string }[] } {
+): {
+  rules: FsRule[];
+  symlinks: { path: string; target: string }[];
+  /** System-dir links recreated WITHOUT carrying their grant to the target.
+   *  Present only when there is at least one (for the caller's log line). */
+  withheld?: { path: string; target: string }[];
+} {
   const symlinks: { path: string; target: string }[] = [];
+  const withheld: { path: string; target: string }[] = [];
   const moves: { from: string; to: string }[] = [];
   const dropped = new Set<string>();
+  const lastSegment = (p: string) => p.slice(p.lastIndexOf('/') + 1);
   for (const r of rules) {
     if (r.source !== 'baseline' || r.access === 'deny' || r.path === '/') continue;
     if (!io.isSymlink(r.path)) continue;
@@ -1378,10 +1403,17 @@ export function relocateSymlinkedBaselineRules(
     if (io.realpath(parent) !== parent) continue;
     const target = io.realpath(r.path);
     if (!target) { dropped.add(r.path); continue; }
-    if (target === r.path || coversPath(r.path, target) || coversPath(target, r.path)) continue;
+    const systemDir = parent === '/';
+    if (target === r.path || coversPath(r.path, target)) continue;
+    // Only `/` covers a top-level path: a system link to `/` is withheld below.
+    if (coversPath(target, r.path) && !systemDir) continue;
     if (symlinks.some(l => l.path === r.path)) continue;
     symlinks.push({ path: r.path, target });
     moves.push({ from: r.path, to: target });
+    if (systemDir && lastSegment(target) !== lastSegment(r.path)) {
+      withheld.push({ path: r.path, target });
+      dropped.add(r.path);
+    }
   }
   if (!moves.length && !dropped.size) return { rules: [...rules], symlinks };
   const byPath = new Map<string, FsRule>();
@@ -1389,14 +1421,15 @@ export function relocateSymlinkedBaselineRules(
     if (dropped.has(r.path)) continue;
     const move = moves.find(m => coversPath(m.from, r.path));
     if (!move) { byPath.set(r.path, r); continue; }
-    const path = move.to + r.path.slice(move.from.length);
+    const rest = r.path.slice(move.from.length);
+    const path = move.to === '/' ? rest || '/' : move.to + rest;
     // A rule already naming the real path wins whichever order it comes in: an
     // earlier one is kept here, a later one overwrites below via set().
     if (!byPath.has(path)) byPath.set(path, { ...r, path });
   }
   const out = [...byPath.values()].sort((a, b) =>
     pathDepth(a.path) - pathDepth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { rules: out, symlinks };
+  return { rules: out, symlinks, ...(withheld.length ? { withheld } : {}) };
 }
 
 export interface CompileBwrapOpts {

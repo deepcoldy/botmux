@@ -73,6 +73,7 @@ Two bots, one on Claude Code and one on Codex:
 | Block someone | `blockedUsers` |
 | Limit which files the agent can read and write | `sandbox` (see [File sandbox](/en/sandbox)) |
 | The live card is too noisy | `disableStreamingCard`, `hiddenStreamingCardButtons` |
+| Keep host paths and local addresses out of replies for a bot others use | `hideLocalAddresses` (see [Hide development host addresses](#hide-local-addresses)) |
 | One card per turn for both progress and answer | `replyCardMode: "unified"` |
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
 | DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
@@ -101,7 +102,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `displayName` | Nickname shown in the Dashboard. Display only; it does not rename the app in Feishu |
 | `cliId` | Which CLI to run. Defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) for the options. `gemini` has been removed: a bot still set to `"gemini"` refuses to start and tells you to switch to `"antigravity"` |
 | `model` | Model passed to the CLI at launch (e.g. `claude --model opus`); empty means the CLI's own default. Several bots on the same CLI can run different models. It is read every time a session starts or resumes, so after a change, existing sessions without a per-group model pick up the new model on their next resume |
-| `reasoningEffort` | Default reasoning effort for new sessions: `low` / `medium` / `high` / `xhigh` / `max` / `ultra`. Supported CLIs: Claude Code, Codex, Codex App, TraeX, Grok, Kimi, ZCode, `remote-runner`. Checked against the CLI and model; unsupported combinations are ignored. For example, Kimi only applies with model `kimi-code/k3` or `kimi-code/k3-256k`, and only has `low` / `high` / `max`; Claude's Haiku models take no reasoning effort |
+| `reasoningEffort` | Default reasoning effort for new sessions: `low` / `medium` / `high` / `xhigh` / `max` / `ultra`. Supported CLIs: Claude Code, Codex, Codex App, TraeX, Grok, Kimi, ZCode, Doubao, `remote-runner`. Checked against the CLI and model; unsupported combinations are ignored. For example, Kimi only applies with model `kimi-code/k3` or `kimi-code/k3-256k`, and only has `low` / `high` / `max`; Claude's Haiku models take no reasoning effort |
 | `groupDefaultModels` | Per-group default model for new topics; Codex and Claude Code for now. See [Per-group default model](#group-default-models) below |
 | `serviceTier` | Codex only: speed tier for new sessions, `default` / `priority` / `ultrafast`. Empty keeps Codex's own setting |
 | `codexProfile` | Codex only: Codex config profile name; the Dashboard can scan and list them |
@@ -113,6 +114,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `cliConfigDir` | Claude Code only: launch with `CLAUDE_CONFIG_DIR=<dir>`, so settings, login and transcripts all come from that directory. New sessions only |
 | `disableCliBypass` | `true` stops botmux from adding approval-bypass flags such as `--yolo` and `--dangerously-*` |
 | `promptCache` | Claude Code only: prompt-cache lifetime and idle keep-alive, e.g. `{"ttl":"1h","keepalive":{"enabled":true}}`. Fields you leave out follow the global setting; off by default |
+| `providerRecovery` | Claude Code only: continue automatically after a transient model-service failure, e.g. `{"enabled":true,"maxWaitMinutes":30}`. Fields you leave out follow the global setting; off by default. See [Global settings: auto-continue after provider failures](/global-settings#provider-recovery) |
 | `skillInjection` | How botmux's built-in skills reach the CLI: `prompt` (per session), `global` (installed into the CLI's global skills dir), or `off`. If unset, it follows the global setting, which defaults to `prompt`. See [Skills](/en/skill-cli) |
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |
@@ -336,7 +338,8 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
     "enabled": true,
     "intervalMinutes": 30,
     "text": "This session is waiting for you. Please follow up.",
-    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"]
+    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"],
+    "quietHours": { "enabled": false, "start": "22:00", "end": "09:00" }
   }
 }
 ```
@@ -347,10 +350,12 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 | `intervalMinutes` | Reminder interval in minutes, default 30, range 1–10080 |
 | `text` | Reminder text, up to 500 characters, no `<at>` tags |
 | `states` | Which states trigger reminders: `idle` (CLI idle), `dormant` (session suspended), `pending_repo` (waiting for a repo choice), `tui_prompt` (waiting for a terminal choice), `agent_attention` (the agent asked for a person), `limited` (quota limited). Pick at least one when enabled |
+| `quietHours` | Optional. Off by default. If enabled, the default window is 22:00 to 09:00 the next day. Use `HH:mm` in the Botmux service's local time zone. The window can cross midnight |
 
 - Only sessions split by topic are reminded (topic groups, topics inside regular groups, and DMs with `p2pMode: "thread"`). A session shared by a whole group or a whole DM is not reminded. The session needs an owner.
 - While the state stays the same, it reminds once every `intervalMinutes`; a state change or a new message in the session restarts the timer.
-- When writing it by hand, include all four fields. A missing or invalid field makes the whole block count as unset (that is, off).
+- Quiet hours include the start time and end at the specified end time. Session activity and state are still tracked during the window. The first scan after it ends sends reminders that are still due.
+- Include `enabled`, `intervalMinutes`, `text`, and `states` when configuring by hand. If you provide `quietHours`, include all three of its fields and use different start and end times. An invalid configuration makes the full reminder setting count as unset.
 
 **`noProgressNotify`**: posts a reminder card when a turn shows no confirmed progress for a long time. It's only a reminder: it never restarts, interrupts or retries the task.
 
@@ -483,9 +488,10 @@ Pick one way to turn it on. It **takes effect for new sessions** (`/restart` an 
 Rules:
 
 - Only `"enabled": true` turns it on. Leaving out `tools` covers every tool; an unknown tool name is an error rather than a silent downgrade.
+- Optional `capabilities` switches each capability separately: `lark-user` (Feishu user identity, `lark-cli --as user`), `bytecloud` (ByteCloud: bytedcli, codebase, git push and bitscli / bits-cli, one switch) and `meego` (`bytedcli meego` only; the standalone `meegle` command is not governed). An unknown value is an error. When absent it is derived from `tools` (`lark-cli` → `lark-user`, `bytedcli` → `bytecloud` + `meego`). With `bytecloud` or `meego` left off the matching commands stay native: they run on this machine's own login with no botmux involvement. With `lark-user` left off there are two cases: a legacy config that only sets `tools` (with no `capabilities`) keeps the upstream behavior, where `lark-cli --as user` uses the current turn sender's own authorization; only when `capabilities` is set explicitly without `lark-user` does `lark-cli --as user` run natively on this machine's own lark-cli config and login, with botmux injecting no credentials and issuing no authorization request (`botmux auth request` returns `lark_user_auth_disabled` for lark-cli).
 - When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
-- It never falls back to running as the bot or as anyone else. `bytedcli` has no bot identity, so an unauthorized call simply fails.
-- Optional fields: `credentialSource` (`auto` by default / `platform` central platform only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
+- It never falls back to running as the bot or as anyone else, and there is no machine-login fallback option; a legacy `fallback` field in old configs is ignored. `bytedcli` has no bot identity, so an unauthorized call simply fails.
+- Optional fields: `credentialSource` (`auto` by default / `platform` [central platform](/en/platform) only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `allowSpeakerSwitch` (default `false`: when `true`, a multi-speaker topic lets you prefix a single command with `BOTMUX_AS=<open_id>` to run it as another speaker of the current turn; when off, the default, `BOTMUX_AS` is always refused), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
 
 #### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}
 
@@ -511,6 +517,7 @@ What the cards look like and what each switch does: see [Live streaming cards](/
 | `replyCardActions` | Show a compact action menu (open terminal / switch model / close session) on ordinary answer cards. Off by default |
 | `askOptionLayout` | Layout of `botmux ask` option buttons: `compact` (default, wraps) or `vertical` (one per row, easier for long options) |
 | `writableTerminalLinkInCard` | `true` puts a writable terminal link directly in the card (anyone who can see the card can drive the terminal). By default it's behind a "get write link" button and sent privately to whoever clicks |
+| `goalStatusCard` | `true` makes Codex / TRAE sessions post one goal status card when a native goal is set, updated in place with the status and the CLI-counted elapsed time. Off by default. Silent, private-reply, document and meeting sessions never show it |
 | `privateCard` | `true` makes `/card` send a private card visible only to admins; regular groups only, and it doesn't refresh live |
 | `silentTurnReactions` | `true` stops adding the GoGoGo / ✅ reactions in sessions with the live card turned off |
 | `receivedReactionEmoji` / `doneReactionEmoji` | Replace the "received" / "done" reactions (Feishu emoji_type); defaults `GoGoGo` / `DONE`. Setting both to the same value avoids an early ✅ when a CLI is judged idle too soon |
@@ -570,6 +577,7 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 | `replyDelivery` | How the final answer reaches Feishu. `send` (default for every CLI except Doubao): the model runs `botmux send` itself; `transcript`: botmux takes the turn's last answer from the CLI's session record and sends it. See below |
 | `senderTag` | On by default: every message forwarded to the CLI carries a `<sender ... />` tag saying who spoke. Only `false` turns it off |
 | `senderTagHideEmail` | Off by default. When on, the `<sender>` tag leaves out the email; name and ID stay |
+| `hideLocalAddresses` | Off by default: model replies reach Feishu as written. When on, host paths and local service addresses are kept out of replies. See [Hide development host addresses](#hide-local-addresses) below |
 | `promptInjection` | `"default"` (default) or `"none"`. `none` is zero-injection mode: botmux adds no system prompt or reminders, passes only the task and attachments, and forwards the final answer automatically. See below |
 | `envelopeInjection` | Claude Code only: `auto` moves the per-turn reminder into a hook, so the terminal input box shows only the message itself. Default `off` keeps it as is |
 | `topicUnavailablePolicy` | What to do when the original topic is deleted or unavailable. See [Topic unavailable policy](/en/topic-unavailable-policy) |
@@ -610,6 +618,23 @@ Without it the model can't tell who is speaking: in multi-person sessions it can
 - `botmux send --mention-back` (mention the person who sent this turn) is unaffected; it uses the daemon's own record of who triggered the turn.
 - Trade-off: Dashboard session insights can no longer tell the sender type from the tag, and `/adopt` loses one clue for recognizing botmux sessions.
 - The Dashboard "Speaker Tag" switch writes this field.
+
+### Hide development host addresses (`hideLocalAddresses`) {#hide-local-addresses}
+
+Feishu users read replies in their own client and cannot open files or services on the development host. Turn this on for a bot other people use; keep the default (off) for a bot only you use whose replies should show troubleshooting paths.
+
+```text
+/botconfig set hideLocalAddresses on
+/botconfig set hideLocalAddresses off
+```
+
+When off (the default), replies and cards are sent as written and no related rule is added to prompts. When on:
+
+- Before model output reaches Feishu (`botmux send`, the automatically forwarded final answer, unified reply cards, native thinking messages and document comment replies), absolute host paths, local schemes such as `file://` and local service addresses are replaced: source files under the working directory become repository-relative paths, everything else becomes an internal-file label, and skill links keep only their name. System paths that name no user file, such as `/dev/null` and `/proc`, stay.
+- The system prompt gets the full rule once per session and every turn's reminder gets one sentence, asking the model to leave such addresses out and deliver files as attachments or reachable links.
+- A card whose button or link points at this host is refused and the model gets `LOCAL_ADDRESS_OUTBOUND_REJECTED`; botmux's own Web terminal and Dashboard links are sent as usual.
+- Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next new session.
+- The Dashboard switch "Bot Config → Message Cards → Development host addresses" writes this field.
 
 ### Zero prompt injection (`promptInjection: "none"`)
 

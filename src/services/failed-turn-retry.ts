@@ -18,7 +18,15 @@ export const RETRY_COOLDOWN_MS = 10_000;
  *  when there is no CLI input to re-inject (e.g. a turn that died before its
  *  prompt was wrapped). */
 export function buildFailedTurnRecord(
-  terminal: { turnId: string; status: 'failed' | 'ambiguous'; errorCode?: string },
+  terminal: {
+    turnId: string;
+    status: 'failed' | 'ambiguous';
+    errorCode?: string;
+    /** turn_terminal `retryable`, kept for the failed-turn rewind decision. */
+    retryable?: boolean;
+    /** turn_terminal `directFailure`: nothing but API errors answered it. */
+    directFailure?: true;
+  },
   sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput;
     trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
   now: Date = new Date(),
@@ -32,6 +40,8 @@ export function buildFailedTurnRecord(
     failedAt: now.toISOString(),
     ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
     status: terminal.status,
+    ...(terminal.retryable !== undefined ? { retryable: terminal.retryable } : {}),
+    ...(terminal.directFailure && terminal.status === 'failed' ? { directFailure: true as const } : {}),
     retryCount: 0,
     ...(sources.silent ? { silent: true } : {}),
     ...(sources.trustedCaller ? { trustedCaller: { ...sources.trustedCaller } } : {}),

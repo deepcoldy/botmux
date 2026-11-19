@@ -4,6 +4,7 @@ botmux 会把「反馈数据」存在一个数据库里：用户对最终回答�
 
 - **默认用 SQLite**：一个本机文件 `botmux-feedback.sqlite`，放在 botmux 数据目录里（默认 `~/.botmux/data/`）。不用装任何东西，绝大多数人一直用它就够了。
 - **可以换成 PostgreSQL**：想集中存放、做备份或接入自己的分析系统时再换。
+- **也可以使用 Supabase**：通过官方 JavaScript SDK 与事务 RPC 存储反馈，支持从 SQLite 或 PostgreSQL 迁入。
 
 换存储的工具是 `botmux feedback storage` 命令和 Dashboard「反馈分析」页里的「反馈存储设置」面板，两边能做的事一样。
 
@@ -15,9 +16,40 @@ botmux 会把「反馈数据」存在一个数据库里：用户对最终回答�
 | 刚装好，就想用 PostgreSQL | 第一次启动时输入 `postgresql`，再给出配置文件路径（见[第 1 步](#第-1-步准备配置文件)） |
 | 已经在用 SQLite，**还没有任何反馈数据** | [仅空库：直接启用](#没有旧数据直接启用) |
 | 已经在用 SQLite，**有历史数据要带走** | [迁移](#第-3-步迁移)（需要一段停机时间） |
-| 已经在用 PostgreSQL，想换回 SQLite 或换另一个库 | 目前不支持，见[常见问题](#常见问题) |
+| 已经在用 PostgreSQL，想迁到 Supabase | 按下方 Supabase 流程迁移；保留原库，不自动回退 |
+| 已经在用 PostgreSQL，想换回 SQLite 或换另一个 PostgreSQL 库 | 目前不支持，见[常见问题](#常见问题) |
 
 > 第一次启动时如果不是在交互终端里（比如脚本里跑），会直接用 SQLite，不会提问。
+
+## Supabase 接入与迁移
+
+此后端使用 `@supabase/supabase-js`，将反馈修订、事件与投递队列联写封装成数据库事务函数。
+服务端密钥只保存引用，不回显；使用独立 schema，不向匿名或普通登录用户开放。
+
+```json
+{
+  "backend": "supabase",
+  "supabase": {
+    "url": "https://PROJECT.supabase.co",
+    "keyRef": "env:SUPABASE_KEY",
+    "schema": "botmux_feedback",
+    "requestTimeoutMs": 10000
+  }
+}
+```
+
+1. 用私有环境变量提供服务端 secret key，不把密钥写进命令行或仓库。
+2. `botmux feedback storage configure --config-file /secure/supabase.json` 仅保存候选，不切库。
+3. `botmux feedback storage supabase-schema > /secure/supabase.sql` 导出绑定原安装身份的 SQL；由管理员检查并在目标项目执行，同时配置独立 schema 的 Data API 暴露。
+4. `botmux feedback storage test` 验证保存的连接和安装身份。
+5. 单独批准维护窗口后，在独立宿主进程运行
+   `botmux feedback storage migrate --to supabase --yes --request-id ORIGINAL_REQUEST_ID`。
+6. 用 `status` 查看真实结果；中断使用原 `resume MIGRATION_ID`，不重新提交未知操作。
+
+SQLite 来源使用 WAL 一致快照，PostgreSQL 来源冻结原 schema 并直接导出；
+两者都校验反馈表、ID、修订顺序、事件序列与投递状态后才切换。
+原库与快照保留，已送达事件不重放。目标接收新写入后不可直接切回旧库。
+上述命令是操作说明，不代表安装时自动执行迁移。
 
 ## 迁移前先知道这三点
 

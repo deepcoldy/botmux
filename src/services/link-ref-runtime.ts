@@ -119,9 +119,12 @@ export function createLinkRefRuntime(
         const { linkRefs: _linkRefs, ...legacy } = payload;
         return legacy;
       }
-      const frozen: CliTurnPayload = { ...payload, linkRefs: { mode } };
+      const frozen: CliTurnPayload = { ...payload, linkRefs: {
+        mode,
+        ...(payload.linkRefs?.presentation ? { presentation: payload.linkRefs.presentation } : {}),
+      } };
       const result = runtime.registerSources({ key, mode, sources });
-      if (mode !== 'enabled' || !result.companion) return frozen;
+      if (mode !== 'enabled' || !result.companion || payload.linkRefs?.presentation === 'registry-only') return frozen;
       const additionalContext = { ...frozen.codexAppInput?.additionalContext };
       if (frozen.codexAppInput) {
         addCodexAppContext(additionalContext, 'botmux_link_refs', result.companion, 'untrusted');

@@ -79,6 +79,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
+      'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -123,9 +124,14 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   },
   { id: 'cross-bot', tab: 'sessions', titleKey: 'botDefaults.sectionCrossBot', fieldKeys: ['botDefaults.botToBotSameDir'] },
   { id: 'session-cap', tab: 'sessions', titleKey: 'botDefaults.sectionSessionCap', fieldKeys: ['botDefaults.maxLiveWorkers', 'botDefaults.idleSuspendMinutes'] },
+  // codex / codex-app（或留有显式覆盖的 Bot）才渲染，见 codexArchiveSectionVisible；覆盖全局 sessionCleanup.archiveCodex。
+  { id: 'codex-archive', tab: 'sessions', titleKey: 'botDefaults.sectionCodexArchive', fieldKeys: ['botDefaults.archiveCodexLabel'] },
   { id: 'prompt-cache', tab: 'sessions', titleKey: 'botDefaults.sectionPromptCache', fieldKeys: [
       'promptCache.ttl', 'promptCache.keepalive', 'promptCache.idleMinutes', 'promptCache.maxPings',
       'promptCache.activeHours', 'promptCache.minContextTokens',
+    ] },
+  { id: 'provider-recovery', tab: 'sessions', titleKey: 'botDefaults.sectionProviderRecovery', fieldKeys: [
+      'providerRecovery.enabled', 'providerRecovery.maxWaitMinutes',
     ] },
   { id: 'startup-commands', tab: 'sessions', titleKey: 'botDefaults.sectionStartupCommands' },
   { id: 'summary-trigger', tab: 'sessions', titleKey: 'botDefaults.sectionSummaryTrigger', fieldKeys: [
@@ -135,7 +141,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
   {
     id: 'grant',
@@ -159,9 +165,10 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'cards',
     titleKey: 'botDefaults.sectionCard',
     fieldKeys: [
-      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.pinStreamingCard',
+      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
+      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
+      'botDefaults.replyCardRecap', 'botDefaults.replyCardRecapModel',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
@@ -183,6 +190,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.replyStyleColor', 'botDefaults.replyStyleTag', 'botDefaults.replyStyleCustomTag',
     ],
   },
+  { id: 'local-address', tab: 'cards', titleKey: 'botDefaults.sectionLocalAddress', fieldKeys: ['botDefaults.hideLocalAddresses'] },
   { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
   { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
   { id: 'oncall', tab: 'cards', titleKey: 'botDefaults.sectionOncall' },
@@ -229,7 +237,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionRuntimeEnv',
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
-  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval', 'botDefaults.ownerReminderQuietHours', 'botDefaults.ownerReminderQuietHoursStart', 'botDefaults.ownerReminderQuietHoursEnd'] },
   { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
@@ -245,6 +253,26 @@ export function findBotDefaultsSection(id: string | null | undefined): BotDefaul
  * `#/bot-defaults?bot=<appId>&tab=<分类>&section=<区块>&field=<配置项>` 深链；都不给就是 Bot 配置页本身。
  * 给了区块就不必再给分类，页面按区块所在的分类切过去。
  */
+/** 为什么这个 Bot 的会话不会做 Codex 原生归档（与 daemon 侧 ownedLocalCodex 的 Bot 级条件对齐）；
+ *  null = 会按本设置归档。只用于提示，不拦保存：显式值仍作用于切换前启动、尚未关闭的旧会话。 */
+export type CodexArchiveInapplicable = 'not-codex' | 'wrapper' | 'scratch' | 'backend';
+
+export function codexArchiveInapplicableReason(
+  bot: Pick<BotDefaultsRow, 'cliId' | 'wrapperCli' | 'effectiveSandboxMode' | 'sandboxMode' | 'sandbox' | 'backendType' | 'defaultBackendType'>,
+): CodexArchiveInapplicable | null {
+  if (bot.cliId !== 'codex' && bot.cliId !== 'codex-app') return 'not-codex';
+  if (bot.wrapperCli) return 'wrapper';
+  if ((bot.effectiveSandboxMode ?? bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off')) === 'scratch') return 'scratch';
+  const backend = bot.backendType || bot.defaultBackendType;
+  if (backend && backend !== 'pty' && backend !== 'tmux') return 'backend';
+  return null;
+}
+
+/** Codex Bot 总是显示；其它 CLI 只在还留着显式覆盖时显示，保证残留值看得见、清得掉。 */
+export function codexArchiveSectionVisible(bot: Pick<BotDefaultsRow, 'cliId' | 'archiveCodex'>): boolean {
+  return bot.cliId === 'codex' || bot.cliId === 'codex-app' || typeof bot.archiveCodex === 'boolean';
+}
+
 export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab; section?: string; field?: string } = {}): string {
   const params = new URLSearchParams();
   if (target.bot) params.set('bot', target.bot);
@@ -323,6 +351,8 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Local/core-only bots have no Feishu transport. */
+  apiOnly?: boolean;
   /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
    *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
   brand?: string;
@@ -395,20 +425,29 @@ export type BotDefaultsRow = {
    *  (null: older daemon). Advice only; never blocks saving. */
   scratchCapability?: ScratchCapability | null;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Per-bot override of the global close/cleanup Codex archive switch; null = inherit. */
+  archiveCodex?: boolean | null;
+  /** Current global `sessionCleanup.archiveCodex`, shown on the inherit option. */
+  archiveCodexDefault?: boolean;
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
    *  gitHost / gitTokenExchangeUrl have no editor in the UI — they round-trip
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
-    fallback: 'bot-identity' | 'none';
+    tools?: Array<'lark-cli' | 'bytedcli'>;
+    /** Per-capability switches. The daemon fills it for stored tools-only configs. */
+    capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
+    /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
+    legacyCapabilities?: boolean;
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;
+    /** One command can run as another speaker of a multi-person turn. Absent = off. */
+    allowSpeakerSwitch?: boolean;
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
@@ -455,8 +494,12 @@ export type BotDefaultsRow = {
   codexBrowser?: boolean;
   codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
+  goalStatusCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
+  replyCardNextStep?: boolean;
+  replyCardRecap?: boolean;
+  replyCardRecapModel?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;
@@ -468,6 +511,8 @@ export type BotDefaultsRow = {
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
   senderTagHideEmail?: boolean;
+  /** Keep development-host addresses out of Lark replies. Default off. */
+  hideLocalAddresses?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {
@@ -512,6 +557,8 @@ export type BotDefaultsRow = {
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */
   promptCache?: import('../../services/prompt-cache-policy.js').PromptCacheConfig | null;
+  /** Per-bot automatic continuation after provider failures; null/absent = inherit. */
+  providerRecovery?: import('../../services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   idleSuspendMinutes?: number | null;
@@ -520,14 +567,10 @@ export type BotDefaultsRow = {
   dormantSessionCount?: number;
   /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
   longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
-  sessionOwnerReminder?: {
-    enabled: boolean;
-    intervalMinutes: number;
-    text: string;
-    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
-  } | null;
+  sessionOwnerReminder?: import('../../core/session-owner-reminder.js').SessionOwnerReminderConfig | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
+  defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
@@ -538,6 +581,7 @@ export type BotDefaultsRow = {
   herdr?: import('../../adapters/backend/types.js').HerdrBackendConfig | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
+  ownerGroupFollow?: import('../../services/owner-group-follow-policy.js').OwnerGroupFollowConfig | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
@@ -637,6 +681,24 @@ export function mergeModelCandidates(
  * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
  * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
  */
+/**
+ * Levels the live catalogue reported for a Codex model (`reasoningEffortsByModel`
+ * from /api/cli-options/models), matched like the server-side judgment: exact
+ * slug first, then case-insensitively. undefined = the catalogue has no word on
+ * this model, and the static table applies.
+ */
+export function liveCodexReasoningEfforts(
+  byModel: Readonly<Record<string, readonly string[]>> | undefined,
+  model: string,
+): readonly string[] | undefined {
+  const name = model.trim();
+  if (!byModel || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(byModel, name)) return byModel[name];
+  const lower = name.toLowerCase();
+  const key = Object.keys(byModel).find(slug => slug.trim().toLowerCase() === lower);
+  return key === undefined ? undefined : byModel[key];
+}
+
 export async function fetchDetectedModels(
   key: string,
   appId?: string,
@@ -847,6 +909,28 @@ export async function fetchGlobalPromptCache(): Promise<import('../../services/p
     return readPromptCacheConfig(body?.settings?.promptCache) ?? null;
   } catch {
     return null;
+  }
+}
+
+/** Machine-wide `providerRecovery` and `promptCache` from GET /api/settings
+ *  (the bot section resolves its blanks and the cache-following default
+ *  against them); nulls when unset or unreadable. */
+export async function fetchGlobalProviderRecovery(): Promise<{
+  providerRecovery: import('../../services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
+  promptCache: import('../../services/prompt-cache-policy.js').PromptCacheConfig | null;
+}> {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return { providerRecovery: null, promptCache: null };
+    const body = await r.json().catch(() => ({}));
+    const { readProviderRecoveryConfig } = await import('../../services/provider-recovery-policy.js');
+    const { readPromptCacheConfig } = await import('../../services/prompt-cache-policy.js');
+    return {
+      providerRecovery: readProviderRecoveryConfig(body?.settings?.providerRecovery) ?? null,
+      promptCache: readPromptCacheConfig(body?.settings?.promptCache) ?? null,
+    };
+  } catch {
+    return { providerRecovery: null, promptCache: null };
   }
 }
 

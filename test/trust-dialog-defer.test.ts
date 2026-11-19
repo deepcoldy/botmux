@@ -22,6 +22,7 @@ type TrustHandler = (data: string) => boolean;
 
 // The handler's free variables, injected as globals for the eval'd copy.
 let trustHandledValue = false;
+let invalidateEvidence: ReturnType<typeof vi.fn>;
 
 function installGlobals(backend: unknown): void {
   const g = globalThis as Record<string, unknown>;
@@ -35,6 +36,9 @@ function installGlobals(backend: unknown): void {
   g.lastInitConfig = {};
   g.log = () => {};
   g.backend = backend;
+  // handleVisibleStartupInteraction 的延迟 Enter 现在会先作废旧准入截图证据
+  invalidateEvidence = vi.fn();
+  g.invalidatePromptReadinessEvidence = invalidateEvidence;
   // 围栏变量：延迟 Enter 回调校验 respawn 代际，eval 上下文需注入
   g.cliSpawnGeneration = 0;
   const patternMatch = workerSource.match(/const TRUST_DIALOG_PATTERN = (\/[^;]+\/);/);
@@ -89,9 +93,11 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
 
     vi.advanceTimersByTime(399);
     expect(sendSpecialKeys).not.toHaveBeenCalled();
+    expect(invalidateEvidence, 'invalidation must be deferred with the Enter, not scheduled early').not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(invalidateEvidence).toHaveBeenCalledTimes(1);
   });
 
   it('recognizes the Codex 0.155 trust-dialog wording', () => {
@@ -156,5 +162,6 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
     (globalThis as Record<string, unknown>).backend = { sendSpecialKeys: vi.fn() };
     vi.advanceTimersByTime(1_000);
     expect(sendSpecialKeys, '旧 timer 不得向新会话 backend 发 Enter').not.toHaveBeenCalled();
+    expect(invalidateEvidence, 'respawn 围栏先返回，不得为未发生的写入作废证据').not.toHaveBeenCalled();
   });
 });

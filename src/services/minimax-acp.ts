@@ -1,4 +1,4 @@
-import { StringDecoder } from 'node:string_decoder';
+import { MINIMAX_FINAL_MAX_BYTES } from './minimax-final-control.js';
 import { join } from 'node:path';
 import { spawnOwnedModelProcess } from './constrained-invocation/native-process.js';
 import { applySessionOwnerEnv } from '../utils/child-env.js';
@@ -17,6 +17,28 @@ export interface MinimaxAcpOptions extends Omit<McodeExecOptions, 'onEvent'> {
 }
 
 const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v);
+// Bound retained data, not the cumulative history/tools drained over a long
+// turn. The caller's deadline and owned-process cancellation still bound work.
+const MAX_FRAME_BYTES = 8_000_000;
+/** A frame can span reads, including the bytes of a single UTF-8 character. */
+export function createMinimaxFrameReader(onLine: (line: string) => void | boolean) {
+  let frameBytes = 0;
+  let fragments: Buffer[] = [];
+  return (chunk: Buffer): void => {
+    for (let start = 0; start < chunk.length;) {
+      const end = chunk.indexOf(0x0a, start);
+      const part = chunk.subarray(start, end < 0 ? chunk.length : end);
+      frameBytes += part.length;
+      if (frameBytes > MAX_FRAME_BYTES) throw new Error('mcode_acp_frame_limit');
+      if (part.length) fragments.push(part);
+      if (end < 0) return;
+      const line = Buffer.concat(fragments, frameBytes).toString('utf8');
+      fragments = []; frameBytes = 0; start = end + 1;
+      if (line.trim() && onLine(line) === false) return;
+    }
+  };
+}
+
 /** Wire client for mcode's ACP v1 NDJSON surface, with no new SDK dependency.
  * One owned process per Botmux turn; exact native session/resume preserves the
  * existing runner's queue and restart semantics. Model-only invocations keep
@@ -35,13 +57,11 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
   let closing = false;
   let failure: Error | undefined;
   let nextId = 1;
-  let bytes = 0;
-  let buffer = '';
   let content = '';
+  let contentBytes = 0;
   let messageId: string | undefined;
   let nextMessage = false;
   let hardKill: ReturnType<typeof setTimeout> | undefined;
-  const decoder = new StringDecoder('utf8');
   const pending = new Map<number, { method: string; resolve: (value: Json) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> }>();
   const incoming = new Set<number | string>();
   const nativeQuestions = new Set<string>();
@@ -122,8 +142,10 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
       if (update.sessionUpdate === 'agent_message_chunk') {
         if (update.content?.type !== 'text' || typeof update.content.text !== 'string') throw new Error('mcode_acp_message_invalid');
         const id = typeof update.messageId === 'string' ? update.messageId : undefined;
-        if ((id && id !== messageId) || (!id && nextMessage)) content = '';
+        if ((id && id !== messageId) || (!id && nextMessage)) { content = ''; contentBytes = 0; }
         messageId = id; nextMessage = false;
+        contentBytes += Buffer.byteLength(update.content.text);
+        if (contentBytes > MINIMAX_FINAL_MAX_BYTES) throw new Error('mcode_acp_content_limit');
         content += update.content.text;
       } else if (update.sessionUpdate === 'tool_call') nextMessage = true;
       // Thoughts/raw tool inputs are never copied into the public reply.
@@ -137,19 +159,18 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
     else if (object(message.result)) p.resolve(message.result);
     else p.reject(new Error('mcode_acp_result_invalid'));
   };
+  const readFrames = createMinimaxFrameReader(line => {
+    handle(JSON.parse(line));
+    // An update callback may synchronously abort the turn.
+    return !failure && !closing;
+  });
   child.stdout.on('data', (chunk: Buffer) => {
     if (failure || closing) return;
-    bytes += chunk.length;
-    if (bytes > 8_000_000) { fail(new Error('mcode_acp_output_limit')); return; }
-    buffer += decoder.write(chunk);
-    let end: number;
-    while ((end = buffer.indexOf('\n')) >= 0 && !failure) {
-      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
-      if (!line.trim()) continue;
-      try { handle(JSON.parse(line)); } catch (error) { fail(error instanceof Error ? error : new Error('mcode_acp_protocol_invalid')); }
-    }
+    try { readFrames(chunk); } catch (error) { fail(error instanceof Error ? error : new Error('mcode_acp_protocol_invalid')); }
   });
-  child.stderr.on('data', (chunk: Buffer) => { bytes += chunk.length; if (bytes > 8_000_000) fail(new Error('mcode_acp_output_limit')); });
+  // Diagnostics are not protocol frames or public replies. Drain without
+  // retaining them, so verbose tools cannot exhaust the answer budget.
+  child.stderr.resume();
   child.stdin.on('error', () => fail(new Error('mcode_acp_transport_closed')));
   child.on('error', () => fail(new Error('mcode_acp_spawn_failed')));
   child.once('close', () => { if (!closing) fail(new Error('mcode_acp_process_exited')); });
@@ -214,6 +235,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
         inputSignal.throwIfAborted();
         const continuation = readMinimaxContinuation(dbPath, sessionId!, nativeQuestions, questionnaireCursor);
         if (continuation.state === 'completed' && !incoming.size) {
+          if (Buffer.byteLength(continuation.content) > MINIMAX_FINAL_MAX_BYTES) throw new Error('mcode_acp_content_limit');
           if (content !== continuation.content) opts.onUpdate?.({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: continuation.content } });
           content = continuation.content;
           break;

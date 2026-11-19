@@ -57,6 +57,7 @@ botmux start     # 启动 daemon；想开机自启用 botmux autostart enable
 | 换一个 CLI，或给会话临时指定 CLI | [多 CLI 适配器](/adapters) |
 | 在网页上管理机器人、会话和配置 | [Dashboard](/dashboard) · [全局设置](/global-settings) |
 | 同时盯多个会话的进度和终端 | [驾驶舱](/workbench) |
+| 在一个网站里管好几台机器、在外网打开 Dashboard 和终端、和团队协作 | [中心化平台（开源）](/platform) |
 
 更多：[角色与团队](/roles) · [文件沙盒](/sandbox) · [语音总结](/voice) · [本地白板](/whiteboard) · [tmux 会话常驻](/tmux) · [反馈数据存储](/feedback-storage) · [模型协议代理（实验）](/model-proxy) · [斜杠命令一览](/slash-commands) · [CLI 命令](/cli-commands) · [架构概览](/architecture) · [最佳实践](/best-practices)
 

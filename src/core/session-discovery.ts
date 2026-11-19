@@ -77,6 +77,8 @@ export interface AdoptableSession {
 
 const CLI_COMM_MAP: Record<string, CliId> = {
   claude: 'claude-code',
+  // Claude Code's npm package runs its native `bin/claude.exe`; that is the comm.
+  'claude.exe': 'claude-code',
   // Seed / Relay are Claude Code forks (Relay is Seed's new release
   // name). Both rebrand process.title to their product name, so a running
   // session's `/proc/<pid>/comm` is literally `seed` / `relay` (verified on a
@@ -336,6 +338,13 @@ export function isNonInteractiveCodexArgv(argv: string[]): boolean {
     return CODEX_NONINTERACTIVE_COMMANDS.has(arg);
   }
   return false;
+}
+
+/** Claude's bare help/version commands are metadata probes, not the resident
+ * interactive CLI. Keep this deliberately narrow: other short-lived helpers
+ * are handled by the startup liveness monitor rather than an argv blacklist. */
+export function isClaudeMetadataProbeArgv(argv: string[]): boolean {
+  return argv.length === 2 && ['--help', '-h', '--version', '-v'].includes(argv[1]!);
 }
 
 /**
@@ -719,10 +728,16 @@ export interface WrapperRealPidResolveDeps {
   getBackend: () => unknown;
   /** Backend's current child pid (the launcher while unchanged). */
   getChildPid: () => number | null | undefined;
-  /** Apply the resolved real pid: rewire backend.cliPid + bridgeCliPid. */
-  applyRealPid: (realPid: number) => void;
+  /** Apply the resolved real pid. Return false when publication failed and
+   * should be retried; void preserves the legacy stop-after-success behavior. */
+  applyRealPid: (realPid: number) => unknown;
   /** Timer scheduler (injectable for tests). */
   schedule: (fn: () => void, ms: number) => void;
+  /** Optional startup-window liveness check after a successful apply. While it
+   * returns true, keep the bounded timer alive without rescanning; when it
+   * returns false, discard that choice and resolve again. This recovers from a
+   * short-lived helper that matched the CLI comm before the interactive leaf. */
+  isAppliedPidValid?: (realPid: number) => boolean;
   /** When the launcher pid is itself the CLI leaf (e.g. a direct native
    *  install, not a wrapper), descendant discovery can never find anything
    *  realer: stop polling immediately instead of rescanning the tree on every
@@ -749,15 +764,25 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   const intervalMs = deps.intervalMs ?? 200;
   const maxAttempts = deps.maxAttempts ?? 30;
   let attempts = 0;
+  let appliedPid: number | undefined;
+  const retry = () => {
+    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+  };
   const tick = () => {
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
     if (deps.isDirectLeaf?.(launcherPid)) return;
+    if (appliedPid !== undefined) {
+      if (deps.isAppliedPidValid?.(appliedPid)) { retry(); return; }
+      appliedPid = undefined;
+    }
     const realPid = deps.findRealPid(launcherPid);
     if (realPid && realPid !== launcherPid) {
-      deps.applyRealPid(realPid);
+      const applied = deps.applyRealPid(realPid);
+      if (applied !== false && deps.isAppliedPidValid) appliedPid = realPid;
+      if (applied === false || appliedPid !== undefined) retry();
       return;
     }
-    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+    retry();
   };
   deps.schedule(tick, intervalMs);
 }

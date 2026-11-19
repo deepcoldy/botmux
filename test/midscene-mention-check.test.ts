@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  awaitCommandReply,
   botDisplayNames,
   buildFocusLoop,
   chatOpenInMain,
@@ -18,6 +19,7 @@ import {
   pickMentionOption,
   pickTopicEntry,
   pickTopicIcon,
+  replyAfterCommand,
   staleViewReason,
   topicOpenInMain,
   topicRootInMain,
@@ -762,38 +764,53 @@ describe('Feishu E2E session card wait', () => {
   });
 });
 
+// The clocks below read like Date.now(), not from 0: a wait measured from the
+// epoch instead of from the click or the send passes a clock that starts at 0.
+const WALL_CLOCK = Date.UTC(2026, 10, 11);
+
 describe('Feishu E2E card output toggle', () => {
   // The streaming card as Feishu shows it: 「更多操作」 starts folded, every
   // landed click flips the output when its card update arrives, and that
   // update folds the panel again. `clipped`: folding clips the panel instead of
   // removing it, so the label still reads but takes no click.
+  // `staleView`: the open view renders no card update at all (CI: the daemon
+  // had updated the card, the page kept 「显示输出」); a reload shows the card
+  // as it is, and that fresh view renders later updates.
   function card(opts: {
     output?: 'hidden' | 'screenshot';
     updateMs?: number;
     missedClicks?: number;
     clipped?: boolean;
+    staleView?: boolean;
+    reopenMs?: number;
   }) {
     let t = 0;
     let folded = true;
     let output = opts.output ?? 'hidden';
+    let shown = output;
+    let live = !opts.staleView;
     let missed = opts.missedClicks ?? 0;
     const updates: number[] = [];
-    const calls = { attempts: 0, clicks: 0, unfolds: 0 };
+    const calls = { attempts: 0, clicks: 0, unfolds: 0, reopens: 0 };
     const settle = () => {
       while (updates.length > 0 && updates[0] <= t) {
         updates.shift();
         output = output === 'hidden' ? 'screenshot' : 'hidden';
-        folded = true;
+        if (live) {
+          shown = output;
+          folded = true;
+        }
       }
     };
     return {
       calls,
       output: () => output,
+      elapsed: () => t,
       deps: {
         toggle: async () => {
           settle();
           if (folded && !opts.clipped) return undefined;
-          return output === 'hidden' ? ('show' as const) : ('hide' as const);
+          return shown === 'hidden' ? ('show' as const) : ('hide' as const);
         },
         unfoldMore: async () => {
           calls.unfolds += 1;
@@ -806,7 +823,15 @@ describe('Feishu E2E card output toggle', () => {
           updates.push(t + (opts.updateMs ?? 2_000));
           return true;
         },
-        now: () => t,
+        reopen: async () => {
+          calls.reopens += 1;
+          t += opts.reopenMs ?? 10_000;
+          settle();
+          shown = output;
+          folded = true;
+          live = true;
+        },
+        now: () => WALL_CLOCK + t,
         sleep: async (ms: number) => {
           t += ms;
         },
@@ -814,43 +839,180 @@ describe('Feishu E2E card output toggle', () => {
     };
   }
 
+  /** The deps without a reload: the behavior every caller had before. */
+  function noReload(deps: ReturnType<typeof card>['deps']) {
+    const { reopen: _reopen, ...rest } = deps;
+    return rest;
+  }
+
   it('unfolds 更多操作, clicks 显示输出, and unfolds it again after the card update folds it', async () => {
     const c = card({ updateMs: 3_000 });
-    await expect(turnOutputOn(c.deps, 45_000)).resolves.toEqual({ on: true, clicked: true, unfolds: 2 });
+    await expect(turnOutputOn(noReload(c.deps), 45_000)).resolves.toEqual({
+      on: true, clicked: true, unfolds: 2, reloaded: false,
+    });
     expect(c.calls.clicks).toBe(1);
     expect(c.output()).toBe('screenshot');
   });
 
   it('clicks once however slow the update is: a second click turns the output off', async () => {
     const slow = card({ updateMs: 20_000 });
-    await expect(turnOutputOn(slow.deps, 45_000)).resolves.toMatchObject({ on: true });
+    await expect(turnOutputOn(noReload(slow.deps), 45_000)).resolves.toMatchObject({ on: true });
     expect(slow.calls.clicks).toBe(1);
     expect(slow.output()).toBe('screenshot');
 
     const never = card({ updateMs: Infinity });
-    await expect(turnOutputOn(never.deps, 45_000)).resolves.toEqual({ on: false, clicked: true, unfolds: 1 });
+    await expect(turnOutputOn(noReload(never.deps), 45_000)).resolves.toEqual({
+      on: false, clicked: true, unfolds: 1, reloaded: false,
+    });
     expect(never.calls.clicks).toBe(1);
-    expect(never.deps.now()).toBeLessThanOrEqual(45_000 + 1_000);
+    expect(never.elapsed()).toBeLessThanOrEqual(45_000 + 1_000);
   });
 
   it('leaves output that is already on alone', async () => {
     const on = card({ output: 'screenshot' });
-    await expect(turnOutputOn(on.deps, 45_000)).resolves.toEqual({ on: true, clicked: false, unfolds: 1 });
+    await expect(turnOutputOn(noReload(on.deps), 45_000)).resolves.toEqual({
+      on: true, clicked: false, unfolds: 1, reloaded: false,
+    });
     expect(on.calls.attempts).toBe(0);
   });
 
   it('clicks again when a click did not go through', async () => {
     const flaky = card({ missedClicks: 1 });
-    await expect(turnOutputOn(flaky.deps, 45_000)).resolves.toMatchObject({ on: true, clicked: true });
+    await expect(turnOutputOn(noReload(flaky.deps), 45_000)).resolves.toMatchObject({ on: true, clicked: true });
     expect(flaky.calls.attempts).toBe(2);
     expect(flaky.calls.clicks).toBe(1);
   });
 
   it('unfolds 更多操作 when the folded panel shows 显示输出 but will not take the click', async () => {
     const c = card({ clipped: true });
-    await expect(turnOutputOn(c.deps, 45_000)).resolves.toEqual({ on: true, clicked: true, unfolds: 1 });
+    await expect(turnOutputOn(noReload(c.deps), 45_000)).resolves.toEqual({
+      on: true, clicked: true, unfolds: 1, reloaded: false,
+    });
     expect(c.calls.attempts).toBe(2);
     expect(c.calls.clicks).toBe(1);
     expect(c.output()).toBe('screenshot');
+  });
+
+  it('reloads the topic once when a landed click never shows, and reads it there without a second click', async () => {
+    const stale = card({ staleView: true, updateMs: 2_000 });
+    await expect(turnOutputOn(stale.deps, 45_000)).resolves.toMatchObject({ on: true, clicked: true, reloaded: true });
+    expect(stale.calls.clicks).toBe(1);
+    expect(stale.calls.reopens).toBe(1);
+    expect(stale.output()).toBe('screenshot');
+  });
+
+  it('fails a card that still reads 显示输出 after the reload: the card itself never changed', async () => {
+    const unchanged = card({ staleView: true, updateMs: Infinity });
+    await expect(turnOutputOn(unchanged.deps, 45_000)).resolves.toMatchObject({
+      on: false, clicked: true, reloaded: true,
+    });
+    expect(unchanged.calls.clicks).toBe(1);
+    expect(unchanged.calls.reopens).toBe(1);
+    expect(unchanged.output()).toBe('hidden');
+  });
+
+  it('does not reload a card whose update is only slow, nor one never clicked', async () => {
+    const slow = card({ updateMs: 20_000 });
+    await expect(turnOutputOn(slow.deps, 45_000)).resolves.toMatchObject({ on: true, reloaded: false });
+    expect(slow.calls.reopens).toBe(0);
+    const unclickable = card({ missedClicks: Infinity });
+    await expect(turnOutputOn(unclickable.deps, 45_000)).resolves.toMatchObject({
+      on: false, clicked: false, reloaded: false,
+    });
+    expect(unclickable.calls.reopens).toBe(0);
+  });
+
+  it('still reads the card after a reload that used up the budget', async () => {
+    const slowReload = card({ staleView: true, updateMs: 2_000, reopenMs: 40_000 });
+    await expect(turnOutputOn(slowReload.deps, 45_000)).resolves.toMatchObject({ on: true, reloaded: true });
+    expect(slowReload.calls.clicks).toBe(1);
+  });
+});
+
+describe('Feishu E2E command reply wait', () => {
+  const command = '/reply-mode new-topic';
+  const updated = /已切换私聊会话模式为：new-topic/;
+  // The bot quote-replies a command: its bubble repeats the command above the answer.
+  const answered = `${command} \n1条回复\n回复 测试账号: ${command}\n✅ 已切换私聊会话模式为：new-topic\n`;
+
+  it('takes the answer below the newest echo of the command, not an older one', () => {
+    expect(replyAfterCommand(`消息\n${answered}`, command, updated)).not.toBeNull();
+    // CI: an earlier identical command was answered; the one just sent was not (yet).
+    const unanswered = `${answered}会话群已解散\n${command} \n`;
+    expect(replyAfterCommand(unanswered, command, updated)).toBeNull();
+    expect(replyAfterCommand(`${unanswered}回复 测试账号: ${command}\n✅ 已切换私聊会话模式为：new-topic\n`, command, updated))
+      .not.toBeNull();
+  });
+
+  it('does not read a longer command as an echo of a shorter one', () => {
+    const text = '/reply-mode chat-topic\n✅ 已切换当前群回复模式为：chat-topic\n';
+    expect(replyAfterCommand(text, '/reply-mode chat', /已切换当前群回复模式为：chat/)).toBeNull();
+  });
+
+  // The chat as Feishu shows it: the command is on screen at once; the answer
+  // renders `answerMs` later, or — `staleView` — only after a reload.
+  function chat(opts: { answerMs?: number; staleView?: boolean; reopenMs?: number; reopenFails?: boolean }) {
+    let t = 0;
+    let reloadedAt: number | null = null;
+    const calls = { reopens: 0, nudges: 0, reads: 0 };
+    const answeredOnServer = () => opts.answerMs !== undefined && t >= opts.answerMs;
+    const deps = {
+      read: async () => {
+        calls.reads += 1;
+        const rendered = answeredOnServer() && (!opts.staleView || (reloadedAt !== null && reloadedAt >= opts.answerMs!));
+        return rendered ? answered : `${command} \n`;
+      },
+      nudge: async () => {
+        calls.nudges += 1;
+      },
+      reopen: async () => {
+        calls.reopens += 1;
+        t += opts.reopenMs ?? 10_000;
+        if (opts.reopenFails) throw new Error('Feishu Messenger chat list did not load');
+        reloadedAt = t;
+      },
+      now: () => WALL_CLOCK + t,
+      sleep: async (ms: number) => {
+        t += ms;
+      },
+      log: () => {},
+    };
+    return { calls, deps, now: () => t };
+  }
+
+  it('finds an answer that renders in place, without a reload', async () => {
+    const c = chat({ answerMs: 3_000 });
+    await expect(awaitCommandReply(c.deps, command, updated, 90_000)).resolves.not.toBeNull();
+    expect(c.calls.reopens).toBe(0);
+  });
+
+  it('reloads a view that never renders the answer once, at half time, and finds it there', async () => {
+    const c = chat({ answerMs: 1_000, staleView: true });
+    await expect(awaitCommandReply(c.deps, command, updated, 90_000)).resolves.not.toBeNull();
+    expect(c.calls.reopens).toBe(1);
+    expect(c.now()).toBeGreaterThan(45_000);
+  });
+
+  it('gives up at the deadline without a reload when the caller has none', async () => {
+    const c = chat({ answerMs: 1_000, staleView: true });
+    const { reopen: _reopen, ...noReload } = c.deps;
+    await expect(awaitCommandReply(noReload, command, updated, 60_000)).resolves.toBeNull();
+    expect(c.now()).toBeLessThanOrEqual(60_000 + 2_000);
+  });
+
+  it('reads once more after a reload that used up the budget, and survives a reload that failed', async () => {
+    const slow = chat({ answerMs: 1_000, staleView: true, reopenMs: 60_000 });
+    await expect(awaitCommandReply(slow.deps, command, updated, 90_000)).resolves.not.toBeNull();
+    expect(slow.calls.reopens).toBe(1);
+
+    const failing = chat({ answerMs: 1_000, staleView: true, reopenFails: true });
+    await expect(awaitCommandReply(failing.deps, command, updated, 90_000)).resolves.toBeNull();
+    expect(failing.calls.reopens).toBe(1);
+  });
+
+  it('does not take an unanswered command for answered after the reload', async () => {
+    const silent = chat({ staleView: true });
+    await expect(awaitCommandReply(silent.deps, command, updated, 90_000)).resolves.toBeNull();
+    expect(silent.calls.reopens).toBe(1);
   });
 });

@@ -20,7 +20,8 @@ bun run test -- test/traex-auto-model.test.ts \
   test/traex-startup-readiness.test.ts \
   test/traex-auto-rpc-config.integration.test.ts \
   test/traex-auto-rpc-runtime.integration.test.ts \
-  test/traex-auto-model.integration.test.ts
+  test/traex-auto-model.integration.test.ts \
+  test/traex-auto-model-continuation.integration.test.ts
 ```
 
 编译态也必须测试，单纯启动成功不能证明 Worker 路径可用。版本后缀仅通过本地构建参数标识，不修改仓库版本字段：
@@ -30,10 +31,11 @@ BOTMUX_VERIFY_BAKED_VERSION=3.49.0-test.traex-auto-model.1 \
   bun scripts/build-bun-binary.mjs --out /tmp/botmux-auto-model
 node scripts/smoke-bun-binary.mjs /tmp/botmux-auto-model
 BOTMUX_TEST_WORKER_BINARY=/tmp/botmux-auto-model \
-  bun run test -- test/traex-auto-model.integration.test.ts
+  bun run test -- test/traex-auto-model.integration.test.ts \
+  test/traex-auto-model-continuation.integration.test.ts
 ```
 
-这些集成场景使用真实 Worker、PTY/tmux 和模拟 TraeX，隔离于宿主 tmux。它们验证配置与输入链路，在线模型的真实负载和生成质量仍取决于服务状态。
+这些集成场景使用真实 Worker、PTY/tmux 和模拟 TraeX，隔离于宿主 tmux。当前轮次续接（会话契约许可、续接失败收尾、访问受限换池）在 `traex-auto-model-continuation.integration.test.ts`，其余场景在 `traex-auto-model.integration.test.ts`，共用夹具在 `test/helpers/traex-auto-model-integration.ts`；两个文件分开是为了各自留在 bun 腿单文件时长上限之内。它们验证配置与输入链路，在线模型的真实负载和生成质量仍取决于服务状态。
 
 ## 现场复测
 

@@ -284,6 +284,17 @@ describe('structured background task records', () => {
     // A persistent Monitor has no deadline of its own.
     expect(backgroundTaskLaunches(structuredLaunch('u', 't4', { taskId: 'm2', timeoutMs: 60_000, persistent: true })))
       .toEqual([{ taskId: 'm2', kind: 'monitor' }]);
+    // SendMessage to an agent that had stopped starts it again under its own id (2.1.322 shapes).
+    expect(backgroundTaskLaunches(structuredLaunch('u', 't7', {
+      success: true, message: 'Resuming agent a1', resumedAgentId: 'a1', revivedAgentId: 'a1', pin: { id: 'a1', name: 'a1', ref: 'r' },
+    }))).toEqual([{ taskId: 'a1', kind: 'agent', resumed: true }]);
+    expect(backgroundTaskLaunches(structuredLaunch('u', 't8', { success: true, message: 'Resuming agent a2', revivedAgentId: 'a2' })))
+      .toEqual([{ taskId: 'a2', kind: 'agent', resumed: true }]);
+    // A message to an agent still running, or one that was not sent, starts nothing.
+    expect(backgroundTaskLaunches(structuredLaunch('u', 't9', {
+      success: true, message: 'Message queued for delivery to a3 at its next tool round.', pin: { id: 'a3' },
+    }))).toEqual([]);
+    expect(backgroundTaskLaunches(structuredLaunch('u', 't10', { success: false, message: 'x', resumedAgentId: 'a4' }))).toEqual([]);
     // A foreground Bash result, and a sidechain launch (a sub-agent's own task), are not main-thread launches.
     expect(backgroundTaskLaunches(structuredLaunch('u', 't5', { stdout: 'ok', stderr: '', interrupted: false }))).toEqual([]);
     expect(backgroundTaskLaunches({ ...structuredLaunch('u', 't6', { backgroundTaskId: 'b2' }), isSidechain: true } as TranscriptEvent)).toEqual([]);
@@ -375,6 +386,147 @@ describe('BackgroundTaskTracker — Bash, Monitor and CLI lifetime', () => {
 /** Replays transcripts recorded from a real Claude Code 2.1.304 session (paths
  *  scrubbed): background Bash + Agent, an interjection, completions, a stop made
  *  in the task dialog, and /clear with the stop landing in the new file. */
+describe('BackgroundTaskTracker — an agent started again with SendMessage', () => {
+  // Session 46e1c728 (2026-11-11): a background review agent finished; the
+  // main thread sent it a second round with SendMessage and ended its turn to
+  // wait. The resumed agent was not counted, so the session read as idle with
+  // nothing running and the live-worker cap suspended it, killing the agent.
+  const at = (min: number) => new Date(Date.parse('2026-11-11T20:41:00.000Z') + min * 60_000).toISOString();
+  const resume = (min: number) => structuredLaunch(`resume-${min}`, `tu-send-${min}`, {
+    success: true, message: 'Resuming agent ae9fdc7', resumedAgentId: 'ae9fdc7392b331781',
+    revivedAgentId: 'ae9fdc7392b331781', pin: { id: 'ae9fdc7392b331781', name: 'ae9fdc7392b331781', ref: 'd9ef7a' },
+  }, at(min));
+  const stopped = (min: number, status = 'completed') => queueOperation(
+    'enqueue', notificationText(['ae9fdc7392b331781'], status), at(min));
+  const finalAnswer = (min: number): TranscriptEvent => ({
+    type: 'assistant', uuid: `final-${min}`, timestamp: at(min),
+    message: { role: 'assistant', content: [{ type: 'text', text: 'waiting for round two' }], stop_reason: 'end_turn' },
+  } as TranscriptEvent);
+  const turnDuration = (min: number): TranscriptEvent => ({
+    type: 'system', subtype: 'turn_duration', uuid: `dur-${min}`, timestamp: at(min),
+  } as TranscriptEvent);
+
+  it('counts the resumed agent until it stops again, also once the main turn has ended', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    t.observe(stopped(65));
+    expect(t.pending()).toBe(0);
+
+    t.observe(resume(86));
+    t.observe(finalAnswer(86.2));
+    t.observe(turnDuration(86.3));
+    expect(t.pending()).toBe(1);
+    // What the daemon's reclaim guard sees while the main turn waits.
+    expect(t.backgroundWait()).toBe(1);
+
+    t.observe(stopped(104));
+    expect(t.pending()).toBe(0);
+  });
+
+  it('does not revive the agent when a re-drain reads the resume again after its later stop', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    t.observe(stopped(65));
+    t.observe(resume(86));
+    t.observe(stopped(104));
+    // Rotation re-drain: launch, first stop and resume come back.
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    t.observe(stopped(65));
+    t.observe(resume(86));
+    expect(t.pending()).toBe(0);
+  });
+
+  /** The delivered copy of an earlier stop notice: Claude Code writes it at the
+   *  next tool round, after the resume, under the notice's own (earlier) time. */
+  const deliveredCopyOfStop = (min: number): TranscriptEvent => ({
+    type: 'attachment', uuid: `copy-${min}`, timestamp: at(min),
+    attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: notificationText(['ae9fdc7392b331781'], 'completed') },
+  } as unknown as TranscriptEvent);
+
+  it('keeps the resumed agent when the earlier stop notice is delivered after the resume', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    // The agent stops while the main turn still works; then it is resumed.
+    t.observe(stopped(65));
+    t.observe(resume(65.15));
+    t.observe(deliveredCopyOfStop(65));
+    t.observe(finalAnswer(65.3));
+    t.observe(turnDuration(65.31));
+    expect(t.pending()).toBe(1);
+    expect(t.backgroundWait()).toBe(1);
+    // Its second run's own stop still settles it.
+    t.observe(stopped(80));
+    expect(t.pending()).toBe(0);
+  });
+
+  it('does not revive the agent on a resume stamped no later than its stop, nor on a plain launch record', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    t.observe(stopped(65));
+    t.observe(resume(65));
+    expect(t.pending()).toBe(0);
+    // Only a resume starts a stopped agent again.
+    t.observe(structuredLaunch('launch-again', 'tu-agent-2', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(70)));
+    expect(t.pending()).toBe(0);
+  });
+
+  it('does not revive the agent when its stop time is unknown, or after a stop read now from a sibling file', () => {
+    const unknown = new BackgroundTaskTracker();
+    unknown.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    unknown.settle('ae9fdc7392b331781');
+    unknown.observe(resume(86));
+    expect(unknown.pending()).toBe(0);
+
+    // After /clear the resumed run's stop lands in another file; the bridge
+    // reads it there now, then a re-drain of the old file replays the resume.
+    const t = new BackgroundTaskTracker();
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    t.observe(stopped(65));
+    t.observe(resume(86));
+    t.settle('ae9fdc7392b331781', Date.parse(at(104)));
+    t.observe(resume(86));
+    expect(t.pending()).toBe(0);
+  });
+
+  it('a second resume of a running agent moves its run start past an older stop copy', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(structuredLaunch('launch', 'tu-agent', {
+      isAsync: true, status: 'async_launched', agentId: 'ae9fdc7392b331781',
+    }, at(0)));
+    t.observe(stopped(65));
+    t.observe(resume(70));
+    t.observe(resume(75));
+    t.observe(deliveredCopyOfStop(72));
+    expect(t.pending()).toBe(1);
+  });
+
+  it('ignores a resume from before the current CLI process, and counts one after it', () => {
+    const t = new BackgroundTaskTracker();
+    t.reset(Date.parse(at(90)));
+    t.observe(resume(86));
+    expect(t.pending()).toBe(0);
+    // An agent resumed by this process runs in it, launched here or not.
+    t.observe(resume(95));
+    expect(t.pending()).toBe(1);
+  });
+});
+
 describe('BackgroundTaskTracker — recorded Claude Code session', () => {
   function load(name: string): TranscriptEvent[] {
     return readFileSync(new URL(`./fixtures/claude-background-tasks/${name}`, import.meta.url), 'utf8')

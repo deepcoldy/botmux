@@ -20,7 +20,7 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
-import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import { larkUserNative, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import { larkToolPrompt } from '../../core/lark-tool-binding.js';
 import type { CliId } from './types.js';
 
@@ -73,11 +73,12 @@ function feedbackResponseKindHint(locale?: Locale): string {
 
 /** Per-turn Lark presentation rules, shared by inline and hook envelopes. Every
  *  follow-up carries these, so the local-address rule is one sentence here; the
- *  full rule rides once in the system prompt or opening routing hints. */
-export function feishuReplyPresentationGuidance(locale?: Locale): string {
+ *  full rule rides once in the system prompt or opening routing hints. Both
+ *  appear only for a bot that hides local addresses (BotConfig.hideLocalAddresses). */
+export function feishuReplyPresentationGuidance(locale?: Locale, hideLocalAddresses = false): string {
   return [
     t('ai.followup.feishu_safe_emphasis', undefined, locale),
-    t('ai.followup.no_local_addresses', undefined, locale),
+    ...(hideLocalAddresses ? [t('ai.followup.no_local_addresses', undefined, locale)] : []),
   ].join('\n');
 }
 
@@ -142,7 +143,7 @@ export function buildBotmuxShellHints(
   noTransport?: boolean,
   replyDelivery?: ReplyDelivery,
   cliId?: CliId,
-  opts: { sessionKind?: WorkflowSessionKind } = {},
+  opts: { sessionKind?: WorkflowSessionKind; hideLocalAddresses?: boolean } = {},
 ): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -204,7 +205,7 @@ export function buildBotmuxShellHints(
       locale,
     )));
   }
-  hints.push(escapeXmlTagLikeTokens(t('ai.routing.no_local_addresses', undefined, locale)));
+  if (opts.hideLocalAddresses) hints.push(escapeXmlTagLikeTokens(t('ai.routing.no_local_addresses', undefined, locale)));
   return hints;
 }
 
@@ -216,7 +217,6 @@ export function buildBotmuxShellHints(
  *  only the live `buildBotmuxShellHints` path applies the workflow kill-switch. */
 export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
-  t('ai.routing.no_local_addresses'),
   t('ai.shell.commands_are_shell'),
   t('ai.shell.how_to_send'),
   ...multilineHeredocLines(),
@@ -262,18 +262,37 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * `lark-cli auth login --scope` that lark-cli's own hints suggest, which
  * prints a device link to the agent.
  */
+function turnSpeakersLines(speakers: ReadonlyArray<{ openId: string; name?: string }> | undefined, locale?: Locale): string[] {
+  return speakers && speakers.length > 1
+    ? [`  ${escapeXmlTagLikeTokens(t('ai.credentials.turn_speakers', {
+      speakers: speakers.map(s => s.name ? `${s.name} (${s.openId})` : s.openId).join(', '),
+    }, locale))}`]
+    : [];
+}
+
+/** The credentials block of a follow-up message: only what changed for this turn, its speakers. */
+export function buildTurnSpeakersBlock(
+  speakers: ReadonlyArray<{ openId: string; name?: string }> | undefined, locale?: Locale,
+): string {
+  const lines = turnSpeakersLines(speakers, locale);
+  return lines.length ? ['<botmux_credentials>', ...lines, '</botmux_credentials>'].join('\n') : '';
+}
+
 export function buildCredentialBoundaryBlock(
   policy: TriggerUserAuthConfig | undefined,
   locale?: Locale,
   larkAuthFlow = false,
+  /** The people who spoke in the running turn; listed only when there are several. */
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
   if (!policy?.enabled || policy.tools.length === 0) return '';
-  const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+  const line = (key: string, vars?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, vars, locale))}`;
   const lark = larkAuthFlow && triggerUserAuthApplies(policy, 'lark-cli');
   return [
     '<botmux_credentials>',
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
+    ...turnSpeakersLines(speakers, locale),
     ...(lark ? [
       line('ai.credentials.on_auth_failure'),
       line('ai.credentials.on_auth_link'),
@@ -297,12 +316,14 @@ export function buildManagedLarkToolPromptBlocks(
   /** Only takes effect with larkToolAppId set; the only transport-less
    *  sessions that get a managed binding are verified headless sessions. */
   headlessNoUserChannel = false,
+  /** The people of the running turn, when it has several. */
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
-  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale, !larkToolAppId);
+  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale, !larkToolAppId, speakers);
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',
-      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel))}`,
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel, larkUserNative(policy)))}`,
       '</botmux_lark_tool>',
     ].join('\n')
     : '';
@@ -357,6 +378,11 @@ export function buildBotmuxSystemPromptText(opts: {
   solo?: boolean;
   /** Lead-only chat manager: append the lead-only role block. */
   leadOnly?: boolean;
+  /** BotConfig.hideLocalAddresses frozen for this session: append the full
+   *  local-address rule to the routing block. Required for the same reason as
+   *  `cliId`: a producer that left it out would silently drop the rule for a
+   *  bot that turned it on. */
+  hideLocalAddresses: boolean | undefined;
   /** The adapter building this prompt. Required (not optional) so every
    *  producer states it: CLI-specific lines key off it, and a producer that
    *  left it out would silently lose them. Today only `claude-code` adds one
@@ -364,7 +390,7 @@ export function buildBotmuxSystemPromptText(opts: {
    *  same text as before the field existed. */
   cliId: CliId | undefined;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId, hideLocalAddresses } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -465,7 +491,7 @@ export function buildBotmuxSystemPromptText(opts: {
       hiddenContextDefense(locale),
       ...whiteboardRouting,
     ];
-  if (!noTransport) routingInner.push(prose('ai.routing.no_local_addresses'));
+  if (!noTransport && hideLocalAddresses) routingInner.push(prose('ai.routing.no_local_addresses'));
   // Trigger-user auth: this session acts with ONE person's credentials, and the
   // token store on disk holds everyone else's. Nothing in the OS stops a curious
   // agent from reading those files today, so the boundary is stated here.

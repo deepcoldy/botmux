@@ -60,6 +60,7 @@ export async function buildForwardedTree(
   const allItems: any[] = (detail?.items ?? []).map((item: any) => ({ ...item,
     ...(item.body ? { body: { ...item.body } } : {}) }));
   const extraResources: MessageResource[] = [];
+  const resourcesByKey = new Map<string, MessageResource & { fallbackMessageIds: string[] }>();
 
   // Recover degraded interactive sub-cards. The parent fetch with
   // userCardContent:true above 500s on many merge_forward parents (Lark
@@ -128,10 +129,20 @@ export async function buildForwardedTree(
       // text extraction below reuses those numbers. Keep the outer forward as
       // the primary download ID: some forwards require it, while others return
       // 234003 until the owning leaf or enclosing forward ID is used.
-      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '', numberer);
+      const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '');
       const fallbackMessageIds = [...new Set([msg.message_id, parentId, ...ancestors])]
         .filter((id): id is string => typeof id === 'string' && !!id && id !== rootMessageId);
-      extraResources.push(...subResources.map(resource => ({ ...resource, fallbackMessageIds })));
+      for (const resource of subResources) {
+        const key = `${resource.type}:${resource.key}`;
+        const existing = resourcesByKey.get(key);
+        if (existing) {
+          existing.fallbackMessageIds = [...new Set([...existing.fallbackMessageIds, ...fallbackMessageIds])];
+        } else if (numberer.assign(key).isNew) {
+          const collected = { ...resource, fallbackMessageIds };
+          resourcesByKey.set(key, collected);
+          extraResources.push(collected);
+        }
+      }
 
       if (msg.msg_type === 'merge_forward' && depth < maxDepth) {
         const inner = walk(msg.message_id, depth + 1, [parentId, ...ancestors]);

@@ -24,6 +24,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
 import { KimiActivityObserver } from '../src/services/kimi-cot.js';
 import { makeKimiSession, toolTurn } from './helpers/kimi-wire-fixture.js';
+import { applyNativeReasoningObservation } from '../src/core/native-reasoning-observation.js';
 
 vi.mock('../src/config.js', () => ({ config: {
   session: { dataDir: '' }, web: { externalHost: 'localhost' }, dashboard: { externalHost: 'localhost', port: 7891 },
@@ -35,7 +36,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}), uploadFile: vi.fn(), replyMessage: vi.fn(), sendMessage: vi.fn(),
   MessageWithdrawnError: class extends Error {},
 }));
-vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh', t: (key: string) => key }));
+// Keys stay literal except the effort-source labels, whose effort argument is the
+// observed value under test.
+vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh',
+  t: (key: string, params?: Record<string, string | number>) => key === 'card.usage.effort_selected' ? `${params?.effort}（已选）`
+    : key === 'card.usage.effort_last_execution' ? `${params?.effort}（最近执行）` : key }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 vi.mock('../src/services/session-store.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/services/session-store.js')>();
@@ -49,6 +54,14 @@ function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
     ...overrides,
   } as DaemonSession;
 }
+
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
 
 describe('reply-card runtime eligibility and recovery', () => {
   let dir: string;
@@ -103,6 +116,93 @@ describe('reply-card runtime eligibility and recovery', () => {
       expect(body).not.toContain('/home/alice/');
       expect(body).not.toContain('/custom/project/');
     }
+  });
+
+  it.each(['bridge', 'explicit'] as const)('sends a %s reply with its host paths for a bot that has not turned on hideLocalAddresses', async source => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    try {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_inline');
+      const raw = '见 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+      const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source, card }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+      expect(cards.some(body => body.includes('[协作技能](/home/alice/.agents/skills/a/SKILL.md)')
+        && body.includes('/custom/project/src/main.ts:12'))).toBe(true);
+      for (const body of cards) expect(body).not.toContain('内部文件');
+    } finally {
+      restore();
+    }
+  });
+
+  // A model card accepted while the bot had hideLocalAddresses off keeps its
+  // link fields when the card is rendered again after the switch is turned on;
+  // prose follows the switch from then on. Otherwise the turn never settles.
+  describe('hideLocalAddresses turned on while a turn is in flight', () => {
+    const localButton = 'http://127.0.0.1:3000/report';
+    const prose = '报告见 /custom/project/out/report.html';
+    const explicitCard = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: prose },
+      { tag: 'button', text: { tag: 'plain_text', content: '打开报告' }, behaviors: [{ type: 'open_url', default_url: localButton }] },
+    ] } });
+    let on = false;
+    let restore: () => void = () => {};
+    beforeEach(() => { on = false; restore = setHideLocalAddressesResolver(() => on); });
+    afterEach(() => restore());
+    const keyOf = (ds: DaemonSession) => ({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' });
+
+    it('settles the terminal update, keeping the accepted button and rewriting prose', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_card');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send);
+      on = true;
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      const record = new TurnReplyCardStore(dir).read(keyOf(ds))!;
+      expect(record).toMatchObject({ phase: 'completed', finalDelivered: true });
+      expect(record.publishPending).toBeFalsy();
+      const last = vi.mocked(updateMessage).mock.calls.at(-1)![2] as string;
+      expect(last).toContain(localButton);
+      expect(last).not.toContain('/custom/project/out');
+    });
+
+    it('lets a restart re-render the interrupted card', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_card');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send);
+      on = true;
+      const store = new TurnReplyCardStore(dir);
+      const record = store.read(keyOf(ds))!;
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(keyOf(ds))}.json`), JSON.stringify(record));
+      vi.mocked(updateMessage).mockClear();
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenCalledOnce();
+      expect(vi.mocked(updateMessage).mock.calls[0]![2]).toContain(localButton);
+      expect(store.read(keyOf(ds))?.publishPending).toBeFalsy();
+    });
+
+    it('retries an unacknowledged first send after the switch is turned on during the backoff', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const uuids: string[] = [];
+      let first = true;
+      const send = vi.fn(async (_body: string, _type: string, uuid?: string) => {
+        uuids.push(uuid!);
+        if (first) {
+          first = false;
+          on = true; // turned on while the result of the first POST is unknown
+          throw new Error('socket hang up');
+        }
+        return 'om_card';
+      });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send as any);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(new Set(uuids).size).toBe(1);
+      expect(new TurnReplyCardStore(dir).read(keyOf(ds))).toMatchObject({ messageId: 'om_card', finalDelivered: true });
+    });
   });
 
   it.each(['disconnect', 'restart'] as const)('removes local addresses when a %s re-renders the reply card', async how => {
@@ -481,7 +581,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     });
   });
 
-  it.each((['traex', 'pi'] as const).flatMap(cliId => [
+  it.each((['traex', 'pi', 'doubao'] as const).flatMap(cliId => [
     'legacy', 'api-only', 'adopt', 'headless', 'remote', 'document', 'vc', 'scheduled', 'non-lark',
   ].map(entry => ({ cliId, entry }))))('keeps $cliId $entry on the established path', ({ cliId, entry }) => {
     const ds = session();
@@ -501,7 +601,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
   });
 
-  it.each((['grok', 'traex', 'pi'] as const).flatMap(cliId =>
+  it.each((['grok', 'traex', 'pi', 'doubao'] as const).flatMap(cliId =>
     (['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const).map(phase => ({ cliId, phase })),
   ))('settles $cliId as $phase and isolates later turns', async ({ cliId, phase }) => {
     const ds = session();
@@ -532,7 +632,8 @@ describe('reply-card runtime eligibility and recovery', () => {
 
   it.each([['grok', 'opencode', 'unified'], ['opencode', 'grok', 'legacy'],
     ['traex', 'opencode', 'unified'], ['opencode', 'traex', 'legacy'],
-    ['pi', 'opencode', 'unified'], ['opencode', 'pi', 'legacy']] as const)(
+    ['pi', 'opencode', 'unified'], ['opencode', 'pi', 'legacy'],
+    ['doubao', 'opencode', 'unified'], ['opencode', 'doubao', 'legacy']] as const)(
     'uses frozen %s rather than stale %s for reply-card admission', (frozen, stale, expected) => {
       const ds = session();
       ds.session.cliId = stale;
@@ -544,7 +645,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     },
   );
 
-  it.each(['grok', 'traex', 'pi'] as const)('preserves a superseded %s card across disconnect and startup recovery', async cliId => {
+  it.each(['grok', 'traex', 'pi', 'doubao'] as const)('preserves a superseded %s card across disconnect and startup recovery', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     const send = vi.fn(async () => 'om_reply');
@@ -601,12 +702,21 @@ describe('reply-card runtime eligibility and recovery', () => {
     const ds = session();
     ds.session.cliId = 'codex';
     ds.session.model = 'gpt-5.6-sol';
-    ds.activeReasoningEffort = 'high';
+    ds.session.cliSessionId = 'native-runtime';
+    ds.workerGeneration = 1;
+    ds.worker = {} as NonNullable<DaemonSession['worker']>;
+    expect(applyNativeReasoningObservation(ds, {
+      cliId: 'codex', nativeSessionId: 'native-runtime', reasoningEffort: 'high',
+      source: 'native-settings', observedAtMs: Date.now(),
+    }, { worker: ds.worker, workerGeneration: 1, cliId: 'codex' })).toBe(true);
     const send = vi.fn(async (_content: string) => 'om_reply');
     await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
     const card = JSON.parse(send.mock.calls[0]![0]);
     const line = card.body.elements.find((e: any) => e.element_id === 'botmux_turn_usage');
-    expect(line?.content).toBe('**gpt-5.6-sol** high');
+    expect(line?.content).toContain('gpt-5.6-sol');
+    expect(line?.content).toMatch(/\bhigh\b/);
+    // The native selection must be labelled, even when token usage is off.
+    expect(line?.content).toContain('已选');
   });
 
   it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
@@ -792,7 +902,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(patched).toContain('README.md');
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi', 'doubao'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     ds.session.sandbox = true;
@@ -846,7 +956,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(replyCardModeFor(legacyIsolated)).toBe('legacy');
   });
 
-  it.each(['claude-code', 'traex', 'pi', 'kimi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
+  it.each(['claude-code', 'traex', 'pi', 'kimi', 'doubao'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     expect(replyCardModeFor(ds)).toBe('unified');

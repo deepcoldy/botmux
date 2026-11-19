@@ -97,6 +97,24 @@ describe('card click turn token', () => {
     }
   });
 
+  it('releases one nonce for every store on the file, leaving the others used', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'card-click-nonce-'));
+    const now = Date.now();
+    const exp = now + 60_000;
+    try {
+      const file = join(dir, 'nonces.json');
+      const first = CardClickNonceStore.open(file);
+      expect(first.consume('nonce-aaaaaaaaaaaa', exp, now)).toBe('ok');
+      expect(first.consume('nonce-bbbbbbbbbbbb', exp, now)).toBe('ok');
+      CardClickNonceStore.open(file).release('nonce-aaaaaaaaaaaa');
+      const reloaded = CardClickNonceStore.open(file);
+      expect(reloaded.consume('nonce-aaaaaaaaaaaa', exp, now)).toBe('ok');
+      expect(reloaded.consume('nonce-bbbbbbbbbbbb', exp, now)).toBe('replayed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('requires exactly one target and an absolute working directory', () => {
     expect(issueCardClickTurn({ secret: SECRET, larkAppId: APP, prompt: 'x', now: NOW }).ok).toBe(false);
     expect(issueCardClickTurn({

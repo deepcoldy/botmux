@@ -1290,11 +1290,17 @@ export function prepareDirectSandbox(opts: {
   }
   // Baseline dirs (/opt, …) that are symlinks on this host: bwrap cannot bind a
   // symlink as such into the fresh root, so rebuild the link the usrmerge way
-  // and bind its real target (see relocateSymlinkedBaselineRules).
+  // and bind its real target — except a system dir whose target is not a
+  // same-named copy of it (`/opt -> /data00`, a whole disk), which keeps only
+  // the link (see relocateSymlinkedBaselineRules).
   const relocated = relocateSymlinkedBaselineRules(opts.policy.rules, {
     isSymlink: (path) => { try { return lstatSync(path).isSymbolicLink(); } catch { return false; } },
     realpath: (path) => { try { return realpathSync(path); } catch { return undefined; } },
   });
+  for (const link of relocated.withheld ?? []) {
+    console.error(`[sandbox] ${link.path} is a symlink to ${link.target}, which is not a ${link.path} directory: `
+      + `recreated the link only, ${link.target} is not granted by default — add the subpaths the session needs to sandboxPaths`);
+  }
   const usrmergePaths = new Set(symlinks.map(link => link.path));
   for (const link of relocated.symlinks) if (!usrmergePaths.has(link.path)) symlinks.push(link);
   const policy: FsPolicy = { ...opts.policy, rules: relocated.rules };

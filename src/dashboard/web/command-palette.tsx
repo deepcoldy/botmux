@@ -4,6 +4,7 @@ import type React from 'react';
 import { useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ModalDialog } from './modal-dialog.js';
+import { useClosedHistorySearch } from './closed-history-search.js';
 import { navigateToHash } from './leave-guard.js';
 import { Html } from './dashboard-components.js';
 import { useDashboardLocale, useDashboardStore } from './react-hooks.js';
@@ -247,6 +248,10 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
     () => PALETTE_SCOPES.filter(value => authed || (value !== 'skill' && value !== 'agent')),
     [authed],
   );
+
+  // 首屏只带最近的已关闭会话：有查询词时去服务端补查更早的已关闭会话，合进 store 后
+  // 和其它会话一起参与下面的匹配与排序（#2071：会话含已关闭的历史会话都能搜）。
+  useClosedHistorySearch(open && (scope === 'all' || scope === 'session') ? deferredQuery : '');
 
   // 每次唤起都是新实例：会话条目按行对象缓存到本次关闭为止，相对时间以唤起时刻为准。
   const sessionCacheRef = useRef<{ key: string; now: number; items: WeakMap<object, PaletteItem> } | null>(null);

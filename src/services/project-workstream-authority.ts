@@ -63,13 +63,46 @@ export function projectOwnerKey(identity: {
   return undefined;
 }
 
+export function isDirectHumanTurnCaller(
+  caller: TrustedCaller | null | undefined,
+): caller is TrustedCaller & { senderType: 'user'; source?: undefined } {
+  return !!caller && caller.senderType === 'user' && !caller.source;
+}
+
 export function projectCallerOwnerKey(caller: TrustedCaller | null | undefined): string | undefined {
-  if (caller?.senderType !== 'user' || caller.source || !caller.requestLarkAppId) return undefined;
+  if (!isDirectHumanTurnCaller(caller) || !caller.requestLarkAppId) return undefined;
   return projectOwnerKey({
     larkAppId: caller.requestLarkAppId,
     ownerOpenId: caller.requestUserOpenId,
     ownerUnionId: caller.requestUserUnionId,
   });
+}
+
+const WORKSTREAM_ERROR_HINTS: Readonly<Record<string, string>> = {
+  actor_nonhuman:
+    '当前回合不是真人直接发起（例如机器人转发、静默通知或定时触发），不能代本人认领或变更归属。请由本人在迁入话题点击「确认登记」卡片按钮，或由本人在群里直接 @主控 发话确认。',
+  source_owner_unknown:
+    '源会话缺少主人身份记录（ownerOpenId/ownerUnionId 为空），无法自动核验归属，也不能通过 grant 授权。可执行 botmux project workstream confirm --root <om_root> --source-app <cli_app> --source-session <id> [--title <标题>] 在该话题发出「确认登记」卡片由本人点击确认；若当前已是本人直接发话明确要求认领的真人回合，也可由主控执行 botmux project workstream attach ... --claim-owner 直接认领并登记。',
+  source_owner_authorization_required:
+    '源会话归属其他成员，当前主控无权直接登记。请由源会话主人在该话题中直接发话触发执行 botmux project workstream grant 获取一次性授权码后，再由主控附带 --grant <id> 执行 attach。',
+  project_coordinator_owner_required:
+    '当前项目主控会话缺少明确的主人身份，或当前操作人与主控会话主人不一致；请由项目主控的本人在群里直接发话操作。',
+  source_owner_already_present:
+    '源会话已有主人身份记录，不能按无主会话覆盖认领；若归属本人可直接 attach，若归属他人请通过 grant 授权。',
+  source_claim_operator_not_allowed:
+    '当前操作人不是源会话所属 Bot 的允许操作者（canOperate 未通过），无法认领该无主会话。',
+};
+
+export function projectWorkstreamErrorHint(error: string): string | undefined {
+  return WORKSTREAM_ERROR_HINTS[error];
+}
+
+export function isProjectWorkstreamForbiddenError(detail: string): boolean {
+  return detail.includes('required')
+    || detail.includes('unproven')
+    || detail === 'actor_nonhuman'
+    || detail === 'source_owner_unknown'
+    || detail === 'source_claim_operator_not_allowed';
 }
 
 export interface ProjectSourceGrant {

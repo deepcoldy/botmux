@@ -6,6 +6,7 @@ import {
   buildBotmuxSystemPromptText,
 } from '../src/adapters/cli/shared-hints.js';
 import { config } from '../src/config.js';
+import { t } from '../src/i18n/index.js';
 
 /** Force the experimental anti-resend toggle (config.noVisibleOutputHint) for a
  *  test, restoring the real live getter afterwards. Mirrors how the guidance is
@@ -42,32 +43,31 @@ describe('Workflow discovery hint (enabled hosts)', () => {
   });
 });
 
-describe('anti-resend guidance (thinking-only nudge false-alarm) — experimental, gated on config.noVisibleOutputHint', () => {
-  it('is ABSENT by default (toggle OFF) — hints match the pre-feature baseline', () => {
+describe.each(['zh', 'en'] as const)('anti-resend guidance (%s), gated on config.noVisibleOutputHint', (locale) => {
+  // Verify gating and placement against the locale catalog, not an obsolete
+  // wording snapshot: copy edits must not break the configuration contract.
+  const shellHint = () => t('ai.shell.no_visible_output_ok', undefined, locale);
+  const routingHint = () => t('ai.routing.no_visible_output_ok', undefined, locale);
+
+  it('omits the optional guidance when the toggle is OFF', () => {
     setNoVisibleOutputHint(false);
-    expect(buildBotmuxShellHints('zh').some((l) => l.includes('无可见输出') || l.includes('不要重发'))).toBe(false);
-    expect(buildBotmuxShellHints('en').some((l) => l.toLowerCase().includes('no visible output'))).toBe(false);
-    expect(buildBotmuxSystemPromptText({ locale: 'zh' })).not.toContain('不要因此重发');
-    expect(buildBotmuxSystemPromptText({ locale: 'en' }).toLowerCase()).not.toContain('do not resend');
-    // The deprecated static array never carries it regardless of the toggle
-    // (it must not read runtime config at module load).
-    expect(BOTMUX_SHELL_HINTS.some((l) => l.includes('不要重发') || l.toLowerCase().includes('do not resend'))).toBe(false);
+    expect(buildBotmuxShellHints(locale)).not.toContain(shellHint());
+    expect(buildBotmuxSystemPromptText({ locale })).not.toContain(routingHint());
   });
 
-  it('is present in zh/en shell hints when the toggle is ON', () => {
+  it('includes the current shell guidance only in the dynamic hints when ON', () => {
     setNoVisibleOutputHint(true);
-    expect(buildBotmuxShellHints('zh').some((l) => l.includes('无可见输出') || l.includes('不要重发'))).toBe(true);
-    expect(buildBotmuxShellHints('en').some((l) => l.toLowerCase().includes('no visible output') && l.toLowerCase().includes('do not resend'))).toBe(true);
+    expect(buildBotmuxShellHints(locale).filter(line => line === shellHint())).toHaveLength(1);
+    // The deprecated static array must never read runtime config at module load.
+    expect(BOTMUX_SHELL_HINTS).not.toContain(shellHint());
   });
 
-  it('is present in injectsSessionContext system routing (zh/en), inside the routing block, when ON', () => {
+  it('includes the current routing guidance once, inside the routing block, when ON', () => {
     setNoVisibleOutputHint(true);
-    const zh = buildBotmuxSystemPromptText({ locale: 'zh' });
-    const en = buildBotmuxSystemPromptText({ locale: 'en' });
-    expect(zh).toContain('不要因此重发');
-    expect(en.toLowerCase()).toContain('do not resend');
-    // Must live inside <botmux_routing>…</botmux_routing>, not leak after it.
-    expect(zh.indexOf('不要因此重发')).toBeLessThan(zh.indexOf('</botmux_routing>'));
-    expect(en.toLowerCase().indexOf('do not resend')).toBeLessThan(en.indexOf('</botmux_routing>'));
+    const prompt = buildBotmuxSystemPromptText({ locale });
+    const hint = routingHint();
+    expect(prompt.split(hint)).toHaveLength(2);
+    expect(prompt.indexOf(hint)).toBeGreaterThan(prompt.indexOf('<botmux_routing>'));
+    expect(prompt.indexOf(hint) + hint.length).toBeLessThan(prompt.indexOf('</botmux_routing>'));
   });
 });

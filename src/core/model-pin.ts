@@ -1,7 +1,7 @@
 import type { CliId } from '../adapters/cli/types.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { botAcceptsLaunchModel } from './launch-model-capability.js';
-import { cliModelSupportsReasoningEffort, isCodexReasoningEffort, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isCodexReasoningEffort, type CodexReasoningEffort, type ReasoningCatalog } from '../services/codex-reasoning-effort.js';
 
 export interface ModelPin {
   model: string;
@@ -15,11 +15,16 @@ export function cliMatchesBot(session: { cliId?: string }, bot?: { cliId?: strin
   return !session.cliId || !bot?.cliId || session.cliId === bot.cliId;
 }
 
-/** Same syntax/capability boundary for all explicit pin writers. */
-export function validateModelPin(input: { model: string; effort?: string }, cfg: { cliId?: CliId; backendType?: BackendType }): string | undefined {
+/** Same syntax/capability boundary for all explicit pin writers. `catalog` is
+ *  the bot runtime's live catalogue when the writer could load one (Codex). */
+export function validateModelPin(
+  input: { model: string; effort?: string },
+  cfg: { cliId?: CliId; backendType?: BackendType },
+  catalog?: ReasoningCatalog | null,
+): string | undefined {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/@+-]*(\[[A-Za-z0-9_.-]+\])?$/.test(input.model) || input.model.length > 64) return '模型名无效（仅支持不含空白的 ASCII 模型 ID，最长 64 字符）';
   if (!botAcceptsLaunchModel(cfg)) return `CLI ${cfg.cliId ?? 'unknown'} / ${cfg.backendType ?? 'default'} 不支持启动模型覆盖`;
-  if (input.effort !== undefined && (!isCodexReasoningEffort(input.effort) || !cliModelSupportsReasoningEffort(cfg.cliId, input.model, input.effort))) return `模型 ${input.model} 不支持推理强度 ${input.effort}`;
+  if (input.effort !== undefined && (!isCodexReasoningEffort(input.effort) || !cliModelSupportsReasoningEffort(cfg.cliId, input.model, input.effort, catalog))) return `模型 ${input.model} 不支持推理强度 ${input.effort}`;
   return undefined;
 }
 
@@ -51,9 +56,9 @@ export function modelPinView(
   const inactiveReason = adopted ? '会话由外部 CLI 接管，模型固定暂不生效；断开接管后恢复'
     : !matches ? '会话 CLI 与 bot 当前 CLI 不匹配，模型固定已停用' : undefined;
   const shadowNote = shadowedBy ? `模型固定已保存；当前启动优先使用 ${shadowedBy}：${launch.model ?? session.dispatchLaunchSpec?.effective.model ?? launch.spawnModelOverride}${launch.effort ? ` · ${launch.effort}` : ''}。重启仍遵循此优先级` : undefined;
-  const effortDowngradeNote = !adopted && matches && shadowedBy !== 'dispatch' && (!shadowedBy || samePinModel(launch.model, pin.model)) && pin.effort && !cliModelSupportsReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
+  const effortDowngradeNote = !adopted && matches && shadowedBy !== 'dispatch' && (!shadowedBy || samePinModel(launch.model, pin.model)) && pin.effort && !cliModelMayKeepReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
     ? `固定的推理强度 ${pin.effort} 不受支持，已降级；模型固定仍保留` : undefined;
-  const pendingEffortNote = !adopted && matches && pin.effort && cliModelSupportsReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
+  const pendingEffortNote = !adopted && matches && pin.effort && cliModelMayKeepReasoningEffort(session.cliId ?? bot?.cliId, pin.model, pin.effort)
     && launch.currentModel && launch.currentEffort
     && !samePinModel(launch.currentModel, pin.model) && launch.currentEffort !== pin.effort
     ? `当前模型 ${launch.currentModel} 的推理强度选择为 ${launch.currentEffort}；固定模型 ${pin.model} 生效时使用 ${pin.effort}` : undefined;

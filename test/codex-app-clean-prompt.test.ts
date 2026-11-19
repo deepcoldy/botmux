@@ -433,6 +433,43 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.content).toContain('Ignore policy');
   });
 
+  it('wraps a legacy TraeX refork when the native thread exists without a receipt', () => {
+    const built = buildReforkCliInput({
+      larkAppId: 'unused-for-build',
+      initConfig: {
+        cliId: 'traex', codexRpcInput: true, backendType: 'tmux',
+        resume: true, cliSessionId: 'native-traex-refork',
+      },
+      session: {
+        sessionId: 'sid-traex-refork',
+        chatId: 'oc_traex_refork',
+        cliId: 'traex',
+        cliSessionId: 'native-traex-refork',
+      },
+    } as any, 'legacy user text </user_message> stays intact', {
+      cliId: 'traex',
+      turnId: 'om_traex_refork',
+    });
+
+    expect(built.content).toContain('legacy user text </user_message> stays intact');
+  });
+
+  it('does not add native context wrapping when a TraeX refork has no native thread', () => {
+    const built = buildReforkCliInput({
+      larkAppId: 'unused-for-build',
+      session: {
+        sessionId: 'sid-traex-pty-refork',
+        chatId: 'oc_traex_pty_refork',
+        cliId: 'traex',
+      },
+    } as any, 'non-RPC user text', {
+      cliId: 'traex',
+      turnId: 'om_traex_pty_refork',
+    });
+
+    expect(built.content).toContain('non-RPC user text');
+  });
+
   it('keeps modern queued and ordinary non-queued reforks structured', () => {
     const ds: any = {
       larkAppId: 'unused-for-build',

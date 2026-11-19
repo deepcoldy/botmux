@@ -19,6 +19,9 @@ export interface LocalAddressContext {
   /** Check card link fields and leave prose as written. The transport sees
    * host-written bodies too; prose is rewritten where model output enters. */
   linkFieldsOnly?: boolean;
+  /** The bot has not opted into the policy (BotConfig.hideLocalAddresses):
+   * every entry returns its input unchanged and nothing is refused. */
+  disabled?: boolean;
 }
 
 interface Context {
@@ -264,10 +267,15 @@ function scrubText(input: string, ctx: Context): string {
   let out = '';
   let cursor = 0;
   const spans = extractHttpUrlSpans(linked);
+  const httpStarts = new Set(spans.map(span => span.start));
   // The link ledger excludes credentials. Locality checks must still inspect
   // such URLs, and protocol-relative web links must be protected too.
-  for (const match of linked.matchAll(/[a-z][a-z0-9+.-]*:[^\s<>"'\x60，。、；！？]+|(?<![:/])\/\/(?=[a-z0-9[])[^\s<>"'\x60，。、；！？]+/giu)) {
-    if (spans.some(span => span.start === match.index)) continue;
+  // A large Markdown attachment can contain long unbroken words. Consume a
+  // whole candidate even without a colon instead of rescanning its suffixes.
+  const urlCandidates = linked.includes(':') || linked.includes('//') ? linked : '';
+  for (const match of urlCandidates.matchAll(/[a-z][a-z0-9+.-]*(?::[^\s<>"'\x60，。、；！？]+)?|(?<![:/])\/\/(?=[a-z0-9[])[^\s<>"'\x60，。、；！？]+/giu)) {
+    if (!match[0].includes(':') && !match[0].startsWith('//')) continue;
+    if (httpStarts.has(match.index)) continue;
     const value = match[0].replace(/[)\].,;]+$/, '');
     try {
       const url = new URL(value.startsWith('//') ? 'https:' + value : value);
@@ -289,6 +297,7 @@ function scrubText(input: string, ctx: Context): string {
 }
 
 export function sanitizeLocalAddressText(text: string, context: LocalAddressContext = {}): string {
+  if (context.disabled) return text;
   return scrubText(text, contextFor(context));
 }
 
@@ -336,6 +345,7 @@ function scrubNode(node: unknown, key: string | undefined, ctx: Context): unknow
 }
 
 export function sanitizeLocalAddressNode<T>(node: T, context: LocalAddressContext = {}): T {
+  if (context.disabled) return node;
   return scrubNode(node, undefined, contextFor(context)) as T;
 }
 

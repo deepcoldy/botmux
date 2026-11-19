@@ -10,6 +10,10 @@ import type { LinkRefMode } from '../services/link-ref-types.js';
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
   content: string;
+  /** Refreshed catalog parked for the TraeX RPC write edge; folded into
+   *  `content` if the item is written through a plain-text transport instead. */
+  traexSkillCatalog?: string;
+  traexSkillCatalogDigest?: string;
   /** The real user turn represented by `content` when delivery uses a short
    * adapter command. Transcript bridges fingerprint this value, while the PTY
    * receives `content`. */
@@ -64,6 +68,9 @@ export interface PendingCliInput {
    * the original turn id for reply attribution but is never merged with a
    * later user input. */
   traexAutoModelRecovery?: true;
+  /** Captured before teardown; only the host can authorize its new runtime. */
+  traexAutoModelContinuation?: import('../services/session-contract.js').RuntimeExecutionContinuation;
+  traexAutoModelContinuationDeadlineAt?: number;
   /** This still-queued independent turn has completed its read-only TraeX load
    * admission. It survives an intentional exact-resume model restart so the
    * original prompt is submitted once without repeating the preflight. */

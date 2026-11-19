@@ -7,6 +7,9 @@
  * browser, per-event detail, for any hook event) and the TRAE CLI legacy-data
  * migration picker and session writer-lock page — each matched against text
  * captured from a real build.
+ * Kimi Code's "cache expired" menu is a separate family (see
+ * utils/kimi-cache-expiry-menu.ts): pages are classified per adapter family,
+ * so a Codex-family CLI never matches the Kimi menu and vice versa.
  * Generic [Y/n]/permission/Press-to-continue prompts are NOT handled here —
  * they require semantic parsing that cannot be safely inferred from a regex.
  * Which keys a card may send for each page lives in core/stuck-page-catalog.ts.
@@ -54,6 +57,8 @@
  *  - The nearest title above the footer binds the level; the region between
  *    them must carry that level's semantic rows.
  */
+import { matchKimiCacheExpiryMenu } from './kimi-cache-expiry-menu.js';
+
 const VIEWPORT_LINES = 40;
 
 /** Strip ANSI escape sequences and carriage returns so a line's visible text
@@ -124,7 +129,17 @@ const PENDING_REVIEW_STATE = /\b\d+\s+hooks?\s+needs?\s+review before (?:it|they
 const L2_TITLE = /^[A-Z][A-Za-z]*\s+hooks$/;
 
 export type HookReviewPageType = 'hook review startup' | 'hook review level 1' | 'hook review level 2';
-export type StuckPageType = HookReviewPageType | 'cli migration menu' | 'session lock';
+/** Kimi's cache-expiry menu with the pointer on "Compact and continue" (where
+ *  Kimi puts it), or anywhere else / nowhere (`moved`) — Enter then picks a
+ *  different row, so that page offers no key at all. */
+export type KimiCacheExpiryPageType = 'kimi cache expiry' | 'kimi cache expiry moved';
+export type StuckPageType = HookReviewPageType | 'cli migration menu' | 'session lock' | KimiCacheExpiryPageType;
+/** CliAdapter.stuckPageFamily: which CLI's blocking pages a screen is read as. */
+export type StuckPageFamily = 'codex-family' | 'kimi';
+
+export function isKimiCacheExpiryPage(pageType: string | undefined): pageType is KimiCacheExpiryPageType {
+  return pageType === 'kimi cache expiry' || pageType === 'kimi cache expiry moved';
+}
 
 /** Hooks browser (level 1) or per-event detail (level 2). The startup menu is
  *  recognised separately — see classifyStuckPage. */
@@ -211,11 +226,18 @@ function isSessionLockScreen(snapshot: string): boolean {
     && footerIs(tail[3]!, SESSION_LOCK_FOOTERS);
 }
 
-/** Which known blocking page (if any) the active screen shows. Pure; the
- *  worker uses it to hold queued input, to raise the stuck card, and to
- *  re-verify the page right before a card click writes a key. */
-export function classifyStuckPage(snapshot: string): StuckPageType | undefined {
+/** Which known blocking page (if any) the active screen shows, read as the
+ *  given family's pages (default: the Codex family, for callers that predate
+ *  families). Pure; the worker uses it to hold queued input, to raise the
+ *  stuck card, and to re-verify the page right before a card click writes a
+ *  key. */
+export function classifyStuckPage(snapshot: string, family: StuckPageFamily = 'codex-family'): StuckPageType | undefined {
   if (!snapshot) return undefined;
+  if (family === 'kimi') {
+    const menu = matchKimiCacheExpiryMenu(snapshot);
+    if (!menu) return undefined;
+    return menu.highlighted === 'compact' ? 'kimi cache expiry' : 'kimi cache expiry moved';
+  }
   const hookPage = matchHookReviewScreen(snapshot);
   if (hookPage) return hookPage;
   if (isStartupHookReviewScreen(snapshot)) return 'hook review startup';
@@ -233,10 +255,11 @@ export function shouldHoldInputForHookReview(snapshot: string): boolean {
     || isStartupHookReviewScreen(snapshot);
 }
 
-/** Any known blocking page (hook review, migration or session lock) — queued input
- *  must not be typed into it. */
-export function shouldHoldInputForStuckPage(snapshot: string): boolean {
-  return classifyStuckPage(snapshot) !== undefined;
+/** Any known blocking page of the family (Codex family: hook review, migration
+ *  or session lock; Kimi: the cache-expiry menu) — queued input must not be
+ *  typed into it. */
+export function shouldHoldInputForStuckPage(snapshot: string, family: StuckPageFamily = 'codex-family'): boolean {
+  return classifyStuckPage(snapshot, family) !== undefined;
 }
 
 export interface StuckDetectorCallbacks {

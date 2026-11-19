@@ -279,4 +279,17 @@ describe('notify() against a stubbed GitHub API', () => {
     expect(posted[0]).toContain('另有 1 个用例');
     expect(readFileSync(join(dir, 'summary'), 'utf8')).toBe('');
   });
+
+  it('names the site artifact next to the report link, which Pages prunes after later runs', async () => {
+    const failed = [otherCase('Claude basic bot flow', 'Replanned 20 times, exceeding the limit.')];
+    await runWith({ REPORT_PUBLISHED: 'true', REPORT_SITE_URL: 'https://example.test/master-run-100/', SITE_ARTIFACT_NAME: 'botmux-midscene-site' }, failed);
+    expect(posted[0]).toContain('https://example.test/master-run-100/');
+    expect(posted[0]).toContain('botmux-midscene-site');
+
+    // Nothing published: no report link, so nothing to fall back from.
+    posted.length = 0;
+    await runWith({ REPORT_PUBLISHED: 'false', REPORT_SITE_URL: 'https://example.test/master-run-100/', SITE_ARTIFACT_NAME: 'botmux-midscene-site' }, failed);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).not.toContain('botmux-midscene-site');
+  });
 });

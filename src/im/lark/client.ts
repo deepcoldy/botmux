@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
-import { loadBotConfigs } from '../../bot-registry.js';
+import { loadBotConfigs, LARK_REQUEST_TIMEOUT_MS } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -24,13 +24,17 @@ import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
 import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
+import { readMessageWithinContext } from './message-read-context.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_CONTACT_INVALID_PARAM,
   LARK_CODE_CONTACT_NO_SUCH_USER,
   LARK_CODE_CONTACT_NOT_VISIBLE,
   LARK_CODE_CROSS_APP_OPEN_ID,
+  LARK_CODE_EPHEMERAL_DELETED,
   LARK_CODE_EPHEMERAL_NOT_GROUP,
+  LARK_CODE_MESSAGE_DELETED,
+  LARK_CODE_MESSAGE_RECALL_EXPIRED,
   LARK_CODE_MESSAGE_UPDATE_EXPIRED,
   LARK_CODE_MESSAGE_WITHDRAWN,
   LARK_CODE_USER_SCOPE_MISSING,
@@ -364,7 +368,7 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
-  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
@@ -434,7 +438,7 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
-  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
@@ -820,7 +824,7 @@ export async function sendUserMessage(
   options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
-  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
@@ -950,8 +954,102 @@ export async function isBotInChat(larkAppId: string, chatId: string): Promise<bo
   });
 }
 
+/** Strict membership probe for a configured bot, including another daemon's bot. */
+export async function isConfiguredBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isConfiguredBotInChat');
+  // Each daemon registers only its own bot. Use the existing credential-aware
+  // probe cache without registering another daemon's bot in this process.
+  const entry = getAllBotClients({ refresh: true }).find(bot => bot.appId === larkAppId);
+  if (!entry) throw new Error(`Bot not configured for Lark: ${larkAppId}`);
+  return executeWithLarkGate(larkAppId, 'isConfiguredBotInChat', async () => {
+    const response = await larkGet(
+      entry.client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`,
+      {},
+      // Probe clients do not inherit the registry client's axios timeout.
+      { timeoutMs: LARK_REQUEST_TIMEOUT_MS },
+    );
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
+}
+
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
+}
+
+/** Pages {@link findCurrentChatUserMembers} reads before giving up (100/page). */
+export const CURRENT_CHAT_USER_MEMBER_PAGE_CAP = 100;
+
+/** The member list was still `has_more` at the page cap with someone unconfirmed. */
+export class ChatMemberListTooLargeError extends Error {
+  constructor(chatId: string) {
+    super(
+      `Chat ${chatId} has more than ${CURRENT_CHAT_USER_MEMBER_PAGE_CAP * 100} members; `
+      + 'could not read the member list to the end to rule anyone out',
+    );
+    this.name = 'ChatMemberListTooLargeError';
+  }
+}
+
+/**
+ * Authorization-grade: which of `openIds` are current human members of the
+ * chat, per `larkAppId`'s live `/members` list (app-scoped open_ids; the list
+ * never contains bots). Stops paging as soon as everyone is found — a row in
+ * any live page proves membership — but only rules someone out after reading
+ * the list to the end. Anything that would make the list look shorter than it
+ * is throws instead: an API error, a page without an `items` array, a
+ * non-boolean `has_more`, `has_more` without a fresh page token (missing or
+ * already used), or hitting the page cap ({@link ChatMemberListTooLargeError}).
+ * Unlike {@link listChatUserMembers} it never returns a silently partial list.
+ */
+export async function findCurrentChatUserMembers(
+  larkAppId: string,
+  chatId: string,
+  openIds: readonly string[],
+): Promise<Set<string>> {
+  if (openIds.length === 0) return new Set();
+  const c = getBotClient(larkAppId);
+  return scanChatMemberPages(chatId, openIds, pageToken => larkGet(
+    c,
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`,
+    { member_id_type: 'open_id', page_size: '100', ...(pageToken ? { page_token: pageToken } : {}) },
+  ));
+}
+
+/** The paging rules of {@link findCurrentChatUserMembers}, over any page source. */
+export async function scanChatMemberPages(
+  chatId: string,
+  openIds: readonly string[],
+  fetchPage: (pageToken: string | undefined) => Promise<any>,
+): Promise<Set<string>> {
+  const wanted = new Set(openIds);
+  const found = new Set<string>();
+  if (wanted.size === 0) return found;
+  const usedTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < CURRENT_CHAT_USER_MEMBER_PAGE_CAP; page++) {
+    const res = await fetchPage(pageToken);
+    if (res?.code !== 0) throw larkApiError('list chat members', res);
+    const items = res.data?.items;
+    if (!Array.isArray(items)) throw new Error(`list chat members: page ${page + 1} has no items array`);
+    for (const it of items) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && wanted.has(id)) found.add(id);
+    }
+    if (found.size === wanted.size) return found;
+    const hasMore = res.data?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error(`list chat members: page ${page + 1} has no boolean has_more`);
+    if (!hasMore) return found;
+    const next = res.data?.page_token;
+    if (typeof next !== 'string' || !next) {
+      throw new Error(`list chat members: page ${page + 1} has more members but no page_token`);
+    }
+    if (usedTokens.has(next)) throw new Error(`list chat members: page ${page + 1} repeats an earlier page_token`);
+    usedTokens.add(next);
+    pageToken = next;
+  }
+  throw new ChatMemberListTooLargeError(chatId);
 }
 
 /**
@@ -1195,24 +1293,38 @@ export async function getChatMode(
  * Recall (delete) a message. Returns `true` only when Lark confirms success,
  * `false` on SDK throw or a non-zero response code — so callers that need to
  * know whether the withdraw actually happened (e.g. grant-card withdraw) can
- * fall back instead of assuming success. Fire-and-forget callers can ignore it.
+ * fall back instead of assuming success. Recovery callers can accept an explicit
+ * already-withdrawn response or supply a fallback when the recall window expires.
  */
-export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
+export async function deleteMessage(
+  larkAppId: string,
+  messageId: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'> & { acceptWithdrawn?: boolean; onRecallExpired?: () => Promise<void> },
+): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
-  return executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
+  const outcomeFor = (code: number | undefined) => {
+    if (code === LARK_CODE_MESSAGE_RECALL_EXPIRED) return 'expired';
+    return !!options?.acceptWithdrawn && (code === LARK_CODE_MESSAGE_WITHDRAWN || code === LARK_CODE_MESSAGE_DELETED);
+  };
+  const outcome = await executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
     const c = getBotClient(larkAppId);
     try {
+      if (options?.beforeWrite) await options.beforeWrite();
       const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
       if (res && typeof res.code === 'number' && res.code !== 0) {
         logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
-        return false;
+        return outcomeFor(res.code);
       }
       return true;
     } catch (err) {
       logger.debug(`Failed to delete message ${messageId}: ${err}`);
-      return false;
+      return outcomeFor(getLarkErrorCode(err));
     }
   });
+  if (outcome !== 'expired') return outcome;
+  if (!options?.onRecallExpired) return false;
+  await options.onRecallExpired();
+  return true;
 }
 
 export interface LarkPinRecord {
@@ -1342,9 +1454,10 @@ export async function unpinMessage(larkAppId: string, messageId: string): Promis
  */
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
-  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;
@@ -1353,6 +1466,7 @@ export async function sendEphemeralCard(
     } catch (err) {
       throw new Error(`Invalid ephemeral card JSON: ${err}`);
     }
+    if (options?.beforeWrite) await options.beforeWrite();
     const res: any = await (c as any).request({
       method: 'POST',
       url: '/open-apis/ephemeral/v1/send',
@@ -1376,7 +1490,7 @@ export async function sendEphemeralCard(
  * is a cosmetic issue, not a correctness one, and the caller has already sent the
  * replacement by the time cleanup runs.
  */
-export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+export async function deleteEphemeralCard(larkAppId: string, messageId: string, options?: { acceptWithdrawn?: boolean }): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteEphemeralCard');
   return executeWithLarkGate(larkAppId, 'deleteEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
@@ -1387,11 +1501,13 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
         data: { message_id: messageId },
       });
       if (res && typeof res.code === 'number' && res.code !== 0) {
+        if (options?.acceptWithdrawn && res.code === LARK_CODE_EPHEMERAL_DELETED) return true;
         logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
         return false;
       }
       return true;
     } catch (err) {
+      if (options?.acceptWithdrawn && getLarkErrorCode(err) === LARK_CODE_EPHEMERAL_DELETED) return true;
       logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
       return false;
     }
@@ -1410,7 +1526,7 @@ export async function updateMessage(
   const beforeWrite = typeof optionsOrAck === 'object' ? optionsOrAck.beforeWrite : undefined;
   const returnAcknowledgement = optionsOrAck === true || (typeof optionsOrAck === 'object' && optionsOrAck.returnAcknowledgement === true);
   assertLarkTransport(larkAppId, 'updateMessage');
-  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -1481,6 +1597,31 @@ export async function resolveCardKitId(larkAppId: string, messageId: string): Pr
   });
 }
 
+/** Sequenced whole-card updates prevent a delayed pre-restart frame overwriting a newer status. */
+export async function updateCardJson(larkAppId: string, cardId: string, messageId: string, content: string,
+  sequence: number, uuid: string, options?: OutboundMessageOptions): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardJson');
+  content = prepareLocalAddressContent(content, 'interactive', linkFieldContext(larkAppId));
+  return executeWithLarkGate(larkAppId, 'updateCardJson', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
+    let response: any;
+    try {
+      response = await getBotClient(larkAppId).cardkit.v1.card.update({
+        path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
+      });
+    } catch (err) {
+      // Same withdrawn signal resolveCardKitId maps for the CardKit API.
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw err;
+    }
+    if (response.code !== 0) {
+      if (response.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw larkApiError('update CardKit card', response);
+    }
+  });
+}
+
 /** Enable/finalize native CardKit streaming without replacing the whole card. */
 export async function updateCardStreamingSettings(
   larkAppId: string,
@@ -1488,7 +1629,7 @@ export async function updateCardStreamingSettings(
   settings: CardStreamingSettings,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
-  settings = sanitizeLocalAddressNode(settings, linkFieldContext());
+  settings = sanitizeLocalAddressNode(settings, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
     await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
@@ -1552,7 +1693,7 @@ export async function patchCardStreamElement(
   messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
-  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext());
+  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -1566,33 +1707,114 @@ export async function patchCardStreamElement(
   });
 }
 
+/** Element-level writes bypass the whole-card egress, so stamp their callback
+ * buttons here the same way (the parser drops stamped buttons from flattened
+ * text read by other bots). */
+function stampedCardNode(node: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(stampBotmuxCallbackMarkers(JSON.stringify(node))) as Record<string, unknown>;
+}
+
+/** Insert elements into an existing CardKit card (element-level; the rest of
+ * the card, including a normalized answer body, is left untouched). */
+export async function insertCardElements(
+  larkAppId: string,
+  cardId: string,
+  placement: { type: 'insert_before' | 'insert_after'; targetElementId: string } | { type: 'append' },
+  elements: Record<string, unknown>[],
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'insertCardElements');
+  elements = elements.map(element => stampedCardNode(sanitizeLocalAddressNode(element, linkFieldContext(larkAppId))));
+  return executeWithLarkGate(larkAppId, 'insertCardElements', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.create({
+      path: { card_id: cardId },
+      data: {
+        type: placement.type,
+        ...(placement.type === 'append' ? {} : { target_element_id: placement.targetElementId }),
+        elements: JSON.stringify(elements),
+        sequence,
+        uuid,
+      },
+    });
+    if (res.code !== 0) throw larkApiError('insert CardKit elements', res);
+  });
+}
+
+/** Replace one existing CardKit element as a whole, keeping its element id. */
+export async function replaceCardElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  element: Record<string, unknown>,
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'replaceCardElement');
+  element = stampedCardNode(sanitizeLocalAddressNode(element, linkFieldContext(larkAppId)));
+  return executeWithLarkGate(larkAppId, 'replaceCardElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.update({
+      path: { card_id: cardId, element_id: elementId },
+      data: { element: JSON.stringify(element), sequence, uuid },
+    });
+    if (res.code !== 0) throw larkApiError('replace CardKit element', res);
+  });
+}
+
+/** Remove one element from an existing CardKit card. */
+export async function deleteCardElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'deleteCardElement');
+  return executeWithLarkGate(larkAppId, 'deleteCardElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.delete({
+      path: { card_id: cardId, element_id: elementId },
+      data: { sequence, uuid },
+    });
+    if (res.code !== 0) throw larkApiError('delete CardKit element', res);
+  });
+}
+
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
   options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
-  const c = getBotClient(larkAppId);
-  // card_msg_content_type=user_card_content returns the original card JSON
-  // (including v2 schema/body/elements) instead of Lark's simplified fallback
-  // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
-  // fetches, but merge_forward enumeration MUST pass false — Lark returns
-  // HTTP 500 when the param is combined with a merge_forward message_id.
-  // Without the param, sub-messages still come back in the "Format A"
-  // simplified card shape which extractCardContent handles.
-  const userCardContent = options.userCardContent ?? true;
-  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
-    // Opt into server-side sender names (sender_name / sender_i18n_names, for
-    // user AND bot senders); without it the server omits them. Matters here for
-    // merge_forward sub-messages, whose senders appear nowhere else.
-    with_sender_name: 'true',
-    // Explicit ID type makes Feishu return app_id for bot mentions.
-    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
-  }, options);
-  if (res.code !== 0) {
-    throw larkApiError('get message', res);
-  }
-  return res.data;
+  const key = options.signal ? undefined : JSON.stringify([larkAppId, messageId, options.userCardContent ?? true, options.timeoutMs ?? null, options.userIdType ?? null]);
+  return readMessageWithinContext(key, async () => {
+    const c = getBotClient(larkAppId);
+    // card_msg_content_type=user_card_content returns the original card JSON
+    // (including v2 schema/body/elements) instead of Lark's simplified fallback
+    // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
+    // fetches, but merge_forward enumeration MUST pass false — Lark returns
+    // HTTP 500 when the param is combined with a merge_forward message_id.
+    // Without the param, sub-messages still come back in the "Format A"
+    // simplified card shape which extractCardContent handles.
+    const userCardContent = options.userCardContent ?? true;
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+      // Opt into server-side sender names (sender_name / sender_i18n_names, for
+      // user AND bot senders); without it the server omits them. Matters here for
+      // merge_forward sub-messages, whose senders appear nowhere else.
+      with_sender_name: 'true',
+      ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
+    }, options);
+    if (res.code !== 0) {
+      throw larkApiError('get message', res);
+    }
+    return res.data;
+  });
+
 }
 
 /** Parse the sender union_id from an IM message fetched with
@@ -1895,14 +2117,14 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
   });
 }
 
-export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
+export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
   return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
     const c = getBotUploadClient(larkAppId);
-    const buf = readFileSync(filePath);
-    const ext = extname(filePath).toLowerCase();
+    const buf = typeof source === 'string' ? readFileSync(source) : source.bytes;
+    const fileName = basename(typeof source === 'string' ? source : source.name);
+    const ext = extname(fileName).toLowerCase();
     const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-    const fileName = basename(filePath);
     // `duration` (ms) only applies to opus voice uploads — it sets the length
     // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
     const duration = fileType === 'opus' && opts?.duration
@@ -1914,7 +2136,7 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
     });
     const fileKey = res?.file_key;
     if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded file ${filePath} → ${fileKey}`);
+    logger.info(`Uploaded file ${fileName} → ${fileKey}`);
     return fileKey;
   });
 }
@@ -3282,6 +3504,25 @@ export async function getChatRoutingFacts(
   const mode = rawMode === 'p2p' ? 'p2p' : rawMode === 'group' || rawMode === 'topic' ? 'group' : null;
   if (!mode || typeof res.data?.external !== 'boolean') throw new Error('chat_facts_unknown');
   return { external: res.data.external, mode };
+}
+
+/** Native invite links let non-members join without BotMux user authorization. */
+export async function getChatInviteLink(larkAppId: string, chatId: string): Promise<string> {
+  const response = await getBotClient(larkAppId).request({
+    method: 'POST', url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/link`,
+    data: { validity_period: 'permanently' }, ...larkRequestDeadline({ timeoutMs: 10_000 }),
+  });
+  if (response.code !== 0 || !response.data?.is_permanent || !response.data.share_link) {
+    throw new Error('人工群入群邀请暂不可用，请确认机器人在人工群中并有分享群权限');
+  }
+  const link = new URL(response.data.share_link);
+  const brand = normalizeBrand(getBot(larkAppId).config.brand);
+  const officialHost = link.hostname === larkHosts(brand).applink
+    || (brand === 'feishu' && link.hostname === 'applink.larkoffice.com');
+  if (link.protocol !== 'https:' || !officialHost
+    || link.pathname !== '/client/chat/chatter/add_by_link' || !link.searchParams.get('link_token')
+    || link.username || link.password) throw new Error('人工群未返回有效入群邀请');
+  return response.data.share_link;
 }
 
 export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {

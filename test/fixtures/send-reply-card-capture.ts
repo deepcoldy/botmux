@@ -79,6 +79,7 @@ if (stubbedLargeUpload) {
 }
 
 const topicLookups = new Map<string, number>();
+let providerMessageSequence = 0;
 
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');
@@ -104,7 +105,8 @@ const topicLookups = new Map<string, number>();
   } else if (url.pathname.includes('/im/v1/messages') && ['POST', 'PATCH'].includes(method)) {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
-    data = { code: 0, data: { message_id: 'om_separate_message' } };
+    data = { code: 0, data: { message_id: process.env.BOTMUX_TEST_DISTINCT_MESSAGE_IDS === '1'
+      ? `om_sent_${++providerMessageSequence}` : 'om_separate_message' } };
   } else if (url.pathname.includes('/cardkit/v1/cards/') && method === 'PUT') {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
@@ -279,8 +281,12 @@ if (process.env.BOTMUX_TEST_NATIVE_COT_BARRIER) {
     const path = new URL(url).pathname;
     if (!path.endsWith('/reply-card-ready')) throw new Error(`Unexpected native CoT test route: ${path}`);
     console.log('CAPTURE_NATIVE_READY');
-    const ok = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER === 'ready';
-    return new Response(JSON.stringify({ ok }), { status: ok ? 200 : 409 });
+    // ready = live native thinking; ready-hidden = display failed/switched off;
+    // ready-legacy = an older daemon that answers without visibility.
+    const barrier = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER ?? '';
+    const ok = barrier.startsWith('ready');
+    const body = barrier === 'ready-legacy' || !ok ? { ok } : { ok, nativeThinkingVisible: barrier === 'ready' };
+    return new Response(JSON.stringify(body), { status: ok ? 200 : 409 });
   });
 }
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.

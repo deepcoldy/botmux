@@ -5,6 +5,8 @@ import { createRoot } from 'react-dom/client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { bootstrap, store } from './store.js';
+import { afterNextPaint } from './deferred-task.js';
+import { runDashboardStartup } from './app-startup.js';
 import {
   attentionReason,
   attentionWaitSince,
@@ -1962,47 +1964,52 @@ void (async () => {
   await loadAuthState();
   renderShell();
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
-  void loadPinnedPluginNavItems();
   // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
   window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
-  void loadDecisionBoardNav();
-  void checkUpdateBadge();
   window.setInterval(() => {
     if (document.hidden) return;
     void checkUpdateBadge();
   }, 30 * 60_000);
-  initOwnerAvatar();
-  try {
-    await bootstrap({
+  window.addEventListener('hashchange', createHashChangeHandler({
+    applyLocale: applyShellLocaleFromHash,
+    route: () => { void route(); },
+  }));
+  // Mount the selected page immediately. Its shell/skeleton and independent
+  // Bot configuration reads must not wait for global session/schedule data.
+  await runDashboardStartup({
+    route,
+    bootstrap: () => bootstrap({
       // P1-14：排程只对「本机管理身份」和「publicReadOnly 匿名访客」开放。
       // Workbench-only 身份（飞书 H5 / 平台 teammate|guest，loadAuthState 里把
       // authed 置 false、workbenchAuthed 置 true）对 /api/schedules 是既定的
       // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
       // 依赖它对不对。
       canReadSchedules: () => ui.authed || ui.publicReadOnly,
-    });
-  } catch (err) {
-    console.error('botmux dashboard bootstrap failed', err);
-    store.setOnline(false);
-  }
-  void loadNameMaps().then(renderShell);
-  // Bot 改名后名称映射跟着 roster 变化重拉（见 ui.ts reloadNameMaps）。
-  store.onBotsChanged(() => {
-    void reloadNameMaps().then(() => {
-      store.relabelBots(botNameForAppId);
-      renderShell();
-    });
+    }),
+    afterNextPaint,
+    optional: () => {
+      void loadPinnedPluginNavItems();
+      void loadDecisionBoardNav();
+      void checkUpdateBadge();
+      initOwnerAvatar();
+      void loadNameMaps().then(renderShell);
+      void loadGroupsSnapshot().then(renderShell);
+    },
+    onBotsChanged: listener => { store.onBotsChanged(listener); },
+    reloadNameMaps: () => {
+      void reloadNameMaps().then(() => {
+        store.relabelBots(botNameForAppId);
+        renderShell();
+      });
+    },
+    onBootstrapError: err => {
+      console.error('botmux dashboard bootstrap failed', err);
+      store.setOnline(false);
+    },
   });
-  void loadGroupsSnapshot().then(renderShell);
   // 空闲时预取 ⌘K 面板 chunk，首次唤起不等网络；无边框工作台壳不挂面板，不白取。
   if (!framelessWorkbenchSurface(location.hash || '#/')) {
     if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(preloadCommandPalette, { timeout: 5_000 });
     else window.setTimeout(preloadCommandPalette, 3_000);
   }
-  // A page with unsaved edits can hold a navigation back (see leave-guard.ts).
-  window.addEventListener('hashchange', createHashChangeHandler({
-    applyLocale: applyShellLocaleFromHash,
-    route: () => { void route(); },
-  }));
-  void route();
 })();

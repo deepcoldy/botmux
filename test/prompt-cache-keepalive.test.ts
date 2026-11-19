@@ -113,6 +113,7 @@ describe('eligibility', () => {
     [{ initConfig: { cliId: 'claude-code', backendType: 'zmx' } }, 'remote_backend'],
     [{ lastScreenStatus: 'working' }, 'not_idle'],
     [{ backgroundTaskCount: 2 }, 'background_tasks'],
+    [{ session: { sessionId: 'abcdef12-0000-0000-0000-000000000000', ordinaryTurnRecovery: { status: 'backoff' } } }, 'recovery_wait'],
   ])('%j → %s', (overrides, reason) => {
     expect(promptCacheKeepaliveIneligibility(session(overrides))).toBe(reason);
   });
@@ -120,6 +121,14 @@ describe('eligibility', () => {
   it('a local claude-code idle session is eligible', () => {
     expect(promptCacheKeepaliveIneligibility(session())).toBeUndefined();
     expect(promptCacheKeepaliveIneligibility(session({ initConfig: { cliId: 'claude-code', backendType: 'pty' } }))).toBeUndefined();
+  });
+
+  it('only a pending recovery wait holds keep-alives back, not a settled recovery', () => {
+    for (const status of ['running', 'completed', 'exhausted', 'attention_required', 'cancelled']) {
+      expect(promptCacheKeepaliveIneligibility(session({
+        session: { sessionId: 'abcdef12-0000-0000-0000-000000000000', ordinaryTurnRecovery: { status } },
+      }))).toBeUndefined();
+    }
   });
 });
 

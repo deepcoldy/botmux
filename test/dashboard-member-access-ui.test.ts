@@ -10,7 +10,9 @@ import type { GroupMemberDisplay } from '../src/dashboard/web/roles.js';
 
 vi.mock('../src/dashboard/web/toast.js', () => ({ toast: vi.fn() }));
 
+const trCalls: Array<{ key: string; values?: Record<string, unknown> }> = [];
 const tr = (key: string, values?: Record<string, unknown>) => {
+  trCalls.push({ key, values });
   let result = key;
   for (const [name, value] of Object.entries(values ?? {})) result = result.replace(`{${name}}`, String(value));
   return result;
@@ -141,7 +143,30 @@ function makeState(overrides?: Partial<RouterState>): RouterState {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.mocked(toast).mockClear();
+  trCalls.length = 0;
 });
+
+function selectMember(renderer: TestRenderer.ReactTestRenderer, openId: string): Promise<void> {
+  return act(async () => {
+    renderer.root.findAllByProps({ 'data-action': 'member-select' })
+      .find((c: any) => c.props.value === openId)!
+      .props.onChange({ currentTarget: { checked: true } });
+  });
+}
+
+function selectedIds(renderer: TestRenderer.ReactTestRenderer): string[] {
+  return renderer.root.findAllByProps({ 'data-action': 'member-select' })
+    .filter((c: any) => c.props.checked)
+    .map((c: any) => String(c.props.value));
+}
+
+async function clickGrant(renderer: TestRenderer.ReactTestRenderer): Promise<void> {
+  await act(async () => {
+    renderer.root.findByProps({ 'data-action': 'grant-selected' }).props.onClick();
+  });
+  await settle();
+}
 
 describe('MemberAccessSection', () => {
   it('shows the empty state when no bot is in chat and performs no requests', () => {
@@ -265,35 +290,157 @@ describe('MemberAccessSection', () => {
     expect(toast).toHaveBeenCalledWith('grantAdmin.tooMany', expect.objectContaining({ kind: 'warning' }));
   });
 
-  it('reports 409 subject_not_current_chat_bot as a not-in-chat message, not network error', async () => {
+  it('makes each member pill the label of its checkbox, so a click anywhere on the pill selects it', async () => {
+    // 群管理抽屉的样式把 .checkbox-row 里的原生复选框隐藏且 pointer-events:none，
+    // 只有当整行是该复选框的 <label> 时鼠标点击才能勾选（真实浏览器的点击验证见
+    // test/dashboard-member-access-select.e2e.ts）。
+    const state = makeState();
+    installFetch(state);
+    const renderer = renderSection();
+    await open(renderer);
+
+    for (const openId of ['ou_u1', 'ou_u2', 'ou_b1']) {
+      const pill = renderer.root.findByProps({ 'data-member-row': openId });
+      expect(pill.type).toBe('label');
+      const controls = pill.findAll(node => node.type === 'input');
+      expect(controls.map(node => node.props['data-action'])).toEqual(['member-select']);
+    }
+  });
+
+  it('does not offer the viewpoint bot itself as a grant subject', async () => {
     const state = makeState({
-      grantResult: {
-        status: 409,
-        body: {
-          ok: false,
-          error: 'subject_not_current_chat_bot',
-          invalidSubjectOpenIds: ['ou_u2'],
-        },
+      membersByApp: {
+        cli_a: [...MEMBERS, { openId: 'ou_self', name: 'Bot A', memberType: 'bot', self: true }],
+        cli_b: [],
       },
     });
     installFetch(state);
     const renderer = renderSection();
     await open(renderer);
 
-    await act(async () => {
-      renderer.root.findAllByProps({ 'data-action': 'member-select' })
-        .find((c: any) => c.props.value === 'ou_u2')!
-        .props.onChange({ currentTarget: { checked: true } });
-    });
-    await act(async () => {
-      renderer.root.findByProps({ 'data-action': 'grant-selected' }).props.onClick();
-    });
-    await settle();
+    const selfBox = renderer.root.findAllByProps({ 'data-action': 'member-select' })
+      .find((c: any) => c.props.value === 'ou_self')!;
+    expect(selfBox.props.disabled).toBe(true);
+    const rowTags = (openId: string) => renderer.root.findByProps({ 'data-member-row': openId })
+      .findAllByType('small').map(node => [node.props.children].flat().join('')).join(' ');
+    expect(rowTags('ou_self')).toContain('grantAdmin.selfTag');
+    expect(rowTags('ou_b1')).not.toContain('grantAdmin.selfTag');
+    // Other bots in the chat stay selectable.
+    expect(renderer.root.findAllByProps({ 'data-action': 'member-select' })
+      .find((c: any) => c.props.value === 'ou_b1')!.props.disabled).toBe(false);
 
-    expect(toast).toHaveBeenCalledWith(
-      'grantAdmin.notInChat',
-      expect.objectContaining({ kind: 'warning' }),
-    );
+    // Even a forced change event cannot select it.
+    await selectMember(renderer, 'ou_self');
+    expect(selectedIds(renderer)).toEqual([]);
+    expect(renderer.root.findByProps({ 'data-action': 'grant-selected' }).props.disabled).toBe(true);
+  });
+
+  it('names the members that left, sends nothing else, and unselects only them', async () => {
+    const state = makeState({
+      grantResult: {
+        status: 409,
+        body: { ok: false, error: 'subject_not_current_chat_member', invalidSubjectOpenIds: ['ou_u2'] },
+      },
+    });
+    installFetch(state);
+    const renderer = renderSection();
+    await open(renderer);
+
+    await selectMember(renderer, 'ou_u1');
+    await selectMember(renderer, 'ou_u2');
+    await clickGrant(renderer);
+
+    expect(state.calls.filter(c => c.body?.operation === 'grant')).toHaveLength(1);
+    expect(trCalls).toContainEqual({ key: 'grantAdmin.notInChat', values: { count: 1, names: 'Bob' } });
+    expect(toast).toHaveBeenCalledWith('grantAdmin.notInChat', expect.objectContaining({ kind: 'warning' }));
+    expect(selectedIds(renderer)).toEqual(['ou_u1']);
+  });
+
+  it('explains a receiver_cannot_be_subject rejection instead of a raw error code', async () => {
+    // Older daemons do not flag the self row, so the backend is the last line.
+    const state = makeState({
+      grantResult: {
+        status: 400,
+        body: { ok: false, error: 'receiver_cannot_be_subject', invalidSubjectOpenIds: ['ou_b1'] },
+      },
+    });
+    installFetch(state);
+    const renderer = renderSection();
+    await open(renderer);
+
+    await selectMember(renderer, 'ou_u2');
+    await selectMember(renderer, 'ou_b1');
+    await clickGrant(renderer);
+
+    expect(toast).toHaveBeenCalledWith('grantAdmin.selfNotGrantable', expect.objectContaining({ kind: 'warning' }));
+    expect(toast).not.toHaveBeenCalledWith('grantAdmin.notInChat', expect.anything());
+    expect(selectedIds(renderer)).toEqual(['ou_u2']);
+  });
+
+  it('reports an unavailable membership lookup as such, not as "not in chat"', async () => {
+    const state = makeState({
+      grantResult: {
+        status: 502,
+        body: { ok: false, error: 'live_membership_unavailable', message: 'members/bots down' },
+      },
+    });
+    installFetch(state);
+    const renderer = renderSection();
+    await open(renderer);
+
+    await selectMember(renderer, 'ou_u2');
+    await clickGrant(renderer);
+
+    expect(toast).toHaveBeenCalledWith('grantAdmin.membershipUnavailable', expect.objectContaining({ kind: 'error' }));
+    expect(toast).not.toHaveBeenCalledWith('grantAdmin.notInChat', expect.anything());
+    expect(selectedIds(renderer)).toEqual(['ou_u2']);
+  });
+
+  it('treats the old daemon code as "left" only for bots; for a person it says the daemon is too old', async () => {
+    // 旧 daemon 只查机器人名单：真人必然被判「不在群」，那不是真的离群。
+    const legacy = (invalid: string[]) => makeState({
+      grantResult: { status: 409, body: { ok: false, error: 'subject_not_current_chat_bot', invalidSubjectOpenIds: invalid } },
+    });
+
+    let state = legacy(['ou_b1']);
+    installFetch(state);
+    let renderer = renderSection();
+    await open(renderer);
+    await selectMember(renderer, 'ou_b1');
+    await clickGrant(renderer);
+    expect(toast).toHaveBeenCalledWith('grantAdmin.notInChat', expect.objectContaining({ kind: 'warning' }));
+    expect(trCalls).toContainEqual({ key: 'grantAdmin.notInChat', values: { count: 1, names: 'Bot X' } });
+    expect(selectedIds(renderer)).toEqual([]);
+
+    // 线上 /members 的真人行没有类型字段，members-display 给的是 'unknown'；
+    // 只要被拒的人里有一个不是机器人，就不能说「已离群」。
+    vi.mocked(toast).mockClear();
+    state = legacy(['ou_u3', 'ou_b1']);
+    state.membersByApp.cli_a = [...MEMBERS, { openId: 'ou_u3', name: 'Carol', memberType: 'unknown' }];
+    installFetch(state);
+    renderer = renderSection();
+    await open(renderer);
+    await selectMember(renderer, 'ou_u3');
+    await selectMember(renderer, 'ou_b1');
+    await clickGrant(renderer);
+    expect(toast).toHaveBeenCalledWith('grantAdmin.daemonTooOld', expect.objectContaining({ kind: 'warning' }));
+    expect(toast).not.toHaveBeenCalledWith('grantAdmin.notInChat', expect.anything());
+    expect(selectedIds(renderer)).toEqual(['ou_u3', 'ou_b1']);
+  });
+
+  it('reports a chat too large to confirm members as such', async () => {
+    const state = makeState({
+      grantResult: { status: 422, body: { ok: false, error: 'live_membership_too_large', message: 'too many' } },
+    });
+    installFetch(state);
+    const renderer = renderSection();
+    await open(renderer);
+
+    await selectMember(renderer, 'ou_u2');
+    await clickGrant(renderer);
+
+    expect(toast).toHaveBeenCalledWith('grantAdmin.membershipTooLarge', expect.objectContaining({ kind: 'error' }));
+    expect(toast).not.toHaveBeenCalledWith('grantAdmin.membershipUnavailable', expect.anything());
   });
 
   it('blocks and unblocks a row via fresh GET + full PUT of raw entries', async () => {

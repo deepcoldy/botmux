@@ -83,6 +83,7 @@ describe('prompt fragment catalog', () => {
       'ai.credentials.never_forward',
       'ai.credentials.on_auth_failure',
       'ai.credentials.on_auth_link',
+      'ai.credentials.turn_speakers',
       'ai.credentials.on_missing_scope',
     ]);
   });
@@ -102,6 +103,8 @@ describe('prompt fragment catalog', () => {
       'ai.whiteboard.block_read',
       'ai.whiteboard.hint_send_shell',
       'ai.send.after_success_unified',
+      'ai.send.after_success_progress',
+      'ai.send.after_success_auxiliary',
     ];
     for (const key of migratedKeys) {
       expect(PROMPT_FRAGMENTS.some((f: PromptFragmentSpec) => f.key === key), key).toBe(true);
@@ -118,7 +121,8 @@ describe('prompt fragment catalog matches what each stage reads', () => {
     );
     setPromptOverrideResolver((key) => (followup.has(key) ? `<<${key}>>` : undefined));
     for (const loc of SUPPORTED_LOCALES) {
-      const lines = feishuReplyPresentationGuidance(loc).split('\n');
+      // With the bot's hideLocalAddresses switch on, every line that can appear.
+      const lines = feishuReplyPresentationGuidance(loc, true).split('\n');
       expect(lines.length).toBeGreaterThan(1);
       for (const line of lines) expect(line, `[${loc}]`).toMatch(/^<<ai\.[\w.]+>>$/);
     }

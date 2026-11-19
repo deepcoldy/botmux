@@ -158,6 +158,35 @@ describe('the two models are mutually exclusive per session', () => {
     expect(existsSync(join(sessionIdentityDataDir(dir, SESSION), 'bytedcli.env'))).toBe(true);
   });
 
+  it('a proven re-init removes plaintext a single-model publication left behind, keeping proven memory', () => {
+    // A daemon that never received the worker's identity decision published
+    // every turn under the fail-closed single default, onto an already-proven
+    // layout. The proven wrapper never reads those files; the next proven
+    // spawn must not leave them on disk.
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
+    writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
+    writeSessionIdentity(dir, SESSION, aliceBy('turn-B'), 'single');
+    const dataDir = sessionIdentityDataDir(dir, SESSION);
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.env')).sort()).toEqual(['bitscli.env', 'bytedcli.env', 'codebase.env']);
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
+    expect(readdirSync(dataDir).some(name => name.endsWith('.env'))).toBe(false);
+    expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');
+    expect(readFileSync(join(dataDir, 'identity-layout'), 'utf8').trim()).toBe('proven-v1');
+  });
+
+  it('a single re-init keeps the snapshot the daemon published before the spawn', () => {
+    // The plaintext clean-up above is for proven layouts only. A single
+    // session's root file is its live publication channel: the daemon writes
+    // the waking or restarted turn there at accept time, before the worker
+    // re-initializes the same layout, and wiping it would deny that turn.
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'single');
+    writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'single');
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'single');
+    const dataDir = sessionIdentityDataDir(dir, SESSION);
+    expect(readFileSync(join(dataDir, 'bytedcli.env'), 'utf8')).toContain('jwt-turn-A');
+    expect(readFileSync(join(dataDir, 'codebase.env'), 'utf8')).not.toBe('');
+  });
+
   it('re-initializing the same model never truncates a live marker', () => {
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
@@ -243,6 +272,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
       managedTurnOrigin: undefined,
       pendingRawTurnId: undefined,
       scheduledTurnCallers: undefined,
+      scheduledToolActors: undefined,
       silentScheduledTurns: undefined,
       ...extra,
     };
@@ -272,7 +302,7 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
   });
 
   it('retains a dispatched-but-not-started queued activation turn', () => {
-    const ds = dsWith({ session: { queuedActivationTurnId: 'turn-Q' } as any });
+    const ds = dsWith({ sessionExtra: { queuedActivationTurnId: 'turn-Q' } as any });
     publish('turn-Q');
     releaseActiveIdentityTurn(dir, SESSION, 'turn-Q');
     expect(collectSessionTurnGarbage(ds)).toEqual([]);
@@ -290,24 +320,28 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
   it('retains scheduled, recovery and continuation turns', () => {
     const ds = dsWith({
       scheduledTurnCallers: new Map([['schedule:1:uuid', {}]]),
-      session: {
+      scheduledToolActors: new Map([['schedule:2:uuid', { openId: 'ou_actor', unionId: 'on_actor' }]]),
+      // sessionExtra (not session:) so the default sessionId survives: with a
+      // replaced session object the retention set is never matched against the
+      // material's session and every row below would assert vacuously.
+      sessionExtra: {
         deferredScheduleRun: { turnId: 'turn-deferred' },
         ordinaryTurnRecovery: { currentTurnId: 'turn-recovery' },
         readonlyTaskContinuation: { currentTurnId: 'turn-continuation' },
         codexAppDispatchLedger: [],
-      } as any,
-    });
-    for (const t of ['schedule:1:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
+      },
+    } as any);
+    for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       publish(t); releaseActiveIdentityTurn(dir, SESSION, t);
     }
     expect(collectSessionTurnGarbage(ds).sort()).toEqual([]);
-    for (const t of ['schedule:1:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
+    for (const t of ['schedule:1:uuid', 'schedule:2:uuid', 'turn-deferred', 'turn-recovery', 'turn-continuation']) {
       expect(recallProvenIdentityContent(dir, SESSION, t, 'bytedcli')).toBeDefined();
     }
   });
 
   it('retains a prepared/non-terminal codex app dispatch ledger entry', () => {
-    const ds = dsWith({ session: {
+    const ds = dsWith({ sessionExtra: {
       codexAppDispatchLedger: [{ turnId: 'turn-ledger', state: 'prepared' }],
     } as any });
     publish('turn-ledger');

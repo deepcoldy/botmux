@@ -1,3 +1,4 @@
+import { selectSessionPage } from './dashboard/session-pagination.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -15,6 +16,7 @@ import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.j
 import { createHostPluginMarket, PluginMarketError } from './dashboard/plugin-market.js';
 import { pluginRecordHash } from './core/plugins/mutation-guard.js';
 import { withPluginServiceLock } from './core/plugins/service-manager.js';
+import { assertPluginPrerequisitesReady } from './core/plugins/prerequisites.js';
 import { createConfigApi } from './core/plugins/runtime.js';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
@@ -134,6 +136,8 @@ import {
   sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleUsageAnalyticsApi } from './dashboard/usage-analytics-api.js';
+import { createUsageAnalytics } from './services/usage-analytics.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
 import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
 import { handleFeedbackExtensionApi } from './dashboard/feedback-extension-api.js';
@@ -316,7 +320,8 @@ import { listProjectGroups, type ProjectGroupState } from './services/project-gr
 import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets } from './dashboard/cli-executable-resolver.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
   buildSkillInstallAuditSummary,
@@ -371,7 +376,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId, type ConfiguredBotAgentFields } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -458,6 +463,7 @@ const dashboardAutostart = createDashboardAutostartController({
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const queryDashboardUsage = createUsageAnalytics();
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
@@ -1250,6 +1256,7 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   /** Experimental, default OFF: reap tmux servers orphaned by a previous
    *  daemon generation at daemon startup (automatic process kill). */
   reapOrphanTmuxServers: boolean;
@@ -1265,6 +1272,7 @@ interface ResolvedDashboardSettings {
   cardBrandLabel: boolean;
   /** Turn initiator may press the safe keys on stuck cards. Default ON. */
   stuckCardInitiatorKeys: boolean;
+  modelQueueNotify: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1306,11 +1314,12 @@ interface ResolvedDashboardSettings {
   noVisibleOutputHint: boolean;
   /** Experimental cross-principal turn isolation (XPI). Default OFF. */
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation: the two default-off switches and the
-   *  host bot grants. Private for anonymous read-only viewers. */
+  /** Schedule delegation switches and host bot grants. Private for anonymous
+   *  read-only viewers. */
   scheduleBotGrants: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     /** Hand-edited entries the reader dropped; a save would not keep them. */
     ignoredCount: number;
@@ -1344,6 +1353,8 @@ interface ResolvedDashboardSettings {
   workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
+  /** Machine-wide automatic continuation after provider failures; null = not configured (off). */
+  providerRecovery: import('./services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退）。 */
   sessionCleanup: {
@@ -1935,6 +1946,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    terminalEffortWriteback: dashboard.terminalEffortWriteback === true,
     reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     tmuxOrphanSessionSweep: dashboard.tmuxOrphanSessionSweep !== false, // default ON report-only; explicit false disables
     tmuxOrphanSessionBareWrapperKill: dashboard.tmuxOrphanSessionBareWrapperKill === true, // default OFF narrow kill
@@ -1946,6 +1958,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     cardBrandLabel: dashboard.cardBrandLabel !== false,
     // default ON — only an explicit stored false disables (matches config.ts getter)
     stuckCardInitiatorKeys: dashboard.stuckCardInitiatorKeys !== false,
+    modelQueueNotify: dashboard.modelQueueNotify === true,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,
@@ -1973,6 +1986,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     scheduleBotGrants: {
       createEnabled: global.scheduleDelegation?.createEnabled === true, // default OFF
       selfManageEnabled: global.scheduleDelegation?.selfManageEnabled === true, // default OFF
+      childOneShotEnabled: global.scheduleDelegation?.childOneShotEnabled === true, // default OFF
       grants: global.scheduleDelegation?.botGrants ?? [],
       ignoredCount: ignoredScheduleBotGrantCount(),
       botOptions: scheduleBotGrantBotOptions(),
@@ -2004,6 +2018,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
+    providerRecovery: global.providerRecovery ?? null,
     multiTopic: {
       enabled: global.multiTopic?.enabled !== false, // default ON
       taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
@@ -2975,6 +2990,9 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
 }
 
 async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  // The live check runs plugin code for up to 20s. Keep it outside the config
+  // lease: the caller's plugin service lock already pins the registry record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
@@ -2995,6 +3013,9 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
   if (defaults.includes(pluginId)) throw new Error('请先关闭全局启用，再按 Bot 配置');
+  // Never hold bots.json's cross-process lock (5s waiter budget) across the
+  // plugin's live check (up to 20s); the service lock still pins the record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   return runDurableConfigMutation({
     scope: 'bots',
     path,
@@ -3263,16 +3284,11 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
-  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
-  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
-  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
->> & { cliId?: string };
-
 function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
+      apiOnly: b.apiOnly,
       cliRuntime: b.cliRuntime,
       // loadBotConfigs mirrors structured runtime.executable into this legacy
       // field in memory. Only forward a genuine path-only config to the private
@@ -3348,6 +3364,7 @@ async function configuredBotDefaultsRecoveryRows(
           larkAppId: bot.larkAppId,
           botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: bot.cliId,
+          apiOnly: bot.apiOnly,
           brand: bot.brand,
           cliRuntime: bot.cliRuntime,
           cliPathOverride: bot.cliRuntime ? undefined : bot.cliPathOverride,
@@ -3382,33 +3399,6 @@ async function configuredBotDefaultsRecoveryRows(
   } catch {
     return [];
   }
-}
-
-function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
-  bot: T,
-  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
-): T & ConfiguredBotAgentFields {
-  const raw = ids.get(bot.larkAppId);
-  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
-  return {
-    ...bot,
-    cliId: bot.cliId || fallback?.cliId,
-    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
-    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
-    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
-    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
-    model: bot.model || fallback?.model,
-    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
-    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
-    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
-    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
-    serviceTier: bot.serviceTier || fallback?.serviceTier,
-    nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
-    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
-    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
-    dshProfile: bot.dshProfile ?? fallback?.dshProfile,
-    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
-  };
 }
 
 function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkTransportEnabled?: boolean }[] {
@@ -4720,6 +4710,8 @@ const server = createServer(async (req, res) => {
       return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
     }
 
+    if (await handleUsageAnalyticsApi(req, res, url, { canManageHost: authed, query: queryDashboardUsage })) return;
+
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
       await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
       return;
@@ -4932,13 +4924,29 @@ const server = createServer(async (req, res) => {
       // re-resolves by larkAppId; the stored row is left untouched.
       const nameOf = dashboardBotNameLookup();
       groupsMatrixSnapshot.warm();
-      const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
+      const groupPresentation = groupsMatrixSnapshot.peekPresentation();
+      let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
+      try {
+        page = selectSessionPage(aggregator.getSessions(), url.searchParams, {
+          // ⌘K / Workbench search also matches the names the browser displays
+          // beside a row: the current bot name and the group name.
+          searchText: row => [
+            row.larkAppId ? nameOf(row.larkAppId) : undefined,
+            typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
+          ],
+        });
+      }
+      catch (error) {
+        return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });
+      }
+      const sessions = enrichSessionsWithGroupNames(page.sessions.map(s => {
         const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
         return n && n !== s.botName ? { ...s, botName: n } : s;
-      }), groupsMatrixSnapshot.peekPresentation());
+      }), groupPresentation);
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
       lazyTopicLinkBackfill.trigger(browserSessions);
       return jsonRes(res, 200, {
+        ...page,
         sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
     }
@@ -5189,10 +5197,7 @@ const server = createServer(async (req, res) => {
       const latest = latestResult.value;
       let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
       try {
-        configuredUpdateTargets = selectCodexRuntimeUpdateTargets(
-          loadBotConfigs(),
-          (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
-        );
+        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigs());
       } catch {
         // Config unreadable or an adapter unavailable: fail closed and hide
         // persisted badges whose continued relevance cannot be established.
@@ -6267,14 +6272,23 @@ const server = createServer(async (req, res) => {
         botConfig = undefined;
       }
       const probeContext = modelCatalogProbeContext(key, botConfig, process.env);
+      const resolveExecutable = createDashboardExecutableResolver(probeContext.probeEnv ?? process.env);
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
-        adapterFactory: requestedCliId => createCliAdapterSync(
-          requestedCliId,
-          requestedCliId === probeContext.cliId ? probeContext.runtimeExecutable : undefined,
-        ),
+        resolveExecutable,
+        supportsModelDiscovery: requestedCliId => {
+          // Capability fields are static for a CLI. An absolute placeholder
+          // keeps even eager constructors (for example pi) from resolving the
+          // real command before this preflight has proved discovery is needed.
+          const adapter = createCliAdapterSync(requestedCliId, '/__botmux_model_capability_probe__');
+          return Boolean(adapter.detectModelCapabilities || adapter.detectModels);
+        },
+        adapterFactory: async (requestedCliId, pathOverride) => {
+          const command = pathOverride ?? rawCliExecutable(requestedCliId);
+          return createCliAdapterSync(requestedCliId, command ? await resolveExecutable(command) : undefined);
+        },
       });
       return jsonRes(res, 200, body);
     }
@@ -6345,11 +6359,24 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web、compat 或 local' });
       }
-      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const registrationMode = registrationModeRaw === 'compat'
+        ? 'compat' as const
+        : registrationModeRaw === 'local'
+          ? 'local' as const
+          : 'web' as const;
+      if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
+      }
+      if (registrationMode === 'local' && parsed.requireCriticalScopesBeforeActivation === true) {
+        return jsonRes(res, 400, { ok: false, error: 'local_scope_gate_unsupported', message: '本地机器人没有飞书权限可校验。' });
+      }
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
+      if (registrationMode !== 'web' && sessionModeRaw) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 只用于飞书 Web 登录' });
+      }
       if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });
       }
@@ -7062,6 +7089,7 @@ const server = createServer(async (req, res) => {
                     projectCoordinatorAppId: mode.coordinatorAppId,
                     projectWorkerAppIds: mode.workerAppIds ?? [],
                     projectAutoEnrollWorkers: mode.autoEnrollWorkers === true,
+                    projectImportNotify: mode.importedSessionPolicy === 'notify',
                     ...(!mode.progressCard
                       ? { projectProgressCard: resolveProjectProgressCardConfig(undefined) }
                       : {}),

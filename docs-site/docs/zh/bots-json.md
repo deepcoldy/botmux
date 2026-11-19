@@ -73,6 +73,7 @@
 | 拉黑某人 | `blockedUsers` |
 | 限制 agent 能读写的文件 | `sandbox`（见[文件沙盒](/sandbox)） |
 | 嫌实时卡片吵 | `disableStreamingCard`、`hiddenStreamingCardButtons` |
+| bot 给别人用，回复里不带开发机路径和本机地址 | `hideLocalAddresses`（见[隐藏开发机地址](#hide-local-addresses)） |
 | 一轮只用一张卡显示进度和答复 | `replyCardMode: "unified"` |
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
 | 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
@@ -101,7 +102,7 @@
 | `displayName` | Dashboard 里显示的备注名。只影响 Dashboard 展示，不改飞书里的应用名 |
 | `cliId` | 用哪个 CLI，默认 `claude-code`。可选值见[多 CLI 适配器](/adapters)。`gemini` 已下线：还写着 `"gemini"` 的 bot 会拒绝启动，并提示改成 `"antigravity"` |
 | `model` | 启动 CLI 用的模型名（比如 `claude --model opus`）；不填就用 CLI 自己的默认值。同一种 CLI 的多个 bot 可以跑不同模型。每次启动或恢复会话时都按当前配置取值，所以改完后，没设群级模型的老会话下次恢复时也会用新模型 |
-| `reasoningEffort` | 新会话默认的思考强度，取值 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`。支持的 CLI：Claude Code、Codex、Codex App、TraeX、Grok、Kimi、ZCode、`remote-runner`。会按 CLI 和模型的能力校验，不支持的组合会被忽略。例如 Kimi 只在模型是 `kimi-code/k3` 或 `kimi-code/k3-256k` 时生效，且只有 `low` / `high` / `max` 三档；Claude 的 Haiku 模型不支持思考强度 |
+| `reasoningEffort` | 新会话默认的思考强度，取值 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`。支持的 CLI：Claude Code、Codex、Codex App、TraeX、Grok、Kimi、ZCode、Doubao、`remote-runner`。会按 CLI 和模型的能力校验，不支持的组合会被忽略。例如 Kimi 只在模型是 `kimi-code/k3` 或 `kimi-code/k3-256k` 时生效，且只有 `low` / `high` / `max` 三档；Claude 的 Haiku 模型不支持思考强度 |
 | `groupDefaultModels` | 按群设置新话题的默认模型，目前支持 Codex 和 Claude Code。见下方[群级新话题默认模型](#group-default-models) |
 | `serviceTier` | 仅 Codex：新会话的速度档位 `default` / `priority` / `ultrafast`；不填沿用 Codex 自己的配置 |
 | `codexProfile` | 仅 Codex：使用的 Codex 配置 profile 名，可在 Dashboard 扫描选择 |
@@ -113,6 +114,7 @@
 | `cliConfigDir` | 仅 Claude Code：用 `CLAUDE_CONFIG_DIR=<目录>` 启动，设置、登录态和会话记录都来自这个目录。只影响新会话 |
 | `disableCliBypass` | 设为 `true` 时不自动追加 `--yolo`、`--dangerously-*` 这类免审批参数 |
 | `promptCache` | 仅 Claude Code：提示缓存的有效期和空闲保活，例如 `{"ttl":"1h","keepalive":{"enabled":true}}`。没写的字段沿用全局设置，默认关闭 |
+| `providerRecovery` | 仅 Claude Code：模型服务暂时出错时自动续跑，例如 `{"enabled":true,"maxWaitMinutes":30}`。没写的字段沿用全局设置，默认关闭。说明见[全局设置：暂态故障自动续跑](/global-settings#provider-recovery) |
 | `skillInjection` | botmux 自带 skill 怎么交给 CLI：`prompt`（按会话注入）、`global`（装进 CLI 全局 skill 目录）、`off`。不填时跟随全局设置，全局默认是 `prompt`。见 [Skill](/skill-cli) |
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |
@@ -347,7 +349,8 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
     "enabled": true,
     "intervalMinutes": 30,
     "text": "该会话已等待处理，请继续跟进。",
-    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"]
+    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"],
+    "quietHours": { "enabled": false, "start": "22:00", "end": "09:00" }
   }
 }
 ```
@@ -358,10 +361,12 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 | `intervalMinutes` | 提醒间隔（分钟），默认 30，范围 1–10080 |
 | `text` | 提醒文字，最多 500 字，不能包含 `<at>` 标签 |
 | `states` | 哪些状态要提醒：`idle`（CLI 空闲）、`dormant`（会话已休眠）、`pending_repo`（等选仓库）、`tui_prompt`（等终端里的选项）、`agent_attention`（agent 请求人处理）、`limited`（额度受限）。开启时至少选一个 |
+| `quietHours` | 可选。默认关闭，启用后默认每天 22:00 至次日 09:00。开始和结束时间使用 `HH:mm`，支持跨午夜，按 Botmux 服务本地时区计算 |
 
 - 只对按话题划分的会话生效（话题群、普通群里的话题、`p2pMode: "thread"` 的私聊）；整群或整个私聊共用一个会话时不提醒。会话要有 owner。
 - 状态一直不变时，每隔 `intervalMinutes` 提醒一次；状态变化或会话里有新消息时重新计时。
-- 手写时四个字段都要写全，缺一个或写错都会当作未配置（也就是关闭）。
+- 免打扰从开始时间（含）生效，在结束时间恢复。免打扰期间继续跟踪会话状态和活动，结束后的下一次扫描会发送仍符合条件的到期提醒。
+- 手写时须提供 `enabled`、`intervalMinutes`、`text` 和 `states`。填写 `quietHours` 时须提供其中的三个字段，且开始和结束时间不能相同。配置无效时，整个提醒配置视为未设置。
 
 **`noProgressNotify`**：一轮任务长时间没有可确认的新进展时，发一条提醒卡片。它只是提醒，不会重启、中断或重试任务。
 
@@ -494,9 +499,10 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 规则：
 
 - 只有 `enabled` 写成 `true` 才算开。`tools` 不写表示覆盖全部工具；写了不认识的工具名会直接报错，不会悄悄降级。
+- 可选 `capabilities` 按能力逐项开关：`lark-user`（飞书用户身份，`lark-cli --as user`）、`bytecloud`（ByteCloud：bytedcli、codebase、git push、bitscli / bits-cli，同一个开关）、`meego`（仅 `bytedcli meego`，独立的 `meegle` 命令不受管）。写了不认识的值会直接报错。不写时由 `tools` 推导（`lark-cli` → `lark-user`，`bytedcli` → `bytecloud` + `meego`）。`bytecloud` / `meego` 没开时对应命令保持原生：直接用这台机器自己的登录态，botmux 不做任何干预。`lark-user` 没开时要分两种：只写 `tools` 的旧配置（不写 `capabilities`）行为与上游一致，`lark-cli --as user` 仍用当轮触发人自己的授权；只有**显式写了 `capabilities` 且不含 `lark-user`** 时，`lark-cli --as user` 才原生执行——用这台机器自己的 lark-cli 配置和登录，botmux 不注入凭据、不发授权请求（`botmux auth request` 对 lark-cli 返回 `lark_user_auth_disabled`）。
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
-- 绝不会退回到 Bot 或其他人的身份代跑。`bytedcli` 没有 Bot 身份，没授权就是失败。
-- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用中心化平台 / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 绝不会退回到 Bot 或其他人的身份代跑，也没有「退回机器登录态」的选项。旧配置里的 `fallback` 字段会被忽略。`bytedcli` 没有 Bot 身份，没授权就是失败。
+- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`allowSpeakerSwitch`（默认 `false`：设为 `true` 后，多人话题里才能在某一条命令前加 `BOTMUX_AS=<open_id>` 用本轮另一位发言人的身份执行；默认关闭时 `BOTMUX_AS` 一律被拒）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
@@ -522,6 +528,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |
 | `askOptionLayout` | `botmux ask` 选项按钮的排布：`compact`（默认，自动换行）或 `vertical`（每行一个，长选项更好读） |
 | `writableTerminalLinkInCard` | `true` 时卡片里直接放可写终端链接（看得到卡片的人都能操作终端）。默认藏在「获取写权限」按钮后面，只私发给点击的人 |
+| `goalStatusCard` | `true` 时，Codex / TRAE 会话设定原生目标后发一张目标状态卡，原地更新状态和 CLI 累计时长；默认关闭。静默、私有回复、文档、会议等会话不显示 |
 | `privateCard` | `true` 时 `/card` 只发给管理员可见的私有卡片，只在普通群有效，且不会实时刷新 |
 | `silentTurnReactions` | `true` 时，关了实时卡的会话不再给消息贴「冲!」/ ✅ 表情 |
 | `receivedReactionEmoji` / `doneReactionEmoji` | 换掉「已收到」/「已完成」表情（飞书 emoji_type），默认 `GoGoGo` / `DONE`。把两者设成一样，可以避免 CLI 提前判定空闲时过早出现 ✅ |
@@ -581,6 +588,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `replyDelivery` | 最终答复怎么送到飞书。`send`（除 Doubao 外所有 CLI 的默认）：模型自己执行 `botmux send`；`transcript`：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去。见下方说明 |
 | `senderTag` | 默认开启：每条转给 CLI 的消息都带一个 `<sender ... />` 标签，告诉模型是谁在说话。只有写 `false` 才关闭 |
 | `senderTagHideEmail` | 默认关闭。开启后 `<sender>` 标签里不带邮箱，姓名和 ID 保留 |
+| `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
 | `promptInjection` | `"default"`（默认）或 `"none"`。`none` 是零注入模式：botmux 不加任何系统提示和提醒，只传任务原文和附件，并自动回传最终答复。见下方说明 |
 | `envelopeInjection` | 仅 Claude Code：`auto` 时把每轮的提醒内容改由 hook 注入，终端输入框里只剩消息本身；默认 `off` 保持原样 |
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
@@ -621,6 +629,23 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 - `botmux send --mention-back`（@ 回本轮发消息的人）不受影响，它用的是 daemon 自己记录的触发人。
 - 代价：Dashboard 的会话洞察没法再从标签判断发言人类型，`/adopt` 识别 botmux 会话时少了一条线索。
 - Dashboard 里「发言人标签」开关改的就是这个字段。
+
+### 隐藏开发机地址（`hideLocalAddresses`） {#hide-local-addresses}
+
+飞书用户在自己的客户端里看回复，打不开开发机上的文件和本机服务。bot 给别人用时可以打开这个开关；只给自己用、需要在回复里看到排障路径的保持默认关闭。
+
+```text
+/botconfig set hideLocalAddresses on
+/botconfig set hideLocalAddresses off
+```
+
+默认关闭时，回复和卡片原样发出，提示里也不加相关规则。开启后：
+
+- 模型的回复（`botmux send`、自动转发的最终答复、动态单卡、思考过程消息、文档评论回复）发到飞书前，开发机上的绝对路径、`file://` 这类本地协议和本机服务地址会被替换：工作目录里的源码换成仓库相对路径，其它换成「【内部文件】」；技能链接只保留名称。`/dev/null`、`/proc` 这类不指向用户文件的系统路径保留。
+- 系统提示里加一条完整规则（每个会话一次），每轮提醒里加一句，要求模型不放这类地址，文件改用附件或真实可访问的链接。
+- 卡片按钮或链接指向本机地址时整条拒发，模型会收到 `LOCAL_ADDRESS_OUTBOUND_REJECTED`；botmux 自己生成的 Web 终端、Dashboard 链接照常发送。
+- 回复处理和每轮提醒立即生效；系统提示里的完整规则从下一个新会话起生效。
+- Dashboard「Bot 配置 → 消息卡片 → 开发机地址」里的开关改的就是这个字段。
 
 ### 零注入模式（`promptInjection: "none"`）
 

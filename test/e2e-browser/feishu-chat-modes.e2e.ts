@@ -169,7 +169,22 @@ async function withRestore(run: () => Promise<void>, restore: () => Promise<void
 // Private-chat modes
 // ---------------------------------------------------------------------------
 
-async function setDmMode({ agent, page }: BrowserSession, label: string): Promise<void> {
+/**
+ * How long a DM or group mode command may go unanswered on screen. Half way
+ * through, the chat is reloaded once (sendAndAwaitReply): CI saw the bot
+ * answer every DM `/reply-mode` within seconds while the open DM left several
+ * of those answers unrendered per run; they were there after a reload.
+ */
+const MODE_REPLY_MS = 90_000;
+
+/** Reload Messenger and open the bot's DM: also renders a view that stopped updating. */
+async function reopenDm({ agent, page }: BrowserSession, bot: ChatModeBot): Promise<void> {
+  await navigateToMessenger(page);
+  await openChat(page, agent, bot);
+}
+
+async function setDmMode(session: BrowserSession, bot: ChatModeBot, label: string): Promise<void> {
+  const { agent, page } = session;
   // `topic` is reported as `new-topic`; `/reply-mode new-topic` is accepted too.
   const shown = label === 'topic' ? 'new-topic' : label;
   const command = `/reply-mode ${label}`;
@@ -178,6 +193,8 @@ async function setDmMode({ agent, page }: BrowserSession, label: string): Promis
     () => typeChatMessage(agent, page, command),
     command,
     new RegExp(`已切换私聊会话模式为：${shown}`),
+    MODE_REPLY_MS,
+    () => reopenDm(session, bot),
   );
 }
 
@@ -197,15 +214,16 @@ async function withDmMode(
       () => typeChatMessage(agent, page, '/reply-mode'),
       '/reply-mode',
       /当前私聊会话模式：\s*([a-z-]+)/,
+      MODE_REPLY_MS,
+      () => reopenDm(session, bot),
     );
     return label;
   });
-  await setDmMode(session, mode);
+  await setDmMode(session, bot, mode);
   await withRestore(run, () =>
     restoreWithRetry(`${bot} DM mode ${original}`, async () => {
-      await navigateToMessenger(page);
-      await openChat(page, agent, bot);
-      await setDmMode(session, original);
+      await reopenDm(session, bot);
+      await setDmMode(session, bot, original);
     }),
   );
 }
@@ -366,7 +384,7 @@ async function withGroupSetting(
       () => sendMentionMessage(page, agent, bot, `${setting.command} ${label}`),
       `${setting.command} ${label}`,
       new RegExp(`${setting.updated}${label}`),
-      90_000,
+      MODE_REPLY_MS,
       reopen,
     );
   const original = await baselineMode(`${kind}:${bot}`, async () => {
@@ -375,7 +393,7 @@ async function withGroupSetting(
       () => sendMentionMessage(page, agent, bot, setting.command),
       setting.command,
       new RegExp(`${setting.status}\\s*([a-z-]+)`),
-      90_000,
+      MODE_REPLY_MS,
       reopen,
     );
     return label;

@@ -1,6 +1,6 @@
 /** Antigravity account catalogue parsing, adapter wiring and Dashboard fallback behavior. */
 import { execFile } from 'node:child_process';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseAntigravityModels } from '../src/adapters/cli/antigravity-models.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { createAntigravityAcpAdapter } from '../src/adapters/cli/antigravity-acp.js';
@@ -23,6 +23,7 @@ function complete(stdout: string, error: Error | null = null): void {
 }
 
 beforeEach(() => execFileMock.mockReset());
+afterEach(() => vi.unstubAllEnvs());
 
 describe('Antigravity model discovery', () => {
   it('parses model IDs in order, removes duplicates and ignores progress or malformed rows', () => {
@@ -39,14 +40,32 @@ describe('Antigravity model discovery', () => {
       const adapter = transport === 'terminal'
         ? createCliAdapterSync('antigravity', process.execPath)
         : createAntigravityAcpAdapter(process.execPath);
-      const env = { HOME: '/test-only-account', PATH: '/test-only-bin' };
+      const env = Object.freeze({ HOME: '/test-only-account', PATH: '/test-only-bin', AGY_CLI_DISABLE_AUTO_UPDATE: 'false' });
       await expect(adapter.detectModels?.({ env }))
         .resolves.toEqual(['gemini-4-argon-high', 'claude-opus-5-5-high']);
       expect(execFileMock.mock.calls[0]?.slice(0, 3)).toEqual([
         process.execPath, ['models'], expect.objectContaining({
-          env, timeout: expect.any(Number), maxBuffer: expect.any(Number), windowsHide: true,
+          env: { ...env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' }, timeout: expect.any(Number), maxBuffer: expect.any(Number), windowsHide: true,
         }),
       ]);
+    });
+
+    it(`${transport} preserves the inherited environment and disables probe updates`, async () => {
+      complete(CATALOG);
+      vi.stubEnv('AGY_CLI_DISABLE_AUTO_UPDATE', 'false');
+      vi.stubEnv('BOTMUX_TEST_MODEL_PROBE', 'inherited');
+      const adapter = transport === 'terminal'
+        ? createCliAdapterSync('antigravity', process.execPath)
+        : createAntigravityAcpAdapter(process.execPath);
+      await expect(adapter.detectModels?.())
+        .resolves.toEqual(['gemini-4-argon-high', 'claude-opus-5-5-high']);
+      expect(execFileMock.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+        env: expect.objectContaining({
+          BOTMUX_TEST_MODEL_PROBE: 'inherited',
+          AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+        }),
+      }));
+      expect(process.env.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('false');
     });
   }
 

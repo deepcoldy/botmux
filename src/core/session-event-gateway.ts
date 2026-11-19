@@ -9,7 +9,21 @@ export type SessionEventAdmission =
   | { kind: 'reject'; reason: string };
 const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
 // persistent_backend_target is stamped before the CLI spawns, so it can only be worker-scoped.
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target']);
+// session_identity_decision is the worker's report of the spawn it is about to
+// make (sandbox / loopback shape). It is sent before the CLI exists, while an
+// opening turn is still queued: from inside the reserved binding (held with it
+// until the binding settles, so a start that aborts never applies it), or from
+// the Codex RPC engine outside any binding. Scoping it to a runtime or turn
+// refused it on every start that carries an opening turn and on every RPC
+// start, leaving the daemon on the fail-closed single model and every proven
+// identity wrapper on exit 77. It grants nothing: the producer is still the
+// current worker channel, any execution it names must exist, and the daemon
+// handler re-checks generation, session and structural possibility.
+// cli_input_backlog reports the worker's own input queue, which outlives runtime
+// re-bindings; the worker sends it without a runtime (see sessionEventMetadata).
+// failed_turn_rewind likewise: it is sent from inside the CLI restart that cuts
+// a failed turn, before the queued message runs.
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'session_identity_decision', 'cli_input_backlog', 'failed_turn_rewind']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
@@ -35,7 +49,8 @@ export class SessionEventGateway {
         || this.store.authorizedExecutionObserver(this.session, runtime, recoveredOrigin.producer, recoveredOrigin.scope.execution)
         || (recoveredOrigin.bindingId && this.store.bindingProducer(this.session, recoveredOrigin.bindingId, recoveredOrigin.producer)
           && sameRuntime(this.store.binding(this.session, recoveredOrigin.bindingId)?.ref, runtime)));
-    const observation = sameWorker(state.worker, channel) && ['final_output', 'turn_terminal'].includes(type)
+    const observation = sameWorker(state.worker, channel)
+      && ['final_output', 'turn_terminal'].includes(type)
       && this.store.authorizedExecutionObserver(this.session, runtime, channel, context.scope.execution);
     if (!this.store.authorizedProducer(this.session, runtime, channel) && !recovery && !observation) return { kind: 'reject', reason: 'runtime_producer_unproven' };
     if (context.scope.execution) {
@@ -50,7 +65,15 @@ export class SessionEventGateway {
       const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
         && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
           || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity'].includes(type)));
-      if (!sameRuntime(execution.runtime, runtime)
+      const sourceRuntime = execution.runtime ? this.store.runtime(this.session, execution.runtime.runtimeId) : undefined;
+      const sameContinuedExecutionRuntime = !!execution.runtime && sameWorker(state.worker, channel)
+        && (this.store.runtimeContinues(this.session, execution.runtime, runtime, channel)
+          || this.store.runtimeContinues(this.session, runtime, execution.runtime, channel)
+          || (sameRuntime(state.activeRuntime, runtime)
+            && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)
+            && !!sourceRuntime
+            && this.store.runtimeContinues(this.session, sourceRuntime.ref, runtime, sourceRuntime.worker)));
+      if (!sameRuntime(execution.runtime, runtime) && !sameContinuedExecutionRuntime
         && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }

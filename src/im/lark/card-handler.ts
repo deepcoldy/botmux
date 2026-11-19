@@ -1,5 +1,6 @@
 import { modelPinText } from '../../core/model-pin.js';
 import { resolveSessionModelPinView } from '../../core/session-model.js';
+import { sessionContractPrimary } from '../../core/session-contract-primary.js';
 import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
@@ -20,8 +21,11 @@ import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
+import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
+import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
@@ -91,6 +95,7 @@ import { logger } from '../../utils/logger.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from '../../core/restart-status-card.js';
 import * as sessionStore from '../../services/session-store.js';
 import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
+import { applyKimiCacheExpiryAutoCompact, isKimiCacheExpiryAutoCompactEnabled } from '../../core/kimi-cache-expiry.js';
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
@@ -98,11 +103,11 @@ import { holdPurgeClickRollback } from '../../services/image-purge-recovery.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from '../../core/resume-result-message.js';
 import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, sessionSupportsKimiCacheExpiryAutoCompact, sendKimiCacheExpiryAutoCompactSetting, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, interruptCodexAppTurn, codexAppStopCardTarget, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -207,7 +212,7 @@ export interface CardHandlerDeps {
     operatorUnionId?: string;
     payload?: string;
     sig?: string;
-  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  }) => Promise<{ ok: true; chatId: string; anchorId?: string; prompt?: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -230,6 +235,9 @@ export interface CardActionData {
   event?: { event_id?: string };
   operator?: {
     open_id?: string;
+    /** Trusted callback identity; user_id requires contact:user.employee_id:readonly. */
+    user_id?: string;
+    tenant_key?: string;
     /** Lark-verified union_id, present on card v2 callbacks where the tenant
      *  enables `with_union_id`. Absent when Lark doesn't carry it; callers
      *  fall back to `resolveUserUnionId` via `resolveCardOperatorUnionId`. */
@@ -869,6 +877,7 @@ export async function commitRepoSelection(
               whiteboardId: ds.session.whiteboardId,
               substituteTrigger: ds.pendingSubstituteTrigger,
               codexAppText: ds.pendingCodexAppText,
+              acceptedInput: ds.pendingAcceptedInput,
               codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
               codexAppMessageContext: ds.pendingCodexAppMessageContext,
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -948,6 +957,7 @@ export async function commitRepoSelection(
       if (emptyStart) markInitialUserTurnPending(ds);
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
+      ds.pendingAcceptedInput = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
       ds.pendingChatContext = undefined;
@@ -1090,6 +1100,7 @@ export async function commitRepoSelection(
         markRepoCardConsumed(current, cardToWithdraw);
         current.repoCardMessageId = undefined;
 
+        const predecessorRevision = current.session.sessionRuntimeContract?.session.revision ?? 0;
         const session = sessionStore.createSession(
           current.chatId,
           current.scope === 'chat' ? oldSession.rootMessageId : rootId,
@@ -1105,6 +1116,11 @@ export async function commitRepoSelection(
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
+        if (sessionContractPrimary(current.larkAppId)) {
+          session.durablePrimaryPredecessor = {
+            sessionId: oldSession.sessionId, contractRevision: predecessorRevision,
+          };
+        }
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;
         session.creatorOpenId = oldSession.creatorOpenId;
@@ -1601,6 +1617,12 @@ function buildMenuCloseConfirmCard(ds: DaemonSession, rootId: string, loc: Local
   });
 }
 
+
+/** The suggestion echoed back as plain text: a text message would turn an
+ * `<at …>` tag in it into a real mention. */
+export function nextStepNoticeText(prompt: string): string {
+  return prompt.replace(/<(\/?at\b)/gi, '＜$1');
+}
 
 function cardClickTurnToastKey(reason: string): string {
   switch (reason) {
@@ -2109,7 +2131,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   if (value?.action === 'card_click_turn' && larkAppId) {
     const loc = localeForBot(larkAppId);
-    if (!deps.cardClickTurn) {
+    // A reply card's「下一步」row. Its notice is unsigned and only selects the
+    // acknowledgement below; turning the bot switch off disables earlier rows.
+    const nextStep = value.notice === NEXT_STEP_CLICK_NOTICE;
+    if (!deps.cardClickTurn || (nextStep && getBot(larkAppId).config.replyCardNextStep !== true)) {
       return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
     }
     const accepted = await deps.cardClickTurn({
@@ -2126,8 +2151,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
       afterAck: () => accepted.run().then(async result => {
         const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
-        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
         try {
+          if (nextStep && accepted.anchorId) {
+            // Stays in the session's own thread, like the reply it came from.
+            const notice = failed
+              ? t('card.click_turn.delivery_failed', undefined, loc)
+              : t('card.next_step.started', { text: nextStepNoticeText(accepted.prompt ?? '') }, loc);
+            await deps.sessionReply(accepted.anchorId, notice, 'text', larkAppId);
+            return;
+          }
+          const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
           await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
         } catch (err) {
           logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -2145,7 +2178,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return handleOncallFormAction(data, larkAppId);
   }
 
-  if ((value?.action === 'oncall_group_create' || value?.action === 'oncall_group_forward') && larkAppId) {
+  if ((value?.action === 'oncall_group_create' || value?.action === 'oncall_group_forward' || value?.action === 'oncall_group_join') && larkAppId) {
     const { handleOncallGroupAction } = await import('./oncall-group.js');
     return handleOncallGroupAction(data, larkAppId);
   }
@@ -2545,6 +2578,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
+    // Like beginNewTurn: the previous turn's「下一步」row and「本轮回顾」panel are retired.
+    noteReplyCardTurnStarted(ds, turnId);
     ds.currentTurnTitle = topicTitle.slice(0, 50);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
@@ -3642,6 +3677,43 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       };
     }
 
+    // 「🗜️ 缓存过期自动压缩：开/关」：本会话 opt-in（core/kimi-cache-expiry.ts，仅 Kimi Code）。
+    // 与闲置自动压缩同形：按钮值带目标状态 desired、旧卡重复点击幂等、设置落在会话行上；
+    // 存盘成功后推给活 worker，换代的 worker 从 init 读到同一设置。
+    if (actionType === 'toggle_kimi_expiry_compact') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      // canOperate is enforced by the sensitive-action gate (card-action-routes.ts).
+      if (!sessionSupportsKimiCacheExpiryAutoCompact(ds)) {
+        return { toast: { type: 'warning', content: t('card.kimi_expiry_compact.unsupported', undefined, loc) } };
+      }
+      const enabled = value?.desired === 'on'
+        ? true
+        : value?.desired === 'off' ? false : !isKimiCacheExpiryAutoCompactEnabled(ds.session);
+      const previous = applyKimiCacheExpiryAutoCompact(ds.session, enabled);
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        if (previous) ds.session.kimiCacheExpiryAutoCompact = previous;
+        else delete ds.session.kimiCacheExpiryAutoCompact;
+        logger.warn(`[${tag(ds)}] toggle_kimi_expiry_compact save failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { toast: { type: 'warning', content: t('card.kimi_expiry_compact.save_failed', undefined, loc) } };
+      }
+      sendKimiCacheExpiryAutoCompactSetting(ds, enabled);
+      logger.info(`[${tag(ds)}] Kimi cache-expiry auto-compact ${enabled ? 'on' : 'off'} via card by ${operatorOpenId ?? '?'}`);
+      return {
+        toast: {
+          type: 'success',
+          content: t(enabled ? 'card.kimi_expiry_compact.enabled' : 'card.kimi_expiry_compact.disabled', undefined, loc),
+        },
+        ...(cardMessageId && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      };
+    }
+
     if (actionType === 'session_effort_pick' || actionType === 'session_effort_apply') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
@@ -4020,11 +4092,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           // the adapter can only resume a precise cliSessionId and none was
           // persisted, the next spawn starts a FRESH session — say so instead
           // of claiming history is back.
-          const resumeMsg = result.recoveryPending
-            ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
-            : resumeStartsFresh(result.ds.session)
-              ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-              : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          const resumeMsg = resumeSuccessMessage(result, cliName, localeForBot(result.ds.larkAppId), dshRuntimeForSession(result.ds));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
           // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
           // cards are enabled. Card-off bots only withdraw the stale closed card
@@ -4183,6 +4251,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return;
       }
       rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -4221,6 +4291,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -4305,6 +4376,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           },
         };
       }
+      // An input is already on its way to re-send this failed turn (its CLI
+      // restart is still running): a retry now would run it twice.
+      if (failedTurnRewindInFlight(ds, failedTurn.turnId)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_in_flight', undefined, locDs) } };
+      }
       if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
@@ -4335,7 +4411,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+        // A turn that failed without any output is cut first and its input
+        // re-sent as it was — nothing ran, so there is nothing to continue
+        // from (core/failed-turn-rewind.ts). Otherwise the mode above applies.
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
         else {
           accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
@@ -4354,6 +4433,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
       rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4448,6 +4529,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const retryReceipt = markRetryAttempt(ds.session);
       holdPurgeClickRollback(ds, retryTurnId, { ...(retryReceipt ? { receipt: retryReceipt } : {}), restoreTurnState });
       rememberLastCliInput(ds, failedTurn.userPrompt, continueInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4918,6 +5001,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           unavailable,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         return { cardJson, unavailable };
       };
@@ -5152,6 +5236,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -5163,12 +5248,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return;
     }
 
-    // 「⏹ 停止」：中断当前 turn 但保留会话（不是 /close——turn 跑飞时折叠态用户此前
-    // 唯一手段是杀整个会话丢上下文）。走已有的 term_action ctrlc IPC 链路
-    // （sendWorkerSessionInput → worker.handleTermAction → sendCriticalControlKey
-    // 带重试注入 ^C），与展开态 ^C 快捷键完全同款。中断后把卡片重渲染为 transient
-    // 'interrupted' 状态（橙色 header + 已中断文案），~2s 后被下一次 screen_update
-    // patch 覆盖为真实 idle 态。
+    // Stop preserves the session. App Runner requires a captured native turn;
+    // terminal adapters keep their existing Ctrl+C path.
     if (actionType === 'stop_turn') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
@@ -5180,22 +5261,39 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (isSessionTransferring(ds)) {
         return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
       }
-      // RPC 输入模式下 ^C 到不了 app-server（pane 只是 viewer）；codex-app（App Runner）
-      // 无 PTY 输入通道。两者都降级为明确拒绝，提示用 /close。
-      if (ds.initConfig?.codexRpcInput === true || sessionCliId(ds) === 'codex-app') {
+      // The experimental RPC input mode still has no card interrupt path.
+      if (sessionCliId(ds) !== 'codex-app' && ds.initConfig?.codexRpcInput === true) {
         return { toast: { type: 'warning', content: t('card.action.stop_unsupported', undefined, locDs) } };
       }
       if (!ds.worker || ds.worker.killed) {
         return { toast: { type: 'warning', content: t('card.action.stop_no_worker', undefined, locDs) } };
       }
-      if (typeof value.reply_card_turn_id === 'string') {
-        const key = replyCardKey(ds, value.reply_card_turn_id,
-          typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined);
-        const record = new TurnReplyCardStore(config.session.dataDir).read(key);
-        if (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered
-          || ds.replyCardRunningTurnId !== key.turnId) {
-          return { toast: { type: 'warning', content: locDs === 'en' ? 'This turn is no longer running.' : '这一轮已不在执行，停止操作未发送。' } };
-        }
+      const replyKey = typeof value.reply_card_turn_id === 'string' ? replyCardKey(ds, value.reply_card_turn_id,
+        typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined) : undefined;
+      const record = replyKey && new TurnReplyCardStore(config.session.dataDir).read(replyKey);
+      const staleTurn = () => ({ toast: { type: 'warning', content: t('cmd.stop.app_stale_turn', undefined, locDs) } });
+      if (replyKey && (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered)) {
+        return staleTurn();
+      }
+      if (sessionCliId(ds) === 'codex-app') {
+        const target = ds.codexAppInterruptTarget;
+        const streamTarget = codexAppStopCardTarget(ds);
+        if (!target || (replyKey
+          ? target.replyTurnId !== replyKey.turnId || target.dispatchAttempt !== replyKey.dispatchAttempt
+          : !cardMessageId || cardMessageId !== ds.streamCardId || value.card_nonce !== ds.streamCardNonce
+            || !streamTarget || value.codex_app_stop_target !== streamTarget)) return staleTurn();
+        const status = await interruptCodexAppTurn(ds, target);
+        const content = t(`cmd.stop.app_${status}`, undefined, locDs);
+        return {
+          toast: { type: status === 'delivered' ? 'success' : 'warning', content },
+          afterAck: async (timedOut?: boolean) => {
+            if (timedOut && operatorOpenId) await sendUserMessage(ds.larkAppId, operatorOpenId, content, 'text');
+          },
+        };
+      }
+      if (replyKey) {
+        const key = replyKey;
+        if (ds.replyCardRunningTurnId !== key.turnId) return staleTurn();
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
         void updateTurnReplyCard(ds, key.turnId, { kind: 'phase', phase: 'stopping' },
           (body, type, uuid, beforeWrite) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid, beforeWrite }),
@@ -5236,6 +5334,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5543,6 +5642,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           false,
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
+          codexAppStopCardTarget(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

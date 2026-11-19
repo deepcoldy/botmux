@@ -122,6 +122,21 @@ describe('bytedcli identity renewal', () => {
     expect(await renewExpiringBytedcliIdentities()).toBe(0);
   });
 
+  // The wrapper words its refusal for a partition without a token by this
+  // marker; a renewal that dropped it would turn "this machine could not mint
+  // one" into a generic refusal for the rest of the turn.
+  it('keeps who minted the partition tokens across a renewal', async () => {
+    const identity = { ...publish(7200, 20 * 60), regionalCloudJwtSource: 'local' as const };
+    writeSessionIdentity(dir, SESSION, identity, 'proven');
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
+    const fresh = jwt('cn', 7200, 'c1');
+    renew.mockResolvedValueOnce({ cloudJwt: fresh });
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    const body = recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')!;
+    expect(body).toContain(fresh);
+    expect(body).toContain("BOTMUX_IDENTITY_REGIONAL_SOURCE='local'");
+  });
+
   it('keeps current tokens when renewal fails and retries later', async () => {
     const identity = publish(7200, 20 * 60);
     renew.mockResolvedValueOnce(null);

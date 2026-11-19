@@ -35,6 +35,7 @@ import { canOperate, canTalk } from '../im/lark/event-dispatcher.js';
 import { logger } from '../utils/logger.js';
 import { pickTurnReplyTarget } from './reply-target.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import {
   buildOrdinaryRecoveryNoticeCard,
   forkWorker,
@@ -48,6 +49,7 @@ export type OrdinaryRecoveryRetryError =
   | 'missing'
   | 'no_input'
   | 'already_retried'
+  | 'in_flight'
   | 'session_unavailable'
   | 'submit_failed';
 
@@ -73,6 +75,10 @@ export async function retryOrdinaryRecoveryNotice(
   if (!record) return { ok: false, error: 'missing' };
   if (record.retried) return { ok: false, error: 'already_retried' };
   if (!record.retry) return { ok: false, error: 'no_input' };
+  // An input is re-sending a failed turn right now (failed-turn rewind). The
+  // card is keyed by the logical turn, but what is being re-sent may be a
+  // continuation of it that failed in turn: any rewind in flight refuses.
+  if (failedTurnRewindInFlight(ds)) return { ok: false, error: 'in_flight' };
   if (ds.session.status !== 'active'
     || ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds))) {
     return { ok: false, error: 'session_unavailable' };
@@ -136,7 +142,7 @@ export async function retryOrdinaryRecoveryNotice(
     // synchronously instead of reporting `deferred` and failing later, after
     // this click was already recorded as accepted.
     const accepted = ds.worker && !ds.worker.killed
-      ? sendWorkerInput(ds, { content }, turnId, { trustedCaller: recoveredCaller, atMostOnce: true })
+      ? sendWorkerInput(ds, { content }, turnId, { trustedCaller: recoveredCaller, atMostOnce: true, failedTurnResendOf: logicalTurnId })
       : forkWorker(ds, { content }, {
         resume: ds.hasHistory, turnId, trustedCaller: recoveredCaller, atMostOnce: true,
       }, {
@@ -233,6 +239,7 @@ export async function handleOrdinaryRecoveryRetryClick(
       + `failed: ${result.error}`,
     );
     if (result.error === 'already_retried') return warn('card.action.retry_recovery_already');
+    if (result.error === 'in_flight') return warn('card.action.retry_turn_in_flight');
     if (result.error === 'missing' || result.error === 'no_input') return warn('card.action.retry_recovery_missing');
     return warn('card.action.retry_recovery_unavailable');
   }

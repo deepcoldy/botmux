@@ -20,6 +20,18 @@ describe('botmux observe arguments', () => {
     expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`未知参数：${args[0]}`));
   });
 
+  it.each([
+    [['--active', '--session', 's1']],
+    [['--session', 's1', '--since', '6h']],
+    [['--since', 'yesterday']],
+    [['--since']],
+  ])('rejects invalid list filter %j before touching any daemon', async (args) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await expect(runObserveCommand(args)).resolves.toBe(2);
+    expect(stderr).toHaveBeenCalled();
+  });
+
   it('documents only the canonical JSON interface', async () => {
     const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 

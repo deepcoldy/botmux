@@ -46,11 +46,13 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 
 ## 5-Minute Setup
 
-> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual app creation / credential entry is also supported).
+> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual credential entry is also supported). For a bot with no Feishu app, use `botmux setup add --local` or Dashboard → Add bot → Local only. The saved `local_*` id is a stable local identity, not a Feishu app id.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # one scan to create app → pick CLI → pick working dir (auto-configured)
+botmux setup add --local --name lab --cli codex --default-working-dir ~ --json
+                             # local bot only: no QR, no Feishu App ID or secret
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 
@@ -85,6 +87,17 @@ Then DM the bot, or run `botmux dashboard` to create a group and start chatting.
 - **[On-call mode](https://deepcoldy.github.io/botmux/en/oncall) & [voice summary](https://deepcoldy.github.io/botmux/en/voice)** — pull it into an on-call group and any member's @ triggers a probe in the project dir; once TTS is configured, each card footer gains a 🔊 voice-summary button that makes the model "speak plainly".
 
 More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Final answer feedback](docs/feedback-capability-current-implementation.md) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent (showcase)](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
+
+## Central Platform (open source, self-hosted)
+
+botmux on a single machine needs no central service. Once you have several machines, want to reach them from outside their network, or want to use them with a team, you can deploy the open-source **[Botmux Platform](https://github.com/botmux-ai/botmux-platform)** (MIT). You sign in with Lark, and the botmux on every machine shows up in one website:
+
+- **Open from anywhere**: each machine dials out to the platform over a tunnel, so no inbound ports are needed; open any machine's Dashboard and web terminal from the website, with Lark single sign-on.
+- **Machine overview**: online status, daemon version, one-click upgrade, and co-managers per machine.
+- **Team collaboration**: teams with Lark collaboration groups and an Issue board, plus finding bots on teammates' machines to bring into a group.
+- **Personal credential vault**: authorize Lark once on the platform, and it issues short-lived credentials to your bound machines so bots can call lark-cli as you.
+
+To connect a machine, click 「绑定新机器」 (Bind new machine) on the platform website and run the `botmux bind <credential>` command it gives you in that machine's terminal. Deployment is covered in the [platform repository](https://github.com/botmux-ai/botmux-platform), connecting and usage in the [Central Platform docs](https://deepcoldy.github.io/botmux/en/platform); there's also a [3-minute explainer video](https://github.com/user-attachments/assets/52136d9e-841e-4e52-a297-8dcad561c7dc) (in Chinese).
 
 ## Per-Bot Zero Prompt Injection
 

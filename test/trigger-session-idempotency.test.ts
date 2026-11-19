@@ -36,6 +36,7 @@ const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alrea
 // tell those apart, so a revert to the bare call would have stayed green.
 const mockBackgroundClose = vi.fn(async (...a: any[]) => mockCloseSession(a[0] as never));
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   closeSession: (...a: any[]) => mockCloseSession(...a),
   closeSessionForBackgroundCleanup: (...a: any[]) => mockBackgroundClose(...a),
   forkWorker: vi.fn(),

@@ -1,0 +1,67 @@
+---
+description: "The open-source, self-hosted central platform for botmux: sign in with Lark, manage every machine in one website, open Dashboards and terminals remotely, and work with a team."
+---
+
+import platformIntro from '../../static/img/platform-intro.mp4';
+
+# Central Platform (Open Source)
+
+botmux runs on your own machines, and a single machine needs no central service. Once you have several machines, want to reach them from outside their network, or want to use them with a team, you can deploy a **central platform**: [Botmux Platform](https://github.com/botmux-ai/botmux-platform). It's open source under the MIT license and self-hosted: you sign in with Lark, and the botmux on every machine shows up in one website.
+
+<video src={platformIntro} controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+*The video is narrated in Chinese.*
+
+It helps when:
+
+- botmux runs on several machines (dev boxes, cloud hosts, your own laptop) and you want to see their status and open their Dashboards in one place.
+- You're not on the machine's network but still want the web terminal, without setting up a reverse proxy or opening ports.
+- Each person on a team runs their own bots, and you want a shared Issue board and a way to find each other's bots across machines.
+- Several people share one bot, and each of them should call lark-cli with their own Lark identity.
+
+## What it does
+
+| Feature | Details |
+|---|---|
+| Open Dashboards and terminals remotely | Every machine has its own subdomains; one click on the website opens its [Dashboard](/en/dashboard) or a session's [web terminal](/en/web-terminal). The machine needs no inbound ports |
+| Lark single sign-on | Links carry no token. The platform first recognizes who you are, then decides what you can see and do based on whether you're the machine's owner, a co-manager, or someone else |
+| Machine overview | Online status, daemon version, one-click upgrade, and co-managers per machine |
+| Team collaboration | Teams with Lark collaboration groups and an Issue board; find bots by specialty on teammates' machines and bring them into a group (see [Multi-bot collaboration](/en/multi-bot#team-scope-finding-bots-on-other-peoples-machines)) |
+| Personal credential vault | Authorize Lark once on the platform, and it issues short-lived credentials to your bound machines when needed. Bots set to [run CLI calls as the message sender](/en/bots-json#trigger-user-auth) can then call lark-cli as you |
+
+## How it works
+
+- Machines usually sit on networks the platform can't reach, so botmux **dials out** to the platform and keeps a WebSocket control tunnel open. When you open a machine on the website, the platform asks it to dial a data connection back and relays the machine's Dashboard over it. Your browser only ever talks to the platform's HTTPS domain.
+- Each machine has two subdomains: the Dashboard at `https://m-<machineId>.<platform-domain>/` and session terminals at `https://t-<machineId>.<platform-domain>/s/<session ID>`. A sign-in is valid for that one machine only.
+- Sessions, CLIs, and code stay on your machines. The platform only stores data such as machines, users, teams, issues, and credentials (in MongoDB).
+
+## Connect a machine
+
+1. Open the platform website, sign in with Lark, click 「绑定新机器」 (Bind new machine), and copy the `botmux bind <credential>` command it shows.
+2. Run it in **that machine's terminal**. The credential already contains the platform address, so there's nothing else to configure.
+3. Binding completes on the spot. If botmux is running, it connects to the platform right away, no restart needed. The command prints this machine's Dashboard link on the platform, and from then on `botmux dashboard` gives the platform link too.
+
+For a machine without botmux yet, copy the command from 「一键安装 Botmux」 (one-click install) on the platform: it installs botmux and common dependencies (Node.js, tmux, Codex, lark-cli, and so on), then reminds you to bind.
+
+A few notes:
+
+- `botmux bind` only runs in a host terminal. Inside an AI CLI session it's refused, so an AI can't get hold of the bind credential.
+- Binding again is safe and keeps the machine identity (machineId). The binding is stored in `~/.botmux/platform.json`.
+- If you've never set "Remote terminal access" (`remoteAccess`), binding turns it on: session terminals, the terminal button on cards, and webhook addresses switch to platform links. To go back to local links, turn it off in the Dashboard under General → Access; see [Global Settings](/en/global-settings).
+
+## Self-hosting
+
+The platform is a Go backend with a React frontend. It needs MongoDB, plus Redis when you run several replicas.
+
+- **Try it locally**: clone the repository, run `docker compose up --build`, and open `http://localhost:8080`. MongoDB starts alongside it, and sign-in uses a development identity (`DEV_LOGIN`), so no Lark app is needed.
+- **Production** needs:
+  - a Lark custom app with the redirect URL set to `<platform-url>/auth/callback`;
+  - DNS records and TLS certificates for the root domain and the `*.<root-domain>` wildcard, which machine subdomains use;
+  - an ingress gateway that passes WebSockets through, with a long idle timeout (the control tunnel is a long-lived connection).
+
+You can build an image with the repository's `Dockerfile`. Environment variables and full instructions are in the [repository README](https://github.com/botmux-ai/botmux-platform#readme).
+
+## Links
+
+- Source, deployment guide, and issues: [github.com/botmux-ai/botmux-platform](https://github.com/botmux-ai/botmux-platform)
+- Releases: [Releases](https://github.com/botmux-ai/botmux-platform/releases)

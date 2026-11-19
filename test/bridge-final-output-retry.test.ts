@@ -20,6 +20,8 @@ import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { drainDoubaoTranscript } from '../src/services/doubao-transcript.js';
+import { pathToFileURL } from 'node:url';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
 import { OutputDeliveryJournal, outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
@@ -33,6 +35,7 @@ import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
+const uploadReplyFile = vi.fn(async (_appId: string, _file: { name: string; bytes: Buffer }) => 'file_reply');
 const uploadImageMock = vi.fn(async (_appId: string, _image: string | Buffer) => 'img_v3_uploaded_preview');
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
@@ -46,6 +49,7 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
 vi.mock('../src/im/lark/client.js', () => ({
   getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
+  uploadFile: (appId: string, file: { name: string; bytes: Buffer }) => uploadReplyFile(appId, file),
   uploadImage: (appId: string, image: string | Buffer) => uploadImageMock(appId, image),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
@@ -301,12 +305,21 @@ afterAll(async () => {
   rmSync(config.session.dataDir, { recursive: true, force: true });
 });
 
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
+
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    uploadReplyFile.mockReset().mockResolvedValue('file_reply');
     uploadImageMock.mockReset().mockResolvedValue('img_v3_uploaded_preview');
     resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
       resolved: entries,
@@ -332,11 +345,76 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_resetOrdinaryImDeliveries();
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
+    // Cancel queued 1200 ms tool-card timers before the data dir is removed so
+    // a flush from a finished test can neither race the rmdir nor land in the
+    // next test's dir (same contract as unified-native-cot's teardown).
+    const { __testOnlyDrainTurnReplyTools } = await import('../src/core/turn-reply-card.js');
+    await __testOnlyDrainTurnReplyTools();
     setActiveSessionsRegistry(undefined);
     rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     linkRefRuntime.current = undefined;
     vi.useRealTimers();
+  });
+
+  it.each([3_000_000, 8_000_000])('delivers a %i-byte MiniMax final as one Markdown file after a transient send failure', async size => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'minimax';
+    getBot('app_test').config.cliId = 'minimax';
+    let firstSend!: () => void;
+    const attempted = new Promise<void>(resolve => { firstSend = resolve; });
+    const sessionReply = vi.fn().mockImplementationOnce(async () => {
+      firstSend();
+      throw new Error('temporary send failure');
+    }).mockResolvedValue('om_file');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const msg = { ...finalOutputMsg(), content: size === 3_000_000
+      ? 'a'.repeat(size - 21) + ' https://example.org/' : '甲\0'.repeat(size / 4) };
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    await attempted;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(complete).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_file'));
+    expect(uploadReplyFile).toHaveBeenCalledTimes(1);
+    const [app, file] = uploadReplyFile.mock.calls[0];
+    expect([app, file.name, file.bytes.length]).toEqual(['app_test', 'reply.md', size]);
+    expect(file.bytes.equals(Buffer.from(msg.content))).toBe(true);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(JSON.parse(call[1])).toEqual({ file_key: 'file_reply' });
+      expect(call[2]).toBe('file');
+      expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+    }
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('reports failed MiniMax attachment publication after upload retries are exhausted', async () => {
+    const ds = makeDs(); ds.adoptedFrom = undefined; ds.session.cliId = 'minimax';
+    getBot('app_test').config.cliId = 'minimax';
+    let firstUpload!: () => void;
+    const attempted = new Promise<void>(resolve => { firstUpload = resolve; });
+    uploadReplyFile.mockImplementation(async () => {
+      firstUpload();
+      throw new Error('upload unavailable');
+    });
+    const sessionReply = vi.fn(); const complete = vi.fn();
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: '文'.repeat(1_000_000) }, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    await attempted;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadReplyFile).toHaveBeenCalledTimes(3);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'MiniMax reply.md delivery failed' });
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
   it('expands LinkRefs before markdown card rendering and keeps the worker IPC immutable', async () => {
@@ -525,7 +603,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
   });
 
-  it.each(['workspace', 'temporary'])('uploads a local Codex App %s screenshot before replying', async location => {
+  it.each(['codex-app', 'doubao'].flatMap(cliId => ['workspace', 'temporary'].map(location => ({ cliId, location }))))('uploads a local $cliId $location screenshot before replying', async ({ cliId, location }) => {
     const dir = mkdtempSync(join(location === 'workspace' ? config.session.dataDir : tmpdir(), 'codex-reply-image-'));
     try {
       const png = Buffer.from('89504e470d0a1a0a', 'hex');
@@ -535,7 +613,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
       ds.adoptedFrom = undefined;
-      ds.session.cliId = 'codex-app';
+      ds.session.cliId = cliId;
       ds.workingDir = config.session.dataDir;
       const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
       deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
@@ -550,8 +628,106 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it.each(['legacy', 'unified'] as const)('delivers all twelve Doubao native gallery images with the %s reply card and reuses uploads after a transient send failure', async mode => {
+    getBot('app_test').config.replyCardMode = mode;
+    const dir = mkdtempSync(join(tmpdir(), 'doubao-gallery-'));
+    try {
+      const png = Buffer.from('89504e470d0a1a0a', 'hex');
+      const paths = Array.from({ length: 12 }, (_, i) => join(dir, `shot-${i}) preview.png`));
+      paths.forEach(path => writeFileSync(path, png));
+      const body = [[0, 1, 2, 3], [4, 5], [6, 7, 8], [9, 10, 11]].map((indices, i) =>
+        `Gallery ${i}\n\n<RichMediaCard>${JSON.stringify({ refs: indices.map(n => n % 2 ? pathToFileURL(paths[n]).href : paths[n]) })}</${i === 3 ? 'MediaCard' : 'RichMediaCard'}>`).join('\n\n');
+      const prompt = 'Create comparison screenshots for all repository forms';
+      writeFileSync(join(dir, 'assignment.md'), `## [${new Date().toISOString()}] 需求\n${prompt}\n`);
+      const trajectory = join(dir, 'trajectory.jsonl');
+      writeFileSync(trajectory, JSON.stringify({ role: 'assistant', content: body }) + '\n');
+      const queue = new CodexBridgeQueue();
+      queue.mark('om_doubao_gallery', prompt);
+      queue.ingest(drainDoubaoTranscript(trajectory, 0).events);
+      const [ready] = queue.drainEmittable();
+      expect(ready?.finalText).toBe(body);
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_gallery');
+      let rejectFirst!: (reason: Error) => void;
+      const firstReply = new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
+      sessionReply.mockImplementationOnce(() => firstReply);
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'doubao';
+      ds.workingDir = config.session.dataDir;
+      const complete = vi.fn();
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), turnId: ready!.turnId, kind: 'bridge', content: ready!.finalText! }, 'tag', 0, complete);
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+      expect(uploadImageMock).toHaveBeenCalledTimes(12);
+      paths.forEach(path => rmSync(path));
+      await vi.advanceTimersByTimeAsync(30_000);
+      // A send rejection can finish its async bookkeeping after the clock
+      // advance. Exercise that ordering explicitly and keep driving retries
+      // while waiting for completion, rather than assuming the timer exists.
+      setTimeout(() => rejectFirst(new Error('temporary send failure')), 400);
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_gallery');
+      }, { timeout: 5_000 });
+      expect(sessionReply).toHaveBeenCalledTimes(2);
+      expect(uploadImageMock).toHaveBeenCalledTimes(12);
+      const card = sessionReply.mock.calls[1][1];
+      expect(card.match(/img_v3_uploaded_preview/g)).toHaveLength(12);
+      expect(card).not.toContain('RichMediaCard');
+      expect(card).not.toContain(dir);
+      expect(card).toContain('Gallery 3');
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      const record = new TurnReplyCardStore(config.session.dataDir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ready!.turnId,
+      });
+      if (mode === 'unified') expect(record).toMatchObject({ mode: 'unified', finalDelivered: true });
+      else expect(record).toBeUndefined();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('shows Doubao tools in a standard card before the final and retains its final images', async () => {
+    vi.useRealTimers();
+    getBot('app_test').config.replyCardMode = 'unified';
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'doubao';
+    ds.currentTurnId = 'om_doubao_visible_tools';
+    ds.workingDir = config.session.dataDir;
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn(async () => 'om_doubao_visible_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const store = new TurnReplyCardStore(config.session.dataDir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId };
+    ds.worker!.emit('message', { type: 'turn_input_committed', turnId: ds.currentTurnId });
+    ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      entries: [{ kind: 'tool_call', id: 'read', name: 'Read', args: '{"file_path":"README.md"}', subject: 'README.md' }] });
+    await vi.waitFor(() => expect(store.read(key)).toMatchObject({ mode: 'unified', phase: 'working', messageId: 'om_doubao_visible_card' }), { timeout: 4000 });
+    // The tool card is published by the 1200 ms debounce in queueTurnReplyTools.
+    // Drive that flush through its test seam instead of racing the unref'd timer
+    // inside a wall-clock waitFor: a stalled hosted runner can push the timer
+    // past the 4 s budget even though the queued render itself is correct.
+    const { flushTurnReplyTools } = await import('../src/core/turn-reply-card.js');
+    await flushTurnReplyTools(ds, ds.currentTurnId);
+    expect(store.read(key)?.lastCard).toContain('README.md');
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(getBotClient).not.toHaveBeenCalled();
+    ds.worker!.emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      kind: 'bridge', content: 'DOUBAO visible final\n\n<RichMediaCard>{"refs":["preview.png"]}</RichMediaCard>' });
+    await vi.waitFor(() => expect(store.read(key)?.finalDelivered).toBe(true), { timeout: 4000 });
+    expect(store.read(key)?.lastCard).toContain('DOUBAO visible final');
+    expect(store.read(key)?.lastCard).toContain('img_v3_uploaded_preview');
+    expect(store.read(key)?.lastCard).not.toContain('RichMediaCard');
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_doubao_visible_card')).toBe(true);
+  });
+
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'].flatMap(mode =>
-    (mode === 'non-adopted' ? ['claude-code'] : ['claude-code', 'codex-app']).map(cliId => ({ mode, cliId }))))(
+    (mode === 'non-adopted' ? ['claude-code'] : ['claude-code', 'codex-app', 'doubao']).map(cliId => ({ mode, cliId }))))(
     'does not add host image uploads to $mode $cliId sessions', async ({ mode, cliId }) => {
       writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
@@ -2469,6 +2645,39 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
   });
 
+  it('persists an interrupted Codex App trigger before acknowledging the signed final', async () => {
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({ sessionReply, onTurnTerminal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-codex-app-cancelled';
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.asyncTriggerResults = new Map([['first', { status: 'pending', createdAt: 1 }]]);
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'first', turnId: 'first', dispatchAttempt: 1, state: 'prepared', content: 'first', deliverySink: 'http_async' },
+      { dispatchId: 'next', turnId: 'next', dispatchAttempt: 1, state: 'accepted', content: 'next', deliverySink: 'lark' },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const final = {
+      type: 'final_output', sessionId: ds.session.sessionId, content: '', lastUuid: 'first', turnId: 'first', dispatchAttempt: 1,
+      suppressDelivery: true, codexAppCancelled: true,
+      codexAppSettlement: { requestId: 'stop-first', generation: 'gen-stop', seq: 1, dispatchId: 'first' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>;
+    ds.worker!.emit('message', final);
+    await vi.waitFor(() => expect(ds.worker!.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'stop-first', ok: true })));
+    const { lookup } = await import('../src/services/async-trigger-store.js');
+    expect(lookup(ds.session.sessionId, 'first')?.result.status).toBe('interrupted');
+    expect(onTurnTerminal).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: 'first', status: 'cancelled' }), expect.anything());
+    expect(ds.session.codexAppDispatchLedger).toMatchObject([{ turnId: 'next', state: 'accepted' }]);
+    ds.worker!.emit('message', { ...final, codexAppSettlement: { ...final.codexAppSettlement, requestId: 'replay' } });
+    await vi.waitFor(() => expect(ds.worker!.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'replay', ok: true })));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('HTTP steer: an http_async steer group fans the REAL final out to the superseded member (in-memory + durable, no Lark)', async () => {
     // options.steer over the HTTP control API: member 1 is the root riff task
     // (http_async, polling trigger-result by its own triggerId), member 2 is the
@@ -3933,6 +4142,36 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).not.toContain('[file](');
   });
 
+  it('forwards host paths and local links as written for a bot that has not turned on hideLocalAddresses', async () => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    try {
+      const ds = makeDs();
+      ds.workingDir = '/custom/project';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, {
+        ...finalOutputMsg(),
+        content: '排查证据在 /opt/app/logs/error.log 和 /custom/project/src/main.ts:12，见 [说明](/home/alice/notes.md)，服务 http://localhost:3000/health',
+      }, 'tag', 0);
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      const cardJson = sessionReply.mock.calls[0][1] as string;
+      for (const kept of ['/opt/app/logs/error.log', '/custom/project/src/main.ts:12', '[说明](/home/alice/notes.md)', 'http://localhost:3000/health']) {
+        expect(cardJson).toContain(kept);
+      }
+      expect(cardJson).not.toContain('内部文件');
+    } finally {
+      restore();
+    }
+  });
+
   it('removes an inaccessible home-shaped relative link from non-isolated bridge output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -5050,6 +5289,32 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(call[1]).toContain('**observed-model** high');
       expect(call[1]).not.toContain('next-turn-model');
     }
+  });
+
+  it.each([
+    { cliId: 'antigravity', replyModel: 'gemini-4-carbon-high', replyReasoningEffort: undefined },
+    { cliId: 'codex', replyModel: 'gpt-6.2-sol', replyReasoningEffort: 'max' },
+    { cliId: 'codex', replyModel: 'gpt-6.1-sol', replyReasoningEffort: undefined },
+  ] as const)('renders the adopted $cliId reply model $replyModel on initial delivery and retry', async ({ cliId, replyModel, replyReasoningEffort }) => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    const ds = makeDs();
+    ds.session.cliId = cliId;
+    ds.activeModel = 'previous-model';
+    if (cliId === 'codex') ds.activeReasoningEffort = 'low';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js');
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), replyModel, replyReasoningEffort }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.activeModel).toBe('previous-model');
+    ds.activeModel = 'next-model';
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const card = sessionReply.mock.calls[0][1];
+    expect(card).toContain(`**${replyModel}**`);
+    expect(card).not.toContain('low');
+    if (replyReasoningEffort) expect(card).toContain(replyReasoningEffort);
+    expect(sessionReply.mock.calls[1][1]).toBe(card);
   });
 
   it('does not read or render footer usage when this bot is not in footer mode', async () => {

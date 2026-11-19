@@ -38,7 +38,9 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
+import { maskCredentialShapes } from '../core/stuck-page-catalog.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 import { BYTEDCLI_HOME_ROOT, MEEGO_ENV_CREDENTIALS } from './bytedcli-home.js';
@@ -48,6 +50,8 @@ import { BYTEDCLI_HOME_ROOT, MEEGO_ENV_CREDENTIALS } from './bytedcli-home.js';
  *  may refresh. Generous enough not to fail a slow network, short enough that a
  *  wedged CLI cannot hold a turn open. */
 const BYTEDCLI_TIMEOUT_MS = 30_000;
+/** Appended to stderr when {@link BYTEDCLI_TIMEOUT_MS} kills a run. */
+const TIMEOUT_MARKER = '[bytedcli-auth] timed out';
 
 /** ByteCloud gives a device-code challenge about an hour; expire ours a little
  *  sooner so we never hand back a token that is about to be refused. */
@@ -72,11 +76,13 @@ export function bytedcliHomeFor(openId: string): string {
  * Storage layout belongs to bytedcli/its SDK, not Botmux. A directory or a
  * legacy token filename is neither necessary nor sufficient authorization. */
 class BytedcliAuthUnavailableError extends Error {
-  constructor(operation: string) {
+  constructor(readonly operation: string) {
     super(`bytedcli authorization service unavailable (${operation}); retry after the service recovers, without starting another login`);
     this.name = 'BytedcliAuthUnavailableError';
   }
 }
+
+const APP_IDENTITY = 'unexpected app identity';
 
 interface LoginObservation {
   authenticated: boolean;
@@ -103,7 +109,7 @@ async function readLoginState(openId: string): Promise<LoginObservation> {
   }
   const sdk = data.bytecloud_auth as Record<string, unknown> | undefined;
   if (data.auth_as === 'app' || sdk?.authType === 'app') {
-    throw new BytedcliAuthUnavailableError('unexpected app identity');
+    throw new BytedcliAuthUnavailableError(APP_IDENTITY);
   }
   if (!data.authenticated && sdk?.status && sdk.status !== 'need_login') {
     throw new BytedcliAuthUnavailableError('provider not ready');
@@ -277,7 +283,7 @@ export async function runBytedcliInHome(
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill('SIGKILL');
-      stderr += '\n[bytedcli-auth] timed out';
+      stderr += `\n${TIMEOUT_MARKER}`;
       // A descendant can retain the pipes after the CLI exits; do not wait for close.
       child.stdout.destroy();
       child.stderr.destroy();
@@ -291,22 +297,114 @@ export async function runBytedcliInHome(
   });
 }
 
+/** A `{status,data}` result, as opposed to an `{event,data}` progress line. */
+function isEnvelope(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && 'status' in value && !('event' in value);
+}
+
 /** Parse bytedcli's `--json` envelope, which wraps everything in {status,data}. */
 export function parseEnvelope(stdout: string): Record<string, unknown> | null {
   // `--begin` emits progress events (`qr_image_ready`) before the envelope, one
   // JSON object per line, so take the last parseable line rather than the first.
   try {
     const parsed = JSON.parse(stdout);
-    if (parsed && typeof parsed === 'object' && 'status' in parsed) return parsed;
+    if (isEnvelope(parsed)) return parsed;
   } catch { /* progress lines may precede the envelope */ }
-  const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    try {
-      const parsed = JSON.parse(lines[i]) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && 'status' in parsed) return parsed;
-    } catch { /* not the envelope line */ }
+  for (const parsed of jsonLines(stdout).reverse()) {
+    if (isEnvelope(parsed)) return parsed;
   }
   return null;
+}
+
+/** Every line of `text` that is a JSON object, in order. */
+function jsonLines(text: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) out.push(parsed as Record<string, unknown>);
+    } catch { /* not JSON */ }
+  }
+  return out;
+}
+
+/** At most this much of what bytedcli said reaches the person. */
+const PROVIDER_DETAIL_MAX = 200;
+/** Only this much provider text is examined: the patterns below backtrack on
+ *  long unbroken runs, and the reply never shows more than a line anyway. */
+const PROVIDER_TEXT_SCAN_MAX = 2_000;
+const HIDDEN_TEXT = '‹hidden›';
+
+/**
+ * Provider text made safe to show in a chat. The reply can land in a group,
+ * so a device-code link, a resume token or a JWT must not survive; the chat's
+ * content audit also refuses e-mail addresses, phone numbers and long hex
+ * strings. Links keep only their host, which is what a network error needs.
+ */
+function redactProviderText(text: string): string {
+  const out = maskCredentialShapes(text.slice(0, PROVIDER_TEXT_SCAN_MAX)
+    .replace(/\bhttps?:\/\/[^\s'"`<>()]+/gi, url => {
+      try { return `${new URL(url).origin}/…`; } catch { return HIDDEN_TEXT; }
+    })
+    // A link without a scheme keeps its path but not its query.
+    .replace(/(\b[\w-]+(?:\.[\w-]+)+\/[^\s?'"`]*)\?[^\s'"`]+/g, '$1?…'))
+    // Before the XXXX-XXXX rule below, which would split a UUID.
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, HIDDEN_TEXT)
+    // Device-code values: `user_code=…`, `code: …`, and the XXXX-XXXX shape.
+    .replace(/\b((?:user_?|device_?)?code|ticket|challenge(?:_?token)?)(\s*[:=]\s*)[^\s,;'"`]+/gi, `$1$2${HIDDEN_TEXT}`)
+    .replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, HIDDEN_TEXT)
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, HIDDEN_TEXT)
+    .replace(/(?<![\w+])(?:\+?86[ -]?)?1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?!\w)/g, HIDDEN_TEXT)
+    .replace(/(?<!\w)\+?\d{11,}(?!\w)/g, HIDDEN_TEXT)
+    .replace(/\b[0-9a-f]{16,}\b/gi, HIDDEN_TEXT)
+    // Opaque base64url-ish tokens; error codes (upper case, no digit) stay.
+    .replace(/\b(?=[\w-]*\d)(?=[\w-]*[a-z])[\w-]{24,}\b/g, HIDDEN_TEXT)
+    // Local paths name this machine's layout and the person's open_id.
+    .replace(/(?<![\w.:/~])\/(?:[^\s'"`:/]+\/)+[^\s'"`:/]*/g, '‹path›')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return out.length > PROVIDER_DETAIL_MAX ? `${out.slice(0, PROVIDER_DETAIL_MAX - 1)}…` : out;
+}
+
+/**
+ * What bytedcli said when a run produced no usable result, as one redacted
+ * line: its own error (`code: message`) when the JSON names one, else an
+ * `action_required` event, else the first lines of plain output.
+ */
+function bytedcliFailureDetail(result: BytedcliResult): string {
+  const text = (v: unknown) => typeof v === 'string' || typeof v === 'number' ? String(v).trim() : '';
+  const codeAndMessage = (record: Record<string, unknown> | undefined) => {
+    const code = text(record?.code);
+    const message = text(record?.message);
+    return code && message ? `${code}: ${message}` : code || message;
+  };
+  const envelope = parseEnvelope(result.stdout);
+  const fromEnvelope = codeAndMessage(envelope?.error as Record<string, unknown> | undefined);
+  if (fromEnvelope) return redactProviderText(fromEnvelope);
+  const event = [...jsonLines(result.stdout), ...jsonLines(result.stderr)]
+    .find(line => line.event === 'action_required');
+  const fromEvent = codeAndMessage(event?.data as Record<string, unknown> | undefined);
+  if (fromEvent) return redactProviderText(fromEvent);
+  if (result.stderr.includes(TIMEOUT_MARKER)) return `bytedcli timed out after ${BYTEDCLI_TIMEOUT_MS / 1000}s`;
+  // A result that is neither a link nor a login says what it was instead.
+  const data = envelope?.data as Record<string, unknown> | undefined;
+  const said = [text(data?.login_status), text(data?.message)].filter(Boolean).join(', ');
+  if (said) return redactProviderText(`unexpected bytedcli result (${said})`);
+  // Plain output: the error line when there is one (a crash prints source and
+  // a caret first), else the first lines. Stack frames, Node's own warnings,
+  // caret markers and JSON lines say nothing to the person.
+  const lines = `${result.stderr}\n${result.stdout}`.split('\n')
+    .map(line => line.trim())
+    .filter(line => line && !line.startsWith('{') && !/^at\s/.test(line)
+      && !/^\(node:\d+\)/.test(line) && !/^[\^~\s]+$/.test(line) && !/^Use `node --trace/.test(line));
+  const errorLine = lines.find(line => /^[\w.]*(?:Error|Exception)\b/.test(line));
+  const plain = errorLine ?? lines.slice(0, 2).join(' ');
+  if (plain) return redactProviderText(plain);
+  if (envelope) return redactProviderText(`unexpected bytedcli result (status ${text(envelope.status) || 'missing'})`);
+  return result.ok ? 'bytedcli printed no JSON result' : 'bytedcli failed without output';
 }
 
 /**
@@ -369,6 +467,21 @@ export interface BytedcliLoginChallenge {
 }
 
 /**
+ * What starting a login came to.
+ *
+ * `authorized`: bytedcli already holds a login for this person (bytedcli
+ * 0.186+ answers `--begin` that way instead of with a link) and the personal
+ * status read confirmed it — there is nothing to open. `failed`: no link, and
+ * `detail` is a redacted summary of what bytedcli said, safe for a chat.
+ */
+export type BytedcliLoginStart =
+  | { state: 'challenge'; challenge: BytedcliLoginChallenge }
+  | { state: 'authorized' }
+  | { state: 'failed'; detail: string };
+
+const RETIRED_DETAIL = 'Login attempt was replaced or revoked.';
+
+/**
  * Start a login for one person and return the link to send them. An unfinished,
  * still-valid challenge is reused so repeated turns do not create new links.
  *
@@ -376,15 +489,15 @@ export interface BytedcliLoginChallenge {
  * instead of holding a terminal open waiting for a scan, which is the only
  * shape that works when the person authorizing is on the other side of a chat.
  */
-const beginnings = new Map<string, { epoch: number; durableEpoch: number; work: Promise<BytedcliLoginChallenge | null> }>();
+const beginnings = new Map<string, { epoch: number; durableEpoch: number; work: Promise<BytedcliLoginStart> }>();
 
-export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+export async function startBytedcliLogin(openId: string): Promise<BytedcliLoginStart> {
   const epoch = authEpoch(openId);
   const durableEpoch = readCliAuthEpoch(openId);
   const existing = beginnings.get(openId);
   if (existing?.epoch === epoch && existing.durableEpoch === durableEpoch) return existing.work;
   const work = serializedCredentialWork(openId, () => credentialEpochCurrent(openId, epoch, durableEpoch)
-    ? beginLogin(openId, epoch, durableEpoch) : Promise.resolve(null));
+    ? beginLogin(openId, epoch, durableEpoch) : Promise.resolve({ state: 'failed' as const, detail: RETIRED_DETAIL }));
   beginnings.set(openId, { epoch, durableEpoch, work });
   try { return await work; } finally {
     if (beginnings.get(openId)?.work === work) beginnings.delete(openId);
@@ -392,7 +505,37 @@ export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginC
   }
 }
 
-async function beginLogin(openId: string, epoch: number, durableEpoch: number): Promise<BytedcliLoginChallenge | null> {
+/** {@link startBytedcliLogin} for callers that only hand out a link. */
+export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  const started = await startBytedcliLogin(openId);
+  return started.state === 'challenge' ? started.challenge : null;
+}
+
+/** How `auth login --begin --json` answered, before any of it is trusted. */
+type BeginAnswer =
+  | { kind: 'challenge'; authUrl: string; completeToken: string }
+  | { kind: 'logged-in' }
+  | { kind: 'failed'; detail: string };
+
+function readBeginAnswer(result: BytedcliResult): BeginAnswer {
+  const env = parseEnvelope(result.stdout);
+  const data = env?.data as Record<string, unknown> | undefined;
+  if (result.ok && env?.status === 'success' && data) {
+    const authUrl = typeof data.verification_uri_complete === 'string' ? data.verification_uri_complete : '';
+    const completeToken = typeof data.complete_token === 'string' ? data.complete_token : '';
+    if (authUrl && completeToken) return { kind: 'challenge', authUrl, completeToken };
+    // No link, because there is a login: since 0.186 bytedcli looks for one
+    // before creating a challenge (`already_authenticated`), and it finishes
+    // its own still-pending challenge first (`already_completed`, or
+    // `login_status: success` when that just landed).
+    if (data.already_authenticated === true || data.already_completed === true || data.login_status === 'success') {
+      return { kind: 'logged-in' };
+    }
+  }
+  return { kind: 'failed', detail: bytedcliFailureDetail(result) };
+}
+
+async function beginLogin(openId: string, epoch: number, durableEpoch: number): Promise<BytedcliLoginStart> {
   const home = bytedcliHomeFor(openId);
   // A revoked HOME must not resume its old challenge. Clear it before login;
   // a newer login that landed during this call is left alone below.
@@ -402,30 +545,47 @@ async function beginLogin(openId: string, epoch: number, durableEpoch: number): 
   if (existsSync(home) && !cliAuthEpochAllows(openId, home)) {
     // The previous SDK child has left the shared queue. Remove any late files
     // before stamping a new login; cleanup is not a new revocation operation.
-    try { rmSync(home, { recursive: true, force: true }); } catch { return null; }
+    try { rmSync(home, { recursive: true, force: true }); } catch {
+      return { state: 'failed', detail: 'Could not reset the revoked bytedcli login directory.' };
+    }
     forgetCachedJwts(openId);
   }
 
   const pending = pendingBytedcliLogin(openId);
-  if (pending?.authUrl) return pending;
+  if (pending?.authUrl) return { state: 'challenge', challenge: pending };
 
-  const { ok, stdout } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
-  const env = parseEnvelope(stdout);
-  const data = env?.data as Record<string, unknown> | undefined;
-  const authUrl = typeof data?.verification_uri_complete === 'string'
-    ? data.verification_uri_complete
-    : undefined;
-  const completeToken = typeof data?.complete_token === 'string' ? data.complete_token : undefined;
-  if (!ok || env?.status !== 'success' || !authUrl || !completeToken) {
-    logger.warn('[bytedcli-auth] could not start a login; provider failed or returned an invalid challenge');
-    return null;
-  }
+  const answer = readBeginAnswer(await runAsUser(openId, ['auth', 'login', '--begin', '--json']));
   // Epoch moved while the CLI ran: a revoke, or a newer login, won. Do not
   // stamp or delete — the newer HOME may already be valid.
-  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return { state: 'failed', detail: RETIRED_DETAIL };
+  if (answer.kind === 'failed') {
+    logger.warn(`[bytedcli-auth] could not start a login: ${answer.detail}`);
+    return { state: 'failed', detail: answer.detail };
+  }
+  if (answer.kind === 'logged-in') {
+    // The CLI saying so is not authority: only the personal status read is,
+    // the same check every turn runs before minting. Nothing is stamped — the
+    // HOME already holds that login under the stamp it was made with.
+    let login: LoginObservation;
+    try { login = await readLoginState(openId); } catch (error) {
+      return { state: 'failed', detail: error instanceof BytedcliAuthUnavailableError && error.operation === APP_IDENTITY
+        ? 'bytedcli is logged in as an app identity, not as this person.'
+        : 'bytedcli reported an existing login, but its status could not be read; retry later.' };
+    }
+    if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return { state: 'failed', detail: RETIRED_DETAIL };
+    if (!login.authenticated) {
+      return { state: 'failed', detail: 'bytedcli reported an existing login that the personal status check does not confirm.' };
+    }
+    // A leftover challenge would only send `done` and the next turn after a
+    // login that has already landed.
+    clearChallenge(openId);
+    return { state: 'authorized' };
+  }
   stampCliAuthEpoch(openId, home);
-  if (!saveChallenge(openId, completeToken, authUrl)) return null;
-  return { authUrl, completeToken };
+  if (!saveChallenge(openId, answer.completeToken, answer.authUrl)) {
+    return { state: 'failed', detail: 'Could not save the login challenge.' };
+  }
+  return { state: 'challenge', challenge: { authUrl: answer.authUrl, completeToken: answer.completeToken } };
 }
 
 export type BytedcliLoginState = 'authorized' | 'pending' | 'failed' | 'unavailable';
@@ -451,7 +611,7 @@ export async function completeBytedcliLogin(
 async function completeLogin(openId: string, completeToken: string, epoch: number, durableEpoch: number): Promise<{ state: BytedcliLoginState; detail?: string }> {
   const current = () => credentialEpochCurrent(openId, epoch, durableEpoch)
     && (!pendingBytedcliChallenge(openId) || pendingBytedcliChallenge(openId) === completeToken);
-  const retired = () => ({ state: 'failed' as const, detail: 'Login attempt was replaced or revoked.' });
+  const retired = () => ({ state: 'failed' as const, detail: RETIRED_DETAIL });
   if (!current()) return retired();
   const { ok, stdout } = await runAsUser(
     openId,
@@ -496,8 +656,7 @@ export interface BytedcliJwts {
 }
 
 /**
- * ByteCloud JWTs are partition-scoped: the default (cn) token is rejected by
- * i18n services with `invalid jwt token ... partition i18n`. Each entry names
+ * ByteCloud JWTs are partition-scoped. Each entry names
  * the region and one `--site` that mints its token; the wrapper maps every
  * `--site` value onto these regions (see renderIdentityWrapper).
  */
@@ -506,6 +665,7 @@ export const BYTEDCLI_REGIONAL_SITES = [
   ['i18n', 'i18n-tt'],
   ['i18nbd', 'i18n-bd'],
   ['tx', 'us-ttp'],
+  ['cn', 'cn'],
 ] as const;
 export type BytedcliRegion = typeof BYTEDCLI_REGIONAL_SITES[number][0];
 export type BytedcliRegionalJwts = Partial<Record<BytedcliRegion, string>>;
@@ -560,20 +720,12 @@ function credentialEpochCurrent(openId: string, epoch: number, durableEpoch: num
 const regionalJwtCache = new Map<string, { jwt: string; expiresAtMs: number; durableEpoch: number; fingerprint?: string }>();
 const REGIONAL_JWT_REUSE_MARGIN_MS = 30 * 60_000;
 
-function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
-  try {
-    return JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Regions this person's login could not mint a token for, and under which
  * login. Most logins hold no regional access, so without this every turn spent
  * three failing CLI runs (~2.5s measured) re-learning that. A miss only means
- * "that region keeps the default token", which is also what a failure means,
- * so remembering it can never widen access. It is forgotten on any change of
+ * "that region has no token" (its calls are refused by the wrapper), which is
+ * also what a failure means, so remembering it can never widen access. It is forgotten on any change of
  * login or epoch, on logout, and after {@link REGIONAL_MISS_TTL_MS}.
  */
 const regionalMissCache = new Map<string, { fingerprint: string; epoch: number; durableEpoch: number; atMs: number }>();
@@ -601,9 +753,9 @@ async function regionalCloudJwt(
   if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const jwt = result.ok ? result.stdout.trim() : '';
   const claims = jwt && !/\s/.test(jwt) ? jwtClaims(jwt) : null;
-  // A token for another partition would only move the failure; keep the default.
+  // A token for another partition would only move the failure; publish none.
   if (!claims || claims.region !== region) {
-    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region keeps the default token`);
+    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region's calls are refused`);
     // Remember only a definite answer about this login (the CLI ran and said
     // it holds no login for that site, or handed back no usable token). A
     // timeout, a crash or a missing binary says nothing, so the next turn asks
@@ -715,6 +867,7 @@ async function renewJwts(openId: string, epoch: number, durableEpoch: number): P
   const codeJwt = code.ok ? code.stdout.trim() : '';
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    if (region === 'cn' && jwtClaims(cloudJwt)?.region === 'cn') continue;
     const jwt = await regionalCloudJwt(openId, region, site, true, epoch, durableEpoch, login.fingerprint);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;
@@ -770,11 +923,13 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
-  // Regional tokens are best-effort like the Codebase JWT: without one, that
-  // region's calls keep the default token. Minted one at a time — concurrent
+  // Regional tokens are best-effort like the Codebase JWT: without one, the
+  // wrapper refuses that region's calls (never sends the default token there),
+  // and the rest of the turn is unaffected. Minted one at a time — concurrent
   // mints against the same HOME were measured returning another region's token.
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    if (region === 'cn' && jwtClaims(cloudJwt)?.region === 'cn') continue;
     const jwt = await regionalCloudJwt(openId, region, site, false, epoch, durableEpoch, fingerprint);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;

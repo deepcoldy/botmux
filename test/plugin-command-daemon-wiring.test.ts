@@ -17,7 +17,7 @@ it('ignores primary commands and marks admitted before plugin execution otherwis
   const scope = {
     coordinationModeIsPrimary: () => primary, runPluginSlashCommand,
     localeForBot: () => 'en', grantRestrictedSlashCommandText: () => undefined,
-    canTalkForGroupSessions: () => true, canOperate: () => true,
+    canTalkForGroupSessions: () => true, canOperate: () => true, canOperateBotSender: () => true,
     markIngressAdmitted: mark, pluginCommandGateway: { execute }, tr: () => 'text',
   };
   const proxy = new Proxy(scope, { has: (_, key) => key !== Symbol.unscopables, get: (target, key) => key in target ? (target as any)[key] : (globalThis as any)[key] });

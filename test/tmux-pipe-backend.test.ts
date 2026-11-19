@@ -14,7 +14,7 @@
 // Must stay the first import: this file fakes node:fs, so refuse to run outside
 // the data-dir fence instead of touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -87,6 +87,12 @@ import {
   TmuxPipeBackend,
   normaliseCaptureLineEndings,
   tmuxLifecycleInitialDelayMs,
+  tmuxLifecycleIdleProbeMs,
+  lifecycleProbeDelayMs,
+  LIFECYCLE_ACTIVE_PROBE_MS,
+  LIFECYCLE_ACTIVITY_WINDOW_MS,
+  LIFECYCLE_OUTPUT_ACTIVITY_WINDOW_MS,
+  LIFECYCLE_IDLE_PROBE_MAX_MS,
   setStartupTmuxRetrySleepForTests,
   buildPipePaneStartupError,
   __testOnly_liveFifoReaderCount,
@@ -99,6 +105,10 @@ import { bufferSpawnResult } from './helpers/spawn-result.js';
 import { takePaneLaunchFile } from './helpers/pane-launch.js';
 import { TmuxCommandTooLongError } from '../src/adapters/backend/pane-launch.js';
 import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
+import {
+  CONNECTION_REFUSED, DEADLINE, EMFILE, LOST_SERVER, NO_SERVER,
+  createTmuxWorld, installTmuxWorld, isLivenessRead, type TmuxWorld,
+} from './helpers/tmux-world.js';
 
 // Startup retries sleep synchronously (Atomics.wait — immune to fake timers);
 // stub the sleep for the whole suite so retry tests don't add real seconds.
@@ -127,6 +137,17 @@ function createFakeShell(name: 'fish'): FakeShell {
 
 function cleanupFakeShell(shell: FakeShell): void {
   rmSync(shell.dir, { recursive: true, force: true });
+}
+
+/** The paste-buffer argv a tmux batch carries: as a plain command, or as the
+ *  dead-pane-guarded if-shell branch (a tmux-quoted command string). */
+function pasteBufferArgv(args: readonly string[]): string[] | null {
+  const plain = args.indexOf('paste-buffer');
+  if (plain >= 0) return args.slice(plain);
+  const branch = args.find(arg => arg.startsWith('"paste-buffer"'));
+  return branch
+    ? [...branch.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(m => m[1].replace(/\\(.)/g, '$1'))
+    : null;
 }
 
 function getExecFileCalls() {
@@ -162,9 +183,32 @@ function scriptIndex(args: readonly string[]): number {
   return index;
 }
 
+/** Emulate tmux executing the queued subscription after printing the new
+ * session's identity. Keep the existing pipe failure injections applicable to
+ * both the creating queue and later standalone subscription retries. */
+function emulateQueuedSubscription(): void {
+  const implementation = mockedExecFileSync.getMockImplementation()!;
+  mockedExecFileSync.mockImplementation(((...params: unknown[]) => {
+    const result = Reflect.apply(implementation, undefined, params);
+    const argv = params[1] as string[];
+    if (!Array.isArray(argv) || !argv.includes('new-session')) return result;
+    const subscription = argv.slice(argv.lastIndexOf(';') + 1);
+    if (!['if-shell', 'pipe-pane'].includes(subscription[0]!)) return result;
+    const command = subscription.map((arg, i) => i === 0 || arg.startsWith('-')
+      ? arg : `'${arg.replace(/'/g, "'\\''")}'`).join(' ');
+    const identity = String(result).trim() || '1234 $7 5678';
+    try {
+      return Buffer.from(`${identity}\n${String(mockedExecSync(`tmux ${command}`))}`);
+    } catch (err) {
+      throw Object.assign(err as Error, { stdout: Buffer.from(`${identity}\n`) });
+    }
+  }) as typeof execFileSync);
+}
+
 beforeEach(() => {
   mockedExecSync.mockReset();
   mockedExecFileSync.mockReset();
+  vi.mocked(execFile).mockReset();
   mockedSpawnSync.mockReset();
   mockedUnlinkSync.mockReset();
   mockedOpenSync.mockReset().mockReturnValue(7);
@@ -184,6 +228,17 @@ beforeEach(() => {
 });
 
 describe('TmuxPipeBackend.spawn', () => {
+  it('removes the FIFO and creates no session if opening its read end fails', () => {
+    mockedOpenSync.mockImplementationOnce(() => { throw new Error('EACCES: FIFO read denied'); });
+    const be = new TmuxPipeBackend('bmx-no-reader', { createSession: true, ownsSession: true });
+    const readersBefore = __testOnly_liveFifoReaderCount();
+    expect(() => be.spawn('/bin/sh', [], spawnOpts())).toThrow(/EACCES/);
+    expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo$/));
+    expect(__testOnly_liveFifoReaderCount()).toBe(readersBefore);
+    expect(mockedExecFileSync.mock.calls.some(([, args]) => (args as string[]).includes('new-session'))).toBe(false);
+    expect(be.retireSessionCreatedBySpawn()).toBe(false);
+  });
+
   it.each([
     { status: 1, stderr: Buffer.from('mkfifo: No space left on device') },
     { status: null, error: new Error('spawn mkfifo ENOENT') },
@@ -248,6 +303,7 @@ describe('TmuxPipeBackend.spawn', () => {
   });
 
   it('throws but does NOT fire an exit when pipe-pane keeps failing (startup failure, not a crash)', () => {
+    emulateQueuedSubscription();
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       let pipeAttempts = 0;
@@ -283,6 +339,7 @@ describe('TmuxPipeBackend.spawn', () => {
   // cached that a later onExit would replay — that used to mislabel a tmux
   // stall as a crashed CLI once fireExit became sticky (#2408).
   it('a failed spawn leaves no sticky exit for an onExit registered afterwards', () => {
+    emulateQueuedSubscription();
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       mockedExecSync.mockImplementation(((cmd: any) => {
@@ -361,6 +418,7 @@ describe('TmuxPipeBackend.spawn', () => {
   });
 
   it('fails pipe-pane FAST on a server-answered deterministic rejection (pane genuinely gone)', () => {
+    emulateQueuedSubscription();
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       let pipeAttempts = 0;
@@ -485,6 +543,7 @@ describe('TmuxPipeBackend.spawn', () => {
   it.each(['binding-a', 'binding-b', ''])('checks the actual identity before adopting a duplicate on startup retry: %s', actual => {
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const be = new TmuxPipeBackend('bmx-bound', { createSession: true, ownsSession: true });
+    const readersBefore = __testOnly_liveFifoReaderCount();
     let attempts = 0;
     mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
       if (args[0] === '-V') return 'tmux 3.3a';
@@ -503,7 +562,7 @@ describe('TmuxPipeBackend.spawn', () => {
       if (actual === 'binding-a') expect(() => be.spawn('sleep', ['60'], opts)).not.toThrow();
       else {
         expect(() => be.spawn('sleep', ['60'], opts)).toThrow(/preserved/);
-        expect(mockedOpenSync).not.toHaveBeenCalled();
+        expect(__testOnly_liveFifoReaderCount()).toBe(readersBefore);
         expect(mockedExecSync.mock.calls.some(([cmd]) => /set-option|pipe-pane/.test(String(cmd)))).toBe(false);
       }
       expect(attempts).toBe(2);
@@ -950,8 +1009,10 @@ describe('TmuxPipeBackend input addressing', () => {
     const bufferName = loadArgs[bIdx + 1];
     expect(bufferName).toMatch(/^botmux-[a-f0-9]{16}$/);
 
-    const pasteArgs = calls[1][1] as string[];
-    expect(pasteArgs).toContain('paste-buffer');
+    // The paste only runs behind `#{pane_dead}`, decided in the same tmux queue.
+    expect(calls[1][1]).toEqual(expect.arrayContaining(['if-shell', '-F', '#{pane_dead}']));
+    const pasteArgs = pasteBufferArgv(calls[1][1] as string[])!;
+    expect(pasteArgs[0]).toBe('paste-buffer');
     const pasteBIdx = pasteArgs.indexOf('-b');
     expect(pasteBIdx).toBeGreaterThanOrEqual(0);
     expect(pasteArgs[pasteBIdx + 1]).toBe(bufferName);
@@ -973,9 +1034,8 @@ describe('TmuxPipeBackend input addressing', () => {
     const calls = getExecFileCalls();
     expect(calls).toHaveLength(3);
     expect((calls[0][2] as any).input).toBe('line one  \nline two');
-    expect(calls[1][1]).toContain('paste-buffer');
-    expect(calls[1][1]).toContain('-r');
-    expect(calls[1][1]).not.toContain('-p');
+    expect(pasteBufferArgv(calls[1][1] as string[])).toContain('-r');
+    expect(pasteBufferArgv(calls[1][1] as string[])).not.toContain('-p');
     expect((calls[1][1] as string[]).slice(-7)).toEqual([';', 'send-keys', '-t', '0:5.0', '-l', '--', '\x1b[201~']);
     expect(calls[1][1]).toContain('\x1b[200~');
     expect((calls[2][1] as string[]).slice(-6)).toEqual(['send-keys', '-t', '0:5.0', '-l', '--', '\r']);
@@ -986,7 +1046,7 @@ describe('TmuxPipeBackend input addressing', () => {
     be.spawn('', [], spawnOpts());
     mockedExecFileSync.mockClear();
     mockedExecFileSync.mockImplementation(((_file: string, args: string[]) => {
-      if (args.includes('paste-buffer')) throw new Error('server busy');
+      if (pasteBufferArgv(args)) throw new Error('server busy');
       return '';
     }) as typeof execFileSync);
     expect(be.submitBracketedPaste('message')).toBe(false);
@@ -1016,7 +1076,7 @@ describe('TmuxPipeBackend input addressing', () => {
     // the finally{} must delete the SAME named buffer. guardedSend swallows the
     // failure (pane ALIVE via the default execSync mock) so pasteText must not throw.
     mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
-      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      if (Array.isArray(args) && pasteBufferArgv(args)) throw new Error('no server running');
       return '' as any;
     }) as any);
 
@@ -1035,7 +1095,7 @@ describe('TmuxPipeBackend input addressing', () => {
     be.spawn('', [], spawnOpts());
     mockedExecFileSync.mockClear();
     mockedExecFileSync.mockImplementation((_cmd, args) => {
-      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      if (Array.isArray(args) && pasteBufferArgv(args)) throw new Error('no server running');
       return Buffer.from('');
     });
 
@@ -1247,6 +1307,60 @@ describe('TmuxPipeBackend.captureViewportAsync', () => {
       expect(await pending).toBe('');
       expect(await be.captureViewportAsync()).toBe('');
     }
+  });
+});
+
+describe('capture failure observability', () => {
+  function captureError(stderr: string): Error {
+    return Object.assign(new Error(stderr), { status: 1, signal: null, stderr: Buffer.from(stderr) });
+  }
+
+  it.each([
+    ['error connecting to /tmp/tmux-0/private-test (Connection refused)', 'server-unreachable'],
+    ['no server running on /tmp/tmux-0/private-test', 'no-server'],
+    ["can't find pane: 0:2.0", 'pane-missing'],
+  ])('classifies %s without changing the empty capture result', (stderr, kind) => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    mockedExecSync.mockImplementation(() => { throw captureError(stderr); });
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    expect(be.captureViewport()).toBe('');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const line = String(errSpy.mock.calls[0][0]);
+    expect(line).toContain(`kind=${kind}`);
+    expect(line).toContain('socket=private-test');
+    expect(line).toContain('target=0:2.0');
+    errSpy.mockRestore();
+  });
+
+  it('rate-limits identical errors but logs again after the interval', () => {
+    vi.useFakeTimers();
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    mockedExecSync.mockImplementation(() => { throw captureError('no server running on /tmp/tmux-0/private-test'); });
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    be.captureViewport();
+    be.captureViewport();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(31_000);
+    be.captureViewport();
+    expect(errSpy).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('classifies async capture errors while preserving rejection', async () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      cb(captureError('error connecting to /tmp/tmux-0/private-test (Connection refused)'), '');
+      return {};
+    }) as any);
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    await expect(be.captureViewportAsync()).rejects.toThrow('error connecting');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toContain('kind=server-unreachable');
+    errSpy.mockRestore();
   });
 });
 
@@ -1465,7 +1579,7 @@ describe('TmuxPipeBackend managed session', () => {
       const launchClause = args.slice(cIdx - 2, cIdx + 3);
       // fish gets its post-script args as $argv: no POSIX `_` sentinel.
       expect(launchClause).toEqual([shell.path, '-i', '-c', 'source $argv[1]', args[cIdx + 2]]);
-      expect(args.slice(cIdx + 3)).toEqual([';', 'set-option', '-t', 'bmx-fish-pipe', 'remain-on-exit', 'failed']);
+      expect(args.slice(cIdx + 3, cIdx + 10)).toEqual([';', 'set-option', '-t', 'bmx-fish-pipe', 'remain-on-exit', 'failed', ';']);
       const { body } = takePaneLaunchFile(args);
       expect(body).toContain(`set argv '/tmp'`);
       expect(body).toContain('cd -- $argv[1]');
@@ -1490,7 +1604,7 @@ describe('TmuxPipeBackend managed session', () => {
     const args = newSessionArgs();
     const cIdx = scriptIndex(args);
     expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', '. "$1"', '_', args[cIdx + 3]]);
-    expect(args.slice(cIdx + 4)).toEqual([';', 'set-option', '-t', 'bmx-posix-pipe', 'remain-on-exit', 'failed']);
+    expect(args.slice(cIdx + 4, cIdx + 11)).toEqual([';', 'set-option', '-t', 'bmx-posix-pipe', 'remain-on-exit', 'failed', ';']);
     const { body } = takePaneLaunchFile(args);
     expect(body).toContain(`set -- '/tmp'`);
     expect(body).toContain('cd -- "$1" && shift');
@@ -1531,143 +1645,299 @@ describe('resolveReportedExitCode merges latched vs terminal death code', () => 
 });
 
 describe('TmuxPipeBackend lifecycle watcher', () => {
-  const isPaneProbe = (args: any) =>
-    Array.isArray(args) && args.includes('display-message') && args.includes('#{pane_id}');
-  const PANE_OK = (_bin: any, args: any) => isPaneProbe(args) ? '%1\n' as any : '' as any;
-  const PANE_GONE = (_bin: any, args: any) => {
-    if (isPaneProbe(args)) throw Object.assign(new Error('no pane'), { status: 1, signal: null });
-    return '' as any;
-  };
+  // The watcher used to ask tmux with TWO synchronous display-message calls
+  // every second, for every pane, whether or not anything happened in it.
+  // These cases run the watcher against a model of what tmux answers
+  // (helpers/tmux-world.ts: answers are expanded from the format the code
+  // sends, for both execFileSync and execFile), so they pin behaviour — when a
+  // pane is judged gone, with which code, how often tmux is asked, and that the
+  // asking never blocks the event loop — not the argv of any one command.
+  const mockedExecFile = vi.mocked(execFile);
+  const TARGET = 'bmx-owned';
+  const INITIAL = tmuxLifecycleInitialDelayMs(TARGET);
+  const IDLE = tmuxLifecycleIdleProbeMs(TARGET);
+  /** Start-up + one full activity window: from here on the pane is idle. */
+  const TO_IDLE = INITIAL + LIFECYCLE_ACTIVITY_WINDOW_MS + LIFECYCLE_IDLE_PROBE_MAX_MS;
+  /** The confirmation debounce (misses at +0 / +3s / +12s) plus async slack. */
+  const DEBOUNCE = 12_000 + 1_000;
 
-  it('fires exit when the tmux pane disappears — but only after 3 consecutive failures (backed-off probes)', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecFileSync.mockImplementation(PANE_GONE);
-
-      // Failed probes back off (1s → 3s → 9s): miss#1 at the initial delay,
-      // miss#2 3s later. Two misses are NOT enough — the gate rides them out.
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000);
-      expect(exits).toEqual([]);
-
-      // miss#3 lands 9s after miss#2, trips the gate; the final lenient
-      // confirm also fails and the server cross-check answers ⇒ now we detach.
-      vi.advanceTimersByTime(9_000);
-      expect(exits).toEqual([[1, null]]);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    errSpy.mockRestore();
   });
 
-  it('treats an empty pane id as a failure (debounced the same way)', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecFileSync.mockImplementation((_bin: any, args: any) => isPaneProbe(args) ? '\n' as any : '' as any);
+  const logged = (text: string) => errSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes(text));
 
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000);
-      expect(exits).toEqual([]);
-      vi.advanceTimersByTime(9_000);
-      expect(exits).toEqual([[1, null]]);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
+  function watch(world: TmuxWorld, target = TARGET, opts: { ownsSession?: boolean; cliPid?: number } = { ownsSession: true }) {
+    installTmuxWorld(world, { execFileSync: mockedExecFileSync, execFile: mockedExecFile });
+    const be = new TmuxPipeBackend(target, opts);
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('', [], spawnOpts());
+    resetCalls(world);
+    return { be, exits };
+  }
+  function resetCalls(world: TmuxWorld): void {
+    world.syncCalls.length = 0;
+    world.asyncCalls.length = 0;
+  }
+  /** Liveness rounds the watcher ran (async), and liveness reads made with a
+   *  BLOCKING execFileSync (must stay 0 while only the watcher runs). */
+  const asyncProbes = (world: TmuxWorld) => world.asyncCalls.filter(isLivenessRead).length;
+  const syncProbes = (world: TmuxWorld) => world.syncCalls.filter(isLivenessRead).length;
+
+  it('asks tmux ONE command per round, asynchronously — never a blocking execFileSync', async () => {
+    const world = createTmuxWorld();
+    watch(world);
+    await vi.advanceTimersByTimeAsync(INITIAL + 5 * LIFECYCLE_ACTIVE_PROBE_MS);
+
+    expect(asyncProbes(world)).toBeGreaterThanOrEqual(5);
+    // Every tmux command of a healthy round IS the liveness read: one per round.
+    expect(world.asyncCalls.length).toBe(asyncProbes(world));
+    expect(world.syncCalls).toEqual([]);
   });
 
-  it('does NOT detach on a single transient probe failure that then recovers', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
+  it('probes an idle pane at the idle cadence, never slower than LIFECYCLE_IDLE_PROBE_MAX_MS', async () => {
+    expect(IDLE).toBeLessThanOrEqual(LIFECYCLE_IDLE_PROBE_MAX_MS);
+    expect(IDLE).toBeGreaterThan(LIFECYCLE_ACTIVE_PROBE_MS * 10);
+    const world = createTmuxWorld();
+    watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    resetCalls(world);
 
-      // One failure, then sustained success — the false signal must be ignored.
-      mockedExecFileSync.mockImplementation(PANE_GONE);
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned'));
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      vi.advanceTimersByTime(10_000);
-
-      expect(exits).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
+    const SPAN = 10 * LIFECYCLE_IDLE_PROBE_MAX_MS;
+    await vi.advanceTimersByTimeAsync(SPAN);
+    const rounds = asyncProbes(world);
+    expect(rounds).toBeGreaterThanOrEqual(Math.floor(SPAN / LIFECYCLE_IDLE_PROBE_MAX_MS));
+    expect(rounds).toBeLessThanOrEqual(Math.ceil(SPAN / IDLE) + 1);
+    expect(syncProbes(world)).toBe(0);
   });
 
-  // #2434: a dead-but-kept corpse still answers #{pane_id}; the watcher then
-  // reads #{pane_dead}:#{pane_dead_status} and confirms death. The real code
-  // (77) is captured AT THAT probe. If a deeply starved tmux is unreadable by
-  // the time handlePaneExit() does its terminal read (~13s later), the latched
-  // code must still be reported — not collapsed to the sentinel 1.
-  it('reports the real exit code latched when the pane was confirmed dead, even if the terminal read is starved', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      const DEAD_STATUS = '#{pane_dead}:#{pane_dead_status}';
-      // A watcher liveness probe reads pane_id FIRST then the death-status
-      // format; handlePaneExit()'s terminal read reads the death-status format
-      // WITHOUT a preceding pane_id. Distinguish them by the previous call:
-      //  - death-status right after a pane_id read (the probe): confirmed 1:77
-      //  - a standalone death-status read (terminal, no preceding pane_id):
-      //    starved/unreadable -> ''  (this is the #2434 starvation shape)
-      let lastWasPaneId = false;
-      const probeImpl = (_bin: any, args: any) => {
-        if (!Array.isArray(args) || !args.includes('display-message')) { lastWasPaneId = false; return '' as any; }
-        if (args.includes('#{pane_id}')) { lastWasPaneId = true; return '%1\n' as any; }
-        if (args.some((a: unknown) => String(a).startsWith(DEAD_STATUS))) {
-          const afterPaneId = lastWasPaneId;
-          lastWasPaneId = false;
-          return afterPaneId ? '1:77\n' as any : '' as any;
-        }
-        lastWasPaneId = false;
-        return '' as any;
-      };
+  it('keeps the fast cadence while the pane streams output (a turn in progress), then decays to idle', async () => {
+    const world = createTmuxWorld();
+    watch(world);
+    const stream: any = vi.mocked(createReadStream).mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    resetCalls(world);
 
-      mockedExecFileSync.mockImplementation(probeImpl);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-
-      // Each watcher probe: pane_id OK + isPaneDead reads 1:77 -> 'missing'
-      // (corpse). Three back-to-back dead verdicts + final confirm trip exit.
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000 + 9_000);
-
-      // handlePaneExit() already ran with a starved terminal read (the
-      // standalone DEAD_STATUS call above returned ''); advance any tail timer.
-      vi.advanceTimersByTime(2_000);
-
-      // Latched 77 wins over the now-unreadable terminal read.
-      expect(exits).toEqual([[77, null]]);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
+    // A turn the worker did not type into (e.g. the CLI continuing on its own):
+    // output alone never pulls a probe in, but once the scheduled idle probe
+    // lands while output streams, the pane is on the 1s cadence.
+    const TURN = LIFECYCLE_IDLE_PROBE_MAX_MS + 20_000;
+    for (let t = 0; t < TURN; t += 500) {
+      stream.emit('data', Buffer.from('⠋ Working…\r'));
+      await vi.advanceTimersByTimeAsync(500);
+      if (t === TURN - 20_000) resetCalls(world);
     }
+    expect(asyncProbes(world)).toBeGreaterThanOrEqual(20_000 / LIFECYCLE_ACTIVE_PROBE_MS - 2);
+
+    // Output stops: the short output window lapses and the pane is idle again.
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_OUTPUT_ACTIVITY_WINDOW_MS + LIFECYCLE_ACTIVE_PROBE_MS);
+    resetCalls(world);
+    await vi.advanceTimersByTimeAsync(5 * LIFECYCLE_IDLE_PROBE_MAX_MS);
+    expect(asyncProbes(world)).toBeLessThanOrEqual(Math.ceil(5 * LIFECYCLE_IDLE_PROBE_MAX_MS / IDLE) + 1);
   });
 
-  // #2453: the same probe-time latch when tmux never publishes a status
-  // because it has not reaped the pane process — the code then comes from the
-  // kernel's record of that unreaped child, read while the probe confirms the
-  // corpse. A real unreaped child stands in for the pane (python forks it and
-  // never waits), so the kernel read is real; the terminal read is starved, so
-  // only the probe-time capture can carry the 3.
+  it('an isolated repaint of an idle CLI (e.g. a statusline refresh every 60s) adds no probes', async () => {
+    const world = createTmuxWorld();
+    watch(world);
+    const stream: any = vi.mocked(createReadStream).mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    resetCalls(world);
+    const SPAN = 10 * 60_000;
+    for (let t = 0; t < SPAN; t += 60_000) {
+      stream.emit('data', Buffer.from('\x1b[s\x1b[50;1H~/repo  main  12:34\x1b[u'));
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    expect(asyncProbes(world) + syncProbes(world)).toBeLessThanOrEqual(Math.ceil(SPAN / IDLE) + 1);
+  });
+
+  it('a write pulls an idle-scheduled probe forward to the fast cadence', async () => {
+    const world = createTmuxWorld();
+    const { be } = watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    resetCalls(world);
+
+    expect(be.sendText('hello')).toBe(true);
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 100);
+    expect(asyncProbes(world)).toBe(1);
+    await vi.advanceTimersByTimeAsync(5 * LIFECYCLE_ACTIVE_PROBE_MS);
+    expect(asyncProbes(world)).toBeGreaterThanOrEqual(5);
+  });
+
+  it('a pane that dies while ACTIVE is torn down on the old schedule: 3 misses + final check, real exit code', async () => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    world.pane = { dead: '77' };
+
+    // Misses at the first round and 3s later: the debounce rides them out.
+    await vi.advanceTimersByTimeAsync(INITIAL + 3_000 + 100);
+    expect(exits).toEqual([]);
+    await vi.advanceTimersByTimeAsync(9_000 + 1_000);
+    expect(exits).toEqual([[77, null]]);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('a pane that dies while IDLE is torn down within the idle cadence + the same debounce', async () => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    world.pane = { dead: '77' };
+
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_IDLE_PROBE_MAX_MS + DEBOUNCE);
+    expect(exits).toEqual([[77, null]]);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('a pane that vanishes (empty pane id) is debounced the same way', async () => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    world.pane = 'gone';
+    await vi.advanceTimersByTimeAsync(INITIAL + 3_000 + 100);
+    expect(exits).toEqual([]);
+    await vi.advanceTimersByTimeAsync(9_000 + 1_000);
+    expect(exits).toEqual([[1, null]]);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('does NOT detach on transient misses that recover, nor when the final lenient check succeeds', async () => {
+    const world = createTmuxWorld();
+    let misses = 3; // three missing rounds, then the final confirm finds the pane
+    world.override = (args, via) => {
+      if (via === 'async' && isLivenessRead(args) && misses > 0) {
+        misses -= 1;
+        return '::::111\n';
+      }
+      return undefined;
+    };
+    const { exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(INITIAL + 30_000);
+    expect(exits).toEqual([]);
+    expect(logged('recovered on final check')).toBe(true);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  // 2026-08-20: a stalled shared server refuses connects instantly. A clean
+  // exit-1 + connection-level stderr must read as UNKNOWN, never as an
+  // authoritative miss — misreading it tore down every live session of every bot.
+  it.each([
+    ['connection refused', CONNECTION_REFUSED],
+    ['lost server', LOST_SERVER],
+  ])('never counts a connection-level failure (%s) as pane-gone', async (_label, failure) => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    world.failAll = failure;
+    await vi.advanceTimersByTimeAsync(INITIAL + 50_000); // inside the 60s outage window
+    expect(exits).toEqual([]);
+    expect(logged('keeping managed session attached')).toBe(true);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it.each([
+    ['probe deadline', DEADLINE],
+    ['spawn EMFILE', EMFILE],
+  ])('never detaches when probes get no answer (%s): unknown, not missing', async (_label, failure) => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    world.failAll = failure;
+    await vi.advanceTimersByTimeAsync(INITIAL + 120_000);
+    expect(exits).toEqual([]);
+    expect(logged('keeping managed session attached')).toBe(true);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('escalates only after the server is continuously unreachable for 60s — bounded even on an idle pane', async () => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    world.failAll = CONNECTION_REFUSED;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(exits).toEqual([]);
+    // First failure seen ≤ one idle period in, escalation on the first round
+    // ≥ 60s after it: ≤ 60s + two idle periods overall.
+    await vi.advanceTimersByTimeAsync(2 * LIFECYCLE_IDLE_PROBE_MAX_MS);
+    expect(exits).toEqual([[1, null]]);
+    expect(logged('continuously unreachable')).toBe(true);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('an outage on an idle pane does not raise its probe rate (no extra load on a struggling server)', async () => {
+    const world = createTmuxWorld();
+    watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    resetCalls(world);
+    world.failAll = DEADLINE;
+    const SPAN = 4 * LIFECYCLE_IDLE_PROBE_MAX_MS;
+    await vi.advanceTimersByTimeAsync(SPAN);
+    // Every liveness read, sync or async, counts against the struggling server.
+    expect(asyncProbes(world) + syncProbes(world)).toBeLessThanOrEqual(Math.ceil(SPAN / IDLE) + 1);
+  });
+
+  it('stays attached when panes read missing but the server itself does not answer (cross-check)', async () => {
+    const world = createTmuxWorld({ pane: 'gone' });
+    world.override = args => (args[0] === 'list-sessions' ? CONNECTION_REFUSED : undefined);
+    const { exits } = watch(world);
+    world.pane = 'gone';
+    await vi.advanceTimersByTimeAsync(INITIAL + 13_000);
+    expect(exits).toEqual([]);
+    expect(logged('treating as server outage')).toBe(true);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('tears down when panes read missing AND the server answers it is not running (sole-session socket)', async () => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    world.failAll = NO_SERVER;
+    // Inside the ~12s debounce + slack, far short of the 60s escalation clock.
+    await vi.advanceTimersByTimeAsync(INITIAL + DEBOUNCE + 2_000);
+    expect(exits).toEqual([[1, null]]);
+    expect(logged('pane gone after')).toBe(true);
+    expect(logged('treating as server outage')).toBe(false);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  // #2434: a corpse's code is latched by the probe that confirms death, so a
+  // terminal read that a starved tmux no longer answers cannot turn 77 into 1.
+  it('reports the code latched when a probe confirmed the corpse, even if the terminal read is starved', async () => {
+    const world = createTmuxWorld({ pane: { dead: '77' } });
+    world.override = (args, via) => (
+      via === 'sync' && args.includes('display-message') && String(args.at(-1)).startsWith('#{pane_dead}')
+        ? DEADLINE : undefined
+    );
+    const { exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(INITIAL + DEBOUNCE);
+    expect(exits).toEqual([[77, null]]);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  it('waits out the 1: → 1:<code> publish gap without blocking, then reports the real code', async () => {
+    const world = createTmuxWorld({ pane: { dead: '' } });
+    let deathReads = 0;
+    world.override = (args, via) => {
+      if (via === 'async' && args.includes('display-message') && String(args.at(-1)).startsWith('#{pane_dead}')) {
+        deathReads += 1;
+        if (deathReads >= 3) world.pane = { dead: '9' };
+      }
+      return undefined;
+    };
+    const { exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(INITIAL + DEBOUNCE);
+    expect(exits).toEqual([[9, null]]);
+    expect(deathReads).toBeGreaterThanOrEqual(3);
+    expect(syncProbes(world)).toBe(0);
+  });
+
+  // #2453: tmux never publishes the status of a pane it has not reaped; the
+  // probe takes it from the kernel's record of that zombie. A real unreaped
+  // child stands in for the pane (python forks it and never waits).
   const python3 = ['/usr/bin/python3', '/bin/python3'].find(path => existsSync(path));
   it.skipIf(!python3 || process.platform !== 'linux')('latches a status tmux never published from the kernel at probe time (#2453)', async () => {
+    vi.useRealTimers();
     const parent = spawn(python3!, ['-c', [
       'import os, sys, time',
       'pid = os.fork()',
@@ -1676,375 +1946,416 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       'print(pid, flush=True)',
       'sys.stdin.read()',
     ].join('\n')], { stdio: ['pipe', 'pipe', 'inherit'] });
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       const [chunk] = await once(parent.stdout!, 'data') as [Buffer];
-      // dead, no status, pane pid = the unreaped child, server pid = its parent
-      const corpse = `1::${String(chunk).trim()}:${parent.pid}\n`;
       vi.useFakeTimers();
-      let lastWasPaneId = false;
-      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
-        if (!Array.isArray(args) || !args.includes('display-message')) { lastWasPaneId = false; return '' as any; }
-        if (args.includes('#{pane_id}')) { lastWasPaneId = true; return '%1\n' as any; }
-        if (args.some((a: unknown) => String(a).startsWith('#{pane_dead}:#{pane_dead_status}'))) {
-          const afterPaneId = lastWasPaneId;
-          lastWasPaneId = false;
-          return afterPaneId ? corpse as any : '' as any;
-        }
-        lastWasPaneId = false;
-        return '' as any;
-      }) as typeof execFileSync);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000 + 9_000 + 2_000);
+      const corpse = `%1:1::${String(chunk).trim()}:${parent.pid}\n`;
+      const world = createTmuxWorld({ pane: { dead: '' } });
+      world.override = (args, via) => {
+        if (via === 'async' && isLivenessRead(args)) return corpse;
+        // Every other death read is starved: only the probe-time kernel read can carry the 3.
+        if (args.includes('display-message') && String(args.at(-1)).startsWith('#{pane_dead}')) return DEADLINE;
+        return undefined;
+      };
+      const { exits } = watch(world);
+      await vi.advanceTimersByTimeAsync(INITIAL + DEBOUNCE);
       expect(exits).toEqual([[3, null]]);
+      expect(syncProbes(world)).toBe(0);
     } finally {
       vi.useRealTimers();
-      errSpy.mockRestore();
       parent.stdin!.end();
       await once(parent, 'close');
     }
   });
 
-  it('resets the failure counter on an intervening success (never 3-in-a-row)', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-
-      mockedExecFileSync.mockImplementation(PANE_GONE);
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000); // 2 failures (probes back off 1s→3s)
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      vi.advanceTimersByTime(9_000);          // success → reset (next probe 9s out)
-      mockedExecFileSync.mockImplementation(PANE_GONE);
-      vi.advanceTimersByTime(4_000);          // 2 more failures at 1s + 3s (gate back to 2)
-
-      expect(exits).toEqual([]);              // never reached 3 consecutive
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('stays attached when the final lenient confirm probe succeeds', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      let paneIdCalls = 0;
-      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-        if (isPaneProbe(args)) {
-          paneIdCalls += 1;
-          if (paneIdCalls <= 3) {
-            throw Object.assign(new Error('no pane'), { status: 1, signal: null });
-          }
-          return '%1\n' as any;
-        }
-        return '' as any;
-      });
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 12_000);
-      expect(exits).toEqual([]);              // recovered on the confirm, no detach
-      expect(paneIdCalls).toBe(4);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('never trips the gate on connection-level clean errors (server stall ⇒ instant ECONNREFUSED)', () => {
-    // 2026-08-20 incident: a briefly stalled shared server refuses connects
-    // instantly (unix-socket accept backlog overflow). The clean exit-1 +
-    // "error connecting" stderr must classify as UNKNOWN, not authoritative
-    // missing — misreading it tore down every live session across all bots.
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-        if (isPaneProbe(args)) {
-          throw Object.assign(new Error('cmd failed'), {
-            status: 1,
-            signal: null,
-            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
-          });
-        }
-        return '' as any;
-      });
-
-      // Well past the old 3-miss window but inside the 60s outage escalation.
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 30_000);
-      expect(exits).toEqual([]);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('keeping managed session attached'))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('escalates to pane-exit when the server stays continuously unreachable past the outage window', () => {
-    // Connection-level errors are unknown, but a genuinely DEAD server also
-    // produces them forever — and its panes died with it. An unbroken run
-    // longer than the escalation window must eventually declare the pane gone
-    // so the worker can restart/resume instead of holding a zombie session.
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-        if (isPaneProbe(args)) {
-          throw Object.assign(new Error('cmd failed'), {
-            status: 1,
-            signal: null,
-            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
-          });
-        }
-        return '' as any;
-      });
-
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 80_000);
-      expect(exits).toEqual([[1, null]]);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('continuously unreachable'))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('stays attached when panes read missing but the server itself does not answer (cross-check)', () => {
-    // Defense in depth: even an authoritative-looking missing verdict must not
-    // destroy state while an independent list-sessions cross-check says the
-    // server is not answering — covers unrecognised stderr wordings / future
-    // tmux message changes that slip past the connection-error classifier.
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-        if (isPaneProbe(args)) {
-          throw Object.assign(new Error('no pane'), { status: 1, signal: null });
-        }
-        if (Array.isArray(args) && args.includes('list-sessions')) {
-          throw Object.assign(new Error('cmd failed'), {
-            status: 1,
-            signal: null,
-            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
-          });
-        }
-        return '' as any;
-      });
-
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 13_000);
-      expect(exits).toEqual([]);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('treating as server outage'))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('tears down when panes read missing AND the cross-check says the server is DOWN (no server running)', () => {
-    // Regression guard for the sole-session hang: when a managed session is the
-    // only session on its socket, its pane dying makes tmux exit, so BOTH the
-    // pane probe and the list-sessions cross-check return authoritative
-    // "no server running" — NOT a connection-level error. That is 'down'
-    // (server gone ⇒ this pane provably gone), so teardown must proceed.
-    // The earlier cross-check collapsed 'down' into "not answering" and stayed
-    // attached forever: each authoritative-missing probe reset the outage
-    // clock, so the 60s escalation never fired and the worker hung until the
-    // next write. Distinct from the connection-level case above (stay attached).
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      // Sole session's pane died → tmux server exited. EVERY tmux invocation
-      // (pane probe AND list-sessions cross-check) now returns authoritative
-      // "no server running".
-      mockedExecFileSync.mockImplementation((_bin: any, _args: any) => {
-        throw Object.assign(new Error('no server'), {
-          status: 1,
-          signal: null,
-          stderr: Buffer.from('no server running on /tmp/tmux-0/default'),
-        });
-      });
-
-      // Well past the ~13s backed-off teardown window, but far short of the 60s
-      // escalation clock — proving teardown comes from the 'down' cross-check,
-      // not from the outage escalation.
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 15_000);
-      expect(exits).toEqual([[1, null]]);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('pane gone after'))).toBe(true);
-      // Must NOT have stayed attached via the outage path.
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('treating as server outage'))).toBe(false);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('never detaches when tmux probes time out or fail to spawn (unknown, not missing)', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-        if (isPaneProbe(args)) {
-          throw Object.assign(new Error('spawn tmux EMFILE'), { code: 'EMFILE', status: null, signal: null });
-        }
-        return '' as any;
-      });
-
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 10_000);
-      expect(exits).toEqual([]);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('keeping managed session attached'))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
-    }
-  });
-
-  it('fires exit IMMEDIATELY when the adopted CLI pid disappears (pid is decisive, not debounced)', () => {
-    // The pid check is a pure process.kill(pid,0) syscall — it can only report
-    // ESRCH/EPERM, never a transient timeout — so it must NOT be debounced:
-    // delaying teardown would route Lark input into the user's bare shell.
-    vi.useFakeTimers();
+  it('detects an adopted CLI pid exit within 1s even while the pane is probed at the idle cadence', async () => {
+    let cliAlive = true;
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | 0) => {
-      if (pid === 4242 && signal === 0) {
-        const err: NodeJS.ErrnoException = new Error('gone');
-        err.code = 'ESRCH';
-        throw err;
+      if (pid === 4242 && signal === 0 && !cliAlive) {
+        throw Object.assign(new Error('gone'), { code: 'ESRCH' });
       }
       return true;
     }) as typeof process.kill);
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('0:2.0', { cliPid: 4242 });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      mockedExecSync.mockClear();
-
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('0:2.0'));
-      expect(exits).toEqual([[1, null]]);
-
-      const cancelCall = mockedExecSync.mock.calls
-        .map(c => String(c[0]))
-        .find(c => c.includes('pipe-pane'));
-      expect(cancelCall).toBeDefined();
-      expect(cancelCall).toContain("'0:2.0'");
-      expect(cancelCall).not.toContain('botmux-pipe-');
-    } finally {
-      errSpy.mockRestore();
-      killSpy.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it('kill() during a pending (sub-threshold) failure streak stops the watcher cleanly', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      mockedExecFileSync.mockImplementation(PANE_OK);
-      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-
-      mockedExecFileSync.mockImplementation(PANE_GONE);
-      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 1_000);
+      const timersBefore = vi.getTimerCount();
+      const world = createTmuxWorld();
+      const { exits } = watch(world, '0:2.0', { cliPid: 4242 });
+      const toIdle = tmuxLifecycleInitialDelayMs('0:2.0') + LIFECYCLE_ACTIVITY_WINDOW_MS + LIFECYCLE_IDLE_PROBE_MAX_MS;
+      await vi.advanceTimersByTimeAsync(toIdle);
+      resetCalls(world);
+      const SPAN = 3 * LIFECYCLE_IDLE_PROBE_MAX_MS;
+      await vi.advanceTimersByTimeAsync(SPAN);
+      // The tmux probe went idle…
+      expect(asyncProbes(world)).toBeLessThanOrEqual(Math.ceil(SPAN / tmuxLifecycleIdleProbeMs('0:2.0')) + 1);
       expect(exits).toEqual([]);
 
-      be.kill();                              // explicit close mid-streak
-      mockedExecFileSync.mockClear();
-      vi.advanceTimersByTime(10_000);         // watcher must be stopped
-
-      expect(exits).toEqual([]);              // kill() does not fire onExit
-      const probeAfterKill = mockedExecFileSync.mock.calls
-        .some(c => (c[1] as string[]).includes('display-message'));
-      expect(probeAfterKill).toBe(false);     // no further probing after kill
+      // …but the pid check did not: the CLI returning to the user's shell is
+      // still caught within a second, so Lark input never reaches that shell.
+      cliAlive = false;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(exits).toEqual([[1, null]]);
+      expect(logged('adopted CLI pid 4242 exited')).toBe(true);
+      expect(syncProbes(world)).toBe(0);
+      // Teardown stops the pid check too: a live interval would keep the
+      // worker's event loop from draining after the session is gone.
+      expect(vi.getTimerCount()).toBe(timersBefore);
     } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
+      killSpy.mockRestore();
     }
   });
 
-  // The 60s continuous-unreachable escalation must carry the same
+  it('kill() while a probe is in flight: the late answer is dropped and the watcher stays stopped', async () => {
+    const world = createTmuxWorld();
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    expect(world.held).toHaveLength(1); // the probe is waiting on tmux, the loop is free
+    be.kill();
+    world.pane = 'gone';
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    resetCalls(world);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(exits).toEqual([]);
+    expect(world.asyncCalls).toEqual([]);
+    expect(world.syncCalls).toEqual([]);
+  });
+
+  it('kill() during a pending (sub-threshold) failure streak stops the watcher cleanly', async () => {
+    const world = createTmuxWorld({ pane: 'alive' });
+    const { be, exits } = watch(world);
+    world.pane = 'gone';
+    await vi.advanceTimersByTimeAsync(INITIAL + 1_000);
+    expect(asyncProbes(world)).toBe(1);
+    be.kill();
+    resetCalls(world);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(exits).toEqual([]);
+    expect(world.asyncCalls).toEqual([]);
+  });
+
+  it('a write that finds the corpse while a probe is in flight reports exactly one exit', async () => {
+    const world = createTmuxWorld();
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    expect(world.held).toHaveLength(1);
+    world.pane = { dead: '77' };
+    expect(be.sendText('hello')).toBe(false);
+    expect(exits).toEqual([[77, null]]);
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(exits).toEqual([[77, null]]);
+  });
+
+  /** With holdAsync enabled from the start, release exactly the three MAIN
+   *  missing rounds. The next held callback is then the final confirmation,
+   *  not the reachability command that follows it. */
+  async function advanceThreeMissesToHeldFinal(world: TmuxWorld): Promise<void> {
+    for (const delay of [INITIAL, 3_000, 9_000]) {
+      await vi.advanceTimersByTimeAsync(delay);
+      expect(world.held).toHaveLength(1);
+      for (const deliver of world.held.splice(0)) deliver();
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.held).toHaveLength(1);
+  }
+
+  async function advanceToDeathCode(
+    world: TmuxWorld,
+    exits: Array<[number | null, string | null]>,
+    code: number,
+  ): Promise<void> {
+    world.pane = { dead: String(code) };
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 12_000 + 100);
+    expect(exits).toEqual([[code, null]]);
+  }
+
+  it.each(['write precheck', 'guardedSend follow-up probe'] as const)(
+    'a newer exists from the %s invalidates an older in-flight final missing confirmation',
+    async (evidencePath) => {
+      const world = createTmuxWorld();
+      let releaseFinalMissing = false;
+      world.override = (args, via) => {
+        if (via === 'async' && isLivenessRead(args) && releaseFinalMissing) return '::::111\n';
+        if (evidencePath === 'guardedSend follow-up probe' && via === 'sync') {
+          // Keep the write precheck inconclusive, then fail the write itself:
+          // only guardedSend's follow-up sync probe supplies the live evidence.
+          if (isLivenessRead(args) && String(args.at(-1)).endsWith('#{pane_in_mode}')) return DEADLINE;
+          if (args[0] === 'send-keys') return { kind: 'exit', status: 1, stderr: 'transient write failure' };
+        }
+        return undefined;
+      };
+      const { be, exits } = watch(world);
+      world.pane = 'gone';
+      world.holdAsync = true;
+      await advanceThreeMissesToHeldFinal(world);
+      expect(world.asyncCalls.filter(isLivenessRead)).toHaveLength(4);
+      expect(world.asyncCalls.some(args => args[0] === 'list-sessions')).toBe(false);
+      expect(exits).toEqual([]);
+
+      // A NEWER synchronous server answer proves the pane alive. In the first
+      // case the write itself lands; in the second, guardedSend's post-failure
+      // probe is the authoritative exists (the write is dropped, not the session).
+      world.pane = 'alive';
+      expect(be.sendText('newer-live-proof')).toBe(evidencePath === 'write precheck');
+
+      // Release the OLDER final answer (missing), while the pane remains alive.
+      // The old synchronous watcher could not interleave a write here; the async
+      // watcher must explicitly invalidate this now-stale destructive sequence.
+      releaseFinalMissing = true;
+      world.holdAsync = false;
+      for (const deliver of world.held.splice(0)) deliver();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(exits).toEqual([]);
+
+      // The live evidence must also RESET the gate, not merely suppress this
+      // callback. One further miss is a new 1/3, not a fourth miss that goes
+      // straight to another final confirmation and tears the live pane down.
+      await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 10);
+      expect(exits).toEqual([]);
+    },
+  );
+
+  it('a newer live write invalidates an older missing chain while its server reachability check is in flight', async () => {
+    const world = createTmuxWorld();
+    const { be, exits } = watch(world);
+    world.pane = 'gone';
+    world.holdAsync = true;
+    await advanceThreeMissesToHeldFinal(world);
+    // Answer the final missing; the following reachability command stays held.
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.held).toHaveLength(1);
+    expect(world.asyncCalls.some(args => args[0] === 'list-sessions')).toBe(true);
+    expect(exits).toEqual([]);
+
+    world.pane = 'alive';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+
+    world.pane = 'gone';
+    await vi.advanceTimersByTimeAsync(LIFECYCLE_ACTIVE_PROBE_MS + 10);
+    expect(exits).toEqual([]);
+  });
+
+  it('a newer exists drops the exit code latched by an invalidated death chain', async () => {
+    const world = createTmuxWorld({ pane: { dead: '77' } });
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await advanceThreeMissesToHeldFinal(world); // the old chain has latched 77
+
+    world.pane = 'alive';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    world.override = (args, via) => (via === 'async' && isLivenessRead(args) ? '::::111\n' : undefined);
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+
+    world.override = undefined;
+    await advanceToDeathCode(world, exits, 9);
+  });
+
+  it('a death-status capture from before a newer exists cannot relatch its old exit code', async () => {
+    const world = createTmuxWorld({ pane: { dead: '' } });
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    for (const deliver of world.held.splice(0)) deliver(); // main probe: dead, status not published
+    await vi.advanceTimersByTimeAsync(60); // cross the 50ms status poll sleep
+    expect(world.held).toHaveLength(1); // the PANE_DEATH_FORMAT re-read is held
+    expect(String(world.asyncCalls.at(-1)!.at(-1)).startsWith('#{pane_dead}')).toBe(true);
+
+    world.pane = 'alive';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    world.override = (args, via) => (
+      via === 'async' && String(args.at(-1)).startsWith('#{pane_dead}') ? '1:77:4242:111\n' : undefined
+    );
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver(); // late 77 belongs to the old chain
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+
+    world.override = undefined;
+    await advanceToDeathCode(world, exits, 9);
+  });
+
+  it.each([
+    ['222', false],
+    ['333', true],
+  ] as const)('a newer write-side exists anchors server 222 before an old async exists returns (answering at death=%s)', async (answeringServerPid, expectedReplacement) => {
+    const world = createTmuxWorld();
+    world.override = (args, via) => (
+      via === 'sync' && args.at(-1) === '#{pane_id} #{pid}' ? DEADLINE : undefined
+    );
+    const { be, exits } = watch(world); // attach-time server-pid anchor is unavailable
+    world.override = undefined;
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    expect(world.held).toHaveLength(1); // old async exists on server 111
+
+    let releaseOldExists = false;
+    world.override = (args, via) => (
+      releaseOldExists && via === 'async' && isLivenessRead(args) ? '%1:0::4242:111\n' : undefined
+    );
+    world.serverPid = '222';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    releaseOldExists = true;
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+
+    world.override = undefined;
+    world.serverPid = answeringServerPid;
+    await advanceToDeathCode(world, exits, 9);
+    expect(be.exitedBecauseServerReplaced()).toBe(expectedReplacement);
+  });
+
+  it('an old async exists cannot backfill its server pid after a newer write-side exists', async () => {
+    const world = createTmuxWorld();
+    world.override = (args, via) => (
+      via === 'sync' && args.at(-1) === '#{pane_id} #{pid}' ? DEADLINE : undefined
+    );
+    const { be, exits } = watch(world);
+    world.holdAsync = true;
+    await vi.advanceTimersByTimeAsync(INITIAL);
+    expect(world.held).toHaveLength(1); // old async exists on server 111
+
+    let releaseOldExists = false;
+    world.override = (args, via) => {
+      if (releaseOldExists && via === 'async' && isLivenessRead(args)) return '%1:0::4242:111\n';
+      // The newer sync exists carries no server pid, so the anchor stays empty;
+      // only the generation guard can prevent the older async 111 backfill.
+      if (via === 'sync' && isLivenessRead(args) && String(args.at(-1)).endsWith('#{pane_in_mode}')) {
+        return '%1:0::4242::0\n';
+      }
+      return undefined;
+    };
+    world.serverPid = '222';
+    expect(be.sendText('newer-live-proof')).toBe(true);
+    releaseOldExists = true;
+    world.holdAsync = false;
+    for (const deliver of world.held.splice(0)) deliver();
+    await vi.advanceTimersByTimeAsync(0);
+
+    world.override = undefined;
+    await advanceToDeathCode(world, exits, 9);
+    expect(be.exitedBecauseServerReplaced()).toBe(false);
+  });
+
+  // A refusal storm is intermittent: some connects are refused, some answered.
+  // The 60s escalation must rest on a dense run of failures — on the idle
+  // cadence 60s holds only ~3 samples, which "all fail" far more often than
+  // ~9 do, and live sessions get torn down.
+  it('escalates a connection outage on an idle pane only after a dense run of failed probes', async () => {
+    const world = createTmuxWorld();
+    const { exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    resetCalls(world);
+    world.failAll = CONNECTION_REFUSED;
+    let probesBeforeExit = -1;
+    for (let t = 0; t < 3 * 60_000 && probesBeforeExit < 0; t += 1_000) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      if (exits.length > 0) probesBeforeExit = asyncProbes(world);
+    }
+    expect(exits).toEqual([[1, null]]);
+    // 60s on the 3s/9s cadence: ≥ 1 + 1 + 6 rounds; on the idle cadence it was 3–4.
+    expect(probesBeforeExit).toBeGreaterThanOrEqual(7);
+  });
+
+  it('kill() during the status capture of a corpse stops asking tmux at once', async () => {
+    // Signal death: tmux never publishes a status and the kernel has none for
+    // this pid, so the capture re-reads for its whole bounded budget.
+    const world = createTmuxWorld({ pane: { dead: '' } });
+    const { be } = watch(world);
+    await vi.advanceTimersByTimeAsync(INITIAL + 120);
+    expect(world.asyncCalls.filter(a => String(a.at(-1)).startsWith('#{pane_dead}')).length).toBeGreaterThan(0);
+    be.kill();
+    resetCalls(world);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(world.asyncCalls).toEqual([]);
+    expect(world.syncCalls).toEqual([]);
+  });
+
+  it('writes during a missing streak do not squeeze the 3s/9s debounce (a 9s misread never tears down a live pane)', async () => {
+    const world = createTmuxWorld();
+    const { be, exits } = watch(world);
+    await vi.advanceTimersByTimeAsync(TO_IDLE);
+    // The pane is alive, but the watcher's reads see "no such pane" for 9s
+    // while the worker keeps writing every 500ms (the writes themselves work).
+    // The first write pulls the idle-scheduled probe in, so the misses come at
+    // ~+1s and ~+4s; the debounce's third look (~+13s) must see the pane again.
+    const misreadUntil = Date.now() + 9_000;
+    world.override = (args, via) => (
+      via === 'async' && isLivenessRead(args) && Date.now() < misreadUntil ? '::::111\n' : undefined
+    );
+    for (let t = 0; t < 30_000; t += 500) {
+      expect(be.sendText('x')).toBe(true);
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    expect(exits).toEqual([]);
+    // The watcher itself never read liveness synchronously (the reads the
+    // writes make before themselves end in #{pane_in_mode}).
+    expect(world.syncCalls.filter(a => isLivenessRead(a) && !String(a.at(-1)).endsWith('#{pane_in_mode}'))).toEqual([]);
+  });
+
+  // The 60s continuous-unreachable escalation carries the same
   // server-replacement classification as the missing streak: when the outage
   // ends with a DIFFERENT server answering the socket, the exit is not charged
-  // to the CLI. Pins the escalation call site of noteServerReplacedAtPaneLoss.
-  it('classifies the 60s server-unreachable escalation as a server replacement when a different server answers', () => {
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    vi.useFakeTimers();
-    try {
-      // Spawn: anchor the pane on server pid 111.
-      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
-        const a = Array.isArray(args) ? (args as string[]) : [];
-        if (a[0] === '-V') return 'tmux 3.3a';
-        if (a.includes('display-message') && a.some(f => String(f) === '#{pane_id} #{pid}')) {
-          return '%1 111' as any;
-        }
-        return '' as any;
-      }) as typeof execFileSync);
-      const be = new TmuxPipeBackend('bmx-outage', { ownsSession: true });
-      const exits: Array<[number | null, string | null]> = [];
-      be.onExit((code, signal) => exits.push([code, signal]));
-      be.spawn('', [], spawnOpts());
-      expect((be as unknown as { lastLiveServerPid?: number }).lastLiveServerPid).toBe(111);
+  // to the CLI.
+  it('classifies the 60s server-unreachable escalation as a server replacement when a different server answers', async () => {
+    const world = createTmuxWorld({ serverPid: '111' });
+    const { be, exits } = watch(world, 'bmx-outage');
+    expect((be as unknown as { lastLiveServerPid?: number }).lastLiveServerPid).toBe(111);
+    world.override = args => {
+      if (args[0] === 'list-sessions' && args.includes('#{pid}')) return '222\n';
+      if (args.includes('kill-session')) return '';
+      return CONNECTION_REFUSED;
+    };
+    mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+    await vi.advanceTimersByTimeAsync(tmuxLifecycleInitialDelayMs('bmx-outage') + 60_000 + 2 * LIFECYCLE_IDLE_PROBE_MAX_MS);
+    expect(exits).toHaveLength(1);
+    expect(be.exitedBecauseServerReplaced()).toBe(true);
+    expect(syncProbes(world)).toBe(0);
+  });
+});
 
-      // After spawn every pane probe fails at CONNECTION level (server never
-      // answers); once the escalation fires, a DIFFERENT server (pid 222) is
-      // already answering on the socket.
-      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
-        const a = Array.isArray(args) ? (args as string[]) : [];
-        if (a[0] === '-V') return 'tmux 3.3a';
-        if (a[0] === 'list-sessions' && a.includes('#{pid}')) return '222\n' as any;
-        if (a.includes('kill-session')) return '' as any;
-        if (a.includes('display-message')) {
-          throw Object.assign(new Error('error connecting to /tmp/tmux-0/botmux'), {
-            status: 1, signal: null,
-            stderr: Buffer.from('error connecting to /tmp/tmux-0/botmux (No such file or directory)'),
-          });
-        }
-        return '' as any;
-      }) as typeof execFileSync);
-      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+describe('lifecycleProbeDelayMs', () => {
+  const idleProbeMs = tmuxLifecycleIdleProbeMs('bmx-x');
+  const delay = (recentlyActive: boolean, setbackStreak: number, lastState: 'exists' | 'missing' | 'unknown') =>
+    lifecycleProbeDelayMs({ recentlyActive, idleProbeMs, setbackStreak, lastState });
 
-      vi.advanceTimersByTime(90_000);
-      expect(exits).toHaveLength(1);
-      expect(be.exitedBecauseServerReplaced()).toBe(true);
-    } finally {
-      vi.useRealTimers();
-      errSpy.mockRestore();
+  it('healthy: fast while active, the (slower, capped) idle cadence otherwise', () => {
+    expect(delay(true, 0, 'exists')).toBe(LIFECYCLE_ACTIVE_PROBE_MS);
+    expect(delay(false, 0, 'exists')).toBe(idleProbeMs);
+    expect(idleProbeMs).toBeGreaterThan(LIFECYCLE_ACTIVE_PROBE_MS);
+    expect(idleProbeMs).toBeLessThanOrEqual(LIFECYCLE_IDLE_PROBE_MAX_MS);
+  });
+
+  it('an authoritative miss confirms on the same backoff whether the pane was active or idle', () => {
+    for (const streak of [1, 2, 3]) {
+      expect(delay(false, streak, 'missing')).toBe(delay(true, streak, 'missing'));
+      expect(delay(true, streak, 'missing')).toBeLessThan(idleProbeMs);
     }
+    expect(delay(true, 2, 'missing')).toBeGreaterThan(delay(true, 1, 'missing'));
+  });
+
+  it('no answer never probes faster than the healthy cadence (outage load shedding)', () => {
+    for (const streak of [1, 2, 5]) {
+      expect(delay(false, streak, 'unknown')).toBeGreaterThanOrEqual(delay(false, 0, 'exists'));
+      expect(delay(true, streak, 'unknown')).toBeGreaterThanOrEqual(delay(true, 0, 'exists'));
+    }
+  });
+
+  it('spreads idle cadences across targets (no lock-step after a mass restore)', () => {
+    const cadences = new Set(Array.from({ length: 50 }, (_, i) => tmuxLifecycleIdleProbeMs(`bmx-${i}`)));
+    expect(cadences.size).toBeGreaterThan(25);
+    for (const c of cadences) expect(c).toBeLessThanOrEqual(LIFECYCLE_IDLE_PROBE_MAX_MS);
   });
 });
 
@@ -2073,39 +2384,138 @@ describe('TmuxPipeBackend send failure handling', () => {
     expect(exits).toEqual([[1, null]]);
   });
 
-  it('drops the write (no throw, no exit) when send-keys fails but the pane is alive', () => {
-    const be = new TmuxPipeBackend('bmx-live', { ownsSession: true });
+  /** A world-model backend for the write-path cases (helpers/tmux-world.ts). */
+  function writeWorld(target: string, world: TmuxWorld) {
+    installTmuxWorld(world, { execFileSync: mockedExecFileSync, execFile: vi.mocked(execFile) });
+    const be = new TmuxPipeBackend(target, { ownsSession: true });
     const exits: Array<[number | null, string | null]> = [];
     be.onExit((c, s) => exits.push([c, s]));
     be.spawn('', [], spawnOpts());
+    world.syncCalls.length = 0;
+    world.asyncCalls.length = 0;
+    return { be, exits };
+  }
+  const isWriteCheck = (args: readonly string[]) => isLivenessRead(args) && String(args.at(-1)).endsWith('#{pane_in_mode}');
+  const writeArgv = (world: TmuxWorld) => world.syncCalls.filter(a => ['send-keys', 'load-buffer', 'paste-buffer'].includes(a[0]));
 
-    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-      if ((args as string[]).includes('send-keys')) throw new Error('transient tmux error');
-      if ((args as string[]).includes('#{pane_id}')) return '%1\n' as any;
-      return '' as any;
-    });
-    // Liveness probe succeeds ⇒ pane ALIVE ⇒ transient error, just dropped.
+  it('drops the write (no throw, no exit) when send-keys fails but the pane is alive — one tmux command to tell', () => {
+    const world = createTmuxWorld();
+    world.override = args => (args[0] === 'send-keys' ? { kind: 'exit', status: 1, stderr: 'transient tmux error' } : undefined);
+    const { be, exits } = writeWorld('bmx-live', world);
 
     expect(() => be.sendText('hi')).not.toThrow();
     expect(exits).toEqual([]);
+    // The read before the write + ONE follow-up liveness probe (it used to
+    // read #{pane_id} and then #{pane_dead} separately).
+    expect(world.syncCalls.filter(a => a.includes('display-message'))).toHaveLength(2);
   });
 
   it('drops the write without teardown when the follow-up pane probe is unknown', () => {
-    const be = new TmuxPipeBackend('bmx-busy', { ownsSession: true });
-    const exits: Array<[number | null, string | null]> = [];
-    be.onExit((c, s) => exits.push([c, s]));
-    be.spawn('', [], spawnOpts());
-
-    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
-      if ((args as string[]).includes('send-keys')) throw new Error('tmux write timed out');
-      if ((args as string[]).includes('#{pane_id}')) {
-        throw Object.assign(new Error('spawn tmux EMFILE'), { code: 'EMFILE', status: null, signal: null });
-      }
-      return '' as any;
-    });
+    const world = createTmuxWorld();
+    world.override = args => {
+      if (args[0] === 'send-keys') return { kind: 'exit', status: 1, stderr: 'tmux write timed out' };
+      if (isLivenessRead(args) && !isWriteCheck(args)) return EMFILE;
+      return undefined;
+    };
+    const { be, exits } = writeWorld('bmx-busy', world);
 
     expect(() => be.sendText('hi')).not.toThrow();
     expect(exits).toEqual([]);
+    expect(world.syncCalls.filter(a => isLivenessRead(a) && !isWriteCheck(a))).toHaveLength(1);
+  });
+
+  // send-keys into a corpse exits 0 and the keys vanish; paste-buffer into one
+  // crashes the WHOLE server on tmux <= 3.3a. The read every write already
+  // makes now sees the corpse, so nothing is written and the exit is reported
+  // with the real code — without waiting for the (possibly idle) watcher.
+  it.each([
+    ['sendText', (be: TmuxPipeBackend) => be.sendText('hello')],
+    ['sendSpecialKeys', (be: TmuxPipeBackend) => be.sendSpecialKeys('Enter')],
+    ['sendLines', (be: TmuxPipeBackend) => be.sendLines(['a', 'b'], 'S-Enter')],
+    ['pasteText', (be: TmuxPipeBackend) => be.pasteText('hello')],
+    ['submitBracketedPaste', (be: TmuxPipeBackend) => be.submitBracketedPaste('hello')],
+  ])('%s refuses a corpse before anything reaches the pane and reports its real exit code', (_label, write) => {
+    const world = createTmuxWorld();
+    const { be, exits } = writeWorld('bmx-corpse', world);
+    world.pane = { dead: '77' };
+
+    expect(write(be)).toBe(false);
+    expect(writeArgv(world)).toEqual([]);
+    expect(exits).toEqual([[77, null]]);
+    // Same single read as before (it already served copy-mode): no added command.
+    expect(world.syncCalls.filter(isWriteCheck)).toHaveLength(1);
+  });
+
+  // paste-buffer into a corpse crashes the whole server on tmux <= 3.3a. The
+  // read before the write can fail (a slow server) and the pane can die right
+  // after it, so the paste itself only runs behind `#{pane_dead}` in the same
+  // tmux queue.
+  it.each([
+    ['pasteText', 'the read before the write times out', 'timeout'],
+    ['pasteText', 'the pane dies between that read and the paste', 'dies-after-read'],
+    ['submitBracketedPaste', 'the read before the write times out', 'timeout'],
+    ['submitBracketedPaste', 'the pane dies between that read and the paste', 'dies-after-read'],
+  ])('%s never pastes into a corpse when %s', (method, _label, mode) => {
+    const world = createTmuxWorld();
+    const { be, exits } = writeWorld('bmx-paste-race', world);
+    if (mode === 'timeout') {
+      world.pane = { dead: '77' };
+      world.override = args => (isWriteCheck(args) ? DEADLINE : undefined);
+    } else {
+      world.override = args => {
+        if (!isWriteCheck(args)) return undefined;
+        world.override = undefined;
+        world.pane = { dead: '77' };
+        return '%1:0::4242:111:0\n'; // read while still alive
+      };
+    }
+    const paste = method === 'pasteText' ? be.pasteText('hello') : be.submitBracketedPaste('hello');
+    expect(paste).toBe(false);
+    expect(world.serverCrashed).toBe(false);
+    expect(world.pastes).toEqual([]);
+    expect(exits).toEqual([[77, null]]);
+    // The loaded buffer is not left behind.
+    expect(world.syncCalls.some(a => a[0] === 'delete-buffer')).toBe(true);
+  });
+
+  it('a guarded paste into a live pane still lands between the bracketed-paste markers', () => {
+    const world = createTmuxWorld();
+    const { be, exits } = writeWorld('bmx-paste-live', world);
+    expect(be.submitBracketedPaste('hello')).toBe(true);
+    expect(world.pastes).toHaveLength(1);
+    expect(world.pastes[0]).toEqual(expect.arrayContaining(['paste-buffer', '-t', 'bmx-paste-live', '-r']));
+    const batch = world.syncCalls.find(a => a.some(arg => arg.startsWith('"paste-buffer"')))!;
+    expect(batch.indexOf('\x1b[200~')).toBeLessThan(batch.indexOf('if-shell'));
+    expect(batch.indexOf('if-shell')).toBeLessThan(batch.indexOf('\x1b[201~'));
+    expect(exits).toEqual([]);
+  });
+
+  it('a write into a vanished pane still fails at once while the watcher sits on the idle cadence', async () => {
+    vi.useFakeTimers();
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const world = createTmuxWorld();
+      const { be, exits } = writeWorld('bmx-idle-write', world);
+      await vi.advanceTimersByTimeAsync(
+        tmuxLifecycleInitialDelayMs('bmx-idle-write') + LIFECYCLE_ACTIVITY_WINDOW_MS + LIFECYCLE_IDLE_PROBE_MAX_MS,
+      );
+      world.asyncCalls.length = 0;
+      const span = 3 * LIFECYCLE_IDLE_PROBE_MAX_MS;
+      await vi.advanceTimersByTimeAsync(span);
+      // Idle: the watcher asks tmux rarely now…
+      expect(world.asyncCalls.filter(isLivenessRead).length)
+        .toBeLessThanOrEqual(Math.ceil(span / tmuxLifecycleIdleProbeMs('bmx-idle-write')) + 1);
+      expect(world.syncCalls.filter(isLivenessRead)).toEqual([]);
+
+      // …and a write does not wait for it: send-keys fails "can't find pane",
+      // guardedSend's own probe answers missing, the exit fires synchronously.
+      world.pane = 'gone';
+      expect(be.sendText('hi')).toBe(false);
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      errSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it('dumps the piped output tail (CLI final stdout/stderr) when the pane is gone', () => {
@@ -2170,10 +2580,10 @@ describe('TmuxPipeBackend send failure handling', () => {
           status: 1, signal: null, stderr: Buffer.from("can't find pane: bmx-reap"),
         });
       }
-      // The death probe is the display-message whose format carries the
-      // STATUS field; the liveness probe's bare '#{pane_dead}' and pane_id
-      // probes must be answered separately (mock split by args).
-      if (a.includes('display-message') && a.some(f => String(f).includes('#{pane_dead_status}'))) {
+      // The terminal death read is the display-message whose format STARTS
+      // with '#{pane_dead}'; the liveness probe (and the pre-write read)
+      // start with '#{pane_id}' and are answered separately below.
+      if (a.includes('display-message') && String(a.at(-1)).startsWith('#{pane_dead}')) {
         deathReads.push(Date.now());
         if (opts.deathAnswer === 'unreadable') throw new Error('tmux client timeout');
         return Buffer.from(opts.deathAnswer as string) as any;
@@ -2258,7 +2668,7 @@ describe('TmuxPipeBackend send failure handling', () => {
         }
         // A DIFFERENT server (pid 222) now answers on the socket.
         if (a[0] === 'list-sessions' && a.includes('#{pid}')) return '222\n' as any;
-        if (a.includes('display-message') && a.some(f => String(f).includes('#{pane_dead_status}'))) {
+        if (a.includes('display-message') && String(a.at(-1)).startsWith('#{pane_dead}')) {
           return '1:77' as any;
         }
         // Bare '#{pane_id}' answers empty -> authoritative missing; everything
@@ -2546,6 +2956,7 @@ describe('TmuxPipeBackend pipe-pane death evidence', () => {
 
       // FRESH create whose CLI died instantly: startup-failure message, no
       // process-exit event (it never came up).
+      emulateQueuedSubscription();
       const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
       const exits: unknown[] = [];
       be.onExit((code, signal) => exits.push([code, signal]));
@@ -2827,6 +3238,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
       }
       return Buffer.from('') as any;
     }) as typeof execSync);
+    emulateQueuedSubscription();
   }
 
   // The shell hands if-shell its arguments, then tmux parses the subscription
@@ -3016,6 +3428,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
       }
       return Buffer.from('') as any;
     }) as typeof execSync);
+    emulateQueuedSubscription();
   }
 
   it('a vanished target (else-branch "can\'t find pane") is a one-shot startup failure with no exit', () => {
@@ -3059,6 +3472,7 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
 
   it('tmux >= 3.2 subscribes with a bare pipe-pane and no if-shell guard', () => {
     // beforeEach default emulation is modern tmux; do not override it.
+    emulateQueuedSubscription();
     const be = new TmuxPipeBackend(target, { createSession: true, ownsSession: true });
     try {
       expect(() => be.spawn('', [], spawnOpts())).not.toThrow();

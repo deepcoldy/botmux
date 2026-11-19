@@ -208,6 +208,34 @@ describe('fetchObserveSnapshot', () => {
     expect(snapshot.daemons[0]!.sessions).toHaveLength(1);
     expect(snapshot.daemons[1]!.sessions).toEqual([]);
   });
+
+  describe('activeWithinMs', () => {
+    const HOUR = 60 * 60_000;
+    const rows = [
+      baseRow({ sessionId: 'alive-old', status: 'working', lastMessageAt: OBSERVED_AT - 50 * HOUR }),
+      baseRow({ sessionId: 'dormant-recent', status: 'dormant', workerPid: undefined, lastMessageAt: OBSERVED_AT - 2 * HOUR }),
+      baseRow({ sessionId: 'dormant-old', status: 'dormant', workerPid: undefined, lastMessageAt: OBSERVED_AT - 30 * HOUR }),
+      baseRow({ sessionId: 'queued-recent', status: 'idle', queued: true, workerPid: undefined, lastMessageAt: OBSERVED_AT - HOUR }),
+      baseRow({ sessionId: 'closed-recent', status: 'closed', workerPid: undefined, lastMessageAt: OBSERVED_AT - 60_000 }),
+    ];
+    const run = (query: { activeWithinMs?: number }) => fetchObserveSnapshot({
+      ...query,
+      now: () => OBSERVED_AT,
+      secret: 'test',
+      discover: () => [makeDaemon()],
+      fetch: async () => jsonResponse({ sessions: rows }),
+    });
+    const ids = (snapshot: Awaited<ReturnType<typeof run>>) => snapshot.daemons[0]!.sessions.map(s => s.identity.sessionId);
+
+    it('keeps every session when not set', async () => {
+      expect(ids(await run({}))).toEqual(rows.map(r => r.sessionId));
+    });
+
+    it('keeps sessions that are alive or had activity inside the window, never closed ones', async () => {
+      expect(ids(await run({ activeWithinMs: 24 * HOUR }))).toEqual(['alive-old', 'dormant-recent', 'queued-recent']);
+      expect(ids(await run({ activeWithinMs: 90 * 60_000 }))).toEqual(['alive-old', 'queued-recent']);
+    });
+  });
 });
 
 describe('fetchObserveSession', () => {
@@ -228,6 +256,15 @@ describe('fetchObserveSession', () => {
     expect(session.turn).toBe('idle');
     expect(session.phase).toBe('unknown');
     expect(session.queued).toBe(false);
+    expect(session).not.toHaveProperty('task');
+  });
+
+  it('adds the task block for a single session only when asked', async () => {
+    const fetch: DaemonIpcFetch = async () => jsonResponse({ session: baseRow({ sessionId: 's_task_1', status: 'working', busySinceAt: OBSERVED_AT - 5_000 }) });
+    const deps = { now: () => OBSERVED_AT, secret: 'test', discover: () => [makeDaemon()], fetch };
+    expect(await fetchObserveSession('s_task_1', deps)).not.toHaveProperty('task');
+    const session = await fetchObserveSession('s_task_1', { ...deps, includeTask: true });
+    expect(session.task).toEqual({ kind: 'working', busySinceAt: OBSERVED_AT - 5_000 });
   });
 
   it('surfaces not_found without cache fallback', async () => {

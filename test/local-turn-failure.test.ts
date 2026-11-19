@@ -114,6 +114,30 @@ describe('worker emitReadyTurns: failed turns', () => {
     expect(h.sent).toEqual([]);
   });
 
+  it('hands the provider\'s retry time and its last answered request to the terminal', () => {
+    const h = harness();
+    h.queue.noteDurationMarkerObserved();
+    h.queue.mark('om_first', makeFingerprint('first'), 100, 'first', 1);
+    h.queue.ingest([user('u1', 'first'),
+      { ...block('a1', [{ type: 'text', text: 'done' }], 'end_turn'), timestamp: '2026-11-13T11:07:58.000Z' } as TranscriptEvent,
+      duration('d1')]);
+    // Already delivered; only the failure that follows is under test.
+    expect(h.queue.drainEmittable({ explicitTerminalOnly: true }).map(turn => turn.turnId)).toEqual(['om_first']);
+    h.queue.mark('om_review', makeFingerprint('review it'), 100, 'review it', 1);
+    h.queue.ingest([user('u2', 'review it'), {
+      type: 'assistant', uuid: 'e2', timestamp: '2026-11-13T11:08:18.238Z', isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 503,
+      message: { role: 'assistant', stop_reason: 'stop_sequence', content: [{ type: 'text',
+        text: 'API Error: 503 no eligible upstream account is currently available; the earliest account is expected to be available at 2026-11-13T11:10:16Z.' }] },
+    } as TranscriptEvent, duration('d2')]);
+    h.emitReadyTurns({ explicitTerminalOnly: true });
+    expect(h.terminals).toHaveLength(1);
+    expect(h.terminals[0].slice(0, 3)).toEqual(['om_review', 'failed', 'provider_server_error']);
+    expect(h.terminals[0][9]).toEqual({
+      retryAtMs: Date.parse('2026-11-13T11:10:16Z'),
+      lastSuccessAtMs: Date.parse('2026-11-13T11:07:58.000Z'),
+    });
+  });
+
   it('fails the Lark turn itself when its final message was split across reads', () => {
     const h = harness();
     h.queue.noteDurationMarkerObserved();
@@ -126,8 +150,10 @@ describe('worker emitReadyTurns: failed turns', () => {
     h.emitReadyTurns({ explicitTerminalOnly: true });
 
     // The API-error record's text rides along for the failure panel.
+    // No provider timing in this fixture: the trailing continuation-failure and
+    // provider-timing arguments stay empty.
     expect(h.terminals).toEqual([['om_review', 'failed', 'provider_server_error', 1, undefined, true,
-      undefined, 'API Error: Connection lost mid-response.']]);
+      undefined, 'API Error: Connection lost mid-response.', undefined, undefined]]);
     expect(h.sent).toEqual([]);
   });
 });
