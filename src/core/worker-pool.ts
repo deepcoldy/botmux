@@ -79,7 +79,7 @@ import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-confi
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } from './retired-runtime-exit.js';
 import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
-import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
+import { checkWorkerAdmission, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
 import { reclaimIdleWorkersForAdmissionAfterTurnDrain, unsettledReplyHoldUntil } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
@@ -1319,6 +1319,8 @@ export interface WorkerSessionReplyOptions {
 export interface WorkerPoolCallbacks {
   /** Exact store-owning app, including boot with no live sessions. */
   larkAppId?: string;
+  /** Host memory diagnostics go to the bot owner, independently of turn replies. */
+  onMemoryAdmissionBlocked?: (ds: DaemonSession, decision: WorkerAdmissionDecision) => void;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
   /** Host-owned return path for zero-injection sub-bots. */
   onZeroPromptFinal?: (ds: DaemonSession, input: {
@@ -17546,6 +17548,8 @@ export interface WorkerAdmissionBlockedNotice {
   turnId?: string;
 }
 export type ForkWorkerOptions = {
+  /** Background recovery must never post host diagnostics into old conversations. */
+  memoryNoticeAudience?: 'owner-only';
   deploymentContinuation?: import('../services/deployment-continuation.js').DeploymentContinuation;
   onAdmission?: (admission: WorkerForkAdmission) => void;
   /** Replace the direct provider reply when the caller owns a durable output lane. */
@@ -18044,7 +18048,7 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -18422,7 +18426,7 @@ function forkWorkerPrepared(
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
       // Deliberately do not replay opts.deploymentContinuation: a deferred
       // device-isolation spawn cannot carry an earlier claim into a new owner.
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -18594,15 +18598,16 @@ function forkWorkerPrepared(
     const notifyBlocked = (decision: WorkerAdmissionDecision, reclaimed: number): void => {
       const reason = decision.reasons.join('; ');
       logger.warn(`[${tag(ds)}] Worker admission blocked by memory pressure: ${reason}`);
-      const reclamationNote = reclaimed > 0
-        ? ` Automatically suspended ${reclaimed} idle session${reclaimed === 1 ? '' : 's'} `
-          + `to free memory, but available memory is still below the reserve.`
-        : '';
-      const retry = `Memory pressure is critical: ${reason}. `
-        + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
-        + `(reserve ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)}, `
-        + `PSI limit ${decision.policy.maxMemoryFullAvg10.toFixed(2)}%).${reclamationNote}`;
+      if (reclaimed > 0) logger.info(`[${tag(ds)}] Memory admission reclaimed ${reclaimed} idle session(s)`);
+      try { cb.onMemoryAdmissionBlocked?.(ds, decision); }
+      catch (error) { logger.warn(`[${tag(ds)}] Failed to report memory admission to owner: ${String(error)}`); }
+      // A blank re-attach has no current request. Never borrow its previous
+      // reply target, even if a persisted queued turn is being recovered.
+      if (opts.memoryNoticeAudience === 'owner-only') return;
+      // A missing turn id does not prove a background fork: voice-card actions
+      // and terminal/dashboard wakes rely on the session's current reply target.
       const blockedTurnId = fallbackTurnId(ds, initTurnId);
+      const retry = tr('worker.memory_admission_unavailable', undefined, botLocale(botCfg));
       if (opts.onAdmissionBlocked) {
         opts.onAdmissionBlocked({
           content: retry,
