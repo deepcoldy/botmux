@@ -2977,15 +2977,18 @@ export type WorkerToDaemonBase =
        *    nothing-to-send sentinel and no `botmux send`). It is the ONLY signal
        *    that lets a durable/async caller settle the turn as
        *    completed-with-empty-output.
-       *  - 'boundary_unobserved': the claude transcript bridge popped this turn
-       *    at a screen-idle terminal boundary WITHOUT ever observing an explicit
-       *    transcript terminal (no assistant stop_reason record, no API-error
-       *    record) and WITHOUT silence evidence. The dominant cause is the CLI
-       *    dying mid-turn (killed/crashed): the frozen pane then looks idle to
-       *    the screen detector, so this boundary is a heuristic, not proof the
-       *    model finished. A durable/async caller must settle this fail-closed
-       *    — no output was ever observed; the claude bridge guarantees
-       *    final_output precedes this terminal, so no answer can still arrive.
+       *  - 'boundary_unobserved': the claude transcript bridge popped a real
+       *    (non-local) turn at a screen-idle boundary WITHOUT observing any
+       *    transcript terminal (`!terminalObserved`: neither an assistant
+       *    stop_reason/API-error record nor a next-turn-start compatibility
+       *    boundary), WITHOUT emitting `final_output` / observing an explicit
+       *    final `botmux send`, and WITHOUT silence evidence. The dominant
+       *    cause is the CLI dying mid-turn (killed/crashed): the frozen pane
+       *    then looks idle to the screen detector, so this boundary is a
+       *    heuristic, not proof the model finished. An HTTP async/wait caller
+       *    must settle this fail-closed — no output was ever observed; the
+       *    claude bridge guarantees `final_output` precedes this terminal, so
+       *    no answer can still arrive.
        *  Absent on every other `completed` terminal — including the
        *  RPC-hydration timeout path, which emits `completed` with no
        *  final_output after fs-lag and must NOT be read as silence or as a dead

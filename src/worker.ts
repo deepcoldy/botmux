@@ -190,7 +190,7 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -12790,6 +12790,10 @@ function emitReadyTurns(opts: {
   // rationale. Tracked by object identity across this function's two loops so
   // the terminal can carry positive silence evidence for a durable/async caller.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
+  // Turns for which loop 1 observed delivered output (emitted final_output,
+  // explicit final `botmux send`, or already-sent fallback suppression). Such
+  // turns must never carry `outputDisposition: 'boundary_unobserved'`.
+  const observedOutputTurns = new Set<(typeof ready)[number]>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -12840,11 +12844,13 @@ function emitReadyTurns(opts: {
       isScheduled: turn.isScheduled,
       forwardLocalFinal: zeroPromptTerminalSync(),
     };
+    const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
+      turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+    );
+    if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) observedOutputTurns.add(turn);
     notifyExplicitRepliesObserved(
       turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
-      ),
+      explicitReplyMarkers,
     );
 
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
@@ -12896,6 +12902,8 @@ function emitReadyTurns(opts: {
       // sentinel (no prose, no send), never "already sent" / local-typed.
       if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
         nothingToSendTurns.add(turn);
+      } else {
+        observedOutputTurns.add(turn);
       }
       continue;
     }
@@ -12977,6 +12985,7 @@ function emitReadyTurns(opts: {
       }
       continue;
     }
+    observedOutputTurns.add(turn);
     send({
       type: 'final_output',
       content: deliveredText,
@@ -13088,34 +13097,35 @@ function emitReadyTurns(opts: {
       );
       continue;
     }
-    // Output disposition, positive evidence only:
+    // Output disposition, positive no-output evidence only:
     //  - genuine silence (bare nothing-to-send sentinel, no `botmux send`) →
     //    'nothing_to_send'; a durable/async caller may settle completed-empty.
-    //  - NO transcript terminal evidence at all (`terminalObserved` false:
+    //  - real (non-local) turn popped at a screen-idle boundary with NO
+    //    transcript terminal evidence at all (`terminalObserved` false:
     //    neither an assistant stop_reason/API-error record nor a next-turn-start
-    //    compatibility boundary) and not silence → 'boundary_unobserved'. The
-    //    turn was popped at a screen-idle boundary that proves nothing: the
-    //    dominant cause is the CLI dying mid-turn (killed/crashed — a frozen
+    //    compatibility boundary) and NO observed output → 'boundary_unobserved'.
+    //    The dominant cause is the CLI dying mid-turn (killed/crashed — a frozen
     //    pane still matches the idle detector), so claiming plain `completed`
-    //    here would let the daemon leave a pending async trigger `running`
-    //    forever (residual headless state) while the session auto-restarts into
-    //    an idle REPL. The label lets the daemon settle fail-closed instead.
-    //    Gate on terminalObserved, NOT on an undefined terminalOutcome: a
-    //    marker-less older JSONL variant closes the previous turn via the NEXT
-    //    user record (bridge queue sets terminalObserved=true without a
-    //    terminalOutcome) — that is positive proof the turn ended, so it must
-    //    keep the label absent. A turn carrying a real terminal outcome is
-    //    terminalObserved by construction and is unaffected.
+    //    here would let the daemon leave pending HTTP async/wait callers
+    //    hanging `running` forever while the session auto-restarts into an idle
+    //    REPL. The label lets the daemon settle fail-closed instead.
+    //    Gate on terminalObserved (NOT on an undefined terminalOutcome) so a
+    //    marker-less older JSONL variant closed by the next user record keeps
+    //    the label absent; turns that emitted final_output / observed an
+    //    explicit final send, or synthesised local turns, also keep it absent.
+    const outputDisposition = nothingToSendTurns.has(turn)
+      ? 'nothing_to_send'
+      : !turn.isLocal
+        && !turn.terminalObserved
+        && !observedOutputTurns.has(turn)
+        ? 'boundary_unobserved'
+        : undefined;
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
       undefined,
       turn.dispatchAttempt,
-      nothingToSendTurns.has(turn)
-        ? 'nothing_to_send'
-        : !turn.terminalObserved
-          ? 'boundary_unobserved'
-          : undefined,
+      outputDisposition,
       undefined,
     );
   }

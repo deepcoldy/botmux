@@ -633,6 +633,76 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(closeSession).not.toHaveBeenCalled();
     expect(ds.idempotentAsyncTurns!.has('turn-ok')).toBe(false);
   });
+
+  it('does not overwrite an earlier stronger failure or interrupt on an unobserved boundary', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([
+      ['turn-already-failed', {
+        status: 'failed', errorCode: 'trigger_failed', terminalErrorCode: 'provider_server_error',
+      } as any],
+      ['turn-interrupted', { status: 'interrupted', interruptedAt: Date.now() } as any],
+    ]);
+    ds.idempotentAsyncTurns = new Map([
+      ['turn-already-failed', { ownerLarkAppId: 'app_test', key: 'k1', kind: 'turn', workerGeneration: 1 } as any],
+    ]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-already-failed', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+    (ds.worker as any).emit('message', terminalMsg('turn-interrupted', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ds.asyncTriggerResults!.get('turn-already-failed')).toMatchObject({
+      status: 'failed',
+      terminalErrorCode: 'provider_server_error',
+    });
+    expect(ds.asyncTriggerResults!.get('turn-interrupted')).toMatchObject({
+      status: 'interrupted',
+    });
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
+    // Do not drop any convergence stamp retained by the earlier failure.
+    expect(ds.idempotentAsyncTurns!.has('turn-already-failed')).toBe(true);
+  });
+
+  it('rejects a Wait Mode HTTP turn fail-closed on an unobserved boundary', async () => {
+    const ds = makeDs();
+    ds.chatId = 'http_wait_fixture';
+    const resolve = vi.fn();
+    const reject = vi.fn();
+    ds.pendingWaitPromises = new Map([['turn-wait-unobserved', { resolve, reject }]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-wait-unobserved', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await vi.waitFor(() => expect(reject).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Worker turn failed: turn_ended_unobserved' }),
+    ));
+    expect(resolve).not.toHaveBeenCalled();
+    expect(ds.pendingWaitPromises.has('turn-wait-unobserved')).toBe(false);
+    expect(ds.settledHttpTerminalTurns?.has('turn-wait-unobserved')).toBe(true);
+  });
+
+  it('ignores synthesised local and scheduled turns on restarted virtual http_async sessions', async () => {
+    const ds = makeDs();
+    ds.chatId = 'headless_hl_fixture';
+    ds.asyncTriggerResults = new Map();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('local-synthetic-1', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+    (ds.worker as any).emit('message', terminalMsg('scheduled-synthetic-1', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('a failed terminal\'s raw error and screen tail (daemon turn_terminal handler)', () => {

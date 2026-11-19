@@ -2271,9 +2271,9 @@ function publishExecutionActivityPatch(ds: DaemonSession): void {
 const TURN_EXPLICIT_MENTION_MAX = 64;
 /** terminalErrorCode used when the claude transcript bridge ends a turn at a
  *  screen-idle boundary WITHOUT ever observing an explicit transcript terminal
- *  (`turn_terminal outputDisposition:'boundary_unobserved'` from the worker) —
- *  the killed-CLI-mid-turn shape. Surfaces to async pollers as
- *  state=failed / errorCode=trigger_failed / terminalErrorCode=below. */
+ *  or output (`turn_terminal outputDisposition:'boundary_unobserved'` from the
+ *  worker) — the killed-CLI-mid-turn shape. Surfaces to HTTP async/wait callers
+ *  as state=failed / errorCode=trigger_failed / terminalErrorCode=below. */
 const TURN_ENDED_UNOBSERVED = 'turn_ended_unobserved';
 /** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
  *  larger than any plausible replay window within one session's lifetime. */
@@ -24965,89 +24965,48 @@ function setupWorkerHandlers(
             );
           }
         }
-        if (!outcomeExcluded && !nonLarkFailureHandled && !ordinaryHttpTerminal) {
-          let delivered = false;
-          void recordTurnOutcome(ds, msg, {
-            recoveryHandled,
-            onClassified: outcome => { delivered = outcome === 'delivered'; },
-            isFinalDelivered: () => isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId)),
-          }).then(async () => {
-            if (!usesOutcomeBasedTurnReactions(ds)) return;
-            await finishTurnReactions(ds, {
-              turnId: msg.turnId,
-              delivered,
-              owns: () => ds.worker === worker && ds.workerGeneration === workerGeneration
-                && ds.session.status === 'active',
-            });
-          }).catch((err: unknown) => {
-            logger.warn(`[${t}] turn outcome: ${err instanceof Error ? err.message : String(err)}`);
-          });
-        }
-        // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
-        // the worker's bridge gate suppressed as GENUINE SILENCE (the model
-        // terminated with a bare nothing-to-send sentinel, no `botmux send`)
-        // emits turn_terminal but NO final_output, so the async-trigger result
-        // would stay `pending` and the poller would hang `running` until timeout.
-        // Settle it here with EMPTY content — nothing-to-send is a legitimate
-        // completed-with-empty-output for an HTTP task.
-        //
-        // POSITIVE EVIDENCE ONLY: we settle solely on the worker's explicit
-        // `outputDisposition === 'nothing_to_send'` flag, never on a bare
-        // `completed`. A bare completed terminal is NOT proof of silence — the
-        // RPC-hydration timeout path (worker.ts hydrateCompletedRpcTurn) emits
-        // `completed` with no final_output after fs-lag while the real answer is
-        // still materializing; settling that empty would mask a lost reply.
-        // Guarded further so it never double-settles a final_output-completed
-        // turn (pending-only), never touches a managed VC-meeting receiver, and
-        // only affects this bot's own pending async result. Feishu turns have no
-        // asyncTriggerResults entry, so their silent-turn behavior is unchanged.
-        if (msg.status === 'completed'
-          && msg.outputDisposition === 'nothing_to_send'
-          && !ds.session.vcMeetingReceiver) {
-          const pendingAsync = ds.asyncTriggerResults?.get(msg.turnId);
-          if (pendingAsync && pendingAsync.status === 'pending') {
-            const completedAt = Date.now();
-            pendingAsync.status = 'completed';
-            pendingAsync.content = '';
-            pendingAsync.completedAt = completedAt;
-            try {
-              asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId);
-            } catch (err: any) {
-              logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
-            }
-            // Cleared like the final_output path so worker-exit convergence does
-            // not retro-fail this now-completed turn. Per-triggerId delete so a
-            // concurrent sibling keyed turn's convergence entry is untouched.
-            ds.idempotentAsyncTurns?.delete(msg.turnId);
-            logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
-          }
-        }
-        // Async-HTTP settle-on-UNOBSERVED-boundary (headless residual-running):
+        // HTTP settle-on-UNOBSERVED-boundary (headless residual-running):
         // the claude transcript bridge pops a started turn at a screen-idle
-        // boundary when the CLI never produced an explicit transcript terminal.
+        // boundary when the CLI never produced a transcript terminal or output.
         // The dominant cause is the CLI dying mid-turn (killed/crashed) — the
         // frozen pane still matches the idle detector, so the pop fires and
         // `emitReadyTurns` emits `completed` with NO final_output. Neither the
         // failure gate above (completed ≠ failed/ambiguous) nor the
-        // nothing_to_send arm (no disposition) settles it, so the durable
-        // async trigger stays `pending` while the session record stays `open`
-        // — `headless wait`/trigger-result then resolve `running` FOREVER (the
-        // session even auto-restarts into an idle REPL and leaks). The worker
-        // now labels that shape `outputDisposition: 'boundary_unobserved'` so
-        // the daemon can keep its positive-evidence policy and still converge:
-        // for the claude bridge, final_output is guaranteed to precede this
-        // terminal (same-worker IPC ordering), so a still-pending result can
-        // never receive an answer afterwards — settle it fail-closed. The
-        // RPC-hydration shape deliberately does NOT carry this label, and a
-        // bare `completed` still settles nothing (the guard above is untouched).
-        // Feishu turns have no asyncTriggerResults entry, so they are unaffected.
+        // nothing_to_send arm settles it, leaving HTTP waiters hanging and
+        // durable async triggers `pending` against an `open` session record
+        // (`running` forever while the session auto-restarts into an idle
+        // REPL). The worker now labels that shape
+        // `outputDisposition: 'boundary_unobserved'` so the daemon can keep its
+        // positive-evidence policy and settle both Wait Mode and Async Mode
+        // fail-closed: for the claude bridge, `final_output` is guaranteed to
+        // precede this terminal (same-worker IPC ordering), so a still-pending
+        // caller can never receive an answer afterwards. The RPC-hydration
+        // shape deliberately does NOT carry this label, a bare `completed`
+        // still settles nothing, and Feishu turns have no HTTP waiter/async
+        // sink so they are unaffected.
         if (msg.status === 'completed'
           && msg.outputDisposition === 'boundary_unobserved'
           && !ds.session.vcMeetingReceiver) {
+          const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+          if (waitPromise) {
+            nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
+            ds.pendingWaitPromises?.delete(msg.turnId);
+            const failure = new Error(`Worker turn failed: ${TURN_ENDED_UNOBSERVED}`);
+            if (waitPromise.reject) waitPromise.reject(failure);
+            else waitPromise.resolve(`ERROR: ${failure.message}`);
+            logger.info(
+              `[${t}] Settled Wait Mode HTTP turn ${msg.turnId.substring(0, 8)} `
+              + `failed (${TURN_ENDED_UNOBSERVED})`,
+            );
+          }
           const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
           const asyncSink = !!asyncResult
-            || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
+            || (virtualDeliverySinkForChatId(ds.chatId) === 'http_async'
+              && !msg.turnId.startsWith('local-')
+              && !msg.turnId.startsWith('scheduled-'));
           if (asyncSink) {
+            nonLarkFailureHandled = true;
             if (asyncResult?.status === 'completed') {
               // A partial answer was already published as final_output (killed
               // mid-answer). Known output is stronger than the unobserved
@@ -25057,9 +25016,17 @@ function setupWorkerHandlers(
                 `[${t}] Ignored unobserved terminal for completed async HTTP turn `
                 + msg.turnId.substring(0, 8),
               );
+            } else if (asyncResult?.status === 'failed' || asyncResult?.status === 'interrupted') {
+              // Preserve an earlier stronger terminal (e.g. provider failure or
+              // caller interrupt) without overwriting its persisted code or
+              // dropping any convergence stamp that earlier failure retained.
+              logger.info(
+                `[${t}] Ignored unobserved terminal for already-${asyncResult.status} async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
             } else {
+              const failedAt = Date.now();
               if (asyncResult?.status === 'pending') {
-                const failedAt = Date.now();
                 asyncResult.status = 'failed';
                 asyncResult.failedAt = failedAt;
                 asyncResult.errorCode = 'trigger_failed';
@@ -25070,7 +25037,7 @@ function setupWorkerHandlers(
                 const outcome = asyncTriggerStore.recordTerminalFailureStrict(
                   ds.session.sessionId,
                   msg.turnId,
-                  Date.now(),
+                  failedAt,
                   ds.larkAppId,
                   TURN_ENDED_UNOBSERVED,
                 );
@@ -25133,6 +25100,63 @@ function setupWorkerHandlers(
                 + `failed (${TURN_ENDED_UNOBSERVED})`,
               );
             }
+          }
+        }
+        if (!outcomeExcluded && !nonLarkFailureHandled && !ordinaryHttpTerminal) {
+          let delivered = false;
+          void recordTurnOutcome(ds, msg, {
+            recoveryHandled,
+            onClassified: outcome => { delivered = outcome === 'delivered'; },
+            isFinalDelivered: () => isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId)),
+          }).then(async () => {
+            if (!usesOutcomeBasedTurnReactions(ds)) return;
+            await finishTurnReactions(ds, {
+              turnId: msg.turnId,
+              delivered,
+              owns: () => ds.worker === worker && ds.workerGeneration === workerGeneration
+                && ds.session.status === 'active',
+            });
+          }).catch((err: unknown) => {
+            logger.warn(`[${t}] turn outcome: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+        // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
+        // the worker's bridge gate suppressed as GENUINE SILENCE (the model
+        // terminated with a bare nothing-to-send sentinel, no `botmux send`)
+        // emits turn_terminal but NO final_output, so the async-trigger result
+        // would stay `pending` and the poller would hang `running` until timeout.
+        // Settle it here with EMPTY content — nothing-to-send is a legitimate
+        // completed-with-empty-output for an HTTP task.
+        //
+        // POSITIVE EVIDENCE ONLY: we settle solely on the worker's explicit
+        // `outputDisposition === 'nothing_to_send'` flag, never on a bare
+        // `completed`. A bare completed terminal is NOT proof of silence — the
+        // RPC-hydration timeout path (worker.ts hydrateCompletedRpcTurn) emits
+        // `completed` with no final_output after fs-lag while the real answer is
+        // still materializing; settling that empty would mask a lost reply.
+        // Guarded further so it never double-settles a final_output-completed
+        // turn (pending-only), never touches a managed VC-meeting receiver, and
+        // only affects this bot's own pending async result. Feishu turns have no
+        // asyncTriggerResults entry, so their silent-turn behavior is unchanged.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'nothing_to_send'
+          && !ds.session.vcMeetingReceiver) {
+          const pendingAsync = ds.asyncTriggerResults?.get(msg.turnId);
+          if (pendingAsync && pendingAsync.status === 'pending') {
+            const completedAt = Date.now();
+            pendingAsync.status = 'completed';
+            pendingAsync.content = '';
+            pendingAsync.completedAt = completedAt;
+            try {
+              asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId);
+            } catch (err: any) {
+              logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+            }
+            // Cleared like the final_output path so worker-exit convergence does
+            // not retro-fail this now-completed turn. Per-triggerId delete so a
+            // concurrent sibling keyed turn's convergence entry is untouched.
+            ds.idempotentAsyncTurns?.delete(msg.turnId);
+            logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
           }
         }
         // Resolve the terminal-strip route once and share it with the legacy

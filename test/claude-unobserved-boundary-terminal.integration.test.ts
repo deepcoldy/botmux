@@ -110,6 +110,11 @@ const answerText: Row = {
   message: { id: 'm1', role: 'assistant', model: 'claude-test', stop_reason: 'end_turn', usage: { ...zeroUsage, output_tokens: 40 },
     content: [{ type: 'text', text: 'The review is posted.' }] },
 };
+const partialAnswerNoStopReason: Row = {
+  type: 'assistant', uuid: 'a-partial',
+  message: { id: 'm-partial', role: 'assistant', model: 'claude-test', stop_reason: null, usage: { ...zeroUsage, output_tokens: 18 },
+    content: [{ type: 'text', text: 'Partial answer before exit.' }] },
+};
 const turnDuration: Row = { type: 'system', subtype: 'turn_duration', uuid: 'd1', durationMs: 3_000 };
 
 /**
@@ -364,5 +369,20 @@ describe('claude bridge terminal at a screen-idle boundary without transcript te
     // The next-turn-start record is positive terminal evidence: no unobserved
     // label, even though terminalOutcome was never populated.
     expect(turn1Terminal!.outputDisposition).toBeUndefined();
+  }, 90_000);
+
+  it('keeps the disposition absent when partial final_output was emitted without a transcript terminal', async () => {
+    const w = startWorker({ beforePrompt: [partialAnswerNoStopReason] });
+    const turnId = 'om_partial_no_terminal';
+    const messages = await runTurn(w, turnId);
+
+    expect(messages.filter(msg => msg.type === 'final_output' && msg.turnId === turnId)).toEqual([
+      expect.objectContaining({ turnId, content: 'Partial answer before exit.' }),
+    ]);
+    const [terminal] = terminalsOf(messages, turnId);
+    expect(terminal).toMatchObject({ status: 'completed' });
+    // Output was observed and delivered as final_output, so the no-output
+    // `boundary_unobserved` label must stay absent even with terminalObserved=false.
+    expect(terminal!.outputDisposition).toBeUndefined();
   }, 90_000);
 });
