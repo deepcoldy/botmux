@@ -54,7 +54,7 @@ export interface SetupBotFlags {
 export type SetupCommand =
   | { action: 'help' }
   | { action: 'list'; json: boolean }
-  | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags; extraScopesFile?: string }
+  | { action: 'add'; json: boolean; createApp: boolean; local: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags; extraScopesFile?: string }
   /** extraScopesFile：undefined 是没传，null 是 `--extra-scopes-file -`（清除已记录的路径）。 */
   | { action: 'configure'; json: boolean; selector: string; switchAccount: boolean; extraScopesFile?: string | null }
   | { action: 'edit'; json: boolean; selector: string; flags: SetupBotFlags }
@@ -118,6 +118,11 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
       owner 可用完整邮箱、手机号、union_id on_xxx，或该应用自己签发的
       open_id ou_xxx；写盘前会用凭证校验，失败不写盘。
 
+  botmux setup add --local [--name <显示名>] [--cli <key>] [--default-working-dir <dir>] [--json]
+      只在本机创建机器人：不扫码、不创建飞书应用、不需要 App ID / Secret。
+      写入的 larkAppId 形如 local_<slug>，只是稳定的本地身份，不是飞书应用。
+      配置带 apiOnly + localIdentity。随后 botmux start 会跳过飞书凭证校验。
+
   botmux setup configure <进程名|AppID> [--switch-account] [--extra-scopes-file <json|->] [--json]
       对已添加的机器人重跑开放平台权限、长连接事件、redirect 与发版。
       用于 add 返回 partial 后继续，不会重复创建应用；成功后自动尝试上线。
@@ -163,6 +168,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
+  --local                    add 时创建不关联飞书的本地机器人（不要 App ID / Secret）
   --create-app               add 时扫码创建应用，不再要求 --app-id/--app-secret
   --compatibility-mode       显式使用 SDK 兼容模式（可能需要额外扫码）
   --switch-account           add --create-app / configure 时重新扫码并覆盖登录态
@@ -182,12 +188,13 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 function parseBotFieldFlags(
   tokens: string[],
   opts: { allowFields: boolean; action: string },
-): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; extraScopesFile?: string | null; positional: string[] } {
+): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; local: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; extraScopesFile?: string | null; positional: string[] } {
   const flags: SetupBotFlags = {};
   const positional: string[] = [];
   let json = false;
   let yes = false;
   let createApp = false;
+  let local = false;
   let compatibilityMode = false;
   let switchAccount = false;
   let openPlatformAuto = false;
@@ -199,6 +206,7 @@ function parseBotFieldFlags(
     if (token === '--json') { json = true; continue; }
     if (token === '--yes' || token === '-y') { yes = true; continue; }
     if (token === '--create-app') { createApp = true; continue; }
+    if (token === '--local') { local = true; continue; }
     if (token === '--compatibility-mode') { compatibilityMode = true; continue; }
     if (token === '--switch-account') { switchAccount = true; continue; }
     if (token === '--open-platform-auto') { openPlatformAuto = true; openPlatformAutoSpecified = true; continue; }
@@ -244,13 +252,13 @@ function parseBotFieldFlags(
     }
     positional.push(token);
   }
-  return { flags, json, yes, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, extraScopesFile, positional };
+  return { flags, json, yes, createApp, local, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, extraScopesFile, positional };
 }
 
 /** Parse only the JSON envelope here; structural validation remains centralized
  * in applyBotConfigEdits -> normalizeCliRuntimeConfig so add/edit/TUI callers
  * cannot drift onto different runtime rules. */
-function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
+export function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
   if (raw === undefined) return undefined;
   const value = raw.trim();
   if (value === '-') return null;
@@ -261,6 +269,7 @@ function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null |
   } catch (err) {
     throw new Error(`--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
+  if (parsed === null) throw new Error('--cli-runtime 必须是 JSON 对象或 -');
   return parsed as CliRuntimeConfig;
 }
 
@@ -287,8 +296,14 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
   }
 
   if (action === 'add') {
-    const { flags, json, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, extraScopesFile, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
+    const { flags, json, createApp, local, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, extraScopesFile, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
     if (positional.length > 0) throw new Error(`add 不接受位置参数: ${positional.join(' ')}（字段一律用 --flag 形式）`);
+    if (local && (createApp || compatibilityMode || switchAccount || flags.appId?.trim() || flags.appSecret?.trim()
+      || flags.brand?.trim() || flags.appName?.trim() || flags.appIcon?.trim() || flags.allowedUsers?.trim()
+      || flags.allowedChatGroups?.trim() || flags.welcomeMessage?.trim() || flags.welcomeMessageFile?.trim()
+      || openPlatformAutoSpecified || extraScopesFile)) {
+      throw new Error('--local 不关联飞书应用，不能与 --create-app / --app-id / --app-secret / --brand / --allowed-users / --open-platform-auto / --extra-scopes-file 同时使用。');
+    }
     if (createApp && (flags.appId?.trim() || flags.appSecret?.trim())) {
       throw new Error('--create-app 不能与 --app-id/--app-secret 同时使用。');
     }
@@ -327,9 +342,10 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
       action: 'add',
       json,
       createApp,
+      local,
       compatibilityMode,
       switchAccount,
-      openPlatformAuto: effectiveOpenPlatformAuto,
+      openPlatformAuto: local ? false : effectiveOpenPlatformAuto,
       flags,
       ...(extraScopesFile ? { extraScopesFile } : {}),
     };
