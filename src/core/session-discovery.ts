@@ -340,6 +340,18 @@ export function isNonInteractiveCodexArgv(argv: string[]): boolean {
   return false;
 }
 
+const CLAUDE_METADATA_FLAGS = new Set(['--help', '-h', '--version', '-v']);
+
+/** A launcher may probe `claude --version` before starting the TUI. Claude's
+ *  parser honours these flags anywhere before `--`, so scan argv up to there. */
+function isNonInteractiveClaudeArgv(argv: string[]): boolean {
+  for (const arg of argv.slice(1)) {
+    if (arg === '--') return false;
+    if (CLAUDE_METADATA_FLAGS.has(arg)) return true;
+  }
+  return false;
+}
+
 /**
  * Resolve a CliId from a process's comm + argv. Checks comm first; if the comm
  * belongs to a generic launcher, scan argv for the CLI executable basename.
@@ -646,7 +658,8 @@ export const CODEX_LEAF_SEARCH_DEPTH = 16;
  * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
  * launcher itself as the CLI. The real CLI process has the binary as its comm
  * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`). Codex
- * additionally excludes noninteractive commands such as `debug models`.
+ * and Claude Code additionally pass over zombies and noninteractive probes such
+ * as `codex debug models` or `claude --version`, so a live sibling still wins.
  *
  * BFS starts at the launcher's children (never the launcher node) and returns
  * the shallowest descendant recognized as `targetCliId`, or null if none exists
@@ -669,6 +682,9 @@ export function findLaunchedCliPid(
   const commOf = probes.commOf ?? readComm;
   const cmdlineOf = probes.cmdlineOf ?? (pid => readCmdline(pid, { exact: true }));
   const isZombie = probes.isZombie ?? isZombieProcess;
+  const isNonInteractiveArgv = targetCliId === 'codex' ? isNonInteractiveCodexArgv
+    : targetCliId === 'claude-code' ? isNonInteractiveClaudeArgv
+      : undefined;
   let frontier = childrenOf(launcherPid);
   const seen = new Set<number>([launcherPid]);
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
@@ -678,8 +694,7 @@ export function findLaunchedCliPid(
       seen.add(pid);
       const comm = commOf(pid);
       if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
-        if (targetCliId === 'codex'
-          && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
+        if (isNonInteractiveArgv && (isZombie(pid) || isNonInteractiveArgv(cmdlineOf(pid)))) continue;
         return pid;
       }
       next.push(...childrenOf(pid));

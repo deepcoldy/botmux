@@ -116,6 +116,10 @@ function runWorkerWiring(late: boolean, options: {
   credentialOnlyBwrap?: boolean;
   /** Pids whose process has exited: their birth token no longer reads back. */
   exited?: number[];
+  /** Exited but unreaped pids: their birth token still reads back. */
+  zombies?: number[];
+  /** argv of pids other than the pane, read by the real BFS. */
+  cmdlines?: Record<number, string[]>;
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
@@ -129,7 +133,7 @@ function runWorkerWiring(late: boolean, options: {
       const [pid, cliId, depth, probes, filter] = args as Parameters<typeof findLaunchedCliPid>;
       return findLaunchedCliPid(pid, cliId, depth, {
         ...probes, childrenOf: context.getChildPids, commOf: context.readComm,
-        cmdlineOf: () => [], isZombie: () => false,
+        cmdlineOf: pid => options.cmdlines?.[pid] ?? [], isZombie: context.isZombieProcess,
       }, filter);
     }
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
@@ -160,6 +164,7 @@ function runWorkerWiring(late: boolean, options: {
     codexOwnershipAttestationPending: false,
     refreshSandboxedCliLeafAttestation: undefined as (() => void) | undefined,
     readProcessStartIdentity: (pid: number) => (options.exited?.includes(pid) ? undefined : `start-${pid}`),
+    isZombieProcess: (pid: number) => options.zombies?.includes(pid) ?? false,
     FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
     CODEX_LEAF_SEARCH_DEPTH, snapshotChildPids: () => () => [],
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
@@ -567,15 +572,51 @@ describe('worker wrapper PID wiring', () => {
     expect(leafAttestations()).toEqual([153, 153, 154]);
   });
 
-  it('leaves a credential-only bwrap wrapperCli leaf to the wrapper resolver alone', () => {
+  it('keeps a payload that already is Claude Code as the leaf, not its same-named child', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150, children: { 150: [154] }, childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+    });
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.publishLocalProcessAttestation).toHaveBeenCalledWith(150);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+  });
+
+  it.each([
+    { cmdlines: { 153: ['claude', '--version'] } },
+    { zombies: [153] },
+  ])('passes over a Claude Code startup probe or zombie to its live sibling (%o)', probe => {
+    const zombies = [...(probe.zombies ?? [])];
+    const children: Record<number, number[]> = { 150: [151], 151: [152], 152: [153, 154] };
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150, children, zombies, cmdlines: probe.cmdlines,
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe', 154: 'claude.exe', 155: 'claude.exe' },
+    });
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(154);
+    // An unreaped leaf still reads back its birth token; it must not stay attested.
+    zombies.push(154);
+    children[152] = [153, 154, 155];
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(155);
+  });
+
+  it('rebinds and re-attests a credential-only bwrap wrapperCli leaf on an aliased backend', () => {
     const result = runWorkerWiring(false, {
       cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
-      scopePayloadPid: 150,
+      scopePayloadPid: 150, aliasedChildPid: true,
       children: { 150: [151], 151: [152], 152: [153] },
       childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
+      beforeTimers: scope => scope.publishLocalProcessAttestation.mockReturnValueOnce(false),
     });
-    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 153)).toHaveLength(1);
-    expect(result.refreshSandboxedCliLeafAttestation).toBeUndefined();
+    const leafPublications = () => result.publishLocalProcessAttestation.mock.calls
+      .filter((call: unknown[]) => call[0] === 153);
+    expect(result.backend.cliPid).toBe(153);
+    expect(result.bridgeCliPid).toBe(153);
+    expect(leafPublications()).toHaveLength(1);
+    result.refreshSandboxedCliLeafAttestation!();
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(leafPublications()).toHaveLength(2);
   });
 
   it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {
