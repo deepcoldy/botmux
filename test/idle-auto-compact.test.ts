@@ -336,6 +336,75 @@ describe('idle auto-compact sweep', () => {
     expect(ds.session.idleAutoCompact?.inFlight?.attempt).toBe(1);
   });
 
+  it('someone using the session between tries ends that stretch: nothing is compacted under them', () => {
+    const ds = makeDs('3333333b', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const stretch = ds.session.idleAutoCompact?.inFlight?.stretch;
+    noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'prompt_not_framed');
+    // A turn typed straight into the web terminal: no botmux turn, just busy → idle.
+    edge(ds, 'working', T0 + 55 * MIN + 20_000);
+    edge(ds, 'idle', T0 + 56 * MIN + 40_000);
+    for (let m = 57; m <= 120; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(1);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(stretch);
+    expect(h.notify).not.toHaveBeenCalled();
+  });
+
+  it("a keep-alive's own busy edge does not end a pending retry", () => {
+    const ds = makeDs('3333333c', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'prompt_not_framed');
+    ds.promptCacheKeepalive = { pings: 0, idleSinceAt: T0, inFlightSince: T0 + 55 * MIN + 10_000 };
+    edge(ds, 'working', T0 + 55 * MIN + 11_000);
+    expect(ds.session.idleAutoCompact?.retry?.attempts).toBe(1);
+    // The keep-alive finishes and restores the idle start (prompt-cache-keepalive.ts).
+    ds.promptCacheKeepalive = { pings: 1, idleSinceAt: T0 };
+    edge(ds, 'idle', T0 + 55 * MIN + 30_000);
+    expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(1);
+    expect(ds.session.idleAutoCompact?.inFlight?.attempt).toBe(2);
+  });
+
+  it('a local CLI command or a toggle between tries does not reset the count', () => {
+    const ds = makeDs('3333333d', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    noteIdleAutoCompactRefused(ds, h.compact.mock.calls.at(-1)![1], 'prompt_not_framed');
+    // `/cost` from the topic: a passthrough turn whose arm the daemon puts back.
+    const arm = ds.idleAutoCompactArm;
+    noteIdleAutoCompactTurnStarted(ds, 'om_cost', T0 + 55 * MIN + 30_000);
+    ds.idleAutoCompactArm = arm;
+    h.sweepAt([ds], T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.inFlight?.attempt).toBe(2);
+    noteIdleAutoCompactRefused(ds, h.compact.mock.calls.at(-1)![1], 'prompt_not_framed');
+    // Turned off and on again from the card.
+    applyIdleAutoCompactSetting(ds.session, { enabled: false });
+    applyIdleAutoCompactSetting(ds.session, { enabled: true });
+    h.sweepAt([ds], T0 + 57 * MIN);
+    expect(noteIdleAutoCompactRefused(ds, h.compact.mock.calls.at(-1)![1], 'prompt_not_framed'))
+      .toEqual({ reason: 'unconfirmed', attempt: 3, retry: false });
+    for (let m = 58; m <= 120; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(3);
+    expect(h.notify.mock.calls.map(c => c[1].attempts)).toEqual([3]);
+  });
+
+  it('a claim that cannot be saved is not sent, and the next tick tries again', () => {
+    const ds = makeDs('3333333e', { enabled: true });
+    edge(ds, 'idle', T0);
+    let failSave = true;
+    const h = harness({ persist: vi.fn(() => { if (failSave) throw new Error('database is locked'); }) });
+    expect(h.sweepAt([ds], T0 + 55 * MIN)).toBe(0);
+    expect(h.compact).not.toHaveBeenCalled();
+    expect(ds.session.idleAutoCompact?.inFlight).toBeUndefined();
+    failSave = false;
+    expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(1);
+  });
+
   it('a refusal for a turn that is not our in-flight compact changes nothing', () => {
     const ds = makeDs('33333339', { enabled: true });
     edge(ds, 'idle', T0);
@@ -775,6 +844,11 @@ describe('idle auto-compact across a worker suspend', () => {
     expect(ds.idleAutoCompactArm).toBeUndefined();
     // Idempotent.
     expect(clearIdleAutoCompactStretch(ds)).toBe(false);
+    // A refused compact waiting for another try goes with the stretch (and the
+    // row is saved: the caller is told something changed).
+    ds.session.idleAutoCompact!.retry = { stretch: T0, attempts: 1, reason: 'unconfirmed' };
+    expect(clearIdleAutoCompactStretch(ds)).toBe(true);
+    expect(ds.session.idleAutoCompact).toEqual({ enabled: true, minutes: 20 });
   });
 
   it('a message-less cold resume is never compacted: its cache was never warmed', () => {

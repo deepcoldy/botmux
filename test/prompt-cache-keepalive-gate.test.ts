@@ -14,6 +14,7 @@ import {
   type PromptCacheKeepaliveWriteProbe,
 } from '../src/core/prompt-cache-keepalive-gate.js';
 import { parseCapturedScreenRows } from '../src/utils/captured-screen-rows.js';
+import { screenShowsFramedPrompt } from '../src/utils/input-gate.js';
 import type { ScreenRow } from '../src/utils/terminal-cells.js';
 
 /** A plain-text screen as cells: nothing dim, nothing inverse. */
@@ -195,9 +196,12 @@ describe('promptCacheKeepaliveRefusal', () => {
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(screen) })).toBe('action_prompt_open');
   });
 
-  it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {
+  it('refuses an AskUserQuestion picker, named by its own footer as a choice', () => {
     expect(READY.test(ASK_USER_QUESTION)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(ASK_USER_QUESTION) })).toBe('prompt_not_framed');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(ASK_USER_QUESTION) })).toBe('action_prompt_open');
+    // Without that footer it is still no input box.
+    const bare = ASK_USER_QUESTION.split('\n').slice(0, -1).join('\n');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(bare) })).toBe('prompt_not_framed');
   });
 
   it('refuses a composer holding an unsent draft, allows an empty one', () => {
@@ -280,6 +284,60 @@ describe('input box shapes Claude Code 2.1.3xx draws', () => {
   });
 });
 
+describe('screens that are not one framed prompt row say what they are', () => {
+  const FOOTER = '  ⏵⏵ bypass permissions on (shift+tab to cycle)';
+  const box = (...rows: string[]) => ['⏺ Done.', '', RULE, ...rows, RULE, FOOTER].join('\n');
+
+  it('a multi-line, wrapped or bash-mode draft is a draft, not an unrecognised box', () => {
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(box('❯ line one', '  line two')) })).toBe('composer_not_empty');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(box(`❯ ${'x'.repeat(78)}`, `  ${'y'.repeat(30)}`)) })).toBe('composer_not_empty');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(box('❯ ', '  second line only')) })).toBe('composer_not_empty');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(box('! ls')) })).toBe('composer_not_empty');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(box('!')) })).toBe('composer_not_empty');
+    // A titled top rule frames such a box too.
+    const titled = box('❯ line one', '  line two').replace(RULE, `${'─'.repeat(60)} 会话名 ─`);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(titled) })).toBe('composer_not_empty');
+  });
+
+  it('a box of several rows of dim ghost text is still not written into', () => {
+    const rows = withComposerRow(box('❯ ', '  '), promptRow('一条很长的推荐', () => ({ dim: true })));
+    const y = rows.findIndex(r => r.map(c => c.ch).join('') === '  ');
+    rows[y] = [{ ch: ' ', dim: false, inverse: false }, { ch: ' ', dim: false, inverse: false },
+      ...Array.from('折到第二行').map(ch => ({ ch, dim: true, inverse: false }))];
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: rows })).toBe('prompt_not_framed');
+  });
+
+  it("a selector's own footer names it a choice", () => {
+    const rewind = ['   ❯ (current)', '', '   Enter to continue · Esc to cancel'].join('\n');
+    const model = [RULE, ' Select model', ' ❯ 1. Default', '   2. Opus', '', ' Enter to confirm · Esc to exit'].join('\n');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(rewind) })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(model) })).toBe('action_prompt_open');
+    // A busy hint is not a selector.
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(['⏺ …', '❯ old', '  esc to interrupt'].join('\n')) })).toBe('prompt_not_framed');
+  });
+});
+
+describe('real Claude Code selectors are choices, never the input box', () => {
+  it.each([
+    'ask-user-question-first.txt',
+    'ask-user-question-type-something.txt',
+    'ask-user-question-chat-about-this.txt',
+    'rewind.txt',
+    'model-picker.txt',
+    'history-search.txt',
+  ])('%s', name => {
+    const screen = readFileSync(join(process.cwd(), 'test/fixtures/claude-selectors', name), 'utf8');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(screen) })).toBe('action_prompt_open');
+  });
+
+  it('a picker row right under a rule is refused even if a second rule closed it', () => {
+    const screen = readFileSync(join(process.cwd(), 'test/fixtures/claude-selectors/ask-user-question-chat-about-this.txt'), 'utf8')
+      .replace('4. Chat about this\n\n', `4. Chat about this\n${RULE}\n`);
+    expect(screenShowsFramedPrompt(screen, READY)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(screen) })).toBe('action_prompt_open');
+  });
+});
+
 describe('real Claude Code input boxes (capture-pane -e -p of live panes)', () => {
   const FIXTURES = join(process.cwd(), 'test/fixtures');
   const capture = (name: string) => readFileSync(join(FIXTURES, name), 'utf8');
@@ -305,6 +363,28 @@ describe('real Claude Code input boxes (capture-pane -e -p of live panes)', () =
     'claude-prompt-suggestion/suggestion-titled-rule-160x50.txt',
   ])('the same text typed by hand is refused as a draft: %s', name => {
     expect(judge(typed(capture(name)))).toBe('composer_not_empty');
+  });
+});
+
+describe('composerScreenLogTail keeps no conversation or input text', () => {
+  it('summarises every row above the last rule, keeps only the status rows below it', () => {
+    const screen = cells([
+      '❯ my earlier prompt',
+      '● the answer it got',
+      `${'─'.repeat(60)} 私密的会话名 ─`,
+      '❯ draft first line',
+      '  draft second line',
+      RULE,
+      '  ⏵⏵ bypass permissions on · 1 shell',
+    ].join('\n'));
+    const tail = composerScreenLogTail(screen, READY);
+    const joined = tail.join('\n');
+    for (const secret of ['earlier', 'answer', '私密', 'draft']) expect(joined).not.toContain(secret);
+    expect(tail.at(-1)).toBe('  ⏵⏵ bypass permissions on · 1 shell');
+    expect(tail).toHaveLength(7);
+    // A highlighted picker row under the last rule is not a status row.
+    const picker = readFileSync(join(process.cwd(), 'test/fixtures/claude-selectors/ask-user-question-chat-about-this.txt'), 'utf8');
+    expect(composerScreenLogTail(cells(picker), READY).join('\n')).not.toContain('Chat about');
   });
 });
 

@@ -189,9 +189,9 @@ export function parseIdleAutoCompactCommand(args: string): IdleAutoCompactComman
 }
 
 /**
- * Turn the feature on/off for one session (caller persists). Minutes and the
- * handled stretch survive any toggle, so off → on inside one idle stretch never
- * compacts that stretch twice; the running-stretch mirror is dropped on off
+ * Turn the feature on/off for one session (caller persists). Minutes, the
+ * handled stretch and the tries spent on a refused one survive any toggle, so
+ * off → on inside one idle stretch never compacts that stretch twice; the running-stretch mirror is dropped on off
  * (it stops being maintained) and re-derived from the live idle clock.
  */
 export function applyIdleAutoCompactSetting(
@@ -205,12 +205,13 @@ export function applyIdleAutoCompactSetting(
   };
   const prev = session.idleAutoCompact;
   if (prev?.handledIdleSince !== undefined) next.handledIdleSince = prev.handledIdleSince;
+  // Tries already spent on this stretch stay spent across a toggle.
+  if (prev?.retry) next.retry = prev.retry;
   if (change.enabled && prev?.enabled) {
     // Re-affirming "on" (stale card, minutes change) keeps the live bookkeeping.
     if (prev.idleSince !== undefined) next.idleSince = prev.idleSince;
     if (prev.inFlight) next.inFlight = prev.inFlight;
     if (prev.armed) next.armed = prev.armed;
-    if (prev.retry) next.retry = prev.retry;
   }
   session.idleAutoCompact = next;
   return next;
@@ -290,6 +291,16 @@ export function noteIdleAutoCompactScreenStatus(
       if (now - arm.at <= IDLE_AUTO_COMPACT_ARM_BUSY_GRACE_MS) arm.busy = true;
       else ds.idleAutoCompactArm = undefined;
     }
+    if (setting?.retry && !setting.inFlight && BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '')
+      && !keepaliveInFlight(ds, now)) {
+      // The CLI went busy while a refused compact waited for another try, and
+      // neither our compact nor a keep-alive did it: someone is using the
+      // session (a turn typed into the terminal, a background task waking
+      // it). That stretch is over, not to be compacted under them.
+      setting.handledIdleSince = setting.retry.stretch;
+      delete setting.retry;
+      changed = true;
+    }
     // Busy edge: save the arm so a daemon restart before the idle edge keeps it.
     syncArm();
     return changed;
@@ -339,6 +350,7 @@ export function noteIdleAutoCompactScreenStatus(
   // A stale marker (or one a different turn already ended) is just dropped.
   if (setting!.inFlight) { delete setting!.inFlight; changed = true; }
   const warm = ds.idleAutoCompactWarmSince;
+  if (setting!.retry && setting!.retry.stretch !== warm) { delete setting!.retry; changed = true; }
   if (warm !== setting!.idleSince) {
     if (warm === undefined) delete setting!.idleSince;
     else setting!.idleSince = warm;
@@ -361,8 +373,6 @@ export function noteIdleAutoCompactTurnStarted(
   const setting = ds.session.idleAutoCompact;
   if (setting?.inFlight && setting.inFlight.turnId !== turnId) delete setting.inFlight;
   if (turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) return;
-  // A real turn ends the stretch a refused compact was waiting to retry.
-  if (setting?.retry) delete setting.retry;
   // Started while the CLI is already busy: no new busy edge will follow, the
   // turn runs on in the same busy period.
   ds.idleAutoCompactArm = { at: now, busy: BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '') };
@@ -396,8 +406,7 @@ export function noteIdleAutoCompactRefused(
   const stretch = flight.stretch ?? setting.handledIdleSince;
   delete setting.inFlight;
   delete ds.idleAutoCompactDispatchedTurnId;
-  if (refusalMayPass(reason) && attempt < IDLE_AUTO_COMPACT_MAX_ATTEMPTS && stretch !== undefined
-    && setting.handledIdleSince === stretch) {
+  if (refusalMayPass(reason) && attempt < IDLE_AUTO_COMPACT_MAX_ATTEMPTS && stretch !== undefined) {
     if (flight.previousHandled === undefined) delete setting.handledIdleSince;
     else setting.handledIdleSince = flight.previousHandled;
     setting.retry = { stretch, attempts: attempt, reason };
@@ -632,7 +641,24 @@ export function runIdleAutoCompactSweep(
         stretch: decision.stretch, attempt,
         ...(previousHandled !== undefined ? { previousHandled } : {}),
       };
-      deps.persist(ds);
+      // Release the claim so a later tick inside the window retries.
+      const releaseClaim = (): void => {
+        const release = current();
+        if (!release) return;
+        if (release.inFlight?.turnId === turnId) delete release.inFlight;
+        if (previousHandled === undefined) delete release.handledIdleSince;
+        else release.handledIdleSince = previousHandled;
+        if (ds.idleAutoCompactDispatchedTurnId === turnId) delete ds.idleAutoCompactDispatchedTurnId;
+      };
+      try {
+        deps.persist(ds);
+      } catch (error) {
+        // An unsaved claim is not sent: a stretch held handled in memory with
+        // nothing dispatched would otherwise go silent for good.
+        releaseClaim();
+        deps.log(`[idle-compact] ${id} could not save the claim; not sending: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
       let accepted = false;
       try {
         accepted = deps.compact(ds, turnId);
@@ -640,15 +666,8 @@ export function runIdleAutoCompactSweep(
         deps.log(`[idle-compact] ${id} send failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (!accepted) {
-        // Not delivered: release the claim so a later tick inside the window retries.
-        const release = current();
-        if (release) {
-          if (release.inFlight?.turnId === turnId) delete release.inFlight;
-          if (previousHandled === undefined) delete release.handledIdleSince;
-          else release.handledIdleSince = previousHandled;
-          if (ds.idleAutoCompactDispatchedTurnId === turnId) delete ds.idleAutoCompactDispatchedTurnId;
-          deps.persist(ds);
-        }
+        releaseClaim();
+        try { deps.persist(ds); } catch { /* the in-memory release already lets a later tick retry */ }
         continue;
       }
       // This process itself handed the compact to the worker: only it may

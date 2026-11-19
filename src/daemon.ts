@@ -536,7 +536,7 @@ import {
   collectSessionTurnGarbage,
   sweepTraexInstallChanges,
 } from './core/worker-pool.js';
-import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
+import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
@@ -6789,12 +6789,13 @@ function runIdleAutoCompact(): void {
  * this, passthrough commands silently PATCH the previous card and the user
  * sees no visible response.
  */
-function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { unattended?: boolean } = {}): void {
   noteTurnStarted(ds, turnId);
   // The previous turn's「下一步」row stops being the last card's.
   noteReplyCardTurnStarted(ds, turnId);
-  // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
-  resetPromptCacheKeepalive(ds);
+  // A real turn ends the idle stretch a prompt-cache keep-alive was extending
+  // (an unattended /compact only once it actually runs — see the helper).
+  notePromptCacheKeepaliveTurnStarted(ds, opts);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
   noteIdleAutoCompactTurnStarted(ds, turnId);
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
@@ -26115,7 +26116,7 @@ function deliverPassthroughToExistingSession(
     // A locally answered CLI command (/model, /cost, …) sends no request, so it
     // must not arm a warm idle-auto-compact stretch (core/idle-auto-compact.ts).
     const idleCompactArm = ds.idleAutoCompactArm;
-    beginNewTurn(ds, commandContent, turnId);
+    beginNewTurn(ds, commandContent, turnId, { unattended: turn.requireSafeComposer === true });
     if (isLocalCliCommand(cmd)) ds.idleAutoCompactArm = idleCompactArm;
     markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);

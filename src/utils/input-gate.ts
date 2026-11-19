@@ -256,10 +256,42 @@ const INPUT_BOX_RULE = /^\s*─{8,}\s*$/;
  *  rule on both ends. The bottom rule never carries text. */
 const INPUT_BOX_TITLED_RULE = /^\s*(─+) \S(?:.*\S)? (─+)\s*$/;
 
-function isInputBoxTopRule(line: string): boolean {
+/** A plain input box rule (`bottom` only) or, for the top rule, one that may
+ *  carry text. */
+export function isInputBoxRule(line: string, edge: 'top' | 'bottom'): boolean {
   if (INPUT_BOX_RULE.test(line)) return true;
+  if (edge === 'bottom') return false;
   const titled = INPUT_BOX_TITLED_RULE.exec(line);
   return !!titled && titled[1].length + titled[2].length >= 8;
+}
+
+function isInputBoxTopRule(line: string): boolean {
+  return isInputBoxRule(line, 'top');
+}
+
+/** Where Claude's input box starts a row: the prompt marker, or `!` in bash mode. */
+const INPUT_BOX_FIRST_ROW = /^[❯!](?:[\u00a0 ]|$)/;
+
+/**
+ * The LAST input box on screen, as line indices of its two rules: the last
+ * plain rule, the nearest rule above it as the top rule, and the box's first
+ * non-blank row starting in column 0 with the prompt marker (or `!`, bash
+ * mode). Unlike screenShowsFramedPrompt this also finds a box holding several
+ * rows — a multi-line or wrapped draft, which never frames a single prompt
+ * row. Selectors and dialogs do not start their rows that way.
+ */
+export function lastInputBox(screen: string): { top: number; bottom: number } | undefined {
+  const lines = screen.split('\n');
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (INPUT_BOX_RULE.test(lines[i])) { bottom = i; break; }
+  }
+  if (bottom < 1) return undefined;
+  let top = bottom - 1;
+  while (top >= 0 && !isInputBoxTopRule(lines[top])) top--;
+  if (top < 0) return undefined;
+  const first = lines.slice(top + 1, bottom).find(line => line.trim() !== '');
+  return first !== undefined && INPUT_BOX_FIRST_ROW.test(first) ? { top, bottom } : undefined;
 }
 
 /**

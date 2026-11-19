@@ -51,7 +51,9 @@ const pane = (rows: ScreenRow[] | null | (() => never)) => ({
 describe('unattended composer screen after a web terminal resized the pane', () => {
   it('the pipe-fed renderer has lost the input box that the pane still shows', async () => {
     const r = await pipeRenderer();
-    expect(judge(r.viewportCells())).toBe('prompt_not_framed');
+    // Refused for a shape the pane does not have (what it is taken for depends
+    // on how the garbled rows line up); the pane's own empty box is admitted.
+    expect(judge(r.viewportCells())).toBeDefined();
     expect(judge(parseCapturedScreenRows(CAPTURE))).toBeUndefined();
   });
 
@@ -76,6 +78,16 @@ describe('unattended composer screen after a web terminal resized the pane', () 
     expect(readUnattendedComposerScreen({ authoritative: true, backend: {}, renderer: r })?.source).toBe('renderer');
     expect(readUnattendedComposerScreen({ authoritative: true, backend: {}, renderer: undefined })).toBeUndefined();
     expect(readUnattendedComposerScreen({ authoritative: false, backend: pane(parseCapturedScreenRows(CAPTURE)), renderer: r })).toBeUndefined();
+  });
+
+  it('a renderer whose terminal a web client resized is no evidence either (PTY)', async () => {
+    const r = await pipeRenderer();
+    expect(readUnattendedComposerScreen({ authoritative: true, backend: {}, renderer: r, terminalSize: { cols: 214, rows: 62 } })).toBeUndefined();
+    expect(readUnattendedComposerScreen({ authoritative: true, backend: {}, renderer: r, terminalSize: { cols: 160, rows: 50 } })?.source).toBe('renderer');
+    // The pane's own capture does not depend on it.
+    expect(readUnattendedComposerScreen({
+      authoritative: true, backend: pane(parseCapturedScreenRows(CAPTURE)), renderer: r, terminalSize: { cols: 214, rows: 62 },
+    })?.source).toBe('pane');
   });
 
   it('the refusal log names the source and both sizes', async () => {

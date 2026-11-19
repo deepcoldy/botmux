@@ -9,8 +9,10 @@
  * for the new size the bytes it renders land elsewhere and the input box
  * vanishes from it while it sits on the pane — or a stale one stays drawn.
  * Backends without such a read (PTY: the renderer is the only screen it has)
- * keep the renderer; a backend whose screen is not authoritative at all (zmx)
- * gives none.
+ * keep the renderer — unless the terminal was resized away from the
+ * renderer's size (a web terminal resizes the PTY too), when the renderer is
+ * no evidence either; a backend whose screen is not authoritative at all
+ * (zmx) gives none.
  */
 import type { ScreenRow } from '../utils/terminal-cells.js';
 import { composerScreenLogTail } from './prompt-cache-keepalive-gate.js';
@@ -32,6 +34,8 @@ export function readUnattendedComposerScreen(input: {
     viewportCells(): ScreenRow[];
     readonly xterm: { readonly cols: number; readonly rows: number };
   } | null | undefined;
+  /** The size the backend's terminal was last resized to, when known. */
+  terminalSize?: { cols: number; rows: number };
 }): UnattendedComposerScreen | undefined {
   if (!input.authoritative) return undefined;
   const be = input.backend;
@@ -45,8 +49,9 @@ export function readUnattendedComposerScreen(input: {
   }
   if (!input.renderer) return undefined;
   try {
-    const rows = input.renderer.viewportCells();
     const { cols, rows: height } = input.renderer.xterm;
+    if (input.terminalSize && (input.terminalSize.cols !== cols || input.terminalSize.rows !== height)) return undefined;
+    const rows = input.renderer.viewportCells();
     return { rows, source: 'renderer', size: { cols, rows: height } };
   } catch {
     return undefined;

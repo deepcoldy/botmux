@@ -355,6 +355,7 @@ describe('auto-compact unattended worker write gate', () => {
       renderer: rendererShowing(COMPOSER),
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
       readUnattendedComposerScreen,
+      webResizedBackendGrid: undefined,
       promptCacheKeepaliveRefusal,
       backend: {},
       cliAdapter: { readyPattern: /❯/ },
@@ -410,6 +411,14 @@ describe('auto-compact unattended worker write gate', () => {
       renderer: rendererShowing(COMPOSER),
       backend: { captureViewportCells: () => cellsOf(PERMISSION_DIALOG) },
     }).refuse({ requireSafeComposer: true })).toBe('action_prompt_open');
+  });
+
+  it('after a web terminal resized a renderer-only backend, its renderer is no evidence', () => {
+    const backend = {};
+    const { refuse } = harness({ backend, webResizedBackendGrid: { backend, cols: 214, rows: 62 } });
+    expect(refuse({ requireSafeComposer: true })).toBe('no_screen_evidence');
+    // A resize recorded for an earlier backend (CLI restarted since) does not count.
+    expect(harness({ webResizedBackendGrid: { backend: {}, cols: 214, rows: 62 } }).refuse({ requireSafeComposer: true })).toBeUndefined();
   });
 
   it('a failed pane capture fails closed instead of trusting the renderer', () => {
