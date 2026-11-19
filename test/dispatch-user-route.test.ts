@@ -1,5 +1,5 @@
 import { capabilityOn } from '../src/services/trigger-user-auth.js';
-import { answerDispatchTaskConsent, assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { answerDispatchTaskConsent, assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
@@ -85,7 +85,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
-    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, assertDispatchTaskApproved,
+    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, assertDispatchTaskApproved,
     dispatchConsentCardAvailable: async () => true,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
@@ -280,6 +280,151 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
     expect(h.send).not.toHaveBeenCalled();
     expect(await read()).toBeUndefined();
+  });
+
+  it.each(['explicit', 'automatic'] as const)('keeps a task denial sticky with %s schedule delegation', async scheduleMode => {
+    const h = harness(scheduleMode === 'explicit' ? { delegateScheduleCreate: true } : {});
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: 'ou_alice' },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      // Both paths would otherwise issue immediate bytedcli AND a schedule
+      // capability whose run scope can use the same personal credential.
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'],
+        ...(scheduleMode === 'automatic' ? { defaultOnDispatchFromBotAppIds: ['cli_source'] } : {}),
+      } }),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['multi-target', 'legacy-recipient', 'ownerless-route-replay'] as const)(
+    'keeps a task denial sticky with automatic schedule and %s', async scenario => {
+      const h = harness(scenario === 'multi-target' ? { targetAppIds: ['cli_target', 'cli_other'] }
+        : scenario === 'legacy-recipient' ? { hasLegacyBots: true } : {});
+      h.ds.chatType = 'group';
+      const route = { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+        targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread' as const,
+        sourceName: 'test', issuedAt: new Date().toISOString() };
+      const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+        consentMessageId: 'om_consent' };
+      writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: {
+        reportBinding: createDispatchReportBinding(secret, { ...route, taskOwner: owner }),
+      } }));
+      expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+        action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+        operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+      })).toBe(true);
+      if (scenario === 'ownerless-route-replay') {
+        // A genuine signed pre-owner route can be replayed, but it must not hide
+        // the host-only denied tombstone left by the newer owner route.
+        writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: {
+          reportBinding: createDispatchReportBinding(secret, route),
+        } }));
+      }
+      Object.assign(h.scope, { readTaskBinding,
+        loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+        evaluateTalk: () => ({ allowed: true }),
+        findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+        readGlobalConfig: () => ({ scheduleDelegation: {
+          createEnabled: true, runScopes: ['bytedcli'], defaultOnDispatchFromBotAppIds: ['cli_source'],
+        } }),
+      });
+      const result = await h.run();
+      expect(result.status).toBe(409);
+      expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+      expect(h.send).not.toHaveBeenCalled();
+      expect(await read()).toBeUndefined();
+    });
+
+  it.each(['provider-write', 'bind'] as const)('rechecks a sticky task decision before schedule %s', async edge => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    let sent = false;
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'], defaultOnDispatchFromBotAppIds: ['cli_source'],
+      } }),
+      replyMessage: async (...args: any[]) => {
+        if (edge === 'provider-write') {
+          click.action.value.choice = 'deny';
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+        }
+        await args[7]?.beforeWrite?.();
+        if (edge === 'bind') {
+          click.action.value.choice = 'deny';
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+        }
+        sent = true;
+        return 'om_kickoff';
+      },
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(sent).toBe(edge === 'bind');
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['ordinary', 'explicit', 'automatic'] as const)('binds a first member delivery without a decision directory: %s', async mode => {
+    const h = harness(mode === 'explicit' ? { delegateScheduleCreate: true } : {});
+    h.ds.chatType = 'group';
+    // Initial taskOwner is present, but no consent card or host decision has
+    // ever existed: the decision directory itself starts absent.
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'],
+        ...(mode === 'automatic' ? { defaultOnDispatchFromBotAppIds: ['cli_source'] } : {}),
+      } }),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(200);
+    const delegated = await read();
+    expect(delegated).toMatchObject({
+      domain: mode === 'ordinary' ? 'botmux.dispatch-user.v1' : 'botmux.dispatch-user.v2',
+      authority: { tools: ['bytedcli'] },
+    });
+    if (mode !== 'ordinary') {
+      expect(scheduleCreateCapabilities(delegated!.authority)).toEqual([
+        expect.objectContaining({ allowedRunScopes: ['bytedcli'] }),
+      ]);
+    }
   });
 
   it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {

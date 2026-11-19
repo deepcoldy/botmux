@@ -328,6 +328,7 @@ export async function deliverDispatchWithUser(input: {
   secret: string;
   payload: DispatchUserPayloadInput;
   send: () => Promise<string>;
+  bindGuard?: (bind: () => Promise<DispatchUserPayload>) => Promise<DispatchUserPayload>;
 }): Promise<string> {
   const pending = await registerPendingDispatchUser(input);
   return deliverPendingDispatchUser(input, pending);
@@ -336,6 +337,7 @@ export async function deliverDispatchWithUser(input: {
 /** Complete an already registered delivery using the same send/cleanup path. */
 export async function deliverPendingDispatchUser(input: {
   dataDir: string; secret: string; send: () => Promise<string>;
+  bindGuard?: (bind: () => Promise<DispatchUserPayload>) => Promise<DispatchUserPayload>;
 }, pending: SignedDispatchUser): Promise<string> {
   const deliveryId = pending.payload.deliveryId;
   let messageId: string;
@@ -346,7 +348,8 @@ export async function deliverPendingDispatchUser(input: {
     throw error;
   }
   try {
-    await bindPendingDispatchUser({ dataDir: input.dataDir, secret: input.secret, deliveryId, messageId });
+    const bind = () => bindPendingDispatchUser({ dataDir: input.dataDir, secret: input.secret, deliveryId, messageId });
+    await (input.bindGuard ? input.bindGuard(bind) : bind());
   } catch (error) {
     await dropPendingDispatchUser(input.dataDir, deliveryId);
     throw error;

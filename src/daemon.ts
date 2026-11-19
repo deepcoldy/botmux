@@ -675,7 +675,7 @@ import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
-import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
+import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
 import { dispatchConsentCardAvailable } from './im/lark/client.js';
 import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
@@ -9489,10 +9489,41 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (authority && ds.managedTurnOrigin?.turnId !== turnId) {
       return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
     }
+    // A terminal task denial is independent of the delivery shape. Check it
+    // before schedule defaults, multi-target delivery or legacy recipients can
+    // bypass the consent-card path. Only the exact owner/app/chat tuple matches.
+    let assertTaskNotDenied: (() => Promise<void>) | undefined;
+    if (directHumanTurn && ds.chatType === 'group' && ds.chatId !== chatId && turnId?.startsWith('om_')
+        && targetAppIds.length > 0 && authority
+        && (authority.tools.includes('bytedcli')
+          || scheduleCreateCapabilities(authority).some(capability => capability.allowedRunScopes.includes('bytedcli')))) {
+      const secret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
+      const binding = await readTaskBinding(config.session.dataDir, secret, rootId);
+      const sticky = binding?.taskOwner;
+      if (binding?.targetLarkAppId === ds.larkAppId && binding.targetSessionId === ds.session.sessionId
+          && binding.targetChatId === ds.chatId && binding.targetScope === 'thread' && !binding.attachment
+          && sticky?.openId === authority.openId && sticky.receivingChatId === chatId
+          && targetAppIds.includes(sticky.receivingAppId)) {
+        if (sticky.decision === 'denied') {
+          return jsonRes(res, 409, { ok: false, error: 'task_consent_denied', dispatchRoot: rootId });
+        }
+        assertTaskNotDenied = async () => {
+          const current = await readTaskBinding(config.session.dataDir, secret, rootId);
+          const owner = current?.taskOwner;
+          if (!current || current.attachment || current.targetLarkAppId !== binding.targetLarkAppId
+              || current.targetSessionId !== binding.targetSessionId || current.targetChatId !== binding.targetChatId
+              || current.targetScope !== binding.targetScope || owner?.openId !== sticky.openId
+              || owner.receivingAppId !== sticky.receivingAppId || owner.receivingChatId !== sticky.receivingChatId) {
+            throw new Error('dispatch_task_changed');
+          }
+          if (owner.decision === 'denied') throw new Error('task_consent_denied');
+        };
+      }
+    }
     let taskConsent: { sourceChatId: string; cardId: string } | undefined;
     if (directHumanTurn && ds.chatType === 'group' && ds.chatId !== chatId && turnId?.startsWith('om_')
         && targetAppIds.length === 1 && targetAppIds[0] !== ds.larkAppId && !body.hasLegacyBots
-        && authority?.tools.includes('bytedcli') && capabilityOn(bot.triggerUserAuth, 'bytecloud') && !inherited && !scheduleCreateRequested) {
+        && authority?.tools.includes('bytedcli') && capabilityOn(bot.triggerUserAuth, 'bytecloud') && !inherited) {
       // Only tasks whose report channel the source daemon owns may request
       // cross-chat consent (including --into). An arbitrary thread is no task.
       const targetApp = targetAppIds[0];
@@ -9509,34 +9540,36 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
             && sticky.receivingAppId === targetApp && sticky.receivingChatId === chatId) {
           return jsonRes(res, 409, { ok: false, error: 'task_consent_denied', dispatchRoot: rootId });
         }
-        const members = await findCurrentChatUserMembers(ds.larkAppId, chatId, [authority.openId]);
-        if (!members.has(authority.openId)) {
-          if (!binding.taskOwner && ds.session.rootMessageId) {
-            binding = await restoreDispatchTaskOwner({ dataDir: config.session.dataDir, secret, binding,
-              owner: { openId: authority.openId, receivingAppId: targetApp, receivingChatId: chatId },
-              sourceRootId: ds.session.rootMessageId, firstReply: () => firstDispatchReply(ds.larkAppId, chatId, rootId, targetApp),
-              original: kickoff => resolveDispatchUser({ dataDir: config.session.dataDir, secret, appId: targetApp,
-                chatId, rootId, turnId: kickoff, waitMs: 0 }),
-              sourceMessage: id => getMessageDetail(ds.larkAppId, id, { userIdType: 'open_id', userCardContent: false, timeoutMs: 5000 }),
-            }) ?? null;
+        if (!scheduleCreateRequested) {
+          const members = await findCurrentChatUserMembers(ds.larkAppId, chatId, [authority.openId]);
+          if (!members.has(authority.openId)) {
+            if (!binding.taskOwner && ds.session.rootMessageId) {
+              binding = await restoreDispatchTaskOwner({ dataDir: config.session.dataDir, secret, binding,
+                owner: { openId: authority.openId, receivingAppId: targetApp, receivingChatId: chatId },
+                sourceRootId: ds.session.rootMessageId, firstReply: () => firstDispatchReply(ds.larkAppId, chatId, rootId, targetApp),
+                original: kickoff => resolveDispatchUser({ dataDir: config.session.dataDir, secret, appId: targetApp,
+                  chatId, rootId, turnId: kickoff, waitMs: 0 }),
+                sourceMessage: id => getMessageDetail(ds.larkAppId, id, { userIdType: 'open_id', userCardContent: false, timeoutMs: 5000 }),
+              }) ?? null;
+            }
+            if (!binding || binding.taskOwner?.openId !== authority.openId || binding.taskOwner.receivingAppId !== targetApp
+                || binding.taskOwner.receivingChatId !== chatId) {
+              return jsonRes(res, 403, { ok: false, error: 'dispatch_task_owner_unproven' });
+            }
+            await sourceWriteOptions.beforeWrite();
+            const cardId = await confirmDispatchTask({
+              dataDir: config.session.dataDir, secret, binding, targetName: targetConfig.displayName,
+              send: (card, key) => replyMessage(ds.larkAppId, turnId, card, 'interactive', true, key, undefined, sourceWriteOptions),
+              checkOrigin: sourceWriteOptions.beforeWrite,
+              isCardAvailable: cardId => dispatchConsentCardAvailable(ds.larkAppId, ds.chatId, cardId),
+            });
+            if (!evaluateTalk(ds.larkAppId, ds.chatId, authority.openId, undefined, authority.unionId, 'group').allowed
+                || !(await findCurrentChatUserMembers(ds.larkAppId, ds.chatId, [authority.openId])).has(authority.openId)) {
+              return jsonRes(res, 403, { ok: false, error: 'dispatch_source_access_denied' });
+            }
+            taskConsent = { sourceChatId: ds.chatId, cardId };
+            authority = { ...authority, tools: ['bytedcli'] };
           }
-          if (!binding || binding.taskOwner?.openId !== authority.openId || binding.taskOwner.receivingAppId !== targetApp
-              || binding.taskOwner.receivingChatId !== chatId) {
-            return jsonRes(res, 403, { ok: false, error: 'dispatch_task_owner_unproven' });
-          }
-          await sourceWriteOptions.beforeWrite();
-          const cardId = await confirmDispatchTask({
-            dataDir: config.session.dataDir, secret, binding, targetName: targetConfig.displayName,
-            send: (card, key) => replyMessage(ds.larkAppId, turnId, card, 'interactive', true, key, undefined, sourceWriteOptions),
-            checkOrigin: sourceWriteOptions.beforeWrite,
-            isCardAvailable: cardId => dispatchConsentCardAvailable(ds.larkAppId, ds.chatId, cardId),
-          });
-          if (!evaluateTalk(ds.larkAppId, ds.chatId, authority.openId, undefined, authority.unionId, 'group').allowed
-              || !(await findCurrentChatUserMembers(ds.larkAppId, ds.chatId, [authority.openId])).has(authority.openId)) {
-            return jsonRes(res, 403, { ok: false, error: 'dispatch_source_access_denied' });
-          }
-          taskConsent = { sourceChatId: ds.chatId, cardId };
-          authority = { ...authority, tools: ['bytedcli'] };
         }
       }
     }
@@ -9559,9 +9592,17 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
         await sourceWriteOptions.beforeWrite();
         await assertDispatchTaskApproved(delivery);
         await sourceWriteOptions.beforeWrite();
+      } } : assertTaskNotDenied && delivery ? { ...sourceWriteOptions, beforeWrite: async () => {
+        await sourceWriteOptions.beforeWrite();
+        await assertTaskNotDenied();
+        await sourceWriteOptions.beforeWrite();
       } } : sourceWriteOptions);
     const messageId = delivery
-      ? await (taskConsent ? deliverApprovedDispatchTask : deliverDispatchWithUser)({ ...delivery, send })
+      ? await (taskConsent
+        ? deliverApprovedDispatchTask({ ...delivery, send })
+        : assertTaskNotDenied
+          ? deliverStickyDispatchWithUser({ ...delivery, send }, assertTaskNotDenied)
+          : deliverDispatchWithUser({ ...delivery, send }))
       : await send();
     if (scheduleCreateDefaulted || serviceGrant) {
       // With a service grant the signer is the sponsor, not whoever drove the

@@ -8,7 +8,7 @@ import { createDispatchReportBinding, verifyDispatchReportBinding, type Dispatch
 import { updateDispatchRegistry } from '../../core/dispatch-registry.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { deliverPendingDispatchUser, registerPendingDispatchUser } from '../../core/dispatch-user-delegation.js';
+import { deliverDispatchWithUser, deliverPendingDispatchUser, registerPendingDispatchUser } from '../../core/dispatch-user-delegation.js';
 
 export const TASK_CONSENT_ACTION = 'dispatch_task_bytedcli';
 const registryPath = (dataDir: string) => join(dataDir, 'orchestrate-dispatch.json');
@@ -53,10 +53,16 @@ export async function readTaskBinding(
 ): Promise<EffectiveBinding | null> {
   const entries = await readJson(registryPath(dataDir));
   const binding = verifyDispatchReportBinding(secret, root, entries?.[root]?.reportBinding);
-  if (!binding?.taskOwner) return binding;
+  let record = await readTaskDecision(dataDir, secret, root);
+  if (!binding?.taskOwner) {
+    // A replayed pre-owner public route must not hide a host-only terminal
+    // denial. Without the signed owner tuple there is no safe way to attribute
+    // a different principal, so every later delivery fails closed.
+    if (record?.decision === 'denied') throw new Error('task_consent_denied');
+    return binding;
+  }
   // The public routing record can be replayed. The actual decision, including
   // terminal revocation, lives outside every worker's filesystem grants.
-  let record = await readTaskDecision(dataDir, secret, root);
   const checkCard = !!isCardAvailable && record?.decision === 'approved'
     && record.cardId === binding.taskOwner.consentMessageId;
   const available = !checkCard || await isCardAvailable!(binding.taskOwner.consentMessageId!);
@@ -108,6 +114,30 @@ export async function deliverApprovedDispatchTask(
     ...input,
     send: async () => { await assertDispatchTaskApproved(input); return input.send(); },
   }, pending);
+}
+
+/**
+ * Delivery for an already-proven task owner that does not carry taskConsent
+ * (ordinary member and schedule-enabled follow-ups). Recheck the host decision
+ * before registration, provider I/O and binding. Binding shares the decision
+ * lock with the callback, so a revocation has a defined order with issuance.
+ */
+export async function deliverStickyDispatchWithUser(
+  input: Parameters<typeof deliverDispatchWithUser>[0],
+  assertAuthorized: () => Promise<void>,
+): Promise<string> {
+  const root = input.payload.rootId;
+  if (!root) throw new Error('dispatch_task_changed');
+  await mkdir(dispatchTaskDecisionDirectory(input.dataDir), { recursive: true, mode: 0o700 });
+  await assertAuthorized();
+  return deliverDispatchWithUser({
+    ...input,
+    send: async () => { await assertAuthorized(); return input.send(); },
+    bindGuard: async bind => withFileLock(decisionPath(input.dataDir, root), async () => {
+      await assertAuthorized();
+      return bind();
+    }),
+  });
 }
 
 /** Adopt a pre-upgrade workstream only after verifying the identity on its

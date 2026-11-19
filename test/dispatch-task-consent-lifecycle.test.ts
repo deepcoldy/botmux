@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
-import { answerDispatchTaskConsent, confirmDispatchTask, deliverApprovedDispatchTask, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { answerDispatchTaskConsent, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { resolveDispatchUser } from '../src/core/dispatch-user-delegation.js';
 import * as atomic from '../src/utils/atomic-write.js';
 
 let dir: string;
@@ -107,6 +108,35 @@ describe('source task consent card lifecycle', () => {
     release();
     expect(await pending).toEqual({ error: 'task_consent_denied' });
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(['before-send', 'before-bind'] as const)('sticky delivery rejects a revocation %s', async edge => {
+    record();
+    await decide('om_old', 'approve');
+    let checks = 0;
+    const assertAuthorized = async () => {
+      checks++;
+      // The second check is immediately before the provider write. Deny there
+      // for the send-edge case; the bind-edge case denies inside send instead.
+      if (edge === 'before-send' && checks === 2) await decide('om_old', 'deny');
+      const current = await readTaskBinding(dir, secret, 'om_task');
+      if (current?.taskOwner?.decision === 'denied') throw new Error('task_consent_denied');
+    };
+    const send = vi.fn(async () => {
+      if (edge === 'before-bind') await decide('om_old', 'deny');
+      return 'om_kickoff';
+    });
+    const delivered = outcome(deliverStickyDispatchWithUser({ dataDir: dir, secret,
+      payload: { sourceAppId: 'cli_source', sourceSessionId: route.targetSessionId, sourceTurnId: 'om_human',
+        rootId: 'om_task', chatId: 'oc_hub', targetAppIds: ['cli_target'],
+        authority: { appId: 'cli_source', openId: owner.openId, unionId: 'on_user', tools: ['bytedcli'] } },
+      send,
+    }, assertAuthorized));
+    expect(await delivered).toEqual({ error: 'task_consent_denied' });
+    expect(send).toHaveBeenCalledTimes(edge === 'before-bind' ? 1 : 0);
+    expect(await resolveDispatchUser({ dataDir: dir, secret, appId: 'cli_target', chatId: 'oc_hub',
+      rootId: 'om_task', turnId: 'om_kickoff', waitMs: 0 })).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(dir, 'dispatch-user-delegations.json'), 'utf8'))).toEqual({});
   });
 
   it('fails closed on an inconclusive card lookup without sending a replacement', async () => {
