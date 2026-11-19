@@ -10,6 +10,7 @@ import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
+import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
@@ -19,6 +20,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
+  if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
